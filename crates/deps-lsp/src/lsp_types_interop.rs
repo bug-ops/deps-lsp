@@ -79,6 +79,23 @@ pub fn to_lsp_uri(url: &url::Url) -> ls_types::Uri {
     deps_core::to_ls_uri(url)
 }
 
+/// Computes the one canonical spelling of a client-supplied `Uri`.
+///
+/// Every LSP entry point keys `ServerState::documents` and echoes response URIs by the same
+/// identity regardless of how the client spelled the request. Round-trips through [`from_lsp_uri`]/[`to_lsp_uri`] to reuse `url::Url`'s WHATWG
+/// normalization (`file://localhost/x` -> `file:///x`, case, `.`/`..` segments, UNC form) —
+/// see `test_url_parse_normalizes_some_uri_spellings` for the exact variants folded together.
+///
+/// When `from_lsp_uri` rejects `uri` (malformed, or the #1090 Windows-drive-with-host guard),
+/// this returns `uri` unchanged rather than falling back to some other key: callers downstream
+/// already treat an unparseable `Uri` as "no ecosystem handles this" (`EcosystemRegistry::for_uri`
+/// returns `None`), so no document is ever created under this non-canonical value — the
+/// passthrough is inert, not a silent bypass of the rejection.
+#[must_use]
+pub fn canonicalize_uri(uri: &ls_types::Uri) -> ls_types::Uri {
+    from_lsp_uri(uri).map_or_else(|| uri.clone(), |url| to_lsp_uri(&url))
+}
+
 /// Converts a domain [`deps_core::position::Range`] into the LSP-protocol `Range` a response
 /// object requires.
 #[must_use]
@@ -230,11 +247,13 @@ mod tests {
 
     /// S3 documentation: `Url::parse` normalizes several `ls_types::Uri`-valid spellings
     /// to a different string — round-tripping through `from_lsp_uri`/`to_lsp_uri` does
-    /// NOT reproduce the client's original `Uri` in these cases. Callers that need to key
-    /// a response (e.g. a `WorkspaceEdit`'s `changes` map) by the exact URI the client
-    /// holds open must reuse the original `Uri` from the request, not `to_lsp_uri`'s
-    /// output — see `handlers::code_actions`' `WorkspaceEdit` re-keying for the fix this
-    /// documents.
+    /// NOT reproduce the client's original `Uri` in these cases. This is exactly the
+    /// divergence [`canonicalize_uri`] exists to fold onto one identity (issue #1086):
+    /// every `server.rs` entry point canonicalizes a request's `Uri` before it reaches
+    /// `ServerState::documents` or any response, so a `WorkspaceEdit`'s `changes` map key
+    /// (or any other response `Uri`) is always built from the same canonical form the
+    /// document is stored under, rather than needing a per-handler rekey back to the
+    /// client's original spelling.
     #[test]
     fn test_url_parse_normalizes_some_uri_spellings() {
         let cases = [
@@ -257,8 +276,8 @@ mod tests {
                 back.as_str(),
                 expected_normalized,
                 "expected {input:?} to normalize to {expected_normalized:?}, got {:?} — if \
-                 this now fails, url::Url's normalization behavior changed and S3's \
-                 re-keying fix in handlers::code_actions may need revisiting",
+                 this now fails, url::Url's normalization behavior changed and \
+                 canonicalize_uri's spelling-variant coverage may need revisiting",
                 back.as_str()
             );
         }
@@ -297,6 +316,49 @@ mod tests {
         let url = from_lsp_uri(&legitimate)
             .expect("a legitimate, host-less file: URI must still convert to a Url");
         assert_eq!(url.to_file_path().unwrap(), real_path);
+    }
+
+    #[test]
+    fn test_canonicalize_uri_is_identity_for_already_canonical_input() {
+        let ls_uri: ls_types::Uri = "file:///x/Cargo.toml".parse().unwrap();
+        assert_eq!(canonicalize_uri(&ls_uri).as_str(), "file:///x/Cargo.toml");
+    }
+
+    #[test]
+    fn test_canonicalize_uri_normalizes_documented_spelling_variants() {
+        let cases = [
+            (
+                "file://localhost/home/u/Cargo.toml",
+                "file:///home/u/Cargo.toml",
+            ),
+            ("FILE:///x/Cargo.toml", "file:///x/Cargo.toml"),
+            ("file:///a/./b/../Cargo.toml", "file:///a/Cargo.toml"),
+            (
+                "file:////server/share/Cargo.toml",
+                "file:///server/share/Cargo.toml",
+            ),
+        ];
+        for (input, expected) in cases {
+            let ls_uri: ls_types::Uri = input.parse().unwrap();
+            assert_eq!(
+                canonicalize_uri(&ls_uri).as_str(),
+                expected,
+                "expected {input:?} to canonicalize to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_canonicalize_uri_passes_through_rejected_windows_drive_host_bypass() {
+        let malicious: ls_types::Uri = "file://attacker.example/C:/real/temp/dir/Cargo.toml"
+            .parse()
+            .expect("a literal-colon drive-letter path is valid RFC 3986");
+        assert_eq!(
+            canonicalize_uri(&malicious),
+            malicious,
+            "a from_lsp_uri-rejected Uri must pass through unchanged, not be silently dropped \
+             or substituted"
+        );
     }
 
     #[test]

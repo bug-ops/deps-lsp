@@ -91,7 +91,7 @@ status: moc
 | 057 | [[057-gradle-version-completion-range-default-regression/spec\|Gradle version completion returns zero results for every real-world manifest shape, regressed by PR #922]] | specify | shipped — bug, P1 (PR #939, issue #931) |
 | 059 | [[059-completion-code-action-latest-marker-prerelease-mismatch/spec\|Version-completion and code-action quick-fix lists mislabel a pre-release as "(latest)"]] | specify | shipped — bug, P1 (PR #955, issue #952); capped-display-window follow-up gaps fixed separately (PR #960 issue #956, PR #970 issue #961) |
 | 061 | [[061-feature-matrix-test-sharding/spec\|Shard feature-matrix-test CI job across parallel runners]] | specify | shipped — testing-infra/enhancement, P2, `feature-matrix-test` split into a 4-leg parallel matrix (`fail-fast: false`) with the redundant `default` slice dropped, coverage parity preserved (PR #1031, issue #1030) |
-| 066 | [[066-canonical-document-identity/spec\|Canonical document identity: canonicalize URIs once at server entry instead of per-handler URI rekeying]] | tasks | enhancement, P4, tasks ready (issue #1086) |
+| 066 | [[066-canonical-document-identity/spec\|Canonical document identity: canonicalize URIs once at server entry instead of per-handler URI rekeying]] | tasks | enhancement, P4, implemented and live-verified (PR #1198, issue #1086) |
 
 ## Project Foundation
 

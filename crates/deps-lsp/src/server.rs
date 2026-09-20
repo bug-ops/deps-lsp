@@ -808,9 +808,15 @@ impl LanguageServer for Backend {
         std::future::ready(Ok(()))
     }
 
+    // Every `#[tracing::instrument(fields(uri = ...))]` on this and the other trait
+    // methods below deliberately records the raw, pre-canonicalization request `Uri`
+    // (evaluated before the body runs `canonicalize_uri`): the span correlates a
+    // request with the client's own wire-format log, while body-level `tracing::info!`/
+    // `tracing::warn!` calls after canonicalization use the resolved (canonical) form —
+    // both are visible in `.local/testing/debug/session.log`, so this is not a gap.
     #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let uri = params.text_document.uri;
+        let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         let content = params.text_document.text;
         let version = params.text_document.version;
 
@@ -832,7 +838,7 @@ impl LanguageServer for Backend {
 
     #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri;
+        let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         let version = params.text_document.version;
 
         if let Some(change) = params.content_changes.first() {
@@ -855,13 +861,20 @@ impl LanguageServer for Backend {
 
     #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let uri = params.text_document.uri;
+        let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!("document closed: {:?}", uri);
 
         self.state.remove_document(&uri);
         self.state.cancel_background_task(&uri).await;
     }
 
+    /// Not routed through `canonicalize_uri` (#1086): `change.uri` here is a watched
+    /// filesystem-event URI (lock file, config file), never looked up against
+    /// `ServerState::documents` directly — it's converted to a path via `from_lsp_uri` and
+    /// matched against already-canonical document keys inside `handle_lockfile_change`'s
+    /// scan instead. Canonicalizing it here would be a no-op for correctness (the affected-
+    /// document match already goes through the canonical map key) and would only churn the
+    /// log/path-resolution value for no behavioral benefit.
     #[tracing::instrument(skip(self, params), fields(count = params.changes.len()))]
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         tracing::debug!("Received {} file change events", params.changes.len());
@@ -915,7 +928,11 @@ impl LanguageServer for Backend {
         skip(self, params),
         fields(uri = ?params.text_document_position_params.text_document.uri)
     )]
-    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+    async fn hover(&self, mut params: HoverParams) -> Result<Option<Hover>> {
+        params.text_document_position_params.text_document.uri =
+            crate::lsp_types_interop::canonicalize_uri(
+                &params.text_document_position_params.text_document.uri,
+            );
         Ok(hover::handle_hover(
             Arc::clone(&self.state),
             params,
@@ -929,7 +946,11 @@ impl LanguageServer for Backend {
         skip(self, params),
         fields(uri = ?params.text_document_position.text_document.uri)
     )]
-    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+    async fn completion(&self, mut params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        params.text_document_position.text_document.uri =
+            crate::lsp_types_interop::canonicalize_uri(
+                &params.text_document_position.text_document.uri,
+            );
         Ok(completion::handle_completion(
             Arc::clone(&self.state),
             params,
@@ -940,7 +961,9 @@ impl LanguageServer for Backend {
     }
 
     #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
-    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+    async fn inlay_hint(&self, mut params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        params.text_document.uri =
+            crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         // Clone config before async call to release lock early
         let inlay_config = { self.config.read().await.inlay_hints.clone() };
         let range = params.range;
@@ -963,8 +986,10 @@ impl LanguageServer for Backend {
     #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
     async fn code_action(
         &self,
-        params: CodeActionParams,
+        mut params: CodeActionParams,
     ) -> Result<Option<Vec<tower_lsp_server::ls_types::CodeActionOrCommand>>> {
+        params.text_document.uri =
+            crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!(
             "code_action request: uri={:?}, range={:?}",
             params.text_document.uri,
@@ -982,7 +1007,9 @@ impl LanguageServer for Backend {
     }
 
     #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
-    async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+    async fn code_lens(&self, mut params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
+        params.text_document.uri =
+            crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         let enabled = { self.config.read().await.code_lens.enabled };
         let lenses = code_lens::handle_code_lens(
             Arc::clone(&self.state),
@@ -996,7 +1023,12 @@ impl LanguageServer for Backend {
     }
 
     #[tracing::instrument(skip(self, params), fields(uri = ?params.text_document.uri))]
-    async fn document_link(&self, params: DocumentLinkParams) -> Result<Option<Vec<DocumentLink>>> {
+    async fn document_link(
+        &self,
+        mut params: DocumentLinkParams,
+    ) -> Result<Option<Vec<DocumentLink>>> {
+        params.text_document.uri =
+            crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         let links = document_link::handle_document_link(
             Arc::clone(&self.state),
             params,
@@ -1012,7 +1044,7 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentDiagnosticParams,
     ) -> Result<DocumentDiagnosticReportResult> {
-        let uri = params.text_document.uri;
+        let uri = crate::lsp_types_interop::canonicalize_uri(&params.text_document.uri);
         tracing::info!("diagnostic request for: {:?}", uri);
 
         // Clone config before async call to release lock early
@@ -1049,8 +1081,9 @@ impl LanguageServer for Backend {
 
         if params.command == commands::UPDATE_VERSION
             && let Some(args) = params.arguments.first()
-            && let Ok(update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone())
+            && let Ok(mut update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone())
         {
+            update_args.uri = crate::lsp_types_interop::canonicalize_uri(&update_args.uri);
             if let Some(edit) = build_update_version_edit(&update_args) {
                 match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, self.client.apply_edit(edit))
                     .await
@@ -1066,14 +1099,18 @@ impl LanguageServer for Backend {
             && let Some(args) = params.arguments.first()
             && let Ok(update_args) = serde_json::from_value::<UpdateAllOutdatedArgs>(args.clone())
         {
-            self.execute_update_all_outdated(update_args.uri).await;
+            self.execute_update_all_outdated(crate::lsp_types_interop::canonicalize_uri(
+                &update_args.uri,
+            ))
+            .await;
         }
 
         if params.command == commands::PIN_ALL_TO_SHA
             && let Some(args) = params.arguments.first()
             && let Ok(pin_args) = serde_json::from_value::<PinAllToShaArgs>(args.clone())
         {
-            self.execute_pin_all_to_sha(pin_args.uri).await;
+            self.execute_pin_all_to_sha(crate::lsp_types_interop::canonicalize_uri(&pin_args.uri))
+                .await;
         }
 
         Ok(None)
@@ -1710,6 +1747,292 @@ mod tests {
             after.value.contains("^18.3.0"),
             "watched config file change did not trigger a reparse of the open document: {}",
             after.value
+        );
+    }
+
+    /// Cross-handler dedup regression (issue #1086, US-001/FR-004): a client opening a
+    /// document under one non-canonical `Uri` spelling and later requesting `hover` on the
+    /// same physical file under a *different* non-canonical spelling must resolve the same
+    /// `DocumentState` — not create a second, empty entry. Exercises two of the four
+    /// documented spelling-variant classes (`file://localhost/...` on open, an uppercase
+    /// `FILE:///...` scheme on hover) built from raw client-style strings (not
+    /// `Uri::from_file_path`, which is always already canonical and so cannot exercise this
+    /// divergence).
+    ///
+    /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path` (which
+    /// `parse_manifest`'s workspace-root discovery calls internally) always fails on Windows
+    /// regardless of the URI's spelling — a fixture-portability limit, not a difference in
+    /// the canonicalization mechanism under test, which the cross-platform
+    /// `lsp_types_interop` round-trip tests already cover on Windows.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_differently_spelled_uris_resolve_the_same_document() {
+        // Held per fs_probe::snapshot_guard's doc: did_open routes through cargo's
+        // parse_manifest, which touches fs_probe, and this test shares a binary with
+        // document/loader.rs's diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use tower_lsp_server::ls_types::{
+            HoverContents, Position, TextDocumentIdentifier, TextDocumentItem,
+            TextDocumentPositionParams,
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        let content = "[dependencies]\nserde = \"1.0.0\"\n";
+        std::fs::write(&manifest_path, content).unwrap();
+        let path_str = manifest_path.to_str().unwrap();
+
+        let open_uri: Uri = format!("file://localhost{path_str}").parse().unwrap();
+        let hover_uri: Uri = format!("FILE://{path_str}").parse().unwrap();
+        let canonical = crate::lsp_types_interop::canonicalize_uri(&open_uri);
+        assert_eq!(
+            canonical,
+            crate::lsp_types_interop::canonicalize_uri(&hover_uri),
+            "test premise: both raw spellings must canonicalize to the same Uri"
+        );
+        assert_ne!(
+            open_uri, hover_uri,
+            "test premise: the two spellings must differ"
+        );
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: open_uri,
+                    language_id: "toml".to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            })
+            .await;
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "did_open must store exactly one document, keyed by the canonical Uri"
+        );
+
+        let hover = backend
+            .hover(HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri: hover_uri },
+                    position: Position::new(1, 9), // inside "serde"'s name
+                },
+                work_done_progress_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert!(
+            hover.is_some(),
+            "hover under a different non-canonical spelling must resolve the document \
+             opened under the first spelling, not miss it as an unknown document"
+        );
+        let HoverContents::Markup(content) = hover.unwrap().contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(content.value.contains("serde"), "{}", content.value);
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "the hover request must not have created a second document entry"
+        );
+    }
+
+    /// Chokepoint-enforcement regression (issue #1086, US-002, critic S2): proves the
+    /// `canonicalize_uri` call is load-bearing at every `server.rs` entry point besides
+    /// `hover` — deleting it from any one of these methods would fail zero tests
+    /// otherwise, since every handler-level unit test passes an already-canonicalized
+    /// `Uri` in directly. Each entry point below is driven with a *different*
+    /// non-canonical spelling than the one `did_open` used, so a missing
+    /// `canonicalize_uri` call surfaces structurally: `ensure_document_loaded` only
+    /// cold-starts a second, disk-backed document when its `state.get_document(uri)`
+    /// lookup misses, which only happens if the raw, non-canonical `Uri` reaches it
+    /// instead of the canonical one already stored — `document_count()` jumps from 1 to
+    /// 2 in that case, and `did_close`'s `remove_document` similarly leaves the original
+    /// entry behind if its own `uri` isn't canonicalized to the same key.
+    ///
+    /// Does not cover the `updateAllOutdated`/`pinAllToSha` `executeCommand` arms: unlike
+    /// every method here, neither ever creates or removes a `ServerState::documents`
+    /// entry on a lookup miss (`execute_update_all_outdated`/`execute_pin_all_to_sha`
+    /// just call `get_document` and refuse), so there is no `document_count()`-based (or
+    /// otherwise state-observable) signal available without a message-capturing test
+    /// client this codebase does not have; both call sites are covered by code
+    /// inspection and `cargo clippy`/compilation only.
+    ///
+    /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path`
+    /// (which `parse_manifest`'s workspace-root discovery and `ensure_document_loaded`'s
+    /// cold-start disk read both call internally) always fails on Windows regardless of
+    /// the URI's spelling — a fixture-portability limit, not a difference in the
+    /// canonicalization mechanism under test.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    #[cfg(not(windows))]
+    async fn test_canonicalize_uri_chokepoint_covers_every_document_reading_entry_point() {
+        // Held per fs_probe::snapshot_guard's doc: cold-start disk reads and
+        // parse_manifest touch fs_probe, and this test shares a binary with
+        // document/loader.rs's diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use tower_lsp_server::ls_types::{
+            Position, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+        };
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("Cargo.toml");
+        let content = "[dependencies]\nserde = \"1.0.0\"\n";
+        std::fs::write(&manifest_path, content).unwrap();
+        let path_str = manifest_path.to_str().unwrap();
+
+        let open_uri: Uri = format!("file://localhost{path_str}").parse().unwrap();
+        let other_spelling: Uri = format!("FILE://{path_str}").parse().unwrap();
+        let canonical = crate::lsp_types_interop::canonicalize_uri(&open_uri);
+        assert_eq!(
+            canonical,
+            crate::lsp_types_interop::canonicalize_uri(&other_spelling),
+            "test premise: both raw spellings must canonicalize to the same Uri"
+        );
+        assert_ne!(
+            open_uri, other_spelling,
+            "test premise: the two spellings must differ"
+        );
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: open_uri,
+                    language_id: "toml".to_string(),
+                    version: 1,
+                    text: content.to_string(),
+                },
+            })
+            .await;
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "test premise: did_open stored one document"
+        );
+
+        backend
+            .code_action(CodeActionParams {
+                text_document: TextDocumentIdentifier {
+                    uri: other_spelling.clone(),
+                },
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                context: Default::default(),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "code_action must resolve the existing document, not cold-start a second one"
+        );
+
+        backend
+            .code_lens(CodeLensParams {
+                text_document: TextDocumentIdentifier {
+                    uri: other_spelling.clone(),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "code_lens must resolve the existing document, not cold-start a second one"
+        );
+
+        backend
+            .completion(CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier {
+                        uri: other_spelling.clone(),
+                    },
+                    position: Position::new(1, 9), // inside "serde"'s name
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "completion must resolve the existing document, not cold-start a second one"
+        );
+
+        backend
+            .inlay_hint(InlayHintParams {
+                text_document: TextDocumentIdentifier {
+                    uri: other_spelling.clone(),
+                },
+                work_done_progress_params: Default::default(),
+                range: Range::new(Position::new(0, 0), Position::new(100, 0)),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "inlay_hint must resolve the existing document, not cold-start a second one"
+        );
+
+        backend
+            .document_link(DocumentLinkParams {
+                text_document: TextDocumentIdentifier {
+                    uri: other_spelling.clone(),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "document_link must resolve the existing document, not cold-start a second one"
+        );
+
+        backend
+            .diagnostic(DocumentDiagnosticParams {
+                text_document: TextDocumentIdentifier {
+                    uri: other_spelling.clone(),
+                },
+                identifier: None,
+                previous_result_id: None,
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.state.document_count(),
+            1,
+            "diagnostic must resolve the existing document, not cold-start a second one"
+        );
+
+        backend
+            .did_close(DidCloseTextDocumentParams {
+                text_document: TextDocumentIdentifier {
+                    uri: other_spelling,
+                },
+            })
+            .await;
+        assert_eq!(
+            backend.state.document_count(),
+            0,
+            "did_close under a different non-canonical spelling must remove the document \
+             opened under the first spelling, not leave it behind under a mismatched key"
         );
     }
 

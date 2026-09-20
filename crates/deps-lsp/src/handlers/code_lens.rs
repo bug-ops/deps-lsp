@@ -116,47 +116,7 @@ pub async fn handle_code_lens(
         ));
     }
 
-    rekey_lens_command_uri(&mut lenses, uri);
     lenses
-}
-
-/// Re-keys every lens's `command.arguments[].uri` field onto `original_uri`, the exact
-/// `Uri` the client sent in this request.
-///
-/// `deps_core::lsp_helpers::generate_code_lenses`/`build_pin_all_to_sha_lens` serialize
-/// their `uri: &url::Url` parameter's string form directly into the command's JSON
-/// argument (`{"uri": ...}`) — a round trip through `url::Url` that can normalize a
-/// non-canonical URI spelling into a different string (see
-/// `crate::lsp_types_interop::from_lsp_uri`'s doc). The client echoes this argument back
-/// verbatim on click (`workspace/executeCommand`), and `execute_update_all_outdated`/
-/// `execute_pin_all_to_sha` (`server.rs`) look it up in `ServerState::documents`, which is
-/// keyed on the *original* client `Uri` from `did_open` — a normalized argument therefore
-/// misses that lookup entirely and the user sees a `window/showMessage` refusal on a lens
-/// they just clicked (issue #1071 S3, worse than the original finding: this was an actual
-/// regression PR A introduced, not a pre-existing gap). Every argument object this
-/// codebase's own code-lens builders produce has exactly one field, `uri` — no lens
-/// construction path here embeds a second, unrelated field also named `uri`, so
-/// unconditionally overwriting it is always correct.
-fn rekey_lens_command_uri(lenses: &mut [CodeLens], original_uri: &tower_lsp_server::ls_types::Uri) {
-    for lens in lenses.iter_mut() {
-        let Some(arguments) = lens
-            .command
-            .as_mut()
-            .and_then(|command| command.arguments.as_mut())
-        else {
-            continue;
-        };
-        for argument in arguments.iter_mut() {
-            if let Some(object) = argument.as_object_mut()
-                && object.contains_key("uri")
-            {
-                object.insert(
-                    "uri".to_string(),
-                    serde_json::Value::String(original_uri.as_str().to_string()),
-                );
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -213,62 +173,6 @@ mod tests {
 
         let result = handle_code_lens(state, params(uri), true, client, config).await;
         assert!(result.is_empty());
-    }
-
-    /// S3 (issue #1071): `rekey_lens_command_uri` is ecosystem-agnostic — it only
-    /// inspects each lens's `command.arguments[].uri` field structurally, never
-    /// downcasting to an ecosystem-specific type. This proves its contract directly
-    /// against a hand-built lens shaped exactly like both of the codebase's lens
-    /// builders (`deps_core::lsp_helpers::generate_code_lenses`/
-    /// `build_pin_all_to_sha_lens`, both of which serialize `{"uri": ...}`).
-    #[test]
-    fn test_rekey_lens_command_uri_replaces_uri_argument() {
-        let normalized_uri: tower_lsp_server::ls_types::Uri =
-            "file:///normalized/x.toml".parse().unwrap();
-        let original_uri: tower_lsp_server::ls_types::Uri =
-            "file://localhost/normalized/x.toml".parse().unwrap();
-        let mut lenses = vec![CodeLens {
-            range: tower_lsp_server::ls_types::Range::new(
-                tower_lsp_server::ls_types::Position::new(0, 0),
-                tower_lsp_server::ls_types::Position::new(0, 0),
-            ),
-            command: Some(tower_lsp_server::ls_types::Command {
-                title: "test".to_string(),
-                command: COMMAND_ID.to_string(),
-                arguments: Some(vec![serde_json::json!({ "uri": normalized_uri.as_str() })]),
-            }),
-            data: None,
-        }];
-
-        rekey_lens_command_uri(&mut lenses, &original_uri);
-
-        let arguments = lenses[0]
-            .command
-            .as_ref()
-            .unwrap()
-            .arguments
-            .as_ref()
-            .unwrap();
-        assert_eq!(arguments[0]["uri"], original_uri.as_str());
-    }
-
-    /// Guards against a future lens shape without a `command` silently panicking
-    /// instead of being left untouched.
-    #[test]
-    fn test_rekey_lens_command_uri_leaves_lens_without_command_untouched() {
-        let uri: tower_lsp_server::ls_types::Uri = "file:///x.toml".parse().unwrap();
-        let mut lenses = vec![CodeLens {
-            range: tower_lsp_server::ls_types::Range::new(
-                tower_lsp_server::ls_types::Position::new(0, 0),
-                tower_lsp_server::ls_types::Position::new(0, 0),
-            ),
-            command: None,
-            data: None,
-        }];
-
-        rekey_lens_command_uri(&mut lenses, &uri);
-
-        assert!(lenses[0].command.is_none());
     }
 
     /// #333 liveness regression: `handle_code_lens` must release the DashMap shard
@@ -472,33 +376,34 @@ mod tests {
             assert_eq!(args["uri"], uri.as_str());
         }
 
-        /// S3 regression (issue #1071), round 2: the "Update N outdated dependencies"
-        /// lens's `executeCommand` argument must carry the exact `Uri` the client sent,
-        /// not the `url::Url`-normalized form — `execute_update_all_outdated` looks the
-        /// argument up in `ServerState::documents`, which is keyed on the *original*
-        /// client `Uri`, so a normalized argument would miss that lookup and the user
-        /// would see a refusal on a lens they just clicked. Uses a raw client-style
-        /// string (not `ls_types::Uri::from_file_path`, which is always already
-        /// canonical) to actually exercise the divergence.
+        /// Canonical-in/canonical-out regression (issue #1086, replaces #1071's
+        /// `test_handle_code_lens_command_argument_uses_original_non_canonical_uri`):
+        /// the "Update N outdated dependencies" lens's `executeCommand` argument must
+        /// carry the canonical `Uri` the document is keyed by, so a later
+        /// `workspace/executeCommand` echoing it back still resolves the same
+        /// `ServerState::documents` entry via `canonicalize_uri`. Uses a raw
+        /// client-style string (not `ls_types::Uri::from_file_path`, which is always
+        /// already canonical) canonicalized exactly as `server.rs`'s `code_lens` trait
+        /// method would before calling this handler, to actually exercise the
+        /// divergence.
         ///
         /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path`
         /// (which `parse_manifest`'s workspace-root discovery calls internally, via
         /// `seed`) always fails on Windows regardless of the URI's spelling — a
-        /// fixture-portability limit, not a difference in the rekey mechanism under
-        /// test, which the cross-platform `lsp_types_interop` round-trip tests already
-        /// cover on Windows.
+        /// fixture-portability limit, not a difference in the canonicalization
+        /// mechanism under test, which the cross-platform `lsp_types_interop`
+        /// round-trip tests already cover on Windows.
         #[tokio::test]
         #[cfg(not(windows))]
-        async fn test_handle_code_lens_command_argument_uses_original_non_canonical_uri() {
+        async fn test_handle_code_lens_command_argument_uses_canonical_uri() {
             let state = Arc::new(ServerState::new());
-            let uri: tower_lsp_server::ls_types::Uri =
+            let raw_uri: tower_lsp_server::ls_types::Uri =
                 "file://localhost/test/Cargo.toml".parse().unwrap();
+            let uri = crate::lsp_types_interop::canonicalize_uri(&raw_uri);
             assert_ne!(
-                crate::lsp_types_interop::from_lsp_uri(&uri)
-                    .unwrap()
-                    .as_str(),
                 uri.as_str(),
-                "expected this URI shape to be normalized by url::Url::parse"
+                raw_uri.as_str(),
+                "expected this URI shape to be normalized by canonicalize_uri"
             );
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = std::collections::HashMap::new();
@@ -519,8 +424,7 @@ mod tests {
             assert_eq!(
                 args["uri"],
                 uri.as_str(),
-                "command argument must carry the client's original URI, not a \
-                 url::Url-normalized one"
+                "command argument must carry the canonical Uri the document is keyed by"
             );
         }
     }
