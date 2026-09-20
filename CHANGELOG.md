@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
-- **deps-github-actions**: hover's "Press Cmd+. to update version" footer now uses the same centralized SHA-pin eligibility check as the quickfix/code-lens, no longer advertising the action for a flow-style step where the quickfix is withheld (resolves #1178)
+- **deps-github-actions**: hover's "Press Cmd+. to update version" footer now uses the same centralized SHA-pin eligibility check as the quickfix/code-lens, no longer advertising the action for a flow-style step where the quickfix is withheld (resolves #1178) (#1187)
 - **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings
 - **deps-go**: fix trailing directive comment (`// indirect`) on a require line with a deleted version being misparsed as the version requirement (resolves #1179) (#1183)
 - **ci**: `auto-merge.yml` scopes `contents`/`pull-requests` write permissions to the job instead of the whole workflow, and `SECURITY.md` links the GitHub Security Advisories reporting channel, resolving OpenSSF Scorecard code-scanning findings (#1172)
