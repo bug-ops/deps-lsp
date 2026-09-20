@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-maven**: version completion now offers items inside a self-closing `<version/>` tag, replacing the whole tag with `<version>X</version>` via an explicit text edit instead of relying on a cursor-position insert (resolves #1167) (#1189)
 - **ci**: release workflow publishes a CycloneDX SBOM (JSON) for `deps-lsp` and `deps-cli` alongside each release's binaries (resolves #1154) (#1169)
 - **ci**: weekly + push-to-main OpenSSF Scorecard workflow, uploading results to the Security tab (#1158)
 - **ci**: CodeQL SAST scanning for Rust source and GitHub Actions workflow files, on push/PR/weekly schedule (resolves #1152) (#1163)
@@ -17,7 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
-- **deps-maven**: version completion no longer misattributes a `<version>` tag to a nearby `<dependency>`/`<plugin>` on a minified pom.xml unless it is structurally nested inside one (resolves #1181) (#1190)
+- **deps-maven**: version completion no longer misattributes a `<version>` or self-closing `<version/>` tag to a nearby `<dependency>`/`<plugin>` on a minified pom.xml unless it is structurally nested inside one (resolves #1181) (#1190)
 - **deps-github-actions**: version completion is now withheld once the cursor moves past a full-SHA pin's own ref text, instead of remaining offered inside the trailing tag comment (resolves #1182) (#1185)
 - **deps-core**: `locate_value_span`'s empty-value short-circuit now applies the same opening-quote correction as the non-empty path, fixing a one-column-early `version_range` anchor for quoted empty values in deps-dart and deps-gitlab-ci (resolves #1180) (#1185)
 - **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings

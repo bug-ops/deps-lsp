@@ -9,7 +9,7 @@ use tower_lsp_server::ls_types::{
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
-use deps_core::completion::Completions;
+use deps_core::completion::{Completions, VersionReplacement};
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, is_safe_maven_coordinate_segment,
     lsp_helpers::{EcosystemFormatter, warn_rejected_value},
@@ -79,8 +79,152 @@ enum MavenXmlContext {
     ArtifactId,
     /// Cursor is inside a `<groupId>` tag's value.
     GroupId,
+    /// Cursor is inside or immediately around a self-closing `<version/>` (or
+    /// `<version />`) tag, which has no value slot at all — `tag_span` is the whole tag's
+    /// range, replaced wholesale with `<version>` + version + `</version>` instead of an
+    /// insert at the cursor (see [`deps_core::completion::VersionReplacement`]'s doc for
+    /// why a cursor-insert can never land correctly here).
+    SelfClosingVersion {
+        /// The full `<version/>` token's range, UTF-16 units.
+        tag_span: LspRange,
+    },
     /// Cursor is not inside any completable tag.
     None,
+}
+
+/// The token a self-closing `<version/>` tag starts with — shared by
+/// [`find_self_closing_version_tag`] and [`VERSION_OPEN_TAG_UTF16_LEN`] so the two never
+/// drift out of sync.
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPEN_TAG: &str = "<version";
+
+/// UTF-16 code unit length of [`VERSION_OPEN_TAG`] — it is pure ASCII, so byte length,
+/// `char` count, and UTF-16 length all coincide.
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPEN_TAG_UTF16_LEN: u32 = 8;
+
+/// Finds the byte range `[tag_start, tag_end)` of the self-closing `<version/>` (or
+/// `<version />`, `<version  />`) tag on `line` whose span contains `cursor_byte`, if any.
+///
+/// Rejects a longer tag name sharing the same prefix (e.g. `<versionRange/>`) by requiring
+/// the character right after [`VERSION_OPEN_TAG`] to be ASCII whitespace or `/`. When several
+/// self-closing `<version/>` tags appear on one line, only the occurrence whose
+/// `[tag_start, tag_end]` contains `cursor_byte` — inclusive, so the returned span provably
+/// contains the completion position per LSP 3.17 — is returned; when the cursor sits exactly
+/// on the shared boundary between two adjacent tags (e.g. `<version/><version/>`, cursor right
+/// between them), the earlier tag wins, since it is checked first and its inclusive `tag_end`
+/// already contains that column.
+///
+/// Like [`detect_xml_context`]'s own `<tag>...</tag>` loop, this scanner itself has no
+/// XML-comment or element-ancestry awareness and would match `<!-- <version/> -->` on its
+/// own — but [`detect_xml_context`] now runs the same [`innermost_open_element`] ancestry
+/// check on every match this function returns (#1181 follow-up): a `<version/>` inside a
+/// comment with no real `<dependency>`/`<plugin>` ancestor of its own is correctly rejected.
+/// See [`innermost_open_element`]'s own doc for the one case this does not cover — a comment
+/// nested *inside* a real `<dependency>`/`<plugin>` — which applies equally to this arm and
+/// the `<version>...</version>` arm below, not something introduced here.
+// Every bound is an ASCII-token-length offset from an already-valid boundary, same invariant as `detect_xml_context`'s own `#[allow(clippy::string_slice)]`.
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn find_self_closing_version_tag(line: &str, cursor_byte: usize) -> Option<(usize, usize)> {
+    let mut search_from = 0;
+    while let Some(rel) = line[search_from..].find(VERSION_OPEN_TAG) {
+        let tag_start = search_from + rel;
+        let after_open = tag_start + VERSION_OPEN_TAG.len();
+        let Some(next_char) = line[after_open..].chars().next() else {
+            break;
+        };
+        if next_char != '/' && !next_char.is_ascii_whitespace() {
+            // e.g. "<versionRange" — not a bare `<version` tag.
+            search_from = after_open;
+            continue;
+        }
+        let after_ws = line[after_open..]
+            .find(|c: char| !c.is_ascii_whitespace())
+            .map_or(line.len(), |rel_ws| after_open + rel_ws);
+        if line[after_ws..].starts_with("/>") {
+            let tag_end = after_ws + 2;
+            if cursor_byte >= tag_start && cursor_byte <= tag_end {
+                return Some((tag_start, tag_end));
+            }
+            search_from = tag_end;
+        } else {
+            search_from = after_open;
+        }
+    }
+    None
+}
+
+/// Zero-width probe position just past `<version` in `tag_span` — NOT `tag_span` itself,
+/// since `dependency_version_range_is_literal`'s `None`-requirement branch would slice the
+/// non-empty `"<version/>"` and always return `false`, silently disabling the whole feature.
+#[cfg(feature = "lsp-responses")]
+fn self_closing_version_probe_range(tag_span: LspRange) -> LspRange {
+    let character = tag_span.start.character + VERSION_OPEN_TAG_UTF16_LEN;
+    LspRange {
+        start: Position {
+            line: tag_span.start.line,
+            character,
+        },
+        end: Position {
+            line: tag_span.start.line,
+            character,
+        },
+    }
+}
+
+/// Completes the value of a self-closing `<version/>` tag by replacing the whole `tag_span`
+/// with `<version>` + version + `</version>` (see [`VersionReplacement`]'s doc for why a
+/// cursor-insert can never land correctly here).
+///
+/// Takes `registry`/`formatter` as trait objects rather than reading `self.registry`/
+/// `self.formatter` directly, so this — the arm's entire logic — can run against a test
+/// double instead of requiring live network access.
+#[cfg(feature = "lsp-responses")]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is independently meaningful and this is the whole arm's inputs \
+              extracted verbatim for testability; wrapping them in a request struct now would \
+              have exactly one caller and one test"
+)]
+async fn complete_self_closing_version(
+    registry: &dyn Registry,
+    formatter: &dyn deps_core::lsp_helpers::SourcePolicy,
+    parse_result: &dyn ParseResultTrait,
+    position: Position,
+    content: &str,
+    tag_span: LspRange,
+    value: &str,
+    freshness: deps_core::FreshnessSettings,
+) -> Vec<CompletionItem> {
+    let probe_range = self_closing_version_probe_range(tag_span);
+    match deps_core::completion::literal_version_dependency(
+        parse_result,
+        position,
+        content,
+        probe_range,
+    ) {
+        Some(dep) => {
+            let replacement = VersionReplacement {
+                range: tag_span,
+                lead: "<version>".to_string(),
+                trail: "</version>".to_string(),
+                replaced_text: value.to_string(),
+            };
+            deps_core::completion::complete_versions_generic_replacing(
+                registry,
+                formatter,
+                dep.name(),
+                &dep.source(),
+                "",
+                &[],
+                freshness,
+                Some(&replacement),
+            )
+            .await
+        }
+        None => vec![],
+    }
 }
 
 /// Builds a completion item for one field of a Maven coordinate.
@@ -221,7 +365,10 @@ impl MavenEcosystem {
     /// to closing tag, not just up to the cursor) and is the range a completion's
     /// `text_edit` must replace so the whole value is overwritten instead of leaving
     /// trailing characters behind — it is meaningless when `context_type` is
-    /// [`MavenXmlContext::None`].
+    /// [`MavenXmlContext::None`]. For [`MavenXmlContext::SelfClosingVersion`], `value` and
+    /// `value_range` both carry the whole self-closing tag's own raw text/span (there is no
+    /// separate "typed prefix" for a tag with no value slot), identical to that variant's
+    /// own `tag_span` field.
     ///
     /// `position.character` is a UTF-16 code unit offset (LSP spec) and is converted to a
     /// byte offset once via [`deps_core::completion::utf16_to_byte_offset`] before any
@@ -249,20 +396,53 @@ impl MavenEcosystem {
 
         let before_cursor = &line[..col_idx];
 
-        // Self-closing `<version/>` is deliberately NOT recognized as a completion trigger
-        // here (reverted critic follow-up, third round): the parser's `Event::Empty` arm
-        // anchors `version_range` right AFTER `/>`, so a completion accepted at that position
-        // inserts text after the self-closed tag instead of inside it — `<version/>` becomes
-        // the invalid `<version/>1.2.3` — since `complete_versions_generic_from` relies on
-        // cursor-position insert with no `text_edit` to redirect it. `<version></version>`'s
-        // anchor sits *between* the tags, so the same insert lands correctly there; the two
-        // shapes are asymmetric in exactly the way that matters for this. Proper `<version/>`
-        // completion needs an explicit `text_edit` replacing the whole self-closing tag with
-        // `<version>...</version>`, not expressible in the current completion path — tracked
-        // as a separate follow-up, out of #1161's literal scope. The parser still captures
-        // `version_range`/`version_open_pos`/`version_close_pos` for this shape (round 1's S1
-        // fix) so hover/diagnostics/code-actions/code-lenses treat it consistently; only the
-        // completion trigger is withheld.
+        // Self-closing `<version/>` has no cursor-insert position that lands inside the
+        // element (#1167) — checked before the `<tag>...</tag>` loop below since it matches
+        // a structurally different shape (no literal "<version>" open substring for the
+        // loop to find anyway). `generate_completions` replaces the whole `tag_span`
+        // wholesale via `VersionReplacement` rather than inserting at the cursor.
+        if let Some((tag_start, tag_end)) = find_self_closing_version_tag(line, col_idx) {
+            // #1181 follow-up: the same ancestry requirement as the `<version>...</version>`
+            // arm below — a self-closing `<version/>` must also be nested inside
+            // `<dependency>`/`<plugin>`, or a minified pom.xml's `<project>`/`<parent>` own
+            // `<version/>` can misattribute to a nearby `<dependency>` via
+            // `literal_version_dependency`'s same-line fallback, the same bug class as #1181
+            // just for the self-closing tag shape. A self-closing tag never contains the
+            // literal `<version>` substring the loop below searches for (it has `/>`, not
+            // `>`, right after the tag name), so there is no *`Version`* candidate to fall
+            // through to for this cursor position. There CAN still be an unrelated
+            // `artifactId`/`groupId` open-tag match at this same cursor position (e.g.
+            // `<groupId>org.foo<version/></groupId>`, cursor inside the self-closing tag) —
+            // `return`ing `None` directly discards that too, unlike the loop's own `continue`
+            // below, which only disqualifies the `Version` candidate and still lets a later
+            // iteration try `artifactId`/`groupId` independently. Pre-existing gap, not a
+            // regression: before #1189 a self-closing tag always resolved to `None` outright,
+            // so no candidate — `Version` or otherwise — was ever reachable there; `None` is
+            // still the safer of the two choices, so left as-is here.
+            let tag_offset = content.substr_range(line).map(|r| r.start + tag_start);
+            if !matches!(
+                tag_offset.and_then(|offset| innermost_open_element(content, offset)),
+                Some("dependency" | "plugin")
+            ) {
+                return (MavenXmlContext::None, "", LspRange::default());
+            }
+
+            let tag_span = LspRange {
+                start: Position {
+                    line: position.line,
+                    character: deps_core::completion::byte_to_utf16_offset(line, tag_start),
+                },
+                end: Position {
+                    line: position.line,
+                    character: deps_core::completion::byte_to_utf16_offset(line, tag_end),
+                },
+            };
+            return (
+                MavenXmlContext::SelfClosingVersion { tag_span },
+                &line[tag_start..tag_end],
+                tag_span,
+            );
+        }
 
         for (tag, ctx) in [
             ("version", MavenXmlContext::Version),
@@ -335,9 +515,10 @@ impl MavenEcosystem {
 /// Tag name of the innermost XML element open at `offset` (an absolute byte offset into
 /// `content`), found via a single forward scan from the document start that pushes on
 /// every opening tag and pops on every closing one, stopping once `offset` is reached —
-/// used by [`MavenEcosystem::detect_xml_context`]'s `Version` arm (#1181) to verify a
-/// matched `<version>` is actually nested inside a `<dependency>`/`<plugin>`, not just
-/// nearest on the cursor's physical line.
+/// used by [`MavenEcosystem::detect_xml_context`]'s `Version` arm (#1181) and its
+/// self-closing `<version/>` arm (#1181 follow-up) alike, to verify a matched `<version>`
+/// (open/close or self-closing) is actually nested inside a `<dependency>`/`<plugin>`, not
+/// just nearest on the cursor's physical line.
 ///
 /// Comments (`<!--...-->`), CDATA sections (`<![CDATA[...]]>`), processing instructions
 /// (`<?...?>`) and other `<!...>` declarations are skipped as opaque spans (searched for
@@ -354,6 +535,17 @@ impl MavenEcosystem {
 /// has already accepted as well-formed XML (completion is only reachable with a
 /// successfully parsed `ParseResult`), so tags close in strict LIFO order and a plain
 /// pop-without-name-check on every close tag is sound.
+///
+/// Being opaque cuts both ways: a comment is never *entered*, so `offset` values that fall
+/// *inside* one are never distinguished from each other — if the comment itself sits inside a
+/// real `<dependency>`/`<plugin>`, every `offset` inside it (including one from a `<version>`
+/// or `<version/>` match a caller's raw-text scanner found on the commented-out text) still
+/// resolves to that real ancestor, e.g. `<dependency><!-- <version/> --></dependency>` reports
+/// `Some("dependency")` for an `offset` inside the comment, same as if the comment weren't
+/// there at all. This narrows the #1181 misattribution class without closing every instance of
+/// it; a comment with no real ancestor of its own is still correctly rejected (see
+/// `test_detect_xml_context_failed_version_ancestry_does_not_suppress_artifact_id`), only a
+/// comment nested inside one is not.
 ///
 /// Proving `<version>` sits inside *a* `<dependency>`/`<plugin>` narrows the #1181
 /// misattribution class, it does not close it: [`deps_core::completion::literal_version_dependency`]'s
@@ -532,6 +724,19 @@ impl Ecosystem for MavenEcosystem {
                         value,
                         MavenNameField::GroupId,
                         value_range,
+                    )
+                    .await
+                }
+                MavenXmlContext::SelfClosingVersion { tag_span } => {
+                    complete_self_closing_version(
+                        self.registry.as_ref(),
+                        &self.formatter,
+                        parse_result,
+                        position,
+                        content,
+                        tag_span,
+                        value,
+                        freshness,
                     )
                     .await
                 }
@@ -849,23 +1054,33 @@ mod tests {
         assert_eq!(v, "");
     }
 
-    // Critic follow-up (third round) to #1161: self-closing `<version/>` must NOT be
-    // recognized as a completion trigger. A prior attempt at this (S1/M2, second round)
-    // returned a Version context anchored right after `/>`, matching the parser's own
-    // `Event::Empty` capture — but `complete_versions_generic_from` relies on cursor-position
-    // insert with no `text_edit`, so accepting a completion there would insert text AFTER the
-    // self-closed tag (`<version/>1.2.3`), corrupting the pom.xml, unlike
-    // `<version></version>`'s anchor, which sits *between* the tags where a cursor-insert
-    // lands correctly. Reverted; proper `<version/>` completion needs an explicit `text_edit`
-    // replacing the whole tag, tracked as a separate follow-up out of #1161's scope.
+    // #1167: self-closing `<version/>` (and its whitespace variants) has no cursor-insert
+    // position that lands inside the element at all — a prior fix (#1161 round 2) tried
+    // anchoring completion right after `/>`, matching the parser's own `Event::Empty`
+    // capture, but `complete_versions_generic_from` relies on cursor-position insert with no
+    // `text_edit`, so accepting a completion there inserted text AFTER the self-closed tag
+    // (`<version/>1.2.3`), corrupting the pom.xml. This is fixed by detecting the whole tag
+    // span and replacing it wholesale via `VersionReplacement` (`MavenXmlContext::
+    // SelfClosingVersion`) instead of relying on a bare cursor-insert.
     #[cfg(feature = "lsp-responses")]
     #[test]
-    fn test_detect_xml_context_self_closing_version_tag_is_not_a_completion_trigger() {
-        for line in ["<version/>", "<version />"] {
-            let (t, v, range) = xml_context_with_range(line, u32::try_from(line.len()).unwrap());
-            assert_eq!(t, MavenXmlContext::None, "must not trigger for {line:?}");
-            assert_eq!(v, "");
-            assert_eq!(range, LspRange::default());
+    fn test_detect_xml_context_self_closing_version_tag_is_a_completion_trigger() {
+        for line in ["<version/>", "<version />", "<version  />"] {
+            let cursor = u32::try_from(line.len()).unwrap();
+            let (t, v, range) = xml_context_with_range_in_dependency(line, cursor);
+            let expected_span = LspRange {
+                start: Position::new(1, 4),
+                end: Position::new(1, 4 + cursor),
+            };
+            assert_eq!(
+                t,
+                MavenXmlContext::SelfClosingVersion {
+                    tag_span: expected_span
+                },
+                "must trigger for {line:?}"
+            );
+            assert_eq!(v, line);
+            assert_eq!(range, expected_span);
         }
     }
 
@@ -879,6 +1094,40 @@ mod tests {
         let line = "<version>4.13.2</version>";
         let (t, v, range) = xml_context_with_range(line, 9);
         assert_eq!(t, MavenXmlContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
+    /// LSP 3.17 requires `textEdit.range` to contain the completion position — proven here
+    /// for the tag-start, mid-tag, and tag-end cursor positions inside a single
+    /// self-closing `<version/>` tag.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_version_tag_triggers_at_any_cursor_inside() {
+        let line = "<version/>";
+        let tag_len = u32::try_from(line.len()).unwrap();
+        for cursor in [0, tag_len / 2, tag_len] {
+            let (t, _v, range) = xml_context_with_range_in_dependency(line, cursor);
+            let MavenXmlContext::SelfClosingVersion { tag_span } = t else {
+                panic!("must trigger at cursor {cursor} for {line:?}, got {t:?}");
+            };
+            let indented_cursor = Position::new(1, cursor + 4);
+            assert!(
+                range.start <= indented_cursor && indented_cursor <= range.end,
+                "range {range:?} must contain cursor {indented_cursor:?}"
+            );
+            assert_eq!(tag_span, range);
+        }
+    }
+
+    /// Rejects a longer tag name sharing the `<version` prefix.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_version_range_self_closing_tag_is_not_a_trigger() {
+        let line = "<versionRange/>";
+        let (t, v, range) =
+            xml_context_with_range_in_dependency(line, u32::try_from(line.len()).unwrap());
+        assert_eq!(t, MavenXmlContext::None, "must not trigger for {line:?}");
         assert_eq!(v, "");
         assert_eq!(range, LspRange::default());
     }
@@ -909,6 +1158,54 @@ mod tests {
         assert_eq!(t, MavenXmlContext::None);
         assert_eq!(v, "");
         assert_eq!(range, LspRange::default());
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_optional_self_closing_tag_is_not_a_trigger() {
+        let line = "<optional/>";
+        let (t, v, range) =
+            xml_context_with_range_in_dependency(line, u32::try_from(line.len()).unwrap());
+        assert_eq!(t, MavenXmlContext::None, "must not trigger for {line:?}");
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
+    /// #1181 follow-up: the same ancestry gap as
+    /// `test_detect_xml_context_version_without_dependency_ancestor_yields_no_context`, but
+    /// for the self-closing tag shape — a minified pom.xml where `<project>`'s own
+    /// self-closing `<version/>` shares physical structure with a real `<dependency>` must
+    /// not trigger completion via the self-closing path either.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_version_without_dependency_ancestor_yields_no_context()
+    {
+        let content =
+            "<project><version/><dependency><artifactId>foo</artifactId></dependency></project>\n";
+        let cursor = u32::try_from(content.find("<version/>").unwrap() + 4).unwrap();
+        let (t, v, range) =
+            MavenEcosystem::detect_xml_context(content, Position::new(0, cursor), &NoopParseResult);
+        assert_eq!(t, MavenXmlContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
+    /// Positive counterpart: a self-closing `<version/>` correctly nested inside
+    /// `<dependency>` still triggers `SelfClosingVersion` after the #1181 follow-up ancestry
+    /// check — proves the fix withholds completion only for the misattributed case, not for
+    /// every self-closing tag.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_version_inside_dependency_is_a_completion_trigger() {
+        let content = "<dependency><version/></dependency>\n";
+        let cursor = u32::try_from(content.find("<version/>").unwrap() + 4).unwrap();
+        let (t, v, _range) =
+            MavenEcosystem::detect_xml_context(content, Position::new(0, cursor), &NoopParseResult);
+        assert!(
+            matches!(t, MavenXmlContext::SelfClosingVersion { .. }),
+            "expected SelfClosingVersion, got {t:?}"
+        );
+        assert_eq!(v, "<version/>");
     }
 
     /// #1181: a commented-out `<dependency>` block must not be mistaken for a live one by
@@ -988,6 +1285,264 @@ mod tests {
         let (t, v) = xml_context(line, u32::try_from(line.len()).unwrap());
         assert_eq!(t, MavenXmlContext::ArtifactId);
         assert_eq!(v, "jun");
+    }
+
+    /// M2 (impl-critic follow-up): unlike the tag-loop's `continue` above, a failed ancestry
+    /// check on the self-closing arm returns `None` directly and so DOES suppress an unrelated
+    /// `groupId`/`artifactId` candidate at the same cursor position — pinning the current,
+    /// intentionally-not-fixed behavior (see the `return (MavenXmlContext::None, ...)` comment
+    /// in `detect_xml_context`'s self-closing arm) rather than leaving it undocumented.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_failed_version_ancestry_suppresses_group_id() {
+        let content = "<dependency><groupId>org.foo<version/></groupId></dependency>\n";
+        let cursor = u32::try_from(content.find("<version/>").unwrap() + 4).unwrap();
+        let (t, v, range) =
+            MavenEcosystem::detect_xml_context(content, Position::new(0, cursor), &NoopParseResult);
+        assert_eq!(
+            t,
+            MavenXmlContext::None,
+            "the self-closing arm's ancestry rejection (innermost element is groupId, not \
+             dependency/plugin) returns None directly, discarding the groupId match the loop \
+             below would otherwise have found"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, LspRange::default());
+    }
+
+    /// Two self-closing `<version/>` tags share one line — only the occurrence whose span
+    /// contains the cursor is returned, not always the first.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_two_self_closing_version_tags_picks_containing_one() {
+        let line = "<version/><version/>";
+        let second_tag_start = u32::try_from(line.rfind("<version/>").unwrap()).unwrap();
+        let cursor = second_tag_start + 3; // inside the second tag
+        let (t, v, range) = xml_context_with_range_in_dependency(line, cursor);
+        let MavenXmlContext::SelfClosingVersion { tag_span } = t else {
+            panic!("must trigger, got {t:?}");
+        };
+        assert_eq!(v, "<version/>");
+        assert_eq!(tag_span, range);
+        assert_eq!(range.start, Position::new(1, second_tag_start + 4)); // +4 for indent
+    }
+
+    /// M2 (critic follow-up): when the cursor sits exactly on the shared boundary between two
+    /// adjacent self-closing tags, the earlier one wins — the previous test only probes a
+    /// column inside the second tag, never the boundary itself.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_two_self_closing_version_tags_boundary_picks_first() {
+        let line = "<version/><version/>";
+        let boundary = u32::try_from("<version/>".len()).unwrap(); // end of tag 1 == start of tag 2
+        let (t, v, range) = xml_context_with_range_in_dependency(line, boundary);
+        let MavenXmlContext::SelfClosingVersion { tag_span } = t else {
+            panic!("must trigger, got {t:?}");
+        };
+        assert_eq!(v, "<version/>");
+        assert_eq!(tag_span, range);
+        assert_eq!(
+            range.start,
+            Position::new(1, 4),
+            "the first tag must win the tie"
+        );
+        assert_eq!(range.end, Position::new(1, 4 + boundary));
+    }
+
+    /// Architect's test plan item (not covered by `test_detect_xml_context_multibyte_value_
+    /// no_panic`, which exercises a different tag branch): a multi-byte character before the
+    /// self-closing tag must not desync the UTF-16/byte round-trip. Expected offsets are
+    /// derived via the same conversion helper the scanner uses, not hand-computed, so the
+    /// test can't silently encode the same arithmetic mistake it's meant to catch.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_version_tag_after_multibyte_prefix_no_panic() {
+        let line = "café <version/>";
+        let tag_byte_start = line.find("<version/>").unwrap();
+        let cursor_byte = tag_byte_start + 1; // one byte into the tag
+        let cursor_char = deps_core::completion::byte_to_utf16_offset(line, cursor_byte);
+
+        let content = format!("<dependency>\n{line}\n</dependency>\n");
+        let (ctx, value, range) = MavenEcosystem::detect_xml_context(
+            &content,
+            Position::new(1, cursor_char),
+            &NoopParseResult,
+        );
+
+        let MavenXmlContext::SelfClosingVersion { tag_span } = ctx else {
+            panic!("expected SelfClosingVersion, got {ctx:?}");
+        };
+        assert_eq!(value, "<version/>");
+        assert_eq!(tag_span, range);
+        assert_eq!(
+            tag_span.start.character,
+            deps_core::completion::byte_to_utf16_offset(line, tag_byte_start)
+        );
+        assert_eq!(
+            tag_span.end.character,
+            deps_core::completion::byte_to_utf16_offset(line, tag_byte_start + "<version/>".len())
+        );
+    }
+
+    /// Proves the emitted `TextEdit` actually produces valid XML when applied — not just
+    /// that its fields look right. Covers the whitespace variants and both the `lead`/`trail`
+    /// wrapping and `filter_text` reasoning from `VersionReplacement`'s own doc.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_self_closing_version_replacement_applies_to_produce_valid_xml() {
+        struct MockVersion(deps_core::ConcreteVersion);
+        impl deps_core::Version for MockVersion {
+            fn version_string(&self) -> &deps_core::ConcreteVersion {
+                &self.0
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        for (tag, indent) in [
+            ("<version/>", "      "),
+            ("<version />", "  "),
+            ("<version  />", ""),
+        ] {
+            let source = format!("{indent}{tag}\n");
+            let tag_start = source.find(tag).unwrap();
+            let tag_end = tag_start + tag.len();
+            let tag_span = LspRange {
+                start: Position::new(0, u32::try_from(tag_start).unwrap()),
+                end: Position::new(0, u32::try_from(tag_end).unwrap()),
+            };
+            let replacement = VersionReplacement {
+                range: tag_span,
+                lead: "<version>".to_string(),
+                trail: "</version>".to_string(),
+                replaced_text: tag.to_string(),
+            };
+
+            let version = MockVersion("1.2.3".into());
+            let display_item = deps_core::completion::VersionDisplayItem::new(
+                &version,
+                &deps_core::PackageName::new("com.example:foo"),
+                0,
+                true,
+            );
+            let item = deps_core::completion::build_version_completion(
+                &display_item,
+                Some(&replacement),
+                deps_core::PublishTime::now(),
+                true,
+            );
+
+            let Some(CompletionTextEdit::Edit(edit)) = item.text_edit else {
+                panic!("expected a textEdit::Edit for {tag:?}");
+            };
+            assert_eq!(edit.new_text, "<version>1.2.3</version>");
+            assert_eq!(item.filter_text, Some(tag.to_string()));
+
+            // Decode `edit.range` itself back to byte offsets (M4, critic follow-up) rather
+            // than reusing the locally-computed `tag_start`/`tag_end` — this proves the
+            // UTF-16 round-trip the emitted range actually carries, not just `new_text`.
+            let line = source.lines().next().unwrap();
+            let edit_start =
+                deps_core::completion::utf16_to_byte_offset(line, edit.range.start.character)
+                    .unwrap();
+            let edit_end =
+                deps_core::completion::utf16_to_byte_offset(line, edit.range.end.character)
+                    .unwrap();
+            assert_eq!((edit_start, edit_end), (tag_start, tag_end));
+
+            let mut result = source.clone();
+            result.replace_range(edit_start..edit_end, &edit.new_text);
+            assert_eq!(
+                result,
+                format!("{indent}<version>1.2.3</version>\n"),
+                "applying the edit to {source:?} must yield valid, indentation-preserving XML"
+            );
+        }
+    }
+
+    /// Acceptance criterion #3 (architect's test plan): sibling `<groupId>`/`<artifactId>`/
+    /// `<scope>` lines must be byte-identical after the edit is applied. Deterministic and
+    /// network-free — the only multi-line integration test is `#[ignore]`d for network, and
+    /// it never asserted the untouched sibling lines either (tester/impl-critic finding).
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_self_closing_version_replacement_leaves_sibling_lines_byte_identical() {
+        struct MockVersion(deps_core::ConcreteVersion);
+        impl deps_core::Version for MockVersion {
+            fn version_string(&self) -> &deps_core::ConcreteVersion {
+                &self.0
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let source = "<project>\n  <dependencies>\n    <dependency>\n      \
+                       <groupId>com.example</groupId>\n      <artifactId>foo</artifactId>\n      \
+                       <scope>test</scope>\n      <version/>\n    </dependency>\n  \
+                       </dependencies>\n</project>\n";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = crate::parser::parse_pom_xml(source, &uri).unwrap();
+
+        let line_idx = 6u32; // "      <version/>"
+        let line = source.lines().nth(6).unwrap();
+        let cursor_col = u32::try_from(line.find("<version").unwrap() + "<version".len()).unwrap();
+        let (ctx, value, tag_span) = MavenEcosystem::detect_xml_context(
+            source,
+            Position::new(line_idx, cursor_col),
+            &parse_result,
+        );
+        assert!(
+            matches!(ctx, MavenXmlContext::SelfClosingVersion { .. }),
+            "expected SelfClosingVersion, got {ctx:?}"
+        );
+
+        let replacement = VersionReplacement {
+            range: tag_span,
+            lead: "<version>".to_string(),
+            trail: "</version>".to_string(),
+            replaced_text: value.to_string(),
+        };
+        let version = MockVersion("1.2.3".into());
+        let display_item = deps_core::completion::VersionDisplayItem::new(
+            &version,
+            &deps_core::PackageName::new("com.example:foo"),
+            0,
+            true,
+        );
+        let item = deps_core::completion::build_version_completion(
+            &display_item,
+            Some(&replacement),
+            deps_core::PublishTime::now(),
+            true,
+        );
+        let Some(CompletionTextEdit::Edit(edit)) = item.text_edit else {
+            panic!("expected a textEdit::Edit");
+        };
+
+        let mut lines: Vec<String> = source.lines().map(str::to_string).collect();
+        let target_idx = edit.range.start.line as usize;
+        let target_line = lines[target_idx].clone();
+        let start =
+            deps_core::completion::utf16_to_byte_offset(&target_line, edit.range.start.character)
+                .unwrap();
+        let end =
+            deps_core::completion::utf16_to_byte_offset(&target_line, edit.range.end.character)
+                .unwrap();
+        let mut new_line = target_line;
+        new_line.replace_range(start..end, &edit.new_text);
+        lines[target_idx] = new_line;
+        let result = lines.join("\n") + "\n";
+
+        let expected = "<project>\n  <dependencies>\n    <dependency>\n      \
+                         <groupId>com.example</groupId>\n      <artifactId>foo</artifactId>\n      \
+                         <scope>test</scope>\n      <version>1.2.3</version>\n    \
+                         </dependency>\n  </dependencies>\n</project>\n";
+        assert_eq!(
+            result, expected,
+            "sibling lines must be byte-identical, only the <version/> line changes"
+        );
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -1891,21 +2446,118 @@ mod tests {
         assert_eq!(resolved.unwrap().name(), dep.name());
     }
 
-    // Critic follow-up (third round) to #1161: a self-closing `<version/>` must still get a
-    // trackable `version_range` from the parser (round 1's S1 fix, kept — every other
-    // consumer, hover/diagnostics/code-actions/code-lenses, correctly no-ops on it), but
-    // `generate_completions` must never offer a completion there (round 2's trigger reverted:
-    // it would insert text after `/>` instead of inside the element, corrupting the pom.xml).
+    /// CI-run counterpart to the network-`#[ignore]`d test below: without this, a wiring
+    /// regression in `complete_self_closing_version` (e.g. swapping `probe_range`/`tag_span`,
+    /// or dropping `Some(&replacement)`) would pass CI undetected, since `cargo nextest run`
+    /// never executes `#[ignore]`d tests. Exercises the exact function the `generate_completions`
+    /// arm calls, substituting a mock registry for the real network-backed one.
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    async fn test_generate_completions_withholds_completion_for_self_closing_version_tag() {
+    async fn test_complete_self_closing_version_threads_replacement_through_mock_registry() {
+        struct MockVersion(deps_core::ConcreteVersion);
+        impl deps_core::Version for MockVersion {
+            fn version_string(&self) -> &deps_core::ConcreteVersion {
+                &self.0
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockRegistry;
+        impl deps_core::Registry for MockRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>>
+            {
+                let versions: Vec<Box<dyn deps_core::Version>> =
+                    vec![Box::new(MockVersion("1.2.3".into()))];
+                Box::pin(async move { Ok(versions) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
+      <version/>
+    </dependency>
+  </dependencies>
+</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = crate::parser::parse_pom_xml(xml, &uri).unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position: Position = dep.version_range().unwrap().start.into();
+
+        let (ctx, value, _) = MavenEcosystem::detect_xml_context(xml, position, &parse_result);
+        let MavenXmlContext::SelfClosingVersion { tag_span } = ctx else {
+            panic!("expected SelfClosingVersion, got {ctx:?}");
+        };
+
+        let items = complete_self_closing_version(
+            &MockRegistry,
+            &MavenFormatter,
+            &parse_result,
+            position,
+            xml,
+            tag_span,
+            value,
+            deps_core::FreshnessSettings::default(),
+        )
+        .await;
+
+        assert!(
+            !items.is_empty(),
+            "must offer a completion via the mock registry"
+        );
+        let Some(CompletionTextEdit::Edit(edit)) = &items[0].text_edit else {
+            panic!("expected a textEdit::Edit");
+        };
+        assert_eq!(edit.range, tag_span);
+        assert_eq!(edit.new_text, "<version>1.2.3</version>");
+        assert_eq!(items[0].filter_text, Some("<version/>".to_string()));
+    }
+
+    // #1167: a self-closing `<version/>` must still get a trackable `version_range` from the
+    // parser (round 1's S1 fix, kept — every other consumer, hover/diagnostics/code-actions/
+    // code-lenses, correctly no-ops on it), and `generate_completions` now offers a real
+    // completion there too, replacing the whole tag via `VersionReplacement` instead of
+    // withholding it (round 2's reverted trigger, fixed properly this time).
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    #[ignore] // Requires network access
+    async fn test_generate_completions_offers_completion_for_self_closing_version_tag() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = MavenEcosystem::new(cache);
         let xml = r"<project>
   <dependencies>
     <dependency>
-      <groupId>com.example</groupId>
-      <artifactId>foo</artifactId>
+      <groupId>junit</groupId>
+      <artifactId>junit</artifactId>
       <version/>
     </dependency>
   </dependencies>
@@ -1923,11 +2575,9 @@ mod tests {
         let position: Position = version_range.start.into();
 
         let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
-        assert_eq!(
-            ctx,
-            MavenXmlContext::None,
-            "self-closing <version/> must not be a completion trigger"
-        );
+        let MavenXmlContext::SelfClosingVersion { tag_span } = ctx else {
+            panic!("self-closing <version/> must be a completion trigger, got {ctx:?}");
+        };
 
         let result = eco
             .generate_completions(
@@ -1937,7 +2587,50 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert_eq!(result, Completions::default());
+
+        assert!(
+            !result.items.is_empty(),
+            "must offer real version completions"
+        );
+        let Some(CompletionTextEdit::Edit(edit)) = &result.items[0].text_edit else {
+            panic!("expected a textEdit::Edit");
+        };
+        assert_eq!(edit.range, tag_span);
+        assert!(edit.new_text.starts_with("<version>"));
+        assert!(edit.new_text.ends_with("</version>"));
+    }
+
+    /// #1181 follow-up: on a minified pom.xml, `<project>`'s own top-level self-closing
+    /// `<version/>` can share a physical line with an unrelated `<dependency>`'s coordinates.
+    /// Before this fix, a self-closing `<version/>` had no ancestry check at all, so
+    /// `literal_version_dependency`'s same-line fallback (#1146) misattributed the project's
+    /// own version tag to the nearby dependency — the same #1181 misattribution class the
+    /// `<version>...</version>` arm was already closed for. The extended ancestry check in
+    /// `detect_xml_context` must now suppress the trigger before `literal_version_dependency`
+    /// is ever reached, mirroring
+    /// `test_generate_completions_withholds_completion_for_project_own_version_on_minified_line`.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_project_version_on_minified_line_yields_no_context() {
+        let xml = "<project><version/><dependencies>\
+<dependency><groupId>com.example</groupId><artifactId>foo</artifactId><version/></dependency>\
+</dependencies></project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let result = crate::parser::parse_pom_xml(xml, &uri).unwrap();
+        let deps = result.dependencies();
+        assert_eq!(deps.len(), 1, "fixture must parse one dependency: {xml}");
+
+        // Cursor inside the project's OWN self-closing `<version/>` (not the dependency's).
+        let project_version_col = u32::try_from(xml.find("<version/>").unwrap() + 5).unwrap();
+        let position = Position::new(0, project_version_col);
+
+        let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, &result);
+        assert_eq!(
+            ctx,
+            MavenXmlContext::None,
+            "a self-closing <version/> with no enclosing <dependency>/<plugin> must not trigger \
+             completion, even when a real dependency's version shares the same minified line"
+        );
     }
 
     /// #1181: on a minified pom.xml, `<project>`'s own top-level `<version>` can share a
