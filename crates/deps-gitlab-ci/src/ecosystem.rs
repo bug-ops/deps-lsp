@@ -541,10 +541,10 @@ impl Ecosystem for GitlabCiEcosystem {
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(error)) => {
-                        tracing::warn!(package = %dep.name(), %error, "FR-007 component pin resolution failed");
+                        tracing::warn!(package = %dep.name().for_tracing(), %error, "FR-007 component pin resolution failed");
                     }
                     Err(_) => {
-                        tracing::warn!(package = %dep.name(), "FR-007 component pin resolution timed out");
+                        tracing::warn!(package = %dep.name().for_tracing(), "FR-007 component pin resolution timed out");
                     }
                 }
             }
@@ -848,11 +848,11 @@ async fn build_dynamic_component_pin_action(
         Ok(Ok(Some(resolved))) => resolved,
         Ok(Ok(None)) => return None,
         Ok(Err(error)) => {
-            tracing::warn!(package = %dep.name(), %error, "C2 component pin quickfix resolution failed");
+            tracing::warn!(package = %dep.name().for_tracing(), %error, "C2 component pin quickfix resolution failed");
             return None;
         }
         Err(_) => {
-            tracing::warn!(package = %dep.name(), "C2 component pin quickfix resolution timed out");
+            tracing::warn!(package = %dep.name().for_tracing(), "C2 component pin quickfix resolution timed out");
             return None;
         }
     };

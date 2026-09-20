@@ -148,7 +148,11 @@ pub(crate) async fn fetch_license(
 /// of that loop's several exit paths — see that function's doc for why.
 #[tracing::instrument(
     skip_all,
-    fields(package = ?coordinate, version = ?version, hops = tracing::field::Empty),
+    fields(
+        package = %deps_core::net_policy::redact_declaration_key(coordinate),
+        version = ?version,
+        hops = tracing::field::Empty
+    ),
     level = "debug"
 )]
 async fn fetch_license_from(
@@ -197,9 +201,9 @@ async fn fetch_license_hops(
                 // Logs both the requested (leaf) coordinate and the current hop's, so a
                 // parent-hop failure can still be correlated back to what the manifest shows.
                 tracing::debug!(
-                    requested_coordinate = coordinate,
+                    requested_coordinate = %deps_core::net_policy::redact_declaration_key(coordinate),
                     requested_version = version,
-                    coordinate = current_coordinate,
+                    coordinate = %deps_core::net_policy::redact_declaration_key(&current_coordinate),
                     version = current_version,
                     error = %e,
                     "gradle license pom fetch failed"

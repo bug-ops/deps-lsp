@@ -452,7 +452,10 @@ impl DepsDevClient {
                 return (None, DEPS_DEV_ERROR_TTL);
             }
             Err(DepsDevFetchError::TimedOut) => {
-                tracing::debug!(package = name, "deps.dev version fetch timed out");
+                tracing::debug!(
+                    package = %crate::net_policy::redact_declaration_key(name),
+                    "deps.dev version fetch timed out"
+                );
                 return (None, DEPS_DEV_ERROR_TTL);
             }
         };

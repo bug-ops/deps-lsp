@@ -84,7 +84,7 @@ impl RubyGemsRegistry {
     ///
     /// Returns an error if the HTTP request fails or the response body is not valid JSON
     /// matching rubygems.org's `versions.json` shape.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<BundlerVersion>> {
         let url = versions_url(&self.api_base, name);
         let data = self.cache.get_cached(&url).await?;
@@ -96,7 +96,7 @@ impl RubyGemsRegistry {
     /// # Errors
     ///
     /// Same as [`Self::get_versions`].
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,

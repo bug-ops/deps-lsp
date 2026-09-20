@@ -197,16 +197,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .await
         {
             Ok(Ok(found)) => {
-                tracing::debug!(package = %dep.name(), found = found.is_some(), "hover latest fallback (get_latest_matching) resolved");
+                tracing::debug!(package = %dep.name().for_tracing(), found = found.is_some(), "hover latest fallback (get_latest_matching) resolved");
                 found
             }
             Ok(Err(error)) => {
-                tracing::warn!(package = %dep.name(), %error, "hover latest fallback (get_latest_matching) failed");
+                tracing::warn!(package = %dep.name().for_tracing(), %error, "hover latest fallback (get_latest_matching) failed");
                 None
             }
             Err(_) => {
                 tracing::warn!(
-                    package = %dep.name(),
+                    package = %dep.name().for_tracing(),
                     timeout_secs = HOVER_FALLBACK_TIMEOUT.as_secs(),
                     "hover latest fallback (get_latest_matching) timed out"
                 );
@@ -2632,6 +2632,138 @@ mod tests {
             !content.value.contains("**Latest**"),
             "no version data is available once the fetch times out; got: {}",
             content.value
+        );
+    }
+
+    /// #1209 C1 (impl-critic follow-up): `await_versions_fetch`'s timeout WARN
+    /// (`lsp_helpers::mod::await_versions_fetch`) used to interpolate the raw `dep.name()`
+    /// directly — this call site (`hover.rs`'s primary fetch, feeding `mod.rs`'s shared sink)
+    /// arrived in #1210, after the original #1209 security audit, which is why it was missed.
+    /// Now redacted via `dep.name().for_tracing()` at the call site. Asserts against the fully
+    /// rendered captured line, mirroring the `deps-engine::classify::fetch` precedent.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_hover_registry_fetch_timeout_log_redacts_credential_shaped_package_name()
+    {
+        use std::collections::HashMap;
+
+        let sentinel_name = "com.example:deploy:AUDITSENTINEL0000@git.internal.corp";
+        let parse_result = freshness_test_parse_result(sentinel_name);
+        let registry = SlowRegistry {
+            delay: REGISTRY_FETCH_BUDGET + Duration::from_secs(1),
+        };
+
+        let log = crate::test_util::capture_tracing_output_async_at(tracing::Level::WARN, async {
+            generate_hover(
+                &parse_result,
+                Position::new(0, 2).into(),
+                VersionData::new(&HashMap::new(), &HashMap::new()),
+                &registry,
+                &MockFormatter,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover must still render when the primary fetch times out");
+        })
+        .await;
+
+        assert!(
+            log.contains("primary registry version fetch timed out"),
+            "expected the primary-fetch-timeout WARN to fire: {log:?}"
+        );
+        assert!(
+            !log.contains("AUDITSENTINEL0000"),
+            "tracing output leaked a credential-shaped package name: {log:?}"
+        );
+        assert!(
+            log.contains("git.internal.corp"),
+            "host should survive redaction: {log:?}"
+        );
+    }
+
+    /// #1209 C1: the "hover latest fallback" WARN (`hover.rs`'s own event, not the shared
+    /// `await_versions_fetch` sink) used to interpolate `dep.name()` raw. Now redacted via
+    /// `dep.name().for_tracing()`.
+    #[tokio::test]
+    async fn test_generate_hover_fallback_failure_log_redacts_credential_shaped_package_name() {
+        use std::any::Any;
+        use std::collections::HashMap;
+
+        struct FallbackFailsRegistry;
+
+        impl crate::Registry for FallbackFailsRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(TestVersion {
+                        version: ConcreteVersion::new("1.2.3"),
+                        yanked: false,
+                    }) as Box<dyn crate::Version>])
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+                _req: &'a crate::VersionReq,
+            ) -> crate::ecosystem::BoxFuture<
+                'a,
+                crate::error::Result<Option<Box<dyn crate::Version>>>,
+            > {
+                Box::pin(async move {
+                    Err(crate::error::DepsError::CacheError(
+                        "transient backend failure".to_string(),
+                    ))
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let sentinel_name = "com.example:deploy:AUDITSENTINEL0000@git.internal.corp";
+        let parse_result = freshness_test_parse_result(sentinel_name);
+        let registry = FallbackFailsRegistry;
+
+        let log = crate::test_util::capture_tracing_output_async_at(tracing::Level::WARN, async {
+            generate_hover(
+                &parse_result,
+                Position::new(0, 2).into(),
+                VersionData::new(&HashMap::new(), &HashMap::new()),
+                &registry,
+                &MockFormatter,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover must still render when the fallback fetch fails");
+        })
+        .await;
+
+        assert!(
+            log.contains("hover latest fallback (get_latest_matching) failed"),
+            "expected the fallback-failure WARN to fire: {log:?}"
+        );
+        assert!(
+            !log.contains("AUDITSENTINEL0000"),
+            "tracing output leaked a credential-shaped package name: {log:?}"
+        );
+        assert!(
+            log.contains("git.internal.corp"),
+            "host should survive redaction: {log:?}"
         );
     }
 

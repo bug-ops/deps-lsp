@@ -116,7 +116,7 @@ pub fn dedup_dependencies_by_source(
             Entry::Occupied(entry) => {
                 if *entry.get() != source && collided.insert(name.clone()) {
                     tracing::warn!(
-                        package = %name,
+                        package = %name.for_tracing(),
                         source_a = ?entry.get(),
                         source_b = ?source,
                         "dependency declared against two different resolved registries; \
@@ -636,7 +636,7 @@ async fn fetch_and_classify_package(
                 .and_then(|idx| versions.get(idx))
             {
                 let latest = v.version_string().clone();
-                tracing::debug!(package = %name, version = %latest, "fetched");
+                tracing::debug!(package = %name.for_tracing(), version = %latest, "fetched");
                 Some((
                     latest,
                     v.removal_status(),
@@ -663,7 +663,7 @@ async fn fetch_and_classify_package(
                     Ok(Ok(Some(v))) => {
                         let latest = v.version_string().clone();
                         tracing::debug!(
-                            package = %name,
+                            package = %name.for_tracing(),
                             version = %latest,
                             "fetched via get_latest_matching fallback"
                         );
@@ -676,7 +676,7 @@ async fn fetch_and_classify_package(
                         ))
                     }
                     Ok(Ok(None)) => {
-                        tracing::debug!(package = %name, "no version found");
+                        tracing::debug!(package = %name.for_tracing(), "no version found");
                         // Both the list-based pick and this fallback succeeded and found
                         // nothing — the package exists but has zero comparable versions
                         // (#550), e.g. tags that don't parse as full semver. Distinct from
@@ -686,7 +686,7 @@ async fn fetch_and_classify_package(
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
-                            package = %name,
+                            package = %name.for_tracing(),
                             error = %e,
                             "fetch fallback failed"
                         );
@@ -707,7 +707,7 @@ async fn fetch_and_classify_package(
                     }
                     Err(_) => {
                         tracing::warn!(
-                            package = %name,
+                            package = %name.for_tracing(),
                             "fetch fallback timed out ({}s)",
                             timeout.as_secs()
                         );
@@ -716,7 +716,8 @@ async fn fetch_and_classify_package(
                             name.clone(),
                             FetchFailure::Transient,
                             format!(
-                                "{name}: registry request timed out after {}s",
+                                "{}: registry request timed out after {}s",
+                                name.for_tracing(),
                                 timeout.as_secs()
                             ),
                         ));
@@ -792,9 +793,9 @@ async fn fetch_and_classify_package(
             // contradicting the toast suppression two call sites away in this
             // same file for being "unusable".
             if e.is_offline() {
-                tracing::debug!(package = %name, "fetch skipped: offline");
+                tracing::debug!(package = %name.for_tracing(), "fetch skipped: offline");
             } else {
-                tracing::warn!(package = %name, error = %e, "fetch failed");
+                tracing::warn!(package = %name.for_tracing(), error = %e, "fetch failed");
             }
             failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
@@ -811,13 +812,14 @@ async fn fetch_and_classify_package(
             None
         }
         Err(_) => {
-            tracing::warn!(package = %name, "fetch timed out ({}s)", timeout.as_secs());
+            tracing::warn!(package = %name.for_tracing(), "fetch timed out ({}s)", timeout.as_secs());
             failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             failed_name = Some((
                 name.clone(),
                 FetchFailure::Transient,
                 format!(
-                    "{name}: registry request timed out after {}s",
+                    "{}: registry request timed out after {}s",
+                    name.for_tracing(),
                     timeout.as_secs()
                 ),
             ));
@@ -2588,6 +2590,119 @@ mod tests {
         );
     }
 
+    /// #1209: the `"fetch failed"` WARN's `package` field used to interpolate the raw,
+    /// manifest-derived name directly (`package = %name`) — a credential embedded in a
+    /// name-shaped manifest field (e.g. via property interpolation) reached this log
+    /// verbatim. Now redacted via [`deps_core::PackageName::for_tracing`]. Asserts against
+    /// the fully rendered line (not just the event message), mirroring
+    /// `deps-maven::registry::tests::test_fetch_publish_times_failure_log_redacts_url_query_string`'s
+    /// precedent: a leak reintroduced only in an enclosing span/field would otherwise pass a
+    /// message-only assertion.
+    #[tokio::test]
+    async fn test_fetch_failed_log_redacts_credential_shaped_package_name() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        // M1 (impl-critic on the original #1209 fix): a real ecosystem registry's
+        // `get_versions` runs inside a `#[tracing::instrument(fields(package = ...))]` span
+        // (e.g. `deps-maven`'s `get_metadata`) — the exact shape the original audit's most
+        // defensible finding hinged on (`warn_rejected_value`'s len-only design defeated by
+        // its own enclosing span). Without an instrumented mock here, this test would still
+        // pass if a *span*-level redaction fix were reverted, since only `fetch.rs`'s own
+        // event field would be exercised. `inner_fetch` mirrors the production idiom exactly
+        // (`fields(package = %name.for_tracing())`) so a regression to `?name`/`%name` here
+        // would fail this test's assertions.
+        #[tracing::instrument(skip_all, fields(package = %name.for_tracing()), level = "debug")]
+        async fn inner_fetch(name: &PackageName) -> deps_core::Result<Vec<Box<dyn Version>>> {
+            // An event fired *from inside* the span (not just the span's own fields) is what
+            // makes `tracing_subscriber`'s default formatter render the span context
+            // (`inner_fetch{package=...}: ...`) into the captured line at all — a span with no
+            // event inside it produces no output on its own.
+            tracing::debug!("mock registry fetch invoked");
+            Err(deps_core::error::DepsError::CacheError(
+                "transient backend failure".to_string(),
+            ))
+        }
+
+        struct AlwaysFailsRegistry;
+
+        impl Registry for AlwaysFailsRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(inner_fetch(name))
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::CacheError(
+                        "transient backend failure".to_string(),
+                    ))
+                })
+            }
+
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let sentinel_name =
+            PackageName::new("com.example:deploy:AUDITSENTINEL0000@git.internal.corp");
+        let registry: Arc<dyn Registry> = Arc::new(AlwaysFailsRegistry);
+        let packages = vec![sentinel_name.clone()];
+
+        let log =
+            deps_core::test_util::capture_tracing_output_async_at(tracing::Level::DEBUG, async {
+                let result = fetch_latest_versions_parallel(
+                    registry,
+                    with_registry_source(packages),
+                    &HashMap::new(),
+                    None,
+                    deps_core::freshness::FreshnessSettings::default(),
+                    5,
+                    10,
+                    None,
+                )
+                .await;
+                assert_eq!(result.failed_count, 1);
+            })
+            .await;
+
+        assert!(
+            log.contains("fetch failed"),
+            "expected the fetch-failed WARN to fire: {log:?}"
+        );
+        assert!(
+            log.contains("mock registry fetch invoked"),
+            "expected the in-span event to fire — without it the span's fields never render, \
+             silently downgrading this test back to event-field-only coverage: {log:?}"
+        );
+        assert!(
+            !log.contains("AUDITSENTINEL0000"),
+            "tracing output leaked a credential-shaped package name: {log:?}"
+        );
+        assert!(
+            log.contains("git.internal.corp"),
+            "host should survive redaction: {log:?}"
+        );
+    }
+
     #[tokio::test]
     async fn test_fetch_not_found_is_not_recorded_as_fetch_failed() {
         // #267 C1: a genuine not-found (`DepsError::PackageNotFound`, the
@@ -2610,7 +2725,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: "mock",
                     })
                 })
@@ -2624,7 +2739,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: "mock",
                     })
                 })
@@ -2854,7 +2969,7 @@ mod tests {
                 Box::pin(async move {
                     if name.as_str() == "not-found" {
                         Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "mock",
                         })
                     } else {
@@ -2997,7 +3112,7 @@ mod tests {
                 Box::pin(async move {
                     if name.as_str() == "typo-pkg" {
                         Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "mock",
                         })
                     } else {
@@ -3083,7 +3198,7 @@ mod tests {
             {
                 Box::pin(async move {
                     Err(deps_core::error::DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: "mock",
                     })
                 })

@@ -83,7 +83,7 @@ impl PubDevRegistry {
     ///
     /// Returns an error if `name` is a dot-segment, the request fails, or the
     /// response body fails to parse.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<DartVersion>> {
         reject_dot_segment(name)?;
         let url = package_metadata_url(&self.base, name);
@@ -96,7 +96,7 @@ impl PubDevRegistry {
     /// # Errors
     ///
     /// Returns an error if fetching the package's versions fails.
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -145,7 +145,7 @@ impl PubDevRegistry {
     ///
     /// Returns an error if `name` is a dot-segment, the request fails, or the
     /// response body fails to parse.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_package_metadata(&self, name: &str) -> Result<PackageInfo> {
         reject_dot_segment(name)?;
         let url = package_metadata_url(&self.base, name);
@@ -168,7 +168,7 @@ impl PubDevRegistry {
     /// Returns an empty `Vec` (never an error) when the fetch fails or no `license:`
     /// tag is present — graceful degradation (NFR-003), since this is a best-effort
     /// secondary signal, not core version data.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_license(&self, name: &str) -> Vec<String> {
         if reject_dot_segment(name).is_err() {
             return Vec::new();
@@ -177,7 +177,11 @@ impl PubDevRegistry {
         match self.cache.get_cached(&url).await {
             Ok(data) => parse_score_license(&data),
             Err(e) => {
-                tracing::debug!(package = name, error = %e, "pub.dev score fetch failed");
+                tracing::debug!(
+                    package = %deps_core::net_policy::redact_declaration_key(name),
+                    error = %e,
+                    "pub.dev score fetch failed"
+                );
                 Vec::new()
             }
         }

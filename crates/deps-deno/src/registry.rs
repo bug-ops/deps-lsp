@@ -121,7 +121,7 @@ fn not_found_or(err: DepsError, full_name: &str) -> DepsError {
 /// into a GET against the bare npm registry base URL.
 fn unroutable(name: &PackageName) -> DepsError {
     DepsError::PackageNotFound {
-        package: name.to_string(),
+        package: name.to_string().into(),
         registry: "deno",
     }
 }
@@ -231,7 +231,10 @@ impl JsrRegistry {
     #[tracing::instrument(skip_all, fields(package = tracing::field::Empty), level = "debug")]
     pub async fn get_versions(&self, scope: &str, name: &str) -> Result<Vec<JsrVersion>> {
         let full_name = format!("@{scope}/{name}");
-        tracing::Span::current().record("package", tracing::field::debug(&full_name));
+        tracing::Span::current().record(
+            "package",
+            tracing::field::display(deps_core::net_policy::redact_declaration_key(&full_name)),
+        );
         // S-L1: a dot-prefixed segment must be rejected before it ever reaches
         // `meta_json_url` — `url::Url::parse` decodes percent-encoding before dot-segment
         // normalization, so encoding alone cannot prevent `..`/`.` from collapsing the
@@ -241,7 +244,7 @@ impl JsrRegistry {
         if is_dot_prefixed(scope) || is_dot_prefixed(name) {
             warn_rejected_value("is_dot_prefixed", "jsr meta.json request URL", &full_name);
             return Err(DepsError::PackageNotFound {
-                package: full_name,
+                package: full_name.into(),
                 registry: REGISTRY,
             });
         }
@@ -264,7 +267,15 @@ impl JsrRegistry {
     /// `license` field, or a dot-prefixed `scope`/`name`/`version` segment — graceful
     /// degradation (NFR-003), since this is a best-effort secondary signal, not core
     /// version data.
-    #[tracing::instrument(skip_all, fields(scope = ?scope, package = ?name, version = ?version), level = "debug")]
+    #[tracing::instrument(
+        skip_all,
+        fields(
+            scope = %deps_core::net_policy::redact_declaration_key(scope),
+            package = %deps_core::net_policy::redact_declaration_key(name),
+            version = ?version
+        ),
+        level = "debug"
+    )]
     pub async fn get_license(&self, scope: &str, name: &str, version: &str) -> Vec<String> {
         if is_dot_prefixed(scope) || is_dot_prefixed(name) || is_dot_prefixed(version) {
             return Vec::new();
@@ -273,7 +284,13 @@ impl JsrRegistry {
         match self.cache.get_cached(&url).await {
             Ok(data) => parse_version_license(&data),
             Err(e) => {
-                tracing::debug!(scope, name, version, error = %e, "jsr version license fetch failed");
+                tracing::debug!(
+                    scope = %deps_core::net_policy::redact_declaration_key(scope),
+                    name = %deps_core::net_policy::redact_declaration_key(name),
+                    version,
+                    error = %e,
+                    "jsr version license fetch failed"
+                );
                 Vec::new()
             }
         }
@@ -479,7 +496,7 @@ impl DenoRegistry {
     /// already does — out of scope for this pre-fetch (deferred as a follow-up, see
     /// spec 010's tier-3 rollout notes). An `npm:` specifier degrades gracefully to an
     /// empty `Vec` (NFR-003), same as any other missing-source case.
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?version), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %name.for_tracing(), version = ?version), level = "debug")]
     pub async fn get_license(&self, name: &PackageName, version: &str) -> Vec<String> {
         match split_scheme(name.as_str()) {
             Some((Scheme::Jsr, rest)) => match split_scoped(rest) {

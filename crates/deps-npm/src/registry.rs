@@ -334,7 +334,7 @@ impl NpmRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
         if has_dot_segment(name) {
             return Err(dot_segment_rejection_error(
@@ -460,12 +460,12 @@ impl NpmRegistry {
         let body = match tokio::time::timeout(PUBLISH_TIMES_FETCH_TIMEOUT, fetch).await {
             Ok(Ok(body)) => body,
             Ok(Err(e)) => {
-                tracing::debug!(package = %name, error = %e, "full packument fetch failed, publish times unavailable");
+                tracing::debug!(package = %deps_core::net_policy::redact_declaration_key(name), error = %e, "full packument fetch failed, publish times unavailable");
                 return HashMap::new();
             }
             Err(_) => {
                 tracing::debug!(
-                    package = %name,
+                    package = %deps_core::net_policy::redact_declaration_key(name),
                     timeout_secs = PUBLISH_TIMES_FETCH_TIMEOUT.as_secs(),
                     "full packument fetch timed out, publish times unavailable"
                 );
@@ -476,7 +476,7 @@ impl NpmRegistry {
         match parse_package_times(&body, known_versions) {
             Ok(times) => times,
             Err(e) => {
-                tracing::debug!(package = %name, error = %e, "full packument parse failed, publish times unavailable");
+                tracing::debug!(package = %deps_core::net_policy::redact_declaration_key(name), error = %e, "full packument parse failed, publish times unavailable");
                 HashMap::new()
             }
         }
@@ -532,7 +532,7 @@ impl NpmRegistry {
     /// assert!(latest.is_some());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -809,7 +809,7 @@ impl deps_core::Registry for NpmRegistry {
                                 .await
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -853,7 +853,7 @@ impl deps_core::Registry for NpmRegistry {
                             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }

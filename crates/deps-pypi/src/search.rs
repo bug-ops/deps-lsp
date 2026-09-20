@@ -486,7 +486,7 @@ where
 fn parse_index(body: &[u8]) -> Result<PackageIndex> {
     let index: SimpleIndex =
         deps_core::parse_json_checked(body).map_err(|e| DepsError::ApiResponse {
-            package: "<pypi-simple-index>".to_string(),
+            package: "<pypi-simple-index>".to_string().into(),
             registry: REGISTRY,
             source: e,
         })?;
