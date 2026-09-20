@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **ci**: release workflow publishes a CycloneDX SBOM (JSON) for `deps-lsp` and `deps-cli` alongside each release's binaries (resolves #1154)
+- **ci**: release workflow publishes a CycloneDX SBOM (JSON) for `deps-lsp` and `deps-cli` alongside each release's binaries (resolves #1154) (#1169)
 - **ci**: weekly + push-to-main OpenSSF Scorecard workflow, uploading results to the Security tab (#1158)
 - **ci**: CodeQL SAST scanning for Rust source and GitHub Actions workflow files, on push/PR/weekly schedule (resolves #1152) (#1163)
 - **ci**: release archives signed with Sigstore/cosign keyless signing alongside existing SHA256 checksums (resolves #1153) (#1163)
@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: `deps-lsp-check` and `docker-build-and-scan` now block `ci-success` (#1130, #1140)
 
 ### Changed
-- **ci**: `crates/github-action`'s Alpine base image pinned by digest, tracked by Dependabot for security-patch bumps (resolves #1155)
+- **ci**: `crates/github-action`'s Alpine base image pinned by digest, tracked by Dependabot for security-patch bumps (resolves #1155) (#1169)
 - **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134)
 - **ci**: `release.yml`'s top-level GITHUB_TOKEN permissions scoped to a read-only default, with `contents: write` granted per-job only where needed (resolves #1151) (#1163)
 - **deps-cli**: `walk_directory`'s positional bool triple replaced with a `WalkOptions` struct and `DotDirs` enum, closing a swap-silent transposition risk on the gitignore/symlink containment gate (resolves #1135)
