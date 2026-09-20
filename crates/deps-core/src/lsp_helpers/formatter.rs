@@ -124,8 +124,17 @@ pub trait PackageRendering: Send + Sync {
     /// registry renders alongside the link, an unrelated crates.io link reads as
     /// confirmation the link is real, which is worse than showing no link at all.
     ///
-    /// Default `false` — every ecosystem with only one registry concept keeps its existing
-    /// hover heading unchanged; only `deps-cargo`'s `CargoFormatter` overrides this.
+    /// Default: suppressed whenever `source` is not exactly
+    /// [`DependencySource::Registry`](crate::parser::DependencySource::Registry) — safe for
+    /// any ecosystem with only one registry concept, including one that has not yet
+    /// classified any non-`Registry` source (the link only hides once a dependency is
+    /// actually classified as `Git`/`Path`/`Url`/... elsewhere). Only `deps-cargo`'s
+    /// `CargoFormatter` still overrides this directly, because it also overrides
+    /// [`SourcePolicy::source_is_public_registry_content`](crate::lsp_helpers::SourcePolicy::source_is_public_registry_content)
+    /// to treat a crates.io-mirroring `AlternateRegistry` as linkable content too — a
+    /// distinction this default cannot express without `SourcePolicy` as a supertrait of
+    /// this trait, which would force every isolated `PackageRendering`-only implementor
+    /// (e.g. test mocks) to also implement it.
     ///
     /// # Examples
     ///
@@ -145,10 +154,12 @@ pub trait PackageRendering: Send + Sync {
     /// }
     ///
     /// assert!(!DefaultFormatter.suppress_package_url(&DependencySource::Registry));
+    /// assert!(DefaultFormatter.suppress_package_url(&DependencySource::Path {
+    ///     path: "../local".into(),
+    /// }));
     /// ```
     fn suppress_package_url(&self, source: &crate::parser::DependencySource) -> bool {
-        let _ = source;
-        false
+        !matches!(source, crate::parser::DependencySource::Registry)
     }
 
     /// Detect if cursor position is on a dependency for code actions.
@@ -651,6 +662,40 @@ pub trait SourcePolicy: Send + Sync {
     /// ```
     fn can_resolve_source(&self, source: &crate::parser::DependencySource) -> bool {
         source.is_version_resolvable()
+            || (self.resolves_alternate_registry()
+                && matches!(
+                    source,
+                    crate::parser::DependencySource::AlternateRegistry { .. }
+                ))
+    }
+
+    /// Whether this ecosystem's registry resolves version data for *any*
+    /// [`DependencySource::AlternateRegistry`](crate::parser::DependencySource::AlternateRegistry)
+    /// source, regardless of `mirrors_crates_io` or any other field.
+    ///
+    /// A single opt-in flag [`can_resolve_source`](Self::can_resolve_source) derives its
+    /// widened answer from, replacing what five ecosystems (`deps-cargo`, `deps-go`,
+    /// `deps-npm`, `deps-nuget`, `deps-pypi`) previously each spelled out as an identical
+    /// full override of `can_resolve_source` itself (issue #1203). An ecosystem whose
+    /// `AlternateRegistry` resolvability depends on more than "is it an
+    /// `AlternateRegistry` at all" (e.g. `deps-gitlab-ci`, which resolves it but never
+    /// plain `Registry`) still overrides [`can_resolve_source`](Self::can_resolve_source)
+    /// directly instead of this flag.
+    ///
+    /// Default `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::SourcePolicy;
+    ///
+    /// struct DefaultFormatter;
+    /// impl SourcePolicy for DefaultFormatter {}
+    ///
+    /// assert!(!DefaultFormatter.resolves_alternate_registry());
+    /// ```
+    fn resolves_alternate_registry(&self) -> bool {
+        false
     }
 
     /// Whether `source`'s content is exactly the default public registry's — safe to treat

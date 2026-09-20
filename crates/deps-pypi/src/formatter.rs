@@ -146,19 +146,6 @@ impl PackageRendering for PypiFormatter {
 
         position.character >= start_char && position.character <= end_char
     }
-
-    /// FR-009/validator finding #2: suppresses the hover heading's `pypi.org` project link
-    /// for anything but plain public-registry content. Without this override (the trait
-    /// default is unconditionally `false`), a private-index dependency's hover would render
-    /// a `pypi.org` link right next to its actual private-index version data — once live
-    /// data renders alongside it, an unrelated `pypi.org` link reads as false confirmation
-    /// the link is real. Mirrors `NpmFormatter`'s/`CargoFormatter`'s identical override,
-    /// reusing `SourcePolicy::source_is_public_registry_content`'s default (`Registry` only
-    /// — PyPI has no crates.io-style verified-mirror concept for `AlternateRegistry` to
-    /// except).
-    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
-        !self.source_is_public_registry_content(source)
-    }
 }
 
 impl RequirementResolution for PypiFormatter {
@@ -202,9 +189,9 @@ impl DiagnosticMessages for PypiFormatter {}
 impl DiagnosticPolicy for PypiFormatter {}
 
 impl SourcePolicy for PypiFormatter {
-    /// FR-009: gates hover/diagnostics/code-actions on a resolved `AlternateRegistry`
-    /// (private-index) source, in addition to the plain public `Registry` default —
-    /// mirrors `NpmFormatter::can_resolve_source` exactly. `CustomRegistry` (an unresolved
+    /// FR-009: widens [`SourcePolicy::can_resolve_source`] to a resolved `AlternateRegistry`
+    /// (private-index) source, in addition to the plain public `Registry` default — mirrors
+    /// `NpmFormatter::resolves_alternate_registry` exactly. `CustomRegistry` (an unresolved
     /// or invalid explicit index — FR-006) is deliberately not accepted here: it falls
     /// through to the default `is_version_resolvable() == false`, keeping the existing
     /// fail-closed gate intact.
@@ -215,12 +202,8 @@ impl SourcePolicy for PypiFormatter {
     /// hover link is still suppressed by `PackageRendering::suppress_package_url` (correct
     /// for the private-index case this feature exists for, cosmetically over-cautious only
     /// for this one edge case). Accepted for phase 1; documented in `ECOSYSTEM_GUIDE.md`.
-    fn can_resolve_source(&self, source: &deps_core::DependencySource) -> bool {
-        matches!(
-            source,
-            deps_core::DependencySource::Registry
-                | deps_core::DependencySource::AlternateRegistry { .. }
-        )
+    fn resolves_alternate_registry(&self) -> bool {
+        true
     }
 }
 

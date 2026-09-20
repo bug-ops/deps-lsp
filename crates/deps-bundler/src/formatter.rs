@@ -170,12 +170,6 @@ impl PackageRendering for BundlerFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::gem_url(name.as_str())
     }
-
-    /// Suppresses the rubygems.org hover link for a gem resolved from a non-default
-    /// source — rendering it would falsely imply the gem is published there.
-    fn suppress_package_url(&self, source: &deps_core::DependencySource) -> bool {
-        !self.source_is_public_registry_content(source)
-    }
 }
 
 impl RequirementResolution for BundlerFormatter {

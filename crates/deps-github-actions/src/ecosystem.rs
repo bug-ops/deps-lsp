@@ -1261,6 +1261,7 @@ mod tests {
         display_name: "GitHub Actions";
         manifest_filenames: &["action.yml", "action.yaml"];
         no_lockfile_support: true;
+        non_registry_fixture: ".github/workflows/ci.yml" => "steps:\n  - uses: ./local-action\n";
     }
 
     // #1137: regression guard, not independent parser verification (see

@@ -24,6 +24,9 @@ pub struct GradleDependency {
     pub configuration: String,
 }
 
+// TODO(follow-up to #1202): `repositories { }` needs real Groovy/Kotlin DSL evaluation to bind
+// a package to a repo, so every dependency stays `DependencySource::Registry` here; Gradle 6+'s
+// `content { includeGroup(...) }` filter is a real static binding worth a narrower look first.
 deps_core::impl_dependency!(GradleDependency {
     name: name,
     name_range: name_range,

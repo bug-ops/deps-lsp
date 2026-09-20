@@ -1,5 +1,19 @@
 # Go
 
+## `replace` Directives to a Filesystem Path
+
+A module `replace`d to a local filesystem path (`replace acme.com/mod => ./local/mod`) is
+classified as a non-registry dependency rather than defaulting to `proxy.golang.org` — the
+classification applies to the module's `require` entry too, not only the `replace` line
+itself, so the same module is not fetched under its original `require`d version while its
+replacement is correctly skipped. A dependency resolved this way is never sent to the
+proxy, drops its pkg.go.dev hover link, and is excluded from OSV vulnerability scanning
+against the public module path (resolves #1202). A `replace` to a remote module at a
+pinned version (not a filesystem path) is unaffected and remains registry-resolvable.
+
+**Known limitation**: two `replace` directives for the same module path (a malformed or
+mid-edit `go.mod`) collapse to whichever is parsed last, with no diagnostic.
+
 ## GOPROXY/GOPRIVATE Support
 
 A Go module dependency whose applicable proxy is overridden via a `$GOENV`

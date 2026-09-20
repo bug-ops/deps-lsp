@@ -1096,6 +1096,40 @@ impl DependencySource {
     }
 }
 
+/// Whether `value` looks like a local filesystem path reference in a manifest specifier.
+///
+/// Matches a relative path (`./`, `../`), an absolute path (`/`), a home-relative path
+/// (`~/`), or a Windows drive letter (`C:/`, `C:\`) — rather than a registry name, URL, or VCS
+/// shorthand.
+///
+/// Shared by every ecosystem whose specifier grammar can name a local path with no explicit
+/// `file:`/`path:`-style prefix at all (npm's bare relative-path dependency value, Go's
+/// filesystem `replace` target) — previously duplicated near-verbatim between
+/// `deps-npm`'s and `deps-go`'s parsers (code review #1202).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::looks_like_filesystem_path;
+///
+/// assert!(looks_like_filesystem_path("../local-sibling"));
+/// assert!(looks_like_filesystem_path("~/local/sibling"));
+/// assert!(looks_like_filesystem_path("C:/local/sibling"));
+/// assert!(!looks_like_filesystem_path("github.com/acme/pkg"));
+/// ```
+#[must_use]
+pub fn looks_like_filesystem_path(value: &str) -> bool {
+    value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with('/')
+        || value.starts_with("~/")
+        || (value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic)
+            && matches!(value.as_bytes().get(1), Some(b':')))
+}
+
 /// Loading state for registry data fetching.
 ///
 /// Tracks the current state of background registry operations to provide

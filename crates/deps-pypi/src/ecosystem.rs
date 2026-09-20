@@ -748,6 +748,7 @@ mod tests {
         display_name: "PyPI (Python)";
         manifest_filenames: &["pyproject.toml"];
         lockfile_filenames: &["poetry.lock", "uv.lock"];
+        non_registry_fixture: "requirements.txt" => "mylib @ https://example.com/mylib.tar.gz\n";
     }
 
     // #758: the shared completion-prefix-length guard

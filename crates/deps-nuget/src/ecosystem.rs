@@ -524,6 +524,7 @@ mod tests {
         display_name: "NuGet (.NET)";
         manifest_filenames: &["Directory.Packages.props", "packages.config"];
         lockfile_filenames: &["packages.lock.json", "packages.*.lock.json"];
+        no_non_registry_fixture: "NuGet's non-Registry classification (AlternateRegistry/CustomRegistry via NuGet.Config) only fires once a real NuGet.Config file resolves from disk (issue #523) — the shared macro's fixture has no filesystem backing to supply one. Covered instead by test_private_feed_clear_resolves_zero_requests_to_public_registry below, which builds a real NuGet.Config end-to-end and asserts the same zero-public-request property.";
     }
 
     // #758: the shared completion-prefix-length guard, replacing

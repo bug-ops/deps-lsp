@@ -475,6 +475,7 @@ mod tests {
         display_name: "Swift (SPM)";
         manifest_filenames: &["Package.swift"];
         lockfile_filenames: &["Package.resolved"];
+        non_registry_fixture: "Package.swift" => r#".package(url: "https://github.com/dev/tool", .branch("main"))"#;
     }
 
     // #794: `complete_package_urls` guards on the exact same `is_valid_completion_prefix_len`

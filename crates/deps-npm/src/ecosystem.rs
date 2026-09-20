@@ -482,6 +482,7 @@ mod tests {
         display_name: "npm (JavaScript)";
         manifest_filenames: &["package.json"];
         lockfile_filenames: &["package-lock.json", "pnpm-lock.yaml"];
+        non_registry_fixture: "package.json" => r#"{"dependencies": {"acme-internal-secret": "git+ssh://git@github.com/acme/internal-secret.git"}}"#;
     }
 
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.

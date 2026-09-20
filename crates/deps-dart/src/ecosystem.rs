@@ -257,6 +257,7 @@ mod tests {
         display_name: "Dart (Pub)";
         manifest_filenames: &["pubspec.yaml"];
         lockfile_filenames: &["pubspec.lock"];
+        non_registry_fixture: "pubspec.yaml" => "name: my_app\ndependencies:\n  local_pkg:\n    path: ../local_pkg\n";
     }
 
     // #758: the shared completion-prefix-length guard

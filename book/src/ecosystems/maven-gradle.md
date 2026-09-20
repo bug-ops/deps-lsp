@@ -5,6 +5,23 @@ back to the Gradle Plugin Portal for a group ID not found there), so most of Mav
 version comparison, range matching, freshness — applies identically to both ecosystems. This
 chapter documents them together; ecosystem-specific notes are called out where they diverge.
 
+## Non-Registry Dependency Sources (Maven)
+
+A Maven `<dependency>` with `<scope>system</scope>` and a `<systemPath>` — an explicit
+locally-provided JAR, never resolved from Maven Central — is classified as a non-registry
+dependency instead of defaulting to Maven Central. A dependency resolved this way is never
+sent to Central, drops its public-registry hover link, and is excluded from OSV
+vulnerability scanning against the public artifact coordinates (resolves #1202). A
+system-scope dependency with a missing or empty `<systemPath>` still falls back to
+Central-resolvable, since scope alone isn't a locally-provided binding without a path.
+
+**Gradle**: Gradle has no per-dependency local-source syntax analogous to Maven's
+`systemPath` today (`project(":core")`/`files()`/`fileTree()` dependencies are deliberately
+not surfaced as version-checkable dependencies at all, so no Gradle dependency currently
+carries a local source through this pipeline) — tracked as a follow-up, since Gradle 6+'s
+`content { includeGroup(...) }` repository filtering is a static per-group binding this
+project doesn't yet read.
+
 ## Version Comparison
 
 Versions are now ranked with correct Maven semantics:

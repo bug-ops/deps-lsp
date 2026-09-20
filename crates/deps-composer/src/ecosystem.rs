@@ -59,7 +59,9 @@ impl ComposerEcosystem {
         .await
     }
 
-    // Position-based, gated (#593, #1136) — currently inert here since `ComposerDependency::source()` is hardcoded `Registry`; see the TODO on that type.
+    // Position-based, gated (#593, #1136) via `SourcePolicy::can_resolve_source` — a `Git`/
+    // `Path`/`Url`-classified dependency (#1202: `repositories` classification, see
+    // `parser::classify_repositories`) now correctly yields zero completions here.
     #[cfg(feature = "lsp-responses")]
     async fn complete_versions(
         &self,
@@ -242,6 +244,7 @@ mod tests {
         display_name: "Composer (PHP)";
         manifest_filenames: &["composer.json"];
         lockfile_filenames: &["composer.lock"];
+        non_registry_fixture: "composer.json" => r#"{"repositories": [{"type": "vcs", "url": "ssh://git@git.acme.internal/private.git", "only": ["acme/secretpkg"]}], "require": {"acme/secretpkg": "^1.0"}}"#;
     }
 
     // #758: the shared completion-prefix-length guard

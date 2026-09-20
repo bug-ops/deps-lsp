@@ -397,6 +397,7 @@ mod tests {
         display_name: "Cargo (Rust)";
         manifest_filenames: &["Cargo.toml"];
         lockfile_filenames: &["Cargo.lock"];
+        non_registry_fixture: "Cargo.toml" => "[dependencies]\nlocal-crate = { path = \"../local-crate\" }\n";
     }
 
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.

@@ -33,15 +33,18 @@ pub struct ComposerDependency {
     pub version_range: Option<Range>,
     /// Which `composer.json` section this dependency was declared under.
     pub section: ComposerSection,
+    /// Resolved source (#1202): `Registry` unless the manifest's own `repositories` array
+    /// declares a `vcs`/`path`/`artifact` repository this dependency is classified against
+    /// (see `parser::classify_repositories`).
+    pub source: deps_core::parser::DependencySource,
 }
 
-// TODO(critic): classify VCS/path repositories (`repositories: [{ "type": "vcs", ... }]`) as
-// a non-Registry DependencySource so the #1136 gate is not inert here (follow-up to #1136).
 deps_core::impl_dependency!(ComposerDependency {
     name: name,
     name_range: name_range,
     version: version_req,
     version_range: version_range,
+    source: source,
 });
 
 /// Section in composer.json where a dependency is declared.
@@ -405,6 +408,7 @@ mod tests {
             version_req: Some("^6.0".into()),
             version_range: Some(Range::new(Position::new(0, 18), Position::new(0, 22))),
             section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
         };
 
         assert_eq!(dep.name, "symfony/console");

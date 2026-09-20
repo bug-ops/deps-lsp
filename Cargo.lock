@@ -699,6 +699,7 @@ dependencies = [
  "mockito",
  "node-semver",
  "serde",
+ "tempfile",
  "tokio",
  "tower-lsp-server",
  "tracing",

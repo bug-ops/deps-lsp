@@ -1,5 +1,14 @@
 # Deno
 
+## Non-Registry Dependency Sources
+
+A `deno.json`/`deno.jsonc` `imports` entry resolved to a private npm scope via `.npmrc` is
+classified as a non-registry dependency instead of defaulting to `registry.npmjs.org`
+(resolves #1202). **Known limitation**: unlike npm's own `.npmrc` handling, Deno's `.npmrc`
+resolution is not yet wired into this project's shared ancestor-config-file cache — it
+re-reads `.npmrc` from disk on every parse rather than reusing the cached lookup npm's
+`NpmEcosystem::with_context` already benefits from; tracked as a follow-up.
+
 ## Release-Freshness Coverage
 
 `jsr:` specifiers get full freshness coverage at **zero extra request cost** — better than

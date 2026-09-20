@@ -627,6 +627,87 @@ pub async fn assert_completion_source_gate(
 }
 
 // ---------------------------------------------------------------------------------------
+// Macro 4b: `assert_non_registry_source_yields_no_fetch`, wired into `ecosystem_conformance!`
+// below — a classified non-`Registry` source must never be fetchable or trusted as
+// public-registry content (#1202).
+// ---------------------------------------------------------------------------------------
+
+/// Asserts that parsing `content` (as `manifest_name`) through `eco.parse_manifest`
+/// classifies at least one dependency as a non-[`crate::parser::DependencySource::Registry`]
+/// source.
+///
+/// Also asserts that every gate #1136/#1203 built for exactly this case actually holds for
+/// it: neither [`crate::lsp_helpers::SourcePolicy::can_resolve_source`] nor
+/// [`crate::lsp_helpers::SourcePolicy::source_is_public_registry_content`] treats it as
+/// fetchable/trustworthy public-registry content, and
+/// [`crate::lsp_helpers::PackageRendering::suppress_package_url`] hides its hover link — the
+/// same architecture [`assert_completion_source_gate`] drives end-to-end for the completion
+/// path specifically, checked here directly against the gates themselves so it also covers
+/// hover/diagnostics/OSV, which never go through completion at all.
+///
+/// An ecosystem that cannot yet supply such a fixture (its parser classifies nothing but
+/// `Registry` — the exact #1202 gap this conformance check exists to close) must not call
+/// this function at all, and must instead pass `ecosystem_conformance!`'s
+/// `no_non_registry_fixture: "<reason>";` arm at its own invocation, rather than silently
+/// having no coverage here — that macro enforces exactly one of the two arms is always
+/// present, so omitting both is a compile error, not a silent gap.
+///
+/// # Panics
+///
+/// Panics if `content` fails to parse, or if no dependency classifies as a non-`Registry`
+/// source — both indicating a broken fixture, not a genuine gate failure.
+pub async fn assert_non_registry_source_yields_no_fetch(
+    eco: &dyn Ecosystem,
+    manifest_name: &str,
+    content: &str,
+) {
+    let uri = crate::test_util::test_uri(&format!("/test/{manifest_name}"));
+    let parse_result = eco
+        .parse_manifest(content, &uri)
+        .await
+        .expect("fixture manifest must parse");
+    let sources: Vec<crate::parser::DependencySource> = parse_result
+        .dependencies()
+        .into_iter()
+        .map(crate::ecosystem::Dependency::source)
+        .filter(|source| !matches!(source, crate::parser::DependencySource::Registry))
+        .collect();
+    assert!(
+        !sources.is_empty(),
+        "fixture manifest must classify at least one dependency as a non-Registry source — \
+         otherwise this test cannot be exercising the #1202 classification gate at all",
+    );
+
+    // Critic S5: checks *every* non-Registry-classified dependency the fixture produced, not
+    // just the first — a fixture with a `Require` entry left unclassified alongside a
+    // correctly-classified `Replace` entry for the same module (deps-go's own C1 regression)
+    // would otherwise pass vacuously despite the gate being inert for the unchecked entry.
+    let formatter = eco.formatter();
+    for source in &sources {
+        assert!(
+            !formatter.can_resolve_source(source),
+            "non-registry source {source:?} must not be resolvable — resolving it would send \
+             this dependency's name to the wrong (or a public) registry"
+        );
+        assert!(
+            !formatter.source_is_public_registry_content(source),
+            "non-registry source {source:?} must never be treated as public-registry content \
+             for OSV/deps.dev/hover-trust-signal purposes"
+        );
+        assert!(
+            formatter.suppress_package_url(source),
+            "non-registry source {source:?} must suppress the public-registry hover link"
+        );
+    }
+}
+
+// Note (M9, critic): this used to be its own standalone `non_registry_source_conformance!`
+// macro, invoked separately alongside `ecosystem_conformance!`. Removed (pre-1.0: no
+// deprecation shim) once `ecosystem_conformance!`'s own mandatory `non_registry_fixture`/
+// `no_non_registry_fixture` arm (below) made a separate opt-in invocation redundant — every
+// ecosystem now gets this coverage (or a recorded, reviewable opt-out) automatically.
+
+// ---------------------------------------------------------------------------------------
 // Macro 5: `json_depth_conformance!` — the shared JSON-nesting depth cap
 // (`crate::MAX_JSON_NESTING_DEPTH` / `crate::check_json_nesting_depth`).
 // ---------------------------------------------------------------------------------------
@@ -810,6 +891,7 @@ impl<T: ?Sized> NotInherent for T {}
 ///     id: "fake";
 ///     display_name: "Fake";
 ///     manifest_filenames: &["fake.toml"];
+///     no_non_registry_fixture: "doctest fixture — no real classification behavior to demonstrate";
 /// }
 /// }
 /// ```
@@ -834,6 +916,15 @@ macro_rules! ecosystem_conformance {
              it has no lock file support; supply at most one of the two"
         );
     };
+    // Critic S5 (#1202 part 2): `non_registry_fixture`/`no_non_registry_fixture` are a
+    // mandatory *pair* of arms, exactly one of which must be present — mirroring the
+    // `lockfile_filenames`/`no_lockfile_support` pattern above, but non-optional, so a
+    // 15th ecosystem crate cannot add `ecosystem_conformance!` without an invocation that
+    // either supplies a real non-registry-source fixture or explicitly records, in a
+    // reviewable string literal, why it cannot yet. Omitting both is not a third option:
+    // neither this arm nor the one below it matches, and `macro_rules!` itself fails the
+    // build with "no rules expected this token" — silently skipping this check is not
+    // possible by construction.
     (
         mod $mod_name:ident;
         build: $build:expr;
@@ -843,6 +934,103 @@ macro_rules! ecosystem_conformance {
         manifest_filenames: $manifest_filenames:expr;
         $(lockfile_filenames: $lockfile_filenames:expr;)?
         $(no_lockfile_support: $no_lockfile_support:literal;)?
+        non_registry_fixture: $nrf_name:literal => $nrf_content:literal;
+    ) => {
+        $crate::ecosystem_conformance_base! {
+            mod $mod_name;
+            build: $build;
+            ty: $ty;
+            id: $id;
+            display_name: $display_name;
+            manifest_filenames: $manifest_filenames;
+            $(lockfile_filenames: $lockfile_filenames;)?
+            $(no_lockfile_support: $no_lockfile_support;)?
+            extra: {
+                async fn ecosystem_non_registry_source_yields_no_fetch_impl() {
+                    $crate::conformance::assert_non_registry_source_yields_no_fetch(
+                        &($build),
+                        $nrf_name,
+                        $nrf_content,
+                    )
+                    .await;
+                }
+                #[::tokio::test]
+                async fn ecosystem_non_registry_source_yields_no_fetch() {
+                    ecosystem_non_registry_source_yields_no_fetch_impl().await;
+                }
+            }
+        }
+    };
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        ty: $ty:ty;
+        id: $id:expr;
+        display_name: $display_name:expr;
+        manifest_filenames: $manifest_filenames:expr;
+        $(lockfile_filenames: $lockfile_filenames:expr;)?
+        $(no_lockfile_support: $no_lockfile_support:literal;)?
+        no_non_registry_fixture: $nrf_reason:literal;
+    ) => {
+        // `$nrf_reason` is deliberately unused beyond being required to be a string literal
+        // at this call site — its only job is to force a reviewable, human-written
+        // justification into the source next to the opt-out, not to be asserted on.
+        const _: &str = $nrf_reason;
+        $crate::ecosystem_conformance_base! {
+            mod $mod_name;
+            build: $build;
+            ty: $ty;
+            id: $id;
+            display_name: $display_name;
+            manifest_filenames: $manifest_filenames;
+            $(lockfile_filenames: $lockfile_filenames;)?
+            $(no_lockfile_support: $no_lockfile_support;)?
+            extra: {}
+        }
+    };
+    // M11 (critic): a friendly compile-time error for the "neither arm above matched"
+    // case — omitting both `non_registry_fixture` and `no_non_registry_fixture` entirely
+    // falls through every other arm (each requires one or the other) to this one, which
+    // matches the same prefix fields and nothing else. Without this arm the same mistake
+    // would still fail to compile, but with `macro_rules!`'s own generic (and much less
+    // helpful) "no rules expected this token" message instead.
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        ty: $ty:ty;
+        id: $id:expr;
+        display_name: $display_name:expr;
+        manifest_filenames: $manifest_filenames:expr;
+        $(lockfile_filenames: $lockfile_filenames:expr;)?
+        $(no_lockfile_support: $no_lockfile_support:literal;)?
+    ) => {
+        compile_error!(
+            "ecosystem_conformance!: missing a mandatory `non_registry_fixture:` or \
+             `no_non_registry_fixture:` arm (#1202) — supply either a real non-registry-source \
+             manifest fixture (`non_registry_fixture: \"name\" => \"content\";`) or a \
+             reviewable reason this ecosystem cannot yet supply one \
+             (`no_non_registry_fixture: \"reason\";`)"
+        );
+    };
+}
+
+/// Shared body [`ecosystem_conformance!`]'s two required-fixture-arm variants both expand
+/// into — not part of this crate's public macro API (call [`ecosystem_conformance!`]
+/// instead), but must be `#[macro_export]`ed like any other macro invoked from another
+/// crate's expansion.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! ecosystem_conformance_base {
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        ty: $ty:ty;
+        id: $id:expr;
+        display_name: $display_name:expr;
+        manifest_filenames: $manifest_filenames:expr;
+        $(lockfile_filenames: $lockfile_filenames:expr;)?
+        $(no_lockfile_support: $no_lockfile_support:literal;)?
+        extra: { $($extra:item)* }
     ) => {
         mod $mod_name {
             use super::*;
@@ -920,6 +1108,8 @@ macro_rules! ecosystem_conformance {
             fn ecosystem_registry_returns_arc() {
                 ecosystem_registry_returns_arc_impl();
             }
+
+            $($extra)*
         }
     };
 }

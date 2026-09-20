@@ -138,17 +138,13 @@ impl DiagnosticPolicy for CargoFormatter {
 }
 
 impl SourcePolicy for CargoFormatter {
-    /// Extends the default (crates.io-only) resolvability to a resolved
-    /// [`DependencySource::AlternateRegistry`] too — `CargoRegistry` (the value behind
-    /// `CargoEcosystem::registry()`) routes that source to the alternate index's own
+    /// `CargoRegistry` (the value behind `CargoEcosystem::registry()`) routes any
+    /// [`DependencySource::AlternateRegistry`] to the alternate index's own
     /// [`crate::sparse::SparseIndexClient`], so it is exactly as resolvable as a plain
     /// [`DependencySource::Registry`] dependency, just against a different index (spec
-    /// FR-016).
-    fn can_resolve_source(&self, source: &DependencySource) -> bool {
-        matches!(
-            source,
-            DependencySource::Registry | DependencySource::AlternateRegistry { .. }
-        )
+    /// FR-016) — widening [`SourcePolicy::can_resolve_source`]'s default accordingly.
+    fn resolves_alternate_registry(&self) -> bool {
+        true
     }
 
     /// A verified crates.io mirror (`AlternateRegistry { mirrors_crates_io: true, .. }`,
