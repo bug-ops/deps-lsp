@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-deno**: `npm:`-scope imports classified `AlternateRegistry` via `.npmrc` are now actually fetched through the resolved registry instead of being silently dropped from the fetch queue, matching `package.json`'s behavior for the identical entry (resolves #1227) (#1231)
+- **deps-npm**: a malformed `.npmrc` line (missing `=`) no longer logs its raw content, closing a credential leak when the line is a typo'd auth-shaped entry; the warning now names only the file path and line number (resolves #1229)
 - **deps-composer**: a bare (no `only` filter) repository entry now cross-checks `composer.lock`'s `source.type` to classify a matching dependency as `Path` (never `Git`) instead of `Registry` (resolves #1212) (#1221)
 - **deps-gradle**: a repository with an explicit `url` and a `content { }` restriction (`includeGroup`/`includeGroupByRegex`/`includeModule`) now classifies its matching dependency as a custom registry source instead of `Registry` (resolves #1212) (#1221)
 - **deps-deno**: `npm:`-scope `.npmrc` classification now shares `NpmEcosystem`'s live policy and cached config instead of re-reading `.npmrc` with a hardcoded policy on every parse (resolves #1212) (#1221)
