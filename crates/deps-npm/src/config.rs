@@ -292,18 +292,28 @@ struct RawNpmrc {
 /// shapes.
 ///
 /// Grammar (FR-001): npm's own `.npmrc` INI-like format — `key=value` or `key = value` one
-/// per line, `#`/`;` as full-line comment markers, blank lines ignored. A line with no `=`
-/// (or an unrecognized key) is skipped with a `tracing::warn!`; every other valid line still
-/// applies.
-fn parse_npmrc_raw(content: &str) -> RawNpmrc {
+/// per line, `#`/`;` as full-line comment markers, blank lines ignored. A line with no `=` is
+/// skipped with a `tracing::warn!` naming `path` and the line's 1-based `line_number`, never
+/// its content — a line missing `=` cannot yet be known to be auth-shaped or not, so the raw
+/// text must never reach logs. A line with a recognized-shape `=` but an unrecognized key
+/// (anything but `registry`/`@<scope>:registry`) is skipped silently, with no log at all —
+/// this is the common case (every real npm config setting other than the registry entries
+/// this function cares about) and logging it would be noise, not a diagnostic. Every other
+/// valid line still applies.
+fn parse_npmrc_raw(path: &Path, content: &str) -> RawNpmrc {
     let mut out = RawNpmrc::default();
-    for line in content.lines() {
+    for (line_number, line) in content.lines().enumerate() {
+        let line_number = line_number + 1;
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
-            tracing::warn!(line, "skipping malformed .npmrc line: no '='");
+            tracing::warn!(
+                path = %path.display(),
+                line_number,
+                "skipping malformed .npmrc line: no '='"
+            );
             continue;
         };
         let key = key.trim();
@@ -447,7 +457,8 @@ impl NpmConfigCache {
     /// re-reading and re-parsing. `None` if `path` does not exist, is not a regular file, or
     /// cannot be read.
     fn get_or_parse(&self, path: &Path) -> Option<Arc<RawNpmrc>> {
-        self.0.get_or_parse(path, parse_npmrc_raw)
+        self.0
+            .get_or_parse(path, |content| parse_npmrc_raw(path, content))
     }
 }
 
@@ -710,7 +721,7 @@ mod tests {
     fn test_parse_npmrc_raw_registry_and_scoped() {
         let content =
             "registry=https://npm.mycorp.example/\n@myorg:registry=https://npm.pkg.github.com/\n";
-        let raw = parse_npmrc_raw(content);
+        let raw = parse_npmrc_raw(Path::new(".npmrc"), content);
         assert_eq!(raw.registry.as_deref(), Some("https://npm.mycorp.example/"));
         assert_eq!(
             raw.scoped.get("@myorg").map(String::as_str),
@@ -721,22 +732,53 @@ mod tests {
     #[test]
     fn test_parse_npmrc_raw_comments_and_blank_lines() {
         let content = "# comment\n\n; also a comment\nregistry=https://npm.example/\n";
-        let raw = parse_npmrc_raw(content);
+        let raw = parse_npmrc_raw(Path::new(".npmrc"), content);
         assert_eq!(raw.registry.as_deref(), Some("https://npm.example/"));
     }
 
     #[test]
     fn test_parse_npmrc_raw_spaced_equals() {
         let content = "registry = https://npm.example/\n";
-        let raw = parse_npmrc_raw(content);
+        let raw = parse_npmrc_raw(Path::new(".npmrc"), content);
         assert_eq!(raw.registry.as_deref(), Some("https://npm.example/"));
     }
 
     #[test]
     fn test_parse_npmrc_raw_malformed_line_skipped_others_still_apply() {
         let content = "not-a-valid-line-no-equals\nregistry=https://npm.example/\n";
-        let raw = parse_npmrc_raw(content);
+        let raw = parse_npmrc_raw(Path::new(".npmrc"), content);
         assert_eq!(raw.registry.as_deref(), Some("https://npm.example/"));
+    }
+
+    /// #1229: a line is classified "malformed" purely by the absence of `=`, before the code
+    /// can know whether it was meant to be an auth-shaped key — so a credential-shaped line
+    /// broken by a typo'd separator (space instead of `=`) must never have its raw content
+    /// logged. Only the file path and 1-based line number may identify the offending line.
+    #[test]
+    fn test_parse_npmrc_raw_malformed_line_never_logs_credential_content() {
+        let content = "//registry.npmjs.org/:_authToken ghp_super_secret_token_value\nregistry=https://npm.example/\n";
+        let path = Path::new("/workspace/.npmrc");
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let raw = parse_npmrc_raw(path, content);
+            assert_eq!(raw.registry.as_deref(), Some("https://npm.example/"));
+        });
+
+        assert!(
+            !log.contains("ghp_super_secret_token_value"),
+            "malformed-line warning leaked the credential value into tracing output: {log:?}"
+        );
+        assert!(
+            !log.contains("_authToken"),
+            "malformed-line warning leaked the raw line content into tracing output: {log:?}"
+        );
+        assert!(
+            log.contains("line_number"),
+            "expected the warning to identify the offending line by number: {log:?}"
+        );
+        assert!(
+            log.contains("/workspace/.npmrc"),
+            "expected the warning to identify the offending file by path: {log:?}"
+        );
     }
 
     /// FR-013/NFR-001: every auth-shaped key shape is skipped entirely, never landing in the
@@ -753,7 +795,7 @@ mod tests {
             "//registry.example.com/:_password=scoped-password\n",
             "registry=https://npm.example/\n",
         );
-        let raw = parse_npmrc_raw(content);
+        let raw = parse_npmrc_raw(Path::new(".npmrc"), content);
         assert_eq!(raw.registry.as_deref(), Some("https://npm.example/"));
         assert!(raw.scoped.is_empty());
 
@@ -780,7 +822,7 @@ mod tests {
     #[test]
     fn test_parse_npmrc_raw_scope_key_no_case_folding() {
         let content = "@MyOrg:registry=https://npm.example/\n";
-        let raw = parse_npmrc_raw(content);
+        let raw = parse_npmrc_raw(Path::new(".npmrc"), content);
         assert!(raw.scoped.contains_key("@MyOrg"));
         assert!(!raw.scoped.contains_key("@myorg"));
     }
