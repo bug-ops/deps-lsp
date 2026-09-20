@@ -180,7 +180,8 @@ pub struct WalkOutcome {
     /// tree, never worth a warning each).
     pub unrecognized_explicit_paths: Vec<PathBuf>,
     /// Manifest-shaped files excluded from the scan without the caller asking for that
-    /// exclusion — either an ignore rule while `respect_gitignore` was enabled (issue #1109),
+    /// exclusion — either an ignore rule while [`GitignorePolicy::Respect`] was in effect
+    /// (issue #1109),
     /// or a `PRUNED_DIRECTORIES` match in *any* mode (reviewer follow-up: an unusual monorepo
     /// layout can have a real subproject's manifest sitting directly inside a directory named
     /// `vendor`/`build`/`dist`/...). Unlike
@@ -196,6 +197,24 @@ pub struct WalkOutcome {
     /// ancestor loop under `--follow-symlinks`, which surfaces via `walk_errors` instead (still
     /// a non-zero exit, just a generic message rather than this specific one).
     pub broken_manifest_symlinks: Vec<PathBuf>,
+}
+
+/// Whether `.gitignore`/`.ignore` rules exclude manifests from the walk (issue #1109).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitignorePolicy {
+    /// `.gitignore`/`.ignore` are consulted, matching `git`'s own behavior.
+    Respect,
+    /// `.gitignore`/`.ignore` are never consulted.
+    Ignore,
+}
+
+/// Whether symlinked manifests and directories are resolved and walked into (issue #1112).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SymlinkPolicy {
+    /// Symlinks are resolved and walked into.
+    Follow,
+    /// Symlinks are detected but never resolved or descended into.
+    Skip,
 }
 
 /// Walks every path in `roots`.
@@ -216,52 +235,52 @@ pub struct WalkOutcome {
 /// from the live registry rather than a hardcoded `[".github", ".gitlab"]` list, so a future
 /// ecosystem introducing a new dot-directory pattern is picked up automatically.
 ///
-/// **`respect_gitignore` (issue #1109)**: when `false` (the `check` subcommand's default —
-/// see [`crate::cli::CheckArgs::respect_gitignore`]), `.gitignore` and `.ignore` files are
-/// never consulted, because in a CI security-gate invocation (`git checkout && deps-cli check
-/// .` against an untrusted fork PR) both are attacker-controlled input: a one-line addition
-/// anywhere in the tree would otherwise silently remove a manifest from the scan. `.git`
-/// itself is still never descended into (that is `hidden`-filtering, an unrelated concern —
-/// see above), and `.git/info/exclude` / the user's global gitignore are always honored
-/// regardless of this flag, since neither travels with a cloned/fetched PR and both are
-/// operator-, not attacker-, controlled. When `true`, standard `.gitignore`/`.ignore`
-/// awareness is restored (matching `git`'s own behavior), and any manifest-shaped file that
-/// awareness excludes is additionally reported via [`WalkOutcome::ignored_manifests`].
-/// The internal `PRUNED_DIRECTORIES` denylist is applied regardless of `respect_gitignore` —
-/// it is compiled into the binary, not attacker-controlled input, so pruning
-/// `node_modules`/`target`/`vendor`/... does not reopen the fail-open gap this flag closes. A
-/// manifest sitting directly at the root of a pruned directory (an unusual but real monorepo
-/// layout, e.g. a genuine subproject named `vendor`) is still reported via
-/// [`WalkOutcome::ignored_manifests`] in every mode, so pruning stays visible rather than a
-/// second, narrower silent-omission bug.
+/// **`gitignore_policy` (issue #1109)**: when [`GitignorePolicy::Ignore`] (the `check`
+/// subcommand's default — see [`crate::cli::CheckArgs::gitignore_policy`]), `.gitignore` and
+/// `.ignore` files are never consulted, because in a CI security-gate invocation (`git
+/// checkout && deps-cli check .` against an untrusted fork PR) both are attacker-controlled
+/// input: a one-line addition anywhere in the tree would otherwise silently remove a manifest
+/// from the scan. `.git` itself is still never descended into (that is `hidden`-filtering, an
+/// unrelated concern — see above), and `.git/info/exclude` / the user's global gitignore are
+/// always honored regardless of this policy, since neither travels with a cloned/fetched PR and
+/// both are operator-, not attacker-, controlled. When [`GitignorePolicy::Respect`], standard
+/// `.gitignore`/`.ignore` awareness is restored (matching `git`'s own behavior), and any
+/// manifest-shaped file that awareness excludes is additionally reported via
+/// [`WalkOutcome::ignored_manifests`]. The internal `PRUNED_DIRECTORIES` denylist is applied
+/// regardless of `gitignore_policy` — it is compiled into the binary, not attacker-controlled
+/// input, so pruning `node_modules`/`target`/`vendor`/... does not reopen the fail-open gap
+/// this policy closes. A manifest sitting directly at the root of a pruned directory (an
+/// unusual but real monorepo layout, e.g. a genuine subproject named `vendor`) is still
+/// reported via [`WalkOutcome::ignored_manifests`] in every mode, so pruning stays visible
+/// rather than a second, narrower silent-omission bug.
 ///
-/// One asymmetry is deliberate rather than accidental: in the default (`respect_gitignore:
-/// false`) mode, a manifest excluded only by the always-on `.git/info/exclude` or global
-/// gitignore is never diffed against (that costly double-walk only runs under
-/// `respect_gitignore`), so such a suppression is silent beyond [`WalkOutcome::manifests`]
-/// coming back emptier than expected — acceptable because both sources are
-/// operator-, not attacker-, controlled (see above).
+/// One asymmetry is deliberate rather than accidental: in the default
+/// ([`GitignorePolicy::Ignore`]) mode, a manifest excluded only by the always-on
+/// `.git/info/exclude` or global gitignore is never diffed against (that costly double-walk
+/// only runs under [`GitignorePolicy::Respect`]), so such a suppression is silent beyond
+/// [`WalkOutcome::manifests`] coming back emptier than expected — acceptable because both
+/// sources are operator-, not attacker-, controlled (see above).
 ///
-/// **`follow_symlinks` (issue #1112)**: a directory entry that is itself a symlink to a
-/// manifest-shaped file is always detected, regardless of this flag — its path is reported via
-/// [`WalkOutcome::ignored_manifests`], the same sink a pruned or `.gitignore`-excluded manifest
-/// already uses, so a symlinked manifest can never silently vanish from the report. Detection
-/// alone never reads the target's content. When `follow_symlinks` is `true`, such a symlink is
-/// additionally resolved and routed like any other manifest (appearing in
-/// [`WalkOutcome::manifests`] instead, with [`DiscoveredManifest::path`] set to the resolved
-/// real path used for reading and [`DiscoveredManifest::display_path`] kept as the symlink's
-/// own encountered path). Every routed entry under `follow_symlinks: true` — not only ones
-/// where the leaf itself is a symlink, since an entry reached by descending into a followed
-/// symlinked *directory* is otherwise indistinguishable from an ordinary one — is canonicalized
-/// and checked against the walked root's own canonicalized absolute path; an entry that
-/// resolves outside the root is never routed, and is reported via `ignored_manifests` only when
-/// it is itself manifest-shaped (an arbitrary out-of-root symlink to a non-manifest file is
-/// silently skipped, matching detection's own never-warn-on-non-manifests invariant). This
-/// containment check applies to every registered ecosystem's own dot-directory sub-root (e.g.
-/// `.github`) too, and — because `ignore`/`walkdir` always follows a walk's own *root* symlink
-/// regardless of `follow_links` — that sub-root containment check runs in every mode, not only
-/// under `follow_symlinks`. A symlink loop is detected by the underlying `ignore` crate and
-/// surfaced via [`WalkOutcome::walk_errors`].
+/// **`symlink_policy` (issue #1112)**: a directory entry that is itself a symlink to a
+/// manifest-shaped file is always detected, regardless of this policy — its path is reported
+/// via [`WalkOutcome::ignored_manifests`], the same sink a pruned or `.gitignore`-excluded
+/// manifest already uses, so a symlinked manifest can never silently vanish from the report.
+/// Detection alone never reads the target's content. When `symlink_policy` is
+/// [`SymlinkPolicy::Follow`], such a symlink is additionally resolved and routed like any other
+/// manifest (appearing in [`WalkOutcome::manifests`] instead, with [`DiscoveredManifest::path`]
+/// set to the resolved real path used for reading and [`DiscoveredManifest::display_path`] kept
+/// as the symlink's own encountered path). Every routed entry under [`SymlinkPolicy::Follow`] —
+/// not only ones where the leaf itself is a symlink, since an entry reached by descending into
+/// a followed symlinked *directory* is otherwise indistinguishable from an ordinary one — is
+/// canonicalized and checked against the walked root's own canonicalized absolute path; an
+/// entry that resolves outside the root is never routed, and is reported via
+/// `ignored_manifests` only when it is itself manifest-shaped (an arbitrary out-of-root symlink
+/// to a non-manifest file is silently skipped, matching detection's own never-warn-on-non-manifests
+/// invariant). This containment check applies to every registered ecosystem's own dot-directory
+/// sub-root (e.g. `.github`) too, and — because `ignore`/`walkdir` always follows a walk's own
+/// *root* symlink regardless of `follow_links` — that sub-root containment check runs in every
+/// mode, not only under [`SymlinkPolicy::Follow`]. A symlink loop is detected by the underlying
+/// `ignore` crate and surfaced via [`WalkOutcome::walk_errors`].
 ///
 /// **Broken symlinks (issue #1124)**: a symlink whose target is not a manifest (unresolvable,
 /// or a non-regular-file such as a directory) is classified by its own filename, not its
@@ -272,15 +291,15 @@ pub struct WalkOutcome {
 pub fn walk(
     roots: &[PathBuf],
     registry: &EcosystemRegistry,
-    respect_gitignore: bool,
-    follow_symlinks: bool,
+    gitignore_policy: GitignorePolicy,
+    symlink_policy: SymlinkPolicy,
 ) -> WalkOutcome {
     walk_with_limit(
         roots,
         registry,
         MAX_WALKED_FILES,
-        respect_gitignore,
-        follow_symlinks,
+        gitignore_policy,
+        symlink_policy,
     )
 }
 
@@ -300,8 +319,8 @@ fn walk_with_limit(
     roots: &[PathBuf],
     registry: &EcosystemRegistry,
     limit: usize,
-    respect_gitignore: bool,
-    follow_symlinks: bool,
+    gitignore_policy: GitignorePolicy,
+    symlink_policy: SymlinkPolicy,
 ) -> WalkOutcome {
     let mut ctx = WalkCtx {
         registry,
@@ -311,8 +330,8 @@ fn walk_with_limit(
     };
     let hidden_ecosystem_dirs = hidden_ecosystem_directories(registry);
     let options = WalkOptions {
-        respect_gitignore,
-        follow_symlinks,
+        respect_gitignore: matches!(gitignore_policy, GitignorePolicy::Respect),
+        follow_symlinks: matches!(symlink_policy, SymlinkPolicy::Follow),
     };
 
     'roots: for root in roots {
@@ -959,7 +978,12 @@ mod tests {
     #[test]
     fn test_walk_empty_directory_finds_nothing() {
         let dir = tempfile::tempdir().expect("create temp dir");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert!(outcome.manifests.is_empty());
         assert!(!outcome.truncated);
     }
@@ -969,7 +993,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n")
             .expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
             outcome.manifests[0].display_path,
@@ -991,7 +1020,12 @@ mod tests {
         fs::create_dir(dir.path().join("ignored")).expect("mkdir");
         fs::write(dir.path().join("ignored").join("Cargo.toml"), "[package]\n")
             .expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
+        );
         assert!(outcome.manifests.is_empty());
         assert_eq!(
             outcome.ignored_manifests,
@@ -1008,7 +1042,12 @@ mod tests {
         fs::create_dir(dir.path().join(".git")).expect("create .git marker");
         fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert_eq!(outcome.manifests.len(), 1);
         assert!(outcome.ignored_manifests.is_empty());
     }
@@ -1024,7 +1063,12 @@ mod tests {
             .expect("write nested gitignore");
         fs::write(dir.path().join("sub").join("Cargo.toml"), "[package]\n")
             .expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert_eq!(outcome.manifests.len(), 1);
     }
 
@@ -1035,7 +1079,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join(".ignore"), "Cargo.toml\n").expect("write .ignore");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert_eq!(outcome.manifests.len(), 1);
     }
 
@@ -1057,7 +1106,12 @@ mod tests {
         )
         .expect("write vendored manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
@@ -1078,7 +1132,12 @@ mod tests {
         fs::write(dir.path().join("vendor").join("Cargo.toml"), "[package]\n")
             .expect("write manifest directly under pruned dir");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(
             outcome.manifests.is_empty(),
@@ -1104,7 +1163,12 @@ mod tests {
         )
         .expect("write nested manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1135,8 +1199,8 @@ mod tests {
             &[dir.path().to_path_buf()],
             &test_registry(),
             5,
-            true,
-            false,
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
         );
 
         assert!(
@@ -1170,7 +1234,12 @@ mod tests {
         )
         .expect("write vendored manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.ignored_manifests.is_empty());
     }
@@ -1190,7 +1259,12 @@ mod tests {
         .expect("write git info/exclude");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(
@@ -1205,7 +1279,12 @@ mod tests {
         fs::write(dir.path().join(".gitignore"), "Cargo.toml\n").expect("write gitignore");
         let manifest = dir.path().join("Cargo.toml");
         fs::write(&manifest, "[package]\n").expect("write manifest");
-        let outcome = walk(&[manifest], &test_registry(), true, false);
+        let outcome = walk(
+            &[manifest],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
+        );
         assert_eq!(outcome.manifests.len(), 1);
     }
 
@@ -1227,8 +1306,8 @@ mod tests {
         let outcome = walk(
             std::slice::from_ref(&manifest),
             &test_registry(),
-            false,
-            false,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
         );
 
         assert!(outcome.manifests.is_empty());
@@ -1251,7 +1330,12 @@ mod tests {
         std::os::unix::fs::symlink(real_dir.path(), &link)
             .expect("create symlink to a real directory");
 
-        let outcome = walk(std::slice::from_ref(&link), &test_registry(), false, false);
+        let outcome = walk(
+            std::slice::from_ref(&link),
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert_eq!(outcome.manifests.len(), 1);
         assert!(outcome.broken_manifest_symlinks.is_empty());
@@ -1276,7 +1360,12 @@ mod tests {
         std::os::unix::fs::symlink(real_dir.path(), &link)
             .expect("create manifest-shaped symlink to a real directory");
 
-        let outcome = walk(std::slice::from_ref(&link), &test_registry(), false, false);
+        let outcome = walk(
+            std::slice::from_ref(&link),
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(
             outcome.manifests.is_empty(),
@@ -1312,7 +1401,12 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &notes)
             .expect("create broken, non-manifest-shaped symlink");
 
-        let outcome = walk(std::slice::from_ref(&notes), &test_registry(), false, false);
+        let outcome = walk(
+            std::slice::from_ref(&notes),
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.broken_manifest_symlinks.is_empty());
         assert_eq!(outcome.unrecognized_explicit_paths, vec![notes]);
@@ -1332,7 +1426,12 @@ mod tests {
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
         let _guard = CwdGuard::chdir(dir.path());
 
-        let outcome = walk(&[PathBuf::from(".")], &test_registry(), false, false);
+        let outcome = walk(
+            &[PathBuf::from(".")],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert_eq!(outcome.manifests.len(), 1);
         assert!(outcome.walk_errors.is_empty());
@@ -1354,8 +1453,8 @@ mod tests {
         let outcome = walk(
             &[PathBuf::from("Cargo.toml")],
             &test_registry(),
-            false,
-            false,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
         );
 
         assert_eq!(outcome.manifests.len(), 1);
@@ -1377,8 +1476,8 @@ mod tests {
             &[dir.path().to_path_buf()],
             &test_registry(),
             2,
-            false,
-            false,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
         );
         assert!(
             outcome.truncated,
@@ -1394,8 +1493,8 @@ mod tests {
             &[dir.path().to_path_buf()],
             &test_registry(),
             100,
-            false,
-            false,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
         );
         assert!(!outcome.truncated);
         assert_eq!(outcome.manifests.len(), 1);
@@ -1411,8 +1510,8 @@ mod tests {
         let outcome = walk(
             std::slice::from_ref(&unknown),
             &test_registry(),
-            false,
-            false,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
         );
         assert!(outcome.manifests.is_empty());
         assert_eq!(outcome.unrecognized_explicit_paths, vec![unknown]);
@@ -1425,7 +1524,12 @@ mod tests {
     fn test_walk_unrecognized_file_found_during_directory_walk_is_not_reported() {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("notes.txt"), "not a manifest").expect("write file");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert!(outcome.unrecognized_explicit_paths.is_empty());
     }
 
@@ -1434,7 +1538,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("create temp dir");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write cargo manifest");
         fs::write(dir.path().join("package.json"), "{}").expect("write npm manifest");
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert_eq!(outcome.manifests.len(), 2);
     }
 
@@ -1468,8 +1577,8 @@ mod tests {
             &[dir.path().to_path_buf()],
             &test_registry(),
             3,
-            false,
-            false,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
         );
         assert!(
             !outcome.truncated,
@@ -1496,7 +1605,12 @@ mod tests {
         )
         .expect("write workflow");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
             outcome.manifests[0].display_path,
@@ -1525,7 +1639,12 @@ mod tests {
         )
         .expect("write nested manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
@@ -1552,7 +1671,13 @@ mod tests {
             })
             .collect();
 
-        let outcome = walk_with_limit(&paths, &test_registry(), 2, false, false);
+        let outcome = walk_with_limit(
+            &paths,
+            &test_registry(),
+            2,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert!(
             outcome.truncated,
             "a 2-entry limit against 5 explicit paths must truncate"
@@ -1572,7 +1697,12 @@ mod tests {
         fs::write(&real, "[package]\n").expect("write real manifest");
         std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
@@ -1591,7 +1721,12 @@ mod tests {
         )
         .expect("create broken symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1613,7 +1748,12 @@ mod tests {
         )
         .expect("create broken, non-manifest-shaped symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1637,7 +1777,12 @@ mod tests {
         )
         .expect("create broken symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1667,7 +1812,12 @@ mod tests {
         std::os::unix::fs::symlink(&intermediate, dir.path().join("Cargo.toml"))
             .expect("create Cargo.toml -> intermediate-link -> does-not-exist");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1696,7 +1846,12 @@ mod tests {
         std::os::unix::fs::symlink(&target, dir.path().join("Cargo.toml"))
             .expect("create symlink into a permission-denied directory");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         let permission_check_effective = std::fs::metadata(&target).is_err();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o755)).expect("restore perms");
 
@@ -1730,7 +1885,12 @@ mod tests {
         )
         .expect("create broken symlink inside pruned directory");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(
             outcome.manifests.is_empty(),
@@ -1760,7 +1920,12 @@ mod tests {
         )
         .expect("create broken symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1786,7 +1951,12 @@ mod tests {
         )
         .expect("create broken symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
+        );
 
         assert_eq!(
             outcome.broken_manifest_symlinks,
@@ -1805,7 +1975,12 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("real_dir"), dir.path().join("link_dir"))
             .expect("create symlink to directory");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1825,7 +2000,12 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("real_dir"), dir.path().join("Cargo.toml"))
             .expect("create manifest-shaped symlink to a directory");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1855,7 +2035,12 @@ mod tests {
         std::os::unix::fs::symlink(&fifo, dir.path().join("Cargo.toml"))
             .expect("create manifest-shaped symlink to a fifo");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -1880,7 +2065,12 @@ mod tests {
         fs::create_dir(&blocked).expect("mkdir app.csproj");
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).expect("chmod 000");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         // Background-review test-gap finding: `metadata()`/`stat()` on `blocked` needs only
         // execute permission on its *ancestors*, not on `blocked` itself, so it always succeeds
         // here regardless of the chmod above — checking it (as an earlier version of this test
@@ -1925,7 +2115,12 @@ mod tests {
         std::os::unix::fs::symlink(&real, dir.path().join("vendor").join("Cargo.toml"))
             .expect("create symlink inside pruned directory");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(
             outcome.manifests.is_empty(),
@@ -1949,7 +2144,12 @@ mod tests {
         fs::write(&real, "[package]\n").expect("write real manifest");
         std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert_eq!(outcome.manifests.len(), 1);
         assert!(outcome.ignored_manifests.is_empty());
@@ -1988,14 +2188,24 @@ mod tests {
         fs::write(&real, "[package]\n").expect("write real manifest");
         std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
 
-        let disabled = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+        let disabled = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
         assert!(disabled.manifests.is_empty());
         assert_eq!(
             disabled.ignored_manifests,
             vec![PathBuf::from("Cargo.toml")]
         );
 
-        let enabled = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        let enabled = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
         assert_eq!(enabled.manifests.len(), 1);
         assert!(enabled.ignored_manifests.is_empty());
     }
@@ -2011,7 +2221,12 @@ mod tests {
         fs::write(&real, "[package]\n").expect("write real manifest");
         std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert_eq!(outcome.manifests.len(), 1);
         assert_eq!(
@@ -2040,7 +2255,12 @@ mod tests {
         )
         .expect("symlink vendored manifest inside pruned directory");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert_eq!(
             outcome.manifests.len(),
@@ -2080,8 +2300,8 @@ mod tests {
             &[dir.path().to_path_buf()],
             &test_registry(),
             4,
-            false,
-            true,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
         );
         assert!(
             outcome.truncated,
@@ -2102,7 +2322,12 @@ mod tests {
         std::os::unix::fs::symlink(&outside_manifest, root.path().join("Cargo.toml"))
             .expect("create symlink escaping the walked root");
 
-        let outcome = walk(&[root.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[root.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert!(
             outcome.manifests.is_empty(),
@@ -2125,7 +2350,12 @@ mod tests {
             .expect("create b/loop -> a");
         fs::write(dir.path().join("Cargo.toml"), "[package]\n").expect("write manifest");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert!(
             outcome
@@ -2161,7 +2391,12 @@ mod tests {
         std::os::unix::fs::symlink(dir.path().join("Cargo.toml"), dir.path().join("Cargo.toml"))
             .expect("create self-referential Cargo.toml -> Cargo.toml");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert_eq!(
             outcome.broken_manifest_symlinks,
@@ -2191,7 +2426,12 @@ mod tests {
         )
         .expect("create broken symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Follow,
+        );
 
         assert!(outcome.manifests.is_empty());
         assert!(outcome.ignored_manifests.is_empty());
@@ -2216,7 +2456,12 @@ mod tests {
         fs::write(&real, "[package]\n").expect("write real manifest");
         std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, true);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Follow,
+        );
 
         assert!(
             outcome.manifests.is_empty(),
@@ -2242,7 +2487,12 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join("evil"))
             .expect("symlink a directory escaping the walked root");
 
-        let outcome = walk(&[root.path().to_path_buf()], &test_registry(), false, true);
+        let outcome = walk(
+            &[root.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
+        );
 
         assert!(
             outcome
@@ -2294,8 +2544,8 @@ mod tests {
             &[root.path().to_path_buf()],
             &test_registry(),
             5,
-            false,
-            true,
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Follow,
         );
 
         assert!(
@@ -2329,7 +2579,12 @@ mod tests {
         fs::write(&real, "[package]\n").expect("write real manifest");
         std::os::unix::fs::symlink(&real, dir.path().join("Cargo.toml")).expect("create symlink");
 
-        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), true, false);
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Respect,
+            SymlinkPolicy::Skip,
+        );
 
         assert_eq!(
             outcome.ignored_manifests,
@@ -2357,7 +2612,12 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), root.path().join(".github"))
             .expect("symlink .github escaping the walked root");
 
-        let outcome = walk(&[root.path().to_path_buf()], &test_registry(), false, false);
+        let outcome = walk(
+            &[root.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
 
         assert!(
             outcome.manifests.is_empty(),

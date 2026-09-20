@@ -71,7 +71,12 @@ fn offline_context() -> (EcosystemRegistry, CheckContext) {
 /// report plus whether any manifest's registry fetch was reported unreachable.
 async fn run_pipeline(dir: &std::path::Path) -> (CheckReport, bool) {
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(&[dir.to_path_buf()], &registry, false, false);
+    let outcome = walk::walk(
+        &[dir.to_path_buf()],
+        &registry,
+        walk::GitignorePolicy::Ignore,
+        walk::SymlinkPolicy::Skip,
+    );
     assert!(!outcome.truncated);
 
     let mut findings = Vec::new();
@@ -264,7 +269,12 @@ async fn test_walk_paths_default_to_current_directory_semantics_via_single_file(
     std::fs::write(&manifest, "[package]\nname = \"fixture\"\n").expect("write fixture manifest");
 
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false, false);
+    let outcome = walk::walk(
+        std::slice::from_ref(&manifest),
+        &registry,
+        walk::GitignorePolicy::Ignore,
+        walk::SymlinkPolicy::Skip,
+    );
     assert_eq!(outcome.manifests.len(), 1);
 
     let content = deps_core::fs_probe::read_to_string_capped(&manifest, 10_000_000)
@@ -301,7 +311,12 @@ async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
     .expect("write fixture manifest");
 
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(std::slice::from_ref(&manifest), &registry, false, false);
+    let outcome = walk::walk(
+        std::slice::from_ref(&manifest),
+        &registry,
+        walk::GitignorePolicy::Ignore,
+        walk::SymlinkPolicy::Skip,
+    );
     assert_eq!(outcome.manifests.len(), 1);
     assert!(
         outcome.manifests[0].display_path.is_absolute(),
@@ -535,7 +550,12 @@ async fn test_follow_symlinks_lockfile_lookup_uses_symlinks_directory_not_target
         .expect("symlink A/Cargo.toml -> B/Cargo.toml");
 
     let (registry, ctx) = offline_context();
-    let outcome = walk::walk(&[root.path().to_path_buf()], &registry, false, true);
+    let outcome = walk::walk(
+        &[root.path().to_path_buf()],
+        &registry,
+        walk::GitignorePolicy::Ignore,
+        walk::SymlinkPolicy::Follow,
+    );
     assert_eq!(
         outcome.manifests.len(),
         1,

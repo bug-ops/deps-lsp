@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: release archives signed with Sigstore/cosign keyless signing alongside existing SHA256 checksums (resolves #1153) (#1163)
 
 ### Breaking
+- **deps-cli**: `walk::walk` takes `GitignorePolicy`/`SymlinkPolicy` enums instead of two adjacent, transposable `bool` parameters; `CheckArgs` gained matching `gitignore_policy()`/`symlink_policy()` accessors (resolves #1224)
 - **deps-core**: `registry::register_capped`/`register_capped_with_occupied` return `CapResult` instead of `bool` (#1218)
 - **deps-gitlab-ci**: removed `pub const MAX_GITLAB_ROUTES`; the cap is now `deps_core::registry::MAX_ALTERNATE_REGISTRIES` (#1218)
 - **deps-core**: `lsp_helpers::git_ref::locate_value_span` gains a 4th `is_quoted: bool` parameter; new `MarkedScalar::is_quoted()` replaces the marker-byte-based quote inference the empty-value correction previously relied on (#1194)
