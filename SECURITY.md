@@ -8,7 +8,8 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability, please report it by emailing the maintainers directly.
+Please report security vulnerabilities privately through GitHub's Security Advisories:
+[Report a vulnerability](https://github.com/bug-ops/deps-lsp/security/advisories/new).
 
 **Please do not open a public issue for security vulnerabilities.**
 
