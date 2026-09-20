@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134)
 - **ci**: `release.yml`'s top-level GITHUB_TOKEN permissions scoped to a read-only default, with `contents: write` granted per-job only where needed (resolves #1151) (#1163)
 - **deps-cli**: `walk_directory`'s positional bool triple replaced with a `WalkOptions` struct and `DotDirs` enum, closing a swap-silent transposition risk on the gitignore/symlink containment gate (resolves #1135)
+- **deps-github-actions, deps-gitlab-ci**: static SHA-pin quickfix/hover-splice logic deduplicated into a shared `ShaPinning` trait in `deps-core::lsp_helpers::git_ref`; GitLab's live-fetch dynamic-component pin and GHA's tag-index footer remain ecosystem-local (resolves #1138) (#1177)
+- **deps-cli**: added a regression test pinning `walk_directory`'s `DotDirs::Descend` call-site wiring at hidden-ecosystem sub-roots (resolves #1165) (#1177)
 
 ## [1.1.0] - 2026-09-16
 

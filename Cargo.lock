@@ -739,7 +739,6 @@ dependencies = [
  "deps-core",
  "mockito",
  "semver",
- "serde_json",
  "tokio",
  "tower-lsp-server",
  "tracing",

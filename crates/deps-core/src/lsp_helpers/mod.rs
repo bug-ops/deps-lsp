@@ -50,6 +50,10 @@ pub use git_ref::{
     match_v_prefix_style,
 };
 #[cfg(feature = "lsp-responses")]
+pub use git_ref::{
+    ResolvedShaPin, ShaPinning, build_sha_pin_action, sha_pin_text_edit, splice_resolved_line,
+};
+#[cfg(feature = "lsp-responses")]
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
 pub use in_use_version::{concrete_pin_version, is_full_semver_shape, resolve_in_use_version};
 #[cfg(feature = "lsp-responses")]

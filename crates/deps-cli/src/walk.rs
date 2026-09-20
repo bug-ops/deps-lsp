@@ -1505,6 +1505,35 @@ mod tests {
         assert_eq!(outcome.manifests[0].ecosystem.id(), "github-actions");
     }
 
+    /// Regression test for issue #1165: pins the `DotDirs::Descend` wiring at the
+    /// hidden-ecosystem sub-root call site (e.g. `.github`) in [`walk_with_limit`].
+    /// `hidden(true)` vs `hidden(false)` only differs on *nested* dot-prefixed entries — the
+    /// sub-root itself is never filtered either way (depth 0) — so a manifest nested under a
+    /// dot-prefixed directory inside `.github` is only discovered under `Descend`. If that call
+    /// site were accidentally flipped to `DotDirs::Skip`, this manifest would be silently
+    /// dropped and this test would fail.
+    #[test]
+    fn test_walk_descends_into_nested_dot_dir_under_github_sub_root() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        fs::create_dir_all(dir.path().join(".github").join(".hidden")).expect("mkdir");
+        fs::write(
+            dir.path()
+                .join(".github")
+                .join(".hidden")
+                .join("Cargo.toml"),
+            "[package]\n",
+        )
+        .expect("write nested manifest");
+
+        let outcome = walk(&[dir.path().to_path_buf()], &test_registry(), false, false);
+
+        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(
+            outcome.manifests[0].display_path,
+            PathBuf::from(".github").join(".hidden").join("Cargo.toml")
+        );
+    }
+
     /// Regression test for background code-review fix 2 (spec 062 review): the cap must be
     /// enforced for explicit file-path arguments too, not only for a directory walk — this
     /// was previously incrementing `entries_walked` without ever checking it in that branch.
