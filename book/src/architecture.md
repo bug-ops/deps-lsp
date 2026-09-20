@@ -25,9 +25,13 @@ Key pieces:
   implementation) and `registry()` (a `Registry` implementation) — most ecosystem crates only
   need to supply parsing plus a formatter and a registry client, not reimplement LSP response
   generation. Override a `generate_*` method only for genuine ecosystem-specific behavior.
-- **`generate_completions`** has no default — every ecosystem must implement it directly (see
-  `deps-core::completion::complete_versions_at_position` for the shared, source-gated
-  version-completion helper most ecosystems build on).
+- **`generate_completions`** has a default implementation that detects
+  `crate::completion::CompletionContext` and dispatches to `complete_package_name` /
+  `complete_version` / `complete_feature`, stamping the resolved `CompletionOrigin` on the
+  result (see `deps-core::completion::complete_versions_at_position` for the shared,
+  source-gated version-completion helper most ecosystems build on). `deps-maven` and
+  `deps-gradle` override it directly because they route on their own XML/Groovy context type
+  instead of `CompletionContext`; every other ecosystem relies on the default.
 
 ## `Registry` and `EcosystemFormatter`
 

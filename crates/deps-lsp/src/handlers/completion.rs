@@ -141,12 +141,13 @@ pub async fn handle_completion(
 
                 match completion_result {
                     // Try fallback: handles the case where the user is typing a new package name.
-                    // `suppress_fallback` (#1184 Gap 2) opts out: an ecosystem sets it when
-                    // it positively identified this cursor as a non-package-name context
-                    // (e.g. `Version`) and withheld the item deliberately, not because
-                    // context detection came up empty.
+                    // `CompletionOrigin::allows_package_name_fallback` (#1184 Gap 2, #1195) gates
+                    // this: an ecosystem's `origin` blocks it when the cursor was positively
+                    // resolved to a non-package-name context (e.g. `Version`) and the item was
+                    // withheld deliberately, not because context detection came up empty.
                     Ok(completions)
-                        if completions.items.is_empty() && !completions.suppress_fallback =>
+                        if completions.items.is_empty()
+                            && completions.origin.allows_package_name_fallback() =>
                     {
                         tracing::info!("completion: ecosystem returned empty, trying fallback");
                         let fallback_items =
@@ -2197,14 +2198,15 @@ ser"
         }
     }
 
-    /// #1184 Gap 2 regression: an ecosystem that positively identified this cursor as a
-    /// non-package-name context (and withheld the item, e.g. GitHub Actions'
-    /// `position_past_sha_pin_own_ref`) sets `Completions::suppress_fallback`, which must
-    /// stop `handle_completion` from re-entering `fallback_completion` on empty items.
-    /// `fallback_completion_prefix` panics and `registry()` is `unimplemented!()` — either
-    /// firing means `fallback_completion` ran despite the suppression flag.
+    /// #1184 Gap 2 / #1195 regression: an ecosystem that positively identified this cursor
+    /// as a non-package-name context (and withheld the item, e.g. GitHub Actions'
+    /// `position_past_sha_pin_own_ref`) stamps `Completions::origin` as
+    /// `CompletionOrigin::Version`, which must stop `handle_completion` from re-entering
+    /// `fallback_completion` on empty items. `fallback_completion_prefix` panics and
+    /// `registry()` is `unimplemented!()` — either firing means `fallback_completion` ran
+    /// despite the blocking origin.
     #[tokio::test]
-    async fn test_suppress_fallback_skips_fallback_search() {
+    async fn test_origin_version_skips_fallback_search() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
@@ -2256,7 +2258,7 @@ ser"
             }
             fn registry(&self) -> Arc<dyn deps_core::Registry> {
                 unimplemented!(
-                    "fallback_completion must not resolve a registry when suppress_fallback is set"
+                    "fallback_completion must not resolve a registry when origin blocks fallback"
                 )
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
@@ -2269,7 +2271,10 @@ ser"
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
             ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                Box::pin(async move { Completions::default().with_suppress_fallback(true) })
+                Box::pin(async move {
+                    Completions::default()
+                        .with_origin(deps_core::completion::CompletionOrigin::Version)
+                })
             }
             fn complete_version<'a>(
                 &'a self,
@@ -2284,7 +2289,7 @@ ser"
                 _content: &'a str,
                 _position: deps_core::position::Position,
             ) -> Option<&'a str> {
-                panic!("fallback_completion must not run when suppress_fallback is set")
+                panic!("fallback_completion must not run when origin blocks fallback")
             }
             fn completion_insert_text(
                 &self,
@@ -2347,16 +2352,16 @@ ser"
     }
 
     /// Tester-recommended counterpart to
-    /// [`test_suppress_fallback_skips_fallback_search`]: a non-suppressing ecosystem
-    /// (`Completions::default()`'s `suppress_fallback` field defaults `false`, matching
-    /// every ecosystem except GitHub Actions' one withholding path) with empty
-    /// `generate_completions` results must still reach `fallback_completion` through
-    /// `handle_completion`'s real match arm, not a helper that calls
-    /// `fallback_completion` directly — proves the `!completions.suppress_fallback`
-    /// guard added for #1184 Gap 2 is a no-op for the common case, as an executed
-    /// behavioral check rather than by type/grep reasoning alone.
+    /// [`test_origin_version_skips_fallback_search`]: an ecosystem
+    /// (`Completions::default()`'s `origin` field defaults `Unresolved`, matching every
+    /// ecosystem except a context that positively resolved to `Version`/`Feature`) with
+    /// empty `generate_completions` results must still reach `fallback_completion` through
+    /// `handle_completion`'s real match arm, not a helper that calls `fallback_completion`
+    /// directly — proves the `origin.allows_package_name_fallback()` guard added for #1184
+    /// Gap 2 / #1195 is a no-op for the common case, as an executed behavioral check rather
+    /// than by type/grep reasoning alone.
     #[tokio::test]
-    async fn test_handle_completion_falls_back_when_completions_not_suppressed() {
+    async fn test_handle_completion_falls_back_when_origin_unresolved() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
@@ -2479,8 +2484,8 @@ ser"
                 _content: &'a str,
                 _freshness: deps_core::FreshnessSettings,
             ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-                // `suppress_fallback` defaults to `false` — this is the common case
-                // every ecosystem except GitHub Actions' one withholding path takes.
+                // `origin` defaults to `Unresolved` — this is the common case every
+                // ecosystem except a positively-resolved `Version`/`Feature` context takes.
                 Box::pin(async move { Completions::default() })
             }
             fn complete_version<'a>(
@@ -2555,6 +2560,240 @@ ser"
                 assert_eq!(items[0].label, "requests");
             }
             other => panic!("expected Array([requests]) from the fallback path, got {other:?}"),
+        }
+    }
+
+    /// Table-driven #1195 regression over every [`deps_core::completion::CompletionOrigin`]:
+    /// `Version`/`Feature` must block `fallback_completion` on empty items (the mock's
+    /// `fallback_completion_prefix` asserts it is never reached for those), while
+    /// `Unresolved`/`PackageName` must still reach it — including the `PackageName` +
+    /// empty-items row, the mid-typing path (prefix shorter than the 2-char minimum) a
+    /// user actually hits, and the one row that fails if the gate is ever written inverted.
+    #[tokio::test]
+    async fn test_fallback_gate_across_all_origins() {
+        use deps_core::completion::{CompletionOrigin, Completions};
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::{
+            Dependency, DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter,
+            Metadata, OsvNaming, PackageNaming, PackageRendering, ParseResult, Registry,
+            RequirementResolution, SourcePolicy, Version,
+        };
+        use std::any::Any;
+        use std::path::Path;
+
+        struct MockFormatter;
+        impl PackageNaming for MockFormatter {}
+        impl PackageRendering for MockFormatter {
+            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &deps_core::PackageName) -> String {
+                format!("https://example.com/{name}")
+            }
+        }
+        impl RequirementResolution for MockFormatter {}
+        impl DiagnosticMessages for MockFormatter {}
+        impl DiagnosticPolicy for MockFormatter {}
+        impl SourcePolicy for MockFormatter {}
+        impl OsvNaming for MockFormatter {}
+
+        struct OneResultRegistry;
+        impl Registry for OneResultRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("requests"),
+                        latest_version: deps_core::ConcreteVersion::new("2.31.0"),
+                    }) as Box<dyn Metadata>])
+                })
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockMetadata {
+            name: deps_core::PackageName,
+            latest_version: deps_core::ConcreteVersion,
+        }
+        impl Metadata for MockMetadata {
+            fn name(&self) -> &deps_core::PackageName {
+                &self.name
+            }
+            fn description(&self) -> Option<&str> {
+                None
+            }
+            fn repository(&self) -> Option<&str> {
+                None
+            }
+            fn documentation(&self) -> Option<&str> {
+                None
+            }
+            fn latest_version(&self) -> &deps_core::ConcreteVersion {
+                &self.latest_version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct OriginProbeEcosystem {
+            origin: CompletionOrigin,
+        }
+        impl Sealed for OriginProbeEcosystem {}
+        impl Ecosystem for OriginProbeEcosystem {
+            fn ecosystem_id(&self) -> deps_core::EcosystemId {
+                deps_core::EcosystemId::Cargo
+            }
+            fn display_name(&self) -> &'static str {
+                "cargo"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &["Cargo.toml"]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a url::Url,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>>
+            {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn Registry> {
+                Arc::new(OneResultRegistry)
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &MockFormatter
+            }
+            fn generate_completions<'a>(
+                &'a self,
+                _parse_result: &'a dyn ParseResult,
+                _position: tower_lsp_server::ls_types::Position,
+                _content: &'a str,
+                _freshness: deps_core::FreshnessSettings,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                let origin = self.origin;
+                Box::pin(async move { Completions::default().with_origin(origin) })
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: deps_core::PackageName,
+                _prefix: String,
+            ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
+                unimplemented!()
+            }
+            fn fallback_completion_prefix<'a>(
+                &self,
+                _content: &'a str,
+                _position: deps_core::position::Position,
+            ) -> Option<&'a str> {
+                assert!(
+                    self.origin.allows_package_name_fallback(),
+                    "fallback_completion must not run when origin={:?} blocks it",
+                    self.origin
+                );
+                Some("req")
+            }
+            fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
+                Some(metadata.name().to_string())
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            uri: url::Url,
+        }
+        impl ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![]
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        for (origin, should_fall_back) in [
+            (CompletionOrigin::Unresolved, true),
+            (CompletionOrigin::PackageName, true),
+            (CompletionOrigin::Version, false),
+            (CompletionOrigin::Feature, false),
+        ] {
+            let state = Arc::new(ServerState::new());
+            state
+                .ecosystem_registry
+                .register(Arc::new(OriginProbeEcosystem { origin }));
+
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = "[dependencies]\nreq = \"1.0\"\n".to_string();
+            let parse_result: Box<dyn ParseResult> = Box::new(MockParseResult { uri: url });
+            let doc =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            state.update_document(uri.clone(), doc);
+
+            let params = CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    position: Position::new(0, 0),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            };
+
+            let (client, config) = create_test_client_and_config();
+            let result = handle_completion(state, params, client, config).await;
+
+            if should_fall_back {
+                match result {
+                    Some(CompletionResponse::Array(items)) => {
+                        assert_eq!(
+                            items.len(),
+                            1,
+                            "origin={origin:?}: expected the fallback search's one item"
+                        );
+                        assert_eq!(items[0].label, "requests");
+                    }
+                    other => panic!(
+                        "origin={origin:?}: expected Array([requests]) from the fallback \
+                         path, got {other:?}"
+                    ),
+                }
+            } else {
+                assert!(
+                    result.is_none(),
+                    "origin={origin:?}: expected no completion response, got {result:?}"
+                );
+            }
         }
     }
 }

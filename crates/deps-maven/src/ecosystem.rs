@@ -658,12 +658,11 @@ impl Ecosystem for MavenEcosystem {
             let (ctx_type, value, value_range) =
                 Self::detect_xml_context(content, position, parse_result);
 
-            // Exhaustive on purpose (#819, same bug class as #793): no wildcard arm, so a
-            // new `MavenXmlContext` variant is a compile error right here.
-            match ctx_type {
+            // Exhaustive on purpose (#819/#793); each arm also picks the CompletionOrigin it maps to (#1195).
+            let (items, origin) = match ctx_type {
                 MavenXmlContext::Version => {
                     // #1134: finds+literal-checks the dependency; #1136: complete_versions_generic_from's own gate rejects a non-registry `dep.source()`.
-                    match deps_core::completion::literal_version_dependency(
+                    let items = match deps_core::completion::literal_version_dependency(
                         parse_result,
                         position,
                         content,
@@ -682,26 +681,31 @@ impl Ecosystem for MavenEcosystem {
                             .await
                         }
                         None => vec![],
-                    }
+                    };
+                    (items, deps_core::completion::CompletionOrigin::Version)
                 }
                 MavenXmlContext::ArtifactId => {
-                    self.complete_package_names_for_field(
-                        value,
-                        MavenNameField::ArtifactId,
-                        value_range,
-                    )
-                    .await
+                    let items = self
+                        .complete_package_names_for_field(
+                            value,
+                            MavenNameField::ArtifactId,
+                            value_range,
+                        )
+                        .await;
+                    (items, deps_core::completion::CompletionOrigin::PackageName)
                 }
                 MavenXmlContext::GroupId => {
-                    self.complete_package_names_for_field(
-                        value,
-                        MavenNameField::GroupId,
-                        value_range,
-                    )
-                    .await
+                    let items = self
+                        .complete_package_names_for_field(
+                            value,
+                            MavenNameField::GroupId,
+                            value_range,
+                        )
+                        .await;
+                    (items, deps_core::completion::CompletionOrigin::PackageName)
                 }
                 MavenXmlContext::SelfClosingVersion { tag_span } => {
-                    complete_self_closing_version(
+                    let items = complete_self_closing_version(
                         self.registry.as_ref(),
                         &self.formatter,
                         parse_result,
@@ -711,11 +715,14 @@ impl Ecosystem for MavenEcosystem {
                         value,
                         freshness,
                     )
-                    .await
+                    .await;
+                    (items, deps_core::completion::CompletionOrigin::Version)
                 }
-                MavenXmlContext::None => vec![],
-            }
-            .into()
+                MavenXmlContext::None => {
+                    (vec![], deps_core::completion::CompletionOrigin::Unresolved)
+                }
+            };
+            Completions::from(items).with_origin(origin)
         })
     }
 
@@ -2325,6 +2332,80 @@ mod tests {
             )
             .await;
         assert_eq!(result, Completions::default());
+        assert_eq!(
+            result.origin,
+            deps_core::completion::CompletionOrigin::Unresolved
+        );
+    }
+
+    /// #1195 supplementary coverage: the `MavenXmlContext::ArtifactId` arm must stamp
+    /// `CompletionOrigin::PackageName` end-to-end through `generate_completions`, not just
+    /// resolve the context — a swapped origin literal in the hand-written match would
+    /// otherwise have no test catching it.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_artifact_id_context_stamps_package_name_origin() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = "<project>\n  <artifactId>junit</artifactId>\n</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+
+        // Only "j" typed: too short for `complete_package_names_for_field` to search the
+        // registry, so this stays network-free while still exercising the `ArtifactId` arm.
+        let (ctx, value, _) =
+            MavenEcosystem::detect_xml_context(xml, Position::new(1, 15), parse_result.as_ref());
+        assert_eq!(ctx, MavenXmlContext::ArtifactId);
+        assert_eq!(value, "j");
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(1, 15),
+                xml,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(
+            result,
+            Completions::default()
+                .with_origin(deps_core::completion::CompletionOrigin::PackageName)
+        );
+    }
+
+    /// #1195 supplementary coverage: the `MavenXmlContext::GroupId` arm must stamp
+    /// `CompletionOrigin::PackageName` end-to-end through `generate_completions`, not just
+    /// resolve the context — a swapped origin literal in the hand-written match would
+    /// otherwise have no test catching it.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_group_id_context_stamps_package_name_origin() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = "<project>\n  <groupId>org.example</groupId>\n</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+
+        // Only "o" typed: too short for `complete_package_names_for_field` to search the
+        // registry, so this stays network-free while still exercising the `GroupId` arm.
+        let (ctx, value, _) =
+            MavenEcosystem::detect_xml_context(xml, Position::new(1, 12), parse_result.as_ref());
+        assert_eq!(ctx, MavenXmlContext::GroupId);
+        assert_eq!(value, "o");
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(1, 12),
+                xml,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(
+            result,
+            Completions::default()
+                .with_origin(deps_core::completion::CompletionOrigin::PackageName)
+        );
     }
 
     /// #919 C1 (critic follow-up): an *unresolved* `${property}` reference — no
@@ -2377,7 +2458,10 @@ mod tests {
         let result = eco
             .generate_completions(parse_result.as_ref(), position, xml, freshness)
             .await;
-        assert_eq!(result, Completions::default());
+        assert_eq!(
+            result,
+            Completions::default().with_origin(deps_core::completion::CompletionOrigin::Version)
+        );
     }
 
     // `complete_versions` has no offline guard for an already-well-formed package name, so
@@ -2565,6 +2649,84 @@ mod tests {
         assert_eq!(edit.range, tag_span);
         assert_eq!(edit.new_text, "<version>1.2.3</version>");
         assert_eq!(items[0].filter_text, Some("<version/>".to_string()));
+    }
+
+    /// #1195 regression: a self-closing `<version/>` with no matching dependency at this
+    /// position resolves to `MavenXmlContext::SelfClosingVersion` (purely text-based, see
+    /// `find_self_closing_version_tag`) but `literal_version_dependency` finds nothing —
+    /// `complete_self_closing_version` returns empty without ever touching the registry
+    /// (deterministic, CI-safe, no network needed), and `generate_completions` must still
+    /// stamp `CompletionOrigin::Version` on that empty result, not
+    /// `Completions::default()`'s `CompletionOrigin::Unresolved`, which would let
+    /// `deps-lsp`'s fallback re-enter a raw-text package-name search.
+    ///
+    /// The cursor sits at an *interior* column of `<version/>` (immediately after
+    /// `<version`, before the `/`), not past the closing `>`:
+    /// `MavenEcosystem::fallback_completion_prefix`'s own `strip_leading_xml_tag`-derived
+    /// suppression only fires once a `>` has been typed, so a test whose cursor sits past
+    /// the tag would pass vacuously (the length guard already rejects the resulting empty
+    /// prefix) without exercising the actual leak this closes — confirmed here by asserting
+    /// `fallback_completion_prefix` still returns a prefix at this exact position, i.e. the
+    /// raw-text path really would have run without the `CompletionOrigin`-based gate.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_self_closing_version_empty_result_stamps_version_origin() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        // `<version/>` is nested inside a `<dependency>` element (satisfying #1181's ancestry
+        // check, so ctx still resolves to `SelfClosingVersion`), but that `<dependency>` has
+        // no `<groupId>`/`<artifactId>` — `finalize_dep` drops it, so no parsed dependency
+        // matches this position, keeping `complete_self_closing_version` registry-free.
+        let xml = "<project>\n  <dependencies>\n    <dependency>\n      <version/>\n    </dependency>\n  </dependencies>\n</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        assert!(
+            parse_result.dependencies().is_empty(),
+            "fixture must not parse a <dependency>: {xml}"
+        );
+
+        let line = "      <version/>";
+        let interior_col =
+            u32::try_from(line.find("<version").unwrap() + "<version".len()).unwrap();
+        let position = Position::new(3, interior_col);
+
+        let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+        assert!(
+            matches!(ctx, MavenXmlContext::SelfClosingVersion { .. }),
+            "expected SelfClosingVersion, got {ctx:?}"
+        );
+        assert!(
+            deps_core::completion::literal_version_dependency(
+                parse_result.as_ref(),
+                position,
+                xml,
+                LspRange::default(),
+            )
+            .is_none(),
+            "fixture must have no matching dependency, to keep the registry unreachable"
+        );
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                xml,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(result.items.is_empty());
+        assert_eq!(
+            result.origin,
+            deps_core::completion::CompletionOrigin::Version,
+            "empty SelfClosingVersion result must still block the raw-text fallback"
+        );
+
+        assert!(
+            eco.fallback_completion_prefix(xml, position.into())
+                .is_some(),
+            "the raw-text fallback prefix must still be reachable at this interior position — \
+             proving CompletionOrigin::Version, not the prefix guard itself, is what closes #1195"
+        );
     }
 
     // #1167: a self-closing `<version/>` must still get a trackable `version_range` from the

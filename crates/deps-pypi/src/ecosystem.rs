@@ -2136,6 +2136,56 @@ dependencies = ["requests"]
         assert!(completions.iter().any(|r| r.label == "requests"));
     }
 
+    /// #1195 M4 regression: a bare `>` comparator (`this-package-does-not-exist-12345>2.0`)
+    /// has no `=` character anywhere on the line, so `deps-lsp`'s
+    /// `fallback_completion`-gate's `prefix.contains('=')` guard offers no protection —
+    /// before this PR, an empty `complete_versions` result at this position would fall
+    /// through to a raw-text package-name search for the literal string
+    /// `"this-package-does-not-exist-12345>2."`. Runs through the real parser and the real
+    /// `generate_completions` dispatch (not a synthetic `ParseResult`), with a mocked 404 so
+    /// the empty result is deterministic and `mock.assert_async()` proves the `Version`
+    /// context was actually reached rather than resolving to `None`/`Unresolved`.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_bare_comparator_version_empty_result_stamps_version_origin()
+    {
+        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem(UNKNOWN_PACKAGE).await;
+
+        let content = format!("{UNKNOWN_PACKAGE}>2.0\n");
+        let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+        let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            1,
+            "fixture must parse the bare `>` comparator as one dependency: {content}"
+        );
+
+        // Cursor between "2." and "0" — mid-typing, prefix "2.", no "=" on the line.
+        let cursor = u32::try_from(content.find("2.0").unwrap() + 2).unwrap();
+        let position = Position {
+            line: 0,
+            character: cursor,
+        };
+
+        let completions = ecosystem
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                &content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+
+        mock.assert_async().await;
+        assert!(completions.items.is_empty());
+        assert_eq!(
+            completions.origin,
+            deps_core::completion::CompletionOrigin::Version,
+            "a bare `>` comparator has no `=` on the line — CompletionOrigin::Version, not \
+             the prefix.contains('=') guard, is what must stop deps-lsp's fallback here"
+        );
+    }
+
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_no_dependency_at_position() {

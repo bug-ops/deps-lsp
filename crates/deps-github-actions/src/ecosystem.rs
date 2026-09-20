@@ -198,60 +198,26 @@ impl Ecosystem for GithubActionsEcosystem {
     // No `complete_package_name` override: GHA has no package-name search endpoint, so
     // the inherited `Completions::default()` is correct (M3, #793).
 
-    /// Overrides the shared dispatch (#793) to withhold a `Version` completion when the
-    /// cursor sits past a comment-annotated SHA pin's own ref text — in the whitespace
-    /// padding before its trailing `# vX.Y.Z` comment, on the `#` itself, or inside the
-    /// comment (issue #1182). That pin's `version_range` intentionally extends through
-    /// the comment — `crate::formatter::GithubActionsFormatter::format_version_replacing_for`'s
-    /// edit range and [`Self::generate_hover`]'s `**Resolved**` splice both depend on it
+    /// Withholds a `Version` completion when the cursor sits past a comment-annotated
+    /// SHA pin's own ref text — in the whitespace padding before its trailing
+    /// `# vX.Y.Z` comment, on the `#` itself, or inside the comment (issue #1182). That
+    /// pin's `version_range` intentionally extends through the comment —
+    /// `crate::formatter::GithubActionsFormatter::format_version_replacing_for`'s edit
+    /// range and [`Self::generate_hover`]'s `**Resolved**` splice both depend on it
     /// spanning the full `<sha> # <tag>` text — so `detect_completion_context` still
     /// reports a `Version` context there. `position_past_sha_pin_own_ref` checks the
     /// cursor position directly against the SHA's own end column rather than scanning
     /// the extracted prefix: `extract_prefix` trims trailing whitespace, so a cursor
     /// sitting in the padding gap or exactly on `#` yields a bare-SHA prefix with no
     /// whitespace left for a prefix-content check to catch.
-    #[cfg(feature = "lsp-responses")]
-    fn generate_completions<'a>(
-        &'a self,
-        parse_result: &'a dyn ParseResultTrait,
-        position: Position,
-        content: &'a str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.prepare_completions();
-            let request =
-                deps_core::completion::CompletionRequest::new(parse_result, position, freshness);
-            match deps_core::completion::detect_completion_context(parse_result, position, content)
-            {
-                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                    self.complete_package_name(request, prefix, range).await
-                }
-                deps_core::completion::CompletionContext::Version {
-                    package_name,
-                    prefix,
-                } => {
-                    if position_past_sha_pin_own_ref(parse_result, position) {
-                        // #1184 Gap 2: this cursor position is a confirmed `Version`
-                        // context, not a package-name one — never fall through to
-                        // `deps-lsp`'s raw-text package-name search.
-                        return Completions::default().with_suppress_fallback(true);
-                    }
-                    self.complete_version(request, package_name, prefix).await
-                }
-                deps_core::completion::CompletionContext::Feature {
-                    package_name,
-                    prefix,
-                } => self.complete_feature(request, package_name, prefix).await,
-                // `CompletionContext` is `#[non_exhaustive]` from outside the crate that
-                // defines it, so a catch-all arm is required here (unlike the exhaustive
-                // match in the shared default this override replaces, per that default's
-                // own doc comment); covers `None` and any future variant with no completion.
-                _ => Completions::default(),
-            }
-        })
-    }
-
+    ///
+    /// The guard lives here rather than in a `generate_completions` override (issue
+    /// #1195): the shared dispatch in `deps-core::Ecosystem::generate_completions`
+    /// already routes a resolved `Version` context to this hook and stamps
+    /// `CompletionOrigin::Version` on whatever it returns — including
+    /// `Completions::default()` from this early return — so #1184 Gap 2's "never fall
+    /// through to `deps-lsp`'s raw-text package-name search" guarantee holds without
+    /// GHA needing its own dispatch override at all.
     // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
     #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
@@ -261,6 +227,9 @@ impl Ecosystem for GithubActionsEcosystem {
         prefix: String,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move {
+            if position_past_sha_pin_own_ref(request.parse_result, request.position) {
+                return Completions::default();
+            }
             deps_core::completion::complete_versions_at_position(
                 self.registry.as_ref(),
                 &self.formatter,
@@ -2142,7 +2111,11 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert_eq!(result, Completions::default());
+        assert_eq!(
+            result,
+            Completions::default()
+                .with_origin(deps_core::completion::CompletionOrigin::PackageName)
+        );
     }
 
     /// Drives a real (mocked) network fetch through `GithubActionsRegistry`, mirroring
@@ -2208,6 +2181,10 @@ mod tests {
             .generate_completions(parse_result.as_ref(), position, content, freshness)
             .await;
         assert_eq!(via_dispatch.items, direct);
+        assert_eq!(
+            via_dispatch.origin,
+            deps_core::completion::CompletionOrigin::Version
+        );
         assert!(!direct.is_empty());
     }
 
@@ -2285,7 +2262,8 @@ mod tests {
                 .await;
             assert_eq!(
                 withheld,
-                Completions::default().with_suppress_fallback(true),
+                Completions::default()
+                    .with_origin(deps_core::completion::CompletionOrigin::Version),
                 "expected no completion (and no fallback) at character {character} \
                  (sha_end = {sha_end})"
             );

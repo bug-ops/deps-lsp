@@ -616,11 +616,11 @@ impl Ecosystem for GradleEcosystem {
             let (ctx_type, value, range, scope) =
                 Self::detect_completion_context(content, position, uri);
 
-            // Exhaustive on purpose (#819, same bug class as #793): no wildcard arm.
-            match ctx_type {
+            // Exhaustive on purpose (#819/#793); each arm also picks the CompletionOrigin it maps to (#1195).
+            let (items, origin) = match ctx_type {
                 GradleCompletionContext::Version => {
                     // #1134: finds+literal-checks the dependency; #1136: complete_versions_generic_from's own gate rejects a non-registry `dep.source()`; #1191: `scope` restricts the same-line fallback to this literal's own declaration.
-                    match deps_core::completion::literal_version_dependency_in_scope(
+                    let items = match deps_core::completion::literal_version_dependency_in_scope(
                         parse_result,
                         position,
                         content,
@@ -640,12 +640,18 @@ impl Ecosystem for GradleEcosystem {
                             .await
                         }
                         None => vec![],
-                    }
+                    };
+                    (items, deps_core::completion::CompletionOrigin::Version)
                 }
-                GradleCompletionContext::Package => self.complete_package_names(value, range).await,
-                GradleCompletionContext::None => vec![],
-            }
-            .into()
+                GradleCompletionContext::Package => {
+                    let items = self.complete_package_names(value, range).await;
+                    (items, deps_core::completion::CompletionOrigin::PackageName)
+                }
+                GradleCompletionContext::None => {
+                    (vec![], deps_core::completion::CompletionOrigin::Unresolved)
+                }
+            };
+            Completions::from(items).with_origin(origin)
         })
     }
 
@@ -1800,7 +1806,10 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert_eq!(result, Completions::default());
+        assert_eq!(
+            result,
+            Completions::default().with_origin(deps_core::completion::CompletionOrigin::Version)
+        );
     }
 
     /// #819 characterization: a cursor with no open quoted string on its line resolves to
@@ -1835,6 +1844,46 @@ mod tests {
             )
             .await;
         assert_eq!(result, Completions::default());
+        assert_eq!(
+            result.origin,
+            deps_core::completion::CompletionOrigin::Unresolved
+        );
+    }
+
+    /// #1195 supplementary coverage: the `GradleCompletionContext::Package` arm must stamp
+    /// `CompletionOrigin::PackageName` end-to-end through `generate_completions`, not just
+    /// resolve the context — a swapped origin literal in the hand-written match would
+    /// otherwise have no test catching it.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_package_context_stamps_package_name_origin() {
+        // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let eco = GradleEcosystem::new(make_cache());
+        let content = r#"implementation("junit:junit:4.13.2")"#;
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+        // Only "j" typed: too short for `complete_package_names_generic` to search the
+        // registry, so this stays network-free while still exercising the `Package` arm.
+        let (ctx, value, _, _) =
+            GradleEcosystem::detect_completion_context(content, Position::new(0, 17), &uri);
+        assert_eq!(ctx, GradleCompletionContext::Package);
+        assert_eq!(value, "j");
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                Position::new(0, 17),
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(
+            result,
+            Completions::default()
+                .with_origin(deps_core::completion::CompletionOrigin::PackageName)
+        );
     }
 
     /// #919 C1 (critic follow-up): an *unresolved* `$var` reference — no matching
@@ -1879,7 +1928,10 @@ mod tests {
         let result = eco
             .generate_completions(parse_result.as_ref(), position, content, freshness)
             .await;
-        assert_eq!(result, Completions::default());
+        assert_eq!(
+            result,
+            Completions::default().with_origin(deps_core::completion::CompletionOrigin::Version)
+        );
     }
 
     /// #931 regression: a plain literal compact-coordinate version must be admitted by the
@@ -1967,7 +2019,7 @@ mod tests {
             .await;
         assert_eq!(
             result,
-            Completions::default(),
+            Completions::default().with_origin(deps_core::completion::CompletionOrigin::Version),
             "a version.ref alias must never be offered completions, even when its \
              resolved value happens to equal its own alias name"
         );
@@ -2006,7 +2058,8 @@ mod tests {
                 .await;
             assert_eq!(
                 result,
-                Completions::default(),
+                Completions::default()
+                    .with_origin(deps_core::completion::CompletionOrigin::Version),
                 "partial alias {partial:?} must not offer the unfiltered version list: {content}"
             );
         }
