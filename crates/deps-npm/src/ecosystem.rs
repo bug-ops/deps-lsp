@@ -22,6 +22,12 @@ use crate::formatter::NpmFormatter;
 use crate::registry::NpmRegistry;
 use crate::types::NpmDependency;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: `node-semver`'s caret, tilde, comparison, and wildcard
+/// operators. No `!` — `node-semver` ranges have no `!=` operator (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
+
 /// npm ecosystem implementation.
 ///
 /// Provides LSP functionality for package.json files, including:
@@ -128,7 +134,7 @@ impl NpmEcosystem {
             parse_result,
             position,
             prefix,
-            &['^', '~', '=', '<', '>', '*'],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -495,6 +501,18 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`node-semver`'s operator set), so an edit to one without the other
+    // fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod npm_operator_chars_conformance;
+        ecosystem: "npm";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['^', '~', '=', '<', '>', '*'];
     }
 
     #[test]

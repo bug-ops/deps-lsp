@@ -3850,6 +3850,47 @@ mod tests {
         assert_eq!(items[1].label, "1.0.1");
     }
 
+    /// Regression for #1137's `deps-composer` finding: `!=` needs *both* `!` and `=` stripped
+    /// (`trim_start_matches` peels leading matching chars one at a time), and `!` was missing
+    /// from `deps_composer::ecosystem::VERSION_OPERATOR_CHARS` before the fix — without it, a
+    /// `!=2.0` prefix isn't stripped at all (its first char `!` doesn't match), so it falls
+    /// through to the unfiltered fallback list, same failure mode as #1137's reported PyPI
+    /// caret bug. `deps-composer` has no test-only mockable registry constructor to exercise
+    /// this through `ComposerEcosystem` itself (unlike `deps-pypi`/`deps-cargo`), so this pins
+    /// composer's exact real array against the shared helper instead — see this crate's
+    /// handoff for the flagged follow-up to add one.
+    #[tokio::test]
+    async fn test_complete_versions_generic_operator_stripping_composer_not_equal() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "1.0.0".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "2.0.0".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        let items = complete_versions_generic_from(
+            &registry,
+            &MockFormatter,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "!=2.0",
+            &['^', '~', '=', '<', '>', '*', '!'],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "2.0.0 (latest)");
+    }
+
     /// #1136: a source `can_resolve_source` rejects (e.g. a Git dependency, never
     /// resolvable against the default public-registry client) must short-circuit before
     /// any registry call — proven here via a registry that panics if queried, not just an

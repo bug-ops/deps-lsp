@@ -15,6 +15,16 @@ use deps_maven::MavenCentralRegistry;
 
 use crate::formatter::GradleFormatter;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: the three range delimiters
+/// `formatter::gradle_version_matches` accepts — `[`/`(` plus Gradle's own reversed-bracket
+/// exclusive notation `]1.2,1.5]` (`deps_core::interval::BracketStyle::AllowReversed`,
+/// unlike Maven's `Standard`). The trailing dynamic suffix (`1.+`) has no leading operator
+/// to strip. Originally left empty, which meant a completion prefix like `"[2.2"` was never
+/// stripped down to `"2.2"` and so never prefix-matched any real version (#1137 critic S1).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['[', '(', ']'];
+
 /// Which manifest position a Gradle completion request resolved to, or none.
 ///
 /// A crate-local, non-`&'static str` replacement for the hand-rolled context-type return of
@@ -94,7 +104,7 @@ impl GradleEcosystem {
             package_name,
             &deps_core::parser::DependencySource::Registry,
             prefix,
-            &[],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -483,7 +493,7 @@ impl Ecosystem for GradleEcosystem {
                                 dep.name(),
                                 &dep.source(),
                                 value,
-                                &[],
+                                VERSION_OPERATOR_CHARS,
                                 freshness,
                             )
                             .await
@@ -612,6 +622,19 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`formatter::gradle_version_matches`'s range-delimiter set, including
+    // the reversed-bracket `]` form), so an edit to one without the other fails loudly
+    // instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod gradle_operator_chars_conformance;
+        ecosystem: "gradle";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['[', '(', ']'];
     }
 
     #[tokio::test]

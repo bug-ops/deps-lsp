@@ -1685,3 +1685,96 @@ macro_rules! completion_source_gate_conformance {
         }
     };
 }
+
+/// Asserts `operator_chars` includes every character in `required`.
+///
+/// **This is a change-detector, not independent parser verification** (#1137 critic S2):
+/// `required` is not derived by actually driving the ecosystem's own constraint matcher —
+/// it is a second, hand-written copy of the same operator set the caller believes
+/// `operator_chars` needs, typically justified in `operator_chars`'s own doc comment by a
+/// citation into that ecosystem's parser. This function only proves the two hand-written
+/// copies still agree; it cannot catch a set that was wrong (or went stale) in *both*
+/// places at once. Its value is forcing a second, separate line to update — and a second,
+/// separate doc-comment justification to write — whenever either one changes, rather than
+/// independently confirming either is correct.
+///
+/// [`crate::completion::complete_versions_generic_from`]'s
+/// `prefix.trim_start_matches(operator_chars)` only strips characters `operator_chars`
+/// lists; an operator the parser accepts but the array omits is left attached to the typed
+/// prefix, so it never matches any real version string and completion silently falls back
+/// to an unfiltered top-5 list instead of the intended prefix-filtered one — the drift class
+/// that let deps-pypi's array go without `^` despite parsing Poetry's caret constraints, and
+/// let deps-maven/deps-gradle/deps-nuget's arrays go empty despite all three parsing a
+/// bracket-delimited range (#1137).
+pub fn assert_operator_chars_cover(ecosystem: &str, operator_chars: &[char], required: &[char]) {
+    let missing: Vec<char> = required
+        .iter()
+        .copied()
+        .filter(|c| !operator_chars.contains(c))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{ecosystem}: operator_chars {operator_chars:?} is missing {missing:?} — required \
+         (hand-derived from this ecosystem's parser) lists these, but operator_chars omits \
+         them: the two copies have drifted"
+    );
+}
+
+/// Generates a regression test asserting an ecosystem's completion `operator_chars` array
+/// is a superset of `required` (#1137).
+///
+/// The array is the one its `complete_versions_at_position`/`complete_versions_generic_from`
+/// call site passes.
+///
+/// **Not independent parser verification** — see [`assert_operator_chars_cover`]'s doc for
+/// what this macro does and does not prove. `required` must be an operator set you derived
+/// by hand from that ecosystem's own parser (cite the specific function/module in a comment
+/// next to `required`, mirroring `operator_chars`'s own doc comment), not a value you
+/// intend to keep in sync with `operator_chars` by construction — the whole point is that
+/// the two are written independently, so a future editor who narrows one without
+/// reconsidering the other gets a failing test instead of silence.
+///
+/// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — see
+/// [`ecosystem_conformance!`]'s doc for why this macro does not emit its own `#[cfg(test)]`.
+///
+/// Wrapped in an explicit `mod example` — see [`ecosystem_conformance!`]'s doc for why.
+///
+/// # Examples
+///
+/// ```
+/// mod example {
+/// deps_core::operator_chars_conformance! {
+///     mod fake_operator_chars_conformance;
+///     ecosystem: "fake";
+///     operator_chars: &['^', '~', '=', '<', '>', '*'];
+///     required: &['^', '~', '=', '<', '>', '*'];
+/// }
+/// }
+/// ```
+#[macro_export]
+macro_rules! operator_chars_conformance {
+    (
+        mod $mod_name:ident;
+        ecosystem: $ecosystem:literal;
+        operator_chars: $operator_chars:expr;
+        required: $required:expr $(;)?
+    ) => {
+        mod $mod_name {
+            use super::*;
+
+            // See `ecosystem_conformance!`'s doc for why this is a plain `_impl` fn called
+            // by a thin `#[test]` wrapper.
+            fn operator_chars_cover_parser_operators_impl() {
+                $crate::conformance::assert_operator_chars_cover(
+                    $ecosystem,
+                    $operator_chars,
+                    $required,
+                );
+            }
+            #[test]
+            fn operator_chars_cover_parser_operators() {
+                operator_chars_cover_parser_operators_impl();
+            }
+        }
+    };
+}

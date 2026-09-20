@@ -20,6 +20,12 @@ use crate::formatter::DenoFormatter;
 use crate::registry::DenoRegistry;
 use deps_npm::NpmRegistry;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: `node-semver`'s caret, tilde, comparison, and wildcard
+/// operators — both JSR and npm specifiers resolve through this grammar (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
+
 /// Deno ecosystem implementation.
 ///
 /// Provides LSP functionality for `deno.json`/`deno.jsonc` files, including:
@@ -109,7 +115,7 @@ impl DenoEcosystem {
             parse_result,
             position,
             prefix,
-            &['^', '~', '=', '<', '>', '*'],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -297,6 +303,18 @@ mod tests {
         };
     }
 
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`node-semver`'s operator set), so an edit to one without the other
+    // fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod deno_operator_chars_conformance;
+        ecosystem: "deno";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['^', '~', '=', '<', '>', '*'];
+    }
+
     #[tokio::test]
     async fn test_parse_manifest_valid_json() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -381,7 +399,7 @@ mod tests {
             &deps_core::PackageName::new("jsr:@this-scope/does-not-exist-12345"),
             &deps_core::parser::DependencySource::Registry,
             "1.0",
-            &['^', '~', '=', '<', '>', '*'],
+            VERSION_OPERATOR_CHARS,
             deps_core::FreshnessSettings::default(),
         )
         .await;

@@ -15,6 +15,16 @@ use deps_core::{
 use crate::formatter::DartFormatter;
 use crate::registry::PubDevRegistry;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: `version::match_single_constraint`'s caret and comparison
+/// set. No `~` — Dart/pub has no tilde constraint syntax. `=` is a deliberate harmless
+/// superset entry, not backed by that function: `match_single_constraint` (`version.rs:134-164`)
+/// has no explicit `=`-prefix arm, since an exact-match constraint is written as a bare
+/// version with no leading operator; keeping `=` in this array is a no-op for real Dart
+/// input, never a wrongly-stripped prefix (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['^', '>', '<', '='];
+
 /// [`Ecosystem`] implementation for Dart/Pub (`pubspec.yaml`).
 pub struct DartEcosystem {
     registry: Arc<PubDevRegistry>,
@@ -69,7 +79,7 @@ impl DartEcosystem {
             parse_result,
             position,
             prefix,
-            &['^', '>', '<', '='],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -268,6 +278,18 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`version::match_single_constraint`'s operator set), so an edit to
+    // one without the other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod dart_operator_chars_conformance;
+        ecosystem: "dart";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['^', '>', '<', '='];
     }
 
     // #1136: a `hosted:` package pointing at a custom (unresolved) registry must yield zero

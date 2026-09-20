@@ -37,6 +37,12 @@ use crate::types::{GitlabCiDependency, HostRef, IncludeKind, PinStyle};
 /// mirrors `deps_github_actions`'s `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` precedent.
 const MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS: usize = 128;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions. Empty: a component/include ref is a bare tag/branch/SHA,
+/// with no comparison/caret/tilde operator syntax (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &[];
+
 /// Maximum character count of `mutable_ref_pin_diagnostics`' interpolated `name`/`tag`
 /// values before truncation — mirrors
 /// `deps_github_actions::ecosystem::MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` exactly (same
@@ -310,7 +316,7 @@ impl Ecosystem for GitlabCiEcosystem {
                 dep.name(),
                 &dep.source(),
                 &prefix,
-                &[],
+                VERSION_OPERATOR_CHARS,
                 request.freshness,
             )
             .await
@@ -1073,6 +1079,18 @@ mod tests {
         display_name: "GitLab CI/CD";
         manifest_filenames: &[".gitlab-ci.yml"];
         no_lockfile_support: true;
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (a component/include ref has no operator syntax), so an edit to one
+    // without the other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod gitlab_ci_operator_chars_conformance;
+        ecosystem: "gitlab-ci";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &[];
     }
 
     #[test]
@@ -2809,7 +2827,7 @@ mod tests {
             &deps_core::PackageName::new("org/proj"),
             &source,
             "v1.0",
-            &[],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await;

@@ -21,6 +21,12 @@ use crate::config::GoParseContext;
 use crate::formatter::GoFormatter;
 use crate::registry::GoRegistry;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions. Empty: `go.mod` requires an exact bare semver (`v1.2.3`),
+/// with no comparison/caret/tilde operator syntax (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &[];
+
 /// Go modules ecosystem implementation.
 ///
 /// Provides LSP functionality for go.mod files, including:
@@ -108,7 +114,7 @@ impl GoEcosystem {
             parse_result,
             position,
             prefix,
-            &[],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -384,6 +390,18 @@ mod tests {
     // hold for a completion path that is unconditionally empty by design — mirrors
     // `deps_github_actions`/`deps_gitlab_ci`'s identical N/A for the same reason (no
     // package-name search endpoint).
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`go.mod` has no operator syntax), so an edit to one without the
+    // other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod go_operator_chars_conformance;
+        ecosystem: "go";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &[];
+    }
 
     #[cfg(feature = "lsp-responses")]
     #[test]

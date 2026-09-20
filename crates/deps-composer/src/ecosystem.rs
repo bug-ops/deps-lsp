@@ -17,6 +17,14 @@ use deps_core::{
 use crate::formatter::ComposerFormatter;
 use crate::registry::PackagistRegistry;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions: caret `^`, tilde `~`, the comparison set `>=`/`<=`/`>`/`<`/
+/// `=`, and `!=` — `formatter::ComposerFormatter::version_satisfies_requirement` accepts all
+/// of these, including `!=`, which was missing here (#1137). `*` covers the bare wildcard
+/// requirement; the trailing-wildcard form (`"1.0.*"`) has no leading operator to strip.
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*', '!'];
+
 /// Composer ecosystem implementation.
 ///
 /// Provides LSP functionality for composer.json files, including:
@@ -66,7 +74,7 @@ impl ComposerEcosystem {
             parse_result,
             position,
             prefix,
-            &['^', '~', '=', '<', '>', '*'],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -255,6 +263,19 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`ComposerFormatter::version_satisfies_requirement`'s operator set),
+    // so an edit to one without the other fails loudly instead of silently degrading
+    // completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod composer_operator_chars_conformance;
+        ecosystem: "composer";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &['^', '~', '=', '<', '>', '*', '!'];
     }
 
     #[test]

@@ -21,6 +21,13 @@ use crate::registry::SwiftRegistry;
 #[cfg(feature = "lsp-responses")]
 use crate::types::SwiftPackage;
 
+/// Leading version-constraint operators stripped from a completion prefix before matching
+/// it against registry versions. Empty: `Package.swift` expresses requirements through
+/// method calls (`.upToNextMajor(from:)`, `.exact(_:)`, `...`/`..<` range operators), never
+/// a leading operator character before the version literal itself (#1137).
+#[cfg(feature = "lsp-responses")]
+const VERSION_OPERATOR_CHARS: &[char] = &[];
+
 /// Builds a completion item that inserts the full GitHub URL for `.package(url: "...")`.
 ///
 /// The completion fires with the cursor inside the `url:` string literal (see
@@ -142,7 +149,7 @@ impl SwiftEcosystem {
             parse_result,
             position,
             prefix,
-            &[],
+            VERSION_OPERATOR_CHARS,
             freshness,
         )
         .await
@@ -471,6 +478,18 @@ mod tests {
                 .await
             })
         };
+    }
+
+    // #1137: regression guard, not independent parser verification (see
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+    // own doc comment (`Package.swift` has no leading-operator syntax), so an edit to one
+    // without the other fails loudly instead of silently degrading completion.
+    #[cfg(feature = "lsp-responses")]
+    deps_core::operator_chars_conformance! {
+        mod swift_operator_chars_conformance;
+        ecosystem: "swift";
+        operator_chars: VERSION_OPERATOR_CHARS;
+        required: &[];
     }
 
     #[test]
