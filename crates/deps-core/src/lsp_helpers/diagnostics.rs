@@ -4,7 +4,7 @@ use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severit
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
-use crate::net_policy::{RedactedUrl, is_authority_bearing_url};
+use crate::net_policy::{RedactedUrl, redact_declaration_key};
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::position::{Position, Range};
 use crate::{
@@ -947,25 +947,11 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
     // #936: redact before truncating so host/path stay identifiable while a query-string
     // credential never reaches this client-visible diagnostic.
     let redacted_value = RedactedUrl::new(&occurrence.raw_value).to_string();
-    // `declaration_key` is opaque (e.g. "top-level") and would be mangled by RedactedUrl's
-    // userinfo-scan, so redaction only runs when the key looks like a URL: authority-bearing,
-    // or containing "://" (deps_cargo's file:// case). Neither check alone is a superset —
-    // each catches a credential shape the other misses (#981 S1) — so both are needed to
-    // cover every opaque label the 6 ecosystems emit.
-    // TODO(critic): move this branch into net_policy::redact_declaration_key so the no-leak
-    // guarantee is unconditional at the render site (#981 structural follow-up).
-    let redacted_key = if is_authority_bearing_url(&occurrence.declaration_key)
-        || occurrence.declaration_key.contains("://")
-    {
-        RedactedUrl::new(&occurrence.declaration_key).to_string()
-    } else {
-        occurrence
-            .declaration_key
-            .split(['?', '#'])
-            .next()
-            .unwrap_or_default()
-            .to_string()
-    };
+    // `declaration_key` is opaque (e.g. "top-level") for most ecosystems and would be mangled
+    // by an unconditional userinfo-scan, so redaction only runs when the key looks like a URL —
+    // see `redact_declaration_key`'s own doc comment for the exact gate and its history (#981,
+    // #993).
+    let redacted_key = redact_declaration_key(&occurrence.declaration_key);
     Diagnostic {
         range: occurrence.range,
         severity: Some(Severity::Information),
@@ -2064,13 +2050,13 @@ mod tests {
         );
     }
 
-    /// S3 (impl-critic): `generate_diagnostics_from_cache` must actually emit the
-    /// `INFORMATION` diagnostic for a `ParseResult::blocked_registries()` entry — the
-    /// §1.7 "must not degrade silently" requirement, previously entirely untested.
-    #[test]
-    fn test_generate_diagnostics_from_cache_emits_blocked_registry_diagnostic() {
+    /// Shared fixture for the `declaration_key`-redaction test family below (#993 M3): builds a
+    /// single dependency with one blocked-registry occurrence and returns the resulting
+    /// blocked-registry [`Diagnostic`], so each test only states the two values that actually
+    /// vary (`declaration_key`, `raw_value`) instead of restating the full
+    /// `ParseResult`/`MockDep`/`BlockedRegistryOccurrence` boilerplate.
+    fn blocked_diagnostic_for(declaration_key: &str, raw_value: &str) -> Diagnostic {
         use crate::net_policy::HostClass;
-        use crate::position::{Position, Range};
 
         struct BlockedRegistryParseResult {
             deps: Vec<MockDep>,
@@ -2109,8 +2095,8 @@ mod tests {
             blocked: vec![BlockedRegistryOccurrence {
                 range: name_range,
                 class: HostClass::CloudMetadata,
-                raw_value: "https://169.254.169.254/index".to_string(),
-                declaration_key: "https://169.254.169.254/index".to_string(),
+                raw_value: raw_value.to_string(),
+                declaration_key: declaration_key.to_string(),
             }],
         };
 
@@ -2127,11 +2113,25 @@ mod tests {
             PublishTime::now(),
         );
 
-        let blocked_diagnostic = diagnostics
-            .iter()
+        diagnostics
+            .into_iter()
             .find(|d| d.message.contains("blocked"))
-            .expect("expected a blocked-registry diagnostic");
-        assert_eq!(blocked_diagnostic.range, name_range);
+            .expect("expected a blocked-registry diagnostic")
+    }
+
+    /// S3 (impl-critic): `generate_diagnostics_from_cache` must actually emit the
+    /// `INFORMATION` diagnostic for a `ParseResult::blocked_registries()` entry — the
+    /// §1.7 "must not degrade silently" requirement, previously entirely untested.
+    #[test]
+    fn test_generate_diagnostics_from_cache_emits_blocked_registry_diagnostic() {
+        let blocked_diagnostic = blocked_diagnostic_for(
+            "https://169.254.169.254/index",
+            "https://169.254.169.254/index",
+        );
+        assert_eq!(
+            blocked_diagnostic.range,
+            Range::new(Position::new(0, 0), Position::new(0, 14))
+        );
         assert_eq!(blocked_diagnostic.severity, Some(Severity::Information));
         assert!(blocked_diagnostic.message.contains("169.254.169.254"));
         assert!(blocked_diagnostic.message.contains("cloud metadata"));
@@ -2148,68 +2148,10 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_query_string_credential()
      {
-        use crate::net_policy::HostClass;
-        use crate::position::{Position, Range};
-
-        struct BlockedRegistryParseResult {
-            deps: Vec<MockDep>,
-            uri: url::Url,
-            blocked: Vec<BlockedRegistryOccurrence>,
-        }
-
-        impl ParseResult for BlockedRegistryParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
-                self.blocked.clone()
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
-        let formatter = MockFormatter;
-        let parse_result = BlockedRegistryParseResult {
-            deps: vec![MockDep {
-                name: "internal-crate".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-            blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
-                class: HostClass::CloudMetadata,
-                raw_value: "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
-                declaration_key: "https://index.mycorp.dev/api?api_key=SECRET".to_string(),
-            }],
-        };
-
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let diagnostics = generate_diagnostics_from_cache(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            &formatter,
-            parse_result.uri(),
-            crate::freshness::FreshnessSettings::default(),
-            DiagnosticSeverities::default(),
-            PublishTime::now(),
+        let blocked_diagnostic = blocked_diagnostic_for(
+            "https://index.mycorp.dev/api?api_key=SECRET",
+            "https://index.mycorp.dev/api?api_key=SECRET",
         );
-
-        let blocked_diagnostic = diagnostics
-            .iter()
-            .find(|d| d.message.contains("blocked"))
-            .expect("expected a blocked-registry diagnostic");
         assert!(
             !blocked_diagnostic.message.contains("SECRET"),
             "{blocked_diagnostic:?}"
@@ -2228,69 +2170,8 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_query_string_credential_in_declaration_key_without_scheme_slashes()
      {
-        use crate::net_policy::HostClass;
-        use crate::position::{Position, Range};
-
-        struct BlockedRegistryParseResult {
-            deps: Vec<MockDep>,
-            uri: url::Url,
-            blocked: Vec<BlockedRegistryOccurrence>,
-        }
-
-        impl ParseResult for BlockedRegistryParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
-                self.blocked.clone()
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
-        let formatter = MockFormatter;
-        let slash_less = "https:169.254.169.254/v3/index.json?api_key=SECRET".to_string();
-        let parse_result = BlockedRegistryParseResult {
-            deps: vec![MockDep {
-                name: "internal-crate".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-            blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
-                class: HostClass::CloudMetadata,
-                raw_value: slash_less.clone(),
-                declaration_key: slash_less,
-            }],
-        };
-
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let diagnostics = generate_diagnostics_from_cache(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            &formatter,
-            parse_result.uri(),
-            crate::freshness::FreshnessSettings::default(),
-            DiagnosticSeverities::default(),
-            PublishTime::now(),
-        );
-
-        let blocked_diagnostic = diagnostics
-            .iter()
-            .find(|d| d.message.contains("blocked"))
-            .expect("expected a blocked-registry diagnostic");
+        let slash_less = "https:169.254.169.254/v3/index.json?api_key=SECRET";
+        let blocked_diagnostic = blocked_diagnostic_for(slash_less, slash_less);
         assert!(
             !blocked_diagnostic.message.contains("SECRET"),
             "declaration_key's query-string credential must be stripped even without \"://\", \
@@ -2309,115 +2190,29 @@ mod tests {
     #[test]
     fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_userinfo_in_declaration_key_without_scheme_slashes()
      {
-        use crate::net_policy::HostClass;
-        use crate::position::{Position, Range};
-
-        struct BlockedRegistryParseResult {
-            deps: Vec<MockDep>,
-            uri: url::Url,
-            blocked: Vec<BlockedRegistryOccurrence>,
-        }
-
-        impl ParseResult for BlockedRegistryParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
-                self.blocked.clone()
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
-        let formatter = MockFormatter;
-        let slash_less_credential = "https:user:hunter2@10.0.0.1/index".to_string();
-        let parse_result = BlockedRegistryParseResult {
-            deps: vec![MockDep {
-                name: "internal-crate".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-            blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
-                class: HostClass::CloudMetadata,
-                raw_value: slash_less_credential.clone(),
-                declaration_key: slash_less_credential,
-            }],
-        };
-
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let diagnostics = generate_diagnostics_from_cache(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            &formatter,
-            parse_result.uri(),
-            crate::freshness::FreshnessSettings::default(),
-            DiagnosticSeverities::default(),
-            PublishTime::now(),
-        );
-
-        let blocked_diagnostic = diagnostics
-            .iter()
-            .find(|d| d.message.contains("blocked"))
-            .expect("expected a blocked-registry diagnostic");
+        let slash_less_credential = "https:user:hunter2@10.0.0.1/index";
+        let blocked_diagnostic =
+            blocked_diagnostic_for(slash_less_credential, slash_less_credential);
         assert!(
-            !blocked_diagnostic.message.contains("hunter2"),
+            blocked_diagnostic
+                .message
+                .contains("declaration: https://***@10.0.0.1/index"),
             "declaration_key's userinfo must be redacted even without \"://\", \
              got: {blocked_diagnostic:?}"
         );
-        assert!(blocked_diagnostic.message.contains("10.0.0.1"));
     }
 
     /// #981: `declaration_key` opaque labels that merely *look* userinfo/credential-shaped
     /// (`"scope:@myorg"`, an npm scoped-registry label; `"source:Blocked"`, a NuGet source
     /// label; plus every other fixed label the remaining ecosystem crates emit) must survive
-    /// unredacted — none of them are authority-bearing URLs, and none contains `"://"`, so all
-    /// take the plain query/fragment-strip branch instead of `RedactedUrl`'s aggressive
+    /// unredacted — none of them are authority-bearing URLs, and `redact_declaration_key`'s
+    /// credential-shape scan finds no genuine `user:pass@`-shaped credential in any of them, so
+    /// all take the plain query/fragment-strip branch instead of `url_for_tracing`'s aggressive
     /// text-scan fallbacks, which would otherwise mangle e.g. `"scope:@myorg"` into
     /// `"***@myorg"` or `"source:Blocked"` into `"source:***"`.
     #[test]
     fn test_generate_diagnostics_from_cache_blocked_registry_message_does_not_mangle_opaque_declaration_keys()
      {
-        use crate::net_policy::HostClass;
-        use crate::position::{Position, Range};
-
-        struct BlockedRegistryParseResult {
-            deps: Vec<MockDep>,
-            uri: url::Url,
-            blocked: Vec<BlockedRegistryOccurrence>,
-        }
-
-        impl ParseResult for BlockedRegistryParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
-                self.blocked.clone()
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let formatter = MockFormatter;
         for opaque_key in [
             "scope:@myorg",
             "source:Blocked",
@@ -2428,42 +2223,12 @@ mod tests {
             "goproxy",
             "component-host:10.0.0.1",
         ] {
-            let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
-            let parse_result = BlockedRegistryParseResult {
-                deps: vec![MockDep {
-                    name: "internal-crate".into(),
-                    version_req: "1.0.0".into(),
-                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                    name_range,
-                }],
-                uri: crate::test_util::test_uri("/test/Cargo.toml"),
-                blocked: vec![BlockedRegistryOccurrence {
-                    range: name_range,
-                    class: HostClass::CloudMetadata,
-                    raw_value: "https://169.254.169.254/index".to_string(),
-                    declaration_key: opaque_key.to_string(),
-                }],
-            };
-
-            let cached_versions = HashMap::new();
-            let resolved_versions = HashMap::new();
-
-            let diagnostics = generate_diagnostics_from_cache(
-                &parse_result,
-                VersionData::new(&cached_versions, &resolved_versions),
-                &formatter,
-                parse_result.uri(),
-                crate::freshness::FreshnessSettings::default(),
-                DiagnosticSeverities::default(),
-                PublishTime::now(),
-            );
-
-            let blocked_diagnostic = diagnostics
-                .iter()
-                .find(|d| d.message.contains("blocked"))
-                .expect("expected a blocked-registry diagnostic");
+            let blocked_diagnostic =
+                blocked_diagnostic_for(opaque_key, "https://169.254.169.254/index");
             assert!(
-                blocked_diagnostic.message.contains(opaque_key),
+                blocked_diagnostic
+                    .message
+                    .contains(&format!("declaration: {opaque_key}")),
                 "opaque declaration_key {opaque_key:?} must survive unmangled, \
                  got: {blocked_diagnostic:?}"
             );
@@ -2476,80 +2241,91 @@ mod tests {
     /// NuGet's `format!("source:{}", entry.key)` or PyPI's `format!("named:{name}")` build from
     /// a user-chosen source name) parses with `Url::parse` treating `"source"` as the scheme
     /// and the rest as an opaque, host-less path — `is_authority_bearing_url` returns `false`
-    /// for it — so the gate must still fall back to `.contains("://")` to catch this shape, the
-    /// same way the pre-#981 code did.
+    /// for it — so the gate must still catch this shape another way (now: credential shape, not
+    /// `.contains("://")`), the same way the pre-#981 code did.
     #[test]
     fn test_generate_diagnostics_from_cache_blocked_registry_message_still_redacts_opaque_label_prefixed_url_in_declaration_key()
      {
-        use crate::net_policy::HostClass;
-        use crate::position::{Position, Range};
-
-        struct BlockedRegistryParseResult {
-            deps: Vec<MockDep>,
-            uri: url::Url,
-            blocked: Vec<BlockedRegistryOccurrence>,
-        }
-
-        impl ParseResult for BlockedRegistryParseResult {
-            fn dependencies(&self) -> Vec<&dyn Dependency> {
-                self.deps.iter().map(|d| d as &dyn Dependency).collect()
-            }
-            fn workspace_root(&self) -> Option<&std::path::Path> {
-                None
-            }
-            fn uri(&self) -> &url::Url {
-                &self.uri
-            }
-            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
-                self.blocked.clone()
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
-        let formatter = MockFormatter;
-        let opaque_prefixed_url = "source:https://user:hunter2@10.0.0.1/v3/index.json".to_string();
-        let parse_result = BlockedRegistryParseResult {
-            deps: vec![MockDep {
-                name: "internal-crate".into(),
-                version_req: "1.0.0".into(),
-                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
-                name_range,
-            }],
-            uri: crate::test_util::test_uri("/test/Cargo.toml"),
-            blocked: vec![BlockedRegistryOccurrence {
-                range: name_range,
-                class: HostClass::CloudMetadata,
-                raw_value: "https://10.0.0.1/v3/index.json".to_string(),
-                declaration_key: opaque_prefixed_url,
-            }],
-        };
-
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let diagnostics = generate_diagnostics_from_cache(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            &formatter,
-            parse_result.uri(),
-            crate::freshness::FreshnessSettings::default(),
-            DiagnosticSeverities::default(),
-            PublishTime::now(),
+        let blocked_diagnostic = blocked_diagnostic_for(
+            "source:https://user:hunter2@10.0.0.1/v3/index.json",
+            "https://10.0.0.1/v3/index.json",
         );
-
-        let blocked_diagnostic = diagnostics
-            .iter()
-            .find(|d| d.message.contains("blocked"))
-            .expect("expected a blocked-registry diagnostic");
         assert!(
-            !blocked_diagnostic.message.contains("hunter2"),
+            blocked_diagnostic
+                .message
+                .contains("declaration: source:https://***@10.0.0.1/v3/index.json"),
             "an opaque-label-prefixed URL's userinfo must still be redacted, \
              got: {blocked_diagnostic:?}"
         );
-        assert!(blocked_diagnostic.message.contains("10.0.0.1"));
+    }
+
+    /// #993 (residual #981 gap), then S1 from impl-critic on the first #993 fix: gating on a
+    /// bare `"//"` substring closed only the exact shape in the original report and left the
+    /// identical leak open for any other separator (a single `/`, no slash at all, or a
+    /// percent-encoded `"//"`) — all reachable from real config
+    /// (`deps-nuget::config::PackageSourceCredentials`'s `format!("source:{}", entry.key)` from
+    /// an unvalidated `NuGet.config` `<add key>`, `deps-pypi::config`'s `format!("named:{name}")`,
+    /// `deps-gitlab-ci::parser`'s `format!("component-host:{}", host_expr)`).
+    /// `redact_declaration_key`'s `find_credential_at`-based shape check has no opinion on
+    /// separators at all, so it closes all four uniformly.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_redacts_declaration_key_credential_regardless_of_separator()
+     {
+        for (declaration_key, expected_declaration) in [
+            ("source:feed//user:hunter2@h", "***@h"),
+            (
+                "source:feed/user:hunter2@nuget.internal",
+                "***@nuget.internal",
+            ),
+            (
+                "source:user:ghp_SECRET@nuget.pkg.github.com/OWNER/index.json",
+                "***@nuget.pkg.github.com/OWNER/index.json",
+            ),
+            ("source:feed%2F%2Fuser:hunter2@h", "***@h"),
+            ("named:user:hunter2@pypi.internal", "***@pypi.internal"),
+            (
+                "component-host:user:hunter2@gitlab.internal",
+                "***@gitlab.internal",
+            ),
+        ] {
+            let blocked_diagnostic =
+                blocked_diagnostic_for(declaration_key, "https://169.254.169.254/index");
+            assert!(
+                blocked_diagnostic
+                    .message
+                    .contains(&format!("declaration: {expected_declaration}")),
+                "declaration_key {declaration_key:?} must redact to {expected_declaration:?}, \
+                 got: {blocked_diagnostic:?}"
+            );
+        }
+    }
+
+    /// #993 S2 (impl-critic on the first #993 fix): a `declaration_key` merely *containing*
+    /// `"//"` with no `@` at all — a plausible custom source/component-host label naming, e.g.
+    /// a path-shaped feed or a `host//group` value — must survive unmangled. The credential-shape
+    /// gate only fires on an actual [`find_credential_at`] match, never on a bare separator
+    /// substring, so a label with no `@` never reaches `url_for_tracing`'s aggressive scans; an
+    /// earlier, separator-based version of this gate (a bare `.contains("//")` check) redacted
+    /// all three of these to `"***//..."`, destroying the one useful piece of information the
+    /// diagnostic exists to show.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_does_not_mangle_double_slash_labels_without_credential()
+     {
+        for opaque_key in [
+            "source:feed//mirror",
+            "component-host:gitlab.example.com//group",
+            "named:my//index",
+        ] {
+            let blocked_diagnostic =
+                blocked_diagnostic_for(opaque_key, "https://169.254.169.254/index");
+            assert!(
+                blocked_diagnostic
+                    .message
+                    .contains(&format!("declaration: {opaque_key}")),
+                "opaque declaration_key {opaque_key:?} must survive unmangled, \
+                 got: {blocked_diagnostic:?}"
+            );
+        }
     }
 
     /// #925 S2 (then corrected by a later code-review pass, finding #3): a config-global

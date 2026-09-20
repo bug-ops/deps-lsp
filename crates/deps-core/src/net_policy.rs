@@ -2264,22 +2264,107 @@ pub fn url_for_tracing(raw: &str) -> String {
 /// they were never designed for: those scans treat any `word:word@`/`word:@` shape as a
 /// possible credential (#810's `key:value` carve-out), which would mangle an opaque label like
 /// `"scope:@myorg"` (`"***@myorg"`) or `"source:Blocked"` (`"source:***"`) into a false-positive
-/// redaction (#981).
+/// redaction (#981). Kept `pub(crate)`, not `pub`: [`redact_declaration_key`] is the only
+/// remaining caller outside this module's own tests, and this predicate alone (without also
+/// checking for credential shape) is not a safe redaction gate on its own — see that function's
+/// doc for why.
+#[must_use]
+pub(crate) fn is_authority_bearing_url(raw: &str) -> bool {
+    url::Url::parse(raw).is_ok_and(|url| url.host().is_some())
+}
+
+/// Redacts a [`crate::ecosystem::BlockedRegistryOccurrence::declaration_key`] value for safe
+/// inclusion in a client-visible diagnostic message.
+///
+/// `key` is not always a URL: most ecosystems set it to a short opaque label (`"top-level"`,
+/// `"source:Blocked"`, `"scope:@myorg"`), and only some set it to a real registry URL, sometimes
+/// prefixed with an opaque label of the ecosystem's own choosing
+/// (`"source:https://user:pass@host/index"`). Running [`url_for_tracing`]'s aggressive
+/// text-scan fallbacks unconditionally would mangle a label like `"scope:@myorg"` into
+/// `"***@myorg"` (#981), so redaction only runs when `key` shows real URL structure
+/// (`is_authority_bearing_url`) or a credential shape of its own: at least one `@` whose own
+/// preceding segment (back to the previous `@`, or `key`'s own start) has a credential-shaped
+/// `:` once its own trailing `:` is stripped (`segment_has_credential_colon`, checked
+/// per-segment so a decoy trailing `label:@...` segment can't shadow an earlier real credential
+/// — #993 M5). Stripping the trailing `:` first is what keeps `"scope:@myorg"` — an
+/// empty-username userinfo shape used as an opaque label, not a credential — from matching,
+/// since after stripping it the segment is just `"scope"`, with no `:` left to trip the check.
+/// This is a shape check, not a separator check: it has no opinion on `/` at all, so it catches
+/// a credential regardless of what separates the opaque label from it
+/// (`"source:user:ghp_SECRET@host"`, `"source:feed/user:hunter2@host"`,
+/// `"source:feed//user:hunter2@host"`, even a percent-encoded
+/// `"source:feed%2F%2Fuser:hunter2@h"`, since the scan only looks at `:`/`@`, never `/`), while
+/// never mangling a `/`-containing label that has no `@` at all (`"source:feed//mirror"`,
+/// `"component-host:gitlab.example.com//group"` are left untouched — #993 S2, a regression in
+/// an earlier, separator-based version of this gate). Every other key takes the plain
+/// query/fragment-strip fallback instead.
+///
+/// Two accepted trade-offs, both favoring over-redaction over under-redaction per this module's
+/// own stated design (see [`redact_userinfo`]'s doc):
+/// - Once triggered, the actual redaction ([`url_for_tracing`]) can still destroy more of `key`
+///   than just the credential — e.g. `"source:feed//user:hunter2@h"` redacts to `"***@h"`,
+///   losing the `"source:feed//"` label entirely — since the fallback scan this reaches has no
+///   way to tell where the opaque label ends and true userinfo begins once neither
+///   `is_authority_bearing_url` nor a real authority is available to anchor on. This defeats
+///   `declaration_key`'s own disambiguation purpose (see its doc, and
+///   `build_blocked_registry_diagnostic`'s) for that one value.
+/// - A non-credential `label:text@text`-shaped key is redacted too, since the gate cannot tell
+///   it apart from a real credential — e.g. `"source:contoso@internal"` redacts to
+///   `"***@internal"` even though `contoso` is just a source name, not a password. In practice
+///   only a free-text label an ecosystem builds from unvalidated user input (e.g. NuGet's
+///   `format!("source:{}", entry.key)` from a `NuGet.config` `<add key>` attribute) is likely to
+///   contain an `@` at all — most ecosystems' own fixed/opaque labels cannot.
+///
+/// This is a best-effort heuristic gate, not a formally verified one: it closes every
+/// known-realistic and known-adversarial leak shape found so far (#981, #993), but a
+/// sufficiently unusual `key` could in principle still slip past both `is_authority_bearing_url`
+/// and this shape check.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::net_policy::is_authority_bearing_url;
+/// use deps_core::net_policy::redact_declaration_key;
 ///
-/// assert!(is_authority_bearing_url("https://registry.example/index"));
-/// assert!(is_authority_bearing_url("https:user:pass@10.0.0.1/index"));
-/// assert!(!is_authority_bearing_url("scope:@myorg"));
-/// assert!(!is_authority_bearing_url("source:Blocked"));
-/// assert!(!is_authority_bearing_url("top-level"));
+/// assert_eq!(
+///     redact_declaration_key("https://user:hunter2@10.0.0.1/index"),
+///     "https://***@10.0.0.1/index"
+/// );
+/// assert_eq!(
+///     redact_declaration_key("source:https://user:hunter2@10.0.0.1/v3/index.json"),
+///     "source:https://***@10.0.0.1/v3/index.json"
+/// );
+/// assert_eq!(redact_declaration_key("source:Blocked"), "source:Blocked");
+/// assert_eq!(redact_declaration_key("scope:@myorg"), "scope:@myorg");
+/// // A single `/` (not `//`) still redacts — this is a credential-shape gate, not a
+/// // separator-substring gate.
+/// assert_eq!(
+///     redact_declaration_key("source:feed/user:hunter2@nuget.internal"),
+///     "***@nuget.internal"
+/// );
+/// // No `@` at all: never redacted, even with a `/`-heavy label.
+/// assert_eq!(
+///     redact_declaration_key("source:feed//mirror"),
+///     "source:feed//mirror"
+/// );
 /// ```
 #[must_use]
-pub fn is_authority_bearing_url(raw: &str) -> bool {
-    url::Url::parse(raw).is_ok_and(|url| url.host().is_some())
+#[expect(
+    clippy::string_slice,
+    reason = "`at` comes from `match_indices('@')` on ASCII '@' bytes, so every slice bound \
+              always lands on a char boundary"
+)]
+pub fn redact_declaration_key(key: &str) -> String {
+    let mut prev = 0;
+    let has_credential_shape = key.match_indices('@').any(|(at, _)| {
+        let segment = &key[prev..at];
+        prev = at + 1;
+        segment_has_credential_colon(segment.trim_end_matches(':'))
+    });
+    if is_authority_bearing_url(key) || has_credential_shape {
+        url_for_tracing(key)
+    } else {
+        key.split(['?', '#']).next().unwrap_or_default().to_string()
+    }
 }
 
 /// A URL-bearing value that has already been redacted for safe inclusion in error or log
@@ -2875,6 +2960,52 @@ mod tests {
         assert!(!is_authority_bearing_url("top-level"));
         assert!(!is_authority_bearing_url("component-host:10.0.0.1"));
         assert!(!is_authority_bearing_url("named:internal"));
+    }
+
+    /// #993 M5 (impl-critic on the first credential-shape fix): the carve-out used to inspect
+    /// only the *last* `@` found by the old `find_credential_at`-based scan, so a trailing
+    /// `label:@`-shaped decoy segment could shadow an earlier, real credential. The per-segment
+    /// scan (`segment_has_credential_colon` on each `@`-delimited segment, independently) fixes
+    /// this: every segment is judged on its own, so a decoy segment after the real credential
+    /// can no longer suppress redaction of the one before it.
+    #[test]
+    fn redact_declaration_key_trailing_decoy_segment_does_not_shadow_earlier_credential() {
+        assert_eq!(
+            redact_declaration_key("source:user:hunter2@nuget.internal:@x"),
+            "***@x"
+        );
+        assert_eq!(
+            redact_declaration_key("source:user:hunter2@host/scope:@myorg"),
+            "***@host/***@myorg"
+        );
+        assert_eq!(redact_declaration_key("named:user:ghp_SECRET@h:@"), "***@");
+        for adversarial in [
+            "source:user:hunter2@nuget.internal:@x",
+            "source:user:hunter2@host/scope:@myorg",
+            "named:user:ghp_SECRET@h:@",
+            "source:user:hunter2@h@scope:@myorg",
+        ] {
+            assert!(
+                !redact_declaration_key(adversarial).contains("hunter2")
+                    && !redact_declaration_key(adversarial).contains("SECRET"),
+                "credential in {adversarial:?} must not survive redaction"
+            );
+        }
+    }
+
+    /// #993 M6: the credential-shape gate cannot distinguish a real credential from a
+    /// non-credential `label:text@text` key, so a free-text label containing an `@` (only
+    /// realistically reachable via NuGet's unvalidated `NuGet.config` `<add key>` attribute) is
+    /// redacted too, even though nothing in it is a password. Accepted per this module's
+    /// over-redact-over-leak design; pinned here as a documented, intentional trade-off rather
+    /// than an accidental regression.
+    #[test]
+    fn redact_declaration_key_over_redacts_non_credential_label_at_text_shape() {
+        assert_eq!(
+            redact_declaration_key("source:contoso@internal"),
+            "***@internal"
+        );
+        assert_eq!(redact_declaration_key("named:my-index@v1"), "***@v1");
     }
 
     fn host_class(url: &str) -> HostClass {
