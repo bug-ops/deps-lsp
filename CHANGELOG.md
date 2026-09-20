@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
+- **deps-core**: hover and code-action registry version fetches now respect a 10s deadline instead of blocking indefinitely, preventing a slow or sequential-fallback registry lookup from stalling an interactive LSP request (resolves #1204) (#1210)
 - **deps-core, deps-swift, deps-maven, deps-lsp**: completion no longer forwards a credential-bearing search prefix to the registry or logs it unredacted (resolves #1206) (#1208)
 - **deps-core**: blocked-registry diagnostic's `declaration_key` redaction now gates on credential shape rather than a URL-separator substring, closing a credential-leak gap for opaque-label-prefixed keys regardless of separator, e.g. `"source:feed/user:pass@host"` or `"named:user:pass@host"` (resolves #993) (#1201)
 - **deps-gradle**: version-completion same-line fallback no longer misattributes a non-dependency or still-unparsed literal on a shared manifest line to a nearby real dependency (resolves #1191) (#1196)

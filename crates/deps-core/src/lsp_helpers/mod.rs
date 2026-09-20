@@ -861,6 +861,54 @@ impl<'a> VersionData<'a> {
 /// one definition, not a hand-copied duplicate per feature state.
 pub const COMPLETION_SEARCH_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Wall-clock budget hover and code-action generation give the primary
+/// `Registry::get_versions_from` fetch for the dependency under the cursor.
+///
+/// Unlike completion, code lens, inlay hints, and the background fetch task, hover
+/// and code actions previously awaited this call with no deadline at all — an
+/// ecosystem whose registry client retries across several candidate URLs
+/// sequentially (e.g. `deps-maven`'s Gradle Plugin Portal fallback) could multiply
+/// `HttpCache`'s own per-request timeout into tens of seconds of blocked, user-facing
+/// latency on a single hover or lightbulb request (issue #1204). This is the *only*
+/// deadline needed to fix that: it wraps the whole `get_versions_from` future,
+/// cancelling it — candidate-URL loop included — at the ecosystem-registry level, so
+/// no per-ecosystem inner budget is required on top of it. On elapse, hover falls back
+/// to its existing `.ok()`-based basic-card degradation (the same path a genuine fetch
+/// error takes); code actions instead drop the speculative fix/unsat actions outright
+/// (see `await_versions_fetch`'s `timed_out` flag) rather than reusing that same
+/// fail-open path, since an unverified yank check must not be treated as "not yanked".
+pub const REGISTRY_FETCH_BUDGET: Duration = Duration::from_secs(10);
+
+/// Awaits `fetch` bounded by [`REGISTRY_FETCH_BUDGET`], logging a `tracing::warn!` naming
+/// `package` and `context` if the budget elapses first.
+///
+/// Shared by hover and code-action generation to avoid duplicating this
+/// timeout/log/degrade shape at both call sites. Returns `(None, false)` for a
+/// fetch-level error exactly like the pre-#1204 `.ok()` degrade, and `(None, true)` on
+/// timeout — the `bool` lets a caller (code actions) tell the two apart when a fetch
+/// failure and a fetch timeout must not be treated the same way (impl-critic S1: a
+/// timeout is not a verified "not yanked" answer, so it must not fail open the way a
+/// genuine registry outage does).
+#[cfg(feature = "lsp-responses")]
+async fn await_versions_fetch<T, E>(
+    fetch: impl std::future::Future<Output = Result<T, E>>,
+    package: impl std::fmt::Display,
+    context: &'static str,
+) -> (Option<T>, bool) {
+    match tokio::time::timeout(REGISTRY_FETCH_BUDGET, fetch).await {
+        Ok(result) => (result.ok(), false),
+        Err(_) => {
+            tracing::warn!(
+                package = %package,
+                context,
+                timeout_secs = REGISTRY_FETCH_BUDGET.as_secs(),
+                "primary registry version fetch timed out"
+            );
+            (None, true)
+        }
+    }
+}
+
 /// Converts UTF-16 offset to byte offset in a string.
 ///
 /// LSP uses UTF-16 code units for character positions (for compatibility with

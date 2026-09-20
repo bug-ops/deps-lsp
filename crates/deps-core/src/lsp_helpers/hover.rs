@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, escape_markdown, in_use_version,
-    markdown_code_span, position_in_range, resolve_in_use_version,
+    EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, await_versions_fetch, escape_markdown,
+    in_use_version, markdown_code_span, position_in_range, resolve_in_use_version,
 };
 use crate::github::normalize_tag;
 
@@ -125,10 +125,13 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // host) must degrade to the same basic card the `!resolvable` branch renders, not vanish
     // the whole hover response.
     let available_versions = if resolvable {
-        registry
-            .get_versions_from(dep.name(), &dep_source, freshness)
-            .await
-            .ok()
+        await_versions_fetch(
+            registry.get_versions_from(dep.name(), &dep_source, freshness),
+            dep.name(),
+            "hover",
+        )
+        .await
+        .0
     } else {
         None
     };
@@ -2588,6 +2591,46 @@ mod tests {
         assert!(
             !content.value.contains("**Latest**"),
             "no version data is available on a fetch failure; got: {}",
+            content.value
+        );
+    }
+
+    /// #1204: the primary `get_versions_from` fetch must not block hover forever — once
+    /// `REGISTRY_FETCH_BUDGET` elapses the timeout's `Err(_)` arm must degrade to the same
+    /// basic card a genuine fetch error renders, not hang or panic. `start_paused` lets the
+    /// budget elapse without a real wall-clock wait.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_hover_registry_fetch_timeout_degrades_to_basic_card() {
+        use std::collections::HashMap;
+
+        let parse_result = freshness_test_parse_result("serde");
+        let registry = SlowRegistry {
+            delay: REGISTRY_FETCH_BUDGET + Duration::from_secs(1),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover must still render when the primary fetch times out, not hang or panic");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            content.value.contains("serde"),
+            "basic card must still render the package name; got: {}",
+            content.value
+        );
+        assert!(
+            !content.value.contains("**Latest**"),
+            "no version data is available once the fetch times out; got: {}",
             content.value
         );
     }
