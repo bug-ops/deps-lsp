@@ -56,3 +56,18 @@ updates:
       github-actions:
         patterns:
           - "*"
+
+  # github-action Docker base image
+  - package-ecosystem: "docker"
+    directory: "/crates/github-action"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "Etc/GMT"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore"
