@@ -119,6 +119,15 @@ pub struct DenoParseResult {
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
     pub dependency_truncation: Option<(usize, usize)>,
+    /// Every `.npmrc`-resolved alternate registry index an `npm:`-scheme import classified
+    /// against (#1227) — the `deno.json` counterpart of
+    /// `deps_npm::parser::NpmParseResult::resolved_registries`. Consumed by
+    /// `DenoEcosystem::parse_manifest`, which registers each one on the shared
+    /// [`crate::registry::DenoRegistry`] via
+    /// [`crate::registry::DenoRegistry::register_alternate_npm`] so a later
+    /// `AlternateRegistry`-sourced fetch actually has a client to route through, instead of
+    /// failing closed to `PackageNotFound` for every request.
+    pub resolved_registries: Vec<deps_npm::config::NpmRegistryIndex>,
 }
 
 deps_core::impl_parse_result!(
@@ -233,12 +242,13 @@ pub fn parse_deno_json_with_context(
         );
     }
 
-    classify_npm_imports(&mut dependencies, uri, ctx);
+    let resolved_registries = classify_npm_imports(&mut dependencies, uri, ctx);
 
     Ok(DenoParseResult {
         dependencies,
         uri: uri.clone(),
         dependency_truncation: budget.truncation(),
+        resolved_registries,
     })
 }
 
@@ -305,11 +315,21 @@ fn check_ast_nesting_depth(root: &Value<'_>, max_depth: usize) -> std::result::R
 /// workspace is reused across every reparse and both ecosystems, and a real server-side
 /// policy that allows workspace registries applies identically whether the `npm:` scope entry
 /// is read from a `package.json` or a `deno.json`.
-fn classify_npm_imports(dependencies: &mut [DenoDependency], uri: &Url, ctx: &DenoParseContext) {
+///
+/// Returns every alternate registry index resolved along the way (#1227), for the caller to
+/// register on [`crate::registry::DenoRegistry`] — without that registration, a dependency
+/// classified here as `AlternateRegistry` would later fail closed to `PackageNotFound` at
+/// fetch time (no client registered for its index), the same shape of bug the classification
+/// itself fixed.
+fn classify_npm_imports(
+    dependencies: &mut [DenoDependency],
+    uri: &Url,
+    ctx: &DenoParseContext,
+) -> Vec<deps_npm::config::NpmRegistryIndex> {
     let Some(manifest_dir) = deps_core::lockfile::resolve_manifest_file_path(uri)
         .and_then(|path| path.parent().map(std::path::Path::to_path_buf))
     else {
-        return;
+        return Vec::new();
     };
     if !dependencies.iter().any(|dep| {
         matches!(
@@ -317,7 +337,7 @@ fn classify_npm_imports(dependencies: &mut [DenoDependency], uri: &Url, ctx: &De
             Some((crate::specifier::Scheme::Npm, _))
         )
     }) {
-        return;
+        return Vec::new();
     }
 
     let npm_config = deps_npm::config::resolve(&manifest_dir, &ctx.config_cache, &ctx.policy);
@@ -333,6 +353,8 @@ fn classify_npm_imports(dependencies: &mut [DenoDependency], uri: &Url, ctx: &De
             dep.source = source;
         }
     }
+
+    npm_config.resolved_registries()
 }
 
 /// Builds a [`DenoDependency`] for every entry in the `imports` object, applying
@@ -827,8 +849,11 @@ mod tests {
     /// fail-closed `CustomRegistry` (not the fetchable `AlternateRegistry`) because this call
     /// site resolves under the default [`deps_core::net_policy::RegistryAccessPolicy`]
     /// (public-only) — the same safe-by-default behavior `deps-npm` itself has when no
-    /// workspace-registry-enabling policy is threaded in, so `DenoFormatter::can_resolve_source`
-    /// (never overridden) correctly answers `false` and no outbound request is made at all.
+    /// workspace-registry-enabling policy is threaded in. `CustomRegistry` stays
+    /// unconditionally unresolvable regardless of `resolves_alternate_registry` (#1227's
+    /// override only widens `AlternateRegistry` handling, per `SourcePolicy::can_resolve_source`'s
+    /// own doc), so `DenoFormatter::can_resolve_source` still correctly answers `false` here
+    /// and no outbound request is made at all.
     #[test]
     fn test_npm_scoped_import_resolves_via_npmrc() {
         use deps_core::lsp_helpers::{PackageRendering, SourcePolicy};

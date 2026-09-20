@@ -126,6 +126,17 @@ fn unroutable(name: &PackageName) -> DepsError {
     }
 }
 
+/// Extracts the bare npm package name from an `npm:`-scheme [`PackageName`]'s
+/// scheme-stripped `rest`, shared by every `Registry` method that delegates to
+/// [`DenoRegistry`]'s `npm` half — factored out so the `rest.is_empty()` guard (#310, see
+/// [`unroutable`]'s doc) can't be applied to some of those methods and missed on others.
+fn npm_bare_name(name: &PackageName, rest: &str) -> Result<PackageName> {
+    if rest.is_empty() {
+        return Err(unroutable(name));
+    }
+    Ok(PackageName::new(rest))
+}
+
 /// One JSR package version entry inside `meta.json`'s `versions` object.
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -486,6 +497,15 @@ impl DenoRegistry {
         }
     }
 
+    /// Registers an `.npmrc`-resolved alternate registry index (#1227) on this facade's
+    /// shared `npm:` half, mirroring [`NpmRegistry::register_alternate`]. `npm` is a private
+    /// field, so this passthrough is the only way `DenoEcosystem::parse_manifest` can reach
+    /// it — the `deno.json` equivalent of `NpmEcosystem::parse_manifest`'s own registration
+    /// loop over `NpmParseResult::resolved_registries`.
+    pub fn register_alternate_npm(&self, index: deps_npm::config::NpmRegistryIndex) {
+        self.npm.register_alternate(index);
+    }
+
     /// Fetches `name`'s (already scheme-qualified, e.g. `"jsr:@std/fs"`) license at
     /// `version` (issue #660).
     ///
@@ -524,10 +544,7 @@ impl Registry for DenoRegistry {
                         .collect())
                 }
                 Some((Scheme::Npm, rest)) => {
-                    if rest.is_empty() {
-                        return Err(unroutable(name));
-                    }
-                    let bare = PackageName::new(rest);
+                    let bare = npm_bare_name(name, rest)?;
                     // S3: `NpmRegistry` has an *inherent* `get_versions` that shadows the
                     // trait method and silently drops `get_versions_with`'s freshness
                     // semantics if called via plain method syntax — UFCS forces the trait
@@ -547,15 +564,37 @@ impl Registry for DenoRegistry {
         Box::pin(async move {
             match split_scheme(name.as_str()) {
                 Some((Scheme::Npm, rest)) => {
-                    if rest.is_empty() {
-                        return Err(unroutable(name));
-                    }
-                    let bare = PackageName::new(rest);
+                    let bare = npm_bare_name(name, rest)?;
                     Registry::get_versions_with(&self.npm, &bare, freshness).await
                 }
                 // JSR's `meta.json` already carries `createdAt` in the same response
                 // `get_versions` fetches (D10) — no separate freshness request needed.
                 _ => self.get_versions(name).await,
+            }
+        })
+    }
+
+    /// Source-aware `npm:` dispatch (#1227): forwards `source` to [`NpmRegistry`]'s own
+    /// `get_versions_from`, which routes an `AlternateRegistry` to its registered alternate
+    /// client (via [`Self::register_alternate_npm`]) instead of the public npm registry —
+    /// without this override, the trait default drops `source` entirely and every `npm:`
+    /// dependency (including an `AlternateRegistry`-classified one) would fetch through the
+    /// public-registry path with the private package name, the exact #248-class leak
+    /// `SourcePolicy::resolves_alternate_registry` opting in is supposed to prevent, not
+    /// enable. `jsr:` has no alternate-registry concept, so it keeps the source-blind path.
+    fn get_versions_from<'a>(
+        &'a self,
+        name: &'a PackageName,
+        source: &'a deps_core::DependencySource,
+        freshness: FreshnessSettings,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
+        Box::pin(async move {
+            match split_scheme(name.as_str()) {
+                Some((Scheme::Npm, rest)) => {
+                    let bare = npm_bare_name(name, rest)?;
+                    Registry::get_versions_from(&self.npm, &bare, source, freshness).await
+                }
+                _ => self.get_versions_with(name, freshness).await,
             }
         })
     }
@@ -581,13 +620,39 @@ impl Registry for DenoRegistry {
                         .map(|v| Box::new(v) as Box<dyn Version>))
                 }
                 Some((Scheme::Npm, rest)) => {
-                    if rest.is_empty() {
-                        return Err(unroutable(name));
-                    }
-                    let bare = PackageName::new(rest);
+                    let bare = npm_bare_name(name, rest)?;
                     Registry::get_latest_matching(&self.npm, &bare, req).await
                 }
                 None => Err(unroutable(name)),
+            }
+        })
+    }
+
+    /// `get_versions_from`'s `get_latest_matching`-shaped counterpart (#1227) — same
+    /// source-aware `npm:` dispatch, needed because `deps-core`'s hover wildcard-requirement
+    /// fallback and `deps-engine`'s background fetch both call this method, not
+    /// `get_latest_matching`, once a dependency's source has been resolved.
+    fn get_latest_matching_from<'a>(
+        &'a self,
+        name: &'a PackageName,
+        source: &'a deps_core::DependencySource,
+        req: &'a VersionReq,
+        minimum_stability: Option<&'a str>,
+    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
+        Box::pin(async move {
+            match split_scheme(name.as_str()) {
+                Some((Scheme::Npm, rest)) => {
+                    let bare = npm_bare_name(name, rest)?;
+                    Registry::get_latest_matching_from(
+                        &self.npm,
+                        &bare,
+                        source,
+                        req,
+                        minimum_stability,
+                    )
+                    .await
+                }
+                _ => self.get_latest_matching(name, req).await,
             }
         })
     }
@@ -1308,6 +1373,121 @@ mod tests {
 
         abbrev_mock.assert_async().await;
         full_mock.assert_async().await;
+    }
+
+    // --- Alternate-registry router through `DenoRegistry` (#1227) ---
+
+    fn all_policy() -> deps_core::net_policy::RegistryAccessPolicy {
+        deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        )
+    }
+
+    /// Mirrors `deps_npm`'s own `alternate_index` test helper: mockito binds
+    /// `http://127.0.0.1`, so both the `cfg(test)` loopback carve-out in
+    /// `NpmRegistryIndex::new` and `WorkspaceRegistryAccess::All` are needed to register it.
+    fn alternate_index(raw: &str) -> deps_npm::config::NpmRegistryIndex {
+        deps_npm::config::NpmRegistryIndex::new(raw, &all_policy()).unwrap()
+    }
+
+    /// #1227: proves `DenoRegistry::get_versions_from` forwards an `AlternateRegistry`
+    /// `npm:` source all the way to `NpmRegistry`'s own alternate-client dispatch, rather
+    /// than the trait default silently dropping `source` and hitting the public registry
+    /// with a private package name — mirrors `deps_npm`'s
+    /// `test_get_versions_from_routes_alternate_registry_never_public`, driven through
+    /// `DenoRegistry` instead of `NpmRegistry` directly.
+    #[tokio::test]
+    async fn test_deno_registry_get_versions_from_routes_alternate_registry_never_public_1227() {
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_mock = alt_server
+            .mock("GET", "/@myorg/internal-lib")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .create_async()
+            .await;
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"versions": {"9.9.9": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let npm = NpmRegistry::with_public_base_for_test(Arc::clone(&cache), public_server.url());
+        let index = alternate_index(&alt_server.url());
+        let deno_registry = DenoRegistry::with_npm(Arc::clone(&cache), npm);
+        deno_registry.register_alternate_npm(index.clone());
+
+        let source = deps_core::DependencySource::AlternateRegistry {
+            index: index.as_str().to_string(),
+            mirrors_crates_io: false,
+        };
+        let versions = Registry::get_versions_from(
+            &deno_registry,
+            &PackageName::new("npm:@myorg/internal-lib"),
+            &source,
+            FreshnessSettings::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(versions.len(), 1);
+
+        alt_mock.assert_async().await;
+        public_mock.assert_async().await;
+    }
+
+    /// `get_versions_from`'s counterpart for `DenoRegistry::get_latest_matching_from`
+    /// (#1227) — same alternate-vs-public routing proof, for the method `deps-core`'s
+    /// hover wildcard-requirement fallback and `deps-engine`'s background fetch actually
+    /// call once a dependency's source has been resolved.
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_from_routes_alternate_registry_never_public_1227()
+     {
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_mock = alt_server
+            .mock("GET", "/@myorg/internal-lib")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .create_async()
+            .await;
+
+        let mut public_server = mockito::Server::new_async().await;
+        let public_mock = public_server
+            .mock("GET", mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(r#"{"versions": {"9.9.9": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let npm = NpmRegistry::with_public_base_for_test(Arc::clone(&cache), public_server.url());
+        let index = alternate_index(&alt_server.url());
+        let deno_registry = DenoRegistry::with_npm(Arc::clone(&cache), npm);
+        deno_registry.register_alternate_npm(index.clone());
+
+        let source = deps_core::DependencySource::AlternateRegistry {
+            index: index.as_str().to_string(),
+            mirrors_crates_io: false,
+        };
+        let latest = Registry::get_latest_matching_from(
+            &deno_registry,
+            &PackageName::new("npm:@myorg/internal-lib"),
+            &source,
+            &VersionReq::new("*"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(latest.is_some());
+
+        alt_mock.assert_async().await;
+        public_mock.assert_async().await;
     }
 
     #[tokio::test]

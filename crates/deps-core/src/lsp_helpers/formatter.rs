@@ -682,6 +682,24 @@ pub trait SourcePolicy: Send + Sync {
     /// plain `Registry`) still overrides [`can_resolve_source`](Self::can_resolve_source)
     /// directly instead of this flag.
     ///
+    /// **This flag alone only widens the gate — it does not make fetching actually work**
+    /// (#1227). Overriding it to `true` without a matching source-aware `Registry`
+    /// implementation regresses silently: dependencies that were previously dropped from the
+    /// fetch queue entirely now reach it, but `Registry::get_versions_from`/
+    /// `get_latest_matching_from`'s *default* implementation ignores `source` and forwards to
+    /// the plain public-registry path — so an `AlternateRegistry` dependency would fetch
+    /// under its private package name against the wrong (public/default) registry instead of
+    /// its resolved alternate host, the exact #248-class name leak this whole `SourcePolicy`
+    /// design exists to prevent. Before flipping this flag, the ecosystem's `Registry` impl
+    /// must also: (1) override `get_versions_from`/`get_latest_matching_from` to dispatch an
+    /// `AlternateRegistry` source to a client for its `index`, and (2) register that client
+    /// (e.g. an `NpmRegistry::register_alternate`-shaped call) from `Ecosystem::parse_manifest`
+    /// over the parse result's own resolved-registries list — see `deps-npm`'s
+    /// `NpmEcosystem::parse_manifest`/`NpmRegistry::{register_alternate,get_versions_from}` for
+    /// the reference shape, and `deps-deno`'s `DenoEcosystem::parse_manifest`/
+    /// `DenoRegistry::{register_alternate_npm,get_versions_from}` for a facade ecosystem that
+    /// delegates its alternate-capable scheme to another crate's registry.
+    ///
     /// Default `false`.
     ///
     /// # Examples

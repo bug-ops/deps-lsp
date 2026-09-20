@@ -176,7 +176,16 @@ impl DiagnosticPolicy for DenoFormatter {
     }
 }
 
-impl SourcePolicy for DenoFormatter {}
+impl SourcePolicy for DenoFormatter {
+    /// Widens [`SourcePolicy::can_resolve_source`] so an `.npmrc`-resolved
+    /// `AlternateRegistry` `npm:` specifier is resolvable, matching
+    /// [`deps_npm::NpmFormatter`]'s override — without this, `dedup_dependencies_by_source`
+    /// drops every `AlternateRegistry`-classified Deno dependency from the fetch queue
+    /// before a request is ever made (#1227).
+    fn resolves_alternate_registry(&self) -> bool {
+        true
+    }
+}
 
 impl OsvNaming for DenoFormatter {
     /// `npm:` dependencies map to OSV's `npm` ecosystem via their bare name (D5);
@@ -365,6 +374,28 @@ mod tests {
                 "expected {requirement:?} to be rejected for npm: scheme"
             );
         }
+    }
+
+    /// #1227: `can_resolve_source` accepts `Registry` and `AlternateRegistry` (widened via
+    /// `resolves_alternate_registry`), rejects `CustomRegistry` — mirrors
+    /// `deps_npm::NpmFormatter`'s and `deps_nuget::NuGetFormatter`'s equivalent test. Without
+    /// the `SourcePolicy` override this pins, `dedup_dependencies_by_source` would drop every
+    /// `AlternateRegistry`-classified Deno `npm:` dependency before a fetch is ever made.
+    #[test]
+    fn test_can_resolve_source_alternate_registry_1227() {
+        let formatter = DenoFormatter;
+        assert!(formatter.can_resolve_source(&deps_core::parser::DependencySource::Registry));
+        assert!(formatter.can_resolve_source(
+            &deps_core::parser::DependencySource::AlternateRegistry {
+                index: "https://npm.pkg.github.com".to_string(),
+                mirrors_crates_io: false,
+            }
+        ));
+        assert!(!formatter.can_resolve_source(
+            &deps_core::parser::DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        ));
     }
 
     #[test]
