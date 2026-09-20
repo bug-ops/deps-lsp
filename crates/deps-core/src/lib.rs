@@ -165,9 +165,11 @@ pub mod position;
 /// Shared escape-aware string-literal and comment scanning.
 ///
 /// [`quote_scan::read_string_literal`], [`quote_scan::strip_line_comment`],
-/// [`quote_scan::blank_comments`], and [`quote_scan::is_code_byte`], parameterized over
-/// [`quote_scan::ScanSyntax`] — used by `deps-bundler`, `deps-swift`, and `deps-pypi`
-/// instead of each hand-rolling its own scanner (#1022).
+/// [`quote_scan::blank_comments`], [`quote_scan::is_code_byte`],
+/// [`quote_scan::last_string_literal`], and [`quote_scan::find_closing_quote_before_comment`],
+/// parameterized over [`quote_scan::ScanSyntax`] — used by `deps-bundler`, `deps-swift`,
+/// `deps-pypi`, and `deps-gradle` instead of each hand-rolling its own scanner (#1022,
+/// #1174).
 pub mod quote_scan;
 /// The [`registry::Registry`] trait: version lookup and search that every
 /// ecosystem's registry client implements.
