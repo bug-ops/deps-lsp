@@ -243,6 +243,13 @@ async fn fallback_completion(
         return vec![];
     }
 
+    // #1206 S3: must run before this function's own `tracing::info!` below, not just inside `search_packages`.
+    if let Some(rejected) =
+        deps_core::completion::reject_credential_bearing_value(prefix, "fallback_completion prefix")
+    {
+        return rejected;
+    }
+
     // Whether the cursor sits inside already-open manifest markup (an XML tag/attribute)
     // that can only safely hold bare candidate text — inserting the full snippet would
     // nest a duplicate copy of the markup already open around the cursor (#724/#728).
@@ -269,6 +276,13 @@ async fn search_packages(
     query: &str,
     bare: bool,
 ) -> Vec<CompletionItem> {
+    // #1206: defense-in-depth gate, independent of `fallback_completion`'s own (#1206 S3).
+    if let Some(rejected) =
+        deps_core::completion::reject_credential_bearing_value(query, "search_packages query")
+    {
+        return rejected;
+    }
+
     tracing::info!(
         "search_packages: query={:?}, ecosystem={}",
         deps_core::lsp_helpers::truncate_for_diagnostic(query, 64),
@@ -1370,6 +1384,56 @@ ser"
         assert!(items.is_empty());
     }
 
+    /// #1206 S3: a credential-shaped raw-text prefix must be rejected inside
+    /// `fallback_completion` itself, before its own `tracing::info!` log line — not only
+    /// inside `search_packages` (checked separately by
+    /// `test_search_packages_rejects_credential_bearing_query` below). `search` panics here,
+    /// so this fails loudly if the earlier gate regresses and the credential-shaped prefix
+    /// reaches the registry after all.
+    #[tokio::test]
+    async fn test_fallback_completion_rejects_credential_bearing_prefix() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("guard must short-circuit before reaching registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let state = mock_cargo_state(
+            Arc::new(PanicsIfSearchedRegistry),
+            Some("deploy:AUDITSENTINEL0000@git.internal.corp/team/x"),
+        );
+        let items =
+            fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
+        assert!(items.is_empty());
+    }
+
     /// #724/#728 end-to-end wiring guard: `fallback_completion` must actually reach
     /// `Ecosystem::fallback_completion_is_bare`/`fallback_bare_insert_text` when an
     /// ecosystem's prefix-extraction step reports `bare = true`, not just
@@ -1683,6 +1747,59 @@ ser"
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "express");
+    }
+
+    /// #1206: `search_packages`'s own gate, called directly rather than through
+    /// `fallback_completion` (see `test_fallback_completion_rejects_credential_bearing_prefix`
+    /// for that end-to-end path) — `search` panics here, so this fails loudly if the gate
+    /// regresses.
+    #[tokio::test]
+    async fn test_search_packages_rejects_credential_bearing_query() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PanicsIfSearchedRegistry;
+        impl Registry for PanicsIfSearchedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+            fn search<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                panic!("guard must short-circuit before reaching registry search");
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let ecosystem = mock_ecosystem(
+            deps_core::EcosystemId::Npm,
+            Arc::new(PanicsIfSearchedRegistry),
+        );
+        let items = search_packages(
+            ecosystem.as_ref(),
+            "deploy:AUDITSENTINEL0000@git.internal.corp/team/x",
+            false,
+        )
+        .await;
+
+        assert!(items.is_empty());
     }
 
     /// `search_packages` drops any result whose `completion_insert_text` rejects it

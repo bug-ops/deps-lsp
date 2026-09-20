@@ -119,11 +119,22 @@ impl SwiftEcosystem {
         if !deps_core::completion::is_valid_completion_prefix_len(query) {
             return vec![];
         }
+        // #1206: `query` is a raw `.package(url: "...")` literal — reject before it reaches `SwiftRegistry::search`.
+        if let Some(rejected) = deps_core::completion::reject_credential_bearing_value(
+            query,
+            "swift url completion prefix",
+        ) {
+            return rejected;
+        }
 
         let results = match self.registry.search(query, 20).await {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Swift registry search failed for '{}': {}", query, e);
+                tracing::warn!(
+                    "Swift registry search failed for '{}': {}",
+                    deps_core::net_policy::url_for_tracing(query),
+                    e
+                );
                 return vec![];
             }
         };
@@ -435,6 +446,23 @@ mod tests {
         // Cursor is still within the scheme itself (e.g. "htt|"), so nothing to strip —
         // the raw partial text becomes the (short-lived, low-value) search query.
         assert_eq!(strip_github_prefix("htt"), "htt");
+    }
+
+    /// #1206: a credential-shaped `.package(url: "...")` literal must never reach
+    /// `SwiftRegistry::search` as a GitHub search query. No mock/network setup is needed here —
+    /// if the gate in `complete_package_urls` works, `self.registry.search` is never called at
+    /// all, so a real (unmockable) `SwiftRegistry` can be used directly and the test still runs
+    /// fast and offline.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_complete_package_urls_rejects_credential_bearing_query() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = SwiftEcosystem::new(cache);
+        let query = "deploy:AUDITSENTINEL0000@git.internal.corp/team/x.git";
+
+        let items = eco.complete_package_urls(query, None).await;
+
+        assert!(items.is_empty());
     }
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
