@@ -310,6 +310,10 @@ fn walk_with_limit(
         outcome: WalkOutcome::default(),
     };
     let hidden_ecosystem_dirs = hidden_ecosystem_directories(registry);
+    let options = WalkOptions {
+        respect_gitignore,
+        follow_symlinks,
+    };
 
     'roots: for root in roots {
         if ctx.outcome.truncated {
@@ -396,9 +400,8 @@ fn walk_with_limit(
         if !walk_directory(
             &absolute_root,
             &absolute_root,
-            true,
-            respect_gitignore,
-            follow_symlinks,
+            DotDirs::Skip,
+            options,
             canonical_root.as_deref(),
             &mut ctx,
         ) {
@@ -426,9 +429,8 @@ fn walk_with_limit(
             if !walk_directory(
                 &sub_root,
                 &absolute_root,
-                false,
-                respect_gitignore,
-                follow_symlinks,
+                DotDirs::Descend,
+                options,
                 canonical_root.as_deref(),
                 &mut ctx,
             ) {
@@ -450,6 +452,34 @@ struct WalkCtx<'a> {
     outcome: WalkOutcome,
 }
 
+/// The `respect_gitignore`/`follow_symlinks` pair, bundled so the internal walk chain (issue
+/// #1135) threads one named value instead of two positional bools whose order a call site can
+/// silently transpose.
+#[derive(Clone, Copy)]
+struct WalkOptions {
+    respect_gitignore: bool,
+    follow_symlinks: bool,
+}
+
+/// Whether a walk skips or descends into dot-prefixed entries — replaces `walk_directory`'s
+/// former positional `hidden: bool` parameter (issue #1135), whose meaning is the inverse of
+/// what a reader expects: `ignore::WalkBuilder::hidden(true)` means "skip hidden entries".
+#[derive(Clone, Copy)]
+enum DotDirs {
+    /// Dot-prefixed entries are filtered out of the walk.
+    Skip,
+    /// Dot-prefixed entries are walked normally.
+    Descend,
+}
+
+impl DotDirs {
+    /// The `ignore::WalkBuilder::hidden` argument this variant corresponds to — the single
+    /// point where `DotDirs` is converted back to the crate's own inverted-bool convention.
+    fn skip_hidden(self) -> bool {
+        matches!(self, Self::Skip)
+    }
+}
+
 /// Walks `walk_root` (a directory), routing every regular file relative to `display_root` —
 /// the outer `root` [`walk_with_limit`] was given, so a file under a dot-directory sub-root
 /// (e.g. `<repo>/.github`) still displays relative to the repository root, not to `.github`
@@ -458,9 +488,8 @@ struct WalkCtx<'a> {
 fn walk_directory(
     walk_root: &Path,
     display_root: &Path,
-    hidden: bool,
-    respect_gitignore: bool,
-    follow_symlinks: bool,
+    dot_dirs: DotDirs,
+    options: WalkOptions,
     canonical_root: Option<&Path>,
     ctx: &mut WalkCtx<'_>,
 ) -> bool {
@@ -468,19 +497,21 @@ fn walk_directory(
     // attacker-controlled in a CI scan of untrusted input. `git_exclude` (`.git/info/exclude`)
     // and `git_global` (the user's global gitignore) stay on unconditionally: neither travels
     // with a cloned/fetched PR, so neither is part of the attack surface this flag closes.
+    let hidden = dot_dirs.skip_hidden();
     let pruned_dirs: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
     let mut builder = WalkBuilder::new(walk_root);
     builder
         .hidden(hidden)
         .parents(true)
-        .ignore(respect_gitignore)
-        .git_ignore(respect_gitignore)
+        .ignore(options.respect_gitignore)
+        .git_ignore(options.respect_gitignore)
         .git_global(true)
         .git_exclude(true)
-        .follow_links(follow_symlinks);
+        .follow_links(options.follow_symlinks);
     {
         let pruned_dirs = Arc::clone(&pruned_dirs);
         let canonical_root_owned = canonical_root.map(Path::to_path_buf);
+        let follow_symlinks = options.follow_symlinks;
         builder.filter_entry(move |entry| {
             if !is_not_pruned_directory(entry) {
                 pruned_dirs
@@ -508,10 +539,10 @@ fn walk_directory(
             Ok(entry) if entry.file_type().is_some_and(|t| t.is_file()) => {
                 let path = entry.path();
                 let display = display_relative_path(path, display_root);
-                if respect_gitignore {
+                if options.respect_gitignore {
                     visited.insert(display.clone());
                 }
-                if follow_symlinks {
+                if options.follow_symlinks {
                     // FR-004/FR-007 (critic C1): canonicalize+containment-check every entry,
                     // not only leaf symlinks — a followed symlinked *directory* ancestor needs
                     // the same check. Resolved path doubles as the real read path (FR-007).
@@ -547,7 +578,7 @@ fn walk_directory(
                         let display = display_relative_path(path, display_root);
                         // Mirrors the `is_file()` arm's `visited` insert — otherwise
                         // `detect_ignored_manifests`'s separate unfiltered walk double-reports.
-                        if respect_gitignore {
+                        if options.respect_gitignore {
                             visited.insert(display.clone());
                         }
                         classification.record(&mut ctx.outcome, display);
@@ -566,7 +597,7 @@ fn walk_directory(
                     && is_manifest_shaped_by_name(path, ctx.registry)
                 {
                     let display = display_relative_path(path, display_root);
-                    if respect_gitignore {
+                    if options.respect_gitignore {
                         visited.insert(display.clone());
                     }
                     ctx.outcome.broken_manifest_symlinks.push(display);
@@ -594,7 +625,7 @@ fn walk_directory(
         warn_on_pruned_directory_manifest(pruned_dir, display_root, ctx);
     }
 
-    if respect_gitignore {
+    if options.respect_gitignore {
         detect_ignored_manifests(walk_root, display_root, hidden, ctx, &visited);
     }
     true
