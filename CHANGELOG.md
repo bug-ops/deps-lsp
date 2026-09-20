@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134)
 - **ci**: `release.yml`'s top-level GITHUB_TOKEN permissions scoped to a read-only default, with `contents: write` granted per-job only where needed (resolves #1151) (#1163)
+- **deps-cli**: `walk_directory`'s positional bool triple replaced with a `WalkOptions` struct and `DotDirs` enum, closing a swap-silent transposition risk on the gitignore/symlink containment gate (resolves #1135)
 
 ## [1.1.0] - 2026-09-16
 
