@@ -31,7 +31,7 @@ impl PackageRendering for MockFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name)
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -57,7 +57,7 @@ impl PackageRendering for MockUnresolvedFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name)
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -95,7 +95,7 @@ impl PackageRendering for MockGoFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://pkg.go.dev/{}", name)
+        format!("https://pkg.go.dev/{}", name.as_str())
     }
 }
 
@@ -139,7 +139,7 @@ impl PackageRendering for MockWidenedResolveFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{name}")
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -182,7 +182,7 @@ impl PackageRendering for RejectingFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name)
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -407,7 +407,7 @@ impl crate::Registry for MockRegistry {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -447,7 +447,7 @@ impl crate::Registry for ErrorRegistry {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -514,7 +514,7 @@ impl crate::Registry for SlowRegistry {
         versions.iter().position(|v| v.is_stable())
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -542,7 +542,7 @@ impl crate::Registry for NotFoundRegistry {
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
         Box::pin(async move {
             Err(crate::error::DepsError::PackageNotFound {
-                package: name.to_string().into(),
+                package: name.as_str().into(),
                 registry: "mock",
             })
         })
@@ -557,7 +557,7 @@ impl crate::Registry for NotFoundRegistry {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -656,7 +656,7 @@ impl crate::Registry for MockRegistryWithVersions {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -742,7 +742,7 @@ impl crate::Registry for MockRegistryWithLicensedVersions {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -828,7 +828,7 @@ impl crate::Registry for MockRegistryPreferringUnflagged {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -906,7 +906,7 @@ impl crate::Registry for MockRegistryListFailsLatestFallbackSucceeds {
         Box::pin(async move { Ok(Some(Box::new(fallback) as Box<dyn crate::Version>)) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -963,7 +963,7 @@ impl crate::Registry for FixedVersionRegistry {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -1019,7 +1019,7 @@ impl PackageRendering for IdentityFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{name}")
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -1055,7 +1055,7 @@ impl PackageRendering for CaretWrappingFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{name}")
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -1100,7 +1100,7 @@ impl PackageRendering for PinPreservingFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{name}")
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -1178,7 +1178,7 @@ impl PackageRendering for TrailingSpaceFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{name}")
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -1223,7 +1223,7 @@ impl PackageRendering for TruncatingFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{name}")
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -1338,7 +1338,7 @@ impl PackageRendering for ExactMatchFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name)
+        format!("https://example.com/{}", name.as_str())
     }
 }
 
@@ -1380,7 +1380,7 @@ impl PackageRendering for StrictSemverFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        name.to_string()
+        name.as_str().to_string()
     }
 }
 

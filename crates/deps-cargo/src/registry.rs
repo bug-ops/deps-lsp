@@ -205,7 +205,7 @@ impl CratesIoRegistry {
     /// assert!(!results.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<CrateInfo>> {
         let url = format!(
             "{}/crates?q={}&per_page={}&sort=downloads",
@@ -301,7 +301,7 @@ impl deps_core::Registry for CratesIoRegistry {
         select_latest_matching_impl(versions, req)
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,
@@ -352,7 +352,7 @@ impl deps_core::Registry for SparseIndexClient {
         select_latest_matching_impl(versions, req)
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -542,7 +542,7 @@ impl CargoRegistry {
                             .await
                     }
                     None => Err(DepsError::PackageNotFound {
-                        package: name.to_string().into(),
+                        package: name.as_str().into(),
                         registry: "alternate registry (not registered)",
                     }),
                 }
@@ -584,7 +584,7 @@ impl CargoRegistry {
                             .await
                     }
                     None => Err(DepsError::PackageNotFound {
-                        package: name.to_string().into(),
+                        package: name.as_str().into(),
                         registry: "alternate registry (not registered)",
                     }),
                 }
@@ -678,12 +678,12 @@ impl deps_core::Registry for CargoRegistry {
 
     /// Always crates.io — the sparse index protocol has no search endpoint, so this is
     /// unreachable for an alternate source by construction (spec FR-001).
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>> {
-        deps_core::Registry::search(&self.crates_io, query, limit)
+        deps_core::Registry::search_raw(&self.crates_io, query, limit)
     }
 
     fn as_any(&self) -> &dyn Any {

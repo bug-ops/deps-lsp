@@ -1694,7 +1694,7 @@ tokio = { version = "1.0", features = ["full"] }"#;
             assert!(
                 !is_default,
                 "name_range should not be default for {}",
-                dep.name
+                dep.name.as_str()
             );
         }
     }

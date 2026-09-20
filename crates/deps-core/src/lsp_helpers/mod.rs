@@ -3165,7 +3165,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://pypi.org/project/{}", name)
+                format!("https://pypi.org/project/{}", name.as_str())
             }
         }
 

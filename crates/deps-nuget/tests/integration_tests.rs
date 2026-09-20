@@ -135,7 +135,7 @@ fn test_fixture_packages_config_normalizes_exact_pin() {
         assert!(
             req.starts_with('[') && req.ends_with(']'),
             "expected bracketed exact pin for {}, got {req}",
-            dep.name
+            dep.name.as_str()
         );
     }
 }

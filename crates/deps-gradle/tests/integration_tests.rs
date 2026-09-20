@@ -70,7 +70,7 @@ fn test_catalog_name_ranges_set() {
         assert!(
             !dep.group_id.is_empty() && !dep.artifact_id.is_empty(),
             "Dependency {} has empty group_id or artifact_id",
-            dep.name
+            dep.name.as_str()
         );
     }
 }
@@ -128,7 +128,7 @@ fn test_kotlin_position_tracking() {
             assert!(
                 dep.version_range.is_some(),
                 "Missing version_range for {} with version {:?}",
-                dep.name,
+                dep.name.as_str(),
                 dep.version_req
             );
         }
@@ -189,7 +189,7 @@ fn test_groovy_position_tracking() {
             assert!(
                 dep.version_range.is_some(),
                 "Missing version_range for {} with version {:?}",
-                dep.name,
+                dep.name.as_str(),
                 dep.version_req
             );
         }

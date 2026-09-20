@@ -447,7 +447,7 @@ impl MavenCentralRegistry {
     ///
     /// Returns the last error (an HTTP/network error, or a synthesized timeout error)
     /// if every attempt fails and no cached result is available to fall back to.
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<ArtifactInfo>> {
         debug_assert!(
             limit <= SEARCH_CACHE_ROWS,
@@ -917,7 +917,7 @@ impl deps_core::Registry for MavenCentralRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,

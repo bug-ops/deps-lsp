@@ -70,7 +70,7 @@ async fn test_mirrored_workspace_plain_deps_carry_mirrors_crates_io_and_resolve_
                 assert!(
                     *mirrors_crates_io,
                     "{} must be marked as a crates.io mirror",
-                    dep.name
+                    dep.name.as_str()
                 );
                 assert_eq!(
                     index.trim_end_matches('/'),
@@ -79,7 +79,7 @@ async fn test_mirrored_workspace_plain_deps_carry_mirrors_crates_io_and_resolve_
             }
             other => panic!(
                 "expected {} to be a resolved AlternateRegistry mirror, got {other:?}",
-                dep.name
+                dep.name.as_str()
             ),
         }
     }

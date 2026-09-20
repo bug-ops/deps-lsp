@@ -738,7 +738,7 @@ impl deps_core::Registry for PypiRegistry {
                                 .collect())
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -785,7 +785,7 @@ impl deps_core::Registry for PypiRegistry {
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -799,7 +799,7 @@ impl deps_core::Registry for PypiRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,
@@ -1988,7 +1988,10 @@ mod tests {
             results = registry.search("reque", 10).await.unwrap();
         }
 
-        let names: Vec<String> = results.iter().map(|p| p.name.to_string()).collect();
+        let names: Vec<String> = results
+            .iter()
+            .map(|p| p.name.as_str().to_string())
+            .collect();
         assert!(names.contains(&"requests".to_string()));
         assert!(names.contains(&"requests-oauthlib".to_string()));
         // C2 build-once: a second round of searches after the index is ready

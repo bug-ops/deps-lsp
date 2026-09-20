@@ -113,7 +113,7 @@ impl PubDevRegistry {
     /// # Errors
     ///
     /// Returns an error if the search request fails or its response body fails to parse.
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<PackageInfo>> {
         let url = format!("{}/search?q={}", self.base, urlencoding::encode(query));
         let data = self.cache.get_cached(&url).await?;
@@ -416,7 +416,7 @@ impl deps_core::Registry for PubDevRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,

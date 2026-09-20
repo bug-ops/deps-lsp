@@ -460,7 +460,7 @@ impl deps_core::Registry for GithubActionsRegistry {
     /// Always empty for the MVP (S2/registry docs): a name-completion search would burn
     /// the 60 req/h unauthenticated budget per keystroke, since GitHub has no
     /// action-specific search endpoint cheaper than repository search.
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,

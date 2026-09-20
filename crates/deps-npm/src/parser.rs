@@ -1007,7 +1007,7 @@ mod tests {
                 dep.source,
                 deps_core::parser::DependencySource::Registry,
                 "{} must fall back to Registry, not build a malformed .git URL",
-                dep.name
+                dep.name.as_str()
             );
         }
     }
@@ -1270,8 +1270,13 @@ mod tests {
 
         let result = parse_package_json(json, &test_uri()).unwrap();
         for dep in &result.dependencies {
-            assert_eq!(dep.package, Some("react".into()), "{}", dep.name);
-            assert_eq!(dep.version_req, Some("^18.0.0".into()), "{}", dep.name);
+            assert_eq!(dep.package, Some("react".into()), "{}", dep.name.as_str());
+            assert_eq!(
+                dep.version_req,
+                Some("^18.0.0".into()),
+                "{}",
+                dep.name.as_str()
+            );
         }
     }
 

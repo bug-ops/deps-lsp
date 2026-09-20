@@ -813,7 +813,7 @@ pub fn build_package_completion(
     }
 
     Some(CompletionItem {
-        label: name.to_string(),
+        label: name.as_str().to_string(),
         kind: Some(CompletionItemKind::MODULE),
         detail: if latest.is_empty() {
             None
@@ -824,13 +824,13 @@ pub fn build_package_completion(
             kind: MarkupKind::Markdown,
             value: doc_parts.join("\n"),
         })),
-        insert_text: Some(name.to_string()),
+        insert_text: Some(name.as_str().to_string()),
         text_edit: Some(CompletionTextEdit::Edit(TextEdit {
             range: insert_range,
-            new_text: name.to_string(),
+            new_text: name.as_str().to_string(),
         })),
-        sort_text: Some(name.to_string()),
-        filter_text: Some(name.to_string()),
+        sort_text: Some(name.as_str().to_string()),
+        filter_text: Some(name.as_str().to_string()),
         ..Default::default()
     })
 }
@@ -1053,7 +1053,7 @@ impl VersionDisplayItem {
         } else {
             version_str.to_string()
         };
-        let description = format!("Update {} to {}", package_name, version_str);
+        let description = format!("Update {} to {}", package_name.as_str(), version_str);
 
         Self {
             version: version_str.clone(),
@@ -1208,7 +1208,7 @@ pub fn build_feature_completion(
     CompletionItem {
         label: feature_name.to_string(),
         kind: Some(CompletionItemKind::PROPERTY),
-        detail: Some(format!("Feature of {}", package_name)),
+        detail: Some(format!("Feature of {}", package_name.as_str())),
         documentation: None,
         insert_text: Some(feature_name.to_string()),
         text_edit: insert_range.map(|range| {
@@ -1439,7 +1439,11 @@ pub async fn complete_versions_generic_replacing(
     {
         Ok(v) => v,
         Err(e) => {
-            tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
+            tracing::warn!(
+                "Failed to fetch versions for '{}': {}",
+                package_name.for_tracing(),
+                e
+            );
             return vec![];
         }
     };
@@ -1829,7 +1833,7 @@ mod tests {
             Box::pin(async move { Ok(None) })
         }
 
-        fn search<'a>(
+        fn search_raw<'a>(
             &'a self,
             _query: &'a str,
             _limit: usize,
@@ -1881,7 +1885,7 @@ mod tests {
             Box::pin(async move { Ok(None) })
         }
 
-        fn search<'a>(
+        fn search_raw<'a>(
             &'a self,
             _query: &'a str,
             _limit: usize,
@@ -4553,7 +4557,7 @@ mod tests {
                 panic!("registry must not be queried for a non-resolvable source");
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -4642,7 +4646,7 @@ mod tests {
             Box::pin(async move { Ok(None) })
         }
 
-        fn search<'a>(
+        fn search_raw<'a>(
             &'a self,
             _query: &'a str,
             _limit: usize,

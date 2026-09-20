@@ -157,7 +157,7 @@ impl PackageRendering for GitlabCiFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         if is_valid_gitlab_coordinate(name.as_str()) {
-            format!("https://{name}")
+            format!("https://{}", name.as_str())
         } else {
             warn_rejected_value(
                 "is_valid_gitlab_coordinate",

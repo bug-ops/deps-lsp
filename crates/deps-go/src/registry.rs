@@ -825,7 +825,7 @@ impl deps_core::Registry for GoRegistry {
                                 .collect())
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -871,7 +871,7 @@ impl deps_core::Registry for GoRegistry {
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string().into(),
+                            package: name.as_str().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -883,7 +883,7 @@ impl deps_core::Registry for GoRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,

@@ -771,7 +771,7 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         name.to_string()
+///         name.as_str().to_string()
 ///     }
 /// }
 /// impl RequirementResolution for SimpleFormatter {}

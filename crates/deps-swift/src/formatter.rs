@@ -117,7 +117,7 @@ impl PackageRendering for SwiftFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         if is_valid_owner_repo(name.as_str()) {
-            format!("https://github.com/{name}")
+            format!("https://github.com/{}", name.as_str())
         } else {
             warn_rejected_value(
                 "is_valid_owner_repo",
@@ -190,7 +190,7 @@ impl OsvNaming for SwiftFormatter {
         let host = reqwest::Url::parse(&swift_dep.url).ok()?;
         host.host_str()
             .is_some_and(crate::is_github_host)
-            .then(|| format!("github.com/{}", dep.name()))
+            .then(|| format!("github.com/{}", dep.name().as_str()))
     }
 }
 

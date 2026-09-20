@@ -499,7 +499,7 @@ impl Ecosystem for PypiEcosystem {
         // an `[project.optional-dependencies]` group) are TOML string-array elements,
         // not a key=value table entry like Cargo's, so the full insert here is the
         // quoted array element itself rather than a `key = value` pair.
-        Some(format!("\"{}\"", metadata.name()))
+        Some(format!("\"{}\"", metadata.name().as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2387,7 +2387,7 @@ dependencies = []
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2492,7 +2492,7 @@ dependencies = []
         result
             .dependencies()
             .into_iter()
-            .map(|d| (d.name().to_string(), d.source()))
+            .map(|d| (d.name().as_str().to_string(), d.source()))
             .collect()
     }
 

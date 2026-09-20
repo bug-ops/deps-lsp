@@ -366,7 +366,7 @@ const MAX_REQUIREMENT_LEN: usize = 256;
 ///         version.to_string()
 ///     }
 ///     fn package_url(&self, name: &PackageName) -> String {
-///         name.to_string()
+///         name.as_str().to_string()
 ///     }
 /// }
 /// impl RequirementResolution for ExactFormatter {
@@ -1122,7 +1122,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
         severity: Some(severity),
         message: format!(
             "{}: {} {}",
-            ctx.dep.name(),
+            ctx.dep.name().as_str(),
             truncate_for_diagnostic(
                 &violation.license,
                 MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS
@@ -1339,7 +1339,7 @@ fn apply_unknown_package_rule(
             diagnostics.push(Diagnostic {
                 range: dep.name_range(),
                 severity: Some(ctx.severities.unknown),
-                message: format!("Invalid package name '{}': {reason}", dep.name()),
+                message: format!("Invalid package name '{}': {reason}", dep.name().as_str()),
                 ..Default::default()
             });
         }
@@ -1347,17 +1347,20 @@ fn apply_unknown_package_rule(
         Ok(()) if fetch_failure.is_some() => {
             let message = match fetch_failure {
                 Some(FetchFailure::Actionable(hint)) => {
-                    format!("Registry lookup failed for '{}': {hint}", dep.name())
+                    format!(
+                        "Registry lookup failed for '{}': {hint}",
+                        dep.name().as_str()
+                    )
                 }
                 Some(FetchFailure::Transient | FetchFailure::NotAttempted) | None => {
                     format!(
                         "Registry lookup failed for '{}'; package status could not be determined",
-                        dep.name()
+                        dep.name().as_str()
                     )
                 }
             };
             fetch_failed.push(FetchFailureEntry {
-                name: dep.name().to_string(),
+                name: dep.name().as_str().to_string(),
                 diagnostic: Diagnostic {
                     range: dep.name_range(),
                     severity: Some(ctx.severities.unknown),
@@ -1372,7 +1375,7 @@ fn apply_unknown_package_rule(
             diagnostics.push(Diagnostic {
                 range: dep.name_range(),
                 severity: Some(ctx.severities.unknown),
-                message: format!("Unknown package '{}'", dep.name()),
+                message: format!("Unknown package '{}'", dep.name().as_str()),
                 ..Default::default()
             });
         }
@@ -4246,7 +4249,7 @@ mod tests {
         struct MockLowercaseFormatter;
         impl PackageNaming for MockLowercaseFormatter {
             fn normalize_package_name(&self, name: &PackageName) -> String {
-                name.to_string().to_lowercase()
+                name.as_str().to_lowercase()
             }
         }
 
@@ -4256,7 +4259,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -5299,7 +5302,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                name.to_string()
+                name.as_str().to_string()
             }
         }
 
@@ -5496,7 +5499,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                name.to_string()
+                name.as_str().to_string()
             }
         }
 
@@ -5762,7 +5765,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &PackageName) -> String {
-                name.to_string()
+                name.as_str().to_string()
             }
         }
 
