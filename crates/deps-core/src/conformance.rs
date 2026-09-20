@@ -385,7 +385,7 @@ pub async fn assert_parse_malformed_lockfile_does_not_panic(
 // ---------------------------------------------------------------------------------------
 
 /// A [`crate::Registry`] whose `search` deterministically returns one fixed, non-empty
-/// result, regardless of the query.
+/// result, regardless of the query, and records whether it was ever called.
 ///
 /// [`assert_completion_guard`] uses this to distinguish "the length guard rejected this
 /// prefix" from "the registry search returned nothing" — a real (or offline-failing)
@@ -395,8 +395,29 @@ pub async fn assert_parse_malformed_lockfile_does_not_panic(
 /// give back, a valid-length prefix reaching it is guaranteed non-empty — so a guard that
 /// wrongly rejects a valid prefix, or a `complete` closure not wired to the guard at all,
 /// both become visible.
+///
+/// [`Self::search_was_called`] additionally lets [`assert_completion_guard`]'s
+/// credential-shaped-prefix case assert the stronger claim issue #1206's remediation actually
+/// asks for: not just "the returned items are empty" (which a redact-then-search-then-drop
+/// implementation would also satisfy), but "`search` was never invoked at all" (#1206 M3).
 #[cfg(feature = "lsp-responses")]
-struct AlwaysHasResultsRegistry;
+struct AlwaysHasResultsRegistry {
+    search_called: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(feature = "lsp-responses")]
+impl AlwaysHasResultsRegistry {
+    fn new() -> Self {
+        Self {
+            search_called: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Whether [`crate::Registry::search`] was invoked on this instance since [`Self::new`].
+    fn search_was_called(&self) -> bool {
+        self.search_called.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
 
 #[cfg(feature = "lsp-responses")]
 impl crate::Registry for AlwaysHasResultsRegistry {
@@ -438,6 +459,8 @@ impl crate::Registry for AlwaysHasResultsRegistry {
                 + 'a,
         >,
     > {
+        self.search_called
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Box::pin(async move {
             let metadata = crate::test_util::MockMetadata::new("conformance-probe", "1.0.0");
             Ok(vec![Box::new(metadata) as Box<dyn crate::Metadata>])
@@ -449,13 +472,14 @@ impl crate::Registry for AlwaysHasResultsRegistry {
     }
 }
 
-/// Asserts a package-name completion function rejects a too-short, empty, and too-long
-/// prefix by returning no completions.
+/// Asserts a package-name completion function rejects a too-short, empty, too-long, or
+/// credential-shaped prefix by returning no completions.
 ///
-/// Mirrors [`crate::completion::complete_package_names_generic`]'s shared guard — and, against
-/// `AlwaysHasResultsRegistry`, that a valid-length prefix actually returns that registry's
-/// result, so the rejection above can't be explained away by "this registry never returns
-/// anything" (#758 impl-critic M1).
+/// Mirrors [`crate::completion::complete_package_names_generic`]'s shared guards — and,
+/// against `AlwaysHasResultsRegistry`, that a valid-length prefix actually returns that
+/// registry's result, so the rejection above can't be explained away by "this registry never
+/// returns anything" (#758 impl-critic M1). The credential-shaped case (#1206) reuses the same
+/// always-has-results registry for the identical reason.
 ///
 /// `complete` returns a boxed, lifetime-parameterized future rather than a plain associated
 /// `Fut: Future`: the natural implementation borrows the `&dyn Registry` argument across the
@@ -474,7 +498,7 @@ where
         Box<dyn std::future::Future<Output = Vec<CompletionItem>> + Send + 'a>,
     >,
 {
-    let registry = AlwaysHasResultsRegistry;
+    let registry = AlwaysHasResultsRegistry::new();
 
     let results = complete(&registry, "s".to_string()).await;
     assert!(
@@ -501,6 +525,25 @@ where
         "a valid-length prefix against a registry that always has a result must return it — \
          an empty result here means either the guard over-rejects a valid prefix, or \
          `complete` isn't actually wired to the registry this test supplied"
+    );
+
+    // #1206: a fresh registry, not the one reused above, so `search_was_called` below reflects only this call.
+    let credential_registry = AlwaysHasResultsRegistry::new();
+    let results = complete(
+        &credential_registry,
+        "user:hunter2@registry.example".to_string(),
+    )
+    .await;
+    assert!(
+        results.is_empty(),
+        "a credential-shaped prefix must return no completions (issue #1206)"
+    );
+    // #1206 M3: proves `search` itself was never called, not just that its result was discarded.
+    assert!(
+        !credential_registry.search_was_called(),
+        "a credential-shaped prefix must be rejected before ever calling `registry.search` \
+         (issue #1206) — redacting the value and searching anyway, then dropping the result, \
+         would still satisfy the empty-result assertion above but fail this one"
     );
 }
 

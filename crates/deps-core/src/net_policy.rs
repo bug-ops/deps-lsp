@@ -2348,23 +2348,128 @@ pub(crate) fn is_authority_bearing_url(raw: &str) -> bool {
 /// );
 /// ```
 #[must_use]
+pub fn redact_declaration_key(key: &str) -> String {
+    if is_authority_bearing_url(key) || has_credential_shape(key) {
+        url_for_tracing(key)
+    } else {
+        key.split(['?', '#']).next().unwrap_or_default().to_string()
+    }
+}
+
+/// The segment-bounded `@`/`:` scan shared by [`redact_declaration_key`] (decides whether a
+/// non-URL label needs redacting at all) and [`is_credential_or_query_bearing`] (decides whether an
+/// outbound value must be rejected outright) — extracted so the two callers can't drift apart
+/// on what counts as "looks like a credential" (#1206).
+///
+/// See [`redact_declaration_key`]'s own doc for the exact segment/trim rule this implements.
 #[expect(
     clippy::string_slice,
     reason = "`at` comes from `match_indices('@')` on ASCII '@' bytes, so every slice bound \
               always lands on a char boundary"
 )]
-pub fn redact_declaration_key(key: &str) -> String {
+fn has_credential_shape(key: &str) -> bool {
     let mut prev = 0;
-    let has_credential_shape = key.match_indices('@').any(|(at, _)| {
+    key.match_indices('@').any(|(at, _)| {
         let segment = &key[prev..at];
         prev = at + 1;
         segment_has_credential_colon(segment.trim_end_matches(':'))
-    });
-    if is_authority_bearing_url(key) || has_credential_shape {
-        url_for_tracing(key)
-    } else {
-        key.split(['?', '#']).next().unwrap_or_default().to_string()
+    })
+}
+
+/// Whether `value` carries credential-shaped userinfo of its own, or an untrusted
+/// query/fragment component that could hide one.
+///
+/// Detects, in order:
+/// - a `?`/`#` anywhere in `value` (#1206 S2) — a query string is exactly where a token can
+///   travel (`?token=...`, `?access_token=...`) without ever taking the `user:pass@host`
+///   shape the checks below look for, and [`url_for_tracing`] already treats *any* query or
+///   fragment as untrusted-by-default (it drops both unconditionally, per #866/#858) — this
+///   function applies that same always-suspect rule to the reject-before-search decision, not
+///   just to what gets logged afterward;
+/// - for a real URL authority (`host()` is `Some`), whether [`redact_userinfo`] would change
+///   `value` at all — not just a non-empty username/password on the authority itself. A
+///   credential-shaped `user:pass@host` span can also sit *after* the authority, later in the
+///   path (e.g. `https://mirror.example/redirect/user:pass@evil.com`, code-review round 1
+///   #1206 finding 1): checking only `url.username()`/`url.password()` missed this, since that
+///   pair only reflects the authority's own userinfo. Delegating to `redact_userinfo` reuses
+///   its existing authority-then-tail scan instead of re-deriving it, and is deliberately
+///   scoped to the `host().is_some()` case alone — see the over-rejection note below for why
+///   this isn't applied unconditionally to every input;
+/// - for text with no parseable URL structure (e.g. a `.package(url: "...")` literal with its
+///   scheme already stripped before reaching a registry-search query), the same
+///   segment-bounded credential-colon shape [`redact_declaration_key`]'s fallback scan uses
+///   (`has_credential_shape`).
+///
+/// Unlike `is_authority_bearing_url`, this is a genuine credential-detection predicate, not
+/// "does this parse as a URL at all" — an ordinary credential-free, query-free URL
+/// (`https://host/path`) returns `false` here.
+///
+/// Narrower than [`url_for_tracing`]'s own redaction coverage in one specific way: a
+/// scheme-stripped, colon-less, token-only userinfo (e.g. `ghp_TOKEN@host/path`, with no `:`
+/// anywhere) is not flagged here, even though `url_for_tracing` would still redact it via
+/// `find_token_prefix_at`'s prefix sniffing. Not widened to match: probe-testing found that
+/// treating "the redactor would change this string" as the reject criterion false-positives on
+/// ordinary non-credential input containing a bare `@` with no colon at all — a Maven
+/// coordinate like `com.google.guava:guava` (no `@`, unaffected) is fine, but an SSH-style Git
+/// remote like `git@github.com:apple/swift-nio.git` would trip a token-prefix-agnostic
+/// widening. The `user:pass@`/`label:value@` colon-shaped case this function does catch covers
+/// every shape in the actual #1206 repro family (a full `.package(url:)` literal, with or
+/// without its scheme).
+///
+/// Conversely, delegating to `redact_userinfo` for the `host().is_some()` case inherits that
+/// function's own documented over-redaction: a colon in the path with no `@` at all (e.g.
+/// `https://10.0.0.1/v1/items:search`, a REST-style path segment, no credential involved) is
+/// still flagged here, because `redact_userinfo` still rewrites it. Accepted per this module's
+/// stated over-redact/over-reject-over-leak trade-off (the same one the `?`/`#` check above
+/// already applies) — an occasional false-positive-rejected completion keystroke costs far less
+/// than a missed credential leak, and this narrower delegation (scoped to values that already
+/// parse as a real URL authority) is far more targeted than falling through to
+/// `has_credential_shape` would be, which over-triggers on *any* `scheme://...@...` value purely
+/// from the scheme's own leading colon (verified while fixing this finding: naively falling
+/// through to `has_credential_shape` for every `host().is_some()` value flagged an ordinary
+/// scoped-package-style path like `https://github.com/@babel/core` with no credential anywhere).
+///
+/// Intended as a reject-before-search gate (issue #1206): a value this function flags must
+/// never reach an outbound registry-search query or an unredacted `tracing` field — a redacted
+/// value is not a useful search term, so the caller should drop the request entirely rather
+/// than redact-and-search.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::is_credential_or_query_bearing;
+///
+/// assert!(is_credential_or_query_bearing(
+///     "https://user:hunter2@registry.example/simple"
+/// ));
+/// // Scheme already stripped by the caller (e.g. Swift's `.package(url:)` completion) — no
+/// // longer parses as a URL, but still shows the same credential shape.
+/// assert!(is_credential_or_query_bearing(
+///     "deploy:AUDITSENTINEL0000@git.internal.corp/team/x.git"
+/// ));
+/// // A query string can carry a token with no userinfo shape at all.
+/// assert!(is_credential_or_query_bearing(
+///     "https://github.com/apple/swift-nio?token=SECRET"
+/// ));
+/// // A credential-shaped span after the authority, later in the path, is caught too.
+/// assert!(is_credential_or_query_bearing(
+///     "https://mirror.example/redirect/user:pass@evil.com"
+/// ));
+/// assert!(!is_credential_or_query_bearing("apple/swift-nio"));
+/// assert!(!is_credential_or_query_bearing("https://registry.example/simple"));
+/// ```
+#[must_use]
+pub fn is_credential_or_query_bearing(value: &str) -> bool {
+    if value.contains(['?', '#']) {
+        return true;
     }
+    if let Ok(url) = url::Url::parse(value)
+        && !url.cannot_be_a_base()
+        && url.host().is_some()
+    {
+        return redact_userinfo(value) != value;
+    }
+    has_credential_shape(value)
 }
 
 /// A URL-bearing value that has already been redacted for safe inclusion in error or log
@@ -3006,6 +3111,111 @@ mod tests {
             "***@internal"
         );
         assert_eq!(redact_declaration_key("named:my-index@v1"), "***@v1");
+    }
+
+    // --- is_credential_or_query_bearing (#1206) ---
+
+    #[test]
+    fn is_credential_or_query_bearing_detects_real_url_userinfo() {
+        assert!(is_credential_or_query_bearing(
+            "https://user:hunter2@registry.example/simple"
+        ));
+        assert!(is_credential_or_query_bearing(
+            "https://tokenonly@registry.example"
+        ));
+    }
+
+    /// The exact shape of issue #1206: Swift's completion strips the `https://github.com/`
+    /// scheme off a `.package(url:)` literal before it becomes a search query, so a
+    /// credential-bearing value no longer parses as a URL by the time this gate sees it.
+    #[test]
+    fn is_credential_or_query_bearing_detects_scheme_stripped_credential() {
+        assert!(is_credential_or_query_bearing(
+            "deploy:AUDITSENTINEL0000@git.internal.corp/team/x.git"
+        ));
+    }
+
+    #[test]
+    fn is_credential_or_query_bearing_false_for_ordinary_url() {
+        assert!(!is_credential_or_query_bearing(
+            "https://registry.example/simple"
+        ));
+    }
+
+    #[test]
+    fn is_credential_or_query_bearing_false_for_plain_package_name() {
+        assert!(!is_credential_or_query_bearing("apple/swift-nio"));
+        assert!(!is_credential_or_query_bearing("serde"));
+    }
+
+    /// A scoped npm-style name (`@scope/pkg`) must not false-positive: the segment before its
+    /// only `@` is empty, so no credential-shaped `:` can be found in it.
+    #[test]
+    fn is_credential_or_query_bearing_false_for_scoped_package_name() {
+        assert!(!is_credential_or_query_bearing("@babel/core"));
+    }
+
+    /// A Windows drive-letter colon (`c:/...`) must not be mistaken for credential shape,
+    /// mirroring `redact_userinfo`'s own drive-letter carve-out.
+    #[test]
+    fn is_credential_or_query_bearing_false_for_drive_letter_colon() {
+        assert!(!is_credential_or_query_bearing("c:/user@evil"));
+    }
+
+    /// #1206 S2: a query-string token has no `user:pass@` userinfo shape at all, so it must be
+    /// caught by the `?`/`#` check rather than falling through to the credential-colon scan.
+    #[test]
+    fn is_credential_or_query_bearing_true_for_query_string_token() {
+        assert!(is_credential_or_query_bearing(
+            "https://github.com/apple/swift-nio?token=SECRET"
+        ));
+        assert!(is_credential_or_query_bearing(
+            "apple/swift-nio?token=SECRET"
+        ));
+        assert!(is_credential_or_query_bearing("apple/swift-nio#fragment"));
+    }
+
+    /// #1206 M1: a Maven coordinate and an SSH-style Git remote must not false-positive —
+    /// pinned here since a naive "the redactor would touch this string" widening (considered
+    /// and rejected, see this function's own doc) would flag both.
+    #[test]
+    fn is_credential_or_query_bearing_false_for_maven_coordinate_and_ssh_remote() {
+        assert!(!is_credential_or_query_bearing("com.google.guava:guava"));
+        assert!(!is_credential_or_query_bearing(
+            "git@github.com:apple/swift-nio.git"
+        ));
+    }
+
+    /// Code-review round 1 finding 1: a credential-shaped span after a real URL authority —
+    /// not in the authority's own userinfo — must still be caught, matching what
+    /// `url_for_tracing` already redacts for the identical input.
+    #[test]
+    fn is_credential_or_query_bearing_true_for_credential_after_authority_in_path() {
+        assert!(is_credential_or_query_bearing(
+            "https://mirror.example/redirect/user:pass@evil.com"
+        ));
+    }
+
+    /// A scoped-package-style path segment (`@babel/core`-shaped) appended to a clean URL
+    /// authority must not false-positive purely from the scheme's own leading colon — the
+    /// specific over-trigger a naive fallback to `has_credential_shape` would have introduced
+    /// (see this function's own doc; caught while fixing the finding above).
+    #[test]
+    fn is_credential_or_query_bearing_false_for_scoped_package_path_after_authority() {
+        assert!(!is_credential_or_query_bearing(
+            "https://github.com/@babel/core"
+        ));
+    }
+
+    /// Documented, accepted over-rejection (see this function's own doc): a REST-style path
+    /// colon with no credential at all still gets rejected, because `redact_userinfo` itself
+    /// still rewrites it. Pinned so a future change to this trade-off is a deliberate doc +
+    /// test update, not a silent behavior drift.
+    #[test]
+    fn is_credential_or_query_bearing_true_for_rest_style_path_colon_no_credential() {
+        assert!(is_credential_or_query_bearing(
+            "https://10.0.0.1/v1/items:search"
+        ));
     }
 
     fn host_class(url: &str) -> HostClass {

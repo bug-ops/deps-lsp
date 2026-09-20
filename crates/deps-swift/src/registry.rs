@@ -175,7 +175,17 @@ impl SwiftRegistry {
     ///
     /// Returns an error if the GitHub search API request fails or the response body is
     /// not valid JSON matching the expected repository-search shape.
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    ///
+    /// `query` is redacted via [`deps_core::net_policy::url_for_tracing`] in the `query` span
+    /// field (#1206) — a caller-supplied search query can itself carry credential-shaped
+    /// userinfo (e.g. a `.package(url: "...")` literal's raw text), and this `debug`-level span
+    /// is otherwise the same unredacted-log sink every other URL-bearing `tracing` field in
+    /// this workspace already guards against.
+    #[tracing::instrument(
+        skip_all,
+        fields(query = %deps_core::net_policy::url_for_tracing(query)),
+        level = "debug"
+    )]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<SwiftPackage>> {
         let url = format!(
             "{}/search/repositories?q={}+language:swift&per_page={limit}",
