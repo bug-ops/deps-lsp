@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **ci**: `auto-merge.yml` scopes `contents`/`pull-requests` write permissions to the job instead of the whole workflow, and `SECURITY.md` links the GitHub Security Advisories reporting channel, resolving OpenSSF Scorecard code-scanning findings (#1172)
+- **deps-gradle**: DSL scanner's quote-delimiter selection is now scoped to the literal containing the cursor instead of picked line-wide, fixing withheld completion on mixed-quote-style joined lines, a quoted Groovy map key evading the map-notation guard, and a forward-scan range corruption when a trailing comment contains a quote character (resolves #1168)
 - **deps-gradle**: DSL version completion no longer overspans into a semicolon- or space-joined earlier dependency on the same line (resolves #1160) (#1166)
 - **deps-maven**: version completion now triggers inside an empty `<version></version>` tag instead of being silently withheld (resolves #1161) (#1166)
 - **deps-pypi, deps-cargo, deps-composer, deps-maven, deps-gradle, deps-nuget**: version-completion's leading-operator stripping fixed for Poetry caret constraints, Cargo `*`, Composer `!=`, and Maven/Gradle/NuGet bracket-range syntax, each ecosystem's operator set now covered by a conformance test (resolves #1137) (#1170)

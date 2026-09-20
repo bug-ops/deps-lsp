@@ -302,6 +302,175 @@ fn detect_catalog_context<'a>(
     (GradleCompletionContext::None, "", Range::default())
 }
 
+/// One Groovy/Kotlin `'...'`/`"..."` string literal found while scanning left to right,
+/// toggling between the two quote characters as independent delimiters instead of
+/// assuming one quote style for the whole text (#1168) — so a line mixing both styles
+/// (`"a:b:1.0"; implementation 'c:d:2.0`) doesn't have an unrelated `"` earlier on the
+/// line desync which character actually closes the `'...'` the cursor is in.
+///
+/// `close` is the byte offset just past the closing delimiter, or `None` when `text` ends
+/// inside this literal (i.e. it's still open at the cursor).
+#[cfg(feature = "lsp-responses")]
+struct QuoteLiteral {
+    quote: char,
+    open: usize,
+    close: Option<usize>,
+}
+
+/// Scans `text` and returns its *last* string literal, open or closed — the one whose
+/// delimiter the cursor (at the end of `text`) would be inside, if any, or (when `text`
+/// ends outside any string) the last one that closed.
+///
+/// Escape-aware per [`deps_core::fallback_completion::count_real_quotes_with`]'s rule: an
+/// odd run of `\` immediately before a quote escapes it. A quote of the *other* style
+/// encountered while inside an open literal is just content, not a delimiter — mirrors
+/// how a single-quote-char scan already treats the other quote character as content.
+///
+/// A `//` or `/* ... */` comment outside any open literal is skipped rather than scanned:
+/// otherwise a quote character inside comment text (e.g. an apostrophe in `// don't bump`)
+/// is misread as opening a phantom literal (critic finding S1 on #1168's PR — `"` picked
+/// line-wide happened to make this parity-even and harmless before that fix; scoping the
+/// scan per-literal removed that accident). A `/`/`*` inside an *open* literal is just
+/// content (the `open.is_none()` guard below), matching e.g. `"http://example.com"`. An
+/// unterminated block comment (no closing `*/` before the end of `text`) is treated like a
+/// line comment — nothing after it can be code.
+#[cfg(feature = "lsp-responses")]
+fn last_quote_literal(text: &str) -> Option<QuoteLiteral> {
+    let mut open: Option<(char, usize)> = None;
+    let mut last = None;
+    let mut backslash_run = 0usize;
+    let mut chars = text.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\\' => backslash_run += 1,
+            '/' if open.is_none() => match chars.peek().copied() {
+                Some((_, '/')) => break,
+                Some((star_idx, '*')) => {
+                    chars.next();
+                    let Some(body_len) = text.get(star_idx + 1..).and_then(|s| s.find("*/")) else {
+                        break;
+                    };
+                    let resume_at = star_idx + 1 + body_len + "*/".len();
+                    while chars.peek().is_some_and(|&(i, _)| i < resume_at) {
+                        chars.next();
+                    }
+                }
+                _ => backslash_run = 0,
+            },
+            '\'' | '"' => {
+                let is_real = backslash_run.is_multiple_of(2);
+                backslash_run = 0;
+                if !is_real {
+                    continue;
+                }
+                match open {
+                    Some((q, start)) if q == ch => {
+                        last = Some(QuoteLiteral {
+                            quote: q,
+                            open: start,
+                            close: Some(idx + ch.len_utf8()),
+                        });
+                        open = None;
+                    }
+                    Some(_) => {}
+                    None => open = Some((ch, idx)),
+                }
+            }
+            _ => backslash_run = 0,
+        }
+    }
+    if let Some((quote, start)) = open {
+        last = Some(QuoteLiteral {
+            quote,
+            open: start,
+            close: None,
+        });
+    }
+    last
+}
+
+/// Forward search for the byte offset of `rest`'s real closing `quote` character, bailing
+/// out (returning `None`, same as "no closing quote on this line") as soon as a `//` line
+/// comment or an unterminated `/*` block comment is reached, and skipping over a *closed*
+/// `/* ... */` block comment rather than scanning its content for a coincidental match.
+///
+/// `rest` is the tail of the current line starting inside an already-open literal (from
+/// [`detect_dsl_context`]'s `open_pos`/`version_start`), and it can extend past the cursor
+/// into not-yet-confirmed content — including a trailing comment the user already typed
+/// while still mid-editing the coordinate. Without this guard, a quote character inside
+/// that comment (e.g. the apostrophe in `// don't forget`, or a quote inside `/* "x" */`)
+/// is indistinguishable from the literal's real closing delimiter to a plain
+/// escape-aware scan, corrupting the completion range and risking deletion of real
+/// comment text on accept (#1168 code review).
+///
+/// Unlike [`last_quote_literal`]'s backward scan — which must still let `/` stand as
+/// ordinary content inside some *other*, unrelated open string (e.g. `"http://..."`) —
+/// this function always treats `//`/`/*` as comment syntax, without an `open.is_none()`
+/// gate: a Maven coordinate segment (group/artifact/version) never legitimately contains
+/// `//`, so there is no real string content this could misclassify here.
+#[cfg(feature = "lsp-responses")]
+fn find_closing_quote_skip_comments(rest: &str, quote: char) -> Option<usize> {
+    let mut backslash_run = 0usize;
+    let mut chars = rest.char_indices().peekable();
+    while let Some((idx, ch)) = chars.next() {
+        match ch {
+            '\\' => backslash_run += 1,
+            '/' => match chars.peek().copied() {
+                Some((_, '/')) => return None,
+                Some((star_idx, '*')) => {
+                    chars.next();
+                    let body_len = rest.get(star_idx + 1..).and_then(|s| s.find("*/"))?;
+                    let resume_at = star_idx + 1 + body_len + "*/".len();
+                    while chars.peek().is_some_and(|&(i, _)| i < resume_at) {
+                        chars.next();
+                    }
+                    backslash_run = 0;
+                }
+                _ => backslash_run = 0,
+            },
+            _ if ch == quote => {
+                let is_real = backslash_run.is_multiple_of(2);
+                backslash_run = 0;
+                if is_real {
+                    return Some(idx);
+                }
+            }
+            _ => backslash_run = 0,
+        }
+    }
+    None
+}
+
+/// Whether `before_colon` (the text up to, but excluding, a trailing `:` immediately
+/// before the cursor's open literal) ends in a *quoted* map key (`'version'`) rather than
+/// a ternary/Elvis operand's already-closed string (`"a:b:1.0" :` / `value ?:`, #1160
+/// review) — both shapes end in a closing quote, so the distinguishing signal is what
+/// sits right before that quoted token's own *opening* delimiter.
+///
+/// Allowlist, not a blocklist (critic finding S2 on #1168's PR, same rationale as
+/// [`deps_core::quote_scan`]'s `is_ruby_char_literal` doc on #1039 finding C4): fires only
+/// when that character is `,`/`(`/`[`/`{` (a named-arg separator or list opener), an
+/// identifier character (a bare command-style call name immediately preceding the first
+/// key, e.g. `implementation 'group': ...`), or nothing at all (the key is the first
+/// token on a wrapped continuation line). Any operator character (`?`, `+`, `)`, ...)
+/// means a value already sits there — e.g. a ternary's true branch (`cond ? "a" : "b"`) or
+/// an arithmetic expression (`c ? p + "a" : "b"`) — so those fall through and are NOT
+/// treated as a map key. A blocklist that only excluded `?` missed the latter shape.
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn quoted_key_precedes_colon(before_colon: &str) -> bool {
+    let Some(span) = last_quote_literal(before_colon) else {
+        return false;
+    };
+    if span.close != Some(before_colon.len()) {
+        return false;
+    }
+    let before_key = before_colon[..span.open].trim_end();
+    before_key.is_empty()
+        || before_key
+            .ends_with(|c: char| c.is_alphanumeric() || matches!(c, '_' | ',' | '(' | '[' | '{'))
+}
+
 /// Detects completion context in Kotlin/Groovy DSL files.
 ///
 /// `col_idx`/`before_cursor` are byte offsets (see
@@ -319,21 +488,15 @@ fn detect_dsl_context<'a>(
     line_idx: u32,
 ) -> (GradleCompletionContext, &'a str, Range) {
     let cursor = col_idx.min(line.len());
-    let quote_char = if before_cursor.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    // Escape-aware odd-parity check on the chosen quote char: even means the cursor is past a
-    // closed string, or none was opened on this line (#738).
-    let (quote_count, last_real_quote) =
-        deps_core::fallback_completion::count_real_quotes_with(before_cursor, quote_char);
-    if quote_count.is_multiple_of(2) {
-        return (GradleCompletionContext::None, "", Range::default());
-    }
-    let Some(open_pos) = last_real_quote else {
+    // Scoped per-literal (#1168), not line-wide: `quote_char` is whatever delimiter opens
+    // the string containing the cursor, found by scanning forward and toggling between
+    // `'`/`"` as independent delimiters, rather than picking one quote character for the
+    // whole line and checking its parity.
+    let Some(open) = last_quote_literal(before_cursor).filter(|span| span.close.is_none()) else {
         return (GradleCompletionContext::None, "", Range::default());
     };
+    let quote_char = open.quote;
+    let open_pos = open.open;
 
     // Groovy's named-argument ("map notation") dependency form
     // (`group: 'x', name: 'y', version: 'z'`) puts each field's value in its own standalone
@@ -341,15 +504,17 @@ fn detect_dsl_context<'a>(
     // `crate::parser::groovy` doesn't parse into a `Dependency` at all, so its colon-free field
     // values must not be misread as a Package/Version segment of a compact coordinate.
     // Requires the colon to be immediately preceded (after whitespace) by an identifier
-    // character, not just any trailing `:` — a Groovy ternary's or Elvis operator's colon
-    // (`cond ? "a:b:1.0" : "c:d:2.0`, `value ?: "a:b:1.0"`) also leaves a trailing `:` before a
-    // legitimate compact-coordinate string, but is preceded by `"`/`?`, never an identifier.
-    if let Some(before_colon) = before_cursor[..open_pos].trim_end().strip_suffix(':')
-        && before_colon
-            .trim_end()
-            .ends_with(|c: char| c.is_alphanumeric() || c == '_')
-    {
-        return (GradleCompletionContext::None, "", Range::default());
+    // character or a quoted key (`'version':`, #1168), not just any trailing `:` — a Groovy
+    // ternary's or Elvis operator's colon (`cond ? "a:b:1.0" : "c:d:2.0`, `value ?: "a:b:1.0"`)
+    // also leaves a trailing `:` before a legitimate compact-coordinate string, but is preceded
+    // by a ternary branch or `?`, never a map key (see `quoted_key_precedes_colon`).
+    if let Some(before_colon) = before_cursor[..open_pos].trim_end().strip_suffix(':') {
+        let before_colon = before_colon.trim_end();
+        let is_map_key = before_colon.ends_with(|c: char| c.is_alphanumeric() || c == '_')
+            || quoted_key_precedes_colon(before_colon);
+        if is_map_key {
+            return (GradleCompletionContext::None, "", Range::default());
+        }
     }
 
     // Scoped to the currently open string literal (from `open_pos` to the cursor), not the
@@ -370,8 +535,7 @@ fn detect_dsl_context<'a>(
             // already-typed version) if any, else the closing quote; bounded by the cursor when
             // unterminated (mirrors `MavenEcosystem::detect_xml_context`'s fallback).
             let rest = &line[open_pos + 1..];
-            let closing_quote_rel =
-                deps_core::fallback_completion::find_closing_quote(rest, quote_char);
+            let closing_quote_rel = find_closing_quote_skip_comments(rest, quote_char);
             let scan_limit_rel = closing_quote_rel.unwrap_or(cursor - (open_pos + 1));
             let end_rel = rest[..scan_limit_rel]
                 .char_indices()
@@ -397,8 +561,7 @@ fn detect_dsl_context<'a>(
             // this arm previously returned `Range::default()`, rejecting every compact-coordinate
             // completion here).
             let rest = &line[version_start..];
-            let closing_quote_rel =
-                deps_core::fallback_completion::find_closing_quote(rest, quote_char);
+            let closing_quote_rel = find_closing_quote_skip_comments(rest, quote_char);
             let value_end = closing_quote_rel
                 .map_or(cursor, |rel| version_start + rel)
                 .max(cursor);
@@ -829,23 +992,237 @@ mod tests {
         assert_eq!(v, "com.o'reilly:li");
     }
 
+    // #1168: a completed double-quoted string earlier on the line must not stop
+    // completion inside a still-open single-quoted string later on the same line — the
+    // scanner now toggles between both quote styles per-literal instead of picking one
+    // quote character for the whole line (previously the even `"` count from the closed
+    // `"x"` returned "no completion context" here, even though the cursor sits in an
+    // unrelated, still-open `'...'`).
     #[cfg(feature = "lsp-responses")]
     #[test]
-    fn test_detect_dsl_context_mixed_quote_types_on_one_line_no_completion() {
-        // exclude module: "x"; implementation 'com.baz:qu — a completed double-quoted
-        // string earlier on the line, followed by a still-open single-quoted string.
-        // `quote_char` picks '"' (the line contains one), whose own parity is even
-        // (closed), so this deliberately reports "no completion context" instead of
-        // guessing at the unrelated single-quoted string — accepted limitation, not a
-        // regression from this fix: a line mixing both quote styles picks one quote
-        // character for the whole line, not per-field.
+    fn test_detect_dsl_context_mixed_quote_types_on_one_line_resolves_open_literal() {
+        // exclude module: "x"; implementation 'com.baz:qu|
         let line = r#"exclude module: "x"; implementation 'com.baz:qu"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.baz:qu");
+    }
+
+    // #1168 Gap 1: the same fix must also apply when the SECOND (not just the last)
+    // literal on the line is closed with the other quote style, and the cursor sits in a
+    // third, still-open literal further right — proving the scan isn't limited to a
+    // two-literal line.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_mixed_quote_styles_joined_line_scopes_version_to_last_dependency() {
+        // implementation "a:b:1.0"; implementation 'c:d:2.0|
+        let line = r#"implementation "a:b:1.0"; implementation 'c:d:2.0"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "2.0");
+        let expected_start = line.rfind("2.0").unwrap();
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, col as u32)
+            )
+        );
+    }
+
+    // #1168 Gap 2: a QUOTED map key (`'version': '1.0'`) must be withheld the same way
+    // the unquoted form (`version: '1.0'`) already is — the map-notation guard's
+    // alphanumeric/underscore check alone misses this, since a quoted key's character
+    // before the colon is `'`, not an identifier character.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_quoted_map_notation_version_value_withholds_completion() {
+        // implementation 'group': 'com.example', 'version': '1.0|
+        let line = r"implementation 'group': 'com.example', 'version': '1.0";
         let col = line.len();
         let before = &line[..col];
         let (t, v, range) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::None);
         assert_eq!(v, "");
         assert_eq!(range, Range::default());
+    }
+
+    // #1168 Gap 2 follow-up: the quoted-key guard must not misfire on a quoted key mixed
+    // with an unquoted one on the same map-notation line.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_quoted_map_notation_group_value_withholds_completion() {
+        // implementation 'group': 'com.exam|
+        let line = "implementation 'group': 'com.exam";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    // #1168 critic finding S1 (significant regression): an apostrophe inside a trailing
+    // `//` comment must not be read as opening a phantom literal. Nothing strips comments
+    // before `detect_dsl_context` runs, so the per-literal scan has to skip them itself.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_apostrophe_in_trailing_line_comment_no_phantom_literal() {
+        // implementation "a:b:1.0" // don't bump|
+        let line = r#"implementation "a:b:1.0" // don't bump"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    // #1168 critic finding S1 follow-up: the same class pre-dates this fix for a
+    // single-quoted line too (an unrelated accident of even quote parity previously hid
+    // it there) — the comment guard must close it for both quote styles.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_apostrophe_in_trailing_line_comment_single_quoted_line() {
+        // implementation 'a:b:1.0' // don't bump|
+        let line = "implementation 'a:b:1.0' // don't bump";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    // #1168 critic finding S1 follow-up: a `/* ... */` block comment containing a quote
+    // character must be skipped the same way, and — unlike a line comment — code after its
+    // closing `*/` on the same line must still be scanned normally.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_apostrophe_in_block_comment_no_phantom_literal_and_resumes_after() {
+        // implementation /* don't */ "com.exam|
+        let line = "implementation /* don't */ \"com.exam";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.exam");
+    }
+
+    // #1168 critic finding S2 (minor regression): a ternary true-branch that ends in a
+    // literal but is preceded by an operator (not just `?`) must still resolve normally —
+    // `quoted_key_precedes_colon` was a blocklist that only excluded `?`, so an operand
+    // like `p + "a"` was misclassified as a quoted map key.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_ternary_branch_after_operator_still_resolves_version() {
+        // implementation(x = c ? p + "a" : "g:a:1.0|
+        let line = r#"implementation(x = c ? p + "a" : "g:a:1.0"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
+    }
+
+    // #1168 code review: `find_closing_quote`'s forward scan (past the cursor, looking for
+    // the literal's real closing delimiter) had no comment awareness — a genuinely
+    // unterminated coordinate followed by a trailing `//` comment that happens to contain a
+    // quote character (e.g. inside `"notes"`) had that quote mistaken for the real closer,
+    // corrupting the Version range into comment text.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_version_forward_scan_stops_at_trailing_line_comment() {
+        // implementation("com.example:foo:1.0| // see "notes" here
+        let line = r#"implementation("com.example:foo:1.0 // see "notes" here"#;
+        let expected_start = line.find("1.0").unwrap();
+        let col = expected_start + 3;
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, col as u32)
+            )
+        );
+    }
+
+    // #1168 code review follow-up: the same forward-scan comment guard applies to the
+    // Package arm (`rest` there also scans past the cursor to the end of the line).
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_package_forward_scan_stops_at_trailing_line_comment() {
+        // implementation("com.example:fo| // see "notes" here
+        let line = r#"implementation("com.example:fo // see "notes" here"#;
+        let expected_start = line.find('"').unwrap() + 1;
+        let col = line.find(":fo").unwrap() + 3;
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.example:fo");
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, col as u32)
+            )
+        );
+    }
+
+    // #1168 code review follow-up: a `/* ... */` block comment containing a quote character
+    // (e.g. inside `"hi"`) must be skipped wholesale, not scanned for a coincidental match —
+    // with nothing legitimate following it here, the search still correctly reports "no
+    // closing quote found" rather than grabbing the quote inside the comment.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_version_forward_scan_skips_block_comment_with_quote_inside() {
+        // implementation("com.example:foo:1.0| /* say "hi" */ trailing
+        let line = r#"implementation("com.example:foo:1.0 /* say "hi" */ trailing"#;
+        let expected_start = line.find("1.0").unwrap();
+        let col = expected_start + 3;
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, col as u32)
+            )
+        );
+    }
+
+    // #1168 code review follow-up: the team-lead's exact repro — a single-quoted literal
+    // (not just double-quoted) whose trailing `//` comment contains an apostrophe matching
+    // its OWN delimiter character (`developer's`), proving the comment guard isn't
+    // accidentally specific to the double-quote case already covered above.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_version_forward_scan_stops_at_apostrophe_in_own_delimiter_style_comment()
+     {
+        // implementation 'com.example:artifact:1.0| // developer's note
+        let line = "implementation 'com.example:artifact:1.0 // developer's note";
+        let expected_start = line.find("1.0").unwrap();
+        let col = expected_start + 3;
+        let before = &line[..col];
+        let (t, v, range) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Version);
+        assert_eq!(v, "1.0");
+        assert_eq!(
+            range,
+            Range::new(
+                Position::new(0, expected_start as u32),
+                Position::new(0, col as u32)
+            )
+        );
     }
 
     // #1160 S2 (critic follow-up): Groovy's named-argument ("map notation") dependency form
