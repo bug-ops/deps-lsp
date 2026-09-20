@@ -460,6 +460,73 @@ impl crate::Registry for ErrorRegistry {
     }
 }
 
+/// A registry whose `get_versions` sleeps past a caller-supplied delay before
+/// resolving, for exercising a caller's `tokio::time::timeout` wrap around the fetch
+/// (e.g. `REGISTRY_FETCH_BUDGET`, #1204). Pair with `#[tokio::test(start_paused =
+/// true)]` so the delay elapses without a real wall-clock wait.
+///
+/// Resolves with a non-empty, non-yanked version list, not `Vec::new()`: an empty list
+/// renders identically to a properly timed-out fetch (no `**Latest**` line, `None` for
+/// yank checks either way), so a caller whose timeout wrap silently stopped applying
+/// would still pass an assertion built only against an empty result — a real version
+/// entry makes that regression visible (surfaces as a `**Latest**` line in hover, or an
+/// unfiltered fix action in code actions) instead of accidentally passing.
+#[cfg(feature = "lsp-responses")]
+pub(crate) struct SlowRegistry {
+    pub(crate) delay: std::time::Duration,
+}
+
+#[cfg(feature = "lsp-responses")]
+impl crate::Registry for SlowRegistry {
+    fn get_versions<'a>(
+        &'a self,
+        _name: &'a PackageName,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
+        let delay = self.delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(vec![Box::new(TestVersion {
+                version: ConcreteVersion::new("9.9.9"),
+                yanked: false,
+            }) as Box<dyn crate::Version>])
+        })
+    }
+
+    fn get_latest_matching<'a>(
+        &'a self,
+        _name: &'a PackageName,
+        _req: &'a VersionReq,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
+    {
+        Box::pin(async move { Ok(None) })
+    }
+
+    // Without this override, `select_latest_matching` falls back to the trait default
+    // (always `None`, registry.rs), so `generate_hover`'s `live_latest_idx` would stay
+    // `None` regardless of whether `get_versions` actually timed out — silently
+    // reintroducing the same non-discriminating-test bug this struct's `get_versions`
+    // fix above was meant to close.
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn crate::Version>],
+        _req: &crate::VersionReq,
+    ) -> Option<usize> {
+        versions.iter().position(|v| v.is_stable())
+    }
+
+    fn search<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>> {
+        Box::pin(async move { Ok(Vec::new()) })
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 /// A registry whose `get_versions` always errs with `PackageNotFound`, for
 /// exercising a "package genuinely doesn't exist" code path — distinct from
 /// [`ErrorRegistry`], whose `CacheError` stands in for a transient/unanswerable

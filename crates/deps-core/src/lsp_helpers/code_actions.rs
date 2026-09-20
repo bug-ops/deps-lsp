@@ -6,8 +6,9 @@ use crate::{ConcreteVersion, Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE,
-    VersionData, is_safe_version_string, literal_span_matches, requirement_is_unsatisfiable,
-    single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
+    VersionData, await_versions_fetch, is_safe_version_string, literal_span_matches,
+    requirement_is_unsatisfiable, single_file_edit, slice_for_range, strip_whitespace,
+    warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -565,25 +566,32 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // dependency must never be looked up against this ecosystem's default registry client,
     // which would offer bogus "update to X" actions for an unrelated package.
     let dep_source = dep.source();
-    let registry_versions = if formatter.can_resolve_source(&dep_source) {
-        registry
-            .get_versions_from(
+    let (registry_versions, fetch_timed_out) = if formatter.can_resolve_source(&dep_source) {
+        await_versions_fetch(
+            registry.get_versions_from(
                 dep.name(),
                 &dep_source,
                 crate::freshness::FreshnessSettings {
                     enabled: false,
                     ..Default::default()
                 },
-            )
-            .await
-            .ok()
+            ),
+            dep.name(),
+            "code action",
+        )
+        .await
     } else {
-        None
+        (None, false)
     };
 
     // A fix target the registry reports as yanked is dropped entirely rather than offered —
-    // the surviving diagnostics carry the finding either way. On a registry outage
-    // (`registry_versions` is `None`) both actions pass through unfiltered.
+    // the surviving diagnostics carry the finding either way. On a genuine registry outage
+    // (`registry_versions` is `None`, fetch not timed out) both actions still pass through
+    // unfiltered, unchanged from before #1204. A *timed-out* fetch is treated differently
+    // (`fetch_timed_out`, checked first below): the deadline, not the registry, decided to
+    // stop waiting, so a live answer confirming or denying the yank may well have been
+    // moments away — failing open here would let a slow registry silently suppress the very
+    // yank check this block exists for. Both speculative actions are dropped outright instead.
     let is_yanked_target = |version_native: &str| {
         registry_versions.as_ref().is_some_and(|versions_list| {
             versions_list
@@ -592,8 +600,8 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 .is_some_and(|v| v.removal_status().blocks_resolution())
         })
     };
-    let fix = fix.filter(|f| !is_yanked_target(&f.version_native));
-    let unsat_fix = unsat_fix.filter(|f| !is_yanked_target(&f.version_native));
+    let fix = fix.filter(|f| !fetch_timed_out && !is_yanked_target(&f.version_native));
+    let unsat_fix = unsat_fix.filter(|f| !fetch_timed_out && !is_yanked_target(&f.version_native));
 
     // Yank-filtering both actions before this collision check matters: PyPI's
     // `truncate_release_to_match` can map a yanked and a live version to identical rewritten
@@ -1950,6 +1958,75 @@ mod tests {
         // S1: the single-exit restructure must not drop `isPreferred` from an
         // already-built fix action on the registry-outage path.
         assert_eq!(actions[0].is_preferred, Some(true));
+    }
+
+    /// #1204: same guarantee as
+    /// `test_generate_code_actions_fix_action_survives_registry_error`, but for the
+    /// `tokio::time::timeout` wrap around the primary `registry_versions` fetch — a
+    /// registry that never returns must not suppress the OSV-derived fix either.
+    /// `start_paused` lets `REGISTRY_FETCH_BUDGET` elapse without a real wait.
+    #[tokio::test(start_paused = true)]
+    async fn test_generate_code_actions_fix_action_dropped_on_registry_timeout() {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            "pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![std::sync::Arc::new(Advisory {
+                        id: "A1".to_string(),
+                        modified: "2023-01-01T00:00:00Z".to_string(),
+                        summary: None,
+                        aliases: vec![],
+                        severity: VulnSeverity::High,
+                        cvss_vector: None,
+                        fixed_versions: vec!["1.2.0".to_string()],
+                        url: String::new(),
+                    })],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::CandidateClean {
+                    version: "1.2.0".to_string(),
+                },
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+        let registry = SlowRegistry {
+            delay: REGISTRY_FETCH_BUDGET + std::time::Duration::from_secs(1),
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MockFormatter,
+        )
+        .await;
+
+        // The fix action is dropped outright rather than offered unfiltered (impl-critic
+        // S1, issue #1204 follow-up): a timed-out fetch means the deadline, not the
+        // registry, decided to stop waiting, so a live answer about whether "1.2.0" is
+        // yanked may well have been moments away — unlike a genuine registry outage, this
+        // must not fail open.
+        assert!(quickfix_titles(&actions).is_empty());
+        assert!(actions.is_empty());
     }
 
     #[tokio::test]
