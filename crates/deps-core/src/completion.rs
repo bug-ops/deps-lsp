@@ -23,7 +23,7 @@ use crate::{
 };
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
-    Documentation, MarkupContent, MarkupKind, Position, Range, TextEdit,
+    Documentation, InsertTextFormat, MarkupContent, MarkupKind, Position, Range, TextEdit,
 };
 
 /// Re-exported from [`crate::lsp_helpers::COMPLETION_SEARCH_TIMEOUT`] — moved there (issue
@@ -644,6 +644,74 @@ pub fn build_package_completion(
     })
 }
 
+/// Describes replacing a source span with `lead + version + trail`, for a completion whose
+/// value slot has no correct cursor-insert position at all.
+///
+/// Without an explicit `text_edit`, an LSP client inserts the accepted completion at the
+/// *cursor* position, not at any detected range's start — so an imprecise detection range
+/// only changes which extra column offers completion, it does not by itself corrupt the
+/// document. Maven's self-closing `<version/>` tag is the shape where this stops holding:
+/// every position inside the tag is a position outside the value slot, so no cursor-insert
+/// can ever land correctly. The only fix is restructuring the tag itself — replacing `range`
+/// with `lead + version + trail` (`<version>` + version + `</version>`) instead of inserting
+/// at the cursor.
+///
+/// `replaced_text` must be the exact source text `range` spans. An LSP client filters
+/// candidates by matching `filterText` (default: `label`) against the document text from
+/// `range.start` to the cursor; with `range` spanning tag markup like `<version/>`, that text
+/// is never a prefix of a bare version label like `"1.2.3"`, so every item would be filtered
+/// out client-side unless `filterText` is set to `replaced_text` instead (see
+/// [`build_version_completion`]). One consequence: the candidate list never narrows as the
+/// user types inside the tag — acceptable, since typing there mutates the tag and
+/// re-triggers detection.
+///
+/// [`build_version_completion`] leaves `insert_text` set to the bare version (e.g.
+/// `"1.2.3"`) even when a replacement is present, rather than `None` or the full
+/// `lead + version + trail`. This relies on LSP 3.17's normative rule that a client MUST
+/// ignore `insertText` when `textEdit` is present — not a new reliance this type
+/// introduces: Maven's existing `groupId`/`artifactId` completion path
+/// (`build_field_completion`, `crates/deps-maven/src/ecosystem.rs`) already depends on the
+/// identical guarantee. `None` would be worse, not safer: a non-conformant client without
+/// `textEdit` support falls back to `label` (e.g. `"1.2.3 (latest)"`) instead.
+///
+/// Constructed via a plain struct literal — named fields, not a positional constructor,
+/// since `lead` and `trail` are two adjacent same-typed strings that would otherwise be
+/// silently swappable with no compiler error.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::completion::VersionReplacement;
+/// use tower_lsp_server::ls_types::Range;
+///
+/// let replacement = VersionReplacement {
+///     range: Range::default(),
+///     lead: "<version>".to_string(),
+///     trail: "</version>".to_string(),
+///     replaced_text: "<version/>".to_string(),
+/// };
+/// assert_eq!(replacement.lead, "<version>");
+/// assert_eq!(replacement.trail, "</version>");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionReplacement {
+    /// The span of source text to replace.
+    pub range: Range,
+    /// Text inserted before the version.
+    pub lead: String,
+    /// Text inserted after the version.
+    pub trail: String,
+    /// The exact source text `range` spans — see this type's own doc for why it matters.
+    pub replaced_text: String,
+}
+
+impl VersionReplacement {
+    /// Renders the replacement text for `version`: `lead + version + trail`.
+    fn render(&self, version: &str) -> String {
+        format!("{}{version}{}", self.lead, self.trail)
+    }
+}
+
 /// Builds a completion item for a version string.
 ///
 /// Creates a properly formatted LSP CompletionItem with version metadata
@@ -652,8 +720,10 @@ pub fn build_package_completion(
 /// # Arguments
 ///
 /// * `display_item` - Version display metadata with label, description, and flags
-/// * `insert_range` - Optional LSP range where the completion should replace text.
-///   If `None`, the completion will insert at cursor position without replacing.
+/// * `replacement` - When `None`, the completion inserts the bare version at the cursor
+///   (`insert_text` only, no `text_edit`). When `Some`, the completion instead replaces
+///   [`VersionReplacement::range`] with `lead + version + trail` — see that type's doc for
+///   why this is needed and for the `filter_text`/`insert_text` implications.
 /// * `now` - Current instant, injected explicitly rather than read internally, so every
 ///   item in the same completion response has its age computed against one consistent
 ///   instant instead of drifting mid-request.
@@ -675,26 +745,31 @@ pub fn build_package_completion(
 /// # Examples
 ///
 /// ```no_run
-/// use deps_core::completion::{build_version_completion, VersionDisplayItem};
+/// use deps_core::completion::{build_version_completion, VersionDisplayItem, VersionReplacement};
 /// use deps_core::PackageName;
 /// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(version: &dyn deps_core::Version) {
 /// let now = deps_core::PublishTime::now();
 ///
-/// // Without range - insert at cursor
+/// // Without a replacement - insert at cursor
 /// let display_item = VersionDisplayItem::new(version, &PackageName::new("serde"), 0, true);
 /// let item = build_version_completion(&display_item, None, now, true);
 /// assert_eq!(item.label, display_item.label);
 ///
-/// // With range - replace existing text
-/// let range = Range::default();
-/// let item = build_version_completion(&display_item, Some(range), now, true);
+/// // With a replacement - replace a whole tag span with lead + version + trail
+/// let replacement = VersionReplacement {
+///     range: Range::default(),
+///     lead: "<version>".to_string(),
+///     trail: "</version>".to_string(),
+///     replaced_text: "<version/>".to_string(),
+/// };
+/// let item = build_version_completion(&display_item, Some(&replacement), now, true);
 /// # }
 /// ```
 pub fn build_version_completion(
     display_item: &VersionDisplayItem,
-    insert_range: Option<Range>,
+    replacement: Option<&VersionReplacement>,
     now: PublishTime,
     freshness_enabled: bool,
 ) -> CompletionItem {
@@ -713,18 +788,29 @@ pub fn build_version_completion(
             description: None,
         });
 
+    let (text_edit, filter_text, insert_text_format) = match replacement {
+        None => (None, None, None),
+        Some(replacement) => (
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range: replacement.range,
+                new_text: replacement.render(display_item.version.as_str()),
+            })),
+            Some(replacement.replaced_text.clone()),
+            // Defense-in-depth: this sink now emits structural markup, not just a bare
+            // version, so make the "not a snippet" contract explicit rather than implicit.
+            Some(InsertTextFormat::PLAIN_TEXT),
+        ),
+    };
+
     CompletionItem {
         label: display_item.label.clone(),
         kind: Some(CompletionItemKind::VALUE),
         detail: Some(display_item.description.clone()),
         documentation: None,
         insert_text: Some(display_item.version.to_string()),
-        text_edit: insert_range.map(|range| {
-            CompletionTextEdit::Edit(TextEdit {
-                range,
-                new_text: display_item.version.to_string(),
-            })
-        }),
+        text_edit,
+        filter_text,
+        insert_text_format,
         sort_text: Some(sort_text),
         preselect: Some(display_item.is_latest),
         label_details,
@@ -1036,6 +1122,8 @@ pub async fn complete_package_names_generic(
 /// * `source` - Where `package_name` actually resolves from (registry, git, path, ...)
 /// * `prefix` - Partial version string typed by user (may include operators)
 /// * `operator_chars` - Ecosystem-specific version operators to strip (e.g., `&['^', '~']`)
+/// * `replacement` - Threaded into [`build_version_completion`] for every returned item; see
+///   [`VersionReplacement`]'s doc for what `Some` changes and why it's needed.
 ///
 /// # Returns
 ///
@@ -1045,6 +1133,127 @@ pub async fn complete_package_names_generic(
 /// [`Registry::select_latest_matching`](crate::Registry::select_latest_matching) — not
 /// necessarily the first — is marked with "(latest)" suffix and preselected; a pre-release or
 /// deprecated release sorting above it in fetch order is offered unlabeled instead (#952).
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::{complete_versions_generic_replacing, VersionReplacement};
+/// use deps_core::lsp_helpers::SourcePolicy;
+/// use deps_core::parser::DependencySource;
+/// use deps_core::PackageName;
+/// use tower_lsp_server::ls_types::{Position, Range};
+///
+/// struct DefaultFormatter;
+/// impl SourcePolicy for DefaultFormatter {}
+///
+/// # async fn example(registry: &dyn deps_core::Registry) {
+/// let freshness = deps_core::FreshnessSettings::default();
+///
+/// // Maven's self-closing `<version/>`: replace the whole tag instead of inserting at the
+/// // cursor, since no cursor position inside `<version/>` lands inside a value slot.
+/// let tag_range = Range {
+///     start: Position { line: 5, character: 6 },
+///     end: Position { line: 5, character: 17 },
+/// };
+/// let replacement = VersionReplacement {
+///     range: tag_range,
+///     lead: "<version>".to_string(),
+///     trail: "</version>".to_string(),
+///     replaced_text: "<version/>".to_string(),
+/// };
+///
+/// let items = complete_versions_generic_replacing(
+///     registry,
+///     &DefaultFormatter,
+///     &PackageName::new("junit:junit"),
+///     &DependencySource::Registry,
+///     "",
+///     &[],
+///     freshness,
+///     Some(&replacement),
+/// ).await;
+/// # }
+/// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors complete_versions_generic_from's own 7 parameters plus the one new \
+              `replacement` param this function adds; wrapping the existing 7 in a request \
+              struct now would break every other ecosystem's already-stable call pattern"
+)]
+pub async fn complete_versions_generic_replacing(
+    registry: &dyn crate::Registry,
+    formatter: &dyn crate::lsp_helpers::SourcePolicy,
+    package_name: &PackageName,
+    source: &crate::parser::DependencySource,
+    prefix: &str,
+    operator_chars: &[char],
+    freshness: FreshnessSettings,
+    replacement: Option<&VersionReplacement>,
+) -> Vec<CompletionItem> {
+    if !formatter.can_resolve_source(source) {
+        return vec![];
+    }
+
+    let versions = match registry
+        .get_versions_from(package_name, source, freshness)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
+            return vec![];
+        }
+    };
+
+    let clean_prefix = prefix.trim_start_matches(operator_chars).trim();
+    let has_prefix_match = versions
+        .iter()
+        .any(|v| v.version_string().as_str().starts_with(clean_prefix));
+
+    // The same registry-delegated pick `prepare_version_display_items` needs (see its doc
+    // comment) — computed over whichever slice is actually about to be displayed (the
+    // prefix-narrowed subset, when non-empty, same as the fallback-to-all-versions case
+    // right below), so a prefix match still gets the correct stable/non-deprecated entry
+    // tagged within itself rather than unconditionally the first one shown.
+    let wildcard_req = crate::existence_wildcard_req();
+    let display_items = if has_prefix_match {
+        let filtered_versions: Vec<Box<dyn Version>> = versions
+            .into_iter()
+            .filter(|v| v.version_string().as_str().starts_with(clean_prefix))
+            .collect();
+        let latest_idx = registry.select_latest_matching(&filtered_versions, &wildcard_req);
+        prepare_version_display_items(&filtered_versions, package_name, latest_idx)
+    } else {
+        let latest_idx = registry.select_latest_matching(&versions, &wildcard_req);
+        prepare_version_display_items(&versions, package_name, latest_idx)
+    };
+
+    let now = PublishTime::now();
+    display_items
+        .iter()
+        // A registry-reported version is untrusted the same way `format_version_for_text_edit`'s
+        // input is (see `is_safe_version_string`'s doc comment) — this sink fires on ordinary
+        // typing rather than a quickfix click.
+        .filter(|item| {
+            let safe = is_safe_version_string(item.version.as_str());
+            if !safe {
+                warn_rejected_value(
+                    "is_safe_version_string",
+                    "version completion item",
+                    item.version.as_str(),
+                );
+            }
+            safe
+        })
+        .map(|item| build_version_completion(item, replacement, now, freshness.enabled))
+        .collect()
+}
+
+/// Thin wrapper over [`complete_versions_generic_replacing`] with `replacement: None`.
+///
+/// This is the cursor-insert behavior every ecosystem's version completion has always had.
+/// See that function's doc for the full contract (source-resolvability gate, prefix
+/// filtering, latest selection, the `is_safe_version_string` guard).
 ///
 /// # Examples
 ///
@@ -1092,64 +1301,17 @@ pub async fn complete_versions_generic_from(
     operator_chars: &[char],
     freshness: FreshnessSettings,
 ) -> Vec<CompletionItem> {
-    if !formatter.can_resolve_source(source) {
-        return vec![];
-    }
-
-    let versions = match registry
-        .get_versions_from(package_name, source, freshness)
-        .await
-    {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
-            return vec![];
-        }
-    };
-
-    let clean_prefix = prefix.trim_start_matches(operator_chars).trim();
-    let has_prefix_match = versions
-        .iter()
-        .any(|v| v.version_string().as_str().starts_with(clean_prefix));
-
-    // The same registry-delegated pick `prepare_version_display_items` needs (see its doc
-    // comment) — computed over whichever slice is actually about to be displayed (the
-    // prefix-narrowed subset, when non-empty, same as the fallback-to-all-versions case
-    // right below), so a prefix match still gets the correct stable/non-deprecated entry
-    // tagged within itself rather than unconditionally the first one shown.
-    let wildcard_req = crate::existence_wildcard_req();
-    let display_items = if has_prefix_match {
-        let filtered_versions: Vec<Box<dyn Version>> = versions
-            .into_iter()
-            .filter(|v| v.version_string().as_str().starts_with(clean_prefix))
-            .collect();
-        let latest_idx = registry.select_latest_matching(&filtered_versions, &wildcard_req);
-        prepare_version_display_items(&filtered_versions, package_name, latest_idx)
-    } else {
-        let latest_idx = registry.select_latest_matching(&versions, &wildcard_req);
-        prepare_version_display_items(&versions, package_name, latest_idx)
-    };
-
-    // Don't provide text_edit range - let LSP client insert at cursor position
-    let now = PublishTime::now();
-    display_items
-        .iter()
-        // A registry-reported version is untrusted the same way `format_version_for_text_edit`'s
-        // input is (see `is_safe_version_string`'s doc comment) — this sink fires on ordinary
-        // typing rather than a quickfix click.
-        .filter(|item| {
-            let safe = is_safe_version_string(item.version.as_str());
-            if !safe {
-                warn_rejected_value(
-                    "is_safe_version_string",
-                    "version completion item",
-                    item.version.as_str(),
-                );
-            }
-            safe
-        })
-        .map(|item| build_version_completion(item, None, now, freshness.enabled))
-        .collect()
+    complete_versions_generic_replacing(
+        registry,
+        formatter,
+        package_name,
+        source,
+        prefix,
+        operator_chars,
+        freshness,
+        None,
+    )
+    .await
 }
 
 /// Version completion resolved by **cursor position**, not by package name (issue #593).
@@ -2795,6 +2957,56 @@ mod tests {
     }
 
     #[test]
+    fn test_build_version_completion_with_replacement_sets_text_edit_and_filter_text() {
+        let version = MockVersion {
+            version: "1.2.3".into(),
+            yanked: false,
+            prerelease: false,
+        };
+        let range = Range {
+            start: Position::new(3, 6),
+            end: Position::new(3, 17),
+        };
+        let replacement = VersionReplacement {
+            range,
+            lead: "<version>".to_string(),
+            trail: "</version>".to_string(),
+            replaced_text: "<version/>".to_string(),
+        };
+
+        let now = PublishTime::now();
+        let display_item = VersionDisplayItem::new(&version, &pkg("junit"), 0, true);
+        let item = build_version_completion(&display_item, Some(&replacement), now, true);
+
+        assert_eq!(
+            item.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: "<version>1.2.3</version>".to_string(),
+            }))
+        );
+        assert_eq!(item.filter_text, Some("<version/>".to_string()));
+        assert_eq!(item.insert_text, Some("1.2.3".to_string()));
+        assert_eq!(item.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
+    }
+
+    #[test]
+    fn test_build_version_completion_without_replacement_omits_filter_text_and_format() {
+        let version = MockVersion {
+            version: "1.0.0".into(),
+            yanked: false,
+            prerelease: false,
+        };
+
+        let now = PublishTime::now();
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, false);
+        let item = build_version_completion(&display_item, None, now, true);
+
+        assert_eq!(item.filter_text, None);
+        assert_eq!(item.insert_text_format, None);
+    }
+
+    #[test]
     fn test_build_version_completion_latest() {
         let version = MockVersion {
             version: "1.0.0".into(),
@@ -3889,6 +4101,95 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "2.0.0 (latest)");
+    }
+
+    /// #1167: threads a [`VersionReplacement`] through every returned item's `text_edit`,
+    /// proving `complete_versions_generic_from`'s `None` wrapper and this function's `Some`
+    /// path both go through the same underlying logic.
+    #[tokio::test]
+    async fn test_complete_versions_generic_replacing_threads_replacement_into_every_item() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "1.0.0".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "1.0.1".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+        let range = Range {
+            start: Position::new(2, 4),
+            end: Position::new(2, 15),
+        };
+        let replacement = VersionReplacement {
+            range,
+            lead: "<version>".to_string(),
+            trail: "</version>".to_string(),
+            replaced_text: "<version/>".to_string(),
+        };
+
+        let items = complete_versions_generic_replacing(
+            &registry,
+            &MockFormatter,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "",
+            &[],
+            FreshnessSettings::default(),
+            Some(&replacement),
+        )
+        .await;
+
+        assert_eq!(items.len(), 2);
+        for item in &items {
+            assert_eq!(item.filter_text, Some("<version/>".to_string()));
+            let Some(CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+                panic!("expected a textEdit::Edit for {item:?}");
+            };
+            assert_eq!(edit.range, range);
+            assert!(edit.new_text.starts_with("<version>1.0."));
+            assert!(edit.new_text.ends_with("</version>"));
+        }
+    }
+
+    /// #1167: a malicious/compromised registry version string must never reach
+    /// [`VersionReplacement::render`]'s `new_text` even when a replacement is threaded
+    /// through — the `is_safe_version_string` filter runs before `build_version_completion`
+    /// regardless of which path (`None`/`Some`) is used.
+    #[tokio::test]
+    async fn test_complete_versions_generic_replacing_drops_unsafe_version_before_render() {
+        let registry = MockRegistry {
+            versions: vec![MockVersion {
+                version: "1.0.0</version><parent><groupId>evil".into(),
+                yanked: false,
+                prerelease: false,
+            }],
+        };
+        let replacement = VersionReplacement {
+            range: Range::default(),
+            lead: "<version>".to_string(),
+            trail: "</version>".to_string(),
+            replaced_text: "<version/>".to_string(),
+        };
+
+        let items = complete_versions_generic_replacing(
+            &registry,
+            &MockFormatter,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "",
+            &[],
+            FreshnessSettings::default(),
+            Some(&replacement),
+        )
+        .await;
+
+        assert!(items.is_empty());
     }
 
     /// #1136: a source `can_resolve_source` rejects (e.g. a Git dependency, never
