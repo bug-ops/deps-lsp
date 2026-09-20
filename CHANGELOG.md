@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
+- **deps-core**: blocked-registry diagnostic's `declaration_key` redaction now gates on credential shape rather than a URL-separator substring, closing a credential-leak gap for opaque-label-prefixed keys regardless of separator, e.g. `"source:feed/user:pass@host"` or `"named:user:pass@host"` (resolves #993) (#1201)
 - **deps-gradle**: version-completion same-line fallback no longer misattributes a non-dependency or still-unparsed literal on a shared manifest line to a nearby real dependency (resolves #1191) (#1196)
 - **deps-core**: `detect_completion_context`'s hand-inlined strict-containment check (package-name completion) now reuses `lsp_helpers::position_in_range` instead of re-deriving it (resolves #1147) (#1196)
 - **deps-lsp**: `ServerState::documents` and every request/response URI are now keyed by one canonical `Uri` form, so requests spelling the same open document differently (e.g. `file://localhost/x` vs `FILE:///x`) resolve to the same document instead of a stale/absent second entry; removes the three per-handler URI-rekey fixups from #1071 (resolves #1086) (#1198)
