@@ -126,7 +126,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///         Box::pin(async move { Ok(None) })
 ///     }
 ///
-///     fn search<'a>(&'a self, _query: &'a str, _limit: usize)
+///     fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
 ///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Metadata>>>> + Send + 'a>>
 ///     {
 ///         Box::pin(async move { Ok(vec![]) })
@@ -289,10 +289,22 @@ pub trait Registry: Send + Sync {
     ///
     /// Returns up to `limit` results sorted by relevance/popularity.
     ///
+    /// Named `search_raw`, not `search` (#1215): this required method carries no
+    /// credential-bearing-query gate of its own, and a `fn search` provided-method default
+    /// could be silently skipped by an override — an *inherent* `search` on `dyn Registry`
+    /// (below) wraps this method with [`crate::net_policy::is_credential_or_query_bearing`]
+    /// and cannot be silently overridden by an implementor, unlike a provided trait method
+    /// default — every `&dyn Registry`/`Arc<dyn Registry>` call site through the gate gets it
+    /// automatically. This is a dispatch-level guarantee, not a hard access barrier: `search_raw`
+    /// is still `pub`, so a caller holding a `&dyn Registry` can call it directly and skip the
+    /// gate with one extra token — call it directly only from a context that already knows
+    /// `query` is safe (e.g. a concrete registry's own inherent `search`, which independently
+    /// gates its own callers).
+    ///
     /// # Errors
     ///
     /// Returns error if network request or parsing fails.
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,
@@ -367,6 +379,72 @@ pub trait Registry: Send + Sync {
 
     /// Downcast to concrete registry type for ecosystem-specific operations
     fn as_any(&self) -> &dyn Any;
+}
+
+impl dyn Registry + '_ {
+    /// Rejects a credential- or query-bearing `query` before it ever reaches
+    /// [`Registry::search_raw`] (#1215), then delegates.
+    ///
+    /// An **inherent** method on the trait object, not a provided trait method: an inherent
+    /// method cannot be shadowed by a `Registry` implementor the way a provided trait method
+    /// can be silently overridden, so every `&dyn Registry`/`Arc<dyn Registry>` call site gets
+    /// this gate automatically, present and future — the same enforcement shape issue #1206
+    /// already established for [`crate::completion::reject_credential_bearing_value`],
+    /// generalized to the trait boundary itself rather than left to each call site to
+    /// remember. This is a dispatch-level guarantee, not a hard access barrier:
+    /// [`Registry::search_raw`] is still `pub`, so a caller holding a `&dyn Registry` can call
+    /// it directly and skip this gate with one extra token — see that method's own doc.
+    ///
+    /// Returns `Ok(vec![])` without calling [`Registry::search_raw`] at all when `query` is
+    /// flagged by [`crate::net_policy::is_credential_or_query_bearing`] — a redacted value is
+    /// not a useful search term, so the request is dropped rather than redacted-and-sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if [`Registry::search_raw`]'s underlying network request or parsing
+    /// fails.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::Registry;
+    ///
+    /// struct MyRegistry;
+    /// # use deps_core::{Metadata, PackageName, Version};
+    /// # use std::any::Any;
+    /// # use std::pin::Pin;
+    /// impl Registry for MyRegistry {
+    /// #   fn get_versions<'a>(&'a self, _name: &'a PackageName)
+    /// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Version>>>> + Send + 'a>>
+    /// #   { Box::pin(async move { Ok(vec![]) }) }
+    /// #   fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq)
+    /// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Option<Box<dyn Version>>>> + Send + 'a>>
+    /// #   { Box::pin(async move { Ok(None) }) }
+    ///     fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
+    ///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Metadata>>>> + Send + 'a>>
+    ///     {
+    ///         panic!("must never be reached for a credential-bearing query");
+    ///     }
+    /// #   fn as_any(&self) -> &dyn Any { self }
+    /// }
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let registry: &dyn Registry = &MyRegistry;
+    /// let results = registry
+    ///     .search("user:hunter2@registry.example", 10)
+    ///     .await
+    ///     .unwrap();
+    /// assert!(results.is_empty());
+    /// # }
+    /// ```
+    pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn Metadata>>> {
+        if crate::net_policy::is_credential_or_query_bearing(query) {
+            crate::lsp_helpers::warn_rejected_value("credential_bearing", "registry search", query);
+            return Ok(vec![]);
+        }
+        self.search_raw(query, limit).await
+    }
 }
 
 /// Whether `version` contains one of the common pre-release substrings
@@ -1182,6 +1260,96 @@ mod tests {
         fn as_any(&self) -> &dyn Any {
             self
         }
+    }
+
+    /// A [`Registry`] whose `search_raw` records whether it was called, for
+    /// [`dyn_registry_search_rejects_credential_bearing_query_before_calling_search_raw`]
+    /// (#1215) — mirrors `conformance.rs`'s `AlwaysHasResultsRegistry::search_was_called`.
+    struct ProbeRegistry {
+        search_raw_called: std::sync::atomic::AtomicBool,
+    }
+
+    impl ProbeRegistry {
+        fn new() -> Self {
+            Self {
+                search_raw_called: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+
+        fn search_raw_was_called(&self) -> bool {
+            self.search_raw_called
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    impl Registry for ProbeRegistry {
+        fn get_versions<'a>(
+            &'a self,
+            _name: &'a PackageName,
+        ) -> BoxFuture<'a, Result<Vec<Box<dyn Version>>>> {
+            Box::pin(async move { Ok(vec![]) })
+        }
+
+        fn get_latest_matching<'a>(
+            &'a self,
+            _name: &'a PackageName,
+            _req: &'a VersionReq,
+        ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn search_raw<'a>(
+            &'a self,
+            _query: &'a str,
+            _limit: usize,
+        ) -> BoxFuture<'a, Result<Vec<Box<dyn Metadata>>>> {
+            self.search_raw_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                let metadata = crate::test_util::MockMetadata::new("probe", "1.0.0");
+                Ok(vec![Box::new(metadata) as Box<dyn Metadata>])
+            })
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    #[tokio::test]
+    async fn dyn_registry_search_rejects_credential_bearing_query_before_calling_search_raw() {
+        let probe = ProbeRegistry::new();
+        let registry: &dyn Registry = &probe;
+
+        let results = registry
+            .search("user:hunter2@registry.example", 10)
+            .await
+            .unwrap();
+
+        assert!(
+            results.is_empty(),
+            "a credential-shaped query must return no results"
+        );
+        assert!(
+            !probe.search_raw_was_called(),
+            "a credential-shaped query must be rejected before ever calling `search_raw` \
+             (issue #1215) — redacting the value and searching anyway, then dropping the \
+             result, would still satisfy the empty-result assertion above but fail this one"
+        );
+    }
+
+    #[tokio::test]
+    async fn dyn_registry_search_delegates_to_search_raw_for_a_safe_query() {
+        let probe = ProbeRegistry::new();
+        let registry: &dyn Registry = &probe;
+
+        let results = registry.search("serde", 10).await.unwrap();
+
+        assert!(
+            !results.is_empty(),
+            "a safe query must reach `search_raw` and return its result"
+        );
+        assert!(probe.search_raw_was_called());
     }
 
     #[test]

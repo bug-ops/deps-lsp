@@ -466,7 +466,7 @@ fn spawn_trust_signal_fetch(
             ecosystem,
         )?;
         let client = Arc::clone(client);
-        let name = dep.name().to_string();
+        let name = dep.name().as_str().to_string();
         Some(tokio::spawn(async move {
             client.trust_signal(system, &name, &version).await
         }))
@@ -2720,7 +2720,7 @@ mod tests {
                 })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -3485,7 +3485,7 @@ mod tests {
         }
 
         fn package_url(&self, name: &crate::PackageName) -> String {
-            format!("https://example.com/{name}")
+            format!("https://example.com/{}", name.as_str())
         }
     }
 

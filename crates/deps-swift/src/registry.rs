@@ -341,7 +341,7 @@ impl deps_core::Registry for SwiftRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,

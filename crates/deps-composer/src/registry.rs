@@ -379,7 +379,7 @@ impl PackagistRegistry {
     /// # Errors
     ///
     /// Returns an error if the HTTP request or JSON parsing fails.
-    #[tracing::instrument(skip_all, fields(query = ?query), level = "debug")]
+    #[tracing::instrument(skip_all, fields(query = %deps_core::net_policy::url_for_tracing(query)), level = "debug")]
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<ComposerPackage>> {
         let url = format!(
             "{}?q={}&per_page={}",
@@ -620,7 +620,7 @@ impl deps_core::Registry for PackagistRegistry {
         })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         query: &'a str,
         limit: usize,

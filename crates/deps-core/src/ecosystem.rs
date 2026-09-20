@@ -726,7 +726,7 @@ impl LicenseSource {
 /// impl PackageNaming for MyFormatter {}
 /// impl PackageRendering for MyFormatter {
 ///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
-///     fn package_url(&self, name: &PackageName) -> String { format!("https://example.com/{name}") }
+///     fn package_url(&self, name: &PackageName) -> String { format!("https://example.com/{}", name.as_str()) }
 /// }
 /// impl RequirementResolution for MyFormatter {}
 /// impl DiagnosticMessages for MyFormatter {}
@@ -810,7 +810,7 @@ impl LicenseSource {
 ///     }
 ///
 ///     fn completion_insert_text(&self, metadata: &dyn Metadata) -> Option<String> {
-///         Some(format!("\"{}\" = \"{}\"", metadata.name(), metadata.latest_version()))
+///         Some(format!("\"{}\" = \"{}\"", metadata.name().as_str(), metadata.latest_version()))
 ///     }
 ///
 ///     fn as_any(&self) -> &dyn Any { self }
@@ -1396,7 +1396,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// `name` is a `group:artifact` compound, and only the `artifact` half belongs in
     /// an already-open `<artifactId>` tag.
     fn fallback_bare_insert_text(&self, metadata: &dyn Metadata) -> Option<String> {
-        Some(metadata.name().to_string())
+        Some(metadata.name().as_str().to_string())
     }
 
     /// Whether this ecosystem's package-name search may return a truncated view of
@@ -1409,7 +1409,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// because no context has been resolved yet:
     ///
     /// - the raw-text fallback search (`fallback_completion`), which always
-    ///   performs a package-name lookup via [`crate::Registry::search`] regardless
+    ///   performs a package-name lookup via `<dyn Registry>::search` regardless
     ///   of what completion context (or lack thereof) triggered it;
     /// - the document-not-loaded early return, before any `ParseResult` — and so
     ///   any completion context — exists to call `generate_completions` with.

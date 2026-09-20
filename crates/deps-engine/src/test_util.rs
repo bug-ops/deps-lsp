@@ -57,7 +57,7 @@ impl Registry for StubRegistry {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -85,7 +85,7 @@ impl PackageRendering for StubFormatter {
     }
 
     fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{name}")
+        format!("https://example.com/{}", name.as_str())
     }
 }
 

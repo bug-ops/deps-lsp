@@ -649,7 +649,7 @@ mod tests {
                 deps_core::parser::DependencySource::Registry,
                 "{} must stay Registry — a bare vcs repo with no `only` must never sweep in \
                  unrelated packages that merely share a vendor/org token with its URL",
-                dep.name
+                dep.name.as_str()
             );
         }
     }
@@ -1498,12 +1498,12 @@ mod tests {
             assert!(
                 dep.name_range.start.line > 0,
                 "name_range for '{}' is at line 0 — position tracking regressed",
-                dep.name
+                dep.name.as_str()
             );
             assert!(
                 dep.version_range.is_some(),
                 "version_range for '{}' is missing",
-                dep.name
+                dep.name.as_str()
             );
         }
 

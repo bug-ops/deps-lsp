@@ -676,7 +676,7 @@ impl Ecosystem for GradleEcosystem {
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
         let name = metadata.name();
         let latest = metadata.latest_version().as_str();
-        Some(format!("implementation(\"{name}:{latest}\")"))
+        Some(format!("implementation(\"{}:{latest}\")", name.as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -2357,7 +2357,7 @@ dependencies {
                 range,
                 deps_core::completion::DeclarationScope::Unchecked,
             )
-            .map(|d| d.name().to_string()),
+            .map(|d| d.name().as_str().to_string()),
             Some("com.example:foo".to_string()),
             "Unchecked pins exactly what the scope prevents: same-line misattribution to foo"
         );
@@ -2399,7 +2399,7 @@ dependencies {
                 range,
                 deps_core::completion::DeclarationScope::Unchecked,
             )
-            .map(|d| d.name().to_string()),
+            .map(|d| d.name().as_str().to_string()),
             Some("com.example:foo".to_string()),
             "Unchecked pins the misattribution this test's real scope must prevent"
         );

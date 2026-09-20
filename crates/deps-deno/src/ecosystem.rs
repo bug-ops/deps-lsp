@@ -271,9 +271,9 @@ impl Ecosystem for DenoEcosystem {
         // N5: an empty `latest` (a JSR search hit with no `latestVersion`) must not
         // insert a dangling `@^` with nothing after it.
         if latest.is_empty() {
-            Some(format!("\"{bare}\": \"{name}\""))
+            Some(format!("\"{bare}\": \"{}\"", name.as_str()))
         } else {
-            Some(format!("\"{bare}\": \"{name}@^{latest}\""))
+            Some(format!("\"{bare}\": \"{}@^{latest}\"", name.as_str()))
         }
     }
 

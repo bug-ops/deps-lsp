@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: removed `pub const MAX_GITLAB_ROUTES`; the cap is now `deps_core::registry::MAX_ALTERNATE_REGISTRIES` (#1218)
 - **deps-core**: `lsp_helpers::git_ref::locate_value_span` gains a 4th `is_quoted: bool` parameter; new `MarkedScalar::is_quoted()` replaces the marker-byte-based quote inference the empty-value correction previously relied on (#1194)
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
+- **deps-core**: `PackageName` no longer implements `Display`/`ToString`; its `Debug` impl now redacts a credential-shaped name instead of deriving, so `?name` and any struct embedding a `PackageName` are safe by construction (resolves #1217) (#1219)
+- **deps-core, deps-cargo, deps-npm, deps-bundler, deps-deno, deps-maven, deps-nuget, deps-dart, deps-composer**: `Registry::search` is renamed to `search_raw`, with a new inherent `search` gate on `dyn Registry` (which an implementor cannot override) that rejects a credential- or query-bearing search string before it ever reaches a registry, and redacts the 9 concrete registries' own `search` tracing spans (resolves #1215) (#1219)
 
 ### Fixed
 - **deps-composer**: a bare (no `only` filter) repository entry now cross-checks `composer.lock`'s `source.type` to classify a matching dependency as `Path` (never `Git`) instead of `Registry` (resolves #1212) (#1221)

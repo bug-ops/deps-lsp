@@ -164,7 +164,7 @@ impl Ecosystem for BundlerEcosystem {
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
         let name = metadata.name();
         let latest = metadata.latest_version().as_str();
-        Some(format!("gem \"{name}\", \"~> {latest}\""))
+        Some(format!("gem \"{}\", \"~> {latest}\"", name.as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {

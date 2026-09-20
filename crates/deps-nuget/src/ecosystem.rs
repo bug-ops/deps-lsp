@@ -434,7 +434,8 @@ impl Ecosystem for NuGetEcosystem {
         let name = metadata.name();
         let latest = metadata.latest_version().as_str();
         Some(format!(
-            "<PackageReference Include=\"{name}\" Version=\"{latest}\" />"
+            "<PackageReference Include=\"{}\" Version=\"{latest}\" />",
+            name.as_str()
         ))
     }
 

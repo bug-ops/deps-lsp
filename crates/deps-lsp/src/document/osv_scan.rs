@@ -103,7 +103,7 @@ pub(crate) async fn run_osv_scan_phase_a(
                     .get(&d.name_range())
                     .cloned()
                     .unwrap_or_else(|| ecosystem.formatter().normalize_package_name(d.name()));
-                (key, d.name().to_string())
+                (key, d.name().as_str().to_string())
             })
             .collect();
         (doc.content.clone(), targets, skipped, raw_name_by_key)

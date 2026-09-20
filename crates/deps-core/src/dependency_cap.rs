@@ -248,7 +248,7 @@ mod tests {
         let names: Vec<_> = capped
             .dependencies()
             .iter()
-            .map(|d| d.name().to_string())
+            .map(|d| d.name().as_str().to_string())
             .collect();
         assert_eq!(names, vec!["dep-0", "dep-1"]);
     }

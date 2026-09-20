@@ -23,7 +23,7 @@ use crate::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, Versio
 pub trait PackageNaming: Send + Sync {
     /// Normalize package name for lookup (default: identity).
     fn normalize_package_name(&self, name: &PackageName) -> String {
-        name.to_string()
+        name.as_str().to_string()
     }
 
     /// Lints `name` against ecosystem-specific naming rules.
@@ -149,7 +149,7 @@ pub trait PackageRendering: Send + Sync {
     ///         version.to_string()
     ///     }
     ///     fn package_url(&self, name: &PackageName) -> String {
-    ///         name.to_string()
+    ///         name.as_str().to_string()
     ///     }
     /// }
     ///
@@ -763,7 +763,7 @@ pub trait OsvNaming: Send + Sync {
     /// Go, Maven, Gradle, Dart, Bundler, NuGet, and PyPI the manifest's raw
     /// name already matches OSV's canonical spelling.
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
-        Some(dep.name().to_string())
+        Some(dep.name().as_str().to_string())
     }
 
     /// Converts a version string as it appears in an OSV advisory record

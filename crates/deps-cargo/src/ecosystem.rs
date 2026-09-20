@@ -221,7 +221,11 @@ impl CargoEcosystem {
         let versions = match versions_result {
             Ok(v) => v,
             Err(e) => {
-                tracing::warn!("Failed to fetch versions for '{}': {}", package_name, e);
+                tracing::warn!(
+                    "Failed to fetch versions for '{}': {}",
+                    package_name.for_tracing(),
+                    e
+                );
                 return vec![];
             }
         };
@@ -229,7 +233,10 @@ impl CargoEcosystem {
         let latest = match versions.iter().find(|v| v.is_stable()) {
             Some(v) => v,
             None => {
-                tracing::warn!("No stable version found for '{}'", package_name);
+                tracing::warn!(
+                    "No stable version found for '{}'",
+                    package_name.for_tracing()
+                );
                 return vec![];
             }
         };
@@ -351,7 +358,7 @@ impl Ecosystem for CargoEcosystem {
         // The key is quoted, not bare: a bare TOML key containing `.` (allowed by
         // `is_safe_package_name` for Cargo crate names) expands into a nested table
         // instead of a dependency entry — quoting closes that dotted-key injection.
-        Some(format!("\"{name}\" = \"{latest}\""))
+        Some(format!("\"{}\" = \"{latest}\"", name.as_str()))
     }
 
     fn as_any(&self) -> &dyn Any {

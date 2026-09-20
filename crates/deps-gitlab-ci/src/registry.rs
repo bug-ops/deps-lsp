@@ -318,7 +318,7 @@ impl GitlabCiRegistry {
         let Some(project_path) = project_path_from_name(name.as_str(), host.host(), route.endpoint)
         else {
             return Err(DepsError::PackageNotFound {
-                package: name.to_string().into(),
+                package: name.as_str().into(),
                 registry: REGISTRY,
             });
         };
@@ -420,7 +420,7 @@ impl deps_core::Registry for GitlabCiRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             Err(DepsError::PackageNotFound {
-                package: name.to_string().into(),
+                package: name.as_str().into(),
                 registry: "gitlab-ci (no route; source required)",
             })
         })
@@ -436,13 +436,13 @@ impl deps_core::Registry for GitlabCiRegistry {
             let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = source
             else {
                 return Err(DepsError::PackageNotFound {
-                    package: name.to_string().into(),
+                    package: name.as_str().into(),
                     registry: "gitlab-ci (no route; source required)",
                 });
             };
             let Some(route) = self.routes.get(index).map(|r| r.clone()) else {
                 return Err(DepsError::PackageNotFound {
-                    package: name.to_string().into(),
+                    package: name.as_str().into(),
                     registry: "gitlab-ci (unregistered route)",
                 });
             };
@@ -463,7 +463,7 @@ impl deps_core::Registry for GitlabCiRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             Err(DepsError::PackageNotFound {
-                package: name.to_string().into(),
+                package: name.as_str().into(),
                 registry: "gitlab-ci (no route; source required)",
             })
         })
@@ -486,7 +486,7 @@ impl deps_core::Registry for GitlabCiRegistry {
     }
 
     /// No cheap GitLab search endpoint under the NFR-002 rate-limit budget.
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,

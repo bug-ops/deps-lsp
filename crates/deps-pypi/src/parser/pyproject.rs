@@ -2864,7 +2864,7 @@ dependencies = ["git-pkg>=1.0.0", "path-pkg>=1.0.0", "workspace-pkg>=1.0.0"]
                 dep.source,
                 PypiDependencySource::Registry,
                 "{} should be unaffected by a non-index uv.sources shape",
-                dep.name
+                dep.name.as_str()
             );
         }
     }

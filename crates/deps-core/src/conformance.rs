@@ -413,7 +413,7 @@ impl AlwaysHasResultsRegistry {
         }
     }
 
-    /// Whether [`crate::Registry::search`] was invoked on this instance since [`Self::new`].
+    /// Whether [`crate::Registry::search_raw`] was invoked on this instance since [`Self::new`].
     fn search_was_called(&self) -> bool {
         self.search_called.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -448,7 +448,7 @@ impl crate::Registry for AlwaysHasResultsRegistry {
         Box::pin(async move { Ok(None) })
     }
 
-    fn search<'a>(
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,
@@ -857,7 +857,7 @@ impl<T: ?Sized> NotInherent for T {}
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(None) })
 /// #     }
-/// #     fn search<'a>(&'a self, _query: &'a str, _limit: usize)
+/// #     fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
@@ -1577,7 +1577,7 @@ macro_rules! json_depth_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(None) })
 /// #     }
-/// #     fn search<'a>(&'a self, _query: &'a str, _limit: usize)
+/// #     fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
@@ -1802,7 +1802,7 @@ macro_rules! registry_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         panic!("must not be queried: the #1136 gate should reject this fixture's source first");
 /// #     }
-/// #     fn search<'a>(&'a self, _query: &'a str, _limit: usize)
+/// #     fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
@@ -1830,7 +1830,7 @@ macro_rules! registry_conformance {
 /// # impl deps_core::lsp_helpers::PackageNaming for FakeFormatter {}
 /// # impl deps_core::lsp_helpers::PackageRendering for FakeFormatter {
 /// #     fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String { v.as_str().to_string() }
-/// #     fn package_url(&self, name: &deps_core::PackageName) -> String { format!("https://example.com/{name}") }
+/// #     fn package_url(&self, name: &deps_core::PackageName) -> String { format!("https://example.com/{}", name.as_str()) }
 /// # }
 /// # impl deps_core::lsp_helpers::RequirementResolution for FakeFormatter {}
 /// # impl deps_core::lsp_helpers::DiagnosticMessages for FakeFormatter {}

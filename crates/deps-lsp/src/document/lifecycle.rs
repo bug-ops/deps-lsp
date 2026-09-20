@@ -1414,7 +1414,7 @@ mod tests {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
-                name.to_string()
+                name.as_str().to_string()
             }
         }
         impl deps_core::lsp_helpers::RequirementResolution for IdentityFormatter {}
@@ -1714,7 +1714,7 @@ mod tests {
                 version.to_string()
             }
             fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
         impl RequirementResolution for NoopFormatter {}
@@ -1806,7 +1806,7 @@ mod tests {
                     Ok(None)
                 })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,

@@ -378,7 +378,7 @@ fn create_package_completion_item(
     };
 
     Some(CompletionItem {
-        label: name.to_string(),
+        label: name.as_str().to_string(),
         kind: Some(CompletionItemKind::MODULE),
         detail,
         documentation: description
@@ -407,7 +407,7 @@ mod tests {
         }
 
         fn package_url(&self, name: &deps_core::PackageName) -> String {
-            format!("https://example.com/{name}")
+            format!("https://example.com/{}", name.as_str())
         }
     }
 
@@ -507,7 +507,7 @@ mod tests {
     /// asserts on the completion item's `label` or on whether a search happened at
     /// all, not on the inserted snippet's syntax.
     fn default_insert_text(metadata: &dyn deps_core::Metadata) -> Option<String> {
-        Some(metadata.name().to_string())
+        Some(metadata.name().as_str().to_string())
     }
 
     /// Builds a [`MockEcosystem`] with `ecosystem_id`, routing registry search through
@@ -606,7 +606,7 @@ mod tests {
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -628,7 +628,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -890,7 +890,7 @@ mod tests {
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -912,7 +912,7 @@ mod tests {
             }
 
             fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -1132,7 +1132,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1179,7 +1179,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1250,7 +1250,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1297,7 +1297,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1365,7 +1365,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1412,7 +1412,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1465,7 +1465,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1490,7 +1490,7 @@ ser"
             fallback_prefix: Some("gua"),
             insert_text: |_| panic!("bare=true must not call completion_insert_text"),
             is_bare: true,
-            bare_insert_text: |metadata| Some(format!("bare:{}", metadata.name())),
+            bare_insert_text: |metadata| Some(format!("bare:{}", metadata.name().as_str())),
         }));
 
         let items =
@@ -1528,7 +1528,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1661,7 +1661,7 @@ ser"
         > {
             Box::pin(async move { Ok(None) })
         }
-        fn search<'a>(
+        fn search_raw<'a>(
             &'a self,
             _query: &'a str,
             _limit: usize,
@@ -1723,7 +1723,7 @@ ser"
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1775,7 +1775,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1832,7 +1832,7 @@ ser"
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1865,7 +1865,7 @@ ser"
                 if metadata.name().as_str() == "rejected-package" {
                     None
                 } else {
-                    Some(metadata.name().to_string())
+                    Some(metadata.name().as_str().to_string())
                 }
             },
             is_bare: false,
@@ -1898,7 +1898,7 @@ ser"
             fallback_prefix: None,
             insert_text: |_| panic!("bare=true must not call completion_insert_text"),
             is_bare: true,
-            bare_insert_text: |metadata| Some(format!("bare:{}", metadata.name())),
+            bare_insert_text: |metadata| Some(format!("bare:{}", metadata.name().as_str())),
         };
 
         assert_eq!(
@@ -1933,7 +1933,7 @@ ser"
                 Box::pin(async move { Ok(None) })
             }
 
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -1981,7 +1981,7 @@ ser"
             }
 
             fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -2146,7 +2146,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2168,7 +2168,7 @@ ser"
             }
 
             fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -2343,7 +2343,7 @@ ser"
             }
 
             fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -2498,7 +2498,7 @@ ser"
             }
 
             fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
 
@@ -2525,7 +2525,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2621,7 +2621,7 @@ ser"
                 Some("req")
             }
             fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-                Some(metadata.name().to_string())
+                Some(metadata.name().as_str().to_string())
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -2705,7 +2705,7 @@ ser"
                 version.to_string()
             }
             fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{name}")
+                format!("https://example.com/{}", name.as_str())
             }
         }
         impl RequirementResolution for MockFormatter {}
@@ -2731,7 +2731,7 @@ ser"
             {
                 Box::pin(async move { Ok(None) })
             }
-            fn search<'a>(
+            fn search_raw<'a>(
                 &'a self,
                 _query: &'a str,
                 _limit: usize,
@@ -2833,7 +2833,7 @@ ser"
                 Some("req")
             }
             fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
-                Some(metadata.name().to_string())
+                Some(metadata.name().as_str().to_string())
             }
             fn as_any(&self) -> &dyn Any {
                 self
