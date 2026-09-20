@@ -377,12 +377,12 @@ impl Ecosystem for NuGetEcosystem {
             let unlisted = match unlisted_result {
                 Ok(Ok(unlisted)) => unlisted,
                 Ok(Err(error)) => {
-                    tracing::debug!(package = %dep.name(), %error, "hover unlisted-versions fetch failed");
+                    tracing::debug!(package = %dep.name().for_tracing(), %error, "hover unlisted-versions fetch failed");
                     return Some(hover);
                 }
                 Err(_) => {
                     tracing::warn!(
-                        package = %dep.name(),
+                        package = %dep.name().for_tracing(),
                         timeout_secs = HOVER_UNLISTED_TIMEOUT.as_secs(),
                         "hover unlisted-versions fetch timed out"
                     );

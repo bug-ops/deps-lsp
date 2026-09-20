@@ -51,7 +51,7 @@ impl SwiftRegistry {
     ///
     /// Returns an error if `name` is not a valid `owner/repo` string or the GitHub tags
     /// API request fails (including a rate-limit or not-found response).
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
         let tags = paginate_tags("Swift", name, |page| async move {
@@ -63,7 +63,7 @@ impl SwiftRegistry {
                         github_rate_limit_error()
                     }
                     DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: REGISTRY,
                     },
                     _ => e,
@@ -93,7 +93,7 @@ impl SwiftRegistry {
     ///
     /// Same as [`Self::get_versions`] — the release-dates fetch is infallible and never
     /// contributes an error.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions_with(
         &self,
         name: &str,
@@ -110,7 +110,7 @@ impl SwiftRegistry {
     ///
     /// Thin wrapper around the shared [`ReleaseDatesCache::fetch`] — see its docs for
     /// the best-effort/memoization contract.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     async fn release_dates(&self, name: &str) -> Arc<HashMap<String, PublishTime>> {
         self.release_dates.fetch(&self.github, name, "Swift").await
     }
@@ -124,7 +124,7 @@ impl SwiftRegistry {
     /// `license` field, or GitHub's `"NOASSERTION"` sentinel (a detected-but-
     /// unclassified `LICENSE` file, not a real SPDX identifier) — graceful degradation
     /// (NFR-003), since this is a best-effort secondary signal, not core version data.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_license(&self, name: &str) -> Vec<String> {
         if validate_owner_repo(name).is_err() {
             return Vec::new();
@@ -133,7 +133,11 @@ impl SwiftRegistry {
         match self.github.fetch_authenticated(&url).await {
             Ok(data) => parse_license_response(&data),
             Err(e) => {
-                tracing::debug!(package = name, error = %e, "github repo license fetch failed");
+                tracing::debug!(
+                    package = %deps_core::net_policy::redact_declaration_key(name),
+                    error = %e,
+                    "github repo license fetch failed"
+                );
                 Vec::new()
             }
         }
@@ -145,7 +149,7 @@ impl SwiftRegistry {
     ///
     /// Same as [`Self::get_versions`]. An unparseable `req_str` is not an error: it
     /// resolves to `Ok(None)`.
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,

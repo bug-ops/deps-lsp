@@ -289,14 +289,18 @@ impl MavenCentralRegistry {
     /// whichever repository base (Maven Central, Google Maven, or the Gradle Plugin
     /// Portal fallback) actually served it — `metadata_urls`' bases differ per group, so
     /// the winning base can only be known after the fetch succeeds, not guessed upfront.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     async fn get_metadata(
         &self,
         name: &str,
     ) -> Result<(Vec<MavenVersion>, Option<String>, Option<String>)> {
+        // Hoisted once (code-review S3): the loop below can redact `name` up to twice per
+        // retry hop plus once more on the final warn — a fixed, single redaction per call is
+        // both cheaper and immune to a future retry-count bump silently multiplying the cost.
+        let redacted_name = deps_core::net_policy::redact_declaration_key(name);
         let urls = metadata_urls(name)?;
         if urls.is_empty() {
-            tracing::debug!(package = %name, "skipping: invalid groupId:artifactId format");
+            tracing::debug!(package = %redacted_name, "skipping: invalid groupId:artifactId format");
             return Ok((vec![], None, None));
         }
 
@@ -310,7 +314,7 @@ impl MavenCentralRegistry {
                 }
                 Err(e) => {
                     tracing::debug!(
-                        package = %name,
+                        package = %redacted_name,
                         url = %RedactedUrl::new(url),
                         error = %e,
                         "metadata fetch failed, trying next"
@@ -324,7 +328,7 @@ impl MavenCentralRegistry {
         // and `last_err` is `Some` here.
         #[allow(clippy::expect_used)]
         let e = last_err.expect("urls is non-empty");
-        tracing::warn!(package = %name, error = %e, "all metadata URLs failed");
+        tracing::warn!(package = %redacted_name, error = %e, "all metadata URLs failed");
         Err(e)
     }
 
@@ -367,7 +371,7 @@ impl MavenCentralRegistry {
     /// # Errors
     ///
     /// Returns an error if fetching or parsing the artifact's metadata fails.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions_with(
         &self,
         name: &str,
@@ -392,7 +396,7 @@ impl MavenCentralRegistry {
     /// # Errors
     ///
     /// Same as [`Self::get_versions_with`].
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<MavenVersion>> {
         self.get_versions_with(
             name,
@@ -410,7 +414,7 @@ impl MavenCentralRegistry {
     /// # Errors
     ///
     /// Returns an error if fetching or parsing the artifact's metadata fails.
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req), level = "debug")]
     pub async fn get_latest_matching(&self, name: &str, req: &str) -> Result<Option<MavenVersion>> {
         let (versions, release, _base) = self.get_metadata(name).await?;
         // For Maven MVP: exact string match, or latest stable if req is empty/wildcard
@@ -644,7 +648,7 @@ fn metadata_urls(name: &str) -> Result<Vec<String>> {
             name,
         );
         return Err(DepsError::PackageNotFound {
-            package: name.to_string(),
+            package: name.to_string().into(),
             registry: REGISTRY,
         });
     };

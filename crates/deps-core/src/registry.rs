@@ -444,7 +444,7 @@ pub fn not_found_or(
             if status == 404 || also_not_found.contains(&status) =>
         {
             DepsError::PackageNotFound {
-                package: package.to_string(),
+                package: package.into(),
                 registry,
             }
         }

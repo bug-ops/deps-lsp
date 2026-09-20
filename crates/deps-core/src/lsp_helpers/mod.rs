@@ -892,14 +892,14 @@ pub const REGISTRY_FETCH_BUDGET: Duration = Duration::from_secs(10);
 #[cfg(feature = "lsp-responses")]
 async fn await_versions_fetch<T, E>(
     fetch: impl std::future::Future<Output = Result<T, E>>,
-    package: impl std::fmt::Display,
+    package: &PackageName,
     context: &'static str,
 ) -> (Option<T>, bool) {
     match tokio::time::timeout(REGISTRY_FETCH_BUDGET, fetch).await {
         Ok(result) => (result.ok(), false),
         Err(_) => {
             tracing::warn!(
-                package = %package,
+                package = %package.for_tracing(),
                 context,
                 timeout_secs = REGISTRY_FETCH_BUDGET.as_secs(),
                 "primary registry version fetch timed out"
@@ -1789,7 +1789,7 @@ pub fn dot_segment_rejection_error(
 ) -> DepsError {
     warn_rejected_value(gate, context, name);
     DepsError::PackageNotFound {
-        package: name.to_string(),
+        package: name.into(),
         registry,
     }
 }

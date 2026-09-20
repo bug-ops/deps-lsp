@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::net_policy::RedactedUrl;
+use crate::net_policy::{RedactedName, RedactedUrl};
 
 /// Reconstructs the "{status} {reason}" text `reqwest::StatusCode`'s `Display`
 /// produces, since `HttpStatus` stores a bare `u16` for structural matching
@@ -202,8 +202,9 @@ pub enum DepsError {
     /// A package name was not found on the given registry.
     #[error("{package} not found on {registry}")]
     PackageNotFound {
-        /// Name of the package that was looked up.
-        package: String,
+        /// Name of the package that was looked up — stored redacted (#1209): the raw value
+        /// is unreachable from this field's type.
+        package: RedactedName,
         /// Name of the registry that reported the package as missing.
         registry: &'static str,
     },
@@ -221,8 +222,9 @@ pub enum DepsError {
     /// A registry's response body failed to deserialize as JSON.
     #[error("failed to parse {registry} response for {package}: {source}")]
     ApiResponse {
-        /// Name of the package whose response failed to parse.
-        package: String,
+        /// Name of the package whose response failed to parse — stored redacted (#1209): the
+        /// raw value is unreachable from this field's type.
+        package: RedactedName,
         /// Name of the registry the response came from.
         registry: &'static str,
         /// The underlying JSON deserialization error.
@@ -918,6 +920,47 @@ mod tests {
             registry: "PyPI",
         };
         assert_eq!(error.to_string(), "flask not found on PyPI");
+    }
+
+    /// #1209: `PackageNotFound.package` is redacted at construction (via [`RedactedName`]),
+    /// so a credential embedded in a manifest's name-shaped field (e.g. Maven property
+    /// interpolation producing `group:artifact:secret@host`) must never reach this variant's
+    /// `Display`/`Debug` — the sink a server log or an LSP client toast (`window/showMessage`)
+    /// reads verbatim.
+    #[test]
+    fn test_package_not_found_display_redacts_credential_shaped_name() {
+        let error = DepsError::PackageNotFound {
+            package: "com.example:deploy:AUDITSENTINEL0000@git.internal.corp".into(),
+            registry: "Maven Central",
+        };
+        assert!(
+            !error.to_string().contains("AUDITSENTINEL0000"),
+            "Display leaked a credential-shaped package name: {error}"
+        );
+        assert!(
+            !format!("{error:?}").contains("AUDITSENTINEL0000"),
+            "Debug leaked a credential-shaped package name: {error:?}"
+        );
+        assert!(error.to_string().contains("git.internal.corp"));
+    }
+
+    /// Same sink, `ApiResponse` variant (#1209).
+    #[test]
+    fn test_api_response_display_redacts_credential_shaped_name() {
+        let json_err = serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err();
+        let error = DepsError::ApiResponse {
+            package: "com.example:deploy:AUDITSENTINEL0000@git.internal.corp".into(),
+            registry: "Maven Central",
+            source: json_err,
+        };
+        assert!(
+            !error.to_string().contains("AUDITSENTINEL0000"),
+            "Display leaked a credential-shaped package name: {error}"
+        );
+        assert!(
+            !format!("{error:?}").contains("AUDITSENTINEL0000"),
+            "Debug leaked a credential-shaped package name: {error:?}"
+        );
     }
 
     #[test]

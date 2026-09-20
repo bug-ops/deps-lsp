@@ -141,7 +141,7 @@ impl CratesIoRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<CargoVersion>> {
         self.sparse.get_versions(name).await
     }
@@ -171,7 +171,7 @@ impl CratesIoRegistry {
     /// assert!(latest.is_some());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -516,7 +516,7 @@ impl CargoRegistry {
         self.alternates.get(index).map(|entry| Arc::clone(&entry))
     }
 
-    #[tracing::instrument(skip_all, fields(package = ?name, index = tracing::field::Empty), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %name.for_tracing(), index = tracing::field::Empty), level = "debug")]
     async fn get_versions_for_source(
         &self,
         name: &PackageName,
@@ -542,7 +542,7 @@ impl CargoRegistry {
                             .await
                     }
                     None => Err(DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: "alternate registry (not registered)",
                     }),
                 }
@@ -555,7 +555,7 @@ impl CargoRegistry {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req, index = tracing::field::Empty), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %name.for_tracing(), version = ?req, index = tracing::field::Empty), level = "debug")]
     async fn get_latest_matching_for_source(
         &self,
         name: &PackageName,
@@ -584,7 +584,7 @@ impl CargoRegistry {
                             .await
                     }
                     None => Err(DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: "alternate registry (not registered)",
                     }),
                 }

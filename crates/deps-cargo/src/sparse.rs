@@ -75,7 +75,7 @@ fn reject_unsafe_crate_name(name: &str, registry_display_name: &'static str) -> 
     if !is_safe_crate_name(name) {
         warn_rejected_value("is_safe_crate_name", "sparse index request URL", name);
         return Err(DepsError::PackageNotFound {
-            package: name.to_string(),
+            package: name.to_string().into(),
             registry: registry_display_name,
         });
     }
@@ -322,7 +322,7 @@ impl SparseIndexClient {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<CargoVersion>> {
         reject_unsafe_crate_name(name, self.registry_display_name)?;
         let url = sparse_index_url(&self.base_url, name);
@@ -339,7 +339,7 @@ impl SparseIndexClient {
     /// Returns an error if:
     /// - Version requirement string is invalid semver
     /// - HTTP request fails
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,

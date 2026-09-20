@@ -338,7 +338,7 @@ mod tests {
                 Box::pin(async move {
                     if name.as_str() == "not-found" {
                         Err(deps_core::error::DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "mock",
                         })
                     } else {

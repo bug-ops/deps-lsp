@@ -242,7 +242,7 @@ impl PackagistRegistry {
     /// # Errors
     ///
     /// Returns an error if the HTTP request or JSON parsing fails.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<ComposerVersion>> {
         reject_dot_segment(name)?;
         let url = p2_url(&self.base, name);
@@ -269,7 +269,7 @@ impl PackagistRegistry {
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails.
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -290,7 +290,7 @@ impl PackagistRegistry {
     /// # Errors
     ///
     /// Returns an error if the HTTP request fails.
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching_with_context(
         &self,
         name: &str,

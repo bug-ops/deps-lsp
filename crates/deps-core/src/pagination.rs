@@ -42,8 +42,9 @@ pub fn warn_if_pagination_truncated(
     max_pages: u32,
 ) {
     if page == max_pages && page_has_more(page_len) {
+        let name = crate::net_policy::redact_declaration_key(name);
         tracing::warn!(
-            package = name,
+            package = %name,
             pages_fetched = max_pages,
             "{ecosystem} {noun} pagination for '{name}' stopped at the {max_pages}-page cap \
              while {provider} reported more pages available; the fetched version list may be \

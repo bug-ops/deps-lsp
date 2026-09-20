@@ -104,7 +104,8 @@ pub fn validate_owner_repo(name: &str) -> Result<()> {
         warn_rejected_value("is_dot_segment", "GitHub owner/repo request URL", name);
     }
     Err(DepsError::InvalidUri(format!(
-        "invalid owner/repo format: '{name}'"
+        "invalid owner/repo format: '{}'",
+        crate::net_policy::redact_declaration_key(name)
     )))
 }
 
@@ -316,7 +317,10 @@ impl GithubTagsClient {
     /// # Errors
     ///
     /// Propagates the underlying HTTP/cache error unchanged.
-    #[tracing::instrument(skip(self), fields(name = name, page = page))]
+    #[tracing::instrument(
+        skip(self),
+        fields(name = %crate::net_policy::redact_declaration_key(name), page = page)
+    )]
     pub async fn fetch_tags_page(&self, name: &str, page: u32) -> Result<Bytes> {
         let url = format!(
             "{}/repos/{name}/tags?per_page=100&page={page}",
@@ -685,7 +689,10 @@ impl ReleaseDatesCache {
     /// assert!(dates.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip(self, github), fields(name = name, ecosystem = ecosystem))]
+    #[tracing::instrument(
+        skip(self, github),
+        fields(name = %crate::net_policy::redact_declaration_key(name), ecosystem = ecosystem)
+    )]
     pub async fn fetch(
         &self,
         github: &GithubTagsClient,
@@ -731,13 +738,16 @@ impl ReleaseDatesCache {
             Ok(Err(e)) => {
                 let (status, cause) = e.safe_tracing_summary();
                 tracing::debug!(
-                    package = name,
+                    package = %crate::net_policy::redact_declaration_key(name),
                     status = ?status,
                     cause,
                     "release dates fetch failed"
                 );
             }
-            Err(_) => tracing::debug!(package = name, "release dates fetch timed out"),
+            Err(_) => tracing::debug!(
+                package = %crate::net_policy::redact_declaration_key(name),
+                "release dates fetch timed out"
+            ),
             Ok(Ok(_)) => {}
         }
         let (dates, ttl) = classify_release_fetch(fetch_result.ok());
@@ -826,6 +836,19 @@ mod tests {
     fn test_validate_owner_repo_rejects_dot_segment_owner() {
         assert!(validate_owner_repo("../repo").is_err());
         assert!(validate_owner_repo("./repo").is_err());
+    }
+
+    /// Code-review finding #2 (post-critic-review sweep, #1209): the invalid-format rejection
+    /// message embedded the raw `name` directly into `DepsError::InvalidUri`'s `Display` text —
+    /// reachable through the same `error = %e` fields already redacted at the `package` level
+    /// for every caller this PR instrumented (`deps-swift`, `deps-github-actions`).
+    #[test]
+    fn test_validate_owner_repo_invalid_format_message_redacts_credential_shaped_input() {
+        let err = validate_owner_repo("user:hunter2@evil.example").unwrap_err();
+        assert!(
+            !err.to_string().contains("hunter2"),
+            "error message leaked a credential-shaped owner/repo value: {err}"
+        );
     }
 
     // --- page_has_more / warn_if_pagination_truncated ---

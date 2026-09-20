@@ -87,7 +87,7 @@ fn resolve_completion_source(
         CompletionSource::Resolved(first)
     } else {
         tracing::warn!(
-            package = %package_name,
+            package = %package_name.for_tracing(),
             "ambiguous dependency source for version/feature completion; offering none"
         );
         CompletionSource::Ambiguous

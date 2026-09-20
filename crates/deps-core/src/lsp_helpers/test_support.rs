@@ -542,7 +542,7 @@ impl crate::Registry for NotFoundRegistry {
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>> {
         Box::pin(async move {
             Err(crate::error::DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: "mock",
             })
         })
