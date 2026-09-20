@@ -2717,7 +2717,11 @@ mod tests {
                 deps_core::FreshnessSettings::default(),
             )
             .await;
-        assert_eq!(result, Completions::default());
+        assert_eq!(
+            result,
+            Completions::default()
+                .with_origin(deps_core::completion::CompletionOrigin::PackageName)
+        );
     }
 
     #[cfg(feature = "lsp-responses")]

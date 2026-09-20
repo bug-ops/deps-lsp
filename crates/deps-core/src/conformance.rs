@@ -1677,6 +1677,11 @@ macro_rules! completion_source_gate_conformance {
                      completions, got: {:?}",
                     result.items,
                 );
+                assert_eq!(
+                    result.origin,
+                    $crate::completion::CompletionOrigin::Version,
+                    "the fixture's dependency-version position must stamp a Version origin"
+                );
             }
             #[::tokio::test]
             async fn completion_source_gate_rejects_non_resolvable_source() {

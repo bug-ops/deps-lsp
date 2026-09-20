@@ -961,6 +961,63 @@ go 1.21
         assert!(completions.items.is_empty());
     }
 
+    /// #1195 M4 regression: `VERSION_OPERATOR_CHARS` is empty for Go — `go.mod` requires a
+    /// bare exact semver with no comparator syntax at all, so nothing about the version
+    /// prefix's *shape* ever protected a `Version` position from `deps-lsp`'s raw-text
+    /// fallback before this PR; only `CompletionOrigin::Version` does now. Runs through the
+    /// real parser and the real `generate_completions` dispatch (not a synthetic
+    /// `ParseResult`), with a mocked 404 so the empty result is deterministic;
+    /// `list_mock.assert_async()` proves the `Version` context was actually reached rather
+    /// than resolving to `None`/`Unresolved`.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_version_context_empty_result_stamps_version_origin() {
+        let mut server = mockito::Server::new_async().await;
+        let list_mock = server
+            .mock("GET", "/github.com/nonexistent/package12345/@v/list")
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = Arc::new(GoRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            server.url(),
+        ));
+        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+        let content = "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/nonexistent/package12345 v1.2.3\n";
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            1,
+            "fixture must parse to exactly one dependency: {content}"
+        );
+
+        let version_range = parse_result.dependencies()[0].version_range().unwrap();
+        let position: Position = version_range.start.into();
+
+        let completions = ecosystem
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                content,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+
+        list_mock.assert_async().await;
+        assert!(completions.items.is_empty());
+        assert_eq!(
+            completions.origin,
+            deps_core::completion::CompletionOrigin::Version,
+            "go.mod has no comparator syntax at all — CompletionOrigin::Version is the only \
+             thing that can stop deps-lsp's fallback from leaking the raw module-path+version \
+             text into a package-name search here"
+        );
+    }
+
     #[tokio::test]
     async fn test_parse_manifest_valid() {
         let cache = Arc::new(deps_core::HttpCache::new());

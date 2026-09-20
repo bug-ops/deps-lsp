@@ -52,23 +52,17 @@ pub struct Completions {
     pub items: Vec<CompletionItem>,
     /// Whether `items` is a possibly-truncated view of a larger candidate set.
     pub is_incomplete: bool,
-    /// Whether an empty [`Self::items`] means "no completion here, and the raw-text
-    /// package-name fallback should not run either" rather than "context detection found
-    /// nothing, try the fallback" (issue #1184 Gap 2).
-    ///
-    /// `deps-lsp`'s completion handler treats empty `items` from a resolved
-    /// [`crate::completion::CompletionContext`] the same as a parse failure — both fall
-    /// back to raw-text package-name search — which is wrong for a context an ecosystem
-    /// positively identified (e.g. a `Version` context) but withheld the item for
-    /// (e.g. GitHub Actions' `position_past_sha_pin_own_ref`, issue #1182): the cursor is
-    /// not a package-name position, so no fallback search should ever run there.
-    pub suppress_fallback: bool,
+    /// Which cursor context this response was resolved for — replaces the former
+    /// `suppress_fallback` boolean (issue #1195). See
+    /// [`CompletionOrigin::allows_package_name_fallback`] for the rule `deps-lsp` applies
+    /// to an empty [`Self::items`].
+    pub origin: CompletionOrigin,
 }
 
 impl Completions {
-    /// Constructs a `Completions` from its items, with [`Self::is_incomplete`] and
-    /// [`Self::suppress_fallback`] left `false` — chain [`Self::with_incomplete`]/
-    /// [`Self::with_suppress_fallback`] to override either.
+    /// Constructs a `Completions` from its items, with [`Self::is_incomplete`] left `false`
+    /// and [`Self::origin`] left [`CompletionOrigin::Unresolved`] — chain
+    /// [`Self::with_incomplete`]/[`Self::with_origin`] to override either.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -86,7 +80,7 @@ impl Completions {
         Self {
             items,
             is_incomplete: false,
-            suppress_fallback: false,
+            origin: CompletionOrigin::Unresolved,
         }
     }
 
@@ -97,27 +91,100 @@ impl Completions {
         self
     }
 
-    /// Overrides [`Self::suppress_fallback`]. See [`Self::new`].
+    /// Overrides [`Self::origin`]. See [`Self::new`].
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::completion::Completions;
+    /// use deps_core::completion::{Completions, CompletionOrigin};
     ///
-    /// let completions = Completions::default().with_suppress_fallback(true);
-    /// assert!(completions.suppress_fallback);
+    /// let completions = Completions::default().with_origin(CompletionOrigin::Version);
+    /// assert_eq!(completions.origin, CompletionOrigin::Version);
     /// ```
     #[must_use]
-    pub const fn with_suppress_fallback(mut self, suppress_fallback: bool) -> Self {
-        self.suppress_fallback = suppress_fallback;
+    pub const fn with_origin(mut self, origin: CompletionOrigin) -> Self {
+        self.origin = origin;
         self
     }
 }
 
 impl From<Vec<CompletionItem>> for Completions {
-    /// Wraps an always-exhaustive result set, i.e. `is_incomplete: false`.
+    /// Wraps an always-exhaustive result set, i.e. `is_incomplete: false`,
+    /// `origin: CompletionOrigin::Unresolved`.
     fn from(items: Vec<CompletionItem>) -> Self {
         Self::new(items)
+    }
+}
+
+/// Which [`CompletionContext`] variant a [`Completions`] response was resolved for.
+///
+/// Stamped by whichever dispatch resolved the completion context — the shared
+/// [`crate::Ecosystem::generate_completions`] default for 11 of 14 ecosystems, or the
+/// ecosystem's own dispatch for the 3 that override it (`deps-maven`, `deps-gradle`,
+/// previously `deps-github-actions`) — so every completion response carries a positive
+/// record of what kind of position it answered, not just whether its author remembered to
+/// flip a flag. Replaces the former `Completions::suppress_fallback` boolean (issue #1195),
+/// which required each ecosystem to opt in individually and left GitHub Actions as the only
+/// one that had (#1182/#1184).
+///
+/// `#[non_exhaustive]`: the only `match` over this type is
+/// [`Self::allows_package_name_fallback`], inside this crate, so a new variant is a compile
+/// error there rather than a silent no-op downstream — the same #793/#819 discipline
+/// `CompletionContext` already applies to its own dispatch match.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CompletionOrigin {
+    /// No context was positively resolved (parse failure, or [`CompletionContext::None`]).
+    #[default]
+    Unresolved,
+    /// Resolved as [`CompletionContext::PackageName`].
+    PackageName,
+    /// Resolved as [`CompletionContext::Version`].
+    Version,
+    /// Resolved as [`CompletionContext::Feature`].
+    Feature,
+}
+
+impl CompletionOrigin {
+    /// Whether an empty [`Completions::items`] with this origin should still fall through
+    /// to `deps-lsp`'s raw-text package-name search fallback.
+    ///
+    /// `Unresolved` and `PackageName` allow it: `Unresolved` covers a parse failure or
+    /// [`CompletionContext::None`], where nothing has ruled out a bare package-name
+    /// position; `PackageName` allows it too because the fallback search *is* a
+    /// package-name search — driven by a raw-text prefix rather than the AST, it can
+    /// still succeed where the AST-driven one returned nothing (e.g. a prefix shorter
+    /// than [`is_valid_completion_prefix_len`]'s 2-character minimum, issue #722). This
+    /// is the row most likely to break if this function is ever written inverted: it is
+    /// the path a user hits on every second keystroke while typing a package name.
+    ///
+    /// `Version` and `Feature` block it: an ecosystem that positively resolved one of
+    /// these contexts but withheld the item (e.g. GitHub Actions' SHA-pin comment guard,
+    /// issue #1182; Maven's `${property}`-interpolated version, issue #1195) has already
+    /// determined the cursor is not a package-name position, so a fallback search there
+    /// would search the registry for version/feature text as if it were a package name.
+    ///
+    /// Written as a wildcard-free `match` rather than a `matches!` macro so that a future
+    /// `CompletionOrigin` variant is a compile error here instead of silently inheriting
+    /// `false` — the exact silent-default failure mode this type replaces
+    /// `suppress_fallback` to avoid.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::completion::CompletionOrigin;
+    ///
+    /// assert!(CompletionOrigin::Unresolved.allows_package_name_fallback());
+    /// assert!(CompletionOrigin::PackageName.allows_package_name_fallback());
+    /// assert!(!CompletionOrigin::Version.allows_package_name_fallback());
+    /// assert!(!CompletionOrigin::Feature.allows_package_name_fallback());
+    /// ```
+    #[must_use]
+    pub const fn allows_package_name_fallback(self) -> bool {
+        match self {
+            Self::Unresolved | Self::PackageName => true,
+            Self::Version | Self::Feature => false,
+        }
     }
 }
 

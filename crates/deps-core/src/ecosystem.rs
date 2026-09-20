@@ -1197,17 +1197,24 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
             // Exhaustive on purpose (#793): no wildcard arm, so a new
             // `CompletionContext` variant is a compile error right here.
             match crate::completion::detect_completion_context(parse_result, position, content) {
-                crate::completion::CompletionContext::PackageName { prefix, range } => {
-                    self.complete_package_name(request, prefix, range).await
-                }
+                crate::completion::CompletionContext::PackageName { prefix, range } => self
+                    .complete_package_name(request, prefix, range)
+                    .await
+                    .with_origin(crate::completion::CompletionOrigin::PackageName),
                 crate::completion::CompletionContext::Version {
                     package_name,
                     prefix,
-                } => self.complete_version(request, package_name, prefix).await,
+                } => self
+                    .complete_version(request, package_name, prefix)
+                    .await
+                    .with_origin(crate::completion::CompletionOrigin::Version),
                 crate::completion::CompletionContext::Feature {
                     package_name,
                     prefix,
-                } => self.complete_feature(request, package_name, prefix).await,
+                } => self
+                    .complete_feature(request, package_name, prefix)
+                    .await
+                    .with_origin(crate::completion::CompletionOrigin::Feature),
                 crate::completion::CompletionContext::None => Completions::default(),
             }
         })
@@ -1762,6 +1769,151 @@ mod tests {
 
         fn as_any(&self) -> &dyn Any {
             self
+        }
+    }
+
+    /// #1195: the default [`Ecosystem::generate_completions`] dispatch — not an ecosystem
+    /// override — must stamp [`crate::completion::CompletionOrigin::PackageName`]/`Version`/
+    /// `Feature` on whichever hook it dispatches to, and `Unresolved` when no
+    /// [`crate::completion::CompletionContext`] resolves. This is the mapping every
+    /// default-dispatch ecosystem crate (11 of 14) relies on for `deps-lsp`'s fallback gate
+    /// without any code of its own.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_default_dispatch_stamps_origin_per_context() {
+        use crate::completion::CompletionOrigin;
+
+        struct OriginMockDep {
+            name: Range,
+            version: Range,
+            features: Range,
+        }
+        impl Dependency for OriginMockDep {
+            fn name(&self) -> &crate::PackageName {
+                static NAME: std::sync::LazyLock<crate::PackageName> =
+                    std::sync::LazyLock::new(|| crate::PackageName::new("demo"));
+                &NAME
+            }
+            fn name_range(&self) -> Range {
+                self.name
+            }
+            fn version_requirement(&self) -> Option<&crate::VersionReq> {
+                static REQ: std::sync::LazyLock<crate::VersionReq> =
+                    std::sync::LazyLock::new(|| crate::VersionReq::new("1.0"));
+                Some(&REQ)
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(self.version)
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn features_range(&self) -> Option<Range> {
+                Some(self.features)
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct OriginMockParseResult {
+            dep: OriginMockDep,
+            uri: url::Url,
+        }
+        impl ParseResult for OriginMockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![&self.dep]
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct OriginMockEcosystem;
+        impl private::Sealed for OriginMockEcosystem {}
+        impl Ecosystem for OriginMockEcosystem {
+            fn ecosystem_id(&self) -> EcosystemId {
+                EcosystemId::Cargo
+            }
+            fn display_name(&self) -> &'static str {
+                "origin-mock"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &[]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a url::Url,
+            ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
+                Box::pin(async move { unimplemented!() })
+            }
+            fn registry(&self) -> Arc<dyn crate::Registry> {
+                unimplemented!()
+            }
+            fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
+                unimplemented!()
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: crate::completion::CompletionRequest<'a>,
+                _package_name: crate::PackageName,
+                _prefix: String,
+            ) -> BoxFuture<'a, Completions> {
+                Box::pin(std::future::ready(Completions::new(vec![])))
+            }
+            fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+                unimplemented!()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+        // `complete_package_name`/`complete_feature` use the trait defaults
+        // (`Completions::default()`) — this test only cares about the stamped `origin`.
+
+        let content = "demo\n1.0\nderive\n";
+        let dep = OriginMockDep {
+            name: Range::new(
+                crate::position::Position::new(0, 0),
+                crate::position::Position::new(0, 4),
+            ),
+            version: Range::new(
+                crate::position::Position::new(1, 0),
+                crate::position::Position::new(1, 3),
+            ),
+            features: Range::new(
+                crate::position::Position::new(2, 0),
+                crate::position::Position::new(2, 6),
+            ),
+        };
+        let parse_result = OriginMockParseResult {
+            dep,
+            uri: crate::test_util::test_uri("/test/manifest.toml"),
+        };
+        let eco = OriginMockEcosystem;
+        let freshness = crate::FreshnessSettings::default();
+
+        for (position, expected) in [
+            (Position::new(0, 2), CompletionOrigin::PackageName),
+            (Position::new(1, 1), CompletionOrigin::Version),
+            (Position::new(2, 3), CompletionOrigin::Feature),
+            (Position::new(3, 0), CompletionOrigin::Unresolved),
+        ] {
+            let result = eco
+                .generate_completions(&parse_result, position, content, freshness)
+                .await;
+            assert_eq!(
+                result.origin, expected,
+                "position {position:?} expected origin {expected:?}, got {:?}",
+                result.origin
+            );
         }
     }
 
