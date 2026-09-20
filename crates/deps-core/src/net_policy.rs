@@ -2550,6 +2550,84 @@ impl AsRef<str> for RedactedUrl {
     }
 }
 
+/// A package/coordinate name, stored pre-redacted via [`redact_declaration_key`] so it is
+/// always safe to log or surface in a client-visible message (#1209).
+///
+/// Unlike [`RedactedUrl`] (built for actual URLs, which mangles ordinary Maven/Gradle
+/// coordinates such as `com.google.guava:guava` into `com.google.guava:***`), this type uses
+/// [`redact_declaration_key`]'s credential-shape gate: a genuine package/coordinate name is
+/// left untouched, while a credential-shaped value (e.g. `deploy:TOKEN@host` embedded where a
+/// manifest expected a name) is redacted the same way. As with `RedactedUrl`, nothing raw is
+/// retained — the only public read surface is [`Display`](std::fmt::Display), [`AsRef<str>`],
+/// and a [`Debug`](std::fmt::Debug) impl that forwards to the redacted text.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::RedactedName;
+///
+/// let redacted = RedactedName::new("com.google.guava:guava");
+/// assert_eq!(redacted.to_string(), "com.google.guava:guava");
+///
+/// let redacted = RedactedName::new("com.google.guava:deploy:TOKEN@git.internal.corp");
+/// assert_eq!(redacted.to_string(), "***@git.internal.corp");
+/// ```
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct RedactedName(String);
+
+impl RedactedName {
+    /// Redacts `raw` immediately via [`redact_declaration_key`], retaining only the resulting
+    /// text.
+    #[must_use]
+    pub fn new(raw: &str) -> Self {
+        Self(redact_declaration_key(raw))
+    }
+}
+
+impl From<&str> for RedactedName {
+    fn from(raw: &str) -> Self {
+        Self::new(raw)
+    }
+}
+
+impl From<String> for RedactedName {
+    fn from(raw: String) -> Self {
+        Self::new(&raw)
+    }
+}
+
+impl std::fmt::Display for RedactedName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::fmt::Debug for RedactedName {
+    /// Forwards to the redacted text's own `Debug` (a quoted string), not a struct-wrapper
+    /// rendering — mirrors [`RedactedUrl`]'s `Debug` impl.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, f)
+    }
+}
+
+impl AsRef<str> for RedactedName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for RedactedName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for RedactedName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
 /// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`) with an `http`
 /// scheme — the shape every `mockito::Server` binds to.
 ///
@@ -5907,5 +5985,71 @@ mod tests {
             IndexUrlError::InvalidUrl(RedactedUrl::new("not-a-url")),
         );
         assert_eq!(entry.blocked_class(), None);
+    }
+
+    /// #1209: `redact_declaration_key` is the primitive [`crate::PackageName::for_tracing`]
+    /// and [`RedactedName`] build on to redact package/coordinate names before they reach a
+    /// log or client-visible message. One genuine, legitimate name per ecosystem (from the
+    /// security audit's live probe against all 14 ecosystems) must survive unredacted —
+    /// otherwise every hover/completion/diagnostic for that ecosystem would render a mangled
+    /// name.
+    #[test]
+    fn redact_declaration_key_leaves_every_ecosystems_legitimate_names_untouched() {
+        for name in [
+            "serde",                                            // Cargo
+            "com.google.guava:guava",                           // Maven/Gradle
+            "org.springframework.boot:spring-boot-starter-web", // Maven/Gradle
+            "@types/node",                                      // npm
+            "@babel/core",                                      // npm
+            "jsr:@std/path",                                    // Deno
+            "npm:@scope/pkg",                                   // Deno
+            "requests",                                         // PyPI
+            "github.com/gin-gonic/gin",                         // Go
+            "gopkg.in/yaml.v3",                                 // Go
+            "rails",                                            // Bundler
+            "path",                                             // Dart
+            "git@github.com:apple/swift-nio.git",               // Swift
+            "monolog/monolog",                                  // Composer
+            "Newtonsoft.Json",                                  // NuGet
+            "actions/checkout",                                 // GitHub Actions
+            "gitlab.com/components/sast",                       // GitLab CI
+            "ghcr.io/owner/image@sha256:abcdef",                // GitLab CI (component ref)
+            "com.example:${project.version}",                   // Maven (unresolved property)
+            "alternate registry (not registered)",              // shared fallback label
+        ] {
+            assert_eq!(
+                redact_declaration_key(name),
+                name,
+                "legitimate name {name:?} must survive redaction unchanged"
+            );
+        }
+    }
+
+    /// #1209 M2 (impl-critic follow-up): `redact_declaration_key` cannot distinguish a real
+    /// `label:value@suffix`-shaped name from a genuine credential — the same structural
+    /// ambiguity [`redact_declaration_key`]'s own doc already calls out. No current ecosystem
+    /// emits this shape in a `PackageName` (Deno keeps the version out of the name —
+    /// `deps_deno::specifier::ParsedSpecifier`'s `name` field never carries a trailing
+    /// `@version`), so this is not a live bug — but since [`RedactedName`] now feeds
+    /// [`crate::DepsError::PackageNotFound`]'s `Display`, which reaches a `window/showMessage`
+    /// toast, a future ecosystem emitting this shape would silently over-redact a legitimate
+    /// name in a user-visible message. This test documents the known limitation explicitly
+    /// (asserting the *actual*, over-redacting behavior) rather than leaving it as a silent
+    /// gap — a change to any of these outcomes should be a deliberate, reviewed one.
+    #[test]
+    fn redact_declaration_key_over_redacts_documented_label_value_at_suffix_shapes() {
+        assert_eq!(redact_declaration_key("npm:express@4.18.2"), "***@4.18.2");
+        assert_eq!(
+            redact_declaration_key("com.example:artifact@1.0"),
+            "***@1.0"
+        );
+        assert_eq!(
+            redact_declaration_key("alpine:3.18@sha256:abc"),
+            "***@sha256:***"
+        );
+        assert_eq!(
+            redact_declaration_key("ghcr.io/owner/image:1.2.3@sha256:abcdef"),
+            "ghcr.io/owner/image:***"
+        );
     }
 }

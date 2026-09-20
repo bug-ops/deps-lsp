@@ -326,7 +326,7 @@ impl GitlabCiRegistry {
             DepsError::HttpStatus {
                 status: 404 | 400, ..
             } => DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: REGISTRY,
             },
             _ => e,
@@ -335,7 +335,7 @@ impl GitlabCiRegistry {
 
     /// Fetches and converts the version list for `name` via `route`, gated by the route's
     /// origin-scoped rate-limit gate.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %name.for_tracing()), level = "debug")]
     async fn fetch_route(
         &self,
         name: &PackageName,
@@ -350,7 +350,7 @@ impl GitlabCiRegistry {
         let Some(project_path) = project_path_from_name(name.as_str(), host.host(), route.endpoint)
         else {
             return Err(DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: REGISTRY,
             });
         };
@@ -429,7 +429,7 @@ impl GitlabCiRegistry {
     /// # Errors
     ///
     /// Propagates the underlying fetch error unchanged (rate limit, not-found, etc).
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?raw), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %name.for_tracing(), version = ?raw), level = "debug")]
     pub async fn resolve_component_pin(
         &self,
         name: &PackageName,
@@ -452,7 +452,7 @@ impl deps_core::Registry for GitlabCiRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             Err(DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: "gitlab-ci (no route; source required)",
             })
         })
@@ -468,13 +468,13 @@ impl deps_core::Registry for GitlabCiRegistry {
             let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = source
             else {
                 return Err(DepsError::PackageNotFound {
-                    package: name.to_string(),
+                    package: name.to_string().into(),
                     registry: "gitlab-ci (no route; source required)",
                 });
             };
             let Some(route) = self.routes.get(index).map(|r| r.clone()) else {
                 return Err(DepsError::PackageNotFound {
-                    package: name.to_string(),
+                    package: name.to_string().into(),
                     registry: "gitlab-ci (unregistered route)",
                 });
             };
@@ -495,7 +495,7 @@ impl deps_core::Registry for GitlabCiRegistry {
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             Err(DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: "gitlab-ci (no route; source required)",
             })
         })

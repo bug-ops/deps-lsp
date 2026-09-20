@@ -366,7 +366,7 @@ pub async fn fetch_tier3_licenses(
             .await
             .unwrap_or_else(|_| {
                 timed_out = true;
-                tracing::debug!(package = %name, "tier-3 license fetch timed out");
+                tracing::debug!(package = %name.for_tracing(), "tier-3 license fetch timed out");
                 Vec::new()
             });
             (name, found, timed_out)

@@ -109,7 +109,8 @@ pub(crate) fn validate_module_path(module_path: &str) -> Result<()> {
     if module_path.split('/').any(is_dot_segment) {
         warn_rejected_value("is_dot_segment", "Go module proxy request URL", module_path);
         return Err(DepsError::InvalidVersionReq(format!(
-            "module path '{module_path}' contains a `.`/`..` path segment"
+            "module path '{}' contains a `.`/`..` path segment",
+            deps_core::net_policy::redact_declaration_key(module_path)
         )));
     }
 
@@ -402,10 +403,15 @@ impl GoRegistry {
     /// `deps-pypi`'s identical FR-005(c) trade-off for the default `,`-separated case:
     /// silently falling through on transport failure risks resolving a module through a
     /// fallback the user did not intend for the reachability state they are actually in.
-    #[tracing::instrument(skip_all, fields(package = ?module_path), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path)), level = "debug")]
     async fn get_versions_chained(&self, module_path: &str) -> Result<Vec<GoVersion>> {
+        // Hoisted once (code-review S4): the chain-fallback loop below can otherwise redact
+        // `module_path` once per hop plus once more per `PackageNotFound` — idempotent
+        // (`redact_declaration_key`'s own contract), so reusing the same redacted string is
+        // both cheaper and immune to a future fallback-chain-length bump multiplying the cost.
+        let redacted_module_path = deps_core::net_policy::redact_declaration_key(module_path);
         let mut last_miss: Result<Vec<GoVersion>> = Err(DepsError::PackageNotFound {
-            package: module_path.to_string(),
+            package: redacted_module_path.clone().into(),
             registry: REGISTRY,
         });
 
@@ -428,14 +434,14 @@ impl GoRegistry {
                 Ok(empty) => last_miss = Ok(empty),
                 Err(DepsError::PackageNotFound { .. }) => {
                     last_miss = Err(DepsError::PackageNotFound {
-                        package: module_path.to_string(),
+                        package: redacted_module_path.clone().into(),
                         registry: REGISTRY,
                     });
                 }
                 Err(other) => match next_sep {
                     Some(ChainSeparator::AnyError) => {
                         tracing::warn!(
-                            module = module_path,
+                            module = %redacted_module_path,
                             error = %other,
                             "Go alternate-proxy chain hop failed, but the `|` separator \
                              tolerates any error; falling through to the next hop"
@@ -444,7 +450,7 @@ impl GoRegistry {
                     }
                     _ => {
                         tracing::warn!(
-                            module = module_path,
+                            module = %redacted_module_path,
                             error = %other,
                             "Go alternate-proxy chain resolution halted on a transport error — \
                              not falling back to proxy.golang.org or the next configured hop"
@@ -485,11 +491,11 @@ impl GoRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?module_path), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path)), level = "debug")]
     pub async fn get_versions(&self, module_path: &str) -> Result<Vec<GoVersion>> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
-                package: module_path.to_string(),
+                package: module_path.to_string().into(),
                 registry: REGISTRY,
             });
         }
@@ -533,11 +539,11 @@ impl GoRegistry {
     /// assert_eq!(info.version, "v1.9.1");
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?module_path, version = ?version), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path), version = ?version), level = "debug")]
     pub async fn get_version_info(&self, module_path: &str, version: &str) -> Result<GoVersion> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
-                package: module_path.to_string(),
+                package: module_path.to_string().into(),
                 registry: REGISTRY,
             });
         }
@@ -590,11 +596,11 @@ impl GoRegistry {
     /// assert!(!latest.is_pseudo);
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?module_path), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path)), level = "debug")]
     pub async fn get_latest_stable(&self, module_path: &str) -> Result<GoVersion> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
-                package: module_path.to_string(),
+                package: module_path.to_string().into(),
                 registry: REGISTRY,
             });
         }
@@ -665,11 +671,11 @@ impl GoRegistry {
     /// assert!(go_mod.contains("module github.com/gin-gonic/gin"));
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?module_path, version = ?version), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(module_path), version = ?version), level = "debug")]
     pub async fn get_go_mod(&self, module_path: &str, version: &str) -> Result<String> {
         if self.tier == GoRegistryTier::Terminal {
             return Err(DepsError::PackageNotFound {
-                package: module_path.to_string(),
+                package: module_path.to_string().into(),
                 registry: REGISTRY,
             });
         }
@@ -761,7 +767,7 @@ fn parse_sort_key(version: &str, is_pseudo: bool) -> Option<semver::Version> {
 fn parse_version_info(module_path: &str, data: &[u8]) -> Result<GoVersion> {
     let info: VersionInfo =
         deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
-            package: module_path.to_string(),
+            package: module_path.to_string().into(),
             registry: REGISTRY,
             source: e,
         })?;
@@ -819,7 +825,7 @@ impl deps_core::Registry for GoRegistry {
                                 .collect())
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -865,7 +871,7 @@ impl deps_core::Registry for GoRegistry {
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -1377,6 +1383,24 @@ mod tests {
         // A dot inside a segment (a real Go module path, e.g. a domain component) is not a
         // dot-segment and must stay valid.
         assert!(validate_module_path("golang.org/x/mod").is_ok());
+    }
+
+    /// Code-review finding #1 (post-critic-review sweep, #1209): `validate_module_path`'s
+    /// dot-segment rejection message embedded the raw `module_path` directly into
+    /// `DepsError::InvalidVersionReq`'s `Display` text — a different sink from the
+    /// `package`-field tracing fixes this PR made everywhere else, reachable through the same
+    /// `error = %e` fields this PR already redacted at the `package` level (e.g.
+    /// `deps-engine::classify::fetch`'s "fetch failed" WARN).
+    #[test]
+    fn test_validate_module_path_rejects_dot_segment_message_redacts_credential_shaped_input() {
+        let result = validate_module_path("deploy:AUDITSENTINEL0000@git.internal.corp/..");
+        let Err(error) = result else {
+            panic!("expected a dot-segment rejection");
+        };
+        assert!(
+            !error.to_string().contains("AUDITSENTINEL0000"),
+            "error message leaked a credential-shaped module path: {error}"
+        );
     }
 
     /// Demonstrates the vulnerability the `validate_module_path` dot-segment check exists

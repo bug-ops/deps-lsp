@@ -87,6 +87,33 @@ impl PackageName {
     pub fn into_string(self) -> String {
         self.0
     }
+
+    /// Renders this name for `tracing`/log output, redacting it via
+    /// [`crate::net_policy::redact_declaration_key`] first (#1209).
+    ///
+    /// A manifest can hold a credential in a name-shaped field (e.g. a Maven
+    /// `group:artifact:secret@host` coordinate produced by property
+    /// interpolation), and this type's own [`Display`](fmt::Display) writes the string
+    /// verbatim — so any
+    /// `tracing` field or span built from a `PackageName` must go through this method instead
+    /// of `%name`/`?name`. An ordinary package name (including scoped ones like
+    /// `@types/node` or `com.google.guava:guava`) passes through unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PackageName;
+    ///
+    /// let name = PackageName::new("com.google.guava:guava");
+    /// assert_eq!(name.for_tracing(), "com.google.guava:guava");
+    ///
+    /// let name = PackageName::new("com.google.guava:deploy:TOKEN@git.internal.corp");
+    /// assert_eq!(name.for_tracing(), "***@git.internal.corp");
+    /// ```
+    #[must_use]
+    pub fn for_tracing(&self) -> String {
+        crate::net_policy::redact_declaration_key(&self.0)
+    }
 }
 
 impl fmt::Display for PackageName {

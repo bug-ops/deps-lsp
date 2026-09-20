@@ -669,10 +669,10 @@ impl NuGetRegistry {
     /// [`DepsError::ChainResolutionHalted`] rather than the underlying error unchanged — never
     /// falling back to api.nuget.org or the next configured feed, which would leak the
     /// package's name past a merely-unreachable private feed.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     async fn get_versions_chained(&self, name: &str) -> Result<Vec<NuGetVersion>> {
         let mut last_miss: Result<Vec<NuGetVersion>> = Err(DepsError::PackageNotFound {
-            package: name.to_string(),
+            package: name.to_string().into(),
             registry: REGISTRY,
         });
 
@@ -682,13 +682,13 @@ impl NuGetRegistry {
                 Ok(empty) => last_miss = Ok(empty),
                 Err(error) if error.is_not_found() => {
                     last_miss = Err(DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: REGISTRY,
                     });
                 }
                 Err(other) => {
                     tracing::warn!(
-                        package = name,
+                        package = %deps_core::net_policy::redact_declaration_key(name),
                         error = %other,
                         "NuGet alternate-feed chain resolution halted on a transport error \
                          — not falling back to api.nuget.org or the next configured feed"
@@ -774,7 +774,7 @@ impl NuGetRegistry {
     ///
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions_with(
         &self,
         name: &str,
@@ -814,7 +814,11 @@ impl NuGetRegistry {
                     attach_publish_times(&mut versions, &enrichment.published);
                 }
                 Err(e) => {
-                    tracing::debug!(package = %name, error = %e, "registration index fetch failed, publish times unavailable");
+                    tracing::debug!(
+                        package = %deps_core::net_policy::redact_declaration_key(name),
+                        error = %e,
+                        "registration index fetch failed, publish times unavailable"
+                    );
                 }
             }
             Ok(versions)
@@ -942,7 +946,7 @@ impl NuGetRegistry {
     /// Returns an error only if `name` is rejected as a dot-segment or the service index
     /// itself cannot be resolved — both of which also fail the hover response's main
     /// version fetch, so this never surfaces a *distinct* failure mode to the caller.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn unlisted_versions(&self, name: &str) -> Result<HashSet<String>> {
         // Issue #562, FR-012: registration-hive enrichment is no longer skipped for
         // `WorkspaceDeclared`-tier feeds — routed through `Self::fetch` (§3.9) like every
@@ -971,7 +975,7 @@ impl NuGetRegistry {
     ///
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req), level = "debug")]
     pub async fn get_latest_matching(&self, name: &str, req: &str) -> Result<Option<NuGetVersion>> {
         let versions = self.get_versions(name).await?;
         Ok(pick_latest_matching(versions, req))
@@ -1226,7 +1230,7 @@ impl deps_core::Registry for NuGetRegistry {
                                 .collect())
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -1263,7 +1267,7 @@ impl deps_core::Registry for NuGetRegistry {
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }

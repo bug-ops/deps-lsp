@@ -374,10 +374,10 @@ impl PypiRegistry {
     /// reaches hover/diagnostics text, not just the `tracing::warn!` below (which still logs
     /// the real underlying error for debugging) — this is NFR-003(3)'s required
     /// distinguishable diagnostic.
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     async fn get_versions_chained(&self, name: &str) -> Result<Vec<PypiVersion>> {
         let mut last_miss: Result<Vec<PypiVersion>> = Err(DepsError::PackageNotFound {
-            package: name.to_string(),
+            package: name.to_string().into(),
             registry: REGISTRY,
         });
 
@@ -387,13 +387,13 @@ impl PypiRegistry {
                 Ok(empty) => last_miss = Ok(empty),
                 Err(DepsError::PackageNotFound { .. }) => {
                     last_miss = Err(DepsError::PackageNotFound {
-                        package: name.to_string(),
+                        package: name.to_string().into(),
                         registry: REGISTRY,
                     });
                 }
                 Err(other) => {
                     tracing::warn!(
-                        package = name,
+                        package = %deps_core::net_policy::redact_declaration_key(name),
                         error = %other,
                         "PyPI alternate-index chain resolution halted on a transport error \
                          — not falling back to pypi.org or the next configured index"
@@ -442,7 +442,7 @@ impl PypiRegistry {
     /// assert!(!versions.is_empty());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<PypiVersion>> {
         let normalized = crate::name::normalize(name);
         if normalized.is_empty() {
@@ -452,7 +452,7 @@ impl PypiRegistry {
                 name,
             );
             return Err(DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: REGISTRY,
             });
         }
@@ -497,7 +497,7 @@ impl PypiRegistry {
     /// assert!(latest.is_some());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = ?name, version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
@@ -629,11 +629,11 @@ impl PypiRegistry {
     ///   name to `pypi.org`'s JSON API (`metadata_url` is always built from the hardcoded
     ///   `PYPI_BASE`, never parameterized — see `metadata_url`'s doc) — closed here before
     ///   any such call site exists, not relied on via the call graph
-    #[tracing::instrument(skip_all, fields(package = ?name), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_package_metadata(&self, name: &str) -> Result<PypiPackage> {
         if self.tier == PypiRegistryTier::WorkspaceDeclared {
             return Err(DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: REGISTRY,
             });
         }
@@ -645,7 +645,7 @@ impl PypiRegistry {
                 name,
             );
             return Err(DepsError::PackageNotFound {
-                package: name.to_string(),
+                package: name.to_string().into(),
                 registry: REGISTRY,
             });
         }
@@ -738,7 +738,7 @@ impl deps_core::Registry for PypiRegistry {
                                 .collect())
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -785,7 +785,7 @@ impl deps_core::Registry for PypiRegistry {
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
-                            package: name.to_string(),
+                            package: name.to_string().into(),
                             registry: "alternate registry (not registered)",
                         }),
                     }
@@ -1045,7 +1045,7 @@ fn build_version_metadata(
 fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<PypiVersion>> {
     let response: SimpleApiResponse =
         deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
-            package: package_name.to_string(),
+            package: package_name.to_string().into(),
             registry: REGISTRY,
             source: e,
         })?;
@@ -1082,7 +1082,7 @@ fn parse_simple_api_response(package_name: &str, data: &[u8]) -> Result<Vec<Pypi
 fn parse_package_info(package_name: &str, data: &[u8]) -> Result<PypiPackage> {
     let response: PypiResponse =
         deps_core::parse_json_checked(data).map_err(|e| DepsError::ApiResponse {
-            package: package_name.to_string(),
+            package: package_name.to_string().into(),
             registry: REGISTRY,
             source: e,
         })?;
