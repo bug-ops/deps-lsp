@@ -302,6 +302,40 @@ impl Dependency for MockSyntheticRangeDep {
     }
 }
 
+/// A dependency with a real `name_range()` and a real, non-default `version_range()`, but no
+/// `version_requirement()` at all — mirrors Maven's `<version></version>` (#1161): the
+/// zero-width `version_range()` exists purely so completion can locate the dependency at that
+/// position, with no requirement text behind it. Used to test that hover/inlay-hints/
+/// diagnostics anchoring correctly treat this exactly like `version_range() == None` (#1161 M1
+/// critic follow-up), rather than treating a non-`None` `version_range()` alone as "there is
+/// real version content here."
+pub(crate) struct MockNoRequirementDep {
+    pub(crate) name: PackageName,
+    pub(crate) name_range: crate::position::Range,
+    pub(crate) version_range: crate::position::Range,
+}
+
+impl Dependency for MockNoRequirementDep {
+    fn name(&self) -> &PackageName {
+        &self.name
+    }
+    fn name_range(&self) -> crate::position::Range {
+        self.name_range
+    }
+    fn version_requirement(&self) -> Option<&VersionReq> {
+        None
+    }
+    fn version_range(&self) -> Option<crate::position::Range> {
+        Some(self.version_range)
+    }
+    fn source(&self) -> crate::parser::DependencySource {
+        crate::parser::DependencySource::Registry
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 pub(crate) struct MockMarkedDep {
     pub(crate) name: PackageName,
     pub(crate) name_range: crate::position::Range,

@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: removed `completion::complete_versions_generic`; `completion::complete_versions_generic_from` now requires an additional `formatter: &dyn lsp_helpers::SourcePolicy` parameter (resolves #1136)
 
 ### Fixed
+- **deps-gradle**: DSL version completion no longer overspans into a semicolon- or space-joined earlier dependency on the same line (resolves #1160)
+- **deps-maven**: version completion now triggers inside an empty `<version></version>` tag instead of being silently withheld (resolves #1161)
 - **deps-core**: Gradle/Maven version-completion's same-line fallback no longer resolves the wrong dependency when multiple dependencies share one manifest line (resolves #1146) (#1159)
 - **deps-core**: version completion now applies the `can_resolve_source` gate for every ecosystem, closing a leak where a private/non-registry dependency's name was still sent to the public registry on every keystroke (resolves #1136)
 - **deps-cli**: `check` now runs the tier-3 license pre-fetch (Dart, Swift, Gradle, Deno) before evaluating `license_policy`, matching `deps-lsp`'s diagnostics instead of silently missing license data for these ecosystems (resolves #1133) (#1148)

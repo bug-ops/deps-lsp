@@ -965,6 +965,16 @@ pub fn position_in_range(pos: Position, range: Range) -> bool {
     true
 }
 
+/// Whether `dep`'s `version_range()` is a degenerate, completion-only position with no
+/// requirement behind it (e.g. Maven's `<version></version>`/self-closing `<version/>`) rather
+/// than a real, non-empty range that happens to have no requirement (e.g. Gradle's
+/// `version.ref` pointing at a dangling or rich-version alias, which spans the real
+/// alias-reference text). Zero-width (`start == end`) is the discriminating signal —
+/// `version_requirement().is_none()` alone is not, since both shapes share it.
+pub(crate) fn version_range_is_synthetic_empty(dep: &dyn Dependency) -> bool {
+    dep.version_requirement().is_none() && dep.version_range().is_some_and(|r| r.start == r.end)
+}
+
 /// Converts byte offsets in source text to LSP `Position` values.
 ///
 /// Precomputes line-start byte offsets once, then maps any byte offset to a
@@ -1881,9 +1891,12 @@ fn literal_span_matches(slice: &str, requirement: &str) -> bool {
 /// completion context, or a raw-text-scanning ecosystem's own completion dispatch (Maven,
 /// Gradle) that never goes through [`crate::completion::detect_completion_context`] at all.
 ///
-/// Returns `false` — not editable — when `dep` has no [`Dependency::version_requirement`], the
-/// slice is syntactically reference-shaped (see below), or the slice doesn't textually match
-/// the declared literal.
+/// Returns `false` — not editable — when the slice is syntactically reference-shaped (see
+/// below), or the slice doesn't textually match the declared literal. When `dep` has no
+/// [`Dependency::version_requirement`] at all, an empty (or whitespace-only) slice is admitted
+/// — e.g. Maven's `<version></version>`, which has no text for its parser to capture and thus
+/// nothing that could be misread as a reference/wildcard (#1161) — but a *non-empty* slice is
+/// still rejected, since there is then no requirement to validate it against.
 ///
 /// The reference-shape check runs **independently** of the text comparison (#919 C1): an
 /// *unresolved* Maven `${property}` or Gradle `$var`/`${var}` interpolation is left by its
@@ -1979,12 +1992,27 @@ pub fn dependency_version_range_is_literal(
     content: &str,
     version_range: Range,
 ) -> bool {
-    let Some(version_req) = dep.version_requirement() else {
+    if version_range == Range::default() {
+        // `Range::default()` ((0,0)-(0,0)) is a purely syntactic "not a real position"
+        // sentinel, never a genuine in-document location — `deps-gradle`'s catalog context
+        // deliberately returns it for a `version.ref = "alias"` reference (#931), including a
+        // dangling or still-being-typed one, so this function must always reject it
+        // unconditionally, before the `version_requirement()` check below ever runs.
         return false;
-    };
+    }
+
     let table = LineOffsetTable::new(content);
     let slice = slice_for_range(content, &table, version_range);
     let trimmed = slice.trim();
+
+    let Some(version_req) = dep.version_requirement() else {
+        // No parsed requirement at all — e.g. Maven's `<version></version>`, which has no
+        // text for its parser to capture. An empty span here has no existing text that could
+        // be misread as a reference/wildcard, so it is always safe to offer completion
+        // (#1161) — now that the `Range::default()` sentinel above is rejected first, this can
+        // only be a genuine in-document position.
+        return trimmed.is_empty();
+    };
     if trimmed.contains('$')
         || (trimmed.starts_with('*') && !crate::is_existence_wildcard_str(trimmed))
     {
@@ -2227,6 +2255,77 @@ mod tests {
             version_req: VersionReq::new("1.0.$patch"), // left unresolved by the parser
             version_range: Range::new(Position::new(0, 32), Position::new(0, 42)), // "1.0.$patch"
             name_range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+        };
+
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            dep.version_range,
+        ));
+    }
+
+    /// #1161: a dependency with no `version_requirement()` at all — Maven's parser never
+    /// sets one for a genuinely empty `<version></version>` tag, since there is no text to
+    /// capture — must still be admitted when `version_range`'s slice is empty. There is no
+    /// existing text at that position that could be misread as a reference/wildcard, so
+    /// offering completion is always safe regardless of whether a requirement was parsed.
+    #[test]
+    fn test_dependency_version_range_is_literal_admits_empty_slice_with_no_requirement_at_all() {
+        let content = "<version></version>";
+        let dep = MockSyntheticRangeDep {
+            name: PackageName::new("com.example:foo"),
+        };
+        let empty_range = Range::new(Position::new(0, 9), Position::new(0, 9));
+
+        assert!(dep.version_requirement().is_none());
+        assert!(dependency_version_range_is_literal(
+            &dep,
+            content,
+            empty_range
+        ));
+    }
+
+    /// Critic follow-up (C1, second round) to #1161: a DANGLING or still-being-typed
+    /// `version.ref` alias (e.g. `version.ref = "gu"` while typing "guava") has
+    /// `version_requirement() == None` — the exact same shape as Maven's genuinely empty
+    /// `<version></version>` tag — but its range is `deps-gradle`'s `Range::default()`
+    /// sentinel, not a real in-document position. This is the *normal* interactive state on
+    /// every keystroke while typing an alias, not an edge case: admitting it here would offer
+    /// the full unfiltered version list and splice a version literal into the alias name.
+    /// Must be rejected regardless of `version_requirement()` being absent.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_default_range_with_no_requirement_at_all() {
+        let content = r#"version.ref = "gu""#;
+        let dep = MockSyntheticRangeDep {
+            name: PackageName::new("com.example:guava"),
+        };
+
+        assert!(dep.version_requirement().is_none());
+        assert!(!dependency_version_range_is_literal(
+            &dep,
+            content,
+            Range::default(),
+        ));
+    }
+
+    /// Critic follow-up (C1) to #1161: an empty slice must NOT be admitted merely because it
+    /// is empty — only when `version_requirement()` is also absent. `deps-gradle`'s catalog
+    /// context deliberately returns `Range::default()` (which slices to `""`) for a
+    /// `version.ref = "alias"` reference while `version_requirement()` still holds the
+    /// alias's real, non-empty resolved value (#931) — the "always reject" guarantee that
+    /// sentinel relies on comes from comparing that non-empty value against the empty slice,
+    /// not from any special-casing of the empty slice itself. A version that checks
+    /// `trimmed.is_empty()` before/independent of `version_requirement()` would invert this
+    /// into an always-accept and let a full completion list splice a version literal into
+    /// the alias name.
+    #[test]
+    fn test_dependency_version_range_is_literal_rejects_default_range_with_nonempty_requirement() {
+        let content = r#"version.ref = "guavaVersion""#;
+        let dep = MockDep {
+            name: PackageName::new("com.example:guava"),
+            version_req: VersionReq::new("32.0.1"), // the alias's resolved value
+            version_range: Range::default(), // deps-gradle's deliberate always-reject sentinel
+            name_range: Range::default(),
         };
 
         assert!(!dependency_version_range_is_literal(

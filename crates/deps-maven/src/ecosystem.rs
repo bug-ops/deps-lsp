@@ -234,6 +234,21 @@ impl MavenEcosystem {
 
         let before_cursor = &line[..col_idx];
 
+        // Self-closing `<version/>` is deliberately NOT recognized as a completion trigger
+        // here (reverted critic follow-up, third round): the parser's `Event::Empty` arm
+        // anchors `version_range` right AFTER `/>`, so a completion accepted at that position
+        // inserts text after the self-closed tag instead of inside it — `<version/>` becomes
+        // the invalid `<version/>1.2.3` — since `complete_versions_generic_from` relies on
+        // cursor-position insert with no `text_edit` to redirect it. `<version></version>`'s
+        // anchor sits *between* the tags, so the same insert lands correctly there; the two
+        // shapes are asymmetric in exactly the way that matters for this. Proper `<version/>`
+        // completion needs an explicit `text_edit` replacing the whole self-closing tag with
+        // `<version>...</version>`, not expressible in the current completion path — tracked
+        // as a separate follow-up, out of #1161's literal scope. The parser still captures
+        // `version_range`/`version_open_pos`/`version_close_pos` for this shape (round 1's S1
+        // fix) so hover/diagnostics/code-actions/code-lenses treat it consistently; only the
+        // completion trigger is withheld.
+
         for (tag, ctx) in [
             ("version", MavenXmlContext::Version),
             ("artifactId", MavenXmlContext::ArtifactId),
@@ -646,6 +661,26 @@ mod tests {
         let (t, v) = xml_context(line, 9);
         assert_eq!(t, MavenXmlContext::Version);
         assert_eq!(v, "");
+    }
+
+    // Critic follow-up (third round) to #1161: self-closing `<version/>` must NOT be
+    // recognized as a completion trigger. A prior attempt at this (S1/M2, second round)
+    // returned a Version context anchored right after `/>`, matching the parser's own
+    // `Event::Empty` capture — but `complete_versions_generic_from` relies on cursor-position
+    // insert with no `text_edit`, so accepting a completion there would insert text AFTER the
+    // self-closed tag (`<version/>1.2.3`), corrupting the pom.xml, unlike
+    // `<version></version>`'s anchor, which sits *between* the tags where a cursor-insert
+    // lands correctly. Reverted; proper `<version/>` completion needs an explicit `text_edit`
+    // replacing the whole tag, tracked as a separate follow-up out of #1161's scope.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_xml_context_self_closing_version_tag_is_not_a_completion_trigger() {
+        for line in ["<version/>", "<version />"] {
+            let (t, v, range) = xml_context_with_range(line, u32::try_from(line.len()).unwrap());
+            assert_eq!(t, MavenXmlContext::None, "must not trigger for {line:?}");
+            assert_eq!(v, "");
+            assert_eq!(range, LspRange::default());
+        }
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -1468,6 +1503,114 @@ mod tests {
             .generate_completions(parse_result.as_ref(), position, xml, freshness)
             .await;
         assert_eq!(via_dispatch.items, direct);
+    }
+
+    // #1161: an empty `<version></version>` tag on its own line (a different line from
+    // `<artifactId>`) must still resolve completion end-to-end through the real parser +
+    // dispatch. Before the parser fix, this shape was unresolvable by either of
+    // `literal_version_dependency`'s passes: pass 1 requires a real `version_range` (there was
+    // none), and pass 2's same-line fallback requires `name_range`'s line to equal the
+    // cursor's line, which it doesn't here. After the fix, the parser's now-real (zero-width)
+    // `version_range` makes pass 1 match directly via its inclusive `position_in_range` check
+    // — this test exercises pass 1, not the same-line fallback (critic re-check follow-up:
+    // this comment previously described the pre-fix, now-inapplicable failure mode).
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_version_context_admits_empty_version_tag_on_separate_line() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>foo</artifactId>
+      <version></version>
+    </dependency>
+  </dependencies>
+</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let version_range = dep
+            .version_range()
+            .expect("empty <version></version> must still yield a trackable range");
+        assert_eq!(
+            version_range.start, version_range.end,
+            "empty tag content must be zero-width"
+        );
+        assert_ne!(
+            version_range.start.line,
+            dep.name_range().start.line,
+            "fixture must keep <version> on a different line from <artifactId>: {xml}"
+        );
+        let position: Position = version_range.start.into();
+
+        let (ctx, value, value_range) =
+            MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+        assert_eq!(ctx, MavenXmlContext::Version);
+        assert_eq!(value, "");
+
+        let resolved = deps_core::completion::literal_version_dependency(
+            parse_result.as_ref(),
+            position,
+            xml,
+            value_range,
+        );
+        assert!(
+            resolved.is_some(),
+            "must resolve the dependency despite version_range being empty and on a \
+             different line from name_range"
+        );
+        assert_eq!(resolved.unwrap().name(), dep.name());
+    }
+
+    // Critic follow-up (third round) to #1161: a self-closing `<version/>` must still get a
+    // trackable `version_range` from the parser (round 1's S1 fix, kept — every other
+    // consumer, hover/diagnostics/code-actions/code-lenses, correctly no-ops on it), but
+    // `generate_completions` must never offer a completion there (round 2's trigger reverted:
+    // it would insert text after `/>` instead of inside the element, corrupting the pom.xml).
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_completions_withholds_completion_for_self_closing_version_tag() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = MavenEcosystem::new(cache);
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>foo</artifactId>
+      <version/>
+    </dependency>
+  </dependencies>
+</project>";
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let parse_result = eco.parse_manifest(xml, &uri).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let version_range = dep
+            .version_range()
+            .expect("self-closing <version/> must still yield a trackable range for non-completion consumers");
+        assert_eq!(
+            version_range.start, version_range.end,
+            "self-closing tag content must be zero-width"
+        );
+        let position: Position = version_range.start.into();
+
+        let (ctx, _, _) = MavenEcosystem::detect_xml_context(xml, position, parse_result.as_ref());
+        assert_eq!(
+            ctx,
+            MavenXmlContext::None,
+            "self-closing <version/> must not be a completion trigger"
+        );
+
+        let result = eco
+            .generate_completions(
+                parse_result.as_ref(),
+                position,
+                xml,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert_eq!(result, Completions::default());
     }
 
     // #1146: cursor just before dep-two's version_range on a real two-dep-per-line pom.xml resolves dep-two via pass 2, not dep-one.

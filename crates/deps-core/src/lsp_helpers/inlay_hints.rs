@@ -47,6 +47,28 @@ pub fn generate_inlay_hints(
                 .cloned()
             };
 
+        if super::version_range_is_synthetic_empty(dep) && resolved_version.is_none() {
+            // Maven's `<version></version>` (#1161 M1 follow-up): `version_range()` is `Some`
+            // purely so completion can locate the dependency at that position, but there is no
+            // declared requirement to show a version hint against — skip, the same way a
+            // manifest with no `<version>` tag at all (`version_range() == None`, caught by the
+            // gate above) is already skipped. Without this, a dependency here would flash a
+            // "Loading…" hint at the empty tag's position while `versions` is being fetched,
+            // then vanish once `RequirementStatus::Unresolved` is reached.
+            //
+            // `version_range_is_synthetic_empty`, not a bare `version_requirement().is_none()`
+            // (code-review follow-up, second round): Gradle's version-catalog `version.ref`
+            // pointing at a dangling/rich-version alias legitimately has a REAL, non-empty
+            // `version_range()` with `version_requirement()` still `None` — inlay hints
+            // rendered for it before #1161, and a blanket check would have silently broken
+            // that. Checked AFTER `resolved_version` is computed, not before (critic follow-up,
+            // second round): a lockfile-derived `resolved_version` can be present even when
+            // `version_requirement()` is `None` for a currently-unreached ecosystem/shape, and
+            // the #483 I5/SEC-2 guarantee below never discards a purely-local, offline
+            // `resolved_version` — skipping earlier would silently drop that hint instead.
+            continue;
+        }
+
         if loading_state == crate::LoadingState::Loading
             && config.show_loading_hints
             && latest_version.is_none()
@@ -174,6 +196,163 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
+
+    /// #1161 M1 (critic follow-up): a dependency whose `version_range()` is `Some` but which
+    /// has no `version_requirement()` — Maven's `<version></version>`, whose zero-width
+    /// `version_range()` exists purely so completion can locate the dependency — must emit no
+    /// hint at all, including no transient "Loading…" hint while `versions` is still being
+    /// fetched. Without the `version_requirement().is_none()` skip, this dependency would
+    /// flash a loading hint at the empty tag's position and then vanish once steady state
+    /// (`RequirementStatus::Unresolved`) is reached, unlike every other "no version" shape
+    /// (a manifest with no `<version>` tag at all, `version_range() == None`), which the
+    /// gate right above already skips outright.
+    #[test]
+    fn test_generate_inlay_hints_skips_dependency_with_no_requirement_even_while_loading() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockMixedParseResult {
+            deps: vec![Box::new(MockNoRequirementDep {
+                name: "com.example:foo".into(),
+                name_range: Range::new(Position::new(4, 18), Position::new(4, 21)).into(),
+                version_range: Range::new(Position::new(5, 15), Position::new(5, 15)).into(),
+            })],
+            uri: crate::test_util::test_uri("/test/pom.xml"),
+        };
+
+        let hints_while_loading = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            crate::LoadingState::Loading,
+            &config,
+            &formatter,
+        );
+        assert!(
+            hints_while_loading.is_empty(),
+            "must not flash a Loading… hint for a dependency with no version_requirement"
+        );
+
+        let hints_loaded = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+        assert!(hints_loaded.is_empty());
+    }
+
+    /// Critic follow-up (M1, second round) to #1161: the `version_requirement().is_none()`
+    /// skip must be checked AFTER `resolved_version` is computed, and must not fire when a
+    /// lockfile-derived `resolved_version` is present even without a `version_requirement` —
+    /// this is the #483 I5/SEC-2 guarantee ("never discard a purely-local, lockfile-derived
+    /// `resolved_version`") applied to a dependency shape #1161 introduced. Uses the offline,
+    /// no-`latest`-cached path so a hint renders purely from `resolved_version`.
+    #[test]
+    fn test_generate_inlay_hints_shows_resolved_version_hint_despite_no_requirement() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: true,
+        };
+
+        let parse_result = MockMixedParseResult {
+            deps: vec![Box::new(MockNoRequirementDep {
+                name: "com.example:foo".into(),
+                name_range: Range::new(Position::new(4, 18), Position::new(4, 21)).into(),
+                version_range: Range::new(Position::new(5, 15), Position::new(5, 15)).into(),
+            })],
+            uri: crate::test_util::test_uri("/test/pom.xml"),
+        };
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("com.example:foo".into(), "1.2.3".into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&HashMap::new(), &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(
+            hints.len(),
+            1,
+            "resolved_version alone must still produce a hint"
+        );
+        match &hints[0].label {
+            InlayHintLabel::String(text) => assert_eq!(text, "📴 1.2.3"),
+            _ => panic!("expected string label"),
+        }
+    }
+
+    /// #1161 M1 code-review follow-up (second round): a REAL, non-empty `version_range()`
+    /// with no `version_requirement()` — Gradle's version-catalog `version.ref` pointing at a
+    /// dangling/rich-version alias — must still show the transient "Loading…" hint while
+    /// `versions` is being fetched, exactly as it did before #1161 (this shape's
+    /// `version_range()` alone gated inlay hints then, with no requirement check at all). A
+    /// bare `version_requirement().is_none()` skip (the M1 fix's first attempt) would have
+    /// suppressed this legitimate Gradle case identically to Maven's genuinely degenerate one.
+    #[test]
+    fn test_generate_inlay_hints_shows_loading_hint_for_non_empty_range_with_no_requirement() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockMixedParseResult {
+            deps: vec![Box::new(MockNoRequirementDep {
+                name: "com.example:guava".into(),
+                name_range: Range::new(Position::new(1, 0), Position::new(1, 5)).into(),
+                version_range: Range::new(Position::new(4, 40), Position::new(4, 45)).into(),
+            })],
+            uri: crate::test_util::test_uri("/test/libs.versions.toml"),
+        };
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            crate::LoadingState::Loading,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(
+            hints.len(),
+            1,
+            "must still show the Loading… hint for a real, non-empty version_range"
+        );
+        match &hints[0].label {
+            InlayHintLabel::String(text) => assert_eq!(text, "⏳"),
+            _ => panic!("expected string label"),
+        }
+    }
 
     #[test]
     fn test_inlay_hint_exact_version_shows_update_needed() {

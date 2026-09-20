@@ -54,6 +54,14 @@ struct DepAccum {
     version: Option<String>,
     version_start: u64,
     version_end: u64,
+    /// Byte offset right after `<version>`'s opening tag, captured unconditionally on
+    /// `Start` (independent of whether a `Text` event ever follows) — quick-xml's reader
+    /// (`trim_text(true)`) emits no `Text` event at all for an empty or whitespace-only
+    /// `<version></version>`, so this is the only position captured for that shape (#1161).
+    version_open_pos: Option<u64>,
+    /// Buffer position captured before reading the `End` event for `</version>`, set only
+    /// when no `Text` event set `version` — see `version_open_pos`.
+    version_close_pos: Option<u64>,
     scope: Option<String>,
 }
 
@@ -124,6 +132,11 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                     }
                     (ParseContext::Dependency | ParseContext::Plugin, field) => {
                         current_tag = Some(field.to_string());
+                        if field == "version"
+                            && let Some(dep) = current_dep.as_mut()
+                        {
+                            dep.version_open_pos = Some(reader.buffer_position());
+                        }
                     }
                     (ParseContext::Root, tag @ ("version" | "groupId" | "artifactId")) => {
                         root_tag = Some(tag.to_string());
@@ -179,6 +192,27 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                     properties.insert(prop_key, text);
                 }
             }
+            Event::Empty(ref e) => {
+                // A self-closing `<version/>` never fires `Start`+`End` — quick-xml emits a
+                // single `Empty` event for it instead — so without this arm it fell through
+                // the wildcard `_ => {}` below and `version_open_pos`/`version_close_pos`
+                // were never captured, reproducing #1161's original symptom verbatim for
+                // this manifest shape (S1 critic/tester follow-up). There is no separate
+                // open/close position for a self-closing tag, so both are set to the same
+                // "right after this tag" offset, matching `<version></version>`'s and
+                // `<version>   </version>`'s treatment as "an empty, present version" rather
+                // than "no version tag at all".
+                let tag = e.local_name().as_ref().to_string();
+                let ctx = context_stack.last().cloned().unwrap_or(ParseContext::Root);
+                if tag == "version"
+                    && matches!(ctx, ParseContext::Dependency | ParseContext::Plugin)
+                    && let Some(dep) = current_dep.as_mut()
+                {
+                    let p = reader.buffer_position();
+                    dep.version_open_pos = Some(p);
+                    dep.version_close_pos = Some(p);
+                }
+            }
             Event::End(ref e) => {
                 let tag = e.local_name().as_ref().to_string();
                 let ctx = context_stack.last().cloned().unwrap_or(ParseContext::Root);
@@ -200,6 +234,14 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                     | (ParseContext::Plugins, "plugins")
                     | (ParseContext::Properties, "properties") => {
                         context_stack.pop();
+                    }
+                    (ParseContext::Dependency | ParseContext::Plugin, "version") => {
+                        if let Some(dep) = current_dep.as_mut()
+                            && dep.version.is_none()
+                        {
+                            dep.version_close_pos = Some(pos);
+                        }
+                        current_tag = None;
                     }
                     (ParseContext::Dependency | ParseContext::Plugin, _) => {
                         current_tag = None;
@@ -239,15 +281,26 @@ fn finalize_dep(
         &artifact_id,
     );
 
-    let version_range = dep.version.as_ref().map(|v| {
-        text_range(
+    let version_range = if let Some(v) = dep.version.as_ref() {
+        Some(text_range(
             content,
             line_table,
             dep.version_start as usize,
             dep.version_end as usize,
             v,
-        )
-    });
+        ))
+    } else if let (Some(open), Some(close)) = (dep.version_open_pos, dep.version_close_pos) {
+        // `<version></version>` (or whitespace-only content quick-xml elides entirely under
+        // `trim_text(true)`) — `text_range` bails out on empty text since it has nothing to
+        // search for, so build the (possibly zero-width) span directly from the tag's own
+        // boundaries instead (#1161). `version_req` below deliberately stays `None`: there is
+        // still no literal text to report as a requirement, only a trackable position.
+        let start = content.floor_char_boundary(open as usize);
+        let end = content.floor_char_boundary((close as usize).max(open as usize));
+        Some(byte_span_to_range(content, line_table, start, end))
+    } else {
+        None
+    };
 
     let scope = dep
         .scope
@@ -482,6 +535,96 @@ mod tests {
         let result = parse_pom_xml(xml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert!(result.dependencies[0].version_req.is_none());
+    }
+
+    // #1161: an empty `<version></version>` tag must still resolve a trackable, zero-width
+    // `version_range` for completion to anchor on, while `version_req` stays `None` — same as
+    // `test_parse_no_version` above. code_actions/code_lenses/most diagnostics rules already
+    // gate on `version_req` being `Some`, unaffected either way; hover/inlay-hints/the
+    // remaining diagnostics rules (deprecation, vulnerability, in-use-yanked) matched or
+    // anchored on `version_range` alone and needed their own `version_req`-aware guard —
+    // see `deps_core::lsp_helpers::{hover, inlay_hints, diagnostics::version_anchor_range}`
+    // (#1161 M1 critic follow-up).
+    #[test]
+    fn test_parse_empty_version_tag_sets_zero_width_range_but_no_requirement() {
+        let xml = r"<project>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>foo</artifactId>
+      <version></version>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert!(dep.version_req.is_none());
+        let range = dep
+            .version_range
+            .expect("empty tag must still yield a trackable range");
+        assert_eq!(
+            range.start, range.end,
+            "empty tag content must be zero-width"
+        );
+        let line = xml.lines().nth(range.start.line as usize).unwrap();
+        let expected_character = u32::try_from("      <version>".chars().count()).unwrap();
+        assert_eq!(
+            range.start.character, expected_character,
+            "range must sit right after the opening tag on {line:?}, not at (0, 0)"
+        );
+    }
+
+    // #1161 follow-up: whitespace-only content between the tags must behave identically to
+    // fully empty, since quick-xml elides an all-whitespace text node under `trim_text(true)`
+    // the same way it elides a genuinely empty one.
+    #[test]
+    fn test_parse_whitespace_only_version_tag_sets_zero_width_range_but_no_requirement() {
+        let xml = "<project>\n  <dependencies>\n    <dependency>\n      <groupId>com.example</groupId>\n      <artifactId>foo</artifactId>\n      <version>   </version>\n    </dependency>\n  </dependencies>\n</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert!(dep.version_req.is_none());
+        let range = dep
+            .version_range
+            .expect("whitespace-only tag must still yield a trackable range");
+        assert_eq!(
+            range.start, range.end,
+            "whitespace-only tag content must be zero-width"
+        );
+        // Empirically verified (quick-xml 0.42.0): a whitespace-only text node between tags
+        // is elided entirely under `trim_text(true)` — no `Event::Text` fires at all, so this
+        // takes the exact same `version_open_pos`/`version_close_pos` fallback path as a fully
+        // empty tag, landing right after `<version>` rather than at a bogus `(0, 0)` (the
+        // position `text_range` would produce if an empty-string `Event::Text` ever did fire
+        // here and got routed through the `Some(v)` branch instead).
+        let expected_character = u32::try_from("      <version>".chars().count()).unwrap();
+        assert_eq!(range.start.character, expected_character);
+        assert_eq!(range.start.line, 5);
+    }
+
+    // S1 (critic/tester follow-up to #1161): a self-closing `<version/>` fires a single
+    // quick-xml `Event::Empty`, never `Start`+`End` — without a dedicated arm for it, this
+    // reproduces the original #1161 symptom (`version_range = None`) verbatim, since neither
+    // `version_open_pos` nor `version_close_pos` would ever be set.
+    #[test]
+    fn test_parse_self_closing_version_tag_sets_zero_width_range_but_no_requirement() {
+        let xml = "<project>\n  <dependencies>\n    <dependency>\n      <groupId>com.example</groupId>\n      <artifactId>foo</artifactId>\n      <version/>\n    </dependency>\n  </dependencies>\n</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert!(dep.version_req.is_none());
+        let range = dep
+            .version_range
+            .expect("self-closing tag must still yield a trackable range");
+        assert_eq!(
+            range.start, range.end,
+            "self-closing tag content must be zero-width"
+        );
+        assert_eq!(range.start.line, 5);
     }
 
     #[test]
