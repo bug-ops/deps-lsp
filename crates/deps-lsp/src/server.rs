@@ -333,35 +333,17 @@ impl Backend {
         self.state.spawn_refresh_requests(&self.client);
     }
 
-    /// Reacts to a change in one of `ecosystem_id`'s
-    /// [`deps_core::Ecosystem::watched_config_filenames`] (issue #590) by fully re-parsing
-    /// every currently open document of that ecosystem.
-    ///
-    /// Unlike [`Self::handle_lockfile_change`], this cannot get away with refreshing only
-    /// `resolved_versions` and re-running diagnostics on the existing `ParseResult`: a
-    /// watched config file (e.g. npm's `pnpm-workspace.yaml` catalog, `.npmrc` registry
-    /// override) is resolved *inside* `parse_manifest` itself, so its effect is already
-    /// baked into the cached `ParseResult` and only a real re-parse picks up a change. Every
-    /// open document of the ecosystem is reparsed rather than only those under the changed
-    /// file's directory tree — the per-document "which config file did this resolve against"
-    /// walk each ecosystem does internally (e.g. `deps_npm::catalog::find_workspace_file`)
-    /// isn't exposed through the [`deps_core::Ecosystem`] trait the way
-    /// [`deps_core::lockfile::LockFileProvider::locate_lockfile`] is for lock files, and
-    /// re-parsing an already-open document is cheap.
-    ///
-    /// A thin wrapper around [`crate::document::reparse::reparse_open_documents`] (issue
-    /// #592), the same version-guarded, sequential-await driver a live-reloaded
-    /// `DepsConfig` setting change now also uses — awaited directly here rather than
-    /// spawned, since this is triggered by a `didChangeWatchedFiles` notification handler
-    /// that already returns promptly, unlike `did_change_configuration`'s debounced path.
-    /// `RefetchPolicy::Diff` matches this path's pre-#592 behavior exactly: only
-    /// added/version-changed dependencies are re-fetched, since a watched-config change
-    /// affects how a manifest *parses*, not the routing decisions a forced full refetch
-    /// exists to correct.
-    async fn handle_watched_config_change(&self, ecosystem_id: &'static str) {
+    /// Fully reparses every open document of `ecosystem_ids` (issue #590/#1232) under
+    /// `refetch` — callers pass `AllDependencies` for a routing-only watched-config change
+    /// (e.g. `.npmrc`), since a plain diff would treat it as a no-op.
+    async fn handle_watched_config_change(
+        &self,
+        ecosystem_ids: Vec<&'static str>,
+        refetch: crate::document::RefetchPolicy,
+    ) {
         crate::document::reparse::reparse_open_documents(
-            crate::config::ReparseScope::Ecosystems(vec![ecosystem_id]),
-            crate::document::RefetchPolicy::Diff,
+            crate::config::ReparseScope::Ecosystems(ecosystem_ids),
+            refetch,
             "watched config file change",
             Arc::clone(&self.state),
             self.client.clone(),
@@ -914,17 +896,30 @@ impl LanguageServer for Backend {
                 continue;
             }
 
-            if let Some(ecosystem) = self.state.ecosystem_registry.for_watched_config(filename) {
+            let ecosystems = self.state.ecosystem_registry.for_watched_config(filename);
+            if !ecosystems.is_empty() {
+                let ecosystem_ids: Vec<&'static str> = ecosystems.iter().map(|e| e.id()).collect();
+                // A routing-only change (e.g. `.npmrc`) needs a full refetch, not a diff (issue #1232 S1).
+                let refetch = if ecosystems
+                    .iter()
+                    .any(|e| e.routing_affecting_watched_configs().contains(&filename))
+                {
+                    crate::document::RefetchPolicy::AllDependencies
+                } else {
+                    crate::document::RefetchPolicy::Diff
+                };
                 tracing::info!(
-                    "Watched config file changed: {} (ecosystem: {})",
+                    "Watched config file changed: {} (ecosystems: {:?}, refetch: {:?})",
                     filename,
-                    ecosystem.id()
+                    ecosystem_ids,
+                    refetch
                 );
 
                 // No cache invalidation here (unlike the lock-file branch above): every
                 // `MtimeFileCache`-backed config cache invalidates itself by mtime on its
                 // next `get_or_parse`, which the reparse below triggers.
-                self.handle_watched_config_change(ecosystem.id()).await;
+                self.handle_watched_config_change(ecosystem_ids, refetch)
+                    .await;
                 continue;
             }
 
@@ -1755,6 +1750,269 @@ mod tests {
             after.value.contains("^18.3.0"),
             "watched config file change did not trigger a reparse of the open document: {}",
             after.value
+        );
+    }
+
+    /// Issue #1232 end-to-end: a single `.npmrc` `didChangeWatchedFiles` event must reparse
+    /// EVERY open document whose ecosystem watches `.npmrc` — not just whichever ecosystem a
+    /// single-winner `for_watched_config` lookup happened to resolve to
+    /// (`EcosystemRegistry::for_watched_config` now returns a `Vec`, see
+    /// `ecosystem_registry.rs::test_for_watched_config_fans_out_to_all_matching_ecosystems`
+    /// for the routing-layer proof). Opens both an npm `package.json` and a Deno `deno.json`
+    /// referencing the same scoped package (Deno via an `npm:` specifier, which resolves
+    /// `.npmrc` through the same `deps_npm::config` machinery `NpmEcosystem` uses), starts
+    /// both unresolvable (`.npmrc` names an invalid registry URL, so hover has no live
+    /// version data), then edits `.npmrc` to add a valid alternate-registry index and fires
+    /// one `.npmrc` change event. Both documents' hover must pick up the live version list —
+    /// proving both ecosystems' open documents were reparsed from that single event, not just
+    /// one.
+    #[cfg(all(feature = "npm", feature = "deno"))]
+    #[tokio::test]
+    async fn test_watched_config_change_reparses_all_matching_ecosystems_1232() {
+        // Held per fs_probe::snapshot_guard's doc: did_open routes through npm's and deno's
+        // parse_manifest, both of which touch fs_probe, and this test shares a binary with
+        // other diffing/fs_probe tests.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use tower_lsp_server::ls_types::{
+            FileChangeType, FileEvent, HoverContents, Position, TextDocumentIdentifier,
+            TextDocumentItem, TextDocumentPositionParams,
+        };
+
+        let mut alt_server = mockito::Server::new_async().await;
+        let alt_mock = alt_server
+            .mock("GET", "/@acme-corp/secretpkg")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}, "2.0.0": {}}}"#)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let npmrc_path = temp_dir.path().join(".npmrc");
+        std::fs::write(&npmrc_path, "@acme-corp:registry=not-a-valid-url\n").unwrap();
+
+        let npm_manifest_path = temp_dir.path().join("package.json");
+        let npm_content = r#"{"dependencies": {"@acme-corp/secretpkg": "^1.0.0"}}"#;
+        std::fs::write(&npm_manifest_path, npm_content).unwrap();
+        let npm_uri = Uri::from_file_path(&npm_manifest_path).unwrap();
+
+        let deno_manifest_path = temp_dir.path().join("deno.json");
+        let deno_content = r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#;
+        std::fs::write(&deno_manifest_path, deno_content).unwrap();
+        let deno_uri = Uri::from_file_path(&deno_manifest_path).unwrap();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        // Workspace-declared registries must be allowed for the `.npmrc` alternate index
+        // (a loopback mockito URL) to be resolved at all.
+        backend
+            .did_change_configuration(DidChangeConfigurationParams {
+                settings: serde_json::json!({ "registries": { "workspace_registries": "all" } }),
+            })
+            .await;
+
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: npm_uri.clone(),
+                    language_id: "json".to_string(),
+                    version: 1,
+                    text: npm_content.to_string(),
+                },
+            })
+            .await;
+        backend
+            .did_open(DidOpenTextDocumentParams {
+                text_document: TextDocumentItem {
+                    uri: deno_uri.clone(),
+                    language_id: "json".to_string(),
+                    version: 1,
+                    text: deno_content.to_string(),
+                },
+            })
+            .await;
+
+        let hover_params = |uri: Uri, character: u32| HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri },
+                position: Position::new(0, character),
+            },
+            work_done_progress_params: Default::default(),
+        };
+        // Character offsets land inside each manifest's `@acme-corp/secretpkg` name range.
+        let npm_before = backend
+            .hover(hover_params(npm_uri.clone(), 25))
+            .await
+            .unwrap()
+            .expect("npm hover must fire");
+        let HoverContents::Markup(npm_before) = npm_before.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !npm_before.value.contains("2.0.0"),
+            "npm hover must have no live version data before .npmrc resolves an index: {}",
+            npm_before.value
+        );
+
+        let deno_before = backend
+            .hover(hover_params(deno_uri.clone(), 35))
+            .await
+            .unwrap()
+            .expect("deno hover must fire");
+        let HoverContents::Markup(deno_before) = deno_before.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            !deno_before.value.contains("2.0.0"),
+            "deno hover must have no live version data before .npmrc resolves an index: {}",
+            deno_before.value
+        );
+
+        // Ensure a distinguishable mtime on filesystems with coarse timestamp resolution
+        // (matches `mtime_cache::tests::forward_mtime_bump_invalidates`).
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::write(
+            &npmrc_path,
+            format!("@acme-corp:registry={}\n", alt_server.url()),
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&npmrc_path)
+            .unwrap()
+            .set_modified(future)
+            .unwrap();
+
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: Uri::from_file_path(&npmrc_path).unwrap(),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        let npm_after = backend
+            .hover(hover_params(npm_uri.clone(), 25))
+            .await
+            .unwrap()
+            .expect("npm hover must still fire");
+        let HoverContents::Markup(npm_after) = npm_after.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            npm_after.value.contains("2.0.0"),
+            "a single .npmrc change did not reparse the open npm document: {}",
+            npm_after.value
+        );
+
+        let deno_after = backend
+            .hover(hover_params(deno_uri.clone(), 35))
+            .await
+            .unwrap()
+            .expect("deno hover must still fire");
+        let HoverContents::Markup(deno_after) = deno_after.contents else {
+            panic!("expected markup hover contents");
+        };
+        assert!(
+            deno_after.value.contains("2.0.0"),
+            "a single .npmrc change did not reparse the open deno document \
+             (issue #1232 regression — for_watched_config must fan out to every matching \
+             ecosystem, not just npm): {}",
+            deno_after.value
+        );
+
+        alt_mock.assert_async().await;
+    }
+
+    /// Issue #1232 S1 regression: a `.npmrc` change that alters registry *routing* only
+    /// (same dependency name/version-requirement, different registry) must still force a
+    /// refetch — it must not be silently skipped by `RefetchPolicy::Diff`'s empty-diff
+    /// short-circuit. This reproduces the bug critic proved live (an open `deno.json`
+    /// resolved against one registry kept serving that same data forever after an `.npmrc`
+    /// scope override redirected `@acme-corp` to a different registry, because the
+    /// dependency set itself never changed so `DependencyDiff` stayed empty).
+    ///
+    /// Seeds a `deno.json` document directly with `cached_versions` as if it were already
+    /// successfully resolved under the *old* routing (mirroring
+    /// `did_change_configuration_tests::test_rapid_config_changes_coalesce_into_a_union_scope_reparse`'s
+    /// pattern for the same `RefetchPolicy::AllDependencies` bug class), then fires a single
+    /// `.npmrc` watched-file change. Under the pre-fix unconditional `RefetchPolicy::Diff`,
+    /// the dependency name/version-requirement here never changes, so the diff is empty, the
+    /// fetch (and its cache drop) never runs, and `cached_versions` would stay stale forever.
+    /// Under the fix, `DenoEcosystem::routing_affecting_watched_configs()` lists `.npmrc`, so
+    /// the reparse uses `RefetchPolicy::AllDependencies`, which drops `cached_versions` unconditionally before
+    /// attempting the (network, expected-to-fail in this sandboxed test) fetch — an empty
+    /// map is proof the forced refetch actually ran, the same observation technique
+    /// `test_rapid_config_changes_coalesce_into_a_union_scope_reparse` already uses.
+    #[cfg(feature = "deno")]
+    #[tokio::test]
+    async fn test_npmrc_routing_only_change_forces_refetch_1232_s1() {
+        // Held per fs_probe::snapshot_guard's doc: deno's parse_manifest touches fs_probe,
+        // and this test shares a binary with other diffing/fs_probe tests.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::{EcosystemId, PackageName, PackageVersions};
+        use tower_lsp_server::ls_types::{FileChangeType, FileEvent};
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let deno_url = deps_core::test_util::test_uri("/test/deno.json");
+        let deno_uri = crate::lsp_types_interop::to_lsp_uri(&deno_url);
+        let deno_ecosystem = backend.state.ecosystem_registry.get("deno").unwrap();
+        let deno_content =
+            r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#.to_string();
+        let deno_parse = deno_ecosystem
+            .parse_manifest(&deno_content, &deno_url)
+            .await
+            .unwrap();
+        let mut deno_doc =
+            DocumentState::new_from_parse_result(EcosystemId::Deno, deno_content, deno_parse);
+        deno_doc.set_version(Some(1));
+        // Simulates a document already successfully resolved under the OLD `.npmrc`
+        // routing: the dependency name/version-requirement is identical before and after
+        // the `.npmrc` change fired below, so `DependencyDiff` sees nothing added or
+        // version-changed — the routing-only case `RefetchPolicy::Diff` cannot detect.
+        deno_doc.update_cached_versions(HashMap::from([(
+            PackageName::new("@acme-corp/secretpkg"),
+            PackageVersions::latest_only("1.0.0"),
+        )]));
+        backend.state.update_document(deno_uri.clone(), deno_doc);
+
+        let npmrc_url = deps_core::test_util::test_uri("/test/.npmrc");
+        backend
+            .did_change_watched_files(DidChangeWatchedFilesParams {
+                changes: vec![FileEvent {
+                    uri: crate::lsp_types_interop::to_lsp_uri(&npmrc_url),
+                    typ: FileChangeType::CHANGED,
+                }],
+            })
+            .await;
+
+        // The forced refetch runs on a spawned background task (`spawn_background_task`),
+        // not synchronously inside the awaited `did_change_watched_files` call above, so
+        // polling with a bounded timeout is required rather than a single immediate check.
+        let cleared = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if backend
+                    .state
+                    .get_document(&deno_uri)
+                    .is_some_and(|d| d.cached_versions.is_empty())
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        assert!(
+            cleared.is_ok(),
+            "a routing-only `.npmrc` change did not force a refetch: stale cached_versions \
+             from the old registry survived (RefetchPolicy must be AllDependencies for \
+             `.npmrc`, not Diff, since the dependency set itself never changed)"
         );
     }
 

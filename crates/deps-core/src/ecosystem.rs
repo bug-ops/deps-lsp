@@ -936,6 +936,22 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         &[]
     }
 
+    /// Subset of [`Self::watched_config_filenames`] whose change can alter dependency
+    /// *routing* (which registry a dependency resolves through) without changing the
+    /// dependency names or version requirements themselves — a caller reacting to a change
+    /// in one of these filenames must force a full re-fetch rather than diff against the
+    /// previous parse result, since a routing-only edit would otherwise look like a no-op
+    /// (issue #1232).
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns an empty slice: most watched configs (e.g. npm's `pnpm-workspace.yaml`
+    /// catalog) rewrite a dependency's version requirement directly, which an ordinary diff
+    /// against the parse result already detects.
+    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
+        &[]
+    }
+
     /// Parse a manifest file and return parsed result
     ///
     /// # Arguments

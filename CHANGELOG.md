@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-npm, deps-bundler, deps-deno, deps-maven, deps-nuget, deps-dart, deps-composer**: `Registry::search` is renamed to `search_raw`, with a new inherent `search` gate on `dyn Registry` (which an implementor cannot override) that rejects a credential- or query-bearing search string before it ever reaches a registry, and redacts the 9 concrete registries' own `search` tracing spans (resolves #1215) (#1219)
 
 ### Fixed
+- **deps-core, deps-deno, deps-npm, deps-lsp**: an `.npmrc` change now reparses every ecosystem that watches it (not just one) and forces a full refetch instead of a silent no-op diff, so an open `deno.json`/`package.json` document picks up the new registry routing (resolves #1232) (#1234)
 - **deps-deno**: `npm:`-scope imports classified `AlternateRegistry` via `.npmrc` are now actually fetched through the resolved registry instead of being silently dropped from the fetch queue, matching `package.json`'s behavior for the identical entry (resolves #1227) (#1231)
 - **deps-npm**: a malformed `.npmrc` line (missing `=`) no longer logs its raw content, closing a credential leak when the line is a typo'd auth-shaped entry; the warning now names only the file path and line number (resolves #1229) (#1233)
 - **deps-composer**: a bare (no `only` filter) repository entry now cross-checks `composer.lock`'s `source.type` to classify a matching dependency as `Path` (never `Git`) instead of `Registry` (resolves #1212) (#1221)

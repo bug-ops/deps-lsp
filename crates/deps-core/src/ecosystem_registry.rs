@@ -445,9 +445,12 @@ impl EcosystemRegistry {
         patterns
     }
 
-    /// Get ecosystem for a [`Ecosystem::watched_config_filenames`] entry — mirrors
-    /// [`Self::for_lockfile`] exactly, reusing the same exact/single-`*`-wildcard
-    /// matching, but scanning the *config* list instead of the lockfile one.
+    /// Get *every* ecosystem matching a [`Ecosystem::watched_config_filenames`] entry —
+    /// mirrors [`Self::for_lockfile`]'s exact/single-`*`-wildcard matching, but scanning the
+    /// *config* list instead of the lockfile one, and returning all matches rather than the
+    /// first: more than one ecosystem can watch the same config filename (e.g. both npm and
+    /// Deno resolve `.npmrc`), and a single-winner lookup would leave the other silently
+    /// unreparsed on save (#1232).
     ///
     /// # Examples
     ///
@@ -457,11 +460,12 @@ impl EcosystemRegistry {
     /// let registry = EcosystemRegistry::new();
     /// // registry.register(npm_ecosystem);
     ///
-    /// if let Some(ecosystem) = registry.for_watched_config("pnpm-workspace.yaml") {
-    ///     println!("pnpm-workspace.yaml handled by: {}", ecosystem.display_name());
+    /// for ecosystem in registry.for_watched_config(".npmrc") {
+    ///     println!(".npmrc handled by: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn for_watched_config(&self, filename: &str) -> Option<Arc<dyn Ecosystem>> {
+    pub fn for_watched_config(&self, filename: &str) -> Vec<Arc<dyn Ecosystem>> {
+        let mut matched = Vec::new();
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
             let matches = ecosystem
@@ -469,14 +473,20 @@ impl EcosystemRegistry {
                 .iter()
                 .any(|pattern| lockfile_pattern_matches(pattern, filename));
             if matches {
-                return Some(Arc::clone(ecosystem));
+                matched.push(Arc::clone(ecosystem));
             }
         }
-        None
+        matched
     }
 
     /// Get all [`Ecosystem::watched_config_filenames`] glob patterns for file watching —
     /// mirrors [`Self::all_lockfile_patterns`], scanning the *config* list instead.
+    ///
+    /// Deduplicated (issue #1232 M1): more than one ecosystem can watch the same config
+    /// filename (e.g. both npm and Deno resolve `.npmrc`), and without a dedup here the same
+    /// `**/.npmrc` pattern would be registered as two separate
+    /// `tower_lsp_server::ls_types::FileSystemWatcher`s with the LSP client, doubling every
+    /// `didChangeWatchedFiles` event (and the reparse work it triggers) for a single save.
     ///
     /// # Examples
     ///
@@ -492,11 +502,15 @@ impl EcosystemRegistry {
     /// }
     /// ```
     pub fn all_watched_config_patterns(&self) -> Vec<String> {
-        let mut patterns = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut patterns: Vec<String> = Vec::new();
         for entry in self.ecosystems.iter() {
             let ecosystem = entry.value();
             for filename in ecosystem.watched_config_filenames() {
-                patterns.push(format!("**/{}", filename));
+                let pattern = format!("**/{filename}");
+                if seen.insert(pattern.clone()) {
+                    patterns.push(pattern);
+                }
             }
         }
         patterns
@@ -1471,7 +1485,7 @@ mod tests {
     #[test]
     fn test_for_watched_config() {
         let registry = EcosystemRegistry::new();
-        let ecosystem = Arc::new(MockEcosystem {
+        let npm = Arc::new(MockEcosystem {
             id: "npm",
             display_name: "npm",
             filenames: &["package.json"],
@@ -1479,16 +1493,56 @@ mod tests {
             watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
         });
 
-        registry.register(ecosystem);
+        registry.register(npm);
 
-        let retrieved = registry.for_watched_config("pnpm-workspace.yaml").unwrap();
-        assert_eq!(retrieved.id(), "npm");
-        let retrieved = registry.for_watched_config(".npmrc").unwrap();
-        assert_eq!(retrieved.id(), "npm");
+        let retrieved = registry.for_watched_config("pnpm-workspace.yaml");
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].id(), "npm");
+        let retrieved = registry.for_watched_config(".npmrc");
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].id(), "npm");
 
         // A lockfile is not a watched config, and vice versa.
-        assert!(registry.for_watched_config("package-lock.json").is_none());
-        assert!(registry.for_watched_config("unknown.yaml").is_none());
+        assert!(registry.for_watched_config("package-lock.json").is_empty());
+        assert!(registry.for_watched_config("unknown.yaml").is_empty());
+    }
+
+    #[test]
+    fn test_for_watched_config_fans_out_to_all_matching_ecosystems() {
+        // Regression test for #1232: more than one ecosystem can watch the same config
+        // filename (npm and Deno both resolve `.npmrc`), so a single-winner lookup would
+        // silently skip reparsing one of them on save.
+        let registry = EcosystemRegistry::new();
+        let npm = Arc::new(MockEcosystem {
+            id: "npm",
+            display_name: "npm",
+            filenames: &["package.json"],
+            lockfiles: &["package-lock.json"],
+            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+        });
+        let deno = Arc::new(MockEcosystem {
+            id: "deno",
+            display_name: "Deno",
+            filenames: &["deno.json", "deno.jsonc"],
+            lockfiles: &[],
+            watched_configs: &[".npmrc"],
+        });
+
+        registry.register(npm);
+        registry.register(deno);
+
+        let mut ids: Vec<&str> = registry
+            .for_watched_config(".npmrc")
+            .iter()
+            .map(|e| e.id())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["deno", "npm"]);
+
+        // pnpm-workspace.yaml is still npm-only.
+        let retrieved = registry.for_watched_config("pnpm-workspace.yaml");
+        assert_eq!(retrieved.len(), 1);
+        assert_eq!(retrieved[0].id(), "npm");
     }
 
     #[test]
@@ -1520,6 +1574,39 @@ mod tests {
     fn test_all_watched_config_patterns_empty() {
         let registry = EcosystemRegistry::new();
         assert!(registry.all_watched_config_patterns().is_empty());
+    }
+
+    #[test]
+    fn test_all_watched_config_patterns_dedups_shared_filename() {
+        // Regression test for #1232 M1: npm and Deno both watch `.npmrc`, and without a
+        // dedup the pattern (and the LSP-client file watcher registered from it) would be
+        // duplicated, doubling reparse work per save.
+        let registry = EcosystemRegistry::new();
+        let npm = Arc::new(MockEcosystem {
+            id: "npm",
+            display_name: "npm",
+            filenames: &["package.json"],
+            lockfiles: &["package-lock.json"],
+            watched_configs: &["pnpm-workspace.yaml", ".npmrc"],
+        });
+        let deno = Arc::new(MockEcosystem {
+            id: "deno",
+            display_name: "Deno",
+            filenames: &["deno.json", "deno.jsonc"],
+            lockfiles: &[],
+            watched_configs: &[".npmrc"],
+        });
+
+        registry.register(npm);
+        registry.register(deno);
+
+        let patterns = registry.all_watched_config_patterns();
+        assert_eq!(
+            patterns.iter().filter(|p| *p == "**/.npmrc").count(),
+            1,
+            "**/.npmrc must be registered only once: {patterns:?}"
+        );
+        assert!(patterns.contains(&"**/pnpm-workspace.yaml".to_string()));
     }
 
     #[test]

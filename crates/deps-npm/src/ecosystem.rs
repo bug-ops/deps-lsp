@@ -164,6 +164,10 @@ impl Ecosystem for NpmEcosystem {
         &["pnpm-workspace.yaml", ".npmrc"]
     }
 
+    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
+        &[".npmrc"]
+    }
+
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
