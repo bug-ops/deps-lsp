@@ -130,9 +130,35 @@ const MAX_DIAGNOSTIC_NAME_CHARS: usize = 128;
 /// ```
 #[must_use]
 pub fn redact_name_for_diagnostic(name: &PackageName) -> String {
-    let redacted = redact_declaration_key(name.as_str());
-    let sanitized = sanitize_invisible(&redacted);
-    truncate_for_diagnostic(&sanitized, MAX_DIAGNOSTIC_NAME_CHARS).into_owned()
+    sanitize_and_truncate_for_diagnostic(
+        &redact_declaration_key(name.as_str()),
+        MAX_DIAGNOSTIC_NAME_CHARS,
+    )
+}
+
+/// Sanitizes then truncates `value` for a client-visible diagnostic message,
+/// `CodeAction` title, or similar single-line surface (#1252).
+///
+/// For a plain `&str` sink that is not a [`PackageName`] (e.g. a mutable-ref tag, a
+/// host string) and so cannot go through [`redact_name_for_diagnostic`] — this applies
+/// the same [`sanitize_invisible`]-then-[`truncate_for_diagnostic`] tail of that
+/// pipeline without the [`redact_declaration_key`] step, which only makes sense for a
+/// name-shaped, potentially credential-bearing value.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic;
+///
+/// assert_eq!(sanitize_and_truncate_for_diagnostic("v1.0.0", 128), "v1.0.0");
+/// assert_eq!(
+///     sanitize_and_truncate_for_diagnostic("bidi\u{202E}tag", 128),
+///     "bidi tag"
+/// );
+/// ```
+#[must_use]
+pub fn sanitize_and_truncate_for_diagnostic(value: &str, max_chars: usize) -> String {
+    truncate_for_diagnostic(&sanitize_invisible(value), max_chars).into_owned()
 }
 
 /// Stable [`Diagnostic::code`] set on the package-level deprecation diagnostic (issue #205).
