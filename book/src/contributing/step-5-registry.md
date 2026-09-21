@@ -76,7 +76,9 @@ impl deps_core::Registry for {Ecosystem}Registry {
         })
     }
 
-    fn search<'a>(
+    // Named `search_raw`, not `search`: the inherent `Registry::search` wraps this with a
+    // credential-bearing-query gate that a trait-level default could be silently overridden past.
+    fn search_raw<'a>(
         &'a self,
         _query: &'a str,
         _limit: usize,

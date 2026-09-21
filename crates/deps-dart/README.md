@@ -24,7 +24,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-dart = "1.1"
+deps-dart = "1.2"
 ```
 
 > [!IMPORTANT]

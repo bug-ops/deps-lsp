@@ -6,7 +6,7 @@ tags:
   - plan
   - deps-lsp
 created: 2026-09-20
-status: draft
+status: shipped
 related:
   - "[[spec]]"
   - "[[constitution]]"

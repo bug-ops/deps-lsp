@@ -30,7 +30,7 @@ workspace's own adapter crates.
 
 ```toml
 [dependencies]
-deps-engine = { version = "1.0", default-features = false, features = ["cargo", "npm"] }
+deps-engine = { version = "1.2", default-features = false, features = ["cargo", "npm"] }
 ```
 
 > [!IMPORTANT]

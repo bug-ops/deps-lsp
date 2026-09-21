@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-21
+
 ### Added
 - **deps-core**: new `net_policy::redact_parse_error_for_log`/`parse_error_source` helpers, redacting a `toml_span`/`yaml-rust2` parse error before it reaches a log sink (resolves #1240) (#1241)
 - **deps-core**: new `rate_limit` module with a `RateLimitGate` mechanism shared by deps-github-actions and deps-gitlab-ci (#1218)
@@ -33,6 +35,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: bumps `taiki-e/install-action` to v2.87.17 across CI and release workflows (flagged as outdated by code scanning) (#1269)
 - **deps-pypi**: `truncate_for_log` now delegates to `deps_core::net_policy::redact_parse_error_for_log` instead of duplicating its redact-then-truncate algorithm (#1240) (#1241)
 - **deps-core, deps-npm, deps-pypi, deps-go, deps-composer, deps-swift, deps-nuget, deps-cargo, deps-dart, deps-bundler, deps-deno**: `Ecosystem::complete_version` now has a shared default implementation (backed by a new `version_operator_chars` hook), replacing ten byte-identical hand-written implementations (resolves #1223) (#1235)
+- **deps-gitlab-ci**: `register_alternate` now logs one cap-reached warning per refused route key instead of one per batch (#1218)
+- **deps-core, deps-gradle**: Gradle's quote/comment scanning migrated onto a shared `deps-core::quote_scan::ScanSyntax::Groovy` scanner instead of a crate-local implementation (resolves #1174) (#1186)
+- **deps-github-actions, deps-gitlab-ci**: static SHA-pin quickfix/hover-splice logic deduplicated into a shared `ShaPinning` trait in `deps-core::lsp_helpers::git_ref`; GitLab's live-fetch dynamic-component pin and GHA's tag-index footer remain ecosystem-local (resolves #1138) (#1177)
+- **deps-cli**: added a regression test pinning `walk_directory`'s `DotDirs::Descend` call-site wiring at hidden-ecosystem sub-roots (resolves #1165) (#1177)
+- **ci**: `crates/github-action`'s Alpine base image pinned by digest, tracked by Dependabot for security-patch bumps (resolves #1155) (#1169)
+- **deps-cli**: `walk_directory`'s positional bool triple replaced with a `WalkOptions` struct and `DotDirs` enum, closing a swap-silent transposition risk on the gitignore/symlink containment gate (resolves #1135) (#1164)
+- **ci**: `release.yml`'s top-level GITHUB_TOKEN permissions scoped to a read-only default, with `contents: write` granted per-job only where needed (resolves #1151) (#1163)
+- **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134) (#1145)
+- **ci**: `deps-lsp-check` and `docker-build-and-scan` now block `ci-success` (#1130, #1140)
 
 ### Fixed
 - **deps-core**: `Diagnostic::new`/`RelatedInformation::new` now sanitize `message` as a defense-in-depth backstop on the constructor path, on top of existing producer-side sanitization (resolves #1276) (#1279)
@@ -74,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `locate_value_span`'s empty-value quote correction now keys on the scalar's actual quote style instead of inferring it from the marker byte, fixing a false correction when a Plain/Literal/Folded empty scalar's next token happens to be a quote character; `deps-lsp`'s SHA-pin-comment completion withholding no longer falls through to a package-name registry search (resolves #1184) (#1194)
 - **deps-github-actions**: version completion is now withheld once the cursor moves past a full-SHA pin's own ref text, instead of remaining offered inside the trailing tag comment (resolves #1182) (#1185)
 - **deps-core**: `locate_value_span`'s empty-value short-circuit now applies the same opening-quote correction as the non-empty path, fixing a one-column-early `version_range` anchor for quoted empty values in deps-dart and deps-gitlab-ci (resolves #1180) (#1185)
-- **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings
+- **ci**: `scorecard.yml` and `release.yml` pin `github/codeql-action/upload-sarif` to the current `v4.38.1` digest, resolving stale-dependency code-scanning findings (#1176)
 - **deps-go**: fix trailing directive comment (`// indirect`) on a require line with a deleted version being misparsed as the version requirement (resolves #1179) (#1183)
 - **deps-gradle**: version-catalog completion now scans single- and double-quoted values as independent delimiters instead of a `"`-only parity check, fixing a wrong context on a mixed-quote-style line and an inline-table field mis-split at a comma inside another field's single-quoted value (resolves #1175) (#1186)
 - **ci**: `auto-merge.yml` scopes `contents`/`pull-requests` write permissions to the job instead of the whole workflow, and `SECURITY.md` links the GitHub Security Advisories reporting channel, resolving OpenSSF Scorecard code-scanning findings (#1172)
@@ -83,25 +94,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-maven**: version completion now triggers inside an empty `<version></version>` tag instead of being silently withheld (resolves #1161) (#1166)
 - **deps-pypi, deps-cargo, deps-composer, deps-maven, deps-gradle, deps-nuget**: version-completion's leading-operator stripping fixed for Poetry caret constraints, Cargo `*`, Composer `!=`, and Maven/Gradle/NuGet bracket-range syntax, each ecosystem's operator set now covered by a conformance test (resolves #1137) (#1170)
 - **deps-core**: Gradle/Maven version-completion's same-line fallback no longer resolves the wrong dependency when multiple dependencies share one manifest line (resolves #1146) (#1159)
-- **deps-core**: version completion now applies the `can_resolve_source` gate for every ecosystem, closing a leak where a private/non-registry dependency's name was still sent to the public registry on every keystroke (resolves #1136)
+- **deps-core**: version completion now applies the `can_resolve_source` gate for every ecosystem, closing a leak where a private/non-registry dependency's name was still sent to the public registry on every keystroke (resolves #1136) (#1145)
 - **deps-cli**: `check` now runs the tier-3 license pre-fetch (Dart, Swift, Gradle, Deno) before evaluating `license_policy`, matching `deps-lsp`'s diagnostics instead of silently missing license data for these ecosystems (resolves #1133) (#1148)
 - **deps-cli**: `check` now reports a manifest replaced by an unresolvable or non-file symlink instead of silently skipping it (#1139, resolves #1124)
 - **ci**: `crates/github-action`'s entrypoint no longer reports success on an abnormal `deps-cli` exit or an unwritable SARIF path (#1131, #1140)
 - **ci**: `crates/github-action`'s entrypoint refuses to write the SARIF file through a symlink or directory left in the scanned checkout (#1132, #1140)
 - **ci**: `deps-lsp-check` and `docker-build-and-scan` resolve `deps-cli`'s release tag via an authenticated `gh api` call before the Docker build instead of the Dockerfile's unauthenticated, cache-frozen fallback (resolves #1141, #1144)
-
-### Changed
-- **ci**: `deps-lsp-check` and `docker-build-and-scan` now block `ci-success` (#1130, #1140)
-
-### Changed
-- **deps-gitlab-ci**: `register_alternate` now logs one cap-reached warning per refused route key instead of one per batch (#1218)
-- **deps-core, deps-gradle**: Gradle's quote/comment scanning migrated onto a shared `deps-core::quote_scan::ScanSyntax::Groovy` scanner instead of a crate-local implementation (resolves #1174) (#1186)
-- **ci**: `crates/github-action`'s Alpine base image pinned by digest, tracked by Dependabot for security-patch bumps (resolves #1155) (#1169)
-- **deps-gradle, deps-maven**: version-completion dependency lookup deduplicated into a shared `deps-core` helper (resolves #1134)
-- **ci**: `release.yml`'s top-level GITHUB_TOKEN permissions scoped to a read-only default, with `contents: write` granted per-job only where needed (resolves #1151) (#1163)
-- **deps-cli**: `walk_directory`'s positional bool triple replaced with a `WalkOptions` struct and `DotDirs` enum, closing a swap-silent transposition risk on the gitignore/symlink containment gate (resolves #1135)
-- **deps-github-actions, deps-gitlab-ci**: static SHA-pin quickfix/hover-splice logic deduplicated into a shared `ShaPinning` trait in `deps-core::lsp_helpers::git_ref`; GitLab's live-fetch dynamic-component pin and GHA's tag-index footer remain ecosystem-local (resolves #1138) (#1177)
-- **deps-cli**: added a regression test pinning `walk_directory`'s `DotDirs::Descend` call-site wiring at hidden-ecosystem sub-roots (resolves #1165) (#1177)
 
 ## [1.1.0] - 2026-09-16
 
@@ -1174,7 +1172,8 @@ CI catch-net once B3 actually lands) is in effect.
 - TLS enforced via rustls
 - cargo-deny configured for vulnerability scanning
 
-[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/bug-ops/deps-lsp/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/bug-ops/deps-lsp/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/bug-ops/deps-lsp/compare/v1.0.1...v1.1.0
 [1.0.1]: https://github.com/bug-ops/deps-lsp/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/bug-ops/deps-lsp/compare/v0.14.0...v1.0.0

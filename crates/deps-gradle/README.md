@@ -28,7 +28,7 @@ This crate is part of the [deps-lsp](https://github.com/bug-ops/deps-lsp) worksp
 
 ```toml
 [dependencies]
-deps-gradle = "1.1"
+deps-gradle = "1.2"
 ```
 
 > [!IMPORTANT]
