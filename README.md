@@ -84,6 +84,9 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | Windows | x86_64 | `deps-lsp-x86_64-pc-windows-msvc.exe` |
 | Windows | ARM64 | `deps-lsp-aarch64-pc-windows-msvc.exe` |
 
+Every archive is signed with Sigstore/cosign in addition to its SHA256 checksum — see
+[Verifying Release Artifacts](SECURITY.md#verifying-release-artifacts) for how to check it.
+
 ### From source
 
 ```bash
