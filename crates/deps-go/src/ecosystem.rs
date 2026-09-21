@@ -8,7 +8,7 @@ use std::any::Any;
 use std::future::Future;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -20,12 +20,6 @@ use deps_core::{
 use crate::config::GoParseContext;
 use crate::formatter::GoFormatter;
 use crate::registry::GoRegistry;
-
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions. Empty: `go.mod` requires an exact bare semver (`v1.2.3`),
-/// with no comparison/caret/tilde operator syntax (#1137).
-#[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &[];
 
 /// Go modules ecosystem implementation.
 ///
@@ -83,41 +77,6 @@ impl GoEcosystem {
     #[cfg(feature = "lsp-responses")]
     fn complete_package_names(&self, _prefix: &str) -> impl Future<Output = Vec<CompletionItem>> {
         std::future::ready(vec![])
-    }
-
-    /// Completes version requirements for the dependency at `position`, resolved by cursor
-    /// position rather than by name (issue #593) — delegates to
-    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
-    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
-    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
-    /// routing (spec 034 F1): two dependencies sharing one `PackageName` but resolving to
-    /// different sources used to collapse into an ambiguous, empty result for both
-    /// occurrences, even though the cursor position unambiguously identifies which one the
-    /// user is editing.
-    ///
-    /// An unresolvable source still offers no completions rather than risking a private
-    /// module path lookup against `proxy.golang.org` — the shared helper's gate is what keeps
-    /// `Registry::get_versions_from`'s permissive routing of an unrecognized source to the
-    /// default public client (matching hover/diagnostics/code-actions' identical gate) from
-    /// leaking one for completions too.
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
-        )
-        .await
     }
 
     /// Completes feature flags for a specific package.
@@ -191,25 +150,6 @@ impl Ecosystem for GoEcosystem {
         _range: Range,
     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
         Box::pin(async move { self.complete_package_names(&prefix).await.into() })
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -293,6 +233,9 @@ mod tests {
     use deps_core::{Dependency, VersionData};
     #[cfg(feature = "lsp-responses")]
     use deps_core::{EcosystemConfig, PackageVersions};
+
+    #[cfg(feature = "lsp-responses")]
+    deps_core::complete_versions_test_shim!(GoEcosystem);
     use std::collections::HashMap;
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::{InlayHintLabel, Position};
@@ -393,14 +336,17 @@ mod tests {
     // package-name search endpoint).
 
     // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`go.mod` has no operator syntax), so an edit to one without the
-    // other fails loudly instead of silently degrading completion.
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `Ecosystem::
+    // version_operator_chars`'s trait-default doc comment (`go.mod` has no operator
+    // syntax, so this crate never overrides it), so an edit to one without the other
+    // fails loudly instead of silently degrading completion. Calls through the real
+    // `version_operator_chars()` method (not a bare `&[]` literal) so a future override
+    // in this crate is caught by this test instead of silently diverging from it.
     #[cfg(feature = "lsp-responses")]
     deps_core::operator_chars_conformance! {
         mod go_operator_chars_conformance;
         ecosystem: "go";
-        operator_chars: VERSION_OPERATOR_CHARS;
+        operator_chars: GoEcosystem::new(Arc::new(deps_core::HttpCache::new())).version_operator_chars();
         required: &[];
     }
 

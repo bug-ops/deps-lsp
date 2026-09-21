@@ -22,9 +22,9 @@ use crate::formatter::NpmFormatter;
 use crate::registry::NpmRegistry;
 use crate::types::NpmDependency;
 
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions: `node-semver`'s caret, tilde, comparison, and wildcard
-/// operators. No `!` — `node-semver` ranges have no `!=` operator (#1137).
+/// Leading version-constraint operators stripped from a completion prefix before
+/// matching it against registry versions: `node-semver`'s caret, tilde, comparison, and
+/// wildcard operators. No `!` — `node-semver` ranges have no `!=` operator (#1137).
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
 
@@ -92,7 +92,9 @@ impl NpmEcosystem {
     ///
     /// Deliberately source-blind (spec FR-011): the string here is a prefix the user typed
     /// into the name field, not a resolved private dependency name, so it is safe to send to
-    /// the public registry unconditionally — unlike [`Self::complete_versions`].
+    /// the public registry unconditionally — unlike version completion, which gates on
+    /// `can_resolve_source` before ever reaching the registry (see
+    /// [`Ecosystem::complete_version`]'s default implementation).
     #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
@@ -100,42 +102,6 @@ impl NpmEcosystem {
             prefix,
             20,
             range,
-        )
-        .await
-    }
-
-    /// Completes version requirements for the dependency at `position`, resolved by cursor
-    /// position rather than by name (issue #599, mirroring `deps_cargo::ecosystem`'s
-    /// identical migration for issue #593) — delegates to
-    /// [`deps_core::completion::complete_versions_at_position`]. This fixes the residual gap
-    /// in the old name-based `resolve_completion_source` routing: two dependencies sharing
-    /// one `PackageName` but resolving to different sources (e.g. two npm workspace scopes,
-    /// or a `.npmrc` scope override) used to collapse into an `Ambiguous` result and offer no
-    /// completions for either occurrence, even though the cursor position unambiguously
-    /// identifies which one the user is editing.
-    ///
-    /// The shared helper's `can_resolve_source` gate keeps `NpmRegistry::get_versions_from`'s
-    /// permissive catch-all from leaking a private/non-registry dependency's name to
-    /// `registry.npmjs.org` on every keystroke (the same leak class FR-006 closes for
-    /// hover/diagnostics/code-actions); `AlternateRegistry` routing through
-    /// `self.registry.alternate_client` is unchanged — it already lives inside
-    /// `NpmRegistry::get_versions_from` itself, which the shared helper calls into.
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
         )
         .await
     }
@@ -208,22 +174,8 @@ impl Ecosystem for NpmEcosystem {
     }
 
     #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 
     /// Appends a `**Catalog**` line (spec 046) to the shared default's hover output for a
@@ -422,6 +374,9 @@ mod tests {
     use deps_core::VersionData;
     #[cfg(feature = "lsp-responses")]
     use deps_core::parser::DependencySource;
+
+    #[cfg(feature = "lsp-responses")]
+    deps_core::complete_versions_test_shim!(NpmEcosystem);
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {

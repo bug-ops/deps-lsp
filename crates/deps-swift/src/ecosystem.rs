@@ -3,9 +3,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionTextEdit, Position, Range as LspRange, TextEdit,
-};
+use tower_lsp_server::ls_types::{CompletionItem, CompletionTextEdit, Range as LspRange, TextEdit};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -20,13 +18,6 @@ use crate::lockfile::SwiftLockParser;
 use crate::registry::SwiftRegistry;
 #[cfg(feature = "lsp-responses")]
 use crate::types::SwiftPackage;
-
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions. Empty: `Package.swift` expresses requirements through
-/// method calls (`.upToNextMajor(from:)`, `.exact(_:)`, `...`/`..<` range operators), never
-/// a leading operator character before the version literal itself (#1137).
-#[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &[];
 
 /// Builds a completion item that inserts the full GitHub URL for `.package(url: "...")`.
 ///
@@ -144,27 +135,6 @@ impl SwiftEcosystem {
             .filter_map(|package| build_url_completion(package, replace_range))
             .collect()
     }
-
-    // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
-        )
-        .await
-    }
 }
 
 impl deps_core::ecosystem::private::Sealed for SwiftEcosystem {}
@@ -227,25 +197,6 @@ impl Ecosystem for SwiftEcosystem {
         })
     }
 
-    #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
-    }
-
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
         let name = metadata.name();
         let latest = metadata.latest_version().as_str();
@@ -295,6 +246,11 @@ impl Ecosystem for SwiftEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
+
+    #[cfg(feature = "lsp-responses")]
+    deps_core::complete_versions_test_shim!(SwiftEcosystem);
 
     #[cfg(feature = "lsp-responses")]
     fn test_package(repository: Option<&str>) -> SwiftPackage {
@@ -511,14 +467,18 @@ mod tests {
     }
 
     // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`Package.swift` has no leading-operator syntax), so an edit to one
-    // without the other fails loudly instead of silently degrading completion.
+    // `operator_chars_conformance!`'s doc) — `required` mirrors `Ecosystem::
+    // version_operator_chars`'s trait-default doc comment (`Package.swift` has no
+    // leading-operator syntax, so this crate never overrides it), so an edit to one
+    // without the other fails loudly instead of silently degrading completion. Calls
+    // through the real `version_operator_chars()` method (not a bare `&[]` literal) so a
+    // future override in this crate is caught by this test instead of silently diverging
+    // from it.
     #[cfg(feature = "lsp-responses")]
     deps_core::operator_chars_conformance! {
         mod swift_operator_chars_conformance;
         ecosystem: "swift";
-        operator_chars: VERSION_OPERATOR_CHARS;
+        operator_chars: SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new())).version_operator_chars();
         required: &[];
     }
 

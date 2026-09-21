@@ -1261,24 +1261,76 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         Box::pin(std::future::ready(Completions::default()))
     }
 
+    /// Leading version-constraint operators this ecosystem's syntax allows before a bare
+    /// version (e.g. npm's `^`/`~`, PyPI's `>=`/`!=`, NuGet's bracket-interval `[`/`(`),
+    /// stripped from a completion prefix before matching it against registry versions.
+    ///
+    /// Consumed by [`Self::complete_version`]'s default implementation, which threads it
+    /// into [`crate::completion::complete_versions_at_position`]. Empty by default —
+    /// correct for an ecosystem whose version requirements are bare version strings with no
+    /// operator prefix (e.g. `deps-go`, `deps-swift`). An ecosystem overriding
+    /// [`Self::complete_version`] directly instead of using the default is free to ignore
+    /// this method entirely.
+    ///
+    /// A `&self` method rather than an associated const: an unconstrained associated const
+    /// would make [`Ecosystem`] dyn-incompatible (it would have to appear in every
+    /// implementor's vtable, which a bare `&'static [char]` value cannot), and a
+    /// `where Self: Sized`-bounded const to opt back out of the vtable needs the unstable
+    /// `generic_const_items` feature — not available on this workspace's stable toolchain.
+    /// `dyn Ecosystem` is exactly how [`crate::ecosystem_registry`] stores every registered
+    /// ecosystem, so this method mirrors [`Self::formatter`]/[`Self::registry`] instead.
+    #[cfg(feature = "lsp-responses")]
+    fn version_operator_chars(&self) -> &'static [char] {
+        &[]
+    }
+
     /// Completion hook for a [`crate::completion::CompletionContext::Version`] context —
     /// called only by [`Self::generate_completions`]'s default dispatch.
     ///
-    /// Required: every ecosystem serves version completion (the one property this method
-    /// preserves from before #793 — requiredness is orthogonal to the wildcard-match bug
-    /// class itself, which is fixed by the dispatch match's *location*, not by which hook is
-    /// required). `package_name`/`prefix` come from the resolved context; several
+    /// Required in spirit: every ecosystem serves version completion (the one property this
+    /// method preserves from before #793 — requiredness is orthogonal to the wildcard-match
+    /// bug class itself, which is fixed by the dispatch match's *location*, not by which hook
+    /// is required). `package_name`/`prefix` come from the resolved context; several
     /// implementations ignore them and instead re-derive the dependency at
     /// `request.position` from `request.parse_result` (cursor-position-based routing, issue
     /// #593) — deliberate divergence between ecosystems, not a mistake to unify, since the
     /// two lookups can disagree (see `deps-cargo`'s position-based migration history).
+    ///
+    /// Default implementation delegates to
+    /// [`crate::completion::complete_versions_at_position`] using `self.registry()`,
+    /// `self.formatter()`, and [`Self::version_operator_chars`] — the pattern `deps-npm`,
+    /// `deps-pypi`, `deps-go`, `deps-composer`, `deps-swift`, `deps-nuget`, `deps-cargo`,
+    /// `deps-dart`, `deps-bundler`, and `deps-deno` all hand-implemented identically before
+    /// this default existed (#1223). Only `deps-gradle` and `deps-maven` (both route by
+    /// dependency *name* through [`crate::completion::complete_versions_generic_from`]
+    /// directly, not by cursor position) and `deps-github-actions`/`deps-gitlab-ci` (each
+    /// wraps [`crate::completion::complete_versions_at_position`] in ecosystem-specific
+    /// guard logic — GitHub Actions withholds completion past a SHA pin's trailing comment;
+    /// GitLab CI re-derives its own position-based dependency lookup with an extra
+    /// literal-range check) have genuinely different version-completion behavior and
+    /// override this method instead of `version_operator_chars`.
     #[cfg(feature = "lsp-responses")]
     fn complete_version<'a>(
         &'a self,
         request: crate::completion::CompletionRequest<'a>,
-        package_name: crate::PackageName,
+        _package_name: crate::PackageName,
         prefix: String,
-    ) -> BoxFuture<'a, Completions>;
+    ) -> BoxFuture<'a, Completions> {
+        Box::pin(async move {
+            let registry = self.registry();
+            crate::completion::complete_versions_at_position(
+                registry.as_ref(),
+                self.formatter(),
+                request.parse_result,
+                request.position,
+                &prefix,
+                self.version_operator_chars(),
+                request.freshness,
+            )
+            .await
+            .into()
+        })
+    }
 
     /// Completion hook for a [`crate::completion::CompletionContext::Feature`] context —
     /// called only by [`Self::generate_completions`]'s default dispatch.
