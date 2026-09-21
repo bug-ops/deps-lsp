@@ -91,6 +91,21 @@ Download from [GitHub Releases](https://github.com/bug-ops/deps-lsp/releases/lat
 | Windows | x86_64 | `deps-cli-x86_64-pc-windows-msvc.exe` |
 | Windows | ARM64 | `deps-cli-aarch64-pc-windows-msvc.exe` |
 
+### Docker
+
+The [GitHub Action image](#github-action) (`ghcr.io/bug-ops/deps-lsp-github-action`) also
+bundles a prebuilt `deps-cli` binary, SHA256-verified against the matching GitHub release — no
+Rust toolchain, and nothing to trust beyond the image itself. Its default entrypoint is fixed to
+the Action's own `check --format sarif` contract, so override it to run `deps-cli` directly:
+
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  --entrypoint deps-cli ghcr.io/bug-ops/deps-lsp-github-action:1 check
+```
+
+`linux/amd64` and `linux/arm64` only. Tags: `latest`, `X`, `X.Y`, `X.Y.Z` — see
+[Image tags](../github-action/README.md#image-tags).
+
 ### From source
 
 ```bash

@@ -31,6 +31,27 @@ download the `.zip` asset from [GitHub Releases](https://github.com/bug-ops/deps
 instead. Pre-built binaries are published for 8 targets: Linux x86_64/aarch64 (glibc and
 musl), macOS x86_64/Apple Silicon, and Windows x86_64/ARM64.
 
+### Docker
+
+The image published for the [GitHub Action](#github-action) below
+(`ghcr.io/bug-ops/deps-lsp-github-action`) also bundles a prebuilt `deps-cli` binary, fetched
+from the matching GitHub release and SHA256-verified at build time — no Rust toolchain to
+install, and nothing to trust beyond the image itself. Its default `ENTRYPOINT` is hardcoded to
+the GitHub Action's own contract (`deps-cli check --format sarif`, driven by `DEPS_CLI_*` env
+vars — see [GitHub Action](#github-action)), so running `deps-cli` directly means overriding it:
+
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  --entrypoint deps-cli ghcr.io/bug-ops/deps-lsp-github-action:1 check
+```
+
+Mount the directory you want to scan at `/workspace`, then pass any normal `deps-cli`
+subcommand and flags after `check` — table output by default, or `--format json`/
+`--format sarif` as described under [Output formats](#output-formats). The image is
+Alpine-based, built for `linux/amd64` and `linux/arm64`, and tagged `latest`, major (`X`),
+minor (`X.Y`), and exact (`X.Y.Z`) — `ghcr.io/bug-ops/deps-lsp-github-action:1` tracks the
+latest `1.x.y` release, the same tag `action.yml` pins for the GitHub Action itself.
+
 ## Usage
 
 ```bash

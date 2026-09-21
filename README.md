@@ -136,6 +136,13 @@ curl -fsSL https://raw.githubusercontent.com/bug-ops/deps-lsp/main/scripts/insta
 deps-cli check --format sarif > results.sarif
 ```
 
+Or run it via Docker, no install at all:
+
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace \
+  --entrypoint deps-cli ghcr.io/bug-ops/deps-lsp-github-action:1 check
+```
+
 - **Output formats**: human-readable table (default), versioned JSON, or SARIF 2.1.0 for
   `github/codeql-action/upload-sarif`
 - **[Pre-commit hook](.pre-commit-hooks.yaml)**: `deps-lsp-check`, runs `deps-cli check`
