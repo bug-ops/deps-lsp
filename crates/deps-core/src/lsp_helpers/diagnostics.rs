@@ -1037,9 +1037,15 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
         message: format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
              (host class: {}; declaration: {})",
-            truncate_for_diagnostic(&redacted_value, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS),
+            sanitize_and_truncate_for_diagnostic(
+                &redacted_value,
+                MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS
+            ),
             occurrence.class,
-            truncate_for_diagnostic(&redacted_key, MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS),
+            sanitize_and_truncate_for_diagnostic(
+                &redacted_key,
+                MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS
+            ),
         ),
         ..Default::default()
     }
@@ -1202,7 +1208,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
         message: format!(
             "{}: {} {}",
             redact_name_for_diagnostic(ctx.dep.name()),
-            truncate_for_diagnostic(
+            sanitize_and_truncate_for_diagnostic(
                 &violation.license,
                 MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS
             ),
@@ -2195,7 +2201,8 @@ mod tests {
 
     /// #1246 (medium, unbounded length): a 400 KB manifest key must not produce an
     /// unbounded diagnostic payload — `redact_name_for_diagnostic` truncates it the same
-    /// way [`truncate_for_diagnostic`] already bounds the blocked-registry sibling message.
+    /// way [`sanitize_and_truncate_for_diagnostic`] already bounds the blocked-registry
+    /// sibling message.
     #[test]
     fn test_generate_diagnostics_from_cache_truncates_oversized_name() {
         use crate::position::{Position, Range};
@@ -3145,6 +3152,20 @@ mod tests {
             "a 10,000-char alias must not render in full inside the diagnostic message"
         );
         assert!(blocked_diagnostic.message.contains('…'));
+    }
+
+    /// #1255: a bidirectional-override or other invisible character embedded in a blocked
+    /// registry's raw declared value or declaration key must not survive into the client-
+    /// visible diagnostic message either — the same Trojan Source / CVE-2021-42574 concern
+    /// [`test_generate_diagnostics_from_cache_sanitizes_bidi_override_in_name`] covers for a
+    /// dependency name.
+    #[test]
+    fn test_generate_diagnostics_from_cache_blocked_registry_message_sanitizes_bidi_override() {
+        let raw_value = "https://index.mycorp.dev/api\u{202E}evil";
+        let declaration_key = "source\u{202E}evil";
+        let blocked_diagnostic = blocked_diagnostic_for(declaration_key, raw_value);
+        assert!(!blocked_diagnostic.message.contains('\u{202E}'));
+        assert!(blocked_diagnostic.message.contains("index.mycorp.dev"));
     }
 
     #[test]
@@ -7194,6 +7215,45 @@ mod tests {
                 diagnostics[0].message,
                 "serde: ISC not on the allowed license list"
             );
+        }
+
+        /// #1257: registry-supplied license text is untrusted, free-form data — a
+        /// bidirectional-override or other invisible character embedded in it must not
+        /// survive into the client-visible diagnostic message (Trojan Source,
+        /// CVE-2021-42574), the same concern [`redact_name_for_diagnostic`] already covers
+        /// for the dependency name on this same message.
+        #[test]
+        fn not_allowed_license_diagnostic_sanitizes_bidi_override_in_license_text() {
+            let formatter = MockFormatter;
+            let parse_result = single_dep_parse_result();
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from("serde"),
+                vec!["ISC\u{202E}evil".to_string()],
+            );
+            let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert!(!diagnostics[0].message.contains('\u{202E}'));
+            assert!(diagnostics[0].message.contains("ISC"));
         }
 
         #[test]
