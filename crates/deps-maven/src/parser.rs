@@ -92,7 +92,7 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
         let pos = reader.buffer_position();
         let event = reader.read_event().map_err(|e| DepsError::ParseError {
             file_type: "pom.xml".into(),
-            source: Box::new(std::io::Error::other(e.to_string())),
+            source: deps_core::net_policy::parse_error_source(&e),
         })?;
 
         match event {
@@ -819,6 +819,40 @@ mod tests {
             result2,
             Err(DepsError::ParseError { file_type, .. }) if file_type == "pom.xml"
         );
+    }
+
+    /// #1243: `quick_xml`'s `IllFormed::MismatchedEndTag` embeds the raw tag-name text
+    /// verbatim in its `Display` output, so a credential-shaped tag name must be redacted
+    /// the same way `toml_span`/`yaml_rust2` parse errors already are (#1240/#1241).
+    #[test]
+    fn test_parse_mismatched_end_tag_error_redacts_credential() {
+        let xml = "<root><https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x ></root>";
+
+        let message = parse_pom_xml(xml, &test_uri()).unwrap_err().to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_parse_mismatched_end_tag_error_benign_name_unchanged() {
+        let xml = "<root><foo></bar></root>";
+
+        // Derived from the raw quick-xml error, not hardcoded, so assert_eq! gates a
+        // redaction regression (mirrors #1240 M5's convention).
+        let mut reader = quick_xml::Reader::from_str(xml);
+        reader.config_mut().trim_text(true);
+        let raw_err = loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => panic!("expected a parse error"),
+                Ok(_) => {}
+                Err(e) => break e,
+            }
+        };
+        let expected = format!("failed to parse pom.xml: {raw_err}");
+
+        let message = parse_pom_xml(xml, &test_uri()).unwrap_err().to_string();
+        assert_eq!(message, expected);
     }
 
     #[test]
