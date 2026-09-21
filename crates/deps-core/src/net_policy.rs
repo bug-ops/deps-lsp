@@ -2356,6 +2356,63 @@ pub fn redact_declaration_key(key: &str) -> String {
     }
 }
 
+/// Replaces every Unicode `Cc` (Control), `Cf` (Format), `Zl` (Line Separator), and `Zp`
+/// (Paragraph Separator) character in `s` with a single space, borrowing when `s` has none
+/// (#1242, #1246).
+///
+/// `Cc` covers ASCII/C1 control characters, including `\n`/`\r` and raw ANSI escape
+/// (`\x1B`) bytes, that could otherwise splice new lines into a single-line rendering
+/// (table row, JSON string, SARIF message) or forge terminal escape sequences. `Cf`
+/// additionally covers invisible formatting characters with no glyph of their own —
+/// bidirectional overrides (e.g. U+202E RIGHT-TO-LEFT OVERRIDE, the Trojan Source vector),
+/// zero-width joiners/spaces (U+200B, U+200C, U+200D), and the byte-order mark (U+FEFF) —
+/// which can visually reorder or hide text without tripping a `Cc`-only check. `Zl`/`Zp`
+/// (U+2028 LINE SEPARATOR, U+2029 PARAGRAPH SEPARATOR) are neither `Cc` nor `Cf`, but are
+/// still line terminators for JS/`eval` consumers of `--format json` output and are treated
+/// as breaks by some editor renderers (critic follow-up M1, #1246).
+///
+/// This is deliberately wider than [`crate::lsp_helpers::escape_markdown`]'s `Cc`-only
+/// [`char::is_control`] check: that helper runs on registry-supplied hover *descriptions*,
+/// where legitimate right-to-left text carries real `Cf` marks (e.g. U+200F RIGHT-TO-LEFT
+/// MARK), so widening it to `Cf` there would mangle genuine Arabic/Hebrew text. A
+/// manifest-declared package/coordinate *name*, by contrast, has no legitimate use for any
+/// `Cf`/`Zl`/`Zp` character, so this dedicated helper — for name-shaped values only — can
+/// safely treat the whole categories as unsafe.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::sanitize_invisible;
+///
+/// assert_eq!(sanitize_invisible("left-pad"), "left-pad");
+/// assert_eq!(sanitize_invisible("a\nb\rc"), "a b c");
+/// assert_eq!(sanitize_invisible("bidi\u{202E}gnp.exe"), "bidi gnp.exe");
+/// assert_eq!(sanitize_invisible("a\u{2028}b\u{2029}c"), "a b c");
+/// ```
+#[must_use]
+pub fn sanitize_invisible(s: &str) -> std::borrow::Cow<'_, str> {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+
+    fn is_invisible(c: char) -> bool {
+        matches!(
+            get_general_category(c),
+            GeneralCategory::Control
+                | GeneralCategory::Format
+                | GeneralCategory::LineSeparator
+                | GeneralCategory::ParagraphSeparator
+        )
+    }
+
+    if !s.chars().any(is_invisible) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| if is_invisible(c) { ' ' } else { c })
+            .collect(),
+    )
+}
+
 /// Longest prefix (in bytes, not chars — see [`redact_parse_error_for_log`]'s slicing) of a
 /// redacted parse-error message logged, post-redaction, by [`redact_parse_error_for_log`].
 ///
@@ -6232,5 +6289,26 @@ mod tests {
             redact_declaration_key("ghcr.io/owner/image:1.2.3@sha256:abcdef"),
             "ghcr.io/owner/image:***"
         );
+    }
+
+    /// Critic follow-up M1 (#1242, #1246): `sanitize_invisible` covers `Cc`/`Cf`, but U+2028
+    /// LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are neither category — both are line
+    /// terminators for JS/`eval` consumers of `--format json` output and are treated as
+    /// breaks by some editor renderers, so they must be sanitized too.
+    #[test]
+    fn sanitize_invisible_replaces_line_and_paragraph_separators() {
+        assert_eq!(
+            sanitize_invisible("a\u{2028}b\u{2029}c"),
+            "a b c",
+            "U+2028/U+2029 must not survive sanitize_invisible"
+        );
+    }
+
+    #[test]
+    fn sanitize_invisible_borrows_when_nothing_needs_sanitizing() {
+        assert!(matches!(
+            sanitize_invisible("com.google.guava:guava"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

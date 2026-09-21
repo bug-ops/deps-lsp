@@ -4,12 +4,12 @@ use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severit
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
-use crate::net_policy::{RedactedUrl, redact_declaration_key};
+use crate::net_policy::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::position::{Position, Range};
 use crate::{
-    BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, FetchFailure, ParseResult,
-    PublishTime, RemovalStatus, VersionReq, format_relative_age, is_within_cooldown,
+    BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, FetchFailure, PackageName,
+    ParseResult, PublishTime, RemovalStatus, VersionReq, format_relative_age, is_within_cooldown,
 };
 
 use super::{
@@ -88,6 +88,51 @@ pub fn truncate_for_diagnostic(value: &str, max_chars: usize) -> std::borrow::Co
     let mut truncated: String = value.chars().take(max_chars).collect();
     truncated.push('…');
     std::borrow::Cow::Owned(truncated)
+}
+
+/// Maximum character count of a dependency name interpolated into an unknown-package
+/// diagnostic message (R5a/R5c/R5d) or a `deps-cli` finding's `dependency_name` field,
+/// before it is truncated with an ellipsis marker (#1242, #1246).
+///
+/// Mirrors [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]'s bound: [`PackageName`] itself is
+/// deliberately unvalidated (see its own doc), so a manifest key of unbounded length would
+/// otherwise reach these sinks unbounded too.
+const MAX_DIAGNOSTIC_NAME_CHARS: usize = 128;
+
+/// Renders `name` safely for a client-visible diagnostic message or `dependency_name`-shaped
+/// field (#1242, #1246): redact, then sanitize, then truncate, in that order.
+///
+/// 1. [`redact_declaration_key`] collapses a credential-shaped value (e.g. a manifest key
+///    that turned out to hold `https://user:TOKEN@host/path`) to `***@host/...` first —
+///    truncating before this step could cut the string exactly at the boundary the
+///    credential-shape scan depends on, leaking a credential that straddles the cut (the
+///    same ordering [`crate::net_policy::redact_parse_error_for_log`] uses, #1240).
+/// 2. [`sanitize_invisible`] then neutralizes any remaining control/format character (in the
+///    host/path remainder, or on the non-credential branch) that could splice a fabricated
+///    line into a table row or forge a bidi-spoofed display name (#1246).
+/// 3. [`truncate_for_diagnostic`] bounds the result so an oversized manifest key cannot
+///    produce an unbounded diagnostic, JSON, or SARIF payload.
+///
+/// Takes `&PackageName` rather than `&str` so the type system itself blocks a future call
+/// site from reintroducing a raw, unredacted `.as_str()` at one of these sinks.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PackageName;
+/// use deps_core::lsp_helpers::redact_name_for_diagnostic;
+///
+/// let name = PackageName::new("serde");
+/// assert_eq!(redact_name_for_diagnostic(&name), "serde");
+///
+/// let name = PackageName::new("https://svcacct:hunter2@gitlab.corp/g/p");
+/// assert_eq!(redact_name_for_diagnostic(&name), "https://***@gitlab.corp/g/p");
+/// ```
+#[must_use]
+pub fn redact_name_for_diagnostic(name: &PackageName) -> String {
+    let redacted = redact_declaration_key(name.as_str());
+    let sanitized = sanitize_invisible(&redacted);
+    truncate_for_diagnostic(&sanitized, MAX_DIAGNOSTIC_NAME_CHARS).into_owned()
 }
 
 /// Stable [`Diagnostic::code`] set on the package-level deprecation diagnostic (issue #205).
@@ -917,12 +962,20 @@ fn blocked_registry_diagnostics(
             })
             .push(occurrence);
     }
+    if order.is_empty() {
+        // #1242/#1246 perf follow-up: nothing is blocked (the common case) — skip building
+        // `dependency_names` below, which would otherwise redact every dependency's name
+        // unconditionally for a map no diagnostic will ever read.
+        return;
+    }
 
     // Built once, not per sibling occurrence (#944 M3), for `related_information` naming;
-    // keyed on `Range` to match `BlockedRegistryOccurrence::range`'s type (#1071 S2).
-    let dependency_names: HashMap<Range, &str> = deps
+    // keyed on `Range` to match `BlockedRegistryOccurrence::range`'s type (#1071 S2). Redacted
+    // via `redact_name_for_diagnostic` (#1242, #1246): this name reaches the same client-visible
+    // `related_information` text as `FetchFailureEntry.name`.
+    let dependency_names: HashMap<Range, String> = deps
         .iter()
-        .map(|dep| (dep.name_range(), dep.name().as_str()))
+        .map(|dep| (dep.name_range(), redact_name_for_diagnostic(dep.name())))
         .collect();
 
     for key in order {
@@ -976,7 +1029,7 @@ fn push_collapsed_blocked_registries(
     diagnostics: &mut Vec<Diagnostic>,
     entries: Vec<BlockedRegistryOccurrence>,
     uri: &url::Url,
-    dependency_names: &HashMap<Range, &str>,
+    dependency_names: &HashMap<Range, String>,
 ) {
     #[expect(
         clippy::indexing_slicing,
@@ -1122,7 +1175,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
         severity: Some(severity),
         message: format!(
             "{}: {} {}",
-            ctx.dep.name().as_str(),
+            redact_name_for_diagnostic(ctx.dep.name()),
             truncate_for_diagnostic(
                 &violation.license,
                 MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS
@@ -1339,28 +1392,29 @@ fn apply_unknown_package_rule(
             diagnostics.push(Diagnostic {
                 range: dep.name_range(),
                 severity: Some(ctx.severities.unknown),
-                message: format!("Invalid package name '{}': {reason}", dep.name().as_str()),
+                message: format!(
+                    "Invalid package name '{}': {reason}",
+                    redact_name_for_diagnostic(dep.name())
+                ),
                 ..Default::default()
             });
         }
         Ok(()) if fetch_failure.is_some() && ctx.versions.offline => {}
         Ok(()) if fetch_failure.is_some() => {
+            let redacted_name = redact_name_for_diagnostic(dep.name());
             let message = match fetch_failure {
                 Some(FetchFailure::Actionable(hint)) => {
-                    format!(
-                        "Registry lookup failed for '{}': {hint}",
-                        dep.name().as_str()
-                    )
+                    format!("Registry lookup failed for '{redacted_name}': {hint}")
                 }
                 Some(FetchFailure::Transient | FetchFailure::NotAttempted) | None => {
                     format!(
-                        "Registry lookup failed for '{}'; package status could not be determined",
-                        dep.name().as_str()
+                        "Registry lookup failed for '{redacted_name}'; package status could not \
+                         be determined"
                     )
                 }
             };
             fetch_failed.push(FetchFailureEntry {
-                name: dep.name().as_str().to_string(),
+                name: redacted_name,
                 diagnostic: Diagnostic {
                     range: dep.name_range(),
                     severity: Some(ctx.severities.unknown),
@@ -1375,7 +1429,10 @@ fn apply_unknown_package_rule(
             diagnostics.push(Diagnostic {
                 range: dep.name_range(),
                 severity: Some(ctx.severities.unknown),
-                message: format!("Unknown package '{}'", dep.name().as_str()),
+                message: format!(
+                    "Unknown package '{}'",
+                    redact_name_for_diagnostic(dep.name())
+                ),
                 ..Default::default()
             });
         }
@@ -1884,6 +1941,270 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
         assert!(diagnostics[0].message.contains("Unknown package"));
         assert!(diagnostics[0].message.contains("unknown-pkg"));
+    }
+
+    /// A credential-shaped manifest key (#1242) must never reach a client-visible
+    /// diagnostic verbatim, whichever `apply_unknown_package_rule` arm renders it.
+    const CREDENTIAL_SHAPED_NAME: &str = "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p";
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_redacts_credential_in_invalid_name() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = RejectingFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: CREDENTIAL_SHAPED_NAME.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.starts_with("Invalid package name"));
+        assert!(diagnostics[0].message.contains("***@"));
+        assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_redacts_credential_in_fetch_failure_hint() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: CREDENTIAL_SHAPED_NAME.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let outcomes = DependencyOutcomes::new().with_fetch_failure(
+            CREDENTIAL_SHAPED_NAME,
+            FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".to_string()),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Registry lookup failed"));
+        assert!(diagnostics[0].message.contains("***@"));
+        assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+    }
+
+    #[test]
+    fn test_generate_diagnostics_from_cache_redacts_credential_in_unknown_package() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: CREDENTIAL_SHAPED_NAME.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("Unknown package"));
+        assert!(diagnostics[0].message.contains("***@"));
+        assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+    }
+
+    /// #1246: `\n`/`\r` embedded in a manifest key must never reach a diagnostic message,
+    /// where they could splice a fabricated extra line into a single-line rendering (a CLI
+    /// table row, or a forged second finding).
+    #[test]
+    fn test_generate_diagnostics_from_cache_sanitizes_newlines_in_name() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let injected_name =
+            "ok\n  [error] 1:1 totally-real-pkg (vulnerable) — CRITICAL RCE, upgrade now";
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: injected_name.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains('\n'));
+        assert!(!diagnostics[0].message.contains('\r'));
+    }
+
+    /// #1246: a bidirectional-override or zero-width character embedded in a manifest key
+    /// must not survive into a diagnostic message, where it could visually reorder or hide
+    /// text (Trojan Source, CVE-2021-42574).
+    #[test]
+    fn test_generate_diagnostics_from_cache_sanitizes_bidi_override_in_name() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let injected_name = "bidi\u{202E}gnp.exe\u{200B}";
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: injected_name.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains('\u{202E}'));
+        assert!(!diagnostics[0].message.contains('\u{200B}'));
+    }
+
+    /// Critic follow-up M1 (#1242, #1246): U+2028 LINE SEPARATOR / U+2029 PARAGRAPH
+    /// SEPARATOR are neither `Cc` nor `Cf`, but are still line terminators for JS/`eval`
+    /// consumers of `--format json` output and are treated as breaks by some editor
+    /// renderers — they must not survive into a diagnostic message either.
+    #[test]
+    fn test_generate_diagnostics_from_cache_sanitizes_line_and_paragraph_separators_in_name() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let injected_name = "evil\u{2028}pkg\u{2029}name";
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: injected_name.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains('\u{2028}'));
+        assert!(!diagnostics[0].message.contains('\u{2029}'));
+    }
+
+    /// #1246 (medium, unbounded length): a 400 KB manifest key must not produce an
+    /// unbounded diagnostic payload — `redact_name_for_diagnostic` truncates it the same
+    /// way [`truncate_for_diagnostic`] already bounds the blocked-registry sibling message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_truncates_oversized_name() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let oversized_name = "a".repeat(400_000);
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: oversized_name.as_str().into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0].message.chars().count() < 200,
+            "expected a bounded message, got {} chars",
+            diagnostics[0].message.chars().count()
+        );
     }
 
     /// Critic finding S1 (#905): a dependency with a synthetic `name_range()` (e.g.
@@ -2489,6 +2810,101 @@ mod tests {
         );
         assert!(anchor.message.contains("top-level"));
         assert!(third.message.contains("scope:@myorg"));
+    }
+
+    /// Critic follow-up S2 (#1242, #1246): the collapsed blocked-registry sibling named in
+    /// `related_information` (`'{name}' also blocked by the same registry policy`) must be
+    /// redacted the same way `FetchFailureEntry.name` is — it is built from the identical
+    /// `dep.name().as_str()` shape, just for a different rule.
+    #[test]
+    fn test_generate_diagnostics_from_cache_redacts_credential_in_blocked_registry_related_info() {
+        use crate::net_policy::HostClass;
+        use crate::position::{Position, Range};
+
+        struct BlockedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: url::Url,
+            blocked: Vec<BlockedRegistryOccurrence>,
+        }
+
+        impl ParseResult for BlockedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+                self.blocked.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let first_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let second_range = Range::new(Position::new(1, 0), Position::new(1, 14));
+        let credential_name = "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p";
+        let formatter = MockFormatter;
+        let parse_result = BlockedRegistryParseResult {
+            deps: vec![
+                MockDep {
+                    name: "first-crate".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                    name_range: first_range,
+                },
+                MockDep {
+                    name: credential_name.into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 20), Position::new(1, 25)),
+                    name_range: second_range,
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            blocked: vec![
+                BlockedRegistryOccurrence {
+                    range: first_range,
+                    class: HostClass::CloudMetadata,
+                    raw_value: "https://169.254.169.254/index".to_string(),
+                    declaration_key: "top-level".to_string(),
+                },
+                BlockedRegistryOccurrence {
+                    range: second_range,
+                    class: HostClass::CloudMetadata,
+                    raw_value: "https://169.254.169.254/index".to_string(),
+                    declaration_key: "top-level".to_string(),
+                },
+            ],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let anchor = diagnostics
+            .iter()
+            .find(|d| d.range == first_range)
+            .expect("anchor diagnostic for the shared declaration key must exist");
+        let related = anchor
+            .related_information
+            .as_ref()
+            .expect("anchor diagnostic must carry related_information for the collapsed sibling");
+        assert_eq!(related.len(), 1);
+        assert!(related[0].message.contains("***@"));
+        assert!(!related[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
     }
 
     /// #944 S2/M3 regression: `push_collapsed_blocked_registries` caps individually-named
@@ -6671,6 +7087,53 @@ mod tests {
                 diagnostics[0].range,
                 Range::new(Position::new(0, 0), Position::new(0, 5))
             );
+        }
+
+        /// Critic follow-up S1 (#1242, #1246): the license-policy diagnostic already
+        /// truncates the *license* (`MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS`) but, before
+        /// this fix, interpolated the raw dependency *name* — same client-visible
+        /// `Diagnostic.message`, same CWE-532/CWE-117 exposure as R5a/R5c/R5d.
+        #[test]
+        fn denied_license_diagnostic_redacts_credential_shaped_name() {
+            let formatter = MockFormatter;
+            let credential_name = "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p";
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: credential_name.into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                }],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from(credential_name),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut license_prefetch = HashMap::new();
+            license_prefetch.insert(
+                PackageName::from(credential_name),
+                vec!["GPL-3.0".to_string()],
+            );
+            let policy = LicensePolicy::new(vec![], vec!["GPL-3.0".to_string()]);
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_license_prefetch(&license_prefetch)
+                    .with_license_policy(&policy),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert!(diagnostics[0].message.contains("***@"));
+            assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
         }
 
         #[test]

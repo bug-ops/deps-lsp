@@ -13,7 +13,7 @@
 use deps_core::diagnostic::{Diagnostic, Severity};
 use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, DependencyOutcomes, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    UNSATISFIABLE_DIAGNOSTIC_CODE,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic,
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
@@ -175,7 +175,9 @@ pub struct CheckFinding {
     pub manifest_path: PathBuf,
     /// The dependency's declared name, when a manifest occurrence's range matched the
     /// diagnostic's own range. `None` for a document-level finding not anchored to one
-    /// dependency (e.g. an offline/dependency-count notice).
+    /// dependency (e.g. an offline/dependency-count notice). Passed through
+    /// [`deps_core::lsp_helpers::redact_name_for_diagnostic`] (#1242, #1246), so this is
+    /// never the raw manifest value.
     pub dependency_name: Option<String>,
     /// The dependency's declared version requirement, when known.
     pub requirement: Option<String>,
@@ -723,7 +725,7 @@ fn to_finding(
     CheckFinding {
         ecosystem,
         manifest_path: display_path.to_path_buf(),
-        dependency_name: dep.map(|d| d.name().as_str().to_string()),
+        dependency_name: dep.map(|d| redact_name_for_diagnostic(d.name())),
         requirement: dep
             .and_then(Dependency::version_requirement)
             .map(ToString::to_string),
@@ -991,6 +993,64 @@ mod tests {
         deps_core::test_util::stub_parse_result_with_dependencies(0)
     }
 
+    /// A single-dependency [`deps_core::Dependency`]/[`deps_core::ParseResult`] fixture whose
+    /// name is caller-controlled — unlike [`dep_index_with_one_dependency`]'s fixed `dep-0`,
+    /// needed to exercise `to_finding`'s `dependency_name` redaction (#1242, #1246) with an
+    /// attacker-controlled manifest key.
+    struct NamedFixtureDep {
+        name: PackageName,
+    }
+
+    impl deps_core::Dependency for NamedFixtureDep {
+        fn name(&self) -> &PackageName {
+            &self.name
+        }
+        fn name_range(&self) -> Range {
+            Range::default()
+        }
+        fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+            None
+        }
+        fn version_range(&self) -> Option<Range> {
+            None
+        }
+        fn source(&self) -> deps_core::parser::DependencySource {
+            deps_core::parser::DependencySource::Registry
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    struct NamedFixtureParseResult {
+        dep: NamedFixtureDep,
+        uri: url::Url,
+    }
+
+    impl deps_core::ParseResult for NamedFixtureParseResult {
+        fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+            vec![&self.dep]
+        }
+        fn workspace_root(&self) -> Option<&Path> {
+            None
+        }
+        fn uri(&self) -> &url::Url {
+            &self.uri
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn dep_index_with_named_dependency(name: &str) -> Box<dyn deps_core::ParseResult> {
+        Box::new(NamedFixtureParseResult {
+            dep: NamedFixtureDep {
+                name: PackageName::new(name),
+            },
+            uri: "file:///project/manifest.toml".parse().expect("valid URI"),
+        })
+    }
+
     /// Regression test (issue #1077 tester must-fix #2): every other SARIF test hand-builds a
     /// `CheckFinding` with `code` pre-set, bypassing the real `Diagnostic.code ->
     /// CheckFinding.code` extraction this covers.
@@ -1067,6 +1127,81 @@ mod tests {
             &HashMap::new(),
         );
         assert!(finding.advisory_url.is_none());
+    }
+
+    /// #1242/#1246: `to_finding`'s `dependency_name` field is a second leak path,
+    /// independent of the diagnostic's own `message` — the fix at `report.rs`'s
+    /// `dependency_name` construction must redact it too.
+    #[test]
+    fn test_to_finding_redacts_credential_shaped_dependency_name() {
+        let parse_result = dep_index_with_named_dependency(
+            "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p",
+        );
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Unknown package");
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let name = finding
+            .dependency_name
+            .expect("range matched the dependency");
+        assert!(name.contains("***@"));
+        assert!(!name.contains("glpat-AAAABBBBCCCCDDDD"));
+    }
+
+    /// #1242/#1246 (critic S3 follow-up): unlike a test that builds a [`CheckFinding`] by
+    /// hand and assigns an already-redacted `dependency_name`, this drives the real
+    /// `to_finding` -> [`crate::format::sarif::to_sarif`] pipeline end to end, so it actually
+    /// fails if `to_finding`'s redaction at `dependency_name` construction is ever reverted —
+    /// the SARIF fingerprint's percent-encoding otherwise preserves a credential verbatim
+    /// (trivially reversible), and GitHub code scanning persists it in alert history beyond
+    /// the manifest's own lifetime.
+    #[test]
+    fn test_to_sarif_fingerprint_never_carries_a_credential_through_to_finding() {
+        let parse_result = dep_index_with_named_dependency(
+            "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p",
+        );
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Unknown package");
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let sarif = crate::format::sarif::to_sarif(&CheckReport {
+            findings: vec![finding],
+        });
+        let fp = sarif.runs[0].results.as_ref().expect("one result")[0]
+            .partial_fingerprints
+            .as_ref()
+            .expect("fingerprint set")
+            .get("depsCli/v1")
+            .expect("depsCli/v1 fingerprint key")
+            .clone();
+
+        assert!(
+            !fp.contains("glpat-AAAABBBBCCCCDDDD"),
+            "token leaked (raw or percent-encoded, since `-` is never percent-escaped): {fp}"
+        );
+        let decoded = urlencoding::decode(&fp).expect("fingerprint is valid percent-encoding");
+        assert!(
+            decoded.contains("***@gitlab.corp"),
+            "expected the redacted '***@host' marker, got: {decoded}"
+        );
     }
 
     #[test]

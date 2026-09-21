@@ -33,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-npm, deps-pypi, deps-go, deps-composer, deps-swift, deps-nuget, deps-cargo, deps-dart, deps-bundler, deps-deno**: `Ecosystem::complete_version` now has a shared default implementation (backed by a new `version_operator_chars` hook), replacing ten byte-identical hand-written implementations (resolves #1223) (#1235)
 
 ### Fixed
+- **deps-core, deps-cli**: a credential-shaped or control-character/bidi-override dependency name no longer leaks unredacted into the unknown-package/license-policy/blocked-registry diagnostic messages, the CLI JSON `dependency_name` field, or the SARIF fingerprint, via a new shared `redact_name_for_diagnostic` helper (resolves #1242, #1246) (#1253)
 - **deps-maven, deps-nuget**: a malformed XML tag whose name is credential-shaped no longer leaks the credential into `quick_xml` parse-error log/stderr output (resolves #1243) (#1251)
 - **deps-cargo, deps-dart, deps-gradle, deps-npm, deps-cli**: a duplicate TOML table/YAML mapping key whose name is credential-shaped no longer leaks the credential into parse-error log/stderr output across Cargo.lock, Cargo.toml, pubspec.lock, gradle/libs.versions.toml, pnpm-lock.yaml, and deps.toml (resolves #1240) (#1241)
 - **deps-pypi**: `truncate_for_log` now redacts credentials before truncating and gates value-redaction to avoid mangling benign colon-shaped text, closing a leak of PEP 508 direct-reference URL and lock-file credentials to logs (resolves #1228) (#1239)
