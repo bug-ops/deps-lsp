@@ -19,7 +19,7 @@ fn validate_module_path(path: &str) -> deps_core::Result<()> {
 }
 
 /// Example: parsing function
-fn parse_manifest(content: &str, uri: &Uri) -> deps_core::Result<ParseResult> {
+fn parse_manifest(content: &str, uri: &url::Url) -> deps_core::Result<ParseResult> {
     // Parse logic...
     // On error: return Err(DepsError::ParseError { ... })
     // On success: return Ok(ParseResult { ... })

@@ -1,5 +1,27 @@
 # Bundler
 
+`deps-bundler` provides LSP support for Ruby projects using Bundler.
+
+## Basics
+
+| | |
+|---|---|
+| Manifest file | `Gemfile` |
+| Lock file (in-use version) | `Gemfile.lock` |
+| Registry | RubyGems (`rubygems.org/api/v1`) |
+| Version syntax | RubyGems' own `Gem::Version`/`Gem::Requirement` semantics, ported directly from RubyGems' source so ordering and `~>` (pessimistic operator) matching are exact, including prerelease tie-breaking |
+
+```ruby
+gem "rails", "~> 7.1.0"
+gem "pg"
+```
+
+Hovering a gem's version string shows the latest RubyGems release and a link to its
+rubygems.org page; an outdated requirement gets an inlay hint and a diagnostic with an
+"Update to latest version" code action. Both modern `key: value` and legacy hash-rocket
+`:key => value` option syntax (`group:`, `require:`, `platforms:`, `source:`, `git:`,
+`path:`) are recognized identically.
+
 ## Custom/Private Registries (issue #980)
 
 Unlike [Cargo](cargo.md)/[npm](npm.md)/[PyPI](pypi.md)/[Go](go.md)/[NuGet](nuget.md), `deps-bundler`

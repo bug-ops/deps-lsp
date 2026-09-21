@@ -1,5 +1,33 @@
 # GitHub Actions
 
+## Basics
+
+Unlike the language-package ecosystems above, GitHub Actions is a **CI/CD supply-chain pinning**
+ecosystem: `deps-lsp` does not track library dependencies, it tracks which commit of a
+third-party Action each workflow step trusts. Two manifest shapes are recognized:
+
+- **`.github/workflows/*.yml`/`*.yaml`** — ordinary workflow files, matched via a
+  directory-pattern rule (any file in that directory with a `.yml`/`.yaml` extension), not an
+  exact filename.
+- **`action.yml`/`action.yaml`** — a composite/reusable Action's own metadata file, whose
+  `runs.steps` can itself reference other Actions.
+
+Every `uses:` step is a dependency:
+
+```yaml
+steps:
+  - uses: actions/checkout@v4
+  - uses: actions/checkout@8f4b7f84864484a7bf31766abe9204da3cbe65b3 # v4.1.1
+```
+
+A tag reference (`@v4`) resolves against **GitHub's own tags API** for that `owner/repo` (no
+separate package registry exists for Actions) and is flagged by the mutable-ref-pin diagnostic,
+since a tag can be force-moved by the repository owner to point at different code without the
+version string in your workflow ever changing — see [CI/CD
+Pinning](../cross-ecosystem/ci-pinning.md) for why this matters and how the SHA-pinning code
+action/code lens works. A full 40-character commit SHA is the only pin GitHub itself cannot
+silently repoint.
+
 ## Non-Semver Tag Handling (issue #550)
 
 When a GitHub Action repository has only tags that don't parse as full semantic versions — such as

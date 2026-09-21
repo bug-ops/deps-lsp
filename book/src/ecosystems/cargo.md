@@ -1,5 +1,37 @@
 # Cargo
 
+`deps-cargo` provides full LSP support for Rust's package manager.
+
+## Basics
+
+| | |
+|---|---|
+| Manifest file | `Cargo.toml` |
+| Lock file (in-use version) | `Cargo.lock` (versions 3 and 4) |
+| Registry | crates.io — sparse index (`index.crates.io`) for version lookups, REST API (`crates.io/api/v1`) for package-name search |
+| Version syntax | Cargo's own requirement grammar (`semver::VersionReq`): `^`, `~`, `=`, `<`, `>`, `*`, and bare comparison operators |
+
+`deps-cargo` parses every dependency-like table — `[dependencies]`, `[dev-dependencies]`,
+`[build-dependencies]`, their `[target.<cfg-expr-or-triple>]` variants, and a workspace
+root's `[workspace.dependencies]` — with byte-accurate position tracking, so hover,
+diagnostics, completion, and code actions all anchor on the exact name/version/features span
+in the file, not just the dependency's line.
+
+```toml
+[dependencies]
+serde = "1.0"
+tokio = { version = "1", features = ["full"] }
+```
+
+Hovering `serde`'s version shows the latest crates.io release, whether the declared
+requirement is satisfied, and a link to the crate's crates.io page; an outdated requirement
+gets an inlay hint (`❌ 1.0.219`) and a matching diagnostic with a "Update to latest version"
+code action. Typing inside the `features` array offers completion sourced from the latest
+stable version's real feature list. `workspace = true` inheritance, `path =`/`git =`
+dependencies, and a `package = "..."` rename (aliasing the TOML key to a different registry
+lookup name) are all recognized and routed correctly — a renamed dependency's diagnostics and
+completions key off the real crate name, not the local alias.
+
 ## Custom/Private Registries
 
 A Cargo dependency declared as `registry = "<alias>"` or `registry-index = "<url>"`

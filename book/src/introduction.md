@@ -8,7 +8,8 @@ GitHub Actions, and GitLab CI/CD — instead of requiring a separate extension p
 
 A companion binary, [`deps-cli`](cli.md), runs the same checks from the command line —
 routing every manifest through the identical classification pipeline — for CI pipelines,
-pre-commit hooks, and shell scripts where an editor isn't involved.
+pre-commit hooks, and shell scripts where an editor isn't involved. A ready-made
+[GitHub Action](github-action.md) wraps it for CI with zero setup beyond a workflow file.
 
 For installation, editor setup, and LSP configuration options, see the root
 [`README.md`](https://github.com/bug-ops/deps-lsp#readme). This book does not duplicate that
@@ -17,7 +18,10 @@ material; it covers instead:
 - **What each ecosystem supports today** — the [Ecosystem Reference](ecosystems/index.md)
   chapters, and the cross-cutting behaviors ([Cross-Ecosystem Features](cross-ecosystem/index.md))
   that apply the same way across most or all of them.
-- **`deps-cli`** — the [command-line reference](cli.md) for CI/pre-commit/shell use.
+- **`deps-cli` and CI integration** — the [command-line reference](cli.md) for CI/pre-commit/shell
+  use, and the ready-made [GitHub Action](github-action.md) that wraps it.
+- **How it's built** — [Architecture & Internals](architecture.md), for the `Ecosystem` trait,
+  registry clients, caching, and the LSP handler dispatch underneath the behaviors above.
 - **How to add support for a new ecosystem** — the
   [Adding a New Ecosystem](contributing/index.md) contributor track, for anyone extending
   `deps-lsp` itself.

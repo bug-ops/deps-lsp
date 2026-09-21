@@ -1,5 +1,37 @@
 # NuGet
 
+## Basics
+
+NuGet is the ecosystem with the most manifest formats `deps-lsp` supports in one place —
+`deps-nuget` recognizes all of them:
+
+- **`.csproj`/`.fsproj`/`.vbproj`** (SDK-style project files) — modern `<PackageReference
+  Include="..." Version="..." />` entries, in either attribute form or nested-element form
+  (`<PackageReference Include="..."><Version>...</Version></PackageReference>`).
+- **`Directory.Packages.props`** — .NET's **Central Package Management** file: a single
+  `<PackageVersion Include="..." Version="..." />` list shared across every project in a
+  repository, with individual `.csproj` files' `<PackageReference>` entries then referencing
+  packages by name only (no version).
+- **`packages.config`** — the legacy (pre-`PackageReference`) manifest format, still found in
+  older .NET Framework projects; its `version="..."` attribute is an exact pin (unlike a bare
+  `PackageReference` `Version`'s floor semantics), normalized internally to a bracketed
+  `[1.0.0]` range so the same interval parser handles both forms.
+
+```xml
+<ItemGroup>
+  <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+</ItemGroup>
+```
+
+Every dependency resolves against **nuget.org**'s V3 API (`api.nuget.org/v3/index.json`, a
+service-index indirection that then points at further per-capability resource URLs — see
+below) by default, unless a `NuGet.Config` redirects it to a private feed (see "Private/Custom
+Feeds"). When a `packages.lock.json` (or per-project `packages.<name>.lock.json`) file is
+present, it is read to resolve each dependency's in-use version. NuGet versions follow
+`Major.Minor.Patch[.Revision]` (1–4 numeric components) with SemVer2 prerelease precedence,
+compared case-insensitively — no maintained Rust crate implements this scheme, so `deps-nuget`
+hand-rolls its own comparator (the same pattern `deps-maven` uses for Maven's own scheme).
+
 ## Private/Custom Feeds
 
 A NuGet dependency whose applicable feed is overridden via a repository's

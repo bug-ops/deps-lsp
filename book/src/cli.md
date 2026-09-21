@@ -9,7 +9,8 @@ code.
 
 > **Note:** `deps-cli` implements no classification logic of its own — every verdict comes
 > from the same function `deps-lsp` calls for its LSP diagnostics, so a `deps-cli check`
-> result and an editor's diagnostics for the same manifest never disagree.
+> result and an editor's diagnostics for the same manifest never disagree. See
+> [The deps-engine crate](engine.md) for how that sharing works.
 
 ## Installation
 
@@ -33,12 +34,12 @@ musl), macOS x86_64/Apple Silicon, and Windows x86_64/ARM64.
 
 ### Docker
 
-The image published for the [GitHub Action](#github-action) below
+The image published for the [GitHub Action](github-action.md)
 (`ghcr.io/bug-ops/deps-lsp-github-action`) also bundles a prebuilt `deps-cli` binary, fetched
 from the matching GitHub release and SHA256-verified at build time — no Rust toolchain to
 install, and nothing to trust beyond the image itself. Its default `ENTRYPOINT` is hardcoded to
 the GitHub Action's own contract (`deps-cli check --format sarif`, driven by `DEPS_CLI_*` env
-vars — see [GitHub Action](#github-action)), so running `deps-cli` directly means overriding it:
+vars — see [GitHub Action](github-action.md)), so running `deps-cli` directly means overriding it:
 
 ```bash
 docker run --rm -v "$PWD:/workspace" -w /workspace \
@@ -85,17 +86,46 @@ none are given.
 
 ### Output formats
 
-- **`table`** (default) — human-readable, grouped by file then severity.
-- **`json`** — a versioned document (`schema_version`, currently `1`) with a `findings`
-  array and a per-category `summary` count map; `schema_version` is bumped, and the bump
-  documented as `Breaking` in `CHANGELOG.md`, whenever a field is renamed or removed.
+- **`table`** (default) — human-readable, grouped by manifest path, then by severity
+  (error > warning > information > hint) within each file, ending in a one-line
+  `Summary: outdated=2 vulnerable=1 ...` count by category.
+- **`json`** — a versioned document:
+
+  ```json
+  {
+    "schema_version": 1,
+    "findings": [
+      {
+        "ecosystem": "cargo",
+        "manifest_path": "Cargo.toml",
+        "dependency_name": "serde",
+        "requirement": "1.0",
+        "category": "outdated",
+        "severity": "hint",
+        "range": { "start": { "line": 4, "character": 0 }, "end": { "line": 4, "character": 10 } },
+        "message": "Newer version available: 1.1.0"
+      }
+    ],
+    "summary": { "outdated": 1 }
+  }
+  ```
+
+  `schema_version` is bumped, and the bump documented as `Breaking` in `CHANGELOG.md`,
+  whenever a field is renamed or removed (adding a new optional field is not itself a bump).
+  Note that the JSON schema does **not** carry a finding's OSV advisory id or its
+  `https://osv.dev/vulnerability/{id}` link — only `sarif` output does (see below). If your
+  tooling needs the advisory id/URL for a vulnerability finding, parse `sarif` output instead
+  of `json`.
 - **`sarif`** — a SARIF 2.1.0 document. A vulnerability finding becomes its own SARIF rule
   (keyed by its OSV advisory id, e.g. `RUSTSEC-...`/`GHSA-...`) with a `helpUri` to the
-  advisory page and a `security-severity` score; every other category collapses to one rule
-  per category token. Each result carries a `partialFingerprints` entry derived from
+  advisory page, a `fullDescription` built from the finding's own message, and a
+  `security-severity` score when the OSV scan itself graded that advisory; every other
+  category collapses to one rule per category token, using each category's own description
+  as its `shortDescription`. Each result carries a `partialFingerprints` entry derived from
   manifest path, dependency identity, rule id, and an occurrence ordinal — not the line
   range — so an unrelated line shift elsewhere in the file doesn't make GitHub treat an
-  existing alert as new.
+  existing alert as new. `run.automationDetails.id` disambiguates repeated uploads for the
+  same commit.
 
 ### `--fail-on` categories and exit codes
 
@@ -134,7 +164,9 @@ run unbounded, regardless of the flag.
 
 A single `check` invocation inspects at most 50,000 files across every walked root; beyond
 that the walk stops and the report is marked truncated rather than silently
-under-reporting.
+under-reporting. A single manifest file larger than 10 MB is skipped with a warning rather
+than read in full (the same cap `deps-lsp` applies via `fs_probe::read_to_string_capped` — see
+[Architecture](architecture.md)).
 
 ## Configuration (`deps.toml`)
 
@@ -158,8 +190,15 @@ offline = false
 allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
 ```
 
-`deps-cli` looks for `./deps.toml` relative to the walked root when `--config` is not
-given. `--offline` and `--cooldown` override the loaded config for that run only.
+`deps-cli` looks for `deps.toml` relative to the walked root when `--config` is not given: if
+`check` was given exactly one path, that path's own directory (or its parent, if the path is a
+file); if it was given several paths, or none (the implicit `.`), the lookup falls back to the
+current working directory instead, since there is no single "the walked root" to prefer among
+several. `deps.toml` itself is capped at 1 MB and must be valid TOML matching this schema
+exactly (`deny_unknown_fields` at the top level — an unrecognized top-level key rejects the
+whole file; an unrecognized key nested inside a known section like `[cache]` is tolerated for
+forward compatibility). `--offline` and `--cooldown` override the loaded config for that run
+only.
 
 > **Warning:** An auto-discovered `deps.toml` — found by the default lookup, not passed
 > explicitly via `--config` — has its `registries`, `network`, and
@@ -191,60 +230,12 @@ repos:
       - id: deps-lsp-check
 ```
 
-## GitHub Action
+## Using deps-cli in CI
 
-[`crates/github-action`](https://github.com/bug-ops/deps-lsp/blob/main/crates/github-action)
-is a Docker-based action wrapping `deps-cli check --format sarif`. The published image
-(`ghcr.io/bug-ops/deps-lsp-github-action`) already bundles a `deps-cli` binary — no toolchain
-setup or install step required. It runs the check and writes a SARIF file — it does **not**
-upload it to GitHub code scanning itself; wire `github/codeql-action/upload-sarif` after it in
-your own workflow. Every published image is Trivy-scanned for CRITICAL/HIGH vulnerabilities
-before publish, and on every PR touching `crates/github-action/`.
-
-> **Note:** Docker-based actions only run on Linux runners (`runs-on: ubuntu-latest` or
-> similar) — `macos-latest` and `windows-latest` are not supported.
-
-> **Tip:** Pin `uses:` to a released tag (e.g. `@v1.2.0`) rather than `@main` — `main` is a
-> mutable ref, so a workflow pinned to it re-runs whatever is currently on that branch,
-> including unreviewed or in-progress changes.
-
-```yaml
-jobs:
-  deps-check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: bug-ops/deps-lsp/crates/github-action@v1.2.0
-        id: deps-check
-        with:
-          fail-on: vulnerable,yanked,unsatisfiable
-      - uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: ${{ steps.deps-check.outputs.sarif-file }}
-      - name: Fail the build on a policy violation
-        if: steps.deps-check.outputs.exit-code == '1'
-        run: exit 1
-```
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `paths` | Space-separated paths to walk | repository root |
-| `fail-on` | Comma-separated categories that exit 1 | `vulnerable,yanked,unsatisfiable` |
-| `cooldown` | Overrides `freshness.cooldown_secs` (e.g. `3d`) | unset |
-| `config` | Path to a **fully-trusted** `deps.toml` — see warning below | unset |
-
-The `deps-cli` version is baked into the image at build time — pin a specific version via the
-image tag (`ghcr.io/bug-ops/deps-lsp-github-action:X.Y.Z`) instead of a `version` input.
-
-The action only fails the job itself on an execution error — any exit code other than `0`
-(clean) or `1` (a `--fail-on` category matched), including a `deps-cli` panic or a refused
-SARIF output path. `sarif-file` is left unset in that case, since the file may be missing or
-truncated, but it can also be unset at `exit-code` `0` or `1` if the output path couldn't be
-written. A `--fail-on` policy violation (`exit-code` `1`) does not fail the step; `sarif-file`
-is otherwise still produced and uploaded, and it's your own workflow's decision whether to
-fail the build on it, as shown above.
-
-> **Warning:** the `config` input is treated as fully trusted, unlike an auto-discovered
-> `deps.toml` — only point it at a file outside the scanned checkout and under your own
-> control, never at a path inside the checkout you're scanning, especially in a
-> `pull_request_target` workflow scanning a fork.
+For GitHub Actions specifically, `crates/github-action` ships a ready-made Docker-based action
+wrapping `deps-cli check --format sarif`, with SARIF output wired for
+`github/codeql-action/upload-sarif` — see [GitHub Action](github-action.md) for inputs,
+outputs, exit-code-to-job-failure mapping, and a full workflow example. For any other CI
+system, install `deps-cli` as described above and run `deps-cli check --format sarif` (or
+`json`/`table`) as an ordinary step, using its [exit code](#--fail-on-categories-and-exit-codes)
+to gate the build.

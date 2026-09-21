@@ -1,5 +1,27 @@
 # Go
 
+`deps-go` provides LSP support for Go modules.
+
+## Basics
+
+| | |
+|---|---|
+| Manifest file | `go.mod` |
+| Lock file (in-use version) | `go.sum` (module content-checksum lines, skipping the `/go.mod`-suffixed checksum-only lines) |
+| Registry | Go module proxy — `proxy.golang.org` by default (`/{module}/@v/list`, `/{module}/@v/{version}.info`, `/{module}/@latest`) |
+| Version syntax | Go's own module versioning (semver-based, including pseudo-versions like `v0.0.0-20230101000000-abcdef123456`) |
+
+```go
+require (
+    github.com/gin-gonic/gin v1.9.1
+)
+```
+
+Hovering a `require` line's version shows the latest module version from the proxy and a link
+to its pkg.go.dev page; an outdated requirement gets an inlay hint and a diagnostic with an
+"Update to latest version" code action. `require`/`replace`/`exclude` directives, both the
+single-line and grouped `(...)` block forms, are all parsed with position tracking.
+
 ## `replace` Directives to a Filesystem Path
 
 A module `replace`d to a local filesystem path (`replace acme.com/mod => ./local/mod`) is

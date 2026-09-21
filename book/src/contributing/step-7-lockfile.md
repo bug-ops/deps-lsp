@@ -11,13 +11,13 @@ use deps_core::lockfile::{
     LockFileProvider, ResolvedPackage, ResolvedPackages, ResolvedSource,
     locate_lockfile_for_manifest,
 };
-use tower_lsp_server::ls_types::Uri;
+use url::Url;
 
 /// Lock file parser for {Ecosystem}.
 pub struct {Ecosystem}LockfileParser;
 
 impl LockFileProvider for {Ecosystem}LockfileParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> {
+    fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, &["{lockfile_name}"])
     }
 

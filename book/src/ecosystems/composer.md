@@ -1,5 +1,30 @@
 # Composer
 
+## Basics
+
+Composer manifests are `composer.json`, with dependencies under `require` (production) and
+`require-dev` (development):
+
+```json
+{
+  "require": {
+    "symfony/console": "^7.0",
+    "monolog/monolog": "~3.5"
+  }
+}
+```
+
+Platform packages (`php`, `ext-*`, `lib-*`) are filtered out — they name a PHP runtime or
+extension, not a Packagist package, and have no registry entry to resolve. Every remaining
+entry is resolved against **Packagist**'s metadata API
+(`repo.packagist.org/p2/{vendor}/{package}.json`), with hover showing the latest version,
+license, and (if the maintainer flagged the package) an "abandoned" notice. Completion queries
+Packagist's `packagist.org/search.json` endpoint. Version constraints use Composer's own
+syntax — caret (`^7.0`, compatible up to the next major), tilde (`~3.5`, compatible up to the
+next minor), exact pins, and wildcards — compared with the stability-aware ordering described
+below. When a `composer.lock` exists alongside the manifest, it is read to resolve each
+dependency's actual in-use (installed) version, shown alongside the declared constraint.
+
 ## Version Comparison
 
 `compare_versions` previously discarded everything after the first non-digit character in a

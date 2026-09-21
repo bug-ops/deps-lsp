@@ -8,14 +8,14 @@ Create manifest parser in `parser.rs` with **position tracking**:
 use crate::error::Result;
 use crate::types::{Ecosystem}Dependency;
 use std::any::Any;
-use tower_lsp_server::ls_types::{Uri};
+use url::Url;
 use deps_core::lsp_helpers::LineOffsetTable;
 
 /// Parse result containing dependencies and metadata.
 #[derive(Debug)]
 pub struct {Ecosystem}ParseResult {
     pub dependencies: Vec<{Ecosystem}Dependency>,
-    pub uri: Uri,
+    pub uri: Url,
 }
 
 impl deps_core::ParseResult for {Ecosystem}ParseResult {
@@ -30,7 +30,7 @@ impl deps_core::ParseResult for {Ecosystem}ParseResult {
         None // Override if ecosystem supports workspaces
     }
 
-    fn uri(&self) -> &Uri {
+    fn uri(&self) -> &Url {
         &self.uri
     }
 
@@ -40,7 +40,7 @@ impl deps_core::ParseResult for {Ecosystem}ParseResult {
 }
 
 /// Parse manifest file and extract dependencies with positions.
-pub fn parse_{manifest}(content: &str, uri: &Uri) -> Result<{Ecosystem}ParseResult> {
+pub fn parse_{manifest}(content: &str, uri: &Url) -> Result<{Ecosystem}ParseResult> {
     let line_table = LineOffsetTable::new(content);
 
     // TODO: Implement actual parsing logic

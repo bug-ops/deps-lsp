@@ -1,5 +1,31 @@
 # Deno
 
+`deps-deno` provides LSP support for Deno projects, which can depend on packages from two
+different registries in the same `imports` map.
+
+## Basics
+
+| | |
+|---|---|
+| Manifest file | `deno.json` or `deno.jsonc` |
+| Lock file (in-use version) | not yet supported — `deno.lock` parsing is a documented gap; no `LockFileProvider` is registered for this ecosystem |
+| Registry | `jsr:` specifiers resolve against JSR (`jsr.io`/`api.jsr.io`); `npm:` specifiers resolve against the same npm registry client `deps-npm` uses |
+| Version syntax | node-semver ranges, same as npm |
+
+```json
+{
+  "imports": {
+    "@std/fs": "jsr:@std/fs@^1.0.0",
+    "lodash": "npm:lodash@^4.17.21"
+  }
+}
+```
+
+A dependency's scheme prefix (`jsr:` or `npm:`) determines which registry client serves its
+hover, completion, and diagnostics — both schemes get the identical LSP experience version
+data otherwise gets (outdated/unsatisfiable diagnostics, inlay hints, code actions), just
+sourced from different upstream registries.
+
 ## Non-Registry Dependency Sources
 
 A `deno.json`/`deno.jsonc` `imports` entry resolved to a private npm scope via `.npmrc` is

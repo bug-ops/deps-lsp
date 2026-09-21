@@ -1,5 +1,32 @@
 # PyPI
 
+`deps-pypi` provides LSP support for Python projects, covering both TOML-based manifests and
+pip's line-oriented requirements-file format from one crate.
+
+## Basics
+
+| | |
+|---|---|
+| Manifest files | `pyproject.toml` (PEP 621, PEP 735, Poetry, PEP 517/518 `build-system.requires`); `requirements*.txt`, `*-requirements.txt`, `*.requirements.txt`, `constraints*.txt`; any `.txt` directly under a `requirements/` directory |
+| Lock file (in-use version) | `poetry.lock` or `uv.lock` |
+| Registry | PyPI — PEP 691 Simple API JSON (`pypi.org/simple/{package}/`) for version lookups, JSON API (`pypi.org/pypi/{package}/json`) for hover metadata |
+| Version syntax | PEP 440 version specifiers, parsed via `pep440_rs`; full PEP 508 requirement strings (extras, environment markers) via `pep508_rs` |
+
+```toml
+[project]
+dependencies = [
+    "requests>=2.31,<3",
+    "numpy>=1.24; python_version>='3.9'",
+]
+```
+
+Hover shows the requirement's PEP 440 satisfaction against the latest PyPI release, extras
+(`requests[socks]`), and — when present — the environment marker in a readable "Active when:"
+form (see [Environment Markers](#environment-markers-pep-508) below). The same PEP 508 parsing
+machinery renders `requirements.txt` entries identically, so switching between `pyproject.toml`
+and a requirements file changes nothing about hover/diagnostic/completion behavior for an
+otherwise-identical requirement string.
+
 ## Custom/Private Indexes
 
 A PyPI/pip dependency whose applicable index is overridden via `requirements.txt`

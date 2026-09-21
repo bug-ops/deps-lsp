@@ -1,5 +1,12 @@
 # Step 6: Implement the Ecosystem Trait
 
+> **Note:** everything below that touches `tower-lsp-server` types (`Range`, `CompletionItem`,
+> the `generate_completions`/`complete_version` methods) belongs behind this crate's
+> `lsp-responses` feature (see [Step 1](step-1-crate.md)) in the real implementation — e.g.
+> `#[cfg(feature = "lsp-responses")] use tower_lsp_server::ls_types::Range;`. Omitted from the
+> snippet below for readability; see `crates/deps-maven/src/ecosystem.rs` for the full
+> `#[cfg(feature = "lsp-responses")]`-gated shape.
+
 Create the main ecosystem implementation in `ecosystem.rs`:
 
 ```rust
@@ -7,7 +14,8 @@ Create the main ecosystem implementation in `ecosystem.rs`:
 
 use std::any::Any;
 use std::sync::Arc;
-use tower_lsp_server::ls_types::{Range, Uri};
+use tower_lsp_server::ls_types::Range;
+use url::Url;
 
 use deps_core::{
     Ecosystem, HttpCache, PackageName, ParseResult as ParseResultTrait, Registry, Result,
@@ -62,7 +70,7 @@ impl Ecosystem for {Ecosystem}Ecosystem {
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
-        uri: &'a Uri,
+        uri: &'a Url,
     ) -> BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
             let result = parse_{manifest}(content, uri)?;

@@ -5,6 +5,61 @@ back to the Gradle Plugin Portal for a group ID not found there), so most of Mav
 version comparison, range matching, freshness — applies identically to both ecosystems. This
 chapter documents them together; ecosystem-specific notes are called out where they diverge.
 
+## Basics
+
+**Maven** manifests are `pom.xml` files. `deps-lsp` reads `<dependency>` entries under
+`<dependencies>` and `<dependencyManagement>`, plus `<plugin>` entries under `<build><plugins>`:
+
+```xml
+<dependencies>
+  <dependency>
+    <groupId>org.apache.commons</groupId>
+    <artifactId>commons-lang3</artifactId>
+    <version>3.14.0</version>
+  </dependency>
+</dependencies>
+```
+
+Hovering over `commons-lang3` or `3.14.0` queries **Maven Central**
+(`repo1.maven.org/maven2`) for the artifact's `maven-metadata.xml`, showing the latest
+release and recent version history. A `groupId` under `androidx.*`, `com.google.firebase.*`,
+`com.google.android.*`, `com.google.gms.*`, or `com.android.*` resolves against **Google
+Maven** (`dl.google.com/dl/android/maven2`) instead — Google does not mirror these artifacts
+to Maven Central. Any group ID not found on Maven Central also falls back to the **Gradle
+Plugin Portal** (`plugins.gradle.org/m2`), which is how a coordinate that is really a Gradle
+plugin (declared as a plain dependency, not a `plugins {}` block) still resolves. Completion
+for `<groupId>`/`<artifactId>`/`<version>` uses Maven Central's Solr search API
+(`search.maven.org/solrsearch`). Maven has no lock file — the version written in `pom.xml` (or
+resolved through a `${property}` reference, see below) is always the "in-use" version.
+
+**Gradle** manifests are `build.gradle` (Groovy DSL), `build.gradle.kts` (Kotlin DSL),
+`settings.gradle`/`settings.gradle.kts` (for `pluginManagement {}` dependencies), and
+`gradle/libs.versions.toml` (the Gradle **version catalog** format). A dependency declared in
+any Gradle configuration — `implementation`, `api`, `testImplementation`,
+`androidTestImplementation`, `compileOnly`, `classpath`, the legacy `compile`/`testCompile`/
+`provided`, and their variant-prefixed forms — is recognized:
+
+```kotlin
+dependencies {
+    implementation("com.google.guava:guava:33.0.0-jre")
+    testImplementation("junit:junit:4.13.2")
+}
+```
+
+```toml
+# gradle/libs.versions.toml
+[versions]
+guava = "33.0.0-jre"
+[libraries]
+guava = { module = "com.google.guava:guava", version.ref = "guava" }
+```
+
+`deps-gradle`'s own parser dispatches by file name/extension into a dedicated Groovy, Kotlin,
+`.properties`, `settings.gradle(.kts)`, or version-catalog sub-parser — but all of them resolve
+coordinates through the *same* Maven Central registry client Maven uses (see the top of this
+page), so hover/completion/diagnostics behavior described for Maven below applies to Gradle too
+unless a section says otherwise. Gradle has no lock file either.
+
 ## Non-Registry Dependency Sources (Maven)
 
 A Maven `<dependency>` with `<scope>system</scope>` and a `<systemPath>` — an explicit
