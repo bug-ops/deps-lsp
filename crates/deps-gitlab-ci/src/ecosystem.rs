@@ -596,6 +596,13 @@ impl Ecosystem for GitlabCiEcosystem {
 }
 
 fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagnostic> {
+    // #1254: redact before sanitizing/truncating so a credential can't survive a cut.
+    let redact_and_sanitize = |s: &str| {
+        sanitize_and_truncate_for_diagnostic(
+            &deps_core::net_policy::redact_declaration_key(s),
+            MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS,
+        )
+    };
     parse_result
         .dependencies()
         .into_iter()
@@ -607,20 +614,14 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
             // actively wrong.
             let message = match &gl_dep.host {
                 HostRef::Unresolved(raw) => {
-                    let raw = sanitize_and_truncate_for_diagnostic(
-                        raw,
-                        MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS,
-                    );
+                    let raw = redact_and_sanitize(raw);
                     format!(
                         "Cannot determine the GitLab instance host for '{raw}'. Set the \
                          `registries.gitlab_instance_host` setting to enable version resolution."
                     )
                 }
                 HostRef::CapacityRefused(origin) => {
-                    let origin = sanitize_and_truncate_for_diagnostic(
-                        origin,
-                        MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS,
-                    );
+                    let origin = redact_and_sanitize(origin);
                     format!(
                         "'{origin}' was not registered for version resolution because a \
                          GitLab CI host/route capacity limit was reached. Reduce the number of \
@@ -1224,6 +1225,62 @@ mod tests {
              GitLab hosts or includes referenced in this workspace (unrelated to the \
              `registries.gitlab_instance_host` setting)."
         );
+    }
+
+    /// #1254: a credential-shaped `Unresolved`/`CapacityRefused` value (e.g. an `include:`
+    /// URL embedding a token) must be redacted in the diagnostic MESSAGE, not just in
+    /// `Debug` output (already covered by
+    /// `types::tests::test_host_ref_unresolved_and_capacity_refused_redact_credentials`).
+    #[test]
+    fn test_unresolved_host_diagnostics_redacts_credentials_in_message() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let range = deps_core::position::Range::default();
+        let make_dep = |host: HostRef| crate::types::GitlabCiDependency {
+            name: "org/proj/comp".into(),
+            name_range: range,
+            version_req: Some("1.0.0".into()),
+            version_range: Some(range),
+            version_literal: None,
+            source: deps_core::parser::DependencySource::CustomRegistry { url: "x".into() },
+            is_plain_scalar: true,
+            is_alias_occurrence: false,
+            kind: IncludeKind::Component,
+            host,
+            pin: Some(PinStyle::Tag),
+            project_path: "org/proj".to_string(),
+        };
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![
+                make_dep(HostRef::Unresolved(
+                    deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+                )),
+                make_dep(HostRef::CapacityRefused(
+                    deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+                )),
+            ],
+            routes: vec![],
+            uri,
+            dependency_truncation: None,
+            blocked_registries: Vec::new(),
+        };
+
+        let diagnostics = unresolved_host_diagnostics(&parse_result);
+
+        assert_eq!(diagnostics.len(), 2);
+        for diagnostic in &diagnostics {
+            assert!(
+                !diagnostic
+                    .message
+                    .contains(deps_core::conformance::CREDENTIAL_PROBE_SECRET),
+                "plaintext credential survived into the diagnostic message: {}",
+                diagnostic.message
+            );
+            assert!(
+                diagnostic.message.contains("***@git.internal.corp"),
+                "expected the redacted `***@host` form in the diagnostic message: {}",
+                diagnostic.message
+            );
+        }
     }
 
     /// Regression for the FR-012 diagnostic: an unresolved-host dependency must get the

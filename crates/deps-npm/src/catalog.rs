@@ -417,9 +417,21 @@ impl CatalogOrigin {
     /// paying `escape_markdown`'s backslash-per-punctuation cost for common, harmless values
     /// like a scoped package name (`@myorg/pkg`). See [`Self::hover_detail`] for the sibling
     /// rendering that *does* feed Markdown and therefore must escape.
+    ///
+    /// Still sanitized against Trojan-Source bidi-override / invisible-character injection
+    /// (CWE-117, #1256) via [`deps_core::net_policy::sanitize_invisible`] — `render()`'s inputs
+    /// are already length-bounded by `bounded()`, so only sanitization (not a second, different
+    /// truncation bound) is applied here. Both the `code` closure (wrapping the raw
+    /// `catalog:...` specifier, which `render()` feeds into most of its non-`None` match arms)
+    /// and the `text` closure (wrapping `dependency_name`/catalog name) sanitize — the
+    /// specifier is just as attacker-controlled as either name.
     #[must_use]
     pub fn diagnostic_message(&self, dependency_name: &str) -> Option<String> {
-        self.render(dependency_name, |s| format!("`{s}`"), str::to_string)
+        self.render(
+            dependency_name,
+            |s: &str| format!("`{}`", deps_core::net_policy::sanitize_invisible(s)),
+            |s: &str| deps_core::net_policy::sanitize_invisible(s).into_owned(),
+        )
     }
 
     /// Markdown-safe rendering of this outcome for the hover `**Catalog**` line.
@@ -1282,6 +1294,57 @@ mod tests {
             message.len() < 1_000,
             "diagnostic message was not truncated: {} bytes",
             message.len()
+        );
+    }
+
+    /// #1256: a Trojan-Source bidi-override in a dependency or catalog name must not survive
+    /// into the plain-text diagnostic message, mirroring the invisible-character sanitization
+    /// already applied to hover/other diagnostic sinks for #1252.
+    #[test]
+    fn test_diagnostic_message_sanitizes_bidi_override_in_dependency_name() {
+        let evil_name = "pkg\u{202E}live-only-pkg\u{2066}";
+        let o = origin("catalog:", None, CatalogOutcome::MissingEntry);
+        let message = o.diagnostic_message(evil_name).unwrap();
+        assert!(
+            !message.contains('\u{202E}') && !message.contains('\u{2066}'),
+            "bidi-override/invisible characters survived into the diagnostic message: {message:?}"
+        );
+    }
+
+    #[test]
+    fn test_diagnostic_message_sanitizes_bidi_override_in_catalog_name() {
+        // `catalog` is always `specifier`'s own `strip_prefix("catalog:")` tail (#1256 M1).
+        let evil_catalog = "react\u{202E}17\u{2066}";
+        let specifier = format!("catalog:{evil_catalog}");
+        let o = origin(
+            &specifier,
+            Some(evil_catalog),
+            CatalogOutcome::UnknownCatalog,
+        );
+        let message = o.diagnostic_message("react").unwrap();
+        // Full-message equality catches a regression that sanitizes it down to nothing.
+        assert_eq!(
+            message,
+            "`catalog:react 17 ` refers to catalog 'react 17 ', which is not defined in \
+             pnpm-workspace.yaml"
+        );
+    }
+
+    /// #1256 S1: the raw specifier reaches `render()`'s `code` closure independently of the
+    /// `text` closure (dependency/catalog name) — `NoWorkspaceFile`'s message interpolates
+    /// only `{specifier}`, never `catalog_phrase`, so this isolates the `code` closure's own
+    /// sanitization rather than incidentally passing because the `text` closure already
+    /// sanitized the same dirty substring.
+    #[test]
+    fn test_diagnostic_message_sanitizes_bidi_override_in_specifier() {
+        let evil_tail = "react\u{202E}17\u{2066}";
+        let specifier = format!("catalog:{evil_tail}");
+        let o = origin(&specifier, Some(evil_tail), CatalogOutcome::NoWorkspaceFile);
+        let message = o.diagnostic_message("react").unwrap();
+        assert_eq!(
+            message,
+            "`catalog:react 17 ` requires a pnpm-workspace.yaml in an ancestor directory; \
+             none was found"
         );
     }
 
