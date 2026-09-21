@@ -163,10 +163,12 @@ jobs:
         # Keyless signing via GitHub Actions OIDC (id-token: write above) — no key material
         # to manage. `shell: bash` so this one step covers both the tar.gz (Unix) and zip
         # (Windows) branches uniformly; GitHub-hosted windows-latest runners ship Git Bash.
+        # cosign v3 defaults sign-blob to a single bundle file and silently ignores
+        # --output-signature/--output-certificate unless --new-bundle-format=false is set.
         shell: bash
         run: |
           for f in "deps-lsp-${{ matrix.target }}.${{ matrix.archive }}" "deps-cli-${{ matrix.target }}.${{ matrix.archive }}"; do
-            cosign sign-blob --yes --output-signature "${f}.sig" --output-certificate "${f}.pem" "$f"
+            cosign sign-blob --yes --new-bundle-format=false --output-signature "${f}.sig" --output-certificate "${f}.pem" "$f"
           done
 
       - name: Upload release archive
