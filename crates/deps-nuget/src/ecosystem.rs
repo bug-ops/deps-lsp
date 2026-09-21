@@ -39,13 +39,14 @@ use crate::lockfile::NuGetLockParser;
 use crate::parser::NuGetParseResult;
 use crate::registry::NuGetRegistry;
 
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions: the two range delimiters `version::parse_range` accepts
-/// (`[1.0,2.0)`) — `deps_core::interval::BracketStyle::Standard`, no reversed-bracket form
-/// (NuGet spec §2). A bare version (no leading bracket, including `1.0.*` floating
-/// versions) is a floor, not a range, and has no operator to strip. Originally left empty,
-/// which meant a completion prefix like `"[2.2"` was never stripped down to `"2.2"` and so
-/// never prefix-matched any real version (#1137 critic S1).
+/// Leading version-constraint operators stripped from a completion prefix before
+/// matching it against registry versions: the two range delimiters
+/// `version::parse_range` accepts (`[1.0,2.0)`) —
+/// `deps_core::interval::BracketStyle::Standard`, no reversed-bracket form (NuGet spec
+/// §2). A bare version (no leading bracket, including `1.0.*` floating versions) is a
+/// floor, not a range, and has no operator to strip. Originally left empty, which meant
+/// a completion prefix like `"[2.2"` was never stripped down to `"2.2"` and so never
+/// prefix-matched any real version (#1137 critic S1).
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['[', '('];
 
@@ -98,7 +99,9 @@ impl NuGetEcosystem {
     /// Deliberately source-blind (mirrors `deps-npm::ecosystem::NpmEcosystem::
     /// complete_package_names`'s identical rationale): the string here is a prefix the user
     /// typed into the name field, not a resolved private dependency name, so it is safe to
-    /// send to api.nuget.org unconditionally — unlike [`Self::complete_versions`].
+    /// send to api.nuget.org unconditionally — unlike version completion, which gates on
+    /// `can_resolve_source` before ever reaching the registry (see
+    /// [`Ecosystem::complete_version`]'s default implementation).
     #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
         deps_core::completion::complete_package_names_generic(
@@ -106,41 +109,6 @@ impl NuGetEcosystem {
             prefix,
             20,
             range,
-        )
-        .await
-    }
-
-    /// Completes version requirements for the dependency at `position`, resolved by cursor
-    /// position rather than by name (issue #593) — delegates to
-    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
-    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
-    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
-    /// routing (issue #523): two dependencies sharing one `PackageName` but resolving to
-    /// different sources used to collapse into an ambiguous, empty result for both
-    /// occurrences, even though the cursor position unambiguously identifies which one the
-    /// user is editing.
-    ///
-    /// An unresolvable source still offers no completions rather than risking a private
-    /// package name lookup against api.nuget.org — the shared helper's gate is what keeps
-    /// `Registry::get_versions_from`'s permissive routing of an unrecognized source to the
-    /// default public client (matching hover/diagnostics/code-actions' identical gate) from
-    /// leaking one for completions too.
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
         )
         .await
     }
@@ -270,22 +238,8 @@ impl Ecosystem for NuGetEcosystem {
     }
 
     #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 
     /// Overrides the default (`lsp_helpers::generate_hover`) to add a hover-only unlisted
@@ -510,6 +464,9 @@ mod tests {
     use super::*;
     #[cfg(feature = "lsp-responses")]
     use crate::types::NuGetDependency;
+
+    #[cfg(feature = "lsp-responses")]
+    deps_core::complete_versions_test_shim!(NuGetEcosystem);
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_lockfile_filenames/test_as_any
@@ -755,6 +712,61 @@ mod tests {
             !results.is_empty(),
             "position-based lookup must resolve the dependency at the cursor position"
         );
+    }
+
+    /// #1223 M2: proves `NuGetEcosystem`'s `version_operator_chars()` override (`['[', '(']`)
+    /// is actually wired into the shared `Ecosystem::complete_version` default, not just
+    /// declared — a bracket-interval-shaped prefix (`"[1."`, as typed mid-`[1.0,2.0)`) must
+    /// prefix-match real version data with the leading `[` stripped, not fall through to an
+    /// unfiltered top-N list. `2.0.0`'s presence in the mocked feed alongside `1.0.0`/`1.2.0`
+    /// is what makes the assertion below reflect filtering rather than an unfiltered list —
+    /// mirrors `deps_composer::ecosystem::tests::
+    /// test_generate_completions_strips_not_equal_operator_against_real_registry`'s same
+    /// non-vacuous-filtering shape for Composer's `!=` operator.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_complete_versions_strips_bracket_operator_against_real_registry() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let _index_mock = server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(nuget_service_index_body(&base))
+            .create_async()
+            .await;
+        let _flat_mock = server
+            .mock("GET", "/flatcontainer/targetpkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "1.2.0", "2.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let registry = NuGetRegistry::with_service_index_url(
+            Arc::new(deps_core::HttpCache::new()),
+            format!("{base}/index.json"),
+        );
+        let eco = NuGetEcosystem::with_registry(registry);
+
+        let dep = dep_with_source("targetpkg", DependencySource::Registry, 0);
+        let position = dep.version_range.unwrap().start;
+        let parse_result = NuGetParseResult {
+            dependencies: vec![dep],
+            uri: deps_core::test_util::test_uri("/test/App.csproj"),
+            resolved_chains: Vec::new(),
+            blocked_registries: Vec::new(),
+            dependency_truncation: None,
+        };
+
+        let results = eco
+            .complete_versions(
+                &parse_result,
+                position.into(),
+                "[1.",
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+        assert!(!results.is_empty());
+        assert!(results.iter().all(|r| r.label.starts_with("1.")));
     }
 
     #[cfg(feature = "lsp-responses")]

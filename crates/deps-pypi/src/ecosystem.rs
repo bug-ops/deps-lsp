@@ -8,7 +8,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Position, Range, Uri};
+use tower_lsp_server::ls_types::{CompletionItem, DocumentLink, Range, Uri};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -163,42 +163,6 @@ impl PypiEcosystem {
             deps_core::ecosystem_registry::manifest_pattern_matches(basename, pattern)
         })
     }
-
-    /// Completes version requirements for the dependency at `position`, resolved by cursor
-    /// position rather than by name (issue #593) — delegates to
-    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
-    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
-    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
-    /// routing (validator finding #1): two dependencies sharing one `PackageName` but
-    /// resolving to different sources used to collapse into an ambiguous, empty result for
-    /// both occurrences, even though the cursor position unambiguously identifies which one
-    /// the user is editing.
-    ///
-    /// An unresolvable source (`CustomRegistry`, or anything
-    /// [`SourcePolicy::can_resolve_source`](deps_core::lsp_helpers::SourcePolicy::can_resolve_source)
-    /// rejects) still offers no completions rather than risking a private package name lookup
-    /// against `pypi.org` — the shared helper's gate is what keeps `Registry::get_versions_from`'s
-    /// permissive routing of an unrecognized source to the default public client (matching
-    /// hover/diagnostics/code-actions' identical gate) from leaking one for completions too.
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
-        )
-        .await
-    }
 }
 
 impl deps_core::ecosystem::private::Sealed for PypiEcosystem {}
@@ -319,22 +283,8 @@ impl Ecosystem for PypiEcosystem {
     }
 
     #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 
     fn package_search_is_incomplete(&self) -> bool {
@@ -730,6 +680,11 @@ mod tests {
     use deps_core::{VersionData, parser::DependencySource};
     use std::assert_matches;
     use std::collections::HashMap;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
+
+    #[cfg(feature = "lsp-responses")]
+    deps_core::complete_versions_test_shim!(PypiEcosystem);
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)

@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
@@ -17,11 +17,12 @@ use deps_core::{
 use crate::formatter::ComposerFormatter;
 use crate::registry::PackagistRegistry;
 
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions: caret `^`, tilde `~`, the comparison set `>=`/`<=`/`>`/`<`/
-/// `=`, and `!=` — `formatter::ComposerFormatter::version_satisfies_requirement` accepts all
-/// of these, including `!=`, which was missing here (#1137). `*` covers the bare wildcard
-/// requirement; the trailing-wildcard form (`"1.0.*"`) has no leading operator to strip.
+/// Leading version-constraint operators stripped from a completion prefix before
+/// matching it against registry versions: caret `^`, tilde `~`, the comparison set
+/// `>=`/`<=`/`>`/`<`/`=`, and `!=` — `formatter::ComposerFormatter::
+/// version_satisfies_requirement` accepts all of these, including `!=`, which was
+/// missing here (#1137). `*` covers the bare wildcard requirement; the trailing-wildcard
+/// form (`"1.0.*"`) has no leading operator to strip.
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*', '!'];
 
@@ -81,29 +82,6 @@ impl ComposerEcosystem {
             prefix,
             20,
             range,
-        )
-        .await
-    }
-
-    // Position-based, gated (#593, #1136) via `SourcePolicy::can_resolve_source` — a `Git`/
-    // `Path`/`Url`-classified dependency (#1202: `repositories` classification, see
-    // `parser::classify_repositories`) now correctly yields zero completions here.
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
         )
         .await
     }
@@ -167,22 +145,8 @@ impl Ecosystem for ComposerEcosystem {
     }
 
     #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 
     fn fallback_completion_prefix<'a>(
@@ -263,6 +227,8 @@ mod tests {
     use deps_core::{EcosystemConfig, VersionData};
     #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
     // test_ecosystem_manifest_filenames, and test_ecosystem_lockfile_filenames. Also closes

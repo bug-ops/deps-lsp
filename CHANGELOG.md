@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `PackageName` no longer implements `Display`/`ToString`; its `Debug` impl now redacts a credential-shaped name instead of deriving, so `?name` and any struct embedding a `PackageName` are safe by construction (resolves #1217) (#1219)
 - **deps-core, deps-cargo, deps-npm, deps-bundler, deps-deno, deps-maven, deps-nuget, deps-dart, deps-composer**: `Registry::search` is renamed to `search_raw`, with a new inherent `search` gate on `dyn Registry` (which an implementor cannot override) that rejects a credential- or query-bearing search string before it ever reaches a registry, and redacts the 9 concrete registries' own `search` tracing spans (resolves #1215) (#1219)
 
+### Changed
+- **deps-core, deps-npm, deps-pypi, deps-go, deps-composer, deps-swift, deps-nuget, deps-cargo, deps-dart, deps-bundler, deps-deno**: `Ecosystem::complete_version` now has a shared default implementation (backed by a new `version_operator_chars` hook), replacing ten byte-identical hand-written implementations (resolves #1223)
+
 ### Fixed
 - **deps-core, deps-deno, deps-npm, deps-lsp**: an `.npmrc` change now reparses every ecosystem that watches it (not just one) and forces a full refetch instead of a silent no-op diff, so an open `deno.json`/`package.json` document picks up the new registry routing (resolves #1232) (#1234)
 - **deps-deno**: `npm:`-scope imports classified `AlternateRegistry` via `.npmrc` are now actually fetched through the resolved registry instead of being silently dropped from the fetch queue, matching `package.json`'s behavior for the identical entry (resolves #1227) (#1231)

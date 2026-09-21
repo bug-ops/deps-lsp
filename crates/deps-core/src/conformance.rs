@@ -17,10 +17,11 @@
 //! actually override `select_latest_matching` instead of inheriting the trait's `None`
 //! default" — with no structural link between the copies, so a fix or a new edge case applied
 //! to one crate's copy routinely never reached the other thirteen. This module is the single
-//! implementation of each family;
-//! the six `#[macro_export]`ed macros below only generate `#[test] fn` scaffolding around the
-//! plain `assert_*` functions here, so a fix to an assertion fixes every ecosystem invoking it
-//! at once.
+//! implementation of each family; most `#[macro_export]`ed macros below only generate
+//! `#[test] fn` scaffolding around the plain `assert_*` functions here, so a fix to an
+//! assertion fixes every ecosystem invoking it at once. The one exception is
+//! [`complete_versions_test_shim!`], which generates a reusable *inherent method* (not a
+//! test) — see its own doc for why.
 //!
 //! Gated identically to [`crate::test_util`] (`#[cfg(any(test, feature = "test-util"))]`):
 //! usable from this crate's own tests and from any workspace crate that enables `test-util` in
@@ -2012,6 +2013,94 @@ macro_rules! operator_chars_conformance {
             #[test]
             fn operator_chars_cover_parser_operators() {
                 operator_chars_cover_parser_operators_impl();
+            }
+        }
+    };
+}
+
+/// Generates a test-only `complete_versions` inherent async method on `$ecosystem_ty`.
+///
+/// Signature: `(&self, parse_result, position, prefix, freshness) -> Vec<CompletionItem>`,
+/// reproducing the pre-#1223 per-ecosystem private helper's call shape over
+/// [`crate::Ecosystem::complete_version`]'s shared default implementation
+/// (`self.registry()`/`self.formatter()`/`self.version_operator_chars()` +
+/// [`crate::completion::complete_versions_at_position`]).
+///
+/// Every ecosystem crate migrated onto the shared `complete_version` default (#1223) had its
+/// own hand-written `complete_versions` test helper with this exact signature, called from
+/// its pre-existing version-completion tests. Generating it here instead of leaving multiple
+/// hand-copies in sync keeps those tests' call sites unchanged while making sure they all
+/// exercise the real, now-shared code path rather than a bespoke per-crate copy of it.
+///
+/// `PackageName::new("")` is a throwaway inside the generated body: the default
+/// `complete_version` implementation never reads its `package_name` argument, deriving the
+/// dependency from `parse_result` and cursor `position` instead (issue #593).
+///
+/// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — see
+/// [`ecosystem_conformance!`]'s doc for why this macro does not emit its own `#[cfg(test)]`.
+///
+/// Wrapped in an explicit `mod example` — see [`ecosystem_conformance!`]'s doc for why.
+///
+/// # Examples
+///
+/// ```
+/// mod example {
+/// # use std::any::Any;
+/// # use std::sync::Arc;
+/// # struct FakeRegistry;
+/// # impl deps_core::Registry for FakeRegistry {
+/// #     fn get_versions<'a>(&'a self, _name: &'a deps_core::PackageName)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>> + Send + 'a>> {
+/// #         Box::pin(async move { Ok(vec![]) })
+/// #     }
+/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
+/// #         Box::pin(async move { Ok(None) })
+/// #     }
+/// #     fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
+/// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
+/// #         Box::pin(async move { Ok(vec![]) })
+/// #     }
+/// #     fn as_any(&self) -> &dyn Any { self }
+/// # }
+/// # struct Fake { registry: Arc<FakeRegistry> }
+/// # impl deps_core::ecosystem::private::Sealed for Fake {}
+/// # impl deps_core::Ecosystem for Fake {
+/// #     fn id(&self) -> &'static str { "fake" }
+/// #     fn ecosystem_id(&self) -> deps_core::EcosystemId { deps_core::EcosystemId::Cargo }
+/// #     fn display_name(&self) -> &'static str { "Fake" }
+/// #     fn manifest_filenames(&self) -> &[&'static str] { &["fake.toml"] }
+/// #     fn registry(&self) -> Arc<dyn deps_core::Registry> { self.registry.clone() }
+/// #     fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter { unimplemented!() }
+/// #     fn parse_manifest<'a>(&'a self, _content: &'a str, _uri: &'a url::Url)
+/// #         -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Box<dyn deps_core::ParseResult>>> {
+/// #         unimplemented!()
+/// #     }
+/// #     fn completion_insert_text(&self, _metadata: &dyn deps_core::Metadata) -> Option<String> { None }
+/// #     fn as_any(&self) -> &dyn Any { self }
+/// # }
+/// deps_core::complete_versions_test_shim!(Fake);
+/// }
+/// ```
+#[macro_export]
+macro_rules! complete_versions_test_shim {
+    ($ecosystem_ty:ty) => {
+        impl $ecosystem_ty {
+            async fn complete_versions(
+                &self,
+                parse_result: &dyn $crate::ParseResult,
+                position: tower_lsp_server::ls_types::Position,
+                prefix: &str,
+                freshness: $crate::FreshnessSettings,
+            ) -> Vec<tower_lsp_server::ls_types::CompletionItem> {
+                use $crate::Ecosystem as _;
+                self.complete_version(
+                    $crate::completion::CompletionRequest::new(parse_result, position, freshness),
+                    $crate::PackageName::new(""),
+                    prefix.to_string(),
+                )
+                .await
+                .items
             }
         }
     };

@@ -3,7 +3,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -67,27 +67,6 @@ impl BundlerEcosystem {
         )
         .await
     }
-
-    // Position-based, gated: see complete_versions_at_position's own doc (#593, #1136).
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
-        )
-        .await
-    }
 }
 
 impl deps_core::ecosystem::private::Sealed for BundlerEcosystem {}
@@ -143,22 +122,8 @@ impl Ecosystem for BundlerEcosystem {
     }
 
     #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 
     fn completion_insert_text(&self, metadata: &dyn deps_core::Metadata) -> Option<String> {
@@ -175,6 +140,11 @@ impl Ecosystem for BundlerEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "lsp-responses")]
+    use tower_lsp_server::ls_types::Position;
+
+    #[cfg(feature = "lsp-responses")]
+    deps_core::complete_versions_test_shim!(BundlerEcosystem);
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/

@@ -6,7 +6,7 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
@@ -144,51 +144,12 @@ impl CargoEcosystem {
         .await
     }
 
-    /// Completes version requirements for the dependency at `position`, resolved by cursor
-    /// position rather than by name (issue #593) — delegates to
-    /// [`deps_core::completion::complete_versions_at_position`], which mirrors
-    /// `deps_gitlab_ci::ecosystem::GitLabCiEcosystem::generate_completions`'s reference
-    /// pattern. Position-based lookup also fixes a residual gap in the old name-based
-    /// [`resolve_completion_source`] routing: two dependencies sharing one `PackageName` but
-    /// resolving to different sources (e.g. two `[[registries]]`-scoped Cargo entries) used to
-    /// collapse into `CompletionSource::Ambiguous` and offer no completions for either
-    /// occurrence, even though the cursor position unambiguously identifies which one the user
-    /// is editing.
-    ///
-    /// The shared helper's `can_resolve_source` gate keeps `Registry::get_versions_from`'s
-    /// permissive catch-all (anything it doesn't explicitly recognize — Git, Path, an
-    /// unresolved `CustomRegistry`, ...) from leaking a private/non-registry dependency's name
-    /// to crates.io on every keystroke (#248). One source it does *not* reject —
-    /// `AlternateRegistry { mirrors_crates_io: true, .. }` left unregistered — deliberately
-    /// degrades to crates.io inside `CargoRegistry::get_versions_for_source`
-    /// (`registry.rs`'s `mirrors_crates_io` arm): safe, since Cargo verifies per-version
-    /// checksum equality against crates.io for a `[source.crates-io] replace-with` mirror, and
-    /// matches hover's identical degrade-to-public behavior for the same flag.
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_versions(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        position: Position,
-        prefix: &str,
-        freshness: deps_core::FreshnessSettings,
-    ) -> Vec<CompletionItem> {
-        deps_core::completion::complete_versions_at_position(
-            self.registry.as_ref(),
-            &self.formatter,
-            parse_result,
-            position,
-            prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
-        )
-        .await
-    }
-
     /// Completes feature flags for a specific package.
     ///
     /// Fetches features from the latest stable version, routed by the source `package_name`
-    /// resolves to in `parse_result` by name (spec FR-012) — unlike [`Self::complete_versions`]
-    /// (issue #593, position-based), this still joins by name via
+    /// resolves to in `parse_result` by name (spec FR-012) — unlike version completion
+    /// (issue #593, position-based; see [`Ecosystem::complete_version`]'s default
+    /// implementation), this still joins by name via
     /// [`resolve_completion_source`]/[`CompletionSource`], so it keeps the same residual
     /// same-name-different-source `Ambiguous` gap #593 fixed for versions (not itself in
     /// #593's scope: `features_range`-based position routing for this method is a follow-up,
@@ -308,22 +269,8 @@ impl Ecosystem for CargoEcosystem {
     }
 
     #[cfg(feature = "lsp-responses")]
-    fn complete_version<'a>(
-        &'a self,
-        request: deps_core::completion::CompletionRequest<'a>,
-        _package_name: deps_core::PackageName,
-        prefix: String,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
-        Box::pin(async move {
-            self.complete_versions(
-                request.parse_result,
-                request.position,
-                &prefix,
-                request.freshness,
-            )
-            .await
-            .into()
-        })
+    fn version_operator_chars(&self) -> &'static [char] {
+        VERSION_OPERATOR_CHARS
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -392,6 +339,9 @@ mod tests {
     use std::collections::HashMap;
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
+
+    #[cfg(feature = "lsp-responses")]
+    deps_core::complete_versions_test_shim!(CargoEcosystem);
 
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests. Does
     // not replace registry.rs's `test_registry_creation`, which constructs `CratesIoRegistry`
