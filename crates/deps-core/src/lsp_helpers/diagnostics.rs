@@ -64,6 +64,25 @@ const MAX_BLOCKED_REGISTRY_RELATED_INFO: usize = 9;
 /// attacker-controlled value.
 const MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS: usize = 128;
 
+/// Maximum character count of a free-text prose value — an OSV advisory's `id`/`summary`, or
+/// a registry-reported deprecation `reason` — interpolated into a diagnostic message before
+/// it is truncated with an ellipsis marker (#1262, #1263 follow-up). Shared across both sinks
+/// rather than one constant per call site: both go through
+/// [`sanitize_advisory_text_for_diagnostic`] for the same reason (narrow-filtered free-form
+/// prose that can legitimately carry RTL marks/emoji ZWJ), so a single cap keeps their
+/// behavior in lockstep instead of letting two near-duplicate constants drift apart.
+///
+/// Mirrors [`MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS`]'s bound. `advisory.summary` and
+/// `deprecation.reason` are both genuinely untrusted, unbounded-length prose — OSV.dev
+/// aggregates GHSA/RustSec/PyPA advisory databases plus community submissions, and
+/// `summary`/a registry's deprecation `reason` both pass through unvalidated
+/// (`OsvVulnRecord::into_advisory`, resp. the registry client). `advisory.id` is *not*
+/// actually unbounded on the real path: `into_advisory` already rejects any record whose id
+/// fails `crate::osv::is_valid_osv_id` (ASCII alphanumeric/`.`/`_`/`-`, `<= 128` bytes) before
+/// an `Advisory` can exist, so this cap on `id` is defense-in-depth for a state that should
+/// already be unreachable, not a fix for a reachable gap.
+const MAX_DIAGNOSTIC_PROSE_CHARS: usize = 128;
+
 /// Truncates `value` to at most `max_chars` characters, appending `…` when truncated.
 ///
 /// So an attacker-controlled string interpolated into a diagnostic message can never
@@ -98,6 +117,16 @@ pub fn truncate_for_diagnostic(value: &str, max_chars: usize) -> std::borrow::Co
 /// deliberately unvalidated (see its own doc), so a manifest key of unbounded length would
 /// otherwise reach these sinks unbounded too.
 const MAX_DIAGNOSTIC_NAME_CHARS: usize = 128;
+
+/// Maximum character count of a version-shaped string (a manifest-declared requirement,
+/// or a registry-reported yanked/latest version) interpolated into a diagnostic message
+/// before it is truncated with an ellipsis marker (#1263).
+///
+/// Mirrors [`MAX_DIAGNOSTIC_NAME_CHARS`]'s bound: `req_str` comes from the parsed manifest
+/// and `yanked_version`/`latest` come from registry version data — neither is validated or
+/// length-capped before reaching these sinks, and both are also missing
+/// [`sanitize_invisible`]'s bidi/invisible-character neutralization before this fix.
+const MAX_VERSION_DIAGNOSTIC_CHARS: usize = 128;
 
 /// Renders `name` safely for a client-visible diagnostic message or `dependency_name`-shaped
 /// field (#1242, #1246): redact, then sanitize, then truncate, in that order.
@@ -159,6 +188,40 @@ pub fn redact_name_for_diagnostic(name: &PackageName) -> String {
 #[must_use]
 pub fn sanitize_and_truncate_for_diagnostic(value: &str, max_chars: usize) -> String {
     truncate_for_diagnostic(&sanitize_invisible(value), max_chars).into_owned()
+}
+
+/// Narrow-filters, then truncates, `value` for the OSV advisory `id`/`summary` sinks in
+/// `push_vulnerability_diagnostics` (#1262).
+///
+/// Deliberately uses `super::replace_markdown_unsafe_chars`'s narrow, explicit bidi/
+/// invisible-character list (shared with [`crate::lsp_helpers::markdown_code_span`], so the
+/// two can't drift) instead of [`sanitize_invisible`]'s whole-`Cf`/`Zl`/`Zp` category sweep: an OSV
+/// advisory `summary` is free-form prose aggregated from GHSA/RustSec/PyPA plus community
+/// submissions, and can legitimately carry right-to-left marks (U+200F, U+061C) or emoji ZWJ
+/// sequences (U+200D) that a category-wide strip would mangle — the same rationale
+/// [`crate::lsp_helpers::escape_markdown`] documents for reusing that narrower filter on
+/// registry-supplied free text.
+///
+/// `summary` is the genuinely untrusted half of this sink — it passes through
+/// `OsvVulnRecord::into_advisory` unvalidated. `id` is run through the same treatment for
+/// defense-in-depth, but on the real path it is already constrained by
+/// `crate::osv::is_valid_osv_id` (ASCII alphanumeric/`.`/`_`/`-`, `<= 128` bytes) before an
+/// `Advisory` can exist at all, so this call is a no-op for `id` in practice.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::sanitize_advisory_text_for_diagnostic;
+///
+/// assert_eq!(sanitize_advisory_text_for_diagnostic("RUSTSEC-2024-0001", 128), "RUSTSEC-2024-0001");
+/// assert_eq!(
+///     sanitize_advisory_text_for_diagnostic("bidi\u{202E}summary", 128),
+///     "bidi summary"
+/// );
+/// ```
+#[must_use]
+pub fn sanitize_advisory_text_for_diagnostic(value: &str, max_chars: usize) -> String {
+    truncate_for_diagnostic(&super::replace_markdown_unsafe_chars(value), max_chars).into_owned()
 }
 
 /// Stable [`Diagnostic::code`] set on the package-level deprecation diagnostic (issue #205).
@@ -1347,6 +1410,10 @@ fn apply_in_use_yanked_rule(
                 == Some(yanked_version.as_str())
         })
     {
+        let yanked_version = sanitize_and_truncate_for_diagnostic(
+            yanked_version.as_str(),
+            MAX_VERSION_DIAGNOSTIC_CHARS,
+        );
         diagnostics.push(Diagnostic {
             range: version_anchor_range(ctx.dep),
             severity: Some(ctx.severities.yanked),
@@ -1510,7 +1577,12 @@ fn apply_unsatisfiable_rule(
         return RuleFlow::Continue;
     }
 
-    let req_str = dep.version_requirement().map_or("", |r| r.as_str());
+    let req_str = sanitize_and_truncate_for_diagnostic(
+        dep.version_requirement().map_or("", |r| r.as_str()),
+        MAX_VERSION_DIAGNOSTIC_CHARS,
+    );
+    let latest =
+        sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
     let mut message =
         format!("No published version satisfies requirement '{req_str}'; latest is {latest}");
     if let Some(prerelease) = dep.version_requirement().and_then(|version_req| {
@@ -1522,6 +1594,8 @@ fn apply_unsatisfiable_rule(
         )
     }) {
         use std::fmt::Write as _;
+        let prerelease =
+            sanitize_and_truncate_for_diagnostic(prerelease.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
         let _ = write!(
             message,
             " (a pre-release, {prerelease}, is excluded by SemVer's default \
@@ -1607,6 +1681,8 @@ fn apply_yanked_only_rule(
         return RuleFlow::Continue;
     }
 
+    let latest =
+        sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
     diagnostics.push(Diagnostic {
         range: resolved.version_range,
         severity: Some(ctx.severities.yanked),
@@ -1654,6 +1730,8 @@ fn apply_outdated_rule(
         .enabled
         .then_some(package_versions.published_at)
         .flatten();
+    let latest =
+        sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
     let message = match published_at {
         Some(published_at)
             if is_within_cooldown(
@@ -1773,6 +1851,12 @@ fn version_anchor_range(dep: &dyn Dependency) -> Range {
 /// Pushes the package-level deprecation [`Diagnostic`] for `dep` (issue #205).
 ///
 /// Modeled on `push_vulnerability_diagnostics`: anchored via [`version_anchor_range`].
+///
+/// `deprecation.reason`/`deprecation.replacement` are registry-supplied, unbounded-length
+/// data (#1263 follow-up sweep) — `reason` is free-text prose, sanitized with the same
+/// narrow bidi/invisible-character filter as an OSV advisory summary
+/// ([`sanitize_advisory_text_for_diagnostic`]); `replacement` is a package-name-shaped
+/// field, sanitized like any other name sink ([`sanitize_and_truncate_for_diagnostic`]).
 fn push_deprecation_diagnostic(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
@@ -1786,9 +1870,12 @@ fn push_deprecation_diagnostic(
 
     let mut message = formatter.deprecated_message().to_string();
     if let Some(reason) = deprecation.reason.as_deref().filter(|r| !r.is_empty()) {
+        let reason = sanitize_advisory_text_for_diagnostic(reason, MAX_DIAGNOSTIC_PROSE_CHARS);
         let _ = write!(message, ": {reason}");
     }
     if let Some(replacement) = deprecation.replacement.as_deref().filter(|r| !r.is_empty()) {
+        let replacement =
+            sanitize_and_truncate_for_diagnostic(replacement, MAX_DIAGNOSTIC_NAME_CHARS);
         let _ = write!(message, " (replacement: {replacement})");
     }
 
@@ -1826,6 +1913,16 @@ fn push_deprecation_diagnostic(
 /// since `INFORMATION` severity alone (`diagnostic_severity_for`) already separates it
 /// from an ordinary unscored CVE's `WARNING` severity but may not render distinctly in
 /// every client's UI chrome.
+///
+/// `Diagnostic.code` deliberately stays the *raw* `advisory.id`, not the
+/// `sanitize_advisory_text_for_diagnostic`-passed copy used in the message text (#1262
+/// critic follow-up): `code` is genuinely client-visible (the LSP `Diagnostic.code` shown in
+/// the Problems panel, and `deps-cli`'s `CheckFinding.code`), but it is already constrained
+/// to ASCII alphanumeric/`.`/`_`/`-` at `<= 128` bytes by [`crate::osv::is_valid_osv_id`] —
+/// the only non-test construction path of [`crate::osv::Advisory`] — before an `Advisory`
+/// can exist at all. `deps-lsp`'s `bind_diagnostics` also matches `code` against raw
+/// `fix.advisory_ids` for code-action binding, so sanitizing this copy would need a matching
+/// change on that side too, for a value that is provably never unsafe on the real path.
 fn push_vulnerability_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
@@ -1840,20 +1937,27 @@ fn push_vulnerability_diagnostics(
             .ok()
             .map(CodeDescription::new);
 
-        let summary = advisory
-            .summary
-            .as_deref()
-            .unwrap_or("(no summary provided)");
+        let advisory_id =
+            sanitize_advisory_text_for_diagnostic(advisory.id.as_str(), MAX_DIAGNOSTIC_PROSE_CHARS);
+        let summary = sanitize_advisory_text_for_diagnostic(
+            advisory
+                .summary
+                .as_deref()
+                .unwrap_or("(no summary provided)"),
+            MAX_DIAGNOSTIC_PROSE_CHARS,
+        );
         let message = match advisory.severity {
-            crate::osv::VulnSeverity::Malicious => format!("{}: [MALWARE] {summary}", advisory.id),
+            crate::osv::VulnSeverity::Malicious => {
+                format!("{advisory_id}: [MALWARE] {summary}")
+            }
             crate::osv::VulnSeverity::Informational => {
-                format!("{}: [INFORMATIONAL] {summary}", advisory.id)
+                format!("{advisory_id}: [INFORMATIONAL] {summary}")
             }
             crate::osv::VulnSeverity::Critical
             | crate::osv::VulnSeverity::High
             | crate::osv::VulnSeverity::Medium
             | crate::osv::VulnSeverity::Low
-            | crate::osv::VulnSeverity::Unknown => format!("{}: {summary}", advisory.id),
+            | crate::osv::VulnSeverity::Unknown => format!("{advisory_id}: {summary}"),
         };
 
         diagnostics.push(Diagnostic {
@@ -3166,6 +3270,263 @@ mod tests {
         let blocked_diagnostic = blocked_diagnostic_for(declaration_key, raw_value);
         assert!(!blocked_diagnostic.message.contains('\u{202E}'));
         assert!(blocked_diagnostic.message.contains("index.mycorp.dev"));
+    }
+
+    /// #1263: a bidirectional-override embedded in the manifest-declared requirement, or in
+    /// the registry-reported `latest` version, must not survive into the unsatisfiable-
+    /// requirement diagnostic message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_unsatisfiable_sanitizes_bidi_in_requirement_and_latest()
+    {
+        struct AlwaysUnsatisfiable;
+        struct NeverMatches;
+        impl RequirementMatcher for NeverMatches {
+            fn matches(&self, _version: &ConcreteVersion) -> Option<bool> {
+                Some(false)
+            }
+        }
+        impl PackageNaming for AlwaysUnsatisfiable {}
+        impl PackageRendering for AlwaysUnsatisfiable {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for AlwaysUnsatisfiable {
+            fn compile_requirement(
+                &self,
+                _requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                Some(Box::new(NeverMatches))
+            }
+        }
+        impl DiagnosticMessages for AlwaysUnsatisfiable {}
+        impl DiagnosticPolicy for AlwaysUnsatisfiable {}
+        impl SourcePolicy for AlwaysUnsatisfiable {}
+        impl OsvNaming for AlwaysUnsatisfiable {}
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "dep".into(),
+            PackageVersions {
+                latest: "1.0.0\u{202E}evil".into(),
+                available: Arc::from(vec!["1.0.0\u{202E}evil".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+        let mut dependency = dep_at("dep");
+        dependency.version_req = VersionReq::new("^2.0.0\u{202E}evil");
+        let parse_result = SingleDepParseResult {
+            dep: dependency,
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &AlwaysUnsatisfiable,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let message = diagnostics
+            .iter()
+            .find(|d| d.message.contains("No published version satisfies"))
+            .map(|d| d.message.as_str())
+            .expect("unsatisfiable diagnostic must fire");
+        assert!(!message.contains('\u{202E}'));
+        assert!(message.contains("2.0.0"));
+        assert!(message.contains("1.0.0"));
+    }
+
+    /// #1263: a bidirectional-override embedded in a registry-reported yanked version must
+    /// not survive into the in-use-yanked diagnostic message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_in_use_yanked_sanitizes_bidi_in_version() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0.5".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let outcomes = DependencyOutcomes::new()
+            .with_yanked("serde", ("1.0.5\u{202E}evil".into(), RemovalStatus::Yanked));
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let yanked_diag = diagnostics
+            .iter()
+            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .expect("expected a yanked diagnostic");
+        assert!(!yanked_diag.message.contains('\u{202E}'));
+        assert!(yanked_diag.message.contains("1.0.5"));
+    }
+
+    /// #1263: a bidirectional-override embedded in the registry-reported `latest` version
+    /// must not survive into the outdated diagnostic message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_sanitizes_bidi_in_latest() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions::latest_only("2.0.0\u{202E}evil"),
+        );
+
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message.contains('\u{202E}'));
+        assert!(diagnostics[0].message.contains("2.0.0"));
+    }
+
+    /// #1263 critic M3: `MAX_VERSION_DIAGNOSTIC_CHARS` must actually truncate an
+    /// over-length `latest` version, not just strip bidi characters from a short one.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_truncates_oversized_latest() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let overlong_latest = format!("2.0.0-{}", "X".repeat(MAX_VERSION_DIAGNOSTIC_CHARS + 50));
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions::latest_only(overlong_latest.clone()),
+        );
+
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains('…'));
+        assert!(
+            !diagnostics[0].message.contains(&overlong_latest),
+            "expected `latest` to be truncated rather than interpolated verbatim, got: {:?}",
+            diagnostics[0].message
+        );
+    }
+
+    /// #1263 follow-up sweep: a bidirectional-override or oversized string in a registry-
+    /// reported deprecation's `reason`/`replacement` must not survive unsanitized/unbounded
+    /// into the deprecation diagnostic message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_deprecation_sanitizes_bidi_and_caps_reason() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "left-pad".into(),
+                version_req: "1.3.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("left-pad".into(), PackageVersions::latest_only("1.3.0"));
+        let resolved_versions = HashMap::new();
+        let overlong_reason = "X".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 50);
+        let outcomes = DependencyOutcomes::new().with_deprecation(
+            "left-pad",
+            Deprecation {
+                reason: Some(format!("bidi\u{202E}{overlong_reason}")),
+                replacement: Some("left-pad\u{202E}evil".to_string()),
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let deprecation_diag = diagnostics
+            .iter()
+            .find(|d| d.code.as_deref() == Some(DEPRECATED_DIAGNOSTIC_CODE))
+            .expect("expected a deprecation diagnostic");
+        assert!(!deprecation_diag.message.contains('\u{202E}'));
+        assert!(deprecation_diag.message.contains('…'));
+        assert!(
+            !deprecation_diag.message.contains(&overlong_reason),
+            "expected the reason to be truncated rather than interpolated verbatim, got: {:?}",
+            deprecation_diag.message
+        );
     }
 
     #[test]
@@ -4931,6 +5292,62 @@ mod tests {
         );
     }
 
+    /// #1263 critic S1: the pre-release enrichment appended to the unsatisfiable message
+    /// interpolates `candidate.to_string()` from `package_versions.available` — the same
+    /// registry-supplied, untrusted source as `latest`/`req_str` — and was left unsanitized.
+    /// A bidi override embedded in the matching pre-release candidate must not survive into
+    /// the message either.
+    #[test]
+    fn test_generate_diagnostics_unsatisfiable_sanitizes_bidi_in_matching_prerelease() {
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert(
+                "dep".into(),
+                PackageVersions {
+                    latest: "1.5.0".into(),
+                    available: Arc::from(vec![
+                        "2.0.0-rc.1\u{202E}evil".into(),
+                        "1.5.0".into(),
+                        "1.4.0".into(),
+                    ]),
+                    yanked: Arc::from(Vec::new()),
+                    published_at: None,
+                },
+            );
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+        let mut dependency = dep_at("dep");
+        dependency.version_req = VersionReq::new("^2.0.0");
+        let parse_result = SingleDepParseResult {
+            dep: dependency,
+            uri,
+        };
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &StrictSemverFormatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let message = diagnostics
+            .iter()
+            .find(|d| d.message.contains("No published version satisfies"))
+            .map(|d| d.message.as_str())
+            .expect("unsatisfiable WARNING must fire");
+        assert!(
+            message.contains("pre-release"),
+            "message must still mention the matching pre-release, got: {message}"
+        );
+        assert!(!message.contains('\u{202E}'));
+        assert!(message.contains("2.0.0-rc.1"));
+    }
+
     #[test]
     fn test_generate_diagnostics_unsatisfiable_no_enrichment_without_matching_prerelease() {
         let cached_versions = {
@@ -5314,6 +5731,82 @@ mod tests {
         assert_ne!(malicious_diag.code, unknown_diag.code);
         assert!(malicious_diag.message.contains("[MALWARE]"));
         assert!(!unknown_diag.message.contains("[MALWARE]"));
+    }
+
+    /// #1262: an OSV advisory `summary` is untrusted, unbounded-length prose (OSV.dev
+    /// aggregates GHSA/RustSec/PyPA plus community submissions, and `summary` passes through
+    /// `OsvVulnRecord::into_advisory` unvalidated) and must be both sanitized
+    /// (bidi/invisible-character override stripped) and capped at
+    /// `MAX_DIAGNOSTIC_PROSE_CHARS` before it reaches the client-visible vulnerability
+    /// diagnostic message.
+    ///
+    /// `id` uses a benign, `is_valid_osv_id`-shaped value here rather than a bidi payload
+    /// (critic M1): on the real (non-test) construction path, `OsvVulnRecord::into_advisory`
+    /// already rejects any record whose id fails that validation before an `Advisory` can
+    /// exist at all, so a malformed `id` reaching this function is not a reachable state —
+    /// `sanitize_advisory_text_for_diagnostic`'s own doctest covers the id-sanitization
+    /// behavior itself as defense-in-depth, independent of reachability.
+    #[test]
+    fn test_generate_diagnostics_vulnerability_sanitizes_and_caps_advisory_summary() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("vulnerable-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let overlong_summary = "X".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 50);
+        let advisory = crate::osv::Advisory {
+            id: "RUSTSEC-2020-0071".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: Some(format!("bidi\u{202E}{overlong_summary}")),
+            aliases: vec![],
+            severity: VulnSeverity::High,
+            cvss_vector: None,
+            fixed_versions: vec![],
+            url: "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
+        };
+
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "vulnerable-pkg".to_string(),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
+                fix_target_status: UpgradeStatus::NotChecked,
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let vuln_diag = diagnostics
+            .iter()
+            .find(|d| d.message.contains("RUSTSEC"))
+            .expect("vulnerability diagnostic must be emitted");
+        assert!(!vuln_diag.message.contains('\u{202E}'));
+        assert!(vuln_diag.message.contains('…'));
+        assert!(
+            !vuln_diag.message.contains(&overlong_summary),
+            "expected the summary to be truncated rather than interpolated verbatim, got: {:?}",
+            vuln_diag.message
+        );
+        // `Diagnostic.code` stays the raw advisory id (see `push_vulnerability_diagnostics`'s
+        // docs) so code-action binding by exact id match keeps working.
+        assert_eq!(vuln_diag.code.as_deref(), Some("RUSTSEC-2020-0071"));
     }
 
     #[test]
