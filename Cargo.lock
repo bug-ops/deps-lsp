@@ -665,6 +665,7 @@ dependencies = [
  "tower-lsp-server",
  "tracing",
  "tracing-subscriber",
+ "unicode-general-category",
  "url",
  "urlencoding",
  "yaml-rust2",

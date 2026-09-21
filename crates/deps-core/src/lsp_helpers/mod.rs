@@ -38,7 +38,7 @@ pub use code_lenses::{
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, generate_diagnostics_from_cache,
-    requirement_is_unsatisfiable, truncate_for_diagnostic,
+    redact_name_for_diagnostic, requirement_is_unsatisfiable, truncate_for_diagnostic,
 };
 pub use formatter::{
     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
