@@ -763,6 +763,7 @@ pub trait ShaPinning: Send + Sync {
 /// `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS`'s bound (#1252 critic follow-up C1): this is the
 /// *primary* `PinStyle::Tag` quickfix title, shared by both `deps-github-actions` and
 /// `deps-gitlab-ci`, so it needs the same cap as the diagnostic sinks it sits next to.
+#[cfg(feature = "lsp-responses")]
 const MAX_SHA_PIN_TITLE_NAME_CHARS: usize = 128;
 
 /// Builds the "Pin `{name}` to commit SHA" [`CodeAction`] for the dependency at `position`.
