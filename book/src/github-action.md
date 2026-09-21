@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bug-ops/deps-lsp/crates/github-action@main
+      - uses: bug-ops/deps-lsp/crates/github-action@v1.2.0
         id: deps-check
         with:
           fail-on: vulnerable,yanked,unsatisfiable
@@ -97,6 +97,12 @@ You can run the exact same image directly with plain `docker run` (useful for re
 CI failure locally) — see [deps-cli's Docker section](cli.md#docker) for the command.
 
 ## Image tags and supply-chain hardening
+
+Pin the `uses:` ref itself to a release tag (`@v1.2.0`, as in the examples above), not `@main` —
+per the [CI/CD Pinning](cross-ecosystem/ci-pinning.md) guidance `deps-lsp` itself gives for your
+other GitHub Actions dependencies, a branch ref can start running different code with no change
+to your workflow file. This is separate from the Docker image tag discussed next, which
+`action.yml` pins on your behalf.
 
 The image is rebuilt whenever a new `deps-lsp`/`deps-cli` release is tagged. Tags published:
 `latest`, a rolling major (`1`), and exact per-release tags (`X.Y`, `X.Y.Z`). `action.yml`

@@ -211,7 +211,7 @@ a composite action. It writes a SARIF file but does not upload it — wire
 `github/codeql-action/upload-sarif` after it in your own workflow:
 
 ```yaml
-- uses: bug-ops/deps-lsp/crates/github-action@main
+- uses: bug-ops/deps-lsp/crates/github-action@v1.2.0
   id: deps-check
   with:
     fail-on: vulnerable,yanked,unsatisfiable

@@ -35,7 +35,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bug-ops/deps-lsp/crates/github-action@main
+      - uses: bug-ops/deps-lsp/crates/github-action@v1.2.0
         id: deps-check
         with:
           fail-on: vulnerable,yanked,unsatisfiable
