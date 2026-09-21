@@ -1,5 +1,28 @@
 # Dart
 
+`deps-dart` provides LSP support for Dart/Flutter projects using the Pub package manager.
+
+## Basics
+
+| | |
+|---|---|
+| Manifest file | `pubspec.yaml` |
+| Lock file (in-use version) | `pubspec.lock` |
+| Registry | pub.dev (`pub.dev/api/packages/{name}`) |
+| Version syntax | SemVer 2.0.0, with §11 prerelease-precedence ordering (numeric identifiers compare numerically, alphanumeric compare lexically, a prerelease sorts below its base release) |
+
+```yaml
+dependencies:
+  http: ^1.2.0
+  provider: ^6.1.1
+```
+
+Hovering a package's version constraint shows the latest pub.dev release and whether the
+constraint is satisfied; an outdated dependency gets an inlay hint and a diagnostic with an
+"Update to latest version" code action. `dependencies`, `dev_dependencies`, and
+`dependency_overrides` are all parsed, along with YAML anchor/alias-based section reuse (see
+below).
+
 ## Custom/Private Registries (issue #980)
 
 Unlike [Cargo](cargo.md)/[npm](npm.md)/[PyPI](pypi.md)/[Go](go.md)/[NuGet](nuget.md), `deps-dart`

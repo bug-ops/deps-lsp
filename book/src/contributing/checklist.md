@@ -25,11 +25,16 @@ Before submitting a PR for a new ecosystem:
 - [ ] Unit tests for parser edge cases
 - [ ] Integration tests for registry (can be `#[ignore]`)
 - [ ] Documentation in lib.rs with examples
-- [ ] Added to workspace members in root Cargo.toml
+- [ ] No workspace-members edit needed (root `Cargo.toml`'s `members` is the `crates/*` glob —
+      see [Step 1](step-1-crate.md)); do add an `lsp-responses` feature forwarding to
+      `deps-core/lsp-responses`, gating this crate's own `tower-lsp-server` dependency
 - [ ] `[lints] workspace = true` in the new crate's Cargo.toml (otherwise it silently gets
       none of the `indexing_slicing`/`unwrap_used`/`expect_used`/`string_slice` restriction
       lints consolidated into `[workspace.lints.clippy]` by #689, and CI stays green)
-- [ ] Feature flag added in deps-lsp/Cargo.toml
-- [ ] Re-exports via `ecosystem!()` macro in deps-lsp/src/lib.rs
-- [ ] Registration via `register!()` macro in deps-lsp/src/lib.rs
+- [ ] Feature flag added in `crates/deps-engine/Cargo.toml`, forwarded from
+      `crates/deps-lsp/Cargo.toml` and (if the CLI should support it too)
+      `crates/deps-cli/Cargo.toml`
+- [ ] Re-exports via `ecosystem!()` macro in `crates/deps-engine/src/setup.rs`
+- [ ] Registration via `register!()` macro inside `register_ecosystems()` in
+      `crates/deps-engine/src/setup.rs` — see [Step 10](step-10-register.md)
 

@@ -1,5 +1,32 @@
 # GitLab CI/CD
 
+## Basics
+
+Like GitHub Actions, GitLab CI/CD is a CI/CD supply-chain pinning ecosystem, not a language
+package manager — `deps-lsp` tracks the `include:` directive, which pulls in job definitions
+from another project or a published CI/CD Catalog component. Manifests are `.gitlab-ci.yml` at
+the repository root, or any `.yml`/`.yaml` file under `.gitlab/ci/` (directory-pattern match,
+same mechanism GitHub Actions uses for `.github/workflows/`).
+
+Two pinnable `include:` forms are recognized:
+
+```yaml
+include:
+  - project: 'my-group/my-project'
+    ref: v1.2.0
+    file: '/templates/build.yml'
+  - component: gitlab.com/my-group/my-component/my-module@1.0
+```
+
+A `project:`/`ref:` include resolves against that project's git tags (GitLab's
+`GET /projects/:id/repository/tags` API); a `component:` include resolves against the
+project's **published releases** (`GET /projects/:id/releases`) — a CI/CD Catalog component
+version is a release, not a bare tag. `.gitlab-ci.yml` also commonly uses YAML anchors/aliases
+to reuse job templates, which `deps-gitlab-ci` resolves faithfully (see below) so a pinned
+version hidden behind an alias is still tracked correctly. Like GitHub Actions, there is no
+package registry involved — only the mutable-ref-vs-SHA distinction described in [CI/CD
+Pinning](../cross-ecosystem/ci-pinning.md).
+
 ## YAML Anchor/Alias Resolution
 
 `.gitlab-ci.yml` supports YAML anchors (`&name`) and aliases (`*name`) for reuse — GitLab's

@@ -9,15 +9,20 @@ All trait methods use `BoxFuture` instead of `#[async_trait]`:
 fn parse_manifest<'a>(
     &'a self,
     content: &'a str,
-    uri: &'a Uri,
+    uri: &'a url::Url,
 ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResult>>> {
     Box::pin(async move { ... })
 }
 
 // Wrong — do not use
 #[async_trait]
-async fn parse_manifest(&self, content: &str, uri: &Uri) -> Result<Box<dyn ParseResult>> { ... }
+async fn parse_manifest(&self, content: &str, uri: &url::Url) -> Result<Box<dyn ParseResult>> { ... }
 ```
+
+> **Note:** manifest/lock-file URIs are plain [`url::Url`](https://docs.rs/url), not
+> `tower_lsp_server::ls_types::Uri` — `deps-lsp` converts an LSP `Uri` to a `url::Url` once at
+> the document boundary, so every `Ecosystem`/`ParseResult`/`LockFileProvider` method below
+> works with `url::Url` throughout.
 
 ## Position Tracking
 
@@ -34,7 +39,7 @@ let position = table.byte_offset_to_position(content, byte_offset);
 
 ```rust
 impl LockFileProvider for MyLockParser {
-    fn locate_lockfile(&self, manifest_uri: &Uri) -> Option<PathBuf> { ... }
+    fn locate_lockfile(&self, manifest_uri: &url::Url) -> Option<PathBuf> { ... }
     fn parse_lockfile<'a>(&'a self, lockfile_path: &'a Path)
         -> Pin<Box<dyn Future<Output = Result<ResolvedPackages>> + Send + 'a>> { ... }
 }

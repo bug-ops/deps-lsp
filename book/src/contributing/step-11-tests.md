@@ -7,8 +7,10 @@ Create comprehensive tests co-located with each module:
 mod tests {
     use super::*;
 
-    fn test_uri() -> Uri {
-        Uri::from_str("file:///test/{manifest_file}").unwrap()
+    fn test_uri() -> url::Url {
+        // `deps_core::test_util::test_uri("/test/{manifest_file}")` builds the same thing
+        // (and handles the Windows `C:` prefix) — prefer it over hand-rolling this helper.
+        url::Url::parse("file:///test/{manifest_file}").unwrap()
     }
 
     #[test]

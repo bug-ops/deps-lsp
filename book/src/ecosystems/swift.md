@@ -1,5 +1,29 @@
 # Swift
 
+## Basics
+
+Swift Package Manager has no manifest data format — `Package.swift` is literal, executable
+Swift source code, not TOML/JSON/YAML. `deps-swift` does not run a Swift compiler; it extracts
+`.package(url:, ...)` calls with a set of targeted patterns covering every requirement form SPM
+supports:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/apple/swift-log.git", from: "1.5.0"),          // upToNextMajor
+    .package(url: "https://github.com/apple/swift-collections.git", .upToNextMinor(from: "1.1.0")),
+    .package(url: "https://github.com/apple/swift-nio.git", .exact("2.65.0")),
+    .package(url: "https://github.com/apple/swift-atomics.git", branch: "main"),
+    .package(url: "https://github.com/apple/swift-algorithms.git", revision: "abc123..."),
+]
+```
+
+Since Swift Package Manager has no registry of its own for GitHub-hosted packages, versions
+are resolved from the same host the `url:` points at: **GitHub's tags API**, via
+`deps_core::github`'s shared client (also used by GitHub Actions — see below). A `.branch`/
+`.revision` dependency is not version-resolvable at all and is shown as a non-registry `Git`
+source with no hover version data. When a `Package.resolved` lock file is present alongside
+the manifest, it is read to show each dependency's actual pinned (in-use) revision/version.
+
 ## Non-GitHub Package Hosts (issues #979, #983, #924)
 
 A registry-form `.package(url: "...")` dependency is only ever resolved against

@@ -7,8 +7,7 @@
 - [Editor Setup](editor-setup.md)
 - [Configuration](configuration.md)
 - [deps-cli](cli.md)
-- [Architecture Overview](architecture.md)
-- [API Documentation](api-docs.md)
+- [GitHub Action](github-action.md)
 
 # Cross-Ecosystem Features
 
@@ -35,6 +34,12 @@
   - [Deno](ecosystems/deno.md)
   - [GitHub Actions](ecosystems/github-actions.md)
   - [GitLab CI/CD](ecosystems/gitlab-ci.md)
+
+# Architecture & Internals
+
+- [Architecture Overview](architecture.md)
+- [The deps-engine crate](engine.md)
+- [API Documentation](api-docs.md)
 
 # Contributing
 

@@ -1,5 +1,37 @@
 # npm
 
+`deps-npm` provides full LSP support for Node.js/JavaScript projects using npm, pnpm, or
+Yarn — all three read the same `package.json` format.
+
+## Basics
+
+| | |
+|---|---|
+| Manifest file | `package.json` |
+| Lock file (in-use version) | `package-lock.json` (versions 2 and 3) or `pnpm-lock.yaml` |
+| Registry | npm registry — packument API (`registry.npmjs.org/{package}`) for versions, search API (`registry.npmjs.org/-/v1/search`) for package-name search |
+| Version syntax | node-semver ranges: `^`, `~`, `=`, `<`, `>`, `*` |
+
+`deps-npm` parses `dependencies`, `devDependencies`, `peerDependencies`, and
+`optionalDependencies`, tracking each entry's exact key/value byte span for accurate
+hover/diagnostic/completion positioning.
+
+```json
+{
+  "dependencies": {
+    "express": "^4.18.2"
+  }
+}
+```
+
+Hovering the version string shows the latest npm release and whether `^4.18.2` is satisfied;
+an outdated dependency gets an inlay hint and a diagnostic with an "Update to latest version"
+code action. Typing a version prefix completes from the real, live version list; typing a new
+dependency name searches the npm registry. `watched_config_filenames` covers `.npmrc` and
+`pnpm-workspace.yaml` — editing either one externally (e.g. `git checkout`) triggers a reparse
+of every open `package.json` so pushed diagnostics stay current without waiting for the next
+in-editor edit.
+
 ## Custom/Private Registries
 
 An npm dependency whose scope (via `@scope:registry=`) or whose workspace (via a
