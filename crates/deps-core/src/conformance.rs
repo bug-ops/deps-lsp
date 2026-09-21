@@ -59,17 +59,24 @@ use crate::{ConcreteVersion, Ecosystem, PackageName};
 /// Adversarial payload for the `package_url` *display* sink, not the dot-segment fetch-URL
 /// sink [`crate::test_util::ADVERSARIAL_URL_SEGMENTS`] guards.
 ///
-/// The real sink is `lsp_helpers::hover`'s `# [{name}]({url})` markdown link, whose
-/// *destination* is written raw (only the label goes through
-/// [`crate::lsp_helpers::escape_markdown`]) — so every character that can break out of a
-/// `[label](destination)` link is a hazard here, not just newline/autolink/percent: `\n`,
-/// `<`, `>`, a bare `%` (must come back encoded as `%25`), and the destination-closing/
-/// markup-reopening set `` ` ``, `(`, `)`, `[`, `]` `escape_markdown`'s own doc names as this
-/// project's contract for this exact sink. Also embeds a raw U+202E right-to-left override
-/// (display-spoofing) and is checked generically for any other control character. Replaces 7
-/// independently hand-copied `test_package_url_encodes_newline_autolink_and_percent` tests
-/// (deps-maven, deps-pypi, deps-npm, deps-go, deps-dart, deps-composer, deps-nuget) that only
-/// asserted the narrower newline/autolink/percent subset.
+/// The real sink is `lsp_helpers::hover`'s `# [{name}]({url})` markdown link. This
+/// producer-side gate is the *primary* defense for that destination — every character
+/// that can break out of a `[label](destination)` link is a hazard here, not just
+/// newline/autolink/percent: `\n`, `<`, `>`, a bare `%` (must come back encoded as
+/// `%25`), and the destination-closing/markup-reopening set `` ` ``, `(`, `)`, `[`, `]`
+/// `escape_markdown`'s own doc names as this project's contract for this exact sink.
+/// Also embeds a raw U+202E right-to-left override (display-spoofing) and is checked
+/// generically for any other control character. Replaces 7 independently hand-copied
+/// `test_package_url_encodes_newline_autolink_and_percent` tests (deps-maven, deps-pypi,
+/// deps-npm, deps-go, deps-dart, deps-composer, deps-nuget) that only asserted the
+/// narrower newline/autolink/percent subset.
+///
+/// `lsp_helpers::hover::push_header_hover_section` (#1259) additionally strips the
+/// narrow bidi/invisible-character subset from the destination *after* `package_url`
+/// builds it, as consumer-side defense-in-depth against a future `package_url`
+/// implementation that regresses this gate — it does **not** cover the structural
+/// breakout set (`(`, `)`, `[`, `]`, `` ` ``, `<`, `>`) this gate is the sole guard
+/// for, so this gate must stay in force; it is not redundant with the hover-side filter.
 pub const HOSTILE_DISPLAY_LINK_PAYLOAD: &str = "evil\n<https://evil%zz.example>)([]`\u{202e}";
 
 // ---------------------------------------------------------------------------------------

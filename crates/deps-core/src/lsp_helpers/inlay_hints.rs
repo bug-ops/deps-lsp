@@ -2,7 +2,25 @@ use tower_lsp_server::ls_types::{InlayHint, InlayHintKind, InlayHintLabel, Inlay
 
 use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
-use super::{EcosystemFormatter, RequirementStatus, VersionData, in_use_version};
+use super::diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
+use super::{
+    EcosystemFormatter, RequirementStatus, VersionData, in_use_version,
+    sanitize_and_truncate_for_diagnostic,
+};
+
+/// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
+/// interpolation into an inlay-hint label (#1268, code-review follow-up).
+///
+/// One small wrapper around `sanitize_and_truncate_for_diagnostic(_, MAX_VERSION_DIAGNOSTIC_CHARS)`
+/// shared by all four sibling call sites in [`generate_inlay_hints`] (the offline
+/// marker, the no-cached-latest up-to-date label, the `UpToDate` match arm, and the
+/// `Outdated` match arm) rather than repeating the pair inline at each one — the exact
+/// "fixed one sink, missed the sibling" pattern this PR's own S1 finding already
+/// flagged once; a single call site here means a future change to the treatment only
+/// needs updating in one place.
+fn sanitize_hint_version(version: &str) -> String {
+    sanitize_and_truncate_for_diagnostic(version, MAX_VERSION_DIAGNOSTIC_CHARS)
+}
 
 /// Builds inlay hints showing the latest/in-use version next to each dependency's declaration.
 ///
@@ -93,9 +111,10 @@ pub fn generate_inlay_hints(
             // `resolved_version` just because the registry side is unknown while
             // offline — show it alongside the marker rather than replacing it.
             if config.offline {
-                let label = resolved_version
-                    .as_ref()
-                    .map_or_else(|| "📴".to_string(), |resolved| format!("📴 {resolved}"));
+                let label = resolved_version.as_ref().map_or_else(
+                    || "📴".to_string(),
+                    |resolved| format!("📴 {}", sanitize_hint_version(resolved.as_str())),
+                );
                 hints.push(InlayHint {
                     position: version_range.end,
                     label: InlayHintLabel::String(label),
@@ -118,7 +137,8 @@ pub fn generate_inlay_hints(
                     position: version_range.end,
                     label: InlayHintLabel::String(format!(
                         "{} {}",
-                        config.up_to_date_text, resolved
+                        config.up_to_date_text,
+                        sanitize_hint_version(resolved.as_str())
                     )),
                     kind: Some(InlayHintKind::TYPE),
                     padding_left: Some(true),
@@ -153,7 +173,11 @@ pub fn generate_inlay_hints(
             RequirementStatus::UpToDate => {
                 if config.show_up_to_date_hints {
                     if let Some(resolved) = &resolved_version {
-                        format!("{} {}", config.up_to_date_text, resolved)
+                        format!(
+                            "{} {}",
+                            config.up_to_date_text,
+                            sanitize_hint_version(resolved.as_str())
+                        )
                     } else {
                         config.up_to_date_text.clone()
                     }
@@ -161,7 +185,9 @@ pub fn generate_inlay_hints(
                     continue;
                 }
             }
-            RequirementStatus::Outdated => config.needs_update_text.replace("{}", latest.as_str()),
+            RequirementStatus::Outdated => config
+                .needs_update_text
+                .replace("{}", &sanitize_hint_version(latest.as_str())),
             // Resolution failed (e.g. dangling alias/unexpanded variable) — neither
             // "up to date" nor "outdated" was actually verified, so show nothing.
             RequirementStatus::Unresolved => continue,
@@ -1044,6 +1070,296 @@ mod tests {
         assert_eq!(hints.len(), 1);
         match &hints[0].label {
             InlayHintLabel::String(text) => assert_eq!(text, "❌ 2.1.1 📴"),
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    /// #1268 critic S1: a lockfile-resolved version is exactly as untrusted as a
+    /// registry-reported one (both are attacker-controllable in a cloned repository),
+    /// so a bidi override embedded in it must not survive into the offline-marker
+    /// label's `resolved` interpolation either — the sibling sink to the `Outdated`
+    /// arm's `latest`, on the same always-visible inline surface.
+    #[test]
+    fn test_inlay_hint_offline_marker_strips_bidi_override_from_resolved_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: true,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "^2.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let malicious_resolved = "2.0.12\u{202E}deifidom ton";
+        let cached_versions = HashMap::new();
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), malicious_resolved.into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    !text.contains('\u{202E}'),
+                    "bidi override must not survive into the offline-marker label; got: {text}"
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    /// #1268 critic S1: same sink concern as the offline-marker test above, for the
+    /// online, no-cached-`latest`, `show_up_to_date_hints` arm's `resolved`
+    /// interpolation.
+    #[test]
+    fn test_inlay_hint_no_cached_latest_up_to_date_strips_bidi_override_from_resolved_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "criterion".into(),
+                version_req: "0.5".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 9)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let malicious_resolved = "0.5.1\u{202E}deifidom ton";
+        // Not in the registry cache (empty), only lockfile-resolved.
+        let cached_versions = HashMap::new();
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("criterion".into(), malicious_resolved.into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    !text.contains('\u{202E}'),
+                    "bidi override must not survive into the up-to-date label; got: {text}"
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    /// #1268 critic S1: same sink concern once more, for the `RequirementStatus::UpToDate`
+    /// arm reached via the normal (non-offline, cached-`latest`-present) path, three
+    /// lines above the fixed `Outdated` arm in the same `match`.
+    #[test]
+    fn test_inlay_hint_up_to_date_label_strips_bidi_override_from_resolved_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "^2.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let malicious_resolved = "2.1.1\u{202E}deifidom ton";
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions::latest_only(malicious_resolved),
+        );
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), malicious_resolved.into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    !text.contains('\u{202E}'),
+                    "bidi override must not survive into the up-to-date label; got: {text}"
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    /// #1268: a bidi-override embedded in the registry-reported `latest` version must
+    /// not survive into the "update available" inlay-hint label, which — unlike a
+    /// diagnostic — is an always-visible inline editor surface.
+    #[test]
+    fn test_inlay_hint_outdated_label_strips_bidi_override_from_latest_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "=2.0.12".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let malicious_latest = "2.1.1\u{202E}live.tsr";
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions::latest_only(malicious_latest),
+        );
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), "2.0.12".into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    !text.contains('\u{202E}'),
+                    "bidi override must not survive into the inlay hint label; got: {text}"
+                );
+            }
+            _ => panic!("Expected string label"),
+        }
+    }
+
+    /// #1268: an oversized `latest` version string must be capped, not interpolated
+    /// unbounded into the always-visible inlay-hint label.
+    #[test]
+    fn test_inlay_hint_outdated_label_caps_oversized_latest_version() {
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MockFormatter;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "=2.0.12".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let oversized_latest = format!("2.0.0-{}", "X".repeat(MAX_VERSION_DIAGNOSTIC_CHARS + 50));
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions::latest_only(oversized_latest),
+        );
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert("serde".into(), "2.0.12".into());
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                // "❌ " (2 chars) + the truncated version (MAX_VERSION_DIAGNOSTIC_CHARS chars
+                // + 1 ellipsis marker) — an exact bound, not just "< input length", so a cap
+                // that truncates at the wrong point (e.g. loosely under the input length but
+                // still oversized) cannot pass this assertion (critic M1).
+                assert_eq!(
+                    text.chars().count(),
+                    2 + MAX_VERSION_DIAGNOSTIC_CHARS + 1,
+                    "expected exact capped length; got: {text}"
+                );
+                assert!(
+                    text.ends_with('…'),
+                    "expected truncation marker; got: {text}"
+                );
+            }
             _ => panic!("Expected string label"),
         }
     }
