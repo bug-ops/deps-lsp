@@ -2681,7 +2681,7 @@ mod tests {
             );
             let unknown_package_diagnostic = diagnostics
                 .into_iter()
-                .find(|d| d.message.contains("Unknown package"))
+                .find(|d| d.message().contains("Unknown package"))
                 .expect(
                     "the stub dependency has no cached versions, so it must be reported unknown",
                 );

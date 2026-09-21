@@ -684,7 +684,7 @@ mod tests {
         let diagnostics = diagnostics_for(&content).await;
         let mutable_count = diagnostics
             .iter()
-            .filter(|d| d.code == Some(mutable_ref_pin_code()))
+            .filter(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .count();
         assert_eq!(
             mutable_count, 1,
@@ -697,10 +697,10 @@ mod tests {
         let diagnostics = diagnostics_for("steps:\n  - uses: actions/checkout@v4\n").await;
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a mutable-ref-pin diagnostic for a tag pin");
         assert_eq!(found.severity, Some(Severity::Hint));
-        assert!(found.message.contains("actions/checkout"));
+        assert!(found.message().contains("actions/checkout"));
     }
 
     /// Security audit finding (low): a huge ref text (attacker-controlled workflow file,
@@ -714,13 +714,13 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a mutable-ref-pin diagnostic");
         assert!(
-            found.message.len() < long_tag.len(),
+            found.message().len() < long_tag.len(),
             "a 10,000-char tag must not render in full inside the diagnostic message"
         );
-        assert!(found.message.contains('…'));
+        assert!(found.message().contains('…'));
     }
 
     /// Security audit finding (#1252): a bidi-override character in the `owner/repo` name
@@ -769,13 +769,13 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a mutable-ref-pin diagnostic");
         // Asserts the full sanitized message, not just absence of the bad characters —
         // a regression that sanitized the message down to nothing (or dropped unrelated
         // content) must fail loudly rather than vacuously pass a "does not contain" check.
         assert_eq!(
-            found.message,
+            found.message(),
             "ac tions/checkout is pinned to the mutable tag ref `v4 0`; pin to a full commit \
              SHA to guard against tag mutation"
         );
@@ -791,7 +791,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code()))
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
         );
     }
 
@@ -805,7 +805,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code()))
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
         );
     }
 
@@ -815,7 +815,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code()))
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
         );
     }
 
@@ -834,7 +834,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code())),
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str())),
             "a literal-named ref with no TagIndex entry yet must stay the honest \
              unknown, not assumed a tag; got: {diagnostics:?}"
         );
@@ -885,8 +885,8 @@ mod tests {
 
         let mutable_ref_pin_messages: Vec<&str> = diagnostics
             .iter()
-            .filter(|d| d.code == Some(mutable_ref_pin_code()))
-            .map(|d| d.message.as_str())
+            .filter(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
+            .map(|d| d.message())
             .collect();
         assert_eq!(
             mutable_ref_pin_messages.len(),
@@ -928,13 +928,13 @@ mod tests {
         let diagnostics = diagnostics_for("steps:\n  - uses: \"actions/checkout@v4\"\n").await;
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a mutable-ref-pin diagnostic for a quoted tag pin");
         assert!(
-            found.message.contains("no automated fix available"),
+            found.message().contains("no automated fix available"),
             "a quoted scalar withholds the SHA-pin quickfix (FR-010), so the message \
              must say so; got: {}",
-            found.message
+            found.message()
         );
     }
 
@@ -947,13 +947,13 @@ mod tests {
             diagnostics_for("steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n").await;
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a mutable-ref-pin diagnostic for a flow-style tag pin");
         assert!(
-            found.message.contains("no automated fix available"),
+            found.message().contains("no automated fix available"),
             "a flow-style step withholds the SHA-pin quickfix (#633), so the message \
              must say so; got: {}",
-            found.message
+            found.message()
         );
     }
 
@@ -968,10 +968,9 @@ mod tests {
         let cold = diagnostics_for(content).await;
         let cold_message = cold
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a diagnostic on cold cache")
-            .message
-            .clone();
+            .message();
         assert!(
             !cold_message.contains("no automated fix available"),
             "a cold TagIndex must not force the manual-edit wording; got: {cold_message}"
@@ -1000,10 +999,9 @@ mod tests {
             .await;
         let warm_message = warm
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a diagnostic on warm cache")
-            .message
-            .clone();
+            .message();
         assert_eq!(
             cold_message, warm_message,
             "the diagnostic message must not flip as the TagIndex cache warms (critic S2)"
@@ -1045,13 +1043,13 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code()))
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
         );
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.code != Some(mutable_ref_pin_code())
-                    && d.message.contains("Newer version available"))
+                .any(|d| d.code() != Some(mutable_ref_pin_code().as_str())
+                    && d.message().contains("Newer version available"))
         );
     }
 
@@ -1079,7 +1077,7 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a mutable-ref-pin diagnostic");
         assert_eq!(found.severity, Some(Severity::Error));
     }
@@ -1111,7 +1109,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code())),
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str())),
             "mutable_ref_pin_enabled: false must suppress the diagnostic entirely: {diagnostics:?}"
         );
     }
@@ -1995,7 +1993,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code())),
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str())),
             "a tag-pinned uses: step inside a composite action.yml must still get the \
              mutable-ref-pin diagnostic: {diagnostics:?}"
         );

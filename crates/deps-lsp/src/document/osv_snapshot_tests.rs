@@ -106,8 +106,8 @@ async fn diagnostics_snapshot_for(
             format!(
                 "{:?} | {} | code={}",
                 d.severity,
-                d.message,
-                d.code.is_some()
+                d.message(),
+                d.code().is_some()
             )
         })
         .collect::<Vec<_>>()

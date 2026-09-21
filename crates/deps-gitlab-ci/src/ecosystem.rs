@@ -1159,7 +1159,7 @@ mod tests {
         assert_eq!(diagnostics.len(), 2);
         assert!(
             diagnostics[0]
-                .message
+                .message()
                 .contains("Set the `registries.gitlab_instance_host`")
         );
         // The capacity-refusal message must never instruct the user to *set* the setting —
@@ -1167,10 +1167,10 @@ mod tests {
         // configure it as a remedy.
         assert!(
             !diagnostics[1]
-                .message
+                .message()
                 .contains("Set the `registries.gitlab_instance_host`")
         );
-        assert!(diagnostics[1].message.contains("capacity"));
+        assert!(diagnostics[1].message().contains("capacity"));
     }
 
     /// Security audit finding (#1252): a bidi-override character in an `Unresolved` host
@@ -1214,12 +1214,12 @@ mod tests {
         // a regression that sanitized the message down to nothing (or dropped unrelated
         // content) must fail loudly rather than vacuously pass a "does not contain" check.
         assert_eq!(
-            diagnostics[0].message,
+            diagnostics[0].message(),
             "Cannot determine the GitLab instance host for 'ci host'. Set the \
              `registries.gitlab_instance_host` setting to enable version resolution."
         );
         assert_eq!(
-            diagnostics[1].message,
+            diagnostics[1].message(),
             "'https://gitlab .example' was not registered for version resolution because a \
              GitLab CI host/route capacity limit was reached. Reduce the number of distinct \
              GitLab hosts or includes referenced in this workspace (unrelated to the \
@@ -1270,15 +1270,15 @@ mod tests {
         for diagnostic in &diagnostics {
             assert!(
                 !diagnostic
-                    .message
+                    .message()
                     .contains(deps_core::conformance::CREDENTIAL_PROBE_SECRET),
                 "plaintext credential survived into the diagnostic message: {}",
-                diagnostic.message
+                diagnostic.message()
             );
             assert!(
-                diagnostic.message.contains("***@git.internal.corp"),
+                diagnostic.message().contains("***@git.internal.corp"),
                 "expected the redacted `***@host` form in the diagnostic message: {}",
-                diagnostic.message
+                diagnostic.message()
             );
         }
     }
@@ -1309,10 +1309,10 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE.to_string()))
+            .find(|d| d.code() == Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE))
             .expect("expected the unresolved-host diagnostic");
         assert_eq!(found.severity, Some(Severity::Information));
-        assert!(found.message.contains("gitlab_instance_host"));
+        assert!(found.message().contains("gitlab_instance_host"));
     }
 
     /// Issue #967 end-to-end, inline-literal `component:` host path: a `component:` host
@@ -1344,7 +1344,7 @@ mod tests {
 
         let blocked: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.to_lowercase().contains("blocked"))
+            .filter(|d| d.message().to_lowercase().contains("blocked"))
             .collect();
         assert_eq!(
             blocked.len(),
@@ -1355,12 +1355,12 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|d| d.code != Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE.to_string())),
+                .all(|d| d.code() != Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE)),
             "must not surface the unresolved-host diagnostic for a policy-blocked host: \
              {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|d| {
-            !d.message
+            !d.message()
                 .contains("Cannot determine the GitLab instance host")
         }),);
     }
@@ -1392,7 +1392,7 @@ mod tests {
 
         let blocked: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.to_lowercase().contains("blocked"))
+            .filter(|d| d.message().to_lowercase().contains("blocked"))
             .collect();
         assert_eq!(
             blocked.len(),
@@ -1401,16 +1401,16 @@ mod tests {
         );
         // S1: the message must name the real configured value, not the `$CI_SERVER_FQDN`
         // placeholder, which appears nowhere in this manifest or its config.
-        assert!(blocked[0].message.contains("10.0.0.1"));
+        assert!(blocked[0].message().contains("10.0.0.1"));
         assert!(
             diagnostics
                 .iter()
-                .all(|d| d.code != Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE.to_string())),
+                .all(|d| d.code() != Some(UNRESOLVED_HOST_DIAGNOSTIC_CODE)),
             "must not surface the unresolved-host diagnostic for a policy-blocked host: \
              {diagnostics:?}"
         );
         assert!(diagnostics.iter().all(|d| {
-            !d.message
+            !d.message()
                 .contains("Cannot determine the GitLab instance host")
         }),);
     }
@@ -1446,11 +1446,11 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag include");
         assert_eq!(found.severity, Some(Severity::Hint));
-        assert!(found.message.contains("v1.0.0"));
-        assert!(!found.message.contains("manual edit"));
+        assert!(found.message().contains("v1.0.0"));
+        assert!(!found.message().contains("manual edit"));
     }
 
     /// #912 critic S1 regression: an aliased `project:` next to a **literal** `ref:` must
@@ -1469,13 +1469,13 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag include");
-        assert!(found.message.contains("v1.0.0"));
+        assert!(found.message().contains("v1.0.0"));
         assert!(
-            !found.message.contains("manual edit"),
+            !found.message().contains("manual edit"),
             "an aliased project: alone must not withhold the literal ref:'s quickfix: {}",
-            found.message
+            found.message()
         );
     }
 
@@ -1501,12 +1501,12 @@ mod tests {
         let diagnostics = diagnostics_for(content, &uri).await;
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag include");
         assert!(
-            !found.message.contains("no automated fix available"),
+            !found.message().contains("no automated fix available"),
             "a PinStyle::Tag message never carries the suffix, cold cache or not: {}",
-            found.message
+            found.message()
         );
 
         // Independently-built parse result + formatter, likewise cold (no seeding).
@@ -1540,7 +1540,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code())),
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str())),
             "a PinStyle::Sha include must never get the mutable-ref-pin diagnostic"
         );
     }
@@ -1555,7 +1555,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code())),
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str())),
             "a PinStyle::Branch include with no TagIndex confirmation is an honest \
              unknown, not diagnosable as a mutable tag ref"
         );
@@ -1606,13 +1606,13 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a registry-confirmed tag");
         assert!(
-            found.message.contains("no automated fix available"),
+            found.message().contains("no automated fix available"),
             "a registry-confirmed-but-Branch ref has no quickfix, so the message must say \
              so; got: {}",
-            found.message
+            found.message()
         );
     }
 
@@ -1652,13 +1652,13 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected a mutable-ref-pin diagnostic");
         // Asserts the full sanitized message, not just absence of the bad characters —
         // a regression that sanitized the message down to nothing (or dropped unrelated
         // content) must fail loudly rather than vacuously pass a "does not contain" check.
         assert_eq!(
-            found.message,
+            found.message(),
             "org /proj project is pinned to the mutable ref `v1 .0`; pin to a full commit \
              SHA to guard against ref mutation"
         );
@@ -1798,14 +1798,14 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Latest component");
-        assert!(found.message.contains("~latest"));
+        assert!(found.message().contains("~latest"));
         assert!(
-            !found.message.contains("no automated fix available"),
+            !found.message().contains("no automated fix available"),
             "a resolved host has a genuine DynamicComponentPin quickfix available, so the \
              suffix must be omitted (spec 048 FR-001): {}",
-            found.message
+            found.message()
         );
     }
 
@@ -1822,14 +1822,14 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Partial component");
-        assert!(found.message.contains("1.2"));
+        assert!(found.message().contains("1.2"));
         assert!(
-            !found.message.contains("no automated fix available"),
+            !found.message().contains("no automated fix available"),
             "a resolved host has a genuine DynamicComponentPin quickfix available, so the \
              suffix must be omitted (spec 048 FR-001): {}",
-            found.message
+            found.message()
         );
     }
 
@@ -1848,14 +1848,14 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Latest component");
-        assert!(found.message.contains("~latest"));
+        assert!(found.message().contains("~latest"));
         assert!(
-            found.message.contains("no automated fix available"),
+            found.message().contains("no automated fix available"),
             "an unresolved host has no registered route, so no quickfix is genuinely \
              available — the suffix must be kept: {}",
-            found.message
+            found.message()
         );
     }
 
@@ -1872,10 +1872,10 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a ref-less project include");
-        assert!(found.message.contains("no `ref:`"));
-        assert!(found.message.contains("no automated fix available"));
+        assert!(found.message().contains("no `ref:`"));
+        assert!(found.message().contains("no automated fix available"));
     }
 
     #[tokio::test]
@@ -1887,10 +1887,10 @@ mod tests {
 
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag component");
-        assert!(found.message.contains("1.0.0"));
-        assert!(found.message.contains("component"));
+        assert!(found.message().contains("1.0.0"));
+        assert!(found.message().contains("component"));
     }
 
     #[tokio::test]
@@ -1917,7 +1917,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.code == Some(mutable_ref_pin_code())),
+                .any(|d| d.code() == Some(mutable_ref_pin_code().as_str())),
             "mutable_ref_pin_enabled: false must suppress the diagnostic entirely"
         );
     }
@@ -1930,14 +1930,14 @@ mod tests {
         let diagnostics = diagnostics_for(content, &uri).await;
         let mut found: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.code == Some(mutable_ref_pin_code()))
+            .filter(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .collect();
         assert_eq!(found.len(), 2, "both Tag-pinned includes must be flagged");
         found.sort_by_key(|d| d.range.start.line);
-        assert!(found[0].message.contains("v1.0.0"));
-        assert!(!found[0].message.contains("v2.0.0"));
-        assert!(found[1].message.contains("v2.0.0"));
-        assert!(!found[1].message.contains("v1.0.0"));
+        assert!(found[0].message().contains("v1.0.0"));
+        assert!(!found[0].message().contains("v2.0.0"));
+        assert!(found[1].message().contains("v2.0.0"));
+        assert!(!found[1].message().contains("v1.0.0"));
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -2176,12 +2176,12 @@ mod tests {
         let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Latest component");
         assert!(
-            !found.message.contains("no automated fix available"),
+            !found.message().contains("no automated fix available"),
             "a resolved host has a genuine quickfix, so the message must omit the suffix: {}",
-            found.message
+            found.message()
         );
 
         let action = build_dynamic_component_pin_action(
@@ -3284,12 +3284,12 @@ mod tests {
         let diagnostics = diagnostics_for(content, &uri).await;
         let found = diagnostics
             .iter()
-            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
             .expect("expected the mutable-ref-pin diagnostic for an alias-occurrence ref");
         assert!(
-            found.message.contains("no automated fix available"),
+            found.message().contains("no automated fix available"),
             "alias-occurrence message must carry the manual-edit suffix: {}",
-            found.message
+            found.message()
         );
     }
 }

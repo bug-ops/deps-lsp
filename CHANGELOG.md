@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: release archives signed with Sigstore/cosign keyless signing alongside existing SHA256 checksums (resolves #1153) (#1163)
 
 ### Breaking
+- **deps-core**: `Diagnostic::message`/`code`/`RelatedInformation::message` are now private, accessed via `message()`/`code()` getters, with `with_code` now sanitizing like `message` does; `Diagnostic` no longer implements `Default` — closes a sanitization-backstop bypass via `Default::default()` or a direct field write (resolves #1280)
 - **deps-cli**: `config::ConfigError::Toml`/`Deserialize` now store a redacted message instead of the raw parse error, closing a credential leak to stderr/logs (resolves #1240) (#1241)
 - **deps-cli**: `walk::walk` takes `GitignorePolicy`/`SymlinkPolicy` enums instead of two adjacent, transposable `bool` parameters; `CheckArgs` gained matching `gitignore_policy()`/`symlink_policy()` accessors (resolves #1224) (#1230)
 - **deps-core**: `registry::register_capped`/`register_capped_with_occupied` return `CapResult` instead of `bool` (#1218)

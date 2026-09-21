@@ -1177,7 +1177,7 @@ mod tests {
         )
         .await
         .into_iter()
-        .map(|d| d.message)
+        .map(|d| d.message().to_string())
         .collect()
     }
 

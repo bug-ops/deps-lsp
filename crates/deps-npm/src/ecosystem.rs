@@ -1467,7 +1467,7 @@ mod tests {
             .await;
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("left-pad"));
+        assert!(diagnostics[0].message().contains("left-pad"));
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
     }
 
