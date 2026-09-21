@@ -290,7 +290,7 @@ impl<'a> CatalogSpecifier<'a> {
 /// Every variant but [`Self::Resolved`] means [`deps_core::Dependency::version_requirement`]
 /// is `None` for that dependency (see the module's totality invariant).
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum CatalogOutcome {
     /// Resolved to the given semver range, fed into the ordinary registry/hover/diagnostic
     /// pipeline exactly as a literal-range dependency would be.
@@ -326,6 +326,33 @@ pub enum CatalogOutcome {
     MissingEntry,
 }
 
+impl std::fmt::Debug for CatalogOutcome {
+    /// Manual, not derived: `Resolved`/`NonSemverEntry` carry a raw catalog entry value that
+    /// can be credential-shaped (e.g. a git-URL specifier with an embedded token) (CWE-532,
+    /// #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Resolved(range) => f
+                .debug_tuple("Resolved")
+                .field(&deps_core::net_policy::redact_declaration_key(range))
+                .finish(),
+            Self::NonSemverEntry { value } => f
+                .debug_struct("NonSemverEntry")
+                .field(
+                    "value",
+                    &deps_core::net_policy::redact_declaration_key(value),
+                )
+                .finish(),
+            Self::MalformedEntry => f.debug_struct("MalformedEntry").finish(),
+            Self::NoWorkspaceFile => f.debug_struct("NoWorkspaceFile").finish(),
+            Self::MalformedWorkspaceFile => f.debug_struct("MalformedWorkspaceFile").finish(),
+            Self::DuplicateDefaultCatalog => f.debug_struct("DuplicateDefaultCatalog").finish(),
+            Self::UnknownCatalog => f.debug_struct("UnknownCatalog").finish(),
+            Self::MissingEntry => f.debug_struct("MissingEntry").finish(),
+        }
+    }
+}
+
 /// Where a catalog-referencing dependency's resolution came from, and what happened.
 ///
 /// Stored on [`NpmDependency::catalog`], `None` for every non-catalog dependency.
@@ -333,7 +360,7 @@ pub enum CatalogOutcome {
 /// Output-only: constructed internally by this module's own catalog resolution, never by
 /// external code — no constructor is provided.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CatalogOrigin {
     /// The raw `catalog:...` text as written in the manifest (e.g. `"catalog:react17"`).
     pub specifier: String,
@@ -341,6 +368,29 @@ pub struct CatalogOrigin {
     pub catalog: Option<String>,
     /// What resolving `specifier` against the workspace's catalog map produced.
     pub outcome: CatalogOutcome,
+}
+
+impl std::fmt::Debug for CatalogOrigin {
+    /// Manual, not derived: `specifier` is the raw `catalog:...` text as written, which can
+    /// carry a credential-shaped value — and `catalog` is `specifier`'s own
+    /// `strip_prefix("catalog:")` tail, so it must be redacted too or the same credential
+    /// leaks through the adjacent field (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CatalogOrigin")
+            .field(
+                "specifier",
+                &deps_core::net_policy::redact_declaration_key(&self.specifier),
+            )
+            .field(
+                "catalog",
+                &self
+                    .catalog
+                    .as_deref()
+                    .map(deps_core::net_policy::redact_declaration_key),
+            )
+            .field("outcome", &self.outcome)
+            .finish()
+    }
 }
 
 /// Upper bound (Unicode scalar values) on how much of any single attacker-controlled fragment
@@ -606,6 +656,30 @@ mod tests {
     fn workspace(dir: &std::path::Path, content: &str) {
         std::fs::write(dir.join("pnpm-workspace.yaml"), content).unwrap();
     }
+
+    deps_core::debug_redaction_conformance!(
+        test_catalog_origin_debug_redacts_credentials,
+        2,
+        CatalogOrigin {
+            specifier: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            catalog: Some(deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string()),
+            outcome: CatalogOutcome::MissingEntry,
+        },
+    );
+
+    deps_core::debug_redaction_conformance!(
+        test_catalog_outcome_resolved_debug_redacts_credentials,
+        1,
+        CatalogOutcome::Resolved(deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string()),
+    );
+
+    deps_core::debug_redaction_conformance!(
+        test_catalog_outcome_non_semver_entry_debug_redacts_credentials,
+        1,
+        CatalogOutcome::NonSemverEntry {
+            value: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+        },
+    );
 
     // --- CatalogSpecifier::parse ---
 

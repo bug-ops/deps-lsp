@@ -126,7 +126,7 @@ pub(crate) fn resolve_entry(
 /// Output-only: constructed internally by [`PypiIndexConfig::resolved_chains`], never by
 /// external code — no constructor is provided.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedChain {
     /// Composite identity — becomes both the router's `alternates` map key and the
     /// `DependencySource::AlternateRegistry.index` value for a plain (non-named-source)
@@ -161,6 +161,30 @@ pub struct ResolvedChain {
     /// public `pypi.org` root, appended at registration time rather than present in
     /// [`Self::hops`] — `PypiRegistry::register_alternate` builds that hop itself.
     pub implicit_public_fallback: bool,
+}
+
+impl std::fmt::Debug for ResolvedChain {
+    /// Manual, not derived: `key` is a real URL only for the named-source
+    /// [`deps_core::registry::KeyShape::Url`] shape — the hashed routing-token
+    /// [`deps_core::registry::KeyShape::Opaque`] shape is printed as-is, never passed through
+    /// [`RedactedUrl`] (which would collapse it to an information-free `"pypi-chain:***"`, per
+    /// [`Self::key`]'s own doc) (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("ResolvedChain");
+        match self.key_shape {
+            deps_core::registry::KeyShape::Url => {
+                debug.field("key", &RedactedUrl::new(&self.key));
+            }
+            deps_core::registry::KeyShape::Opaque => {
+                debug.field("key", &self.key);
+            }
+        }
+        debug
+            .field("key_shape", &self.key_shape)
+            .field("hops", &self.hops)
+            .field("implicit_public_fallback", &self.implicit_public_fallback)
+            .finish()
+    }
 }
 
 impl ResolvedChain {
@@ -759,6 +783,36 @@ mod tests {
         two.add_extra("https://extra-b.example/simple", &policy);
 
         assert_ne!(one.resolved_chains()[0].key, two.resolved_chains()[0].key);
+    }
+
+    deps_core::debug_redaction_conformance!(
+        test_resolved_chain_debug_redacts_credentials_for_url_shape,
+        1,
+        ResolvedChain {
+            key: deps_core::conformance::CREDENTIAL_PROBE_URL.to_string(),
+            key_shape: deps_core::registry::KeyShape::Url,
+            hops: vec![
+                PypiIndexUrl::new("https://pypi.mycorp.example/simple", &all_policy()).unwrap(),
+            ],
+            implicit_public_fallback: false,
+        },
+    );
+
+    /// The hashed [`deps_core::registry::KeyShape::Opaque`] shape must never be run through
+    /// [`RedactedUrl`] — doing so would collapse an ordinary, non-credential routing token into
+    /// an information-free `"pypi-chain:***"`.
+    #[test]
+    fn test_resolved_chain_debug_opaque_shape_prints_key_verbatim() {
+        let chain = ResolvedChain {
+            key: "pypi-chain:deadbeef".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
+            hops: vec![
+                PypiIndexUrl::new("https://pypi.mycorp.example/simple", &all_policy()).unwrap(),
+            ],
+            implicit_public_fallback: false,
+        };
+        let rendered = format!("{chain:?}");
+        assert!(rendered.contains(r#"key: "pypi-chain:deadbeef""#));
     }
 
     /// An invalid explicit primary fails closed — never falls through to extras.

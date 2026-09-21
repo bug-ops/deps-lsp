@@ -62,7 +62,7 @@ impl EndpointKind {
 
 /// A dependency's resolved (or not-yet-resolvable) host.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum HostRef {
     /// A validated, policy-gated host — from a `component:` prefix, or from
     /// `registries.gitlab_instance_host` (spec FR-011a).
@@ -109,6 +109,39 @@ pub enum HostRef {
     },
 }
 
+impl std::fmt::Debug for HostRef {
+    /// Manual, not derived: `Unresolved`/`CapacityRefused`/`PolicyBlocked` carry raw,
+    /// potentially credential-shaped host strings (CWE-532, #1222) — `PolicyBlocked::raw`
+    /// mirrors the same `registries.gitlab_instance_host` value `RegistriesConfig`'s own
+    /// hand-written `Debug` already redacts (#936).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Literal(host) => f.debug_tuple("Literal").field(host).finish(),
+            Self::Unresolved(raw) => f
+                .debug_tuple("Unresolved")
+                .field(&deps_core::net_policy::redact_declaration_key(raw))
+                .finish(),
+            Self::CapacityRefused(raw) => f
+                .debug_tuple("CapacityRefused")
+                .field(&deps_core::net_policy::redact_declaration_key(raw))
+                .finish(),
+            Self::PolicyBlocked {
+                raw,
+                class,
+                declaration_key,
+            } => f
+                .debug_struct("PolicyBlocked")
+                .field("raw", &deps_core::net_policy::redact_declaration_key(raw))
+                .field("class", class)
+                .field(
+                    "declaration_key",
+                    &deps_core::net_policy::redact_declaration_key(declaration_key),
+                )
+                .finish(),
+        }
+    }
+}
+
 /// The `(host, endpoint)` pair a dependency resolves against, registered at parse time
 /// under an opaque routing key carried in `DependencySource::AlternateRegistry.index`.
 ///
@@ -144,7 +177,7 @@ pub enum PinStyle {
 /// Parsed `include:` dependency from a `.gitlab-ci.yml`-syntax file, with position
 /// tracking.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct GitlabCiDependency {
     /// Host-qualified when the host is known: `{host}/{project_path}` for [`IncludeKind::Project`],
     /// `{host}/{project_path}/{component_name}` for [`IncludeKind::Component`]. The bare
@@ -193,6 +226,30 @@ pub struct GitlabCiDependency {
     /// The bare `org/sub/proj[/component]` path, without a host prefix — kept for URL
     /// construction and the registry's own fetch-path use.
     pub project_path: String,
+}
+
+impl std::fmt::Debug for GitlabCiDependency {
+    /// Manual, not derived: `project_path` is a raw path segment that can carry a credential
+    /// via CI variable interpolation (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitlabCiDependency")
+            .field("name", &self.name)
+            .field("name_range", &self.name_range)
+            .field("version_req", &self.version_req)
+            .field("version_range", &self.version_range)
+            .field("version_literal", &self.version_literal)
+            .field("source", &self.source)
+            .field("is_plain_scalar", &self.is_plain_scalar)
+            .field("is_alias_occurrence", &self.is_alias_occurrence)
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("pin", &self.pin)
+            .field(
+                "project_path",
+                &deps_core::net_policy::redact_declaration_key(&self.project_path),
+            )
+            .finish()
+    }
 }
 
 deps_core::impl_dependency!(GitlabCiDependency {
@@ -375,6 +432,47 @@ mod tests {
             d.source(),
             DependencySource::AlternateRegistry { .. }
         ));
+    }
+
+    deps_core::debug_redaction_conformance!(
+        test_gitlab_ci_dependency_debug_redacts_credentials,
+        1,
+        GitlabCiDependency {
+            name: "gitlab.com/org/proj".into(),
+            name_range: range(),
+            version_req: Some("v1.0.0".into()),
+            version_range: Some(range()),
+            version_literal: None,
+            source: DependencySource::Registry,
+            is_plain_scalar: true,
+            is_alias_occurrence: false,
+            kind: IncludeKind::Project,
+            host: HostRef::Unresolved("$CI_SERVER_FQDN".into()),
+            pin: Some(PinStyle::Tag),
+            project_path: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+        },
+    );
+
+    deps_core::debug_redaction_conformance!(
+        test_host_ref_policy_blocked_debug_redacts_credentials,
+        2,
+        HostRef::PolicyBlocked {
+            raw: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            class: deps_core::net_policy::HostClass::Loopback,
+            declaration_key: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+        },
+    );
+
+    #[test]
+    fn test_host_ref_unresolved_and_capacity_refused_redact_credentials() {
+        for host in [
+            HostRef::Unresolved(deps_core::conformance::CREDENTIAL_PROBE_KEY.into()),
+            HostRef::CapacityRefused(deps_core::conformance::CREDENTIAL_PROBE_KEY.into()),
+        ] {
+            let rendered = format!("{host:?}");
+            assert!(!rendered.contains(deps_core::conformance::CREDENTIAL_PROBE_SECRET));
+            assert!(rendered.contains("***@git.internal.corp"));
+        }
     }
 
     #[test]

@@ -274,7 +274,7 @@ impl std::fmt::Display for EcosystemId {
 /// [`Self::declaration_key`] are both `String`s, so a positional tuple would let them be
 /// silently swapped at any call site with no compile error — the same shape as the value/key
 /// mixup this type exists to rule out.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BlockedRegistryOccurrence {
     /// Range of the affected dependency's name in the manifest.
     pub range: Range,
@@ -291,6 +291,27 @@ pub struct BlockedRegistryOccurrence {
     pub declaration_key: String,
 }
 
+impl std::fmt::Debug for BlockedRegistryOccurrence {
+    /// Manual, not derived: `raw_value`/`declaration_key` are raw, potentially
+    /// credential-shaped strings, already redacted the same way on the Display path
+    /// (`lsp_helpers::diagnostics::build_blocked_registry_diagnostic`) but not on `Debug`
+    /// (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockedRegistryOccurrence")
+            .field("range", &self.range)
+            .field("class", &self.class)
+            .field(
+                "raw_value",
+                &crate::net_policy::RedactedUrl::new(&self.raw_value),
+            )
+            .field(
+                "declaration_key",
+                &crate::net_policy::redact_declaration_key(&self.declaration_key),
+            )
+            .finish()
+    }
+}
+
 /// One host-class/raw-value/declaration-key classification an ecosystem config's own
 /// `blocked_class_for` helper produces.
 ///
@@ -305,7 +326,7 @@ pub struct BlockedRegistryOccurrence {
 /// [`BlockedRegistryOccurrence`] itself was already converted off of (#944 M9). Implemented by
 /// `deps_nuget::config::NuGetConfig::blocked_class_for`, `deps_npm::config::NpmConfig::blocked_class_for`,
 /// and `deps_pypi::config::PypiIndexConfig::blocked_class_for`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct BlockedSourceClass {
     /// The blocked host's classification.
     pub class: crate::net_policy::HostClass,
@@ -315,6 +336,24 @@ pub struct BlockedSourceClass {
     /// this entry — see [`BlockedRegistryOccurrence::declaration_key`]'s doc for why this must
     /// stay distinct from [`Self::raw_value`].
     pub declaration_key: String,
+}
+
+impl std::fmt::Debug for BlockedSourceClass {
+    /// Manual, not derived: same `raw_value`/`declaration_key` leak class and redactor pairing
+    /// as [`BlockedRegistryOccurrence`]'s own manual `Debug` impl (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockedSourceClass")
+            .field("class", &self.class)
+            .field(
+                "raw_value",
+                &crate::net_policy::RedactedUrl::new(&self.raw_value),
+            )
+            .field(
+                "declaration_key",
+                &crate::net_policy::redact_declaration_key(&self.declaration_key),
+            )
+            .finish()
+    }
 }
 
 impl BlockedSourceClass {
@@ -2060,4 +2099,25 @@ mod tests {
             other => panic!("Expected ParseError, got: {other:?}"),
         }
     }
+
+    crate::debug_redaction_conformance!(
+        test_blocked_registry_occurrence_debug_redacts_credentials,
+        2,
+        BlockedRegistryOccurrence {
+            range: Range::default(),
+            class: crate::net_policy::HostClass::Loopback,
+            raw_value: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
+            declaration_key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+        },
+    );
+
+    crate::debug_redaction_conformance!(
+        test_blocked_source_class_debug_redacts_credentials,
+        2,
+        BlockedSourceClass {
+            class: crate::net_policy::HostClass::Loopback,
+            raw_value: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
+            declaration_key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+        },
+    );
 }

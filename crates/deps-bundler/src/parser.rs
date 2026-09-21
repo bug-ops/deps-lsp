@@ -14,7 +14,7 @@ use url::Url;
 
 /// Result of parsing a Gemfile.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BundlerParseResult {
     /// Dependencies found in the `Gemfile`.
     pub dependencies: Vec<BundlerDependency>,
@@ -28,6 +28,26 @@ pub struct BundlerParseResult {
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
     pub dependency_truncation: Option<(usize, usize)>,
+}
+
+impl std::fmt::Debug for BundlerParseResult {
+    /// Manual, not derived: `source_url` is the verbatim Gemfile `source "..."` literal, which
+    /// can carry a credential (`source "https://user:token@gems.internal"`) (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BundlerParseResult")
+            .field("dependencies", &self.dependencies)
+            .field("ruby_version", &self.ruby_version)
+            .field(
+                "source_url",
+                &self
+                    .source_url
+                    .as_deref()
+                    .map(deps_core::net_policy::RedactedUrl::new),
+            )
+            .field("uri", &self.uri)
+            .field("dependency_truncation", &self.dependency_truncation)
+            .finish()
+    }
 }
 
 // Compile-time-constant patterns; a malformed literal is a build-visible programmer error,
@@ -1769,6 +1789,18 @@ mod tests {
         let path = "/test/Gemfile";
         Url::from_file_path(path).unwrap()
     }
+
+    deps_core::debug_redaction_conformance!(
+        test_bundler_parse_result_debug_redacts_credentials,
+        1,
+        BundlerParseResult {
+            dependencies: vec![],
+            ruby_version: None,
+            source_url: Some(deps_core::conformance::CREDENTIAL_PROBE_URL.to_string()),
+            uri: test_uri(),
+            dependency_truncation: None,
+        },
+    );
 
     #[test]
     fn test_parse_simple_gem() {

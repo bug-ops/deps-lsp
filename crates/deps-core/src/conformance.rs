@@ -2105,3 +2105,135 @@ macro_rules! complete_versions_test_shim {
         }
     };
 }
+
+// ---------------------------------------------------------------------------------------
+// Macro 7: `debug_redaction_conformance!` — a manual `Debug` impl actually redacts a
+// credential-shaped field instead of leaking it (CWE-532, #1222).
+// ---------------------------------------------------------------------------------------
+
+/// URL-shaped credential probe for [`crate::debug_redaction_conformance!`] — plant into a
+/// `url`-typed field a manual `Debug` impl is expected to run through
+/// [`crate::net_policy::RedactedUrl`].
+pub const CREDENTIAL_PROBE_URL: &str = "https://deploy:hunter2@git.internal.corp/team/x.git";
+
+/// Coordinate/key-shaped credential probe for [`crate::debug_redaction_conformance!`].
+///
+/// Plant into a name/path/key-typed field a manual `Debug` impl is expected to run through
+/// [`crate::net_policy::redact_declaration_key`].
+pub const CREDENTIAL_PROBE_KEY: &str = "org.example:deploy:hunter2@git.internal.corp";
+
+/// The password half of both probe constants — must never appear in a redacted `Debug`
+/// rendering.
+pub const CREDENTIAL_PROBE_SECRET: &str = "hunter2";
+
+/// The marker both [`crate::net_policy::RedactedUrl`] and
+/// [`crate::net_policy::redact_declaration_key`] converge on for either probe constant —
+/// the anti-vacuity signal [`assert_debug_redacts_credentials`] counts occurrences of.
+const PROBE_MARKER: &str = "***@git.internal.corp";
+
+/// Asserts `value`'s `Debug` rendering redacts every planted credential probe
+/// ([`CREDENTIAL_PROBE_URL`]/[`CREDENTIAL_PROBE_KEY`]) instead of leaking it (CWE-532, #1222).
+///
+/// Three checks against `format!("{value:?}")`:
+/// 1. does not contain [`CREDENTIAL_PROBE_SECRET`] (the password half);
+/// 2. does not contain `"deploy:"` (the username half — a redactor that stripped only the
+///    password would still fail this);
+/// 3. `rendered.matches(PROBE_MARKER).count() >= planted_fields` — the anti-vacuity check.
+///    Both redactors converge on the same `***@git.internal.corp` marker for both probe
+///    constants, so one substring covers URL-shaped and key-shaped fields alike. Without this,
+///    a caller that forgot to plant the probe, or an impl that silently dropped the field from
+///    its `Debug`, would pass trivially on checks 1/2 alone.
+///
+/// # Panics
+///
+/// Panics (via `assert!`) if any of the three checks fails.
+pub fn assert_debug_redacts_credentials<T: std::fmt::Debug>(
+    value: &T,
+    planted_fields: usize,
+    context: &str,
+) {
+    let rendered = format!("{value:?}");
+    assert!(
+        !rendered.contains(CREDENTIAL_PROBE_SECRET),
+        "{context}: Debug output leaked the planted credential's password half: {rendered}"
+    );
+    assert!(
+        !rendered.contains("deploy:"),
+        "{context}: Debug output leaked the planted credential's username half: {rendered}"
+    );
+    let matches = rendered.matches(PROBE_MARKER).count();
+    assert!(
+        matches >= planted_fields,
+        "{context}: expected at least {planted_fields} redacted occurrence(s) of {PROBE_MARKER:?}, \
+         found {matches} in: {rendered}"
+    );
+}
+
+/// Generates a `#[test]` asserting `$build`'s `Debug` rendering redacts every planted
+/// credential probe (CWE-532, #1222).
+///
+/// **Invocation contract — this is the load-bearing part.** `$build` must construct its value
+/// via an *exhaustive* struct/enum literal — never `..Default::default()`, never `..base`. This
+/// makes adding a new field to the type a *compile error* here — forcing whoever adds it to
+/// explicitly name the new field in this literal (and so notice it), rather than silently
+/// inheriting an unredacted default via `..Default::default()`/`..base`. This holds regardless
+/// of whether the type is `#[non_exhaustive]` or constructed from outside its own crate
+/// elsewhere — an exhaustive literal has no `..` to hide a field behind either way. It only
+/// forces the field to be *named*, not correctly redacted — `$planted` must still match the
+/// number of probes actually planted for [`assert_debug_redacts_credentials`]'s anti-vacuity
+/// check to catch a field silently dropped from `Debug`.
+///
+/// Must be invoked inside your own `#[cfg(test)] mod tests { ... }` — like every other macro in
+/// this module, this generates its own `mod $name { ... }` rather than a bare `#[test] fn`
+/// (see [`ecosystem_conformance!`]'s doc for why a bare `#[test]`-attributed fn body would be
+/// silently elided, and thus never actually type-checked, in a doctest).
+///
+/// # Examples
+///
+/// Wrapped in an explicit `mod example` — see [`ecosystem_conformance!`]'s doc for why.
+///
+/// ```
+/// mod example {
+/// struct Fake {
+///     url: String,
+/// }
+///
+/// impl std::fmt::Debug for Fake {
+///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+///         f.debug_struct("Fake")
+///             .field("url", &deps_core::net_policy::RedactedUrl::new(&self.url))
+///             .finish()
+///     }
+/// }
+///
+/// deps_core::debug_redaction_conformance!(
+///     fake_debug_redacts_credentials,
+///     1,
+///     Fake {
+///         url: deps_core::conformance::CREDENTIAL_PROBE_URL.to_string(),
+///     },
+/// );
+/// }
+/// ```
+#[macro_export]
+macro_rules! debug_redaction_conformance {
+    ($name:ident, $planted:expr, $build:expr $(,)?) => {
+        mod $name {
+            use super::*;
+
+            // See `ecosystem_conformance!`'s doc for why this is a plain `_impl` fn called by
+            // a thin `#[test]` wrapper.
+            fn debug_redaction_conformance_impl() {
+                $crate::conformance::assert_debug_redacts_credentials(
+                    &($build),
+                    $planted,
+                    stringify!($name),
+                );
+            }
+            #[test]
+            fn debug_redaction_conformance() {
+                debug_redaction_conformance_impl();
+            }
+        }
+    };
+}
