@@ -168,7 +168,14 @@ impl RelatedInformation {
     /// Builds a [`RelatedInformation`] from its `uri`/`range`/`message` fields.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must call this constructor instead.
+    /// this crate, so every other crate must call this constructor to build a new value.
+    ///
+    /// `message` is sanitized through an internal markdown-unsafe-character filter (#1276)
+    /// as a defense-in-depth backstop on this constructor path, on top of (not instead of)
+    /// producer-side sanitization — it is not a guarantee for every way `message` can end
+    /// up on a [`Self`] value, since [`Self`] exposes a public `message` field that can
+    /// still be reassigned directly after construction, bypassing this filter. The filter
+    /// is idempotent, so callers that already sanitized their input are unaffected.
     ///
     /// # Examples
     ///
@@ -189,7 +196,7 @@ impl RelatedInformation {
         Self {
             uri,
             range,
-            message: message.into(),
+            message: crate::lsp_helpers::replace_markdown_unsafe_chars(&message.into()),
         }
     }
 }
@@ -246,7 +253,16 @@ impl Diagnostic {
     /// unset. Chain the `with_*` builders to set them.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must call this constructor instead.
+    /// this crate, so every other crate must call this constructor to build a new value.
+    ///
+    /// `message` is sanitized through an internal markdown-unsafe-character filter (#1276)
+    /// as a defense-in-depth backstop on this constructor path, on top of (not instead of)
+    /// producer-side sanitization — it is not a guarantee for every way `message` can end
+    /// up on a [`Self`] value, since [`Self`] derives `Default` and exposes a public
+    /// `message` field, so `message` can still be set via `Default::default()` or
+    /// reassigned directly after `new`, bypassing this filter. The filter is idempotent,
+    /// so callers that already sanitized their input are unaffected; length-capping (e.g.
+    /// `MAX_DIAGNOSTIC_NAME_CHARS`) stays producer-side and is not duplicated here.
     ///
     /// # Examples
     ///
@@ -267,7 +283,7 @@ impl Diagnostic {
             severity: None,
             code: None,
             code_description: None,
-            message: message.into(),
+            message: crate::lsp_helpers::replace_markdown_unsafe_chars(&message.into()),
             related_information: None,
         }
     }
@@ -389,6 +405,33 @@ mod tests {
             let json = serde_json::to_string(&severity).unwrap();
             assert_eq!(serde_json::from_str::<Severity>(&json).unwrap(), severity);
         }
+    }
+
+    /// #1276: `Diagnostic::new` is a defense-in-depth backstop on its own constructor
+    /// path — a bidi-override character in `message` must not survive construction through
+    /// `new`, even without an explicit producer-side call to `replace_markdown_unsafe_chars`.
+    #[test]
+    fn test_diagnostic_new_sanitizes_bidi_override_in_message() {
+        use crate::position::Position;
+
+        let diagnostic = Diagnostic::new(
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+            "vulnerable\u{202E}gnp.sj",
+        );
+        assert_eq!(diagnostic.message, "vulnerable gnp.sj");
+    }
+
+    /// #1276: same backstop applies to `RelatedInformation::new`.
+    #[test]
+    fn test_related_information_new_sanitizes_bidi_override_in_message() {
+        use crate::position::Position;
+
+        let related = RelatedInformation::new(
+            url::Url::parse("file:///Cargo.toml").unwrap(),
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+            "also here\u{202E}gnp.sj",
+        );
+        assert_eq!(related.message, "also here gnp.sj");
     }
 
     /// #1083 critic S1: an out-of-range integer must never fail deserialization — it must

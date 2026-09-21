@@ -34,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-npm, deps-pypi, deps-go, deps-composer, deps-swift, deps-nuget, deps-cargo, deps-dart, deps-bundler, deps-deno**: `Ecosystem::complete_version` now has a shared default implementation (backed by a new `version_operator_chars` hook), replacing ten byte-identical hand-written implementations (resolves #1223) (#1235)
 
 ### Fixed
+- **deps-core**: `Diagnostic::new`/`RelatedInformation::new` now sanitize `message` as a defense-in-depth backstop on the constructor path, on top of existing producer-side sanitization (resolves #1276) (#1279)
 - **deps-core**: sanitizes and caps the registry- and lockfile-derived version strings interpolated into every inlay-hint version label, closing a sink missed by the prior sanitization sweep (resolves #1268) (#1270)
 - **deps-core**: hover header's dependency name (rendered label) is now capped at 128 characters, and its link destination strips bidi/invisible characters as defense-in-depth on top of the existing producer-side `package_url` conformance gate (resolves #1259) (#1270)
 - **deps-gitlab-ci**: a credential-shaped `include:` host value no longer leaks unredacted into the unresolved-host diagnostic message (resolves #1254) (#1264)
