@@ -53,23 +53,34 @@ pub enum ConfigError {
         path: PathBuf,
     },
     /// `path`'s content is not valid TOML.
-    #[error("failed to parse TOML in {path}: {source}")]
+    #[error("failed to parse TOML in {path}: {message}")]
     Toml {
         /// The config file path.
         path: PathBuf,
-        /// The underlying TOML parse error.
-        #[source]
-        source: toml_span::Error,
+        /// The underlying `toml_span::Error`'s `Display` text, redacted and bounded via
+        /// [`deps_core::net_policy::redact_parse_error_for_log`] at construction time rather
+        /// than stored raw — a duplicate-key/table parse error can embed a credential-shaped
+        /// name verbatim (#1240), and `main.rs` renders this variant via `eprintln!("deps-cli:
+        /// {error}")` straight to stderr/CI logs. Storing the already-redacted text (instead of
+        /// the raw `toml_span::Error`) means every consumer of this variant is safe by
+        /// construction, not just the current call site.
+        message: String,
     },
     /// `path` parsed as TOML but does not match [`CliConfig`]'s schema (an unknown top-level
     /// key, or a field of the wrong type).
-    #[error("invalid configuration in {path}: {source}")]
+    #[error("invalid configuration in {path}: {message}")]
     Deserialize {
         /// The config file path.
         path: PathBuf,
-        /// The underlying (de)serialization error.
-        #[source]
-        source: serde_json::Error,
+        /// The underlying `serde_json::Error`'s `Display` text, redacted and bounded via
+        /// [`deps_core::net_policy::redact_parse_error_for_log`] at construction time rather
+        /// than stored raw — `serde_json`'s "unknown field" and "invalid type" messages both
+        /// embed the offending key or value verbatim, either of which can be credential-shaped
+        /// (#1240 round 2), and `main.rs` renders this variant via `eprintln!("deps-cli:
+        /// {error}")` straight to stderr/CI logs. Same fix as [`Self::Toml`], for the same
+        /// reason: storing the already-redacted text means every consumer of this variant is
+        /// safe by construction, not just the current call site.
+        message: String,
     },
 }
 
@@ -230,15 +241,18 @@ fn ignored_sections(policy: &PolicyConfig) -> Vec<&'static str> {
 fn parse(content: &str, path: &Path) -> Result<CliConfig, ConfigError> {
     let value = toml_span::parse(content).map_err(|source| ConfigError::Toml {
         path: path.to_path_buf(),
-        source,
+        message: deps_core::net_policy::redact_parse_error_for_log(&source.to_string())
+            .into_owned(),
     })?;
     let json = serde_json::to_value(&value).map_err(|source| ConfigError::Deserialize {
         path: path.to_path_buf(),
-        source,
+        message: deps_core::net_policy::redact_parse_error_for_log(&source.to_string())
+            .into_owned(),
     })?;
     serde_json::from_value(json).map_err(|source| ConfigError::Deserialize {
         path: path.to_path_buf(),
-        source,
+        message: deps_core::net_policy::redact_parse_error_for_log(&source.to_string())
+            .into_owned(),
     })
 }
 
@@ -309,11 +323,106 @@ mod tests {
         assert!(matches!(result, Err(ConfigError::Toml { .. })));
     }
 
+    /// #1240: a duplicate table whose name is credential-shaped must not leak the credential
+    /// into `ConfigError::Toml`'s stored message, which `main.rs` prints straight to stderr.
+    #[test]
+    fn test_load_duplicate_table_toml_error_redacts_credential() {
+        let file = write_temp_toml(
+            r#"
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+a = 1
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+b = 2
+"#,
+        );
+        let result = load(Some(file.path()), Path::new("."));
+        let message = result.unwrap_err().to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_load_duplicate_table_toml_error_benign_name_unchanged() {
+        let content = r"
+[serde]
+a = 1
+[serde]
+b = 2
+";
+        let file = write_temp_toml(content);
+
+        // Derived from the raw parse, not hardcoded, so assert_eq! gates a redaction regression (#1240 M5).
+        let raw_err = toml_span::parse(content).unwrap_err();
+        let expected = format!(
+            "failed to parse TOML in {}: {raw_err}",
+            file.path().display()
+        );
+
+        let result = load(Some(file.path()), Path::new("."));
+        assert_eq!(result.unwrap_err().to_string(), expected);
+    }
+
     #[test]
     fn test_load_unknown_top_level_key_is_rejected() {
         let file = write_temp_toml("totally_unknown_key = true\n");
         let result = load(Some(file.path()), Path::new("."));
         assert!(matches!(result, Err(ConfigError::Deserialize { .. })));
+    }
+
+    /// #1240 round 2: an unknown top-level key whose *name* is credential-shaped must not leak
+    /// the credential into `ConfigError::Deserialize`'s stored message — `serde_json`'s "unknown
+    /// field" message embeds the key verbatim, and this is actually easier to trigger than the
+    /// `ConfigError::Toml` duplicate-key case (round 1): one bad key, no duplicate needed.
+    #[test]
+    fn test_load_unknown_field_credential_shaped_name_redacted() {
+        let file = write_temp_toml(
+            "\"https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x\" = true\n",
+        );
+        let message = load(Some(file.path()), Path::new("."))
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    /// #1240 round 2: a wrong-typed field *value* that happens to be credential-shaped must not
+    /// leak either — `serde_json`'s "invalid type" message embeds the offending value verbatim.
+    #[test]
+    fn test_load_wrong_typed_value_credential_shaped_string_redacted() {
+        let file = write_temp_toml(
+            r#"
+            [cache]
+            enabled = "https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"
+            "#,
+        );
+        let message = load(Some(file.path()), Path::new("."))
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_load_unknown_field_benign_name_unchanged() {
+        let content = "totally_unknown_key = true\n";
+        let file = write_temp_toml(content);
+
+        // Derived from the raw serde_json round-trip, not hardcoded, so assert_eq! gates a redaction regression.
+        let value = toml_span::parse(content).unwrap();
+        let json = serde_json::to_value(&value).unwrap();
+        let raw_err = serde_json::from_value::<CliConfig>(json).unwrap_err();
+        let expected = format!(
+            "invalid configuration in {}: {raw_err}",
+            file.path().display()
+        );
+
+        let message = load(Some(file.path()), Path::new("."))
+            .unwrap_err()
+            .to_string();
+        assert_eq!(message, expected);
     }
 
     #[test]

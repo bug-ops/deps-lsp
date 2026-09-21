@@ -248,8 +248,12 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
         ));
     }
 
-    let docs = YamlLoader::load_from_str(content)
-        .map_err(|e| to_parse_error(format!("invalid YAML: {e}")))?;
+    let docs = YamlLoader::load_from_str(content).map_err(|e| {
+        to_parse_error(format!(
+            "invalid YAML: {}",
+            deps_core::net_policy::redact_parse_error_for_log(&e.to_string())
+        ))
+    })?;
     let Some(doc) = docs.first() else {
         return Ok(ResolvedPackages::new());
     };
@@ -463,6 +467,42 @@ fn parse_git_source(url: &str) -> ResolvedSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1240: a duplicate mapping key whose name is credential-shaped must not leak the
+    /// credential into the parse error's `Display` text, which reaches `tracing::warn!`.
+    #[test]
+    fn test_parse_pnpm_lock_yaml_duplicate_key_error_redacts_credential() {
+        let content = r#"
+packages:
+  "https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x":
+    version: "1.0.0"
+  "https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x":
+    version: "2.0.0"
+"#;
+
+        let message = parse_pnpm_lock_yaml(content).unwrap_err().to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_parse_pnpm_lock_yaml_duplicate_key_error_benign_name_unchanged() {
+        let content = r#"
+packages:
+  serde:
+    version: "1.0.0"
+  serde:
+    version: "2.0.0"
+"#;
+
+        // Derived from the raw parse (ScanError's position text is fragile to hardcode), so assert_eq! gates a redaction regression (#1240 M5).
+        let raw_err = YamlLoader::load_from_str(content).unwrap_err();
+        let expected = format!("failed to parse pnpm-lock.yaml: invalid YAML: {raw_err}");
+
+        let message = parse_pnpm_lock_yaml(content).unwrap_err().to_string();
+        assert_eq!(message, expected);
+    }
 
     #[test]
     fn test_extract_package_name_simple() {

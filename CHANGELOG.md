@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core**: new `net_policy::redact_parse_error_for_log`/`parse_error_source` helpers, redacting a `toml_span`/`yaml-rust2` parse error before it reaches a log sink (resolves #1240)
 - **deps-core**: new `rate_limit` module with a `RateLimitGate` mechanism shared by deps-github-actions and deps-gitlab-ci (#1218)
 - **fuzz**: `redact_declaration_key` fuzz target, covering the client-visible declaration-key redaction gate for blocked-registry diagnostics (resolves #1207) (#1213)
 - **deps-maven**: version completion now offers items inside a self-closing `<version/>` tag, replacing the whole tag with `<version>X</version>` via an explicit text edit instead of relying on a cursor-position insert (resolves #1167) (#1189)
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: release archives signed with Sigstore/cosign keyless signing alongside existing SHA256 checksums (resolves #1153) (#1163)
 
 ### Breaking
+- **deps-cli**: `config::ConfigError::Toml`/`Deserialize` now store a redacted message instead of the raw parse error, closing a credential leak to stderr/logs (resolves #1240)
 - **deps-cli**: `walk::walk` takes `GitignorePolicy`/`SymlinkPolicy` enums instead of two adjacent, transposable `bool` parameters; `CheckArgs` gained matching `gitignore_policy()`/`symlink_policy()` accessors (resolves #1224) (#1230)
 - **deps-core**: `registry::register_capped`/`register_capped_with_occupied` return `CapResult` instead of `bool` (#1218)
 - **deps-gitlab-ci**: removed `pub const MAX_GITLAB_ROUTES`; the cap is now `deps_core::registry::MAX_ALTERNATE_REGISTRIES` (#1218)
@@ -27,9 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-npm, deps-bundler, deps-deno, deps-maven, deps-nuget, deps-dart, deps-composer**: `Registry::search` is renamed to `search_raw`, with a new inherent `search` gate on `dyn Registry` (which an implementor cannot override) that rejects a credential- or query-bearing search string before it ever reaches a registry, and redacts the 9 concrete registries' own `search` tracing spans (resolves #1215) (#1219)
 
 ### Changed
+- **deps-pypi**: `truncate_for_log` now delegates to `deps_core::net_policy::redact_parse_error_for_log` instead of duplicating its redact-then-truncate algorithm (#1240)
 - **deps-core, deps-npm, deps-pypi, deps-go, deps-composer, deps-swift, deps-nuget, deps-cargo, deps-dart, deps-bundler, deps-deno**: `Ecosystem::complete_version` now has a shared default implementation (backed by a new `version_operator_chars` hook), replacing ten byte-identical hand-written implementations (resolves #1223) (#1235)
 
 ### Fixed
+- **deps-cargo, deps-dart, deps-gradle, deps-npm, deps-cli**: a duplicate TOML table/YAML mapping key whose name is credential-shaped no longer leaks the credential into parse-error log/stderr output across Cargo.lock, Cargo.toml, pubspec.lock, gradle/libs.versions.toml, pnpm-lock.yaml, and deps.toml (resolves #1240)
 - **deps-pypi**: `truncate_for_log` now redacts credentials before truncating and gates value-redaction to avoid mangling benign colon-shaped text, closing a leak of PEP 508 direct-reference URL and lock-file credentials to logs (resolves #1228) (#1239)
 - **deps-core, deps-deno, deps-npm, deps-lsp**: an `.npmrc` change now reparses every ecosystem that watches it (not just one) and forces a full refetch instead of a silent no-op diff, so an open `deno.json`/`package.json` document picks up the new registry routing (resolves #1232) (#1234)
 - **deps-deno**: `npm:`-scope imports classified `AlternateRegistry` via `.npmrc` are now actually fetched through the resolved registry instead of being silently dropped from the fetch queue, matching `package.json`'s behavior for the identical entry (resolves #1227) (#1231)

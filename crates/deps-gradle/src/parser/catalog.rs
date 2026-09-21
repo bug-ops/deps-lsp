@@ -31,7 +31,7 @@ pub fn parse_version_catalog(content: &str, uri: &Url) -> Result<GradleParseResu
 
     let doc = toml_span::parse(content).map_err(|e| DepsError::ParseError {
         file_type: "Gradle".into(),
-        source: Box::new(std::io::Error::other(e.to_string())),
+        source: deps_core::net_policy::parse_error_source(&e),
     })?;
 
     let line_table = LineOffsetTable::new(content);
@@ -176,6 +176,44 @@ mod tests {
 
     fn make_uri() -> Url {
         deps_core::test_util::test_uri("/project/gradle/libs.versions.toml")
+    }
+
+    /// #1240: a duplicate table whose name is credential-shaped must not leak the credential
+    /// into the parse error's `Display` text, which reaches `tracing::debug!`/`error!`.
+    #[test]
+    fn test_parse_version_catalog_duplicate_table_error_redacts_credential() {
+        let content = r#"
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+a = 1
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+b = 2
+"#;
+
+        let message = parse_version_catalog(content, &make_uri())
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_parse_version_catalog_duplicate_table_error_benign_name_unchanged() {
+        let content = r"
+[serde]
+a = 1
+[serde]
+b = 2
+";
+
+        // Derived from the raw parse, not hardcoded, so assert_eq! gates a redaction regression (#1240 M5).
+        let raw_err = toml_span::parse(content).unwrap_err();
+        let expected = format!("failed to parse Gradle: {raw_err}");
+
+        let message = parse_version_catalog(content, &make_uri())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(message, expected);
     }
 
     #[test]
