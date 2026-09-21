@@ -102,6 +102,11 @@ jobs:
           targets: ${{ matrix.target }}
           bins: cross
           cache-target: release
+          # setup-rust's cache key hashes $GITHUB_JOB, which is identical across every
+          # matrix leg — without this, all ubuntu-latest legs (gnu/musl x86_64/aarch64)
+          # collide on one cache key and race on the same target/ dir, corrupting it
+          # (e.g. a missing zerofrom_derive proc-macro artifact).
+          cache-extra-identifier: ${{ matrix.target }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
