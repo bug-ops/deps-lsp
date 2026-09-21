@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-npm, deps-bundler, deps-deno, deps-maven, deps-nuget, deps-dart, deps-composer**: `Registry::search` is renamed to `search_raw`, with a new inherent `search` gate on `dyn Registry` (which an implementor cannot override) that rejects a credential- or query-bearing search string before it ever reaches a registry, and redacts the 9 concrete registries' own `search` tracing spans (resolves #1215) (#1219)
 
 ### Changed
-- **ci**: bumps `taiki-e/install-action` to v2.87.17 across CI and release workflows (flagged as outdated by code scanning)
+- **ci**: bumps `taiki-e/install-action` to v2.87.17 across CI and release workflows (flagged as outdated by code scanning) (#1269)
 - **deps-pypi**: `truncate_for_log` now delegates to `deps_core::net_policy::redact_parse_error_for_log` instead of duplicating its redact-then-truncate algorithm (#1240) (#1241)
 - **deps-core, deps-npm, deps-pypi, deps-go, deps-composer, deps-swift, deps-nuget, deps-cargo, deps-dart, deps-bundler, deps-deno**: `Ecosystem::complete_version` now has a shared default implementation (backed by a new `version_operator_chars` hook), replacing ten byte-identical hand-written implementations (resolves #1223) (#1235)
 
