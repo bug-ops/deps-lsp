@@ -38,7 +38,8 @@ pub use code_lenses::{
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, generate_diagnostics_from_cache,
-    redact_name_for_diagnostic, requirement_is_unsatisfiable, sanitize_and_truncate_for_diagnostic,
+    redact_name_for_diagnostic, requirement_is_unsatisfiable,
+    sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
     truncate_for_diagnostic,
 };
 pub use formatter::{
@@ -1364,6 +1365,18 @@ fn is_markdown_unsafe(c: char) -> bool {
         )
 }
 
+/// Replaces every [`is_markdown_unsafe`] character in `s` with a single space.
+///
+/// Shared by [`markdown_code_span`] and `diagnostics::sanitize_advisory_text_for_diagnostic`
+/// (#1262 code-review follow-up) so the narrow bidi/invisible-character filter has exactly
+/// one loop to keep in sync with [`is_markdown_unsafe`]'s policy, instead of two copies that
+/// could silently drift.
+fn replace_markdown_unsafe_chars(s: &str) -> String {
+    s.chars()
+        .map(|c| if is_markdown_unsafe(c) { ' ' } else { c })
+        .collect()
+}
+
 /// Wraps `content` in a Markdown inline code span (backticks included) that safely
 /// contains arbitrary untrusted text, regardless of embedded backticks.
 ///
@@ -1385,10 +1398,7 @@ fn is_markdown_unsafe(c: char) -> bool {
 /// assert_eq!(markdown_code_span("a`b"), "``a`b``");
 /// ```
 pub fn markdown_code_span(content: &str) -> String {
-    let sanitized: String = content
-        .chars()
-        .map(|c| if is_markdown_unsafe(c) { ' ' } else { c })
-        .collect();
+    let sanitized = replace_markdown_unsafe_chars(content);
 
     let max_backtick_run = sanitized
         .split(|c| c != '`')
