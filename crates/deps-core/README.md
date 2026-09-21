@@ -28,13 +28,16 @@ This crate provides the shared infrastructure used by all ecosystem-specific cra
 - **`lockfile::read_lockfile_content`** — shared read-and-error-wrap helper for lock file parsers
 - **`deps_dev::DepsDevClient`** — supply-chain trust signal client for the [deps.dev](https://deps.dev) API, resolving a dependency's linked source repository, OpenSSF Scorecard score, and SLSA/attestation provenance status (`SupplyChainTrustSignal`, `ScorecardSummary`, `ProvenanceStatus`)
 - **`licenses::LicensePolicy`** — SPDX allow/deny-list evaluation shared by every ecosystem's `license_policy` diagnostic, plus `Ecosystem::fetch_license`/`license_source()` sealed-trait hooks for tier-3 ecosystems whose license isn't already present in the hot-path registry response
+- **`diagnostic::Diagnostic`/`RelatedInformation`** — sanitize and cap their message/code text at construction (control characters, bidi/invisible-character overrides, unbounded length), exposed only through `message()`/`code()` getters so no caller can bypass the sanitization after the fact
+- **`net_policy::redact_parse_error_for_log`** — redacts credential-shaped substrings from a parser error before it reaches logs or an LSP-visible diagnostic
+- **`rate_limit::RateLimitGate`** — process-lifetime cooldown gate shared by ecosystem registry clients to stop hammering an upstream once it has rate-limited or auth-rejected a request
 - **Error types** — Unified error handling with `thiserror`
 
 ## Installation
 
 ```toml
 [dependencies]
-deps-core = "1.1"
+deps-core = "1.2"
 ```
 
 > [!IMPORTANT]

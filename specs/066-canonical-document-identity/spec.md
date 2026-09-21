@@ -7,7 +7,7 @@ tags:
   - deps-lsp
   - lsp-protocol
 created: 2026-09-20
-status: draft
+status: shipped
 related:
   - "[[constitution]]"
   - "[[063-deps-core-domain-boundary-hardening/spec]]"

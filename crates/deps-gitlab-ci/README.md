@@ -37,7 +37,7 @@ provides parsing and registry integration for `.gitlab-ci.yml` and `.gitlab/ci/*
 
 ```toml
 [dependencies]
-deps-gitlab-ci = "1.1"
+deps-gitlab-ci = "1.2"
 ```
 
 > [!IMPORTANT]

@@ -35,6 +35,13 @@ block (plugin resolution) never affects the project's own `dependencies {}` clas
 parsed — only `includeGroup`/`includeGroupByRegex`/`includeModule` inside an ordinary
 `content {}` block.
 
+## Version Completion (Maven)
+
+Version completion is offered for a self-closing `<version/>` tag, not just `<version>X</version>`
+or an empty `<version></version>`: accepting a completion item there replaces the whole
+`<version/>` span with `<version>X</version>` via an explicit text edit, rather than inserting text
+at the cursor (which would otherwise land just after `/>` and corrupt the surrounding XML).
+
 ## Version Comparison
 
 Versions are now ranked with correct Maven semantics:

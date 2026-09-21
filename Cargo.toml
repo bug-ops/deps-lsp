@@ -9,7 +9,7 @@ exclude = ["crates/deps-zed", "crates/github-action", "fuzz"]
 resolver = "3"
 
 [workspace.package]
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.98"
 authors = ["Andrei G"]
@@ -22,24 +22,24 @@ bytes = "1"
 clap = "4.6"
 criterion = "0.8"
 dashmap = "6.2"
-deps-bundler = { version = "1.1.0", path ="crates/deps-bundler" }
-deps-cargo = { version = "1.1.0", path ="crates/deps-cargo" }
-deps-cli = { version = "1.1.0", path ="crates/deps-cli" }
-deps-composer = { version = "1.1.0", path ="crates/deps-composer" }
-deps-core = { version = "1.1.0", path ="crates/deps-core" }
-deps-dart = { version = "1.1.0", path ="crates/deps-dart" }
-deps-deno = { version = "1.1.0", path ="crates/deps-deno" }
-deps-engine = { version = "1.1.0", path ="crates/deps-engine" }
-deps-github-actions = { version = "1.1.0", path ="crates/deps-github-actions" }
-deps-gitlab-ci = { version = "1.1.0", path ="crates/deps-gitlab-ci" }
-deps-go = { version = "1.1.0", path ="crates/deps-go" }
-deps-gradle = { version = "1.1.0", path ="crates/deps-gradle" }
-deps-lsp = { version = "1.1.0", path ="crates/deps-lsp" }
-deps-maven = { version = "1.1.0", path ="crates/deps-maven" }
-deps-npm = { version = "1.1.0", path ="crates/deps-npm" }
-deps-nuget = { version = "1.1.0", path ="crates/deps-nuget" }
-deps-pypi = { version = "1.1.0", path ="crates/deps-pypi" }
-deps-swift = { version = "1.1.0", path ="crates/deps-swift" }
+deps-bundler = { version = "1.2.0", path ="crates/deps-bundler" }
+deps-cargo = { version = "1.2.0", path ="crates/deps-cargo" }
+deps-cli = { version = "1.2.0", path ="crates/deps-cli" }
+deps-composer = { version = "1.2.0", path ="crates/deps-composer" }
+deps-core = { version = "1.2.0", path ="crates/deps-core" }
+deps-dart = { version = "1.2.0", path ="crates/deps-dart" }
+deps-deno = { version = "1.2.0", path ="crates/deps-deno" }
+deps-engine = { version = "1.2.0", path ="crates/deps-engine" }
+deps-github-actions = { version = "1.2.0", path ="crates/deps-github-actions" }
+deps-gitlab-ci = { version = "1.2.0", path ="crates/deps-gitlab-ci" }
+deps-go = { version = "1.2.0", path ="crates/deps-go" }
+deps-gradle = { version = "1.2.0", path ="crates/deps-gradle" }
+deps-lsp = { version = "1.2.0", path ="crates/deps-lsp" }
+deps-maven = { version = "1.2.0", path ="crates/deps-maven" }
+deps-npm = { version = "1.2.0", path ="crates/deps-npm" }
+deps-nuget = { version = "1.2.0", path ="crates/deps-nuget" }
+deps-pypi = { version = "1.2.0", path ="crates/deps-pypi" }
+deps-swift = { version = "1.2.0", path ="crates/deps-swift" }
 dirs = "7.0.0"
 futures = "0.3"
 ignore = "0.4"
