@@ -1028,6 +1028,11 @@ fn parse_nuget_config_raw(content: &str) -> RawNuGetConfigFile {
         let event = match reader.read_event() {
             Ok(event) => event,
             Err(error) => {
+                // #1243 M1: `quick_xml`'s `IllFormed::MismatchedEndTag` embeds the raw
+                // tag-name text verbatim, so it must be redacted the same way as the other
+                // parse-error log/`Display` sites (#1240/#1241) before it reaches `tracing`.
+                let raw = error.to_string();
+                let error = deps_core::net_policy::redact_parse_error_for_log(&raw);
                 tracing::warn!(
                     %error,
                     "malformed NuGet.Config XML; ignoring this file's declarations entirely"
@@ -3273,6 +3278,23 @@ mod tests {
         );
         assert!(!raw.sources_cleared);
         assert!(raw.sources.is_empty());
+    }
+
+    /// #1243 M1: `parse_nuget_config_raw`'s malformed-XML warn path logs `%error` (the raw
+    /// `quick_xml` error's `Display` text), which can embed a credential-shaped tag name
+    /// verbatim (`IllFormed::MismatchedEndTag`) — must be redacted before reaching `tracing`,
+    /// the same way the other 3 sites fixed by #1243 already are.
+    #[test]
+    fn test_h1_malformed_xml_warn_redacts_credential() {
+        let xml = "<root><https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x ></root>";
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let _ = parse_nuget_config_raw(xml);
+        });
+
+        assert!(!log.contains("ghp_SUPERSECRETTOKEN123"), "log: {log}");
+        assert!(!log.contains("svcacct"), "log: {log}");
+        assert!(log.contains("pkg.internal.corp"), "log: {log}");
     }
 
     #[test]
