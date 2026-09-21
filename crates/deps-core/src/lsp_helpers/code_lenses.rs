@@ -1046,7 +1046,7 @@ mod tests {
             );
             let newer_version_diagnostics = diagnostics
                 .iter()
-                .filter(|d| d.message.contains("Newer version available"))
+                .filter(|d| d.message().contains("Newer version available"))
                 .count();
 
             assert_eq!(edits.len(), newer_version_diagnostics);

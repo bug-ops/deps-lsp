@@ -963,19 +963,20 @@ struct YankedOnlyPrior {
 /// Emits: at most one [`Severity::Information`].
 fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &dyn ParseResult) {
     if let Some((kept, total)) = parse_result.dependency_truncation() {
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 0),
-            },
-            severity: Some(Severity::Information),
-            message: format!(
-                "manifest declares {total} dependencies, exceeding deps-lsp's per-document \
-                 limit of {kept}; only the first {kept} are tracked, fetched, and checked \
-                 against the registry"
-            ),
-            ..Default::default()
-        });
+        diagnostics.push(
+            Diagnostic::new(
+                Range {
+                    start: Position::new(0, 0),
+                    end: Position::new(0, 0),
+                },
+                format!(
+                    "manifest declares {total} dependencies, exceeding deps-lsp's per-document \
+                     limit of {kept}; only the first {kept} are tracked, fetched, and checked \
+                     against the registry"
+                ),
+            )
+            .with_severity(Severity::Information),
+        );
     }
 }
 
@@ -1002,17 +1003,17 @@ fn offline_notice(
     deps: &[&dyn Dependency],
 ) {
     if versions.offline && !deps.is_empty() {
-        diagnostics.push(Diagnostic {
-            range: Range {
-                start: Position::new(0, 0),
-                end: Position::new(0, 0),
-            },
-            severity: Some(Severity::Information),
-            message: "deps-lsp is offline (network.offline): dependency and vulnerability \
-                      data reflects only what was already cached, not the current registry state"
-                .to_string(),
-            ..Default::default()
-        });
+        diagnostics.push(
+            Diagnostic::new(
+                Range {
+                    start: Position::new(0, 0),
+                    end: Position::new(0, 0),
+                },
+                "deps-lsp is offline (network.offline): dependency and vulnerability data \
+                 reflects only what was already cached, not the current registry state",
+            )
+            .with_severity(Severity::Information),
+        );
     }
 }
 
@@ -1106,10 +1107,9 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
     // see `redact_declaration_key`'s own doc comment for the exact gate and its history (#981,
     // #993).
     let redacted_key = redact_declaration_key(&occurrence.declaration_key);
-    Diagnostic {
-        range: occurrence.range,
-        severity: Some(Severity::Information),
-        message: format!(
+    Diagnostic::new(
+        occurrence.range,
+        format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
              (host class: {}; declaration: {})",
             sanitize_and_truncate_for_diagnostic(
@@ -1122,8 +1122,8 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
                 MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS
             ),
         ),
-        ..Default::default()
-    }
+    )
+    .with_severity(Severity::Information)
 }
 
 /// R1 collapse (#944 M8, capped per S2): mirrors [`push_collapsed_fetch_failures`]'s pattern so
@@ -1178,10 +1178,7 @@ fn push_collapsed_blocked_registries(
                     ),
                 ));
             }
-            diagnostics.push(Diagnostic {
-                related_information: Some(related_information),
-                ..diagnostic
-            });
+            diagnostics.push(diagnostic.with_related_information(related_information));
         }
     }
 }
@@ -1277,21 +1274,22 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
         ViolationReason::Denied => Severity::Error,
         ViolationReason::NotAllowed => Severity::Warning,
     };
-    diagnostics.push(Diagnostic {
-        range: ctx.dep.name_range(),
-        severity: Some(severity),
-        message: format!(
-            "{}: {} {}",
-            redact_name_for_diagnostic(ctx.dep.name()),
-            sanitize_and_truncate_for_diagnostic(
-                &violation.license,
-                MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS
+    diagnostics.push(
+        Diagnostic::new(
+            ctx.dep.name_range(),
+            format!(
+                "{}: {} {}",
+                redact_name_for_diagnostic(ctx.dep.name()),
+                sanitize_and_truncate_for_diagnostic(
+                    &violation.license,
+                    MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS
+                ),
+                violation.reason
             ),
-            violation.reason
-        ),
-        code: Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.into()),
-        ..Default::default()
-    });
+        )
+        .with_severity(severity)
+        .with_code(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE),
+    );
 }
 
 /// R3 — package-level deprecation finding (#205, I4).
@@ -1426,12 +1424,13 @@ fn apply_in_use_yanked_rule(
             yanked_version.as_str(),
             MAX_VERSION_DIAGNOSTIC_CHARS,
         );
-        diagnostics.push(Diagnostic {
-            range: version_anchor_range(ctx.dep),
-            severity: Some(ctx.severities.yanked),
-            message: format!("{} ({})", ctx.formatter.yanked_message(), yanked_version),
-            ..Default::default()
-        });
+        diagnostics.push(
+            Diagnostic::new(
+                version_anchor_range(ctx.dep),
+                format!("{} ({})", ctx.formatter.yanked_message(), yanked_version),
+            )
+            .with_severity(ctx.severities.yanked),
+        );
         true
     } else {
         false
@@ -1500,15 +1499,16 @@ fn apply_unknown_package_rule(
             .is_some_and(|o| o.no_comparable_versions(ctx.normalized_name));
     match ctx.formatter.validate_package_name(dep.name().as_str()) {
         Err(reason) => {
-            diagnostics.push(Diagnostic {
-                range: dep.name_range(),
-                severity: Some(ctx.severities.unknown),
-                message: format!(
-                    "Invalid package name '{}': {reason}",
-                    redact_name_for_diagnostic(dep.name())
-                ),
-                ..Default::default()
-            });
+            diagnostics.push(
+                Diagnostic::new(
+                    dep.name_range(),
+                    format!(
+                        "Invalid package name '{}': {reason}",
+                        redact_name_for_diagnostic(dep.name())
+                    ),
+                )
+                .with_severity(ctx.severities.unknown),
+            );
         }
         Ok(()) if fetch_failure.is_some() && ctx.versions.offline => {}
         Ok(()) if fetch_failure.is_some() => {
@@ -1526,26 +1526,23 @@ fn apply_unknown_package_rule(
             };
             fetch_failed.push(FetchFailureEntry {
                 name: redacted_name,
-                diagnostic: Diagnostic {
-                    range: dep.name_range(),
-                    severity: Some(ctx.severities.unknown),
-                    message,
-                    ..Default::default()
-                },
+                diagnostic: Diagnostic::new(dep.name_range(), message)
+                    .with_severity(ctx.severities.unknown),
                 failure: fetch_failure.cloned(),
             });
         }
         Ok(()) if no_comparable_versions => {}
         Ok(()) if can_resolve_source => {
-            diagnostics.push(Diagnostic {
-                range: dep.name_range(),
-                severity: Some(ctx.severities.unknown),
-                message: format!(
-                    "Unknown package '{}'",
-                    redact_name_for_diagnostic(dep.name())
-                ),
-                ..Default::default()
-            });
+            diagnostics.push(
+                Diagnostic::new(
+                    dep.name_range(),
+                    format!(
+                        "Unknown package '{}'",
+                        redact_name_for_diagnostic(dep.name())
+                    ),
+                )
+                .with_severity(ctx.severities.unknown),
+            );
         }
         Ok(()) => {}
     }
@@ -1614,13 +1611,11 @@ fn apply_unsatisfiable_rule(
              pre-release-matching rules; require it explicitly to use it)"
         );
     }
-    diagnostics.push(Diagnostic {
-        range: resolved.version_range,
-        severity: Some(ctx.severities.unsatisfiable),
-        message,
-        code: Some(UNSATISFIABLE_DIAGNOSTIC_CODE.into()),
-        ..Default::default()
-    });
+    diagnostics.push(
+        Diagnostic::new(resolved.version_range, message)
+            .with_severity(ctx.severities.unsatisfiable)
+            .with_code(UNSATISFIABLE_DIAGNOSTIC_CODE),
+    );
     RuleFlow::Stop
 }
 
@@ -1695,12 +1690,13 @@ fn apply_yanked_only_rule(
 
     let latest =
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
-    diagnostics.push(Diagnostic {
-        range: resolved.version_range,
-        severity: Some(ctx.severities.yanked),
-        message: format!("{}; latest is {latest}", ctx.formatter.yanked_message()),
-        ..Default::default()
-    });
+    diagnostics.push(
+        Diagnostic::new(
+            resolved.version_range,
+            format!("{}; latest is {latest}", ctx.formatter.yanked_message()),
+        )
+        .with_severity(ctx.severities.yanked),
+    );
     RuleFlow::Stop
 }
 
@@ -1758,12 +1754,9 @@ fn apply_outdated_rule(
         }
         _ => format!("Newer version available: {latest}"),
     };
-    diagnostics.push(Diagnostic {
-        range: resolved.version_range,
-        severity: Some(ctx.severities.outdated),
-        message,
-        ..Default::default()
-    });
+    diagnostics.push(
+        Diagnostic::new(resolved.version_range, message).with_severity(ctx.severities.outdated),
+    );
 }
 
 /// R8 — fetch-failure collapse (#479, #480 S2, #478/#485).
@@ -1823,13 +1816,9 @@ fn push_collapsed_fetch_failures(
                     )
                 })
                 .collect();
-            diagnostics.push(Diagnostic {
-                range,
-                severity,
-                message,
-                related_information: Some(related_information),
-                ..Default::default()
-            });
+            let mut diagnostic = Diagnostic::new(range, message);
+            diagnostic.severity = severity;
+            diagnostics.push(diagnostic.with_related_information(related_information));
         }
     }
 }
@@ -1891,13 +1880,11 @@ fn push_deprecation_diagnostic(
         let _ = write!(message, " (replacement: {replacement})");
     }
 
-    diagnostics.push(Diagnostic {
-        range,
-        severity: Some(severities.deprecated),
-        message,
-        code: Some(DEPRECATED_DIAGNOSTIC_CODE.into()),
-        ..Default::default()
-    });
+    diagnostics.push(
+        Diagnostic::new(range, message)
+            .with_severity(severities.deprecated)
+            .with_code(DEPRECATED_DIAGNOSTIC_CODE),
+    );
 }
 
 /// Pushes one [`Diagnostic`] per advisory (each with its own severity, code,
@@ -1926,15 +1913,17 @@ fn push_deprecation_diagnostic(
 /// from an ordinary unscored CVE's `WARNING` severity but may not render distinctly in
 /// every client's UI chrome.
 ///
-/// `Diagnostic.code` deliberately stays the *raw* `advisory.id`, not the
+/// `Diagnostic.code` is passed the raw `advisory.id` here, not the
 /// `sanitize_advisory_text_for_diagnostic`-passed copy used in the message text (#1262
-/// critic follow-up): `code` is genuinely client-visible (the LSP `Diagnostic.code` shown in
-/// the Problems panel, and `deps-cli`'s `CheckFinding.code`), but it is already constrained
-/// to ASCII alphanumeric/`.`/`_`/`-` at `<= 128` bytes by [`crate::osv::is_valid_osv_id`] —
-/// the only non-test construction path of [`crate::osv::Advisory`] — before an `Advisory`
-/// can exist at all. `deps-lsp`'s `bind_diagnostics` also matches `code` against raw
-/// `fix.advisory_ids` for code-action binding, so sanitizing this copy would need a matching
-/// change on that side too, for a value that is provably never unsafe on the real path.
+/// critic follow-up) — `with_code` (#1280) sanitizes it at the setter, the same
+/// defense-in-depth treatment `message` gets, so this is not an unsanitized value reaching
+/// a client. It is also already constrained to ASCII alphanumeric/`.`/`_`/`-` at `<= 128`
+/// bytes by [`crate::osv::is_valid_osv_id`] — the only non-test construction path of
+/// [`crate::osv::Advisory`] — before an `Advisory` can exist at all. The binding agreement
+/// between the published `code` and `diagnostic_codes` (this module's `code_actions.rs:214`
+/// and `deps-lsp`'s `handlers/code_actions.rs`'s `bind_diagnostics`, which matches `code`
+/// against raw `fix.advisory_ids`) rests on `is_valid_osv_id` forbidding unsafe characters
+/// at ingest on both sides, not on `code` staying unsanitized.
 fn push_vulnerability_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
     dep: &dyn Dependency,
@@ -1972,24 +1961,21 @@ fn push_vulnerability_diagnostics(
             | crate::osv::VulnSeverity::Unknown => format!("{advisory_id}: {summary}"),
         };
 
-        diagnostics.push(Diagnostic {
-            range,
-            severity: Some(diagnostic_severity_for(advisory.severity)),
-            message,
-            code: Some(advisory.id.clone()),
-            code_description,
-            ..Default::default()
-        });
+        let mut diagnostic = Diagnostic::new(range, message)
+            .with_severity(diagnostic_severity_for(advisory.severity))
+            .with_code(advisory.id.clone());
+        if let Some(code_description) = code_description {
+            diagnostic = diagnostic.with_code_description(code_description);
+        }
+        diagnostics.push(diagnostic);
     }
 
     let remaining = dv.advisories.remaining();
     if remaining > 0 {
-        diagnostics.push(Diagnostic {
-            range,
-            severity: Some(Severity::Information),
-            message: format!("+{remaining} more advisories"),
-            ..Default::default()
-        });
+        diagnostics.push(
+            Diagnostic::new(range, format!("+{remaining} more advisories"))
+                .with_severity(Severity::Information),
+        );
     }
 }
 
@@ -2087,8 +2073,8 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
-        assert!(diagnostics[0].message.contains("Unknown package"));
-        assert!(diagnostics[0].message.contains("unknown-pkg"));
+        assert!(diagnostics[0].message().contains("Unknown package"));
+        assert!(diagnostics[0].message().contains("unknown-pkg"));
     }
 
     /// A credential-shaped manifest key (#1242) must never reach a client-visible
@@ -2124,9 +2110,9 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.starts_with("Invalid package name"));
-        assert!(diagnostics[0].message.contains("***@"));
-        assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+        assert!(diagnostics[0].message().starts_with("Invalid package name"));
+        assert!(diagnostics[0].message().contains("***@"));
+        assert!(!diagnostics[0].message().contains("glpat-AAAABBBBCCCCDDDD"));
     }
 
     #[test]
@@ -2163,9 +2149,9 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("Registry lookup failed"));
-        assert!(diagnostics[0].message.contains("***@"));
-        assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+        assert!(diagnostics[0].message().contains("Registry lookup failed"));
+        assert!(diagnostics[0].message().contains("***@"));
+        assert!(!diagnostics[0].message().contains("glpat-AAAABBBBCCCCDDDD"));
     }
 
     #[test]
@@ -2197,9 +2183,9 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("Unknown package"));
-        assert!(diagnostics[0].message.contains("***@"));
-        assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+        assert!(diagnostics[0].message().contains("Unknown package"));
+        assert!(diagnostics[0].message().contains("***@"));
+        assert!(!diagnostics[0].message().contains("glpat-AAAABBBBCCCCDDDD"));
     }
 
     /// #1246: `\n`/`\r` embedded in a manifest key must never reach a diagnostic message,
@@ -2236,8 +2222,8 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains('\n'));
-        assert!(!diagnostics[0].message.contains('\r'));
+        assert!(!diagnostics[0].message().contains('\n'));
+        assert!(!diagnostics[0].message().contains('\r'));
     }
 
     /// #1246: a bidirectional-override or zero-width character embedded in a manifest key
@@ -2273,8 +2259,8 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains('\u{202E}'));
-        assert!(!diagnostics[0].message.contains('\u{200B}'));
+        assert!(!diagnostics[0].message().contains('\u{202E}'));
+        assert!(!diagnostics[0].message().contains('\u{200B}'));
     }
 
     /// Critic follow-up M1 (#1242, #1246): U+2028 LINE SEPARATOR / U+2029 PARAGRAPH
@@ -2311,8 +2297,8 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains('\u{2028}'));
-        assert!(!diagnostics[0].message.contains('\u{2029}'));
+        assert!(!diagnostics[0].message().contains('\u{2028}'));
+        assert!(!diagnostics[0].message().contains('\u{2029}'));
     }
 
     /// #1246 (medium, unbounded length): a 400 KB manifest key must not produce an
@@ -2350,9 +2336,9 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert!(
-            diagnostics[0].message.chars().count() < 200,
+            diagnostics[0].message().chars().count() < 200,
             "expected a bounded message, got {} chars",
-            diagnostics[0].message.chars().count()
+            diagnostics[0].message().chars().count()
         );
     }
 
@@ -2401,8 +2387,8 @@ mod tests {
             "the synthetic-range dependency must contribute no diagnostic at all, not one \
              stacked on Range::default()"
         );
-        assert!(diagnostics[0].message.contains("unknown-pkg"));
-        assert!(!diagnostics[0].message.contains("synthetic-pkg"));
+        assert!(diagnostics[0].message().contains("unknown-pkg"));
+        assert!(!diagnostics[0].message().contains("synthetic-pkg"));
     }
 
     /// #796: a manifest whose dependency count was truncated by
@@ -2438,7 +2424,7 @@ mod tests {
             .iter()
             .filter(|d| d.severity == Some(Severity::Information))
             .filter(|d| {
-                d.message
+                d.message()
                     .contains("exceeding deps-lsp's per-document limit")
             })
             .collect();
@@ -2447,8 +2433,8 @@ mod tests {
             1,
             "expected exactly one dependency-ceiling diagnostic, got: {diagnostics:?}"
         );
-        assert!(ceiling_diagnostics[0].message.contains("12"));
-        assert!(ceiling_diagnostics[0].message.contains("10"));
+        assert!(ceiling_diagnostics[0].message().contains("12"));
+        assert!(ceiling_diagnostics[0].message().contains("10"));
     }
 
     /// A document under the ceiling must never get a ceiling notice.
@@ -2473,7 +2459,7 @@ mod tests {
 
         assert!(
             !diagnostics.iter().any(|d| d
-                .message
+                .message()
                 .contains("exceeding deps-lsp's per-document limit")),
             "a document under the ceiling must get no ceiling notice, got: {diagnostics:?}"
         );
@@ -2588,7 +2574,7 @@ mod tests {
 
         diagnostics
             .into_iter()
-            .find(|d| d.message.contains("blocked"))
+            .find(|d| d.message().contains("blocked"))
             .expect("expected a blocked-registry diagnostic")
     }
 
@@ -2606,10 +2592,10 @@ mod tests {
             Range::new(Position::new(0, 0), Position::new(0, 14))
         );
         assert_eq!(blocked_diagnostic.severity, Some(Severity::Information));
-        assert!(blocked_diagnostic.message.contains("169.254.169.254"));
-        assert!(blocked_diagnostic.message.contains("cloud metadata"));
+        assert!(blocked_diagnostic.message().contains("169.254.169.254"));
+        assert!(blocked_diagnostic.message().contains("cloud metadata"));
         assert!(
-            !blocked_diagnostic.message.contains("CloudMetadata"),
+            !blocked_diagnostic.message().contains("CloudMetadata"),
             "message must use the Display form, not the Debug identifier"
         );
     }
@@ -2626,11 +2612,11 @@ mod tests {
             "https://index.mycorp.dev/api?api_key=SECRET",
         );
         assert!(
-            !blocked_diagnostic.message.contains("SECRET"),
+            !blocked_diagnostic.message().contains("SECRET"),
             "{blocked_diagnostic:?}"
         );
-        assert!(blocked_diagnostic.message.contains("index.mycorp.dev"));
-        assert!(blocked_diagnostic.message.contains("/api"));
+        assert!(blocked_diagnostic.message().contains("index.mycorp.dev"));
+        assert!(blocked_diagnostic.message().contains("/api"));
     }
 
     /// Impl-critic follow-up on M1 (#965/#966): a scheme-colon, slash-less URL
@@ -2646,11 +2632,11 @@ mod tests {
         let slash_less = "https:169.254.169.254/v3/index.json?api_key=SECRET";
         let blocked_diagnostic = blocked_diagnostic_for(slash_less, slash_less);
         assert!(
-            !blocked_diagnostic.message.contains("SECRET"),
+            !blocked_diagnostic.message().contains("SECRET"),
             "declaration_key's query-string credential must be stripped even without \"://\", \
              got: {blocked_diagnostic:?}"
         );
-        assert!(blocked_diagnostic.message.contains("169.254.169.254"));
+        assert!(blocked_diagnostic.message().contains("169.254.169.254"));
     }
 
     /// #981: gating `declaration_key`'s userinfo-redaction step on a bare `"://"` substring
@@ -2668,7 +2654,7 @@ mod tests {
             blocked_diagnostic_for(slash_less_credential, slash_less_credential);
         assert!(
             blocked_diagnostic
-                .message
+                .message()
                 .contains("declaration: https://***@10.0.0.1/index"),
             "declaration_key's userinfo must be redacted even without \"://\", \
              got: {blocked_diagnostic:?}"
@@ -2700,7 +2686,7 @@ mod tests {
                 blocked_diagnostic_for(opaque_key, "https://169.254.169.254/index");
             assert!(
                 blocked_diagnostic
-                    .message
+                    .message()
                     .contains(&format!("declaration: {opaque_key}")),
                 "opaque declaration_key {opaque_key:?} must survive unmangled, \
                  got: {blocked_diagnostic:?}"
@@ -2725,7 +2711,7 @@ mod tests {
         );
         assert!(
             blocked_diagnostic
-                .message
+                .message()
                 .contains("declaration: source:https://***@10.0.0.1/v3/index.json"),
             "an opaque-label-prefixed URL's userinfo must still be redacted, \
              got: {blocked_diagnostic:?}"
@@ -2765,7 +2751,7 @@ mod tests {
                 blocked_diagnostic_for(declaration_key, "https://169.254.169.254/index");
             assert!(
                 blocked_diagnostic
-                    .message
+                    .message()
                     .contains(&format!("declaration: {expected_declaration}")),
                 "declaration_key {declaration_key:?} must redact to {expected_declaration:?}, \
                  got: {blocked_diagnostic:?}"
@@ -2793,7 +2779,7 @@ mod tests {
                 blocked_diagnostic_for(opaque_key, "https://169.254.169.254/index");
             assert!(
                 blocked_diagnostic
-                    .message
+                    .message()
                     .contains(&format!("declaration: {opaque_key}")),
                 "opaque declaration_key {opaque_key:?} must survive unmangled, \
                  got: {blocked_diagnostic:?}"
@@ -2908,7 +2894,7 @@ mod tests {
 
         let blocked_diagnostics: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("blocked"))
+            .filter(|d| d.message().contains("blocked"))
             .collect();
         assert_eq!(
             blocked_diagnostics.len(),
@@ -2940,9 +2926,9 @@ mod tests {
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].range, second_range);
         assert!(
-            related[0].message.contains("second-crate"),
+            related[0].message().contains("second-crate"),
             "related_information message must name the collapsed sibling dependency, got: {:?}",
-            related[0].message
+            related[0].message()
         );
 
         // Impl-critic M1 (#965/#966): the anchor ("top-level") and third entry
@@ -2953,12 +2939,13 @@ mod tests {
             .find(|d| d.range == third_range)
             .expect("diagnostic for the differently-declared third occurrence must exist");
         assert_ne!(
-            anchor.message, third.message,
+            anchor.message(),
+            third.message(),
             "two independently-declared blocked sources sharing the same raw_value must not \
              render byte-identical diagnostic messages"
         );
-        assert!(anchor.message.contains("top-level"));
-        assert!(third.message.contains("scope:@myorg"));
+        assert!(anchor.message().contains("top-level"));
+        assert!(third.message().contains("scope:@myorg"));
     }
 
     /// Critic follow-up S2 (#1242, #1246): the collapsed blocked-registry sibling named in
@@ -3052,8 +3039,8 @@ mod tests {
             .as_ref()
             .expect("anchor diagnostic must carry related_information for the collapsed sibling");
         assert_eq!(related.len(), 1);
-        assert!(related[0].message.contains("***@"));
-        assert!(!related[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+        assert!(related[0].message().contains("***@"));
+        assert!(!related[0].message().contains("glpat-AAAABBBBCCCCDDDD"));
     }
 
     /// #944 S2/M3 regression: `push_collapsed_blocked_registries` caps individually-named
@@ -3139,7 +3126,7 @@ mod tests {
 
         let blocked_diagnostics: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("blocked"))
+            .filter(|d| d.message().contains("blocked"))
             .collect();
         assert_eq!(
             blocked_diagnostics.len(),
@@ -3155,16 +3142,19 @@ mod tests {
             10,
             "9 individually-named siblings plus 1 folded '+N more' entry, got: {related:?}"
         );
-        let named_count = related.iter().filter(|r| r.message.contains('\'')).count();
+        let named_count = related
+            .iter()
+            .filter(|r| r.message().contains('\''))
+            .count();
         assert_eq!(
             named_count, 9,
             "exactly 9 siblings must be individually named, got: {related:?}"
         );
         let fold_entry = &related[9];
         assert!(
-            fold_entry.message.contains("and 2 more"),
+            fold_entry.message().contains("and 2 more"),
             "trailing fold entry must report the 2 siblings beyond the 9-entry cap, got: {:?}",
-            fold_entry.message
+            fold_entry.message()
         );
         assert_eq!(
             fold_entry.range, blocked_diagnostics[0].range,
@@ -3261,13 +3251,13 @@ mod tests {
 
         let blocked_diagnostic = diagnostics
             .iter()
-            .find(|d| d.message.contains("blocked"))
+            .find(|d| d.message().contains("blocked"))
             .expect("expected a blocked-registry diagnostic");
         assert!(
-            blocked_diagnostic.message.len() < long_alias.len(),
+            blocked_diagnostic.message().len() < long_alias.len(),
             "a 10,000-char alias must not render in full inside the diagnostic message"
         );
-        assert!(blocked_diagnostic.message.contains('…'));
+        assert!(blocked_diagnostic.message().contains('…'));
     }
 
     /// #1255: a bidirectional-override or other invisible character embedded in a blocked
@@ -3280,8 +3270,8 @@ mod tests {
         let raw_value = "https://index.mycorp.dev/api\u{202E}evil";
         let declaration_key = "source\u{202E}evil";
         let blocked_diagnostic = blocked_diagnostic_for(declaration_key, raw_value);
-        assert!(!blocked_diagnostic.message.contains('\u{202E}'));
-        assert!(blocked_diagnostic.message.contains("index.mycorp.dev"));
+        assert!(!blocked_diagnostic.message().contains('\u{202E}'));
+        assert!(blocked_diagnostic.message().contains("index.mycorp.dev"));
     }
 
     /// #1263: a bidirectional-override embedded in the manifest-declared requirement, or in
@@ -3349,8 +3339,8 @@ mod tests {
 
         let message = diagnostics
             .iter()
-            .find(|d| d.message.contains("No published version satisfies"))
-            .map(|d| d.message.as_str())
+            .find(|d| d.message().contains("No published version satisfies"))
+            .map(|d| d.message())
             .expect("unsatisfiable diagnostic must fire");
         assert!(!message.contains('\u{202E}'));
         assert!(message.contains("2.0.0"));
@@ -3392,10 +3382,10 @@ mod tests {
 
         let yanked_diag = diagnostics
             .iter()
-            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .find(|d| d.message().starts_with(formatter.yanked_message()))
             .expect("expected a yanked diagnostic");
-        assert!(!yanked_diag.message.contains('\u{202E}'));
-        assert!(yanked_diag.message.contains("1.0.5"));
+        assert!(!yanked_diag.message().contains('\u{202E}'));
+        assert!(yanked_diag.message().contains("1.0.5"));
     }
 
     /// #1263: a bidirectional-override embedded in the registry-reported `latest` version
@@ -3436,8 +3426,8 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains('\u{202E}'));
-        assert!(diagnostics[0].message.contains("2.0.0"));
+        assert!(!diagnostics[0].message().contains('\u{202E}'));
+        assert!(diagnostics[0].message().contains("2.0.0"));
     }
 
     /// #1263 critic M3: `MAX_VERSION_DIAGNOSTIC_CHARS` must actually truncate an
@@ -3479,11 +3469,11 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains('…'));
+        assert!(diagnostics[0].message().contains('…'));
         assert!(
-            !diagnostics[0].message.contains(&overlong_latest),
+            !diagnostics[0].message().contains(&overlong_latest),
             "expected `latest` to be truncated rather than interpolated verbatim, got: {:?}",
-            diagnostics[0].message
+            diagnostics[0].message()
         );
     }
 
@@ -3530,14 +3520,14 @@ mod tests {
 
         let deprecation_diag = diagnostics
             .iter()
-            .find(|d| d.code.as_deref() == Some(DEPRECATED_DIAGNOSTIC_CODE))
+            .find(|d| d.code() == Some(DEPRECATED_DIAGNOSTIC_CODE))
             .expect("expected a deprecation diagnostic");
-        assert!(!deprecation_diag.message.contains('\u{202E}'));
-        assert!(deprecation_diag.message.contains('…'));
+        assert!(!deprecation_diag.message().contains('\u{202E}'));
+        assert!(deprecation_diag.message().contains('…'));
         assert!(
-            !deprecation_diag.message.contains(&overlong_reason),
+            !deprecation_diag.message().contains(&overlong_reason),
             "expected the reason to be truncated rather than interpolated verbatim, got: {:?}",
-            deprecation_diag.message
+            deprecation_diag.message()
         );
     }
 
@@ -3576,9 +3566,9 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains("Unknown package"));
-        assert!(diagnostics[0].message.contains("Registry lookup failed"));
-        assert!(diagnostics[0].message.contains("flaky-pkg"));
+        assert!(!diagnostics[0].message().contains("Unknown package"));
+        assert!(diagnostics[0].message().contains("Registry lookup failed"));
+        assert!(diagnostics[0].message().contains("flaky-pkg"));
     }
 
     /// Issue #483 I2: while offline, the per-dependency "Registry lookup failed" WARNING
@@ -3631,13 +3621,13 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message.contains("Registry lookup failed")),
+                .any(|d| d.message().contains("Registry lookup failed")),
             "the per-dependency WARNING must not fire while offline, got: {diagnostics:?}"
         );
         let offline_diagnostics: Vec<_> = diagnostics
             .iter()
             .filter(|d| d.severity == Some(Severity::Information))
-            .filter(|d| d.message.to_lowercase().contains("offline"))
+            .filter(|d| d.message().to_lowercase().contains("offline"))
             .collect();
         assert_eq!(
             offline_diagnostics.len(),
@@ -3686,7 +3676,7 @@ mod tests {
             diagnostics
                 .iter()
                 .any(|d| d.severity == Some(Severity::Information)
-                    && d.message.to_lowercase().contains("offline")),
+                    && d.message().to_lowercase().contains("offline")),
             "expected a file-level offline diagnostic even with zero fetch failures; \
              got: {diagnostics:?}"
         );
@@ -3729,13 +3719,13 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(!diagnostics[0].message().contains("Unknown package"));
         assert!(
             diagnostics[0]
-                .message
+                .message()
                 .contains("set GITHUB_TOKEN to increase the rate limit")
         );
-        assert!(diagnostics[0].message.contains("rate-limited-pkg"));
+        assert!(diagnostics[0].message().contains("rate-limited-pkg"));
     }
 
     #[test]
@@ -3800,7 +3790,7 @@ mod tests {
         );
         assert!(
             diagnostics[0]
-                .message
+                .message()
                 .contains("Registry lookup failed for 3 packages")
         );
         assert_eq!(
@@ -3822,10 +3812,10 @@ mod tests {
         );
         assert_eq!(related_information[0].range, name_range_2);
         assert_eq!(related_information[0].uri, parse_result.uri().clone());
-        assert!(related_information[0].message.contains("flaky-2"));
+        assert!(related_information[0].message().contains("flaky-2"));
         assert_eq!(related_information[1].range, name_range_3);
         assert_eq!(related_information[1].uri, parse_result.uri().clone());
-        assert!(related_information[1].message.contains("flaky-3"));
+        assert!(related_information[1].message().contains("flaky-3"));
     }
 
     #[test]
@@ -3882,7 +3872,7 @@ mod tests {
         );
         assert!(
             diagnostics[0]
-                .message
+                .message()
                 .contains("Registry lookup failed for 2 packages")
         );
         let related_information = diagnostics[0]
@@ -3896,7 +3886,7 @@ mod tests {
         );
         assert_eq!(related_information[0].range, name_range_2);
         assert_eq!(related_information[0].uri, parse_result.uri().clone());
-        assert!(related_information[0].message.contains("flaky-2"));
+        assert!(related_information[0].message().contains("flaky-2"));
     }
 
     #[test]
@@ -3960,13 +3950,13 @@ mod tests {
             "3 fetch-failed dependencies must still collapse into exactly one diagnostic, got: {diagnostics:?}"
         );
         assert!(
-            diagnostics[0].message.contains(&shared_hint),
+            diagnostics[0].message().contains(&shared_hint),
             "collapsed diagnostic must surface the shared actionable hint, got: {}",
-            diagnostics[0].message
+            diagnostics[0].message()
         );
         assert!(
             !diagnostics[0]
-                .message
+                .message()
                 .contains("package status could not be determined"),
             "the actionable hint must replace, not accompany, the generic fallback message"
         );
@@ -4017,10 +4007,10 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(!diagnostics[0].message().contains("Unknown package"));
         assert!(
             diagnostics[0]
-                .message
+                .message()
                 .contains("package status could not be determined")
         );
     }
@@ -4060,10 +4050,10 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(!diagnostics[0].message().contains("Unknown package"));
         assert!(
             diagnostics[0]
-                .message
+                .message()
                 .contains("package status could not be determined")
         );
     }
@@ -4104,7 +4094,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.contains("Invalid package name"));
+        assert!(diagnostics[0].message().contains("Invalid package name"));
     }
 
     #[test]
@@ -4142,8 +4132,8 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
-        assert!(diagnostics[0].message.starts_with("Invalid package name"));
-        assert!(!diagnostics[0].message.contains("Unknown package"));
+        assert!(diagnostics[0].message().starts_with("Invalid package name"));
+        assert!(!diagnostics[0].message().contains("Unknown package"));
     }
 
     #[test]
@@ -4180,8 +4170,8 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(Severity::Hint));
-        assert!(diagnostics[0].message.contains("Newer version available"));
-        assert!(diagnostics[0].message.contains("2.0.0"));
+        assert!(diagnostics[0].message().contains("Newer version available"));
+        assert!(diagnostics[0].message().contains("2.0.0"));
     }
 
     /// Issue #227 §4.3: an outdated dependency whose `latest` was published within the
@@ -4231,12 +4221,12 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].severity, Some(Severity::Hint));
         assert_eq!(
-            diagnostics[0].message,
+            diagnostics[0].message(),
             "Newer version available: 2.0.0 (published 1 hour ago — still within the release cooldown window)"
         );
         // Guards against reintroducing the "ago ago" duplication bug found while
         // writing this test — `format_relative_age` already appends "ago".
-        assert!(!diagnostics[0].message.contains("ago ago"));
+        assert!(!diagnostics[0].message().contains("ago ago"));
     }
 
     /// Same setup, but `latest` was published well outside the cooldown window — the
@@ -4284,7 +4274,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].message, "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[0].message(), "Newer version available: 2.0.0");
     }
 
     /// `freshness.enabled: false` suppresses the cooldown differentiation even when the
@@ -4334,7 +4324,7 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].message, "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[0].message(), "Newer version available: 2.0.0");
     }
 
     /// Deterministic boundary test (issue #227 M4): `now` is threaded in as a parameter
@@ -4389,7 +4379,8 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(
-            diagnostics[0].message, "Newer version available: 2.0.0",
+            diagnostics[0].message(),
+            "Newer version available: 2.0.0",
             "age exactly equal to cooldown_secs must not be within cooldown"
         );
     }
@@ -4443,7 +4434,7 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(
-            diagnostics[0].message,
+            diagnostics[0].message(),
             "Newer version available: 2.0.0 (published 1 minute ago — still within the release cooldown window)",
             "age == cooldown_secs - 1 must be within cooldown"
         );
@@ -4539,10 +4530,10 @@ mod tests {
         // Dependency-loop order (not rule order): "serde" is up to date and emits
         // nothing, so index 0 is "tokio"'s R7 outdated diagnostic and index 1 is
         // "unknown"'s R5d unknown-package diagnostic — the same order as `deps`.
-        assert_eq!(diagnostics[0].message, "Newer version available: 2.0.0");
-        assert_eq!(diagnostics[0].code, None);
-        assert_eq!(diagnostics[1].message, "Unknown package 'unknown'");
-        assert_eq!(diagnostics[1].code, None);
+        assert_eq!(diagnostics[0].message(), "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[0].code(), None);
+        assert_eq!(diagnostics[1].message(), "Unknown package 'unknown'");
+        assert_eq!(diagnostics[1].code(), None);
     }
 
     #[test]
@@ -4625,10 +4616,10 @@ mod tests {
 
         let yanked_diag = diagnostics
             .iter()
-            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .find(|d| d.message().starts_with(formatter.yanked_message()))
             .expect("expected a yanked diagnostic");
         assert_eq!(yanked_diag.severity, Some(Severity::Error));
-        assert!(yanked_diag.message.contains("1.0.5"));
+        assert!(yanked_diag.message().contains("1.0.5"));
     }
 
     #[test]
@@ -4665,7 +4656,7 @@ mod tests {
 
         let yanked_diag = diagnostics
             .iter()
-            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .find(|d| d.message().starts_with(formatter.yanked_message()))
             .expect("expected a yanked diagnostic");
         assert_eq!(yanked_diag.severity, Some(Severity::Warning));
     }
@@ -4707,7 +4698,7 @@ mod tests {
         assert!(
             !diagnostics
                 .iter()
-                .any(|d| d.message.starts_with(formatter.yanked_message())),
+                .any(|d| d.message().starts_with(formatter.yanked_message())),
             "Expected no yanked diagnostic when `yanked` is None, got: {diagnostics:?}"
         );
     }
@@ -4757,12 +4748,12 @@ mod tests {
         // the orchestrator, so index 0 is always the yanked finding and index 1 is
         // always the outdated finding — never the reverse.
         assert_eq!(
-            diagnostics[0].message,
+            diagnostics[0].message(),
             format!("{} (1.0.5)", formatter.yanked_message())
         );
-        assert_eq!(diagnostics[0].code, None);
-        assert_eq!(diagnostics[1].message, "Newer version available: 2.0.0");
-        assert_eq!(diagnostics[1].code, None);
+        assert_eq!(diagnostics[0].code(), None);
+        assert_eq!(diagnostics[1].message(), "Newer version available: 2.0.0");
+        assert_eq!(diagnostics[1].code(), None);
     }
 
     /// T2 (D5 collision): an exact-pin dependency whose package is both package-level
@@ -4821,7 +4812,7 @@ mod tests {
         );
         assert!(
             diagnostics[0]
-                .message
+                .message()
                 .starts_with(formatter.deprecated_message())
         );
     }
@@ -4878,15 +4869,15 @@ mod tests {
         // R3 (deprecation) always runs before R4 (in-use-yanked) in the orchestrator,
         // so index 0 is the deprecation finding and index 1 is the yanked finding.
         assert_eq!(
-            diagnostics[0].message,
+            diagnostics[0].message(),
             format!("{}: project archived", formatter.deprecated_message())
         );
-        assert_eq!(diagnostics[0].code, Some(DEPRECATED_DIAGNOSTIC_CODE.into()));
+        assert_eq!(diagnostics[0].code(), Some(DEPRECATED_DIAGNOSTIC_CODE));
         assert_eq!(
-            diagnostics[1].message,
+            diagnostics[1].message(),
             format!("{} (1.0.0)", formatter.yanked_message())
         );
-        assert_eq!(diagnostics[1].code, None);
+        assert_eq!(diagnostics[1].code(), None);
     }
 
     /// T6b (D5 gate, severity independence): on an npm-shaped fixture where the two
@@ -4952,7 +4943,7 @@ mod tests {
             );
             assert!(
                 diagnostics[0]
-                    .message
+                    .message()
                     .starts_with(formatter.deprecated_message())
             );
         }
@@ -5007,7 +4998,7 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .all(|d| !d.message.starts_with(MockFormatter.deprecated_message())),
+                    .all(|d| !d.message().starts_with(MockFormatter.deprecated_message())),
                 "source {source:?} must never surface the deprecation diagnostic for a \
                  coincidentally-named registry package: {diagnostics:?}"
             );
@@ -5031,7 +5022,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.starts_with(MockFormatter.deprecated_message())),
+                .any(|d| d.message().starts_with(MockFormatter.deprecated_message())),
             "control case: a Registry-source dependency must still produce the diagnostic"
         );
     }
@@ -5070,7 +5061,7 @@ mod tests {
 
         let yanked_diag = diagnostics
             .iter()
-            .find(|d| d.message.starts_with(formatter.yanked_message()))
+            .find(|d| d.message().starts_with(formatter.yanked_message()))
             .expect("expected a yanked diagnostic even without a version_range");
         assert_eq!(yanked_diag.range, name_range);
     }
@@ -5140,7 +5131,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.starts_with(formatter.yanked_message())),
+                .any(|d| d.message().starts_with(formatter.yanked_message())),
             "expected normalized-name lookup to resolve the yanked entry, got: {diagnostics:?}"
         );
     }
@@ -5192,7 +5183,7 @@ mod tests {
 
         let yanked_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with(formatter.yanked_message()))
+            .filter(|d| d.message().starts_with(formatter.yanked_message()))
             .collect();
         assert_eq!(
             yanked_diags.len(),
@@ -5203,7 +5194,7 @@ mod tests {
             yanked_diags[0].range.start.line, 0,
             "must land on the yanked occurrence's own line"
         );
-        assert!(yanked_diags[0].message.contains("0.1.43"));
+        assert!(yanked_diags[0].message().contains("0.1.43"));
     }
 
     #[test]
@@ -5251,7 +5242,7 @@ mod tests {
 
         let yanked_diags = diagnostics
             .iter()
-            .filter(|d| d.message.starts_with(formatter.yanked_message()))
+            .filter(|d| d.message().starts_with(formatter.yanked_message()))
             .count();
         assert_eq!(
             yanked_diags, 2,
@@ -5295,8 +5286,8 @@ mod tests {
 
         let message = diagnostics
             .iter()
-            .find(|d| d.message.contains("No published version satisfies"))
-            .map(|d| d.message.as_str())
+            .find(|d| d.message().contains("No published version satisfies"))
+            .map(|d| d.message())
             .expect("unsatisfiable WARNING must fire");
         assert!(
             message.contains("2.0.0-rc.1") && message.contains("pre-release"),
@@ -5349,8 +5340,8 @@ mod tests {
 
         let message = diagnostics
             .iter()
-            .find(|d| d.message.contains("No published version satisfies"))
-            .map(|d| d.message.as_str())
+            .find(|d| d.message().contains("No published version satisfies"))
+            .map(|d| d.message())
             .expect("unsatisfiable WARNING must fire");
         assert!(
             message.contains("pre-release"),
@@ -5396,8 +5387,8 @@ mod tests {
 
         let message = diagnostics
             .iter()
-            .find(|d| d.message.contains("No published version satisfies"))
-            .map(|d| d.message.as_str())
+            .find(|d| d.message().contains("No published version satisfies"))
+            .map(|d| d.message())
             .expect("unsatisfiable WARNING must fire");
         assert!(
             !message.contains("pre-release"),
@@ -5454,7 +5445,7 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .all(|d| !d.message.contains("No published version satisfies")),
+                    .all(|d| !d.message().contains("No published version satisfies")),
                 "source {source:?} must never produce the unsatisfiable-requirement WARNING"
             );
         }
@@ -5478,7 +5469,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.contains("No published version satisfies")),
+                .any(|d| d.message().contains("No published version satisfies")),
             "control case: a Registry-source dependency must still produce the WARNING"
         );
     }
@@ -5514,7 +5505,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|d| !d.message.contains("Unknown package")),
+                .all(|d| !d.message().contains("Unknown package")),
             "a CustomRegistry-sourced dependency must never produce the \"Unknown package\" WARNING"
         );
 
@@ -5536,7 +5527,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.contains("Unknown package")),
+                .any(|d| d.message().contains("Unknown package")),
             "control case: a Registry-source dependency must still produce the WARNING"
         );
     }
@@ -5571,7 +5562,7 @@ mod tests {
             PublishTime::now(),
         );
         assert_eq!(diagnostics.len(), 1);
-        assert!(diagnostics[0].message.starts_with("Invalid package name"));
+        assert!(diagnostics[0].message().starts_with("Invalid package name"));
     }
 
     #[test]
@@ -5610,7 +5601,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|d| !d.message.contains("Newer version available")),
+                .all(|d| !d.message().contains("Newer version available")),
             "a CustomRegistry-sourced dependency must never produce the \"Outdated\" WARNING"
         );
 
@@ -5632,7 +5623,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message.contains("Newer version available")),
+                .any(|d| d.message().contains("Newer version available")),
             "control case: a Registry-source dependency must still produce the WARNING"
         );
     }
@@ -5681,10 +5672,10 @@ mod tests {
 
         let vuln_diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .find(|d| d.message().contains("RUSTSEC-2020-0071"))
             .expect("vulnerability diagnostic must be emitted even without registry data");
         assert_eq!(vuln_diag.severity, Some(Severity::Warning));
-        assert_eq!(vuln_diag.code, Some("RUSTSEC-2020-0071".to_string()));
+        assert_eq!(vuln_diag.code(), Some("RUSTSEC-2020-0071"));
     }
 
     #[test]
@@ -5732,17 +5723,17 @@ mod tests {
 
         let malicious_diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("MAL-2025-47141"))
+            .find(|d| d.message().contains("MAL-2025-47141"))
             .expect("malicious advisory diagnostic must be emitted");
         let unknown_diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .find(|d| d.message().contains("RUSTSEC-2020-0071"))
             .expect("unknown-severity advisory diagnostic must be emitted");
 
-        assert_ne!(malicious_diag.message, unknown_diag.message);
-        assert_ne!(malicious_diag.code, unknown_diag.code);
-        assert!(malicious_diag.message.contains("[MALWARE]"));
-        assert!(!unknown_diag.message.contains("[MALWARE]"));
+        assert_ne!(malicious_diag.message(), unknown_diag.message());
+        assert_ne!(malicious_diag.code(), unknown_diag.code());
+        assert!(malicious_diag.message().contains("[MALWARE]"));
+        assert!(!unknown_diag.message().contains("[MALWARE]"));
     }
 
     /// #1262: an OSV advisory `summary` is untrusted, unbounded-length prose (OSV.dev
@@ -5807,18 +5798,18 @@ mod tests {
 
         let vuln_diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("RUSTSEC"))
+            .find(|d| d.message().contains("RUSTSEC"))
             .expect("vulnerability diagnostic must be emitted");
-        assert!(!vuln_diag.message.contains('\u{202E}'));
-        assert!(vuln_diag.message.contains('…'));
+        assert!(!vuln_diag.message().contains('\u{202E}'));
+        assert!(vuln_diag.message().contains('…'));
         assert!(
-            !vuln_diag.message.contains(&overlong_summary),
+            !vuln_diag.message().contains(&overlong_summary),
             "expected the summary to be truncated rather than interpolated verbatim, got: {:?}",
-            vuln_diag.message
+            vuln_diag.message()
         );
         // `Diagnostic.code` stays the raw advisory id (see `push_vulnerability_diagnostics`'s
         // docs) so code-action binding by exact id match keeps working.
-        assert_eq!(vuln_diag.code.as_deref(), Some("RUSTSEC-2020-0071"));
+        assert_eq!(vuln_diag.code(), Some("RUSTSEC-2020-0071"));
     }
 
     #[test]
@@ -5866,19 +5857,19 @@ mod tests {
 
         let informational_diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("RUSTSEC-2024-0320"))
+            .find(|d| d.message().contains("RUSTSEC-2024-0320"))
             .expect("informational advisory diagnostic must be emitted");
         let unknown_diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .find(|d| d.message().contains("RUSTSEC-2020-0071"))
             .expect("unknown-severity advisory diagnostic must be emitted");
 
-        assert_ne!(informational_diag.message, unknown_diag.message);
+        assert_ne!(informational_diag.message(), unknown_diag.message());
         assert_ne!(informational_diag.severity, unknown_diag.severity);
         assert_eq!(informational_diag.severity, Some(Severity::Information));
         assert_eq!(unknown_diag.severity, Some(Severity::Warning));
-        assert!(informational_diag.message.contains("[INFORMATIONAL]"));
-        assert!(!unknown_diag.message.contains("[INFORMATIONAL]"));
+        assert!(informational_diag.message().contains("[INFORMATIONAL]"));
+        assert!(!unknown_diag.message().contains("[INFORMATIONAL]"));
     }
 
     #[test]
@@ -5933,18 +5924,18 @@ mod tests {
 
         let diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("MAL-2025-47141"))
+            .find(|d| d.message().contains("MAL-2025-47141"))
             .expect("malicious advisory diagnostic must be emitted");
         assert!(
-            diag.message.contains("[MALWARE]"),
+            diag.message().contains("[MALWARE]"),
             "message must carry the distinguishing [MALWARE] tag, got: {}",
-            diag.message
+            diag.message()
         );
         assert!(
-            !diag.message.contains("Malicious package"),
+            !diag.message().contains("Malicious package"),
             "message must not also prefix the redundant 'Malicious package' wording \
              on top of OSV's own \"Malicious ...\" summary text, got: {}",
-            diag.message
+            diag.message()
         );
     }
 
@@ -5989,12 +5980,12 @@ mod tests {
 
         let more_diag = diagnostics
             .iter()
-            .find(|d| d.message.contains("more advisories"))
+            .find(|d| d.message().contains("more advisories"))
             .expect("expected a trailing +N more advisories diagnostic");
         assert!(
-            more_diag.message.contains("+35"),
+            more_diag.message().contains("+35"),
             "got: {}",
-            more_diag.message
+            more_diag.message()
         );
     }
 
@@ -6074,7 +6065,7 @@ mod tests {
 
         let advisory_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .filter(|d| d.message().contains("RUSTSEC-2020-0071"))
             .collect();
         assert_eq!(
             advisory_diags.len(),
@@ -6179,7 +6170,7 @@ mod tests {
 
         let advisory_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|d| d.message.contains("RUSTSEC-2020-0071"))
+            .filter(|d| d.message().contains("RUSTSEC-2020-0071"))
             .collect();
         assert_eq!(
             advisory_diags.len(),
@@ -6223,7 +6214,7 @@ mod tests {
         );
 
         assert!(
-            diagnostics.iter().all(|d| d.code.is_none()),
+            diagnostics.iter().all(|d| d.code().is_none()),
             "a Skipped outcome must never render an advisory diagnostic"
         );
     }
@@ -6972,7 +6963,7 @@ mod tests {
             assert_eq!(diagnostics.len(), 1, "expected exactly one diagnostic");
             assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
             assert_eq!(
-                diagnostics[0].message,
+                diagnostics[0].message(),
                 format!("{}; latest is 2.0.0", formatter.yanked_message())
             );
         }
@@ -7042,16 +7033,16 @@ mod tests {
             // R3 always runs before R6b (#247), so index 0 is deprecation and index 1 is the
             // #247 match — R6b fires regardless of `deprecation_found`, unlike R4's D5 gate.
             assert_eq!(
-                diagnostics[0].message,
+                diagnostics[0].message(),
                 format!("{}: archived", formatter.deprecated_message()),
                 "a genuine Yanked #247 match must still fire, without a #263 entry: {diagnostics:?}"
             );
-            assert_eq!(diagnostics[0].code, Some(DEPRECATED_DIAGNOSTIC_CODE.into()));
+            assert_eq!(diagnostics[0].code(), Some(DEPRECATED_DIAGNOSTIC_CODE));
             assert_eq!(
-                diagnostics[1].message,
+                diagnostics[1].message(),
                 format!("{}; latest is 2.0.0", formatter.yanked_message())
             );
-            assert_eq!(diagnostics[1].code, None);
+            assert_eq!(diagnostics[1].code(), None);
         }
 
         /// #437 companion: unlike the `Yanked` case above, a #247 match whose own status is
@@ -7108,14 +7099,14 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .all(|d| !d.message.starts_with(formatter.yanked_message())),
+                    .all(|d| !d.message().starts_with(formatter.yanked_message())),
                 "an AdvisoryDeprecated #247 match must yield to the co-occurring deprecation \
                  finding, got: {diagnostics:?}"
             );
             assert!(
                 diagnostics
                     .iter()
-                    .any(|d| d.message.starts_with(formatter.deprecated_message())),
+                    .any(|d| d.message().starts_with(formatter.deprecated_message())),
                 "the deprecation finding must still fire: {diagnostics:?}"
             );
         }
@@ -7189,18 +7180,18 @@ mod tests {
             // #247 match against the genuinely Yanked 1.2.1 — independent of R4's
             // D5-suppressed #263 finding for the unrelated 2.0.0 entry.
             assert_eq!(
-                diagnostics[0].message,
+                diagnostics[0].message(),
                 format!("{}: archived", formatter.deprecated_message()),
                 "the package-level deprecation finding must still fire: {diagnostics:?}"
             );
-            assert_eq!(diagnostics[0].code, Some(DEPRECATED_DIAGNOSTIC_CODE.into()));
+            assert_eq!(diagnostics[0].code(), Some(DEPRECATED_DIAGNOSTIC_CODE));
             assert_eq!(
-                diagnostics[1].message,
+                diagnostics[1].message(),
                 format!("{}; latest is 2.0.0", formatter.yanked_message()),
                 "the #247 match against the genuinely Yanked 1.2.1 must still fire even though \
                  the unrelated #263 in-use-version finding was D5-suppressed, got: {diagnostics:?}"
             );
-            assert_eq!(diagnostics[1].code, None);
+            assert_eq!(diagnostics[1].code(), None);
         }
 
         /// #247 vs. #263 dedup: a dependency whose in-use version (lock-file-resolved, or an
@@ -7258,16 +7249,17 @@ mod tests {
             // R4 (#263) runs before R7 (outdated); R6b (#247) is dedup-suppressed by R4
             // having already emitted, so index 0 is in-use-yanked and index 1 is outdated.
             assert_eq!(
-                diagnostics[0].message,
+                diagnostics[0].message(),
                 format!("{} (1.2.1)", formatter.yanked_message()),
                 "expected the in-use-version check (#263) to run first and win, got: {diagnostics:?}"
             );
-            assert_eq!(diagnostics[0].code, None);
+            assert_eq!(diagnostics[0].code(), None);
             assert_eq!(
-                diagnostics[1].message, "Newer version available: 2.0.0",
+                diagnostics[1].message(),
+                "Newer version available: 2.0.0",
                 "expected the co-emitted outdated diagnostic, got: {diagnostics:?}"
             );
-            assert_eq!(diagnostics[1].code, None);
+            assert_eq!(diagnostics[1].code(), None);
         }
 
         /// `severities.yanked` reaches the emitted diagnostic on the cache-only path, the same
@@ -7359,7 +7351,7 @@ mod tests {
             assert!(
                 !diagnostics
                     .iter()
-                    .any(|d| d.message.starts_with(formatter.yanked_message())),
+                    .any(|d| d.message().starts_with(formatter.yanked_message())),
                 "a non-yanked match exists, so no yanked diagnostic should fire, got: {diagnostics:?}"
             );
         }
@@ -7472,7 +7464,7 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .all(|d| !d.message.starts_with(formatter.yanked_message())),
+                    .all(|d| !d.message().starts_with(formatter.yanked_message())),
                 "a path dependency must never produce the yanked diagnostic, got: {diagnostics:?}"
             );
         }
@@ -7519,7 +7511,7 @@ mod tests {
             assert!(
                 !diagnostics
                     .iter()
-                    .any(|d| d.message.contains("Newer version available")),
+                    .any(|d| d.message().contains("Newer version available")),
                 "the yanked diagnostic must suppress the outdated hint, not add to it, got: {diagnostics:?}"
             );
         }
@@ -7630,10 +7622,10 @@ mod tests {
 
             assert_eq!(diagnostics.len(), 1);
             assert_eq!(diagnostics[0].severity, Some(Severity::Error));
-            assert_eq!(diagnostics[0].message, "serde: GPL-3.0 denied by policy");
+            assert_eq!(diagnostics[0].message(), "serde: GPL-3.0 denied by policy");
             assert_eq!(
-                diagnostics[0].code,
-                Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE.to_string())
+                diagnostics[0].code(),
+                Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE)
             );
             assert_eq!(
                 diagnostics[0].range,
@@ -7644,7 +7636,7 @@ mod tests {
         /// Critic follow-up S1 (#1242, #1246): the license-policy diagnostic already
         /// truncates the *license* (`MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS`) but, before
         /// this fix, interpolated the raw dependency *name* — same client-visible
-        /// `Diagnostic.message`, same CWE-532/CWE-117 exposure as R5a/R5c/R5d.
+        /// `Diagnostic.message()`, same CWE-532/CWE-117 exposure as R5a/R5c/R5d.
         #[test]
         fn denied_license_diagnostic_redacts_credential_shaped_name() {
             let formatter = MockFormatter;
@@ -7684,8 +7676,8 @@ mod tests {
             );
 
             assert_eq!(diagnostics.len(), 1);
-            assert!(diagnostics[0].message.contains("***@"));
-            assert!(!diagnostics[0].message.contains("glpat-AAAABBBBCCCCDDDD"));
+            assert!(diagnostics[0].message().contains("***@"));
+            assert!(!diagnostics[0].message().contains("glpat-AAAABBBBCCCCDDDD"));
         }
 
         #[test]
@@ -7717,7 +7709,7 @@ mod tests {
             assert_eq!(diagnostics.len(), 1);
             assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
             assert_eq!(
-                diagnostics[0].message,
+                diagnostics[0].message(),
                 "serde: ISC not on the allowed license list"
             );
         }
@@ -7757,8 +7749,8 @@ mod tests {
             );
 
             assert_eq!(diagnostics.len(), 1);
-            assert!(!diagnostics[0].message.contains('\u{202E}'));
-            assert!(diagnostics[0].message.contains("ISC"));
+            assert!(!diagnostics[0].message().contains('\u{202E}'));
+            assert!(diagnostics[0].message().contains("ISC"));
         }
 
         #[test]
@@ -7823,12 +7815,12 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .any(|d| d.message.contains("Unknown package"))
+                    .any(|d| d.message().contains("Unknown package"))
             );
             assert!(
                 diagnostics
                     .iter()
-                    .any(|d| d.message.contains("denied by policy"))
+                    .any(|d| d.message().contains("denied by policy"))
             );
         }
 
@@ -7912,7 +7904,7 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .any(|d| d.message.contains("denied by policy")),
+                    .any(|d| d.message().contains("denied by policy")),
                 "normalized GPL-3.0 must be denied by a GPL-3.0 deny-list, got: {diagnostics:?}"
             );
         }
@@ -8051,7 +8043,7 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .any(|d| d.message.contains("denied by policy")),
+                    .any(|d| d.message().contains("denied by policy")),
                 "a recognized denied entry must still fire despite a sibling \
                  unrecognized entry, got: {diagnostics:?}"
             );
@@ -8144,7 +8136,7 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .any(|d| d.message.contains("denied by policy")),
+                    .any(|d| d.message().contains("denied by policy")),
                 "GPL-3.0 side must be denied even though Apache-2.0 is also present and \
                  allow-listed, got: {diagnostics:?}"
             );
@@ -8186,11 +8178,11 @@ mod tests {
 
             assert_eq!(diagnostics.len(), 1);
             assert!(
-                diagnostics[0].message.len() < overlong.len(),
+                diagnostics[0].message().len() < overlong.len(),
                 "expected the message to be truncated, got: {:?}",
-                diagnostics[0].message
+                diagnostics[0].message()
             );
-            assert!(diagnostics[0].message.contains('…'));
+            assert!(diagnostics[0].message().contains('…'));
         }
 
         /// Issue #660/#661 critic security P2: a `NotAllowed` violation against a
@@ -8225,9 +8217,9 @@ mod tests {
 
             assert_eq!(diagnostics.len(), 1);
             assert!(
-                diagnostics[0].message.contains("more)"),
+                diagnostics[0].message().contains("more)"),
                 "expected the entry list to be capped with a '(+N more)' suffix, got: {:?}",
-                diagnostics[0].message
+                diagnostics[0].message()
             );
         }
     }

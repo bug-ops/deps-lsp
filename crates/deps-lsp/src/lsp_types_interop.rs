@@ -145,7 +145,7 @@ pub fn to_lsp_related_information(
             uri: to_lsp_uri(&related.uri),
             range: to_lsp_range(related.range),
         },
-        message: related.message,
+        message: related.message().to_string(),
     }
 }
 
@@ -160,13 +160,15 @@ pub fn to_lsp_related_information(
 /// that attaches it.
 #[must_use]
 pub fn to_lsp_diagnostic(diagnostic: deps_core::diagnostic::Diagnostic) -> ls_types::Diagnostic {
+    let message = diagnostic.message().to_string();
+    let code = diagnostic.code().map(ToString::to_string);
     ls_types::Diagnostic {
         range: to_lsp_range(diagnostic.range),
         severity: diagnostic.severity.map(to_lsp_diagnostic_severity),
-        code: diagnostic.code.map(ls_types::NumberOrString::String),
+        code: code.map(ls_types::NumberOrString::String),
         code_description: diagnostic.code_description.map(to_lsp_code_description),
         source: Some("deps-lsp".into()),
-        message: diagnostic.message,
+        message,
         related_information: diagnostic.related_information.map(|related| {
             related
                 .into_iter()

@@ -90,7 +90,7 @@ impl<'de> serde::Deserialize<'de> for Severity {
     }
 }
 
-/// An advisory/rule URL attached to a [`Diagnostic::code`], field-for-field identical to
+/// An advisory/rule URL attached to a `Diagnostic`'s `code`, field-for-field identical to
 /// `tower_lsp_server::ls_types::CodeDescription` but carrying no dependency on
 /// `tower-lsp-server`.
 ///
@@ -151,7 +151,26 @@ impl CodeDescription {
 ///     Range::new(Position::new(0, 0), Position::new(0, 4)),
 ///     "also declared here",
 /// );
-/// assert_eq!(related.message, "also declared here");
+/// assert_eq!(related.message(), "also declared here");
+/// ```
+///
+/// # The sanitization backstop this design relies on (issue #1280)
+///
+/// `message` is private — the only way to build a `RelatedInformation` from outside this
+/// crate is through [`Self::new`], which sanitizes it. Setting `message` directly fails to
+/// compile (the field does not exist from outside this crate):
+///
+/// ```compile_fail
+/// use deps_core::diagnostic::RelatedInformation;
+/// use deps_core::position::{Position, Range};
+/// use url::Url;
+///
+/// let mut related = RelatedInformation::new(
+///     Url::parse("file:///Cargo.toml").unwrap(),
+///     Range::new(Position::new(0, 0), Position::new(0, 1)),
+///     "safe",
+/// );
+/// related.message = "raw".to_string();
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,8 +179,7 @@ pub struct RelatedInformation {
     pub uri: url::Url,
     /// Span within [`Self::uri`].
     pub range: Range,
-    /// Message describing the relation.
-    pub message: String,
+    message: String,
 }
 
 impl RelatedInformation {
@@ -171,11 +189,11 @@ impl RelatedInformation {
     /// this crate, so every other crate must call this constructor to build a new value.
     ///
     /// `message` is sanitized through an internal markdown-unsafe-character filter (#1276)
-    /// as a defense-in-depth backstop on this constructor path, on top of (not instead of)
-    /// producer-side sanitization — it is not a guarantee for every way `message` can end
-    /// up on a [`Self`] value, since [`Self`] exposes a public `message` field that can
-    /// still be reassigned directly after construction, bypassing this filter. The filter
-    /// is idempotent, so callers that already sanitized their input are unaffected.
+    /// on this constructor path, on top of (not instead of) producer-side sanitization. This
+    /// is a real guarantee, not just a best-effort backstop (#1280): [`Self::message`] is
+    /// private, so [`Self::new`] is the only way to set it, and there is no setter that
+    /// bypasses sanitization. The filter is idempotent, so callers that already sanitized
+    /// their input are unaffected.
     ///
     /// # Examples
     ///
@@ -198,6 +216,27 @@ impl RelatedInformation {
             range,
             message: crate::lsp_helpers::replace_markdown_unsafe_chars(&message.into()),
         }
+    }
+
+    /// Returns the sanitized message describing the relation.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::diagnostic::RelatedInformation;
+    /// use deps_core::position::{Position, Range};
+    /// use url::Url;
+    ///
+    /// let related = RelatedInformation::new(
+    ///     Url::parse("file:///Cargo.toml").unwrap(),
+    ///     Range::new(Position::new(0, 0), Position::new(0, 1)),
+    ///     "also declared here",
+    /// );
+    /// assert_eq!(related.message(), "also declared here");
+    /// ```
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -225,24 +264,56 @@ impl RelatedInformation {
 /// .with_severity(Severity::Hint)
 /// .with_code("outdated");
 ///
-/// assert_eq!(diagnostic.message, "newer version available");
+/// assert_eq!(diagnostic.message(), "newer version available");
 /// assert_eq!(diagnostic.severity, Some(Severity::Hint));
-/// assert_eq!(diagnostic.code.as_deref(), Some("outdated"));
+/// assert_eq!(diagnostic.code(), Some("outdated"));
+/// ```
+///
+/// # The sanitization backstop this design relies on (issue #1280)
+///
+/// `message` and `code` are private, and `Self` does not implement `Default` — the only way
+/// to build or mutate a `Diagnostic` from outside this crate is through [`Self::new`] and the
+/// `with_*` builders, every one of which sanitizes the value it sets. Each of the following
+/// fails to compile:
+///
+/// Setting `message` directly (the field does not exist from outside this crate):
+///
+/// ```compile_fail
+/// use deps_core::diagnostic::Diagnostic;
+/// use deps_core::position::{Position, Range};
+///
+/// let mut d = Diagnostic::new(Range::new(Position::new(0, 0), Position::new(0, 1)), "safe");
+/// d.message = "raw".to_string();
+/// ```
+///
+/// Setting `code` directly:
+///
+/// ```compile_fail
+/// use deps_core::diagnostic::Diagnostic;
+/// use deps_core::position::{Position, Range};
+///
+/// let mut d = Diagnostic::new(Range::new(Position::new(0, 0), Position::new(0, 1)), "safe");
+/// d.code = Some("raw".to_string());
+/// ```
+///
+/// Constructing via `Default` (not implemented):
+///
+/// ```compile_fail
+/// use deps_core::diagnostic::Diagnostic;
+///
+/// let _d = Diagnostic::default();
 /// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
     /// Span the diagnostic applies to.
     pub range: Range,
     /// Severity, if classified.
     pub severity: Option<Severity>,
-    /// Stable machine-readable code identifying the diagnostic kind, e.g.
-    /// `"unsatisfiable-requirement"`.
-    pub code: Option<String>,
-    /// Advisory/rule URL for [`Self::code`], e.g. an OSV advisory page.
+    code: Option<String>,
+    /// Advisory/rule URL for `code`, e.g. an OSV advisory page.
     pub code_description: Option<CodeDescription>,
-    /// Human-readable diagnostic message.
-    pub message: String,
+    message: String,
     /// Other locations related to this diagnostic, e.g. sibling occurrences of a blocked
     /// registry.
     pub related_information: Option<Vec<RelatedInformation>>,
@@ -256,13 +327,13 @@ impl Diagnostic {
     /// this crate, so every other crate must call this constructor to build a new value.
     ///
     /// `message` is sanitized through an internal markdown-unsafe-character filter (#1276)
-    /// as a defense-in-depth backstop on this constructor path, on top of (not instead of)
-    /// producer-side sanitization — it is not a guarantee for every way `message` can end
-    /// up on a [`Self`] value, since [`Self`] derives `Default` and exposes a public
-    /// `message` field, so `message` can still be set via `Default::default()` or
-    /// reassigned directly after `new`, bypassing this filter. The filter is idempotent,
-    /// so callers that already sanitized their input are unaffected; length-capping (e.g.
-    /// `MAX_DIAGNOSTIC_NAME_CHARS`) stays producer-side and is not duplicated here.
+    /// on this constructor path, on top of (not instead of) producer-side sanitization. This
+    /// is a real guarantee, not just a best-effort backstop (#1280): [`Self`] does not
+    /// implement `Default`, [`Self::message`] is private, and there is no setter that
+    /// bypasses sanitization — [`Self::new`] is the only way to set it. The filter is
+    /// idempotent, so callers that already sanitized their input are unaffected;
+    /// length-capping (e.g. `MAX_DIAGNOSTIC_NAME_CHARS`) stays producer-side and is not
+    /// duplicated here.
     ///
     /// # Examples
     ///
@@ -288,6 +359,46 @@ impl Diagnostic {
         }
     }
 
+    /// Returns the sanitized, human-readable diagnostic message.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::diagnostic::Diagnostic;
+    /// use deps_core::position::{Position, Range};
+    ///
+    /// let diagnostic = Diagnostic::new(
+    ///     Range::new(Position::new(0, 0), Position::new(0, 1)),
+    ///     "package not found",
+    /// );
+    /// assert_eq!(diagnostic.message(), "package not found");
+    /// ```
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// Returns the stable machine-readable code identifying the diagnostic kind (e.g.
+    /// `"unsatisfiable-requirement"`), if set.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::diagnostic::Diagnostic;
+    /// use deps_core::position::{Position, Range};
+    ///
+    /// let diagnostic = Diagnostic::new(
+    ///     Range::new(Position::new(0, 0), Position::new(0, 1)),
+    ///     "package not found",
+    /// )
+    /// .with_code("unknown-package");
+    /// assert_eq!(diagnostic.code(), Some("unknown-package"));
+    /// ```
+    #[must_use]
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+
     /// Overrides [`Self::severity`]. See [`Self::new`].
     #[must_use]
     pub const fn with_severity(mut self, severity: Severity) -> Self {
@@ -295,10 +406,17 @@ impl Diagnostic {
         self
     }
 
-    /// Overrides [`Self::code`]. See [`Self::new`].
+    /// Overrides the diagnostic's `code` (see [`Self::code`]). See [`Self::new`].
+    ///
+    /// `code` is sanitized through the same markdown-unsafe-character filter as `message`
+    /// (#1280) — it reaches the same client-visible sinks (the editor's Problems panel,
+    /// SARIF `ruleId`), so it gets the same defense-in-depth guarantee, on top of (not
+    /// instead of) producer-side validation.
     #[must_use]
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
-        self.code = Some(code.into());
+        self.code = Some(crate::lsp_helpers::replace_markdown_unsafe_chars(
+            &code.into(),
+        ));
         self
     }
 
@@ -344,12 +462,12 @@ mod tests {
         )]);
 
         assert_eq!(diagnostic.severity, Some(Severity::Error));
-        assert_eq!(diagnostic.code.as_deref(), Some("GHSA-xxxx"));
+        assert_eq!(diagnostic.code(), Some("GHSA-xxxx"));
         assert_eq!(diagnostic.code_description.as_ref().unwrap().href, href);
         let related = diagnostic.related_information.as_ref().unwrap();
         assert_eq!(related.len(), 1);
         assert_eq!(related[0].uri, related_uri);
-        assert_eq!(related[0].message, "also here");
+        assert_eq!(related[0].message(), "also here");
     }
 
     #[test]
@@ -361,7 +479,7 @@ mod tests {
             "message",
         );
         assert_eq!(diagnostic.severity, None);
-        assert_eq!(diagnostic.code, None);
+        assert_eq!(diagnostic.code(), None);
         assert_eq!(diagnostic.code_description, None);
         assert_eq!(diagnostic.related_information, None);
     }
@@ -418,7 +536,21 @@ mod tests {
             Range::new(Position::new(0, 0), Position::new(0, 1)),
             "vulnerable\u{202E}gnp.sj",
         );
-        assert_eq!(diagnostic.message, "vulnerable gnp.sj");
+        assert_eq!(diagnostic.message(), "vulnerable gnp.sj");
+    }
+
+    /// #1280: `with_code` gets the same sanitization backstop as `message` — a `code` value
+    /// reaches the same client-visible sinks (Problems panel, SARIF `ruleId`).
+    #[test]
+    fn test_diagnostic_with_code_sanitizes_bidi_override() {
+        use crate::position::Position;
+
+        let diagnostic = Diagnostic::new(
+            Range::new(Position::new(0, 0), Position::new(0, 1)),
+            "vulnerable",
+        )
+        .with_code("GHSA-xxxx\u{202E}gnp.sj");
+        assert_eq!(diagnostic.code(), Some("GHSA-xxxx gnp.sj"));
     }
 
     /// #1276: same backstop applies to `RelatedInformation::new`.
@@ -431,7 +563,7 @@ mod tests {
             Range::new(Position::new(0, 0), Position::new(0, 1)),
             "also here\u{202E}gnp.sj",
         );
-        assert_eq!(related.message, "also here gnp.sj");
+        assert_eq!(related.message(), "also here gnp.sj");
     }
 
     /// #1083 critic S1: an out-of-range integer must never fail deserialization — it must

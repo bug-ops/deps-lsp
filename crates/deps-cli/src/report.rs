@@ -711,7 +711,7 @@ fn to_finding(
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
-    let code = diagnostic.code.clone();
+    let code = diagnostic.code().map(str::to_string);
     let advisory_url = diagnostic
         .code_description
         .as_ref()
@@ -735,7 +735,7 @@ fn to_finding(
         advisory_severity,
         severity: diagnostic.severity.unwrap_or(Severity::Warning),
         range: diagnostic.range,
-        message: diagnostic.message,
+        message: diagnostic.message().to_string(),
     }
 }
 
@@ -759,8 +759,8 @@ fn classify(
     diagnostic: &Diagnostic,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> Category {
-    if let Some(code) = &diagnostic.code {
-        return match code.as_str() {
+    if let Some(code) = diagnostic.code() {
+        return match code {
             UNSATISFIABLE_DIAGNOSTIC_CODE => Category::Unsatisfiable,
             LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE => Category::License,
             DEPRECATED_DIAGNOSTIC_CODE => Category::Deprecated,
@@ -771,15 +771,15 @@ fn classify(
             _ => Category::Vulnerable,
         };
     }
-    if diagnostic.message.starts_with("Newer version available") {
+    if diagnostic.message().starts_with("Newer version available") {
         return Category::Outdated;
     }
-    if diagnostic.message.contains(formatter.yanked_message()) {
+    if diagnostic.message().contains(formatter.yanked_message()) {
         return Category::Yanked;
     }
     // The advisory-overflow summary line carries no code but is still a vulnerability finding
     // (M1, spec 062 review) — else a manifest over `ADVISORY_DISPLAY_CAP` reports it as `Other`.
-    if diagnostic.message.ends_with("more advisories") {
+    if diagnostic.message().ends_with("more advisories") {
         return Category::Vulnerable;
     }
     Category::Other

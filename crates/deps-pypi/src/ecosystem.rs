@@ -2433,7 +2433,7 @@ dependencies = []
             assert!(
                 diagnostics
                     .iter()
-                    .all(|d| !d.message.contains("Unknown package")),
+                    .all(|d| !d.message().contains("Unknown package")),
                 "no 'Unknown package' diagnostic should be emitted: {diagnostics:?}"
             );
         }

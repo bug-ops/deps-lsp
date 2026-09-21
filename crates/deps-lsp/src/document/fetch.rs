@@ -651,7 +651,7 @@ dependencies = ["requests>=2.0.0"]
                 "must be keyed by the normalized (dash) name, not the raw manifest name"
             );
             assert!(
-                diagnostics.iter().any(|d| d.message.contains("4.9.0")),
+                diagnostics.iter().any(|d| d.message().contains("4.9.0")),
                 "yanked diagnostic must reach the generated output: {diagnostics:?}"
             );
         }
@@ -666,7 +666,7 @@ dependencies = ["requests>=2.0.0"]
                 "must be keyed by the normalized (dotted -> dash) name"
             );
             assert!(
-                diagnostics.iter().any(|d| d.message.contains("5.0.0")),
+                diagnostics.iter().any(|d| d.message().contains("5.0.0")),
                 "yanked diagnostic must reach the generated output: {diagnostics:?}"
             );
         }
