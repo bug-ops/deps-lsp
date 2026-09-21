@@ -110,23 +110,35 @@ pub fn truncate_for_diagnostic(value: &str, max_chars: usize) -> std::borrow::Co
 }
 
 /// Maximum character count of a dependency name interpolated into an unknown-package
-/// diagnostic message (R5a/R5c/R5d) or a `deps-cli` finding's `dependency_name` field,
-/// before it is truncated with an ellipsis marker (#1242, #1246).
+/// diagnostic message (R5a/R5c/R5d), a `deps-cli` finding's `dependency_name` field, or
+/// the hover header's link label, before it is truncated with an ellipsis marker
+/// (#1242, #1246, #1259 critic S4).
 ///
 /// Mirrors [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]'s bound: [`PackageName`] itself is
 /// deliberately unvalidated (see its own doc), so a manifest key of unbounded length would
 /// otherwise reach these sinks unbounded too.
-const MAX_DIAGNOSTIC_NAME_CHARS: usize = 128;
+///
+/// `pub(crate)`, not module-private: `lsp_helpers::hover`'s header label (#1259 critic
+/// S4) shares this exact bound rather than declaring its own duplicate constant, per
+/// this project's shared-constant DRY rule — the same reasoning
+/// [`MAX_VERSION_DIAGNOSTIC_CHARS`]'s doc gives for its own `inlay_hints` reuse.
+pub(crate) const MAX_DIAGNOSTIC_NAME_CHARS: usize = 128;
 
 /// Maximum character count of a version-shaped string (a manifest-declared requirement,
-/// or a registry-reported yanked/latest version) interpolated into a diagnostic message
-/// before it is truncated with an ellipsis marker (#1263).
+/// a lockfile-resolved version, or a registry-reported yanked/latest version)
+/// interpolated into a diagnostic message or inlay-hint label before it is truncated
+/// with an ellipsis marker (#1263, #1268).
 ///
-/// Mirrors [`MAX_DIAGNOSTIC_NAME_CHARS`]'s bound: `req_str` comes from the parsed manifest
-/// and `yanked_version`/`latest` come from registry version data — neither is validated or
-/// length-capped before reaching these sinks, and both are also missing
+/// Mirrors [`MAX_DIAGNOSTIC_NAME_CHARS`]'s bound: `req_str` comes from the parsed manifest,
+/// `yanked_version`/`latest` come from registry version data, and a lockfile-resolved
+/// version comes from a cloned repository's lock file — none of these are validated or
+/// length-capped before reaching these sinks, and all are also missing
 /// [`sanitize_invisible`]'s bidi/invisible-character neutralization before this fix.
-const MAX_VERSION_DIAGNOSTIC_CHARS: usize = 128;
+///
+/// `pub(crate)`, not module-private: `lsp_helpers::inlay_hints`' "update available"/"up
+/// to date"/offline-marker labels (#1268) share this exact bound rather than declaring
+/// their own duplicate constant, per this project's shared-constant DRY rule.
+pub(crate) const MAX_VERSION_DIAGNOSTIC_CHARS: usize = 128;
 
 /// Renders `name` safely for a client-visible diagnostic message or `dependency_name`-shaped
 /// field (#1242, #1246): redact, then sanitize, then truncate, in that order.

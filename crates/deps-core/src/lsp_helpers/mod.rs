@@ -1371,10 +1371,42 @@ fn is_markdown_unsafe(c: char) -> bool {
 /// (#1262 code-review follow-up) so the narrow bidi/invisible-character filter has exactly
 /// one loop to keep in sync with [`is_markdown_unsafe`]'s policy, instead of two copies that
 /// could silently drift.
+///
+/// Only correct for a text/label sink or an inline code span, where a stray space is
+/// harmless — **not** for a Markdown link *destination*: per CommonMark, an unbracketed
+/// `[label](destination)` destination cannot contain a literal space at all, so
+/// substituting one would turn a fired hazard into a broken (non-)link instead of a
+/// sanitized one. [`strip_markdown_unsafe_chars`] is the destination-safe sibling.
 fn replace_markdown_unsafe_chars(s: &str) -> String {
     s.chars()
         .map(|c| if is_markdown_unsafe(c) { ' ' } else { c })
         .collect()
+}
+
+/// Removes every `is_markdown_unsafe` character from `s` outright, rather than
+/// substituting a space (`replace_markdown_unsafe_chars`'s behavior).
+///
+/// Used for a Markdown link *destination* (#1259 critic S3): CommonMark forbids a
+/// literal, unescaped space inside an unbracketed `[label](destination)` destination,
+/// so replacing a stripped character with a space there would break the link (render it
+/// as non-link literal text) instead of sanitizing it in place. Dropping the character
+/// keeps the surrounding URL syntactically intact — the removed character carried no
+/// meaningful display information to begin with (it is invisible/bidi-control by
+/// definition), so there is nothing worth preserving a placeholder for.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::strip_markdown_unsafe_chars;
+///
+/// assert_eq!(strip_markdown_unsafe_chars("https://example.com/pkg"), "https://example.com/pkg");
+/// assert_eq!(
+///     strip_markdown_unsafe_chars("https://example.com/real\u{202E}gnp.sj"),
+///     "https://example.com/realgnp.sj"
+/// );
+/// ```
+pub fn strip_markdown_unsafe_chars(s: &str) -> String {
+    s.chars().filter(|c| !is_markdown_unsafe(*c)).collect()
 }
 
 /// Wraps `content` in a Markdown inline code span (backticks included) that safely

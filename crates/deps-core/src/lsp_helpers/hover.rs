@@ -12,6 +12,7 @@ use crate::{
     format_relative_age, is_within_cooldown,
 };
 
+use super::diagnostics::MAX_DIAGNOSTIC_NAME_CHARS;
 use super::{
     EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, await_versions_fetch, escape_markdown,
     in_use_version, markdown_code_span, position_in_range, resolve_in_use_version,
@@ -475,18 +476,66 @@ fn spawn_trust_signal_fetch(
 
 /// Appends the hover header: the dependency name, linked to its registry page when
 /// `url` (from [`crate::lsp_helpers::PackageRendering::package_url`]) is present.
+///
+/// `package_url`'s producer-side hostile-input gate
+/// (`crate::conformance::assert_package_url_hostile_input_safe`, run for every
+/// ecosystem formatter via `formatter_conformance!`) is the *primary* defense for this
+/// destination — every real `package_url` impl percent-encodes or allowlist-validates
+/// the name before building the URL. Stripping `url`'s bidi-override/invisible
+/// characters here (#1259) is consumer-side **defense-in-depth** on top of that gate,
+/// not a replacement for it: it covers only the narrow bidi/invisible subset
+/// `is_markdown_unsafe` names, not the structural breakout set (`(`, `)`,
+/// `[`, `]`, `` ` ``, `<`, `>`) the producer-side gate is the sole guard for.
+///
+/// [`super::strip_markdown_unsafe_chars`], not [`escape_markdown`] or
+/// `super::replace_markdown_unsafe_chars`: full markdown escaping backslash-escapes
+/// every ASCII punctuation character, mangling an ordinary, non-malicious URL's
+/// `/`/`:`/`.`; and `replace_markdown_unsafe_chars`'s space substitution — correct for
+/// label/code-span *text* — is wrong for a link *destination*, where CommonMark
+/// forbids an unescaped literal space outright, so a fired substitution would turn the
+/// link into broken non-link text instead of sanitizing it in place. Removing the
+/// character keeps the surrounding URL syntactically valid.
+///
+/// `url` is deliberately **not** length-capped (code-review follow-up to critic S4):
+/// an earlier version of this fix truncated `url` at a fixed raw-character boundary,
+/// which (1) broke legitimate long, non-malicious links — a Go module path or an npm
+/// scoped package near npm's 214-char limit routinely exceeds 128 chars once the
+/// registry prefix is added, well within normal (non-hostile) use — and (2) is not
+/// percent-encoding-aware, so a cut can land inside a `%XX` escape and leave a
+/// structurally malformed dangling `%X` right before the `…` marker. Given `url`'s
+/// *content* safety already rests on `package_url`'s producer-side gate (percent-
+/// encoding/allowlisting, per the paragraph above), a length cap here would add a
+/// real-world regression without closing a gap that gate doesn't already close, so
+/// `url` only goes through the (length-preserving-or-shrinking)
+/// `strip_markdown_unsafe_chars` filter, unbounded.
+///
+/// The **label** (`dep.name()`), by contrast, *is* capped at
+/// [`MAX_DIAGNOSTIC_NAME_CHARS`] — the same bound `diagnostics.rs`'s name-shaped sinks
+/// use, since [`crate::PackageName`] is explicitly unvalidated/unbounded (see its own
+/// doc) and this is always-visible rendered text, not an opaque link target. The
+/// truncation runs **after** [`escape_markdown`], not before (code-review follow-up):
+/// `escape_markdown` backslash-escapes every ASCII punctuation character — common in
+/// real package names (`-`, `_`, `.`, `@`) — so truncating the raw name first bounds
+/// only the *source* read, not the *rendered* length `escape_markdown` can more than
+/// double. Truncating the already-escaped string is what actually keeps the rendered
+/// label bounded, at the cost of a possible trailing lone backslash right before the
+/// `…` marker on the rare cut that lands between an escape's backslash and its
+/// punctuation character — cosmetically odd but harmless in label text (unlike the
+/// link-destination case above, this can't break Markdown structure).
 fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: Option<&str>) {
     use std::fmt::Write as _;
+
+    let escaped_name = escape_markdown(dep.name().as_str());
+    let name = super::truncate_for_diagnostic(&escaped_name, MAX_DIAGNOSTIC_NAME_CHARS);
 
     // `write!` here is infallible; result discarded (#673 M3).
     let _ = match url {
         Some(url) => write!(
             markdown,
-            "# [{}]({})\n\n",
-            escape_markdown(dep.name().as_str()),
-            url
+            "# [{name}]({})\n\n",
+            super::strip_markdown_unsafe_chars(url)
         ),
-        None => write!(markdown, "# {}\n\n", escape_markdown(dep.name().as_str())),
+        None => write!(markdown, "# {name}\n\n"),
     };
 }
 
@@ -3796,8 +3845,8 @@ mod tests {
         };
 
         // The link label (the escape_markdown sink #1248 targets) must not carry the bidi
-        // override; the link *destination* is a separate, unescaped URL-construction path
-        // outside this fix's scope (tracked separately, see #1252/#1248 follow-up).
+        // override; the link *destination* is sanitized too (#1259), see the dedicated
+        // `test_generate_hover_bidi_override_in_name_cannot_spoof_link_destination` test below.
         let header_line = content
             .value
             .lines()
@@ -3810,6 +3859,211 @@ mod tests {
             .next()
             .expect("header contains label/url separator");
         assert!(!label.contains('\u{202E}'));
+        assert!(!header_line.contains('\u{202E}'));
+    }
+
+    /// #1259: a bidi-override embedded in a dependency name must not survive into the
+    /// hover header's link *destination* either (defense-in-depth on top of
+    /// `conformance::assert_package_url_hostile_input_safe`'s producer-side gate — see
+    /// `push_header_hover_section`'s doc). Critic finding S3: the fix must strip the
+    /// character rather than substitute a space for it, or the destination stops being
+    /// a valid, parseable link destination at all — asserted here via `url::Url::parse`,
+    /// the same check `conformance.rs`'s gate uses, not just absence of the bidi char.
+    #[tokio::test]
+    async fn test_generate_hover_bidi_override_in_name_cannot_spoof_link_destination() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let malicious_name = "real\u{202E}gnp.sj";
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: malicious_name.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, malicious_name.len() as u32),
+                ),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+
+        let header_line = content
+            .value
+            .lines()
+            .next()
+            .expect("hover markdown has a header line");
+        let destination = header_line
+            .split("](")
+            .nth(1)
+            .expect("header contains label/url separator")
+            .strip_suffix(')')
+            .expect("destination ends with a closing paren");
+        assert!(
+            !destination.contains('\u{202E}'),
+            "link destination must not carry the bidi override; got: {destination}"
+        );
+        assert!(
+            url::Url::parse(destination).is_ok(),
+            "sanitized destination must still be a valid, parseable URL — a space \
+             substitution (rather than removal) would break the link; got: {destination:?}"
+        );
+        assert_eq!(
+            destination, "https://example.com/realgnp.sj",
+            "removing the bidi char must not introduce a stray space or other artifact"
+        );
+    }
+
+    /// #1259 critic S4, code-review follow-up: the hover header's link *label* must
+    /// not render unbounded, and the cap must bound the actual *rendered* (post-escape)
+    /// length, not just the source-character count. A name built entirely of
+    /// punctuation (every `-` becomes `\-` under `escape_markdown`, doubling length —
+    /// common in real package names too, e.g. `-`/`_`/`.`/`@`) is exactly the case that
+    /// would slip past a truncate-before-escape ordering: truncating 300 raw dashes to
+    /// 128 raw chars and then escaping would still yield a 256-char rendered label, not
+    /// the 129 this test asserts.
+    #[tokio::test]
+    async fn test_generate_hover_header_caps_rendered_label_length_after_escaping() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let punctuation_heavy_name = "-".repeat(300);
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: punctuation_heavy_name.clone().into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 310), Position::new(0, 320)),
+                name_range: Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, punctuation_heavy_name.len() as u32),
+                ),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+
+        let header_line = content
+            .value
+            .lines()
+            .next()
+            .expect("hover markdown has a header line");
+        let label = header_line
+            .strip_prefix("# [")
+            .expect("header starts with link label")
+            .split("](")
+            .next()
+            .expect("header contains label/url separator");
+
+        assert_eq!(
+            label.chars().count(),
+            MAX_DIAGNOSTIC_NAME_CHARS + 1,
+            "rendered (post-escape) label must be capped to MAX_DIAGNOSTIC_NAME_CHARS \
+             chars plus the ellipsis marker, proving truncation runs after escaping, \
+             not before; got: {label}"
+        );
+        assert!(
+            label.ends_with('…'),
+            "expected truncation marker; got: {label}"
+        );
+    }
+
+    /// #1259 code-review follow-up: a long but entirely legitimate `package_url`
+    /// destination — e.g. a Go module path or an npm scoped package near npm's 214-char
+    /// limit — must render in full, not get cut at a fixed raw-character boundary. An
+    /// earlier version of the S4 fix capped the destination the same way as the label
+    /// and broke exactly this case; the destination's safety instead rests on
+    /// `package_url`'s producer-side conformance gate (percent-encoding/allowlisting),
+    /// not a length cap here.
+    #[tokio::test]
+    async fn test_generate_hover_header_does_not_truncate_long_legitimate_destination() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let long_legitimate_name = "x".repeat(200);
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: long_legitimate_name.clone().into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 210), Position::new(0, 220)),
+                name_range: Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, long_legitimate_name.len() as u32),
+                ),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+
+        let header_line = content
+            .value
+            .lines()
+            .next()
+            .expect("hover markdown has a header line");
+        let destination = header_line
+            .split("](")
+            .nth(1)
+            .expect("header contains label/url separator")
+            .strip_suffix(')')
+            .expect("destination ends with a closing paren");
+        let expected = format!("https://example.com/{long_legitimate_name}");
+
+        assert_eq!(
+            destination, expected,
+            "a long but legitimate destination must render in full, untruncated"
+        );
+        assert!(
+            url::Url::parse(destination).is_ok(),
+            "destination must still be a valid, parseable URL; got: {destination:?}"
+        );
     }
 
     #[tokio::test]
