@@ -195,6 +195,16 @@ impl Ecosystem for DenoEcosystem {
         &["deno.json", "deno.jsonc"]
     }
 
+    /// `.npmrc` drives `AlternateRegistry` vs `CustomRegistry` classification for
+    /// `npm:`-scope imports (#1202/#1212/#1227), mirroring `NpmEcosystem`.
+    fn watched_config_filenames(&self) -> &[&'static str] {
+        &[".npmrc"]
+    }
+
+    fn routing_affecting_watched_configs(&self) -> &[&'static str] {
+        &[".npmrc"]
+    }
+
     fn parse_manifest<'a>(
         &'a self,
         content: &'a str,
