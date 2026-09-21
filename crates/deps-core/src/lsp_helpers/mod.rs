@@ -1370,14 +1370,21 @@ fn is_markdown_unsafe(c: char) -> bool {
 /// Shared by [`markdown_code_span`] and `diagnostics::sanitize_advisory_text_for_diagnostic`
 /// (#1262 code-review follow-up) so the narrow bidi/invisible-character filter has exactly
 /// one loop to keep in sync with [`is_markdown_unsafe`]'s policy, instead of two copies that
-/// could silently drift.
+/// could silently drift. Also called from `crate::diagnostic::Diagnostic::new` and
+/// `crate::diagnostic::RelatedInformation::new` as a defense-in-depth backstop on their
+/// constructor path (#1276) — `pub(crate)` rather than private for that, but still not
+/// reachable from outside `deps-core`.
+///
+/// Idempotent: `' '` is not itself [`is_markdown_unsafe`], so re-applying this to
+/// already-sanitized input is a no-op — safe to double-apply through both a producer-side
+/// call and the constructor-path backstop.
 ///
 /// Only correct for a text/label sink or an inline code span, where a stray space is
 /// harmless — **not** for a Markdown link *destination*: per CommonMark, an unbracketed
 /// `[label](destination)` destination cannot contain a literal space at all, so
 /// substituting one would turn a fired hazard into a broken (non-)link instead of a
 /// sanitized one. [`strip_markdown_unsafe_chars`] is the destination-safe sibling.
-fn replace_markdown_unsafe_chars(s: &str) -> String {
+pub(crate) fn replace_markdown_unsafe_chars(s: &str) -> String {
     s.chars()
         .map(|c| if is_markdown_unsafe(c) { ' ' } else { c })
         .collect()
@@ -2927,6 +2934,37 @@ mod tests {
             let escaped = escape_markdown(&format!("a{c}b"));
             assert_eq!(escaped, "a b", "{c:?} must be replaced with a space");
         }
+    }
+
+    /// #1276: `Diagnostic::new`/`RelatedInformation::new` apply `replace_markdown_unsafe_chars`
+    /// on top of producer-side sanitization that may have already called it —
+    /// double-application must be a no-op, since `' '` (the substitution) is not itself
+    /// `is_markdown_unsafe`.
+    #[test]
+    fn test_replace_markdown_unsafe_chars_is_idempotent() {
+        for c in [
+            '\u{202E}',
+            '\u{2066}',
+            '\u{200B}',
+            '\u{2060}',
+            '\u{2028}',
+            '\u{2029}',
+            '\u{FEFF}',
+            '\u{FFFA}',
+            '\u{E0041}',
+            '\n',
+            '\t',
+        ] {
+            let input = format!("a{c}b");
+            let once = replace_markdown_unsafe_chars(&input);
+            assert_eq!(once, "a b", "{c:?} must be replaced with a single space");
+            let twice = replace_markdown_unsafe_chars(&once);
+            assert_eq!(twice, once, "{c:?} must not change on re-application");
+        }
+        assert!(
+            !is_markdown_unsafe(' '),
+            "substituted space must be stable under re-application"
+        );
     }
 
     #[test]
