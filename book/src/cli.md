@@ -204,13 +204,17 @@ before publish, and on every PR touching `crates/github-action/`.
 > **Note:** Docker-based actions only run on Linux runners (`runs-on: ubuntu-latest` or
 > similar) — `macos-latest` and `windows-latest` are not supported.
 
+> **Tip:** Pin `uses:` to a released tag (e.g. `@v1.2.0`) rather than `@main` — `main` is a
+> mutable ref, so a workflow pinned to it re-runs whatever is currently on that branch,
+> including unreviewed or in-progress changes.
+
 ```yaml
 jobs:
   deps-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: bug-ops/deps-lsp/crates/github-action@main
+      - uses: bug-ops/deps-lsp/crates/github-action@v1.2.0
         id: deps-check
         with:
           fail-on: vulnerable,yanked,unsatisfiable

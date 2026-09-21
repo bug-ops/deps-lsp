@@ -207,11 +207,12 @@ repos:
 ## GitHub Action
 
 [`crates/github-action`](../github-action/README.md) wraps `deps-cli check --format sarif` as
-a composite action. It writes a SARIF file but does not upload it — wire
-`github/codeql-action/upload-sarif` after it in your own workflow:
+a Docker-based action. It writes a SARIF file but does not upload it — wire
+`github/codeql-action/upload-sarif` after it in your own workflow. Pin `uses:` to a released
+tag rather than `@main` — see the action's own README for why:
 
 ```yaml
-- uses: bug-ops/deps-lsp/crates/github-action@main
+- uses: bug-ops/deps-lsp/crates/github-action@v1.2.0
   id: deps-check
   with:
     fail-on: vulnerable,yanked,unsatisfiable
