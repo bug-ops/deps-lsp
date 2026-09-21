@@ -322,10 +322,6 @@ fn marker_too_deep(marker: &str) -> bool {
     false
 }
 
-/// Longest prefix of an attacker-controlled requirement/dependency string
-/// logged, post-redaction, by [`truncate_for_log`].
-const MAX_LOGGED_LEN: usize = 200;
-
 /// Redacts, then truncates, `s` to a safe-to-log prefix, so a warn!/debug!
 /// call site can never (a) leak a credential embedded in an unparseable PEP
 /// 508 direct-reference URL (`pkg @ https://user:token@host/...`, or a
@@ -335,40 +331,18 @@ const MAX_LOGGED_LEN: usize = 200;
 /// overall file cap. Falls back to `s` unchanged when redaction was a no-op
 /// and it's already short enough.
 ///
-/// Redaction goes through [`deps_core::net_policy::redact_declaration_key`], not the more
-/// aggressive [`deps_core::net_policy::url_for_tracing`] directly: `s` here is a
-/// dependency/requirement string, TOML key, or marker fragment — not a URL — and
-/// `url_for_tracing`'s fallback scans (designed for a value already known to be URL-shaped)
-/// mistake an ordinary `word:word` shape (`"docs:build"`, a group name; `` "duplicate key:
-/// `name`" ``, a TOML parse error) for a credential and erase it (#1228, critic round 4).
-/// `redact_declaration_key` gates that same aggressive scan behind an actual credential/URL
-/// shape check first, so a benign colon-bearing value survives untouched while a genuine
-/// credential (`user:pass@host`, or a query-string token) still redacts.
-///
-/// Redaction must run before truncation: cutting the string first could
-/// slice off the boundary the credential-shape scan relies on, leaving a
-/// credential in the (now truncated) prefix unredacted.
-// `boundary` is floor_char_boundary-clamped just above before slicing `text`.
-#[allow(clippy::string_slice)]
+/// A thin wrapper around [`deps_core::net_policy::redact_parse_error_for_log`]: the
+/// redact-then-truncate-with-original-length-annotation algorithm was independently
+/// implemented here and in `deps-core` for #1228 and #1240 respectively (CLAUDE.md's
+/// cross-ecosystem rule names this exact shape of duplication as a bug class), so this crate
+/// now delegates rather than keeping a second copy. `s` here is a dependency/requirement
+/// string, TOML key, or marker fragment — not a URL — see that function's own doc for why
+/// redaction goes through [`deps_core::net_policy::redact_declaration_key`] rather than the
+/// more aggressive [`deps_core::net_policy::url_for_tracing`] directly (#1228, critic round 4):
+/// `url_for_tracing`'s fallback scans mistake an ordinary `word:word` shape (`"docs:build"`, a
+/// group name; `` "duplicate key: `name`" ``, a TOML parse error) for a credential and erase it.
 pub(crate) fn truncate_for_log(s: &str) -> std::borrow::Cow<'_, str> {
-    let redacted = deps_core::net_policy::redact_declaration_key(s);
-    let text: std::borrow::Cow<'_, str> = if redacted == s {
-        std::borrow::Cow::Borrowed(s)
-    } else {
-        std::borrow::Cow::Owned(redacted)
-    };
-    if text.len() <= MAX_LOGGED_LEN {
-        return text;
-    }
-    let boundary = text.floor_char_boundary(MAX_LOGGED_LEN);
-    // `s.len()`, not `text.len()`: the annotation describes the original attacker-controlled
-    // payload's size, which redaction must not misreport just because it happened to shorten
-    // the visible text.
-    std::borrow::Cow::Owned(format!(
-        "{}... ({} bytes total)",
-        &text[..boundary],
-        s.len()
-    ))
+    deps_core::net_policy::redact_parse_error_for_log(s)
 }
 
 // An error's own Display/message is classified via `crate::error::pep508_error_kind_str`
@@ -880,7 +854,12 @@ mod pep508_name_tests {
 
 #[cfg(test)]
 mod truncate_for_log_tests {
-    use super::{MAX_LOGGED_LEN, truncate_for_log};
+    use super::truncate_for_log;
+
+    /// Mirrors [`deps_core::net_policy::MAX_PARSE_ERROR_LOG_BYTES`] — the value
+    /// [`truncate_for_log`] delegates to — rather than hardcoding a second `200` in this
+    /// module's own fixtures that could silently drift from it.
+    const MAX_LOGGED_LEN: usize = deps_core::net_policy::MAX_PARSE_ERROR_LOG_BYTES;
 
     #[test]
     fn short_credential_free_input_is_borrowed_unchanged() {

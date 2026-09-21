@@ -112,7 +112,7 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
 
     let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
         file_type: "Cargo.lock".into(),
-        source: Box::new(std::io::Error::other(e.to_string())),
+        source: deps_core::net_policy::parse_error_source(&e),
     })?;
 
     let mut packages = ResolvedPackages::new();
@@ -244,6 +244,42 @@ mod tests {
             "Cargo.lock" => "version = 4",
         ];
         malformed: "not valid toml {{{";
+    }
+
+    /// #1240: a duplicate table whose name is credential-shaped must not leak the credential
+    /// into the parse error's `Display` text, which reaches `tracing::warn!`.
+    #[test]
+    fn test_parse_cargo_lock_duplicate_table_error_redacts_credential() {
+        let content = r#"
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+a = 1
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+b = 2
+"#
+        .to_string();
+
+        let message = parse_cargo_lock(content).unwrap_err().to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_parse_cargo_lock_duplicate_table_error_benign_name_unchanged() {
+        let content = r"
+[serde]
+a = 1
+[serde]
+b = 2
+"
+        .to_string();
+
+        // Derived from the raw parse, not hardcoded, so assert_eq! gates a redaction regression (#1240 M5).
+        let raw_err = toml_span::parse(&content).unwrap_err();
+        let expected = format!("failed to parse Cargo.lock: {raw_err}");
+
+        let message = parse_cargo_lock(content).unwrap_err().to_string();
+        assert_eq!(message, expected);
     }
 
     #[test]

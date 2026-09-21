@@ -2356,6 +2356,108 @@ pub fn redact_declaration_key(key: &str) -> String {
     }
 }
 
+/// Longest prefix (in bytes, not chars — see [`redact_parse_error_for_log`]'s slicing) of a
+/// redacted parse-error message logged, post-redaction, by [`redact_parse_error_for_log`].
+///
+/// `pub`, not `pub(crate)`: `deps_pypi::parser::truncate_for_log` (a thin wrapper delegating to
+/// [`redact_parse_error_for_log`]) mirrors this value for its own test fixtures rather than
+/// hardcoding a second `200` that could silently drift from this one.
+pub const MAX_PARSE_ERROR_LOG_BYTES: usize = 200;
+
+/// Redacts, then bounds, a parse-error's `Display` text before it reaches a log sink.
+///
+/// `toml_span::Error` and `yaml_rust2::ScanError` can both embed a manifest/lockfile's
+/// offending duplicate key or table name verbatim in their `Display` output, and that name can
+/// itself be a credential-bearing URL (#1240). [`redact_declaration_key`] runs first, then the
+/// result is truncated to a bounded prefix — in that order, since truncating first could cut the
+/// string exactly at the boundary the credential-shape scan depends on, leaking a credential
+/// that straddles the cut. Truncation is an independent concern from redaction: the file `raw`
+/// derives from can be as large as the ~10 MB read cap
+/// ([`crate::fs_probe::read_to_string_capped`]'s bound), so an unbounded
+/// `tracing::warn!`/`debug!`/`error!` call would be a synchronous multi-megabyte write to a (by
+/// default, unbuffered, stderr-backed) log sink — this mostly matters on the benign path, since
+/// once redaction actually fires it collapses `raw` to a short fixed-shape string well under the
+/// cap. Falls back to `raw` unchanged (as a `Cow::Borrowed`, so a caller that just needs to read
+/// or forward the result avoids a second clone) when redaction was a no-op and it's already
+/// short enough.
+///
+/// Note: this does not currently avoid the *first* allocation — [`redact_declaration_key`]
+/// itself always builds an owned `String`, even on its own no-op branch, so a `Cow::Borrowed`
+/// here still follows one allocation inside it. Making [`redact_declaration_key`] itself
+/// `Cow`-returning would close that gap, but it has ~20 other call sites across the workspace,
+/// so that's out of scope here (a possible follow-up, not done by this PR).
+///
+/// This is the single shared implementation behind both `deps-core`'s own parse-error sinks and
+/// `deps_pypi::parser::truncate_for_log`'s delegation to it — see CLAUDE.md's cross-ecosystem
+/// rule: the same redact-then-truncate shape was independently needed in ≥2 crates (#1228,
+/// #1239, #1240), so it lives here once rather than being reimplemented per-crate.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::redact_parse_error_for_log;
+///
+/// assert_eq!(
+///     redact_parse_error_for_log(
+///         "duplicate key: `https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x`"
+///     ),
+///     "duplicate key: `https://***@pkg.internal.corp/x`"
+/// );
+/// // Benign errors are left unchanged — the credential-shape gate does not fire on them.
+/// assert_eq!(redact_parse_error_for_log("duplicate key: `serde`"), "duplicate key: `serde`");
+/// ```
+#[must_use]
+#[expect(
+    clippy::string_slice,
+    reason = "`boundary` comes from `floor_char_boundary`, so the slice always lands on a char \
+              boundary"
+)]
+pub fn redact_parse_error_for_log(raw: &str) -> std::borrow::Cow<'_, str> {
+    let redacted = redact_declaration_key(raw);
+    let text: std::borrow::Cow<'_, str> = if redacted == raw {
+        std::borrow::Cow::Borrowed(raw)
+    } else {
+        std::borrow::Cow::Owned(redacted)
+    };
+    if text.len() <= MAX_PARSE_ERROR_LOG_BYTES {
+        return text;
+    }
+    let boundary = text.floor_char_boundary(MAX_PARSE_ERROR_LOG_BYTES);
+    // `raw.len()`, not `text.len()`: the annotation describes the original attacker-controlled
+    // payload's size, which redaction must not misreport just because it happened to shorten
+    // the visible text (#1228 M1).
+    std::borrow::Cow::Owned(format!(
+        "{}... ({} bytes total)",
+        &text[..boundary],
+        raw.len()
+    ))
+}
+
+/// Redacts `e` via [`redact_parse_error_for_log`] and wraps the result as the boxed error
+/// [`crate::error::DepsError::ParseError`]'s `source` field expects.
+///
+/// Centralizes the whole "redact, then wrap into an `io::Error`" step — not just the redaction
+/// itself — as one call, `deps_core::net_policy::parse_error_source(&e)`, in place of
+/// `Box::new(std::io::Error::other(redact_parse_error_for_log(&e.to_string())))` repeated at
+/// each `toml_span`/`yaml-rust2` `map_err` site. A future ecosystem crate adding a new parse-error
+/// site is forced through the safe path by construction, rather than being able to copy an old,
+/// unfixed `Box::new(std::io::Error::other(e.to_string()))` from elsewhere and reintroduce #1240.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::net_policy::parse_error_source;
+///
+/// let source = parse_error_source(&"duplicate key: `serde`");
+/// assert_eq!(source.to_string(), "duplicate key: `serde`");
+/// ```
+#[must_use]
+pub fn parse_error_source(e: &dyn std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
+    Box::new(std::io::Error::other(
+        redact_parse_error_for_log(&e.to_string()).into_owned(),
+    ))
+}
+
 /// The segment-bounded `@`/`:` scan shared by [`redact_declaration_key`] (decides whether a
 /// non-URL label needs redacting at all) and [`is_credential_or_query_bearing`] (decides whether an
 /// outbound value must be rejected outright) — extracted so the two callers can't drift apart
@@ -3143,6 +3245,85 @@ mod tests {
         assert!(!is_authority_bearing_url("top-level"));
         assert!(!is_authority_bearing_url("component-host:10.0.0.1"));
         assert!(!is_authority_bearing_url("named:internal"));
+    }
+
+    #[test]
+    fn redact_parse_error_for_log_redacts_credential_and_keeps_host() {
+        let redacted = redact_parse_error_for_log(
+            "duplicate key: `https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x`",
+        );
+        assert!(!redacted.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!redacted.contains("svcacct"));
+        assert!(redacted.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn redact_parse_error_for_log_leaves_benign_message_unchanged() {
+        assert_eq!(
+            redact_parse_error_for_log("duplicate key: `serde`"),
+            "duplicate key: `serde`"
+        );
+    }
+
+    /// #1240 (impl-critic S3 follow-up on the developer's first attempt): the original fixture
+    /// placed the whole credential past [`MAX_PARSE_ERROR_LOG_BYTES`], so a truncate-first bug
+    /// would have dropped it too — the ordering invariant went untested. This fixture instead
+    /// straddles the cut: the secret token sits before the boundary, and the disambiguating `@`
+    /// that `has_credential_shape` needs lands after it. A truncate-first implementation would
+    /// see only the `@`-less prefix, never detect a credential, and emit the secret almost
+    /// verbatim; redact-then-truncate (the correct order) sees the whole string, including the
+    /// `@`, and redacts it before the cut ever happens.
+    ///
+    /// #1240 round 2 (impl-critic R2-M1): asserting on the *full* `"ghp_SUPERSECRETTOKEN123"` is
+    /// not load-bearing on its own — the boundary cuts mid-token (at byte 200, one byte before
+    /// the token's own end at byte 201), so even a truncate-first bug drops the trailing digits
+    /// and that assertion passes under either ordering. `"SUPERSECRETTOKEN"` (no trailing
+    /// digits) ends before the boundary, so it fully survives a buggy truncate-first prefix —
+    /// only the correct redact-first order removes it, making this assertion actually gate the
+    /// invariant, same as the `"svcacct"` one already did.
+    #[test]
+    fn redact_parse_error_for_log_redacts_before_truncating() {
+        let raw = format!(
+            "{}svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x",
+            "x".repeat(170)
+        );
+        // Named `needle_end`/`at_sign_offset`, not `secret_*` — these are byte offsets into the
+        // fixture, not the credential text itself, but CodeQL's cleartext-logging heuristic
+        // flags on variable-name pattern, not on what the value actually holds.
+        let needle_end = raw.find("SUPERSECRETTOKEN").unwrap() + "SUPERSECRETTOKEN".len();
+        let at_sign_offset = raw.find('@').unwrap();
+        assert!(
+            needle_end < MAX_PARSE_ERROR_LOG_BYTES && at_sign_offset > MAX_PARSE_ERROR_LOG_BYTES,
+            "fixture must straddle the truncation boundary: needle ends at {needle_end}, '@' at {at_sign_offset}, boundary {MAX_PARSE_ERROR_LOG_BYTES}"
+        );
+
+        let redacted = redact_parse_error_for_log(&raw);
+        assert!(!redacted.contains("SUPERSECRETTOKEN"));
+        assert!(!redacted.contains("svcacct"));
+    }
+
+    /// #1240 round 2 (impl-critic R2-M2): the truncation branch itself — including the
+    /// original-vs-redacted length annotation rule (round 1 S2) — was only exercised via
+    /// `deps_pypi::parser::truncate_for_log`'s inherited test, not directly in `deps-core`.
+    /// Mirrors that test's fixture here so the rule stays covered even if the pypi wrapper is
+    /// ever removed.
+    #[test]
+    fn redact_parse_error_for_log_truncation_annotation_reports_original_length() {
+        let credential = "user:hunter2very-long-password-padding-to-cross-the-cap@";
+        let host_and_path = "example.com/".repeat(20);
+        let raw = format!("https://{credential}{host_and_path}");
+        assert!(
+            raw.len() > MAX_PARSE_ERROR_LOG_BYTES,
+            "fixture must exceed the cap"
+        );
+
+        let redacted = redact_parse_error_for_log(&raw);
+        assert!(!redacted.contains("hunter2"));
+        assert!(
+            redacted.contains(&format!("({} bytes total)", raw.len())),
+            "byte count must reflect the original input length, not the (shorter, \
+             post-redaction) visible text: {redacted:?}"
+        );
     }
 
     /// #993 M5 (impl-critic on the first credential-shape fix): the carve-out used to inspect

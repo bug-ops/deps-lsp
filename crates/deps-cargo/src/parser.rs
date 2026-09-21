@@ -206,7 +206,7 @@ pub fn parse_cargo_toml_with_context(
 
     let doc = toml_span::parse(content).map_err(|e| DepsError::ParseError {
         file_type: "Cargo.toml".into(),
-        source: Box::new(std::io::Error::other(e.to_string())),
+        source: deps_core::net_policy::parse_error_source(&e),
     })?;
 
     let line_table = LineOffsetTable::new(content);
@@ -735,7 +735,7 @@ fn discover_workspace(doc_uri: &Url) -> Result<WorkspaceDiscovery> {
                                     Err(e) => {
                                         tracing::warn!(
                                             path = %workspace_toml.display(),
-                                            error = %e,
+                                            error = %deps_core::net_policy::redact_parse_error_for_log(&e.to_string()),
                                             "skipping ancestor Cargo.toml during workspace root discovery: TOML parse failed"
                                         );
                                     }
@@ -810,6 +810,44 @@ mod tests {
         let file_uri = Url::from_file_path(manifest_path).unwrap();
         let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
         format!("{prefix}{path_part}").parse().unwrap()
+    }
+
+    /// #1240: a duplicate table whose name is credential-shaped must not leak the credential
+    /// into the parse error's `Display` text, which reaches `tracing::debug!`/`error!`.
+    #[test]
+    fn test_parse_cargo_toml_duplicate_table_error_redacts_credential() {
+        let content = r#"
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+a = 1
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x"]
+b = 2
+"#;
+
+        let message = parse_cargo_toml(content, &test_url())
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_parse_cargo_toml_duplicate_table_error_benign_name_unchanged() {
+        let content = r"
+[serde]
+a = 1
+[serde]
+b = 2
+";
+
+        // Derived from the raw parse, not hardcoded, so assert_eq! gates a redaction regression (#1240 M5).
+        let raw_err = toml_span::parse(content).unwrap_err();
+        let expected = format!("failed to parse Cargo.toml: {raw_err}");
+
+        let message = parse_cargo_toml(content, &test_url())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(message, expected);
     }
 
     #[test]
@@ -2030,5 +2068,37 @@ tokio = "1.0"
             output.contains(&unreadable_manifest.display().to_string()),
             "expected the warn log to include the unreadable ancestor's path, got: {output:?}"
         );
+    }
+
+    /// #1240: a duplicate table whose name is credential-shaped, in an *ancestor* Cargo.toml
+    /// consulted during workspace-root discovery, must not leak the credential into the
+    /// `tracing::warn!` this function logs — a separate site from `parse_cargo_toml`'s own.
+    #[test]
+    fn test_discover_workspace_redacts_credential_in_ancestor_cargo_toml_parse_error() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+
+        let root = tempfile::tempdir().unwrap();
+        let project_dir = root.path().join("proj");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let opened_content = "[dependencies]\nserde = \"1.0\"\n";
+        let opened_path = project_dir.join("Cargo.toml");
+        std::fs::write(&opened_path, opened_content).unwrap();
+        let doc_uri = Url::from_file_path(&opened_path).unwrap();
+
+        let malformed_manifest = root.path().join("Cargo.toml");
+        std::fs::write(
+            &malformed_manifest,
+            "[\"https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x\"]\na = 1\n[\"https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x\"]\nb = 2\n",
+        )
+        .unwrap();
+
+        let output = deps_core::test_util::capture_tracing_output(|| {
+            discover_workspace(&doc_uri).unwrap();
+        });
+
+        assert!(!output.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!output.contains("svcacct"));
+        assert!(output.contains("pkg.internal.corp"));
     }
 }

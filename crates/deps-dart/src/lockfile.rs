@@ -71,7 +71,7 @@ pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| DepsError::ParseError {
         file_type: "pubspec.lock".into(),
-        source: Box::new(std::io::Error::other(e.to_string())),
+        source: deps_core::net_policy::parse_error_source(&e),
     })?;
 
     let doc = match docs.first() {
@@ -142,6 +142,42 @@ pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1240: a duplicate mapping key whose name is credential-shaped must not leak the
+    /// credential into the parse error's `Display` text, which reaches `tracing::warn!`.
+    #[test]
+    fn test_parse_pubspec_lock_duplicate_key_error_redacts_credential() {
+        let lock = r#"
+packages:
+  "https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x":
+    version: "1.0.0"
+  "https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x":
+    version: "2.0.0"
+"#;
+
+        let message = parse_pubspec_lock(lock).unwrap_err().to_string();
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+    }
+
+    #[test]
+    fn test_parse_pubspec_lock_duplicate_key_error_benign_name_unchanged() {
+        let lock = r#"
+packages:
+  serde:
+    version: "1.0.0"
+  serde:
+    version: "2.0.0"
+"#;
+
+        // Derived from the raw parse (ScanError's position text is fragile to hardcode), so assert_eq! gates a redaction regression (#1240 M5).
+        let raw_err = YamlLoader::load_from_str(lock).unwrap_err();
+        let expected = format!("failed to parse pubspec.lock: {raw_err}");
+
+        let message = parse_pubspec_lock(lock).unwrap_err().to_string();
+        assert_eq!(message, expected);
+    }
 
     #[test]
     fn test_parse_simple_lock() {
