@@ -318,8 +318,9 @@ impl PypiParser {
                 }
                 Err(e) => {
                     tracing::debug!(
-                        "Failed to parse requirements line '{}': {e}",
-                        super::truncate_for_log(req_text)
+                        "Failed to parse requirements line '{}': {}",
+                        super::truncate_for_log(req_text),
+                        e.reason_for_log()
                     );
                     failed_lines += 1;
                 }
@@ -1532,5 +1533,48 @@ mod tests {
         // relies on the `catch_unwind` backstop, which is confirmed here to still work.
         let result = parse("0m[1A.]\n");
         assert!(result.dependencies.is_empty());
+    }
+
+    /// Regression for #1228 M3: a `requirements.txt` line whose leading name token *is* valid
+    /// (so it isn't intercepted by the pip option-line dash-check, unlike the
+    /// `-mypkg @ https://...` shape covered in `pyproject.rs`'s tests) but that still fails
+    /// `Requirement::from_str` later (an unterminated `[extras` clause here) must not leak the
+    /// credential embedded in the raw `pep508_rs` error's `Display` via the generic
+    /// `Err(e) => tracing::debug!(...)` branch.
+    #[test]
+    fn test_parse_failure_redacts_credential_embedded_in_pep508_error_display() {
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let result = parse(
+                "mypkg[ @ https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/simple/mypkg-1.0.tar.gz\n",
+            );
+            assert!(result.dependencies.is_empty());
+        });
+        assert!(
+            !log.contains("ghp_SUPERSECRETTOKEN123") && !log.contains("svcacct"),
+            "credential embedded in the pep508_rs error's Display must not survive: {log:?}"
+        );
+        assert!(
+            log.contains("invalid PEP 508 syntax"),
+            "the DEBUG line should still say why parsing failed: {log:?}"
+        );
+    }
+
+    /// Regression for #1228, critic round 2: a credential-free malformed `requirements.txt`
+    /// line must still get a real reason in the log, not have it masked to `***` by a
+    /// URL-credential redactor mistakenly applied to prose that never had a credential in it.
+    #[test]
+    fn test_credential_free_parse_failure_still_reports_a_useful_reason() {
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let result = parse("otherpkg >=< 2.0\n");
+            assert!(result.dependencies.is_empty());
+        });
+        assert!(
+            log.contains("invalid PEP 508 syntax"),
+            "a credential-free malformed requirement must still get a real reason: {log:?}"
+        );
+        assert!(
+            !log.contains("***"),
+            "there is nothing here to redact: {log:?}"
+        );
     }
 }

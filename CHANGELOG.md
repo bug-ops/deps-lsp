@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-npm, deps-pypi, deps-go, deps-composer, deps-swift, deps-nuget, deps-cargo, deps-dart, deps-bundler, deps-deno**: `Ecosystem::complete_version` now has a shared default implementation (backed by a new `version_operator_chars` hook), replacing ten byte-identical hand-written implementations (resolves #1223) (#1235)
 
 ### Fixed
+- **deps-pypi**: `truncate_for_log` now redacts credentials before truncating and gates value-redaction to avoid mangling benign colon-shaped text, closing a leak of PEP 508 direct-reference URL and lock-file credentials to logs (resolves #1228)
 - **deps-core, deps-deno, deps-npm, deps-lsp**: an `.npmrc` change now reparses every ecosystem that watches it (not just one) and forces a full refetch instead of a silent no-op diff, so an open `deno.json`/`package.json` document picks up the new registry routing (resolves #1232) (#1234)
 - **deps-deno**: `npm:`-scope imports classified `AlternateRegistry` via `.npmrc` are now actually fetched through the resolved registry instead of being silently dropped from the fetch queue, matching `package.json`'s behavior for the identical entry (resolves #1227) (#1231)
 - **deps-npm**: a malformed `.npmrc` line (missing `=`) no longer logs its raw content, closing a credential leak when the line is a typo'd auth-shaped entry; the warning now names only the file path and line number (resolves #1229) (#1233)

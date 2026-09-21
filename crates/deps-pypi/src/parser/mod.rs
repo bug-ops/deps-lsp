@@ -323,23 +323,56 @@ fn marker_too_deep(marker: &str) -> bool {
 }
 
 /// Longest prefix of an attacker-controlled requirement/dependency string
-/// logged verbatim by [`truncate_for_log`].
+/// logged, post-redaction, by [`truncate_for_log`].
 const MAX_LOGGED_LEN: usize = 200;
 
-/// Truncates `s` to a safe-to-log prefix, so a warn!/debug! call site can
-/// never turn into a multi-megabyte synchronous write to the (by default,
-/// unbuffered, stderr-backed) log sink — exactly the size range
-/// [`MAX_REQUIREMENT_LEN`] exists to reject, up to the ~10 MB overall file
-/// cap. Falls back to `s` unchanged when it's already short enough.
-// `boundary` is floor_char_boundary-clamped just above before slicing `s`.
+/// Redacts, then truncates, `s` to a safe-to-log prefix, so a warn!/debug!
+/// call site can never (a) leak a credential embedded in an unparseable PEP
+/// 508 direct-reference URL (`pkg @ https://user:token@host/...`, or a
+/// query-string token), or (b) turn into a multi-megabyte synchronous write
+/// to the (by default, unbuffered, stderr-backed) log sink — exactly the
+/// size range [`MAX_REQUIREMENT_LEN`] exists to reject, up to the ~10 MB
+/// overall file cap. Falls back to `s` unchanged when redaction was a no-op
+/// and it's already short enough.
+///
+/// Redaction goes through [`deps_core::net_policy::redact_declaration_key`], not the more
+/// aggressive [`deps_core::net_policy::url_for_tracing`] directly: `s` here is a
+/// dependency/requirement string, TOML key, or marker fragment — not a URL — and
+/// `url_for_tracing`'s fallback scans (designed for a value already known to be URL-shaped)
+/// mistake an ordinary `word:word` shape (`"docs:build"`, a group name; `` "duplicate key:
+/// `name`" ``, a TOML parse error) for a credential and erase it (#1228, critic round 4).
+/// `redact_declaration_key` gates that same aggressive scan behind an actual credential/URL
+/// shape check first, so a benign colon-bearing value survives untouched while a genuine
+/// credential (`user:pass@host`, or a query-string token) still redacts.
+///
+/// Redaction must run before truncation: cutting the string first could
+/// slice off the boundary the credential-shape scan relies on, leaving a
+/// credential in the (now truncated) prefix unredacted.
+// `boundary` is floor_char_boundary-clamped just above before slicing `text`.
 #[allow(clippy::string_slice)]
-fn truncate_for_log(s: &str) -> std::borrow::Cow<'_, str> {
-    if s.len() <= MAX_LOGGED_LEN {
-        return std::borrow::Cow::Borrowed(s);
+pub(crate) fn truncate_for_log(s: &str) -> std::borrow::Cow<'_, str> {
+    let redacted = deps_core::net_policy::redact_declaration_key(s);
+    let text: std::borrow::Cow<'_, str> = if redacted == s {
+        std::borrow::Cow::Borrowed(s)
+    } else {
+        std::borrow::Cow::Owned(redacted)
+    };
+    if text.len() <= MAX_LOGGED_LEN {
+        return text;
     }
-    let boundary = s.floor_char_boundary(MAX_LOGGED_LEN);
-    std::borrow::Cow::Owned(format!("{}... ({} bytes total)", &s[..boundary], s.len()))
+    let boundary = text.floor_char_boundary(MAX_LOGGED_LEN);
+    // `s.len()`, not `text.len()`: the annotation describes the original attacker-controlled
+    // payload's size, which redaction must not misreport just because it happened to shorten
+    // the visible text.
+    std::borrow::Cow::Owned(format!(
+        "{}... ({} bytes total)",
+        &text[..boundary],
+        s.len()
+    ))
 }
+
+// An error's own Display/message is classified via `crate::error::pep508_error_kind_str`
+// instead of redacted as text — see that function's doc for why (#1228).
 
 /// Extracts the leading PEP 508 name token from `s` (the part before any `[extras]`,
 /// version specifier, or whitespace) — `s` is not assumed to be trimmed. Always returns
@@ -782,7 +815,11 @@ fn normalize_marker_string(raw: &str) -> Option<String> {
     match MarkerTree::from_str(trimmed) {
         Ok(tree) => tree.try_to_string(),
         Err(e) => {
-            tracing::warn!("Failed to parse marker expression '{}': {}", trimmed, e);
+            tracing::warn!(
+                "Failed to parse marker expression '{}': {}",
+                truncate_for_log(trimmed),
+                crate::error::pep508_error_kind_str(&e)
+            );
             bounded_marker_fallback(trimmed)
         }
     }
@@ -842,6 +879,78 @@ mod pep508_name_tests {
 }
 
 #[cfg(test)]
+mod truncate_for_log_tests {
+    use super::{MAX_LOGGED_LEN, truncate_for_log};
+
+    #[test]
+    fn short_credential_free_input_is_borrowed_unchanged() {
+        assert!(matches!(
+            truncate_for_log("requests==2.31.0"),
+            std::borrow::Cow::Borrowed("requests==2.31.0")
+        ));
+    }
+
+    #[test]
+    fn userinfo_credential_is_redacted() {
+        let out = truncate_for_log("https://user:hunter2@example.com/pkg");
+        assert!(!out.contains("hunter2"));
+        assert!(out.contains("example.com"));
+    }
+
+    /// Regression for #1228 critic round 4 (REQUIRED FIX 1): `truncate_for_log` used to call
+    /// `deps_core::net_policy::url_for_tracing` unconditionally, and that redactor's
+    /// colon-credential heuristic treats *any* `word:word` shape as a credential — mangling an
+    /// ordinary PEP 735 dependency-group name (`"docs:build"`), a marker fragment
+    /// (`extra == "docs:build"`), or a `toml_span` duplicate-key message
+    /// (`` "duplicate key: `name`" ``) into `***`, even though none of these carry a
+    /// credential. Now gated behind `redact_declaration_key`'s actual credential/URL shape
+    /// check, so a benign colon-bearing value survives untouched.
+    #[test]
+    fn benign_colon_shaped_values_survive_unredacted() {
+        for benign in [
+            "docs:build",
+            "test:unit",
+            "isabella@example.com",
+            "duplicate key: `name`",
+        ] {
+            assert!(
+                matches!(truncate_for_log(benign), std::borrow::Cow::Borrowed(b) if b == benign),
+                "{benign:?} has no credential shape and must survive unredacted"
+            );
+        }
+    }
+
+    /// Companion to `benign_colon_shaped_values_survive_unredacted`: the gate must not become a
+    /// bypass — a genuine credential embedded in the same `word:word@host`-adjacent shapes must
+    /// still redact.
+    #[test]
+    fn credential_shaped_values_still_redact_through_the_gate() {
+        let out = truncate_for_log("group:https://svcacct:hunter2@internal.example/x");
+        assert!(!out.contains("hunter2") && !out.contains("svcacct"));
+        assert!(out.contains("internal.example"));
+    }
+
+    /// Regression for #1228 M1: the "(N bytes total)" annotation must describe the *original*
+    /// attacker-controlled payload's size, not the (possibly much shorter, post-redaction)
+    /// visible text — reporting the redacted length would misrepresent how large the actual
+    /// input was.
+    #[test]
+    fn oversized_len_annotation_reports_original_not_redacted_length() {
+        let credential = "user:hunter2very-long-password-padding-to-cross-the-cap@";
+        let host_and_path = "example.com/".repeat(20);
+        let input = format!("https://{credential}{host_and_path}");
+        assert!(input.len() > MAX_LOGGED_LEN, "fixture must exceed the cap");
+
+        let out = truncate_for_log(&input);
+        assert!(!out.contains("hunter2"));
+        assert!(
+            out.contains(&format!("({} bytes total)", input.len())),
+            "byte count must reflect the original input length: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod pep508_parse_error_tests {
     use super::*;
 
@@ -861,13 +970,39 @@ mod pep508_parse_error_tests {
             panic!("expected InvalidDependencySpec, got {err:?}");
         };
 
-        assert!(
-            !source.to_string().is_empty(),
-            "Display must forward the underlying pep508_rs error message"
-        );
+        // Display is now hardened at the type level (#1228 critic round 4) — it forwards to
+        // `Pep508ParseError::kind_str`'s fixed category, not the wrapped `pep508_rs` error's own
+        // message, so this only asserts it's non-empty, not that it echoes the parser's text.
+        assert!(!source.to_string().is_empty());
         // The underlying `pep508_rs::Pep508Error` is a leaf parse error with no further
         // `source()` chain of its own — asserting `None` here would break if `pep508_rs`
         // ever changes that, which is exactly the regression this test exists to catch.
         assert!(std::error::Error::source(&source).is_none());
+    }
+
+    /// Regression for #1228 critic round 4 (REQUIRED FIX 2): a future call site that displays
+    /// a `Pep508ParseError` directly (`{}`, `.to_string()`, or `{:?}`) — bypassing
+    /// `PypiError::reason_for_log`/`Pep508ParseError::kind_str` entirely — must still never leak
+    /// the wrapped `pep508_rs` error's raw input, since neither is guaranteed to be called.
+    #[test]
+    fn pep508_parse_error_display_and_debug_never_echo_credential_in_input() {
+        let content = "mypkg[ @ https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/x";
+        let line_table = LineOffsetTable::new(content);
+        let err = PypiParser
+            .parse_pep508_requirement(content, None, content, &line_table)
+            .expect_err("unterminated extras clause must fail to parse");
+
+        let PypiError::InvalidDependencySpec { source } = err else {
+            panic!("expected InvalidDependencySpec, got {err:?}");
+        };
+
+        let displayed = source.to_string();
+        let debugged = format!("{source:?}");
+        for rendered in [&displayed, &debugged] {
+            assert!(
+                !rendered.contains("ghp_SUPERSECRETTOKEN123") && !rendered.contains("svcacct"),
+                "Pep508ParseError must never echo the credential directly: {rendered:?}"
+            );
+        }
     }
 }
