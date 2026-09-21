@@ -956,7 +956,7 @@ impl RegistriesConfig {
 /// of each re-deriving `gitlab_instance_host`'s empty-string-to-`None` normalization
 /// independently — three copies of that normalization is exactly the kind of drift-prone
 /// duplication issue #1058 (T009) found and closed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct RegistryRuntimeSettings {
     /// Resolved workspace-registry access policy — see [`WorkspaceRegistriesSetting::to_policy`].
     pub workspace_registries: crate::net_policy::WorkspaceRegistryAccess,
@@ -965,6 +965,28 @@ pub struct RegistryRuntimeSettings {
     /// See [`RegistriesConfig::gitlab_instance_host`] — normalized from an empty string to
     /// `None`.
     pub gitlab_instance_host: Option<String>,
+}
+
+impl std::fmt::Debug for RegistryRuntimeSettings {
+    /// Manual, not derived: `gitlab_instance_host` is a raw host string one hop away from
+    /// [`RegistriesConfig`]'s own redacting `Debug` impl (#936), the same "sibling missed by a
+    /// prior sweep" pattern as the rest of this leak class (CWE-532, #1222).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegistryRuntimeSettings")
+            .field("workspace_registries", &self.workspace_registries)
+            .field(
+                "nuget_user_profile_sources",
+                &self.nuget_user_profile_sources,
+            )
+            .field(
+                "gitlab_instance_host",
+                &self
+                    .gitlab_instance_host
+                    .as_deref()
+                    .map(crate::net_policy::RedactedUrl::new),
+            )
+            .finish()
+    }
 }
 
 impl RegistriesConfig {
@@ -1509,4 +1531,14 @@ mod tests {
         let config: LicensePolicyConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.allow, vec!["MIT".to_string()]);
     }
+
+    crate::debug_redaction_conformance!(
+        test_registry_runtime_settings_debug_redacts_credentials,
+        1,
+        RegistryRuntimeSettings {
+            workspace_registries: crate::net_policy::WorkspaceRegistryAccess::PublicOnly,
+            nuget_user_profile_sources: false,
+            gitlab_instance_host: Some(crate::conformance::CREDENTIAL_PROBE_URL.to_string()),
+        },
+    );
 }
