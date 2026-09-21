@@ -16,6 +16,12 @@ after it in your own workflow.
 > `deps-cli` version is now baked into the image at build time — pin a specific version via
 > the image tag instead (see below).
 
+> [!TIP]
+> Pin `uses:` to a released tag (e.g. `@v1.2.0`) rather than `@main` — `main` is a mutable ref,
+> so a workflow pinned to it re-runs whatever is currently on that branch, including unreviewed
+> or in-progress changes. Check the [releases page](https://github.com/bug-ops/deps-lsp/releases)
+> for the latest tag.
+
 ## Usage
 
 ```yaml
