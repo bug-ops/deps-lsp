@@ -8,7 +8,7 @@ use deps_core::position::Range;
 /// Package names use `owner/repo` format derived from the Git URL.
 /// Position tracking enables hover, completion, and inlay hints.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SwiftDependency {
     /// Package identity: owner/repo (e.g. "apple/swift-nio")
     pub name: deps_core::PackageName,
@@ -28,6 +28,23 @@ pub struct SwiftDependency {
     pub url: String,
     /// Dependency source (registry, git, or path)
     pub source: DependencySource,
+}
+
+impl std::fmt::Debug for SwiftDependency {
+    /// Manual, not derived: `url` is the raw Package.swift Git URL, which can carry a
+    /// credential (CWE-532, #1222) — redacted the same way its `source: DependencySource::Git`
+    /// sibling already renders the identical string (#935).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SwiftDependency")
+            .field("name", &self.name)
+            .field("name_range", &self.name_range)
+            .field("version_req", &self.version_req)
+            .field("version_range", &self.version_range)
+            .field("version_literal", &self.version_literal)
+            .field("url", &deps_core::net_policy::RedactedUrl::new(&self.url))
+            .field("source", &self.source)
+            .finish()
+    }
 }
 
 deps_core::impl_dependency!(SwiftDependency {
@@ -172,6 +189,37 @@ mod tests {
             Some(">=2.0.0, <3.0.0")
         );
         assert_matches!(dep.source(), DependencySource::Registry);
+    }
+
+    deps_core::debug_redaction_conformance!(
+        test_swift_dependency_debug_redacts_credentials,
+        1,
+        SwiftDependency {
+            name: "apple/swift-nio".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 15)),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            url: deps_core::conformance::CREDENTIAL_PROBE_URL.into(),
+            source: DependencySource::Registry,
+        },
+    );
+
+    #[test]
+    fn test_swift_dependency_debug_redacts_ssh_form_url() {
+        // Accepted over-redaction (security audit #1222): `RedactedUrl` has no
+        // credential-shape gate, so a legitimate SCP-style SSH remote also gets `***@`-mangled.
+        let dep = SwiftDependency {
+            name: "apple/swift-nio".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 15)),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            url: "git@github.com:apple/swift-nio.git".into(),
+            source: DependencySource::Registry,
+        };
+        let rendered = format!("{dep:?}");
+        assert!(rendered.contains(r#"url: "***@github.com:***/swift-nio.git""#));
     }
 
     #[test]
