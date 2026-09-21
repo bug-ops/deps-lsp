@@ -41,6 +41,28 @@ enabled (e.g. an unused parameter that's only used when other ecosystems are
 also compiled in) is invisible to the `--all-features` command above. Run the
 same command locally before adding or changing a feature flag.
 
+### API & Style Guidelines
+
+Public APIs in this project must follow:
+
+- [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/) — naming
+  conventions, trait implementations, interoperability, documentation, and
+  predictability for public types and functions.
+- [Microsoft's Rust Guidelines](https://microsoft.github.io/rust-guidelines/) —
+  additional conventions for error handling, `unsafe` code, async APIs, and
+  dependability that build on the guidelines above.
+
+Conventions enforced specifically in this project:
+
+- every `pub` type, trait, function, and method has a `///` doc comment;
+  non-trivial public APIs include a runnable `# Examples` doctest
+- errors are typed enums via `thiserror`, with a `# Errors` section on every
+  fallible public function
+- `unsafe_code = "forbid"` at the workspace level — no `unsafe` blocks
+- async trait methods use native Edition 2024 syntax — do not add the
+  `async-trait` crate unless it is already a workspace dependency
+- logging goes through `tracing`, never `log`
+
 ## Testing
 
 ```bash
