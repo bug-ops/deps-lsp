@@ -130,9 +130,13 @@ fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
         });
     }
 
+    // toml_span::Error::Display echoes raw key/table names (see PypiError::reason_for_log's
+    // doc) — redacted here (#1228 S3).
     let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
         file_type: "Python lock file".into(),
-        source: Box::new(std::io::Error::other(e.to_string())),
+        source: Box::new(std::io::Error::other(
+            crate::parser::truncate_for_log(&e.to_string()).into_owned(),
+        )),
     })?;
 
     let mut packages = ResolvedPackages::new();
@@ -158,7 +162,11 @@ fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
         };
 
         let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
-            tracing::warn!("Package '{}' missing version field", name);
+            // `name` is attacker-controlled (#1228) — redacted.
+            tracing::warn!(
+                "Package '{}' missing version field",
+                crate::parser::truncate_for_log(name)
+            );
             continue;
         };
 
@@ -691,5 +699,66 @@ name = "missing-version"
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved.version("valid-package"), Some("1.0.0"));
         assert!(resolved.get("missing-version").is_none());
+    }
+
+    /// Regression for #1228 S2: a `[[package]]` table's `name` is read straight from an
+    /// attacker-authored lock file (same threat model as `pyproject.toml`) — the
+    /// missing-version-field WARN used to log it raw, unbounded and unredacted.
+    ///
+    /// Exercises `parse_pypi_lock` directly rather than the full `PypiLockParser::parse_lockfile`
+    /// — the latter runs its parse closure on the `spawn_blocking` pool (see
+    /// `deps_core::lockfile::read_and_parse_lockfile`), a different OS thread than this test's,
+    /// which the `tracing` capture helper (thread-local, see `deps_core::test_util`) can't see
+    /// into. `parse_pypi_lock` itself is the plain, synchronous function that actually emits the
+    /// WARN under test, so calling it directly on this thread is both simpler and correct.
+    #[test]
+    fn test_missing_version_warn_redacts_credential_in_package_name() {
+        let lockfile_content = r#"
+[[package]]
+name = "https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/x"
+"#;
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let packages = parse_pypi_lock(lockfile_content.to_string()).unwrap();
+            assert_eq!(packages.len(), 0);
+        });
+
+        assert!(
+            !log.contains("ghp_SUPERSECRETTOKEN123") && !log.contains("svcacct"),
+            "credential in the lock file's package name must not survive into the log: {log:?}"
+        );
+        assert!(
+            log.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {log:?}"
+        );
+    }
+
+    /// Regression for #1228 S3: `toml_span::Error::Display` (unlike its own `ErrorKind::Display`,
+    /// a fixed kebab-case label with no payload) echoes a duplicate table's name verbatim — a
+    /// redefined table header in an attacker-authored `poetry.lock`/`uv.lock`, shaped like a
+    /// credential-bearing URL, must not survive into the `DepsError::ParseError`'s `source`.
+    #[test]
+    fn test_duplicate_table_error_redacts_credential_in_lockfile() {
+        let lockfile_content = r#"
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/x"]
+a = 1
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/x"]
+b = 2
+"#;
+
+        let err = parse_pypi_lock(lockfile_content.to_string()).unwrap_err();
+        let DepsError::ParseError { source, .. } = err else {
+            panic!("expected ParseError, got: {err:?}");
+        };
+        let message = source.to_string();
+
+        assert!(
+            !message.contains("ghp_SUPERSECRETTOKEN123") && !message.contains("svcacct"),
+            "credential in the duplicate table name must not survive: {message:?}"
+        );
+        assert!(
+            message.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {message:?}"
+        );
     }
 }

@@ -102,9 +102,11 @@ impl PypiParser {
             });
         }
 
+        // toml_span::Error::Display echoes raw key/table names (see PypiError::reason_for_log's
+        // doc) — redacted here (#1228 M5).
         let doc =
             toml_span::parse(content).map_err(|e| crate::error::PypiError::TomlParseError {
-                message: e.to_string(),
+                message: super::truncate_for_log(&e.to_string()).into_owned(),
             })?;
 
         let line_table = LineOffsetTable::new(content);
@@ -261,7 +263,7 @@ impl PypiParser {
                         tracing::warn!(
                             "Failed to parse build-system require '{}': {}",
                             super::truncate_for_log(dep_str),
-                            e
+                            e.reason_for_log()
                         );
                     }
                 }
@@ -313,7 +315,7 @@ impl PypiParser {
                         tracing::warn!(
                             "Failed to parse dependency '{}': {}",
                             super::truncate_for_log(dep_str),
-                            e
+                            e.reason_for_log()
                         );
                     }
                 }
@@ -369,7 +371,7 @@ impl PypiParser {
                                 tracing::warn!(
                                     "Failed to parse dependency '{}': {}",
                                     super::truncate_for_log(dep_str),
-                                    e
+                                    e.reason_for_log()
                                 );
                             }
                         }
@@ -426,9 +428,9 @@ impl PypiParser {
                             Err(e) => {
                                 tracing::warn!(
                                     "Failed to parse dependency group '{}' item '{}': {}",
-                                    group_key.name,
+                                    super::truncate_for_log(&group_key.name),
                                     super::truncate_for_log(dep_str),
-                                    e
+                                    e.reason_for_log()
                                 );
                             }
                         }
@@ -487,7 +489,11 @@ impl PypiParser {
                     dependencies.push(dep);
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to parse Poetry dependency '{}': {}", name, e);
+                    tracing::warn!(
+                        "Failed to parse Poetry dependency '{}': {}",
+                        super::truncate_for_log(name),
+                        e.reason_for_log()
+                    );
                 }
             }
         }
@@ -545,7 +551,11 @@ impl PypiParser {
                             dependencies.push(dep);
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to parse Poetry dependency '{}': {}", name, e);
+                            tracing::warn!(
+                                "Failed to parse Poetry dependency '{}': {}",
+                                super::truncate_for_log(name),
+                                e.reason_for_log()
+                            );
                         }
                     }
                 }
@@ -723,8 +733,10 @@ impl PypiParser {
             });
         }
 
+        // `name` redacted here — `UnsupportedFormat`'s message is shown verbatim (#1228).
         Err(crate::error::PypiError::unsupported_format(format!(
-            "Unsupported Poetry dependency format for '{name}'"
+            "Unsupported Poetry dependency format for '{}'",
+            super::truncate_for_log(name)
         )))
     }
 }
@@ -874,6 +886,33 @@ mod tests {
         let parser = PypiParser::new();
         let result = parser.parse_content(&content, &test_uri());
         assert_matches!(result, Err(PypiError::TomlParseError { .. }));
+    }
+
+    /// Regression for #1228 M5: `toml_span::Error::Display` (unlike its own `ErrorKind::Display`,
+    /// a fixed kebab-case label with no payload) echoes a duplicate table's name verbatim —
+    /// a redefined table header shaped like a credential-bearing URL must not survive into
+    /// `TomlParseError`'s `message`.
+    #[test]
+    fn test_parse_content_redacts_credential_in_duplicate_table_error() {
+        let content = r#"
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/x"]
+a = 1
+["https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/x"]
+b = 2
+"#;
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content, &test_uri());
+        let Err(PypiError::TomlParseError { message }) = result else {
+            panic!("expected TomlParseError, got: {result:?}");
+        };
+        assert!(
+            !message.contains("ghp_SUPERSECRETTOKEN123") && !message.contains("svcacct"),
+            "credential in the duplicate table name must not survive: {message:?}"
+        );
+        assert!(
+            message.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {message:?}"
+        );
     }
 
     #[test]
@@ -2886,5 +2925,176 @@ flask = "^3.0"
         for dep in &result.dependencies {
             assert_eq!(dep.source, PypiDependencySource::Registry);
         }
+    }
+
+    /// Regression for #1228: a PEP 508 direct-reference URL's userinfo credential must
+    /// never survive into the WARN emitted for a dependency whose leading name token
+    /// fails `looks_like_valid_pep508_name` (a leading `-` here) — `truncate_for_log`
+    /// used to bound only the logged string's *length*, never its content, so the raw
+    /// requirement (credential included) was logged verbatim.
+    #[test]
+    fn test_leading_name_rejection_redacts_direct_reference_url_credential() {
+        let content = r#"
+[project]
+dependencies = ["-mypkg @ https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/simple/mypkg-1.0.tar.gz"]
+"#;
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = PypiParser::new()
+                .parse_content(content, &test_uri())
+                .unwrap();
+            assert!(result.dependencies.is_empty());
+        });
+        assert!(
+            !log.contains("ghp_SUPERSECRETTOKEN123") && !log.contains("svcacct"),
+            "credential must not survive into the log: {log:?}"
+        );
+        assert!(
+            log.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {log:?}"
+        );
+    }
+
+    /// Regression for #1228: a credential carried in the URL's *query string* (not
+    /// userinfo) must also be stripped — `redact_userinfo` alone preserves the query
+    /// string verbatim, so `truncate_for_log` must route through
+    /// `deps_core::net_policy::url_for_tracing` (which additionally truncates at the
+    /// first `?`/`#`), not `redact_userinfo` directly.
+    #[test]
+    fn test_leading_name_rejection_redacts_direct_reference_url_query_token() {
+        let content = r#"
+[project]
+dependencies = ["-mypkg @ https://pypi.internal.corp/simple/mypkg-1.0.tar.gz?token=ghp_SUPERSECRETTOKEN123"]
+"#;
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = PypiParser::new()
+                .parse_content(content, &test_uri())
+                .unwrap();
+            assert!(result.dependencies.is_empty());
+        });
+        assert!(
+            !log.contains("ghp_SUPERSECRETTOKEN123"),
+            "query-string credential must not survive into the log: {log:?}"
+        );
+        assert!(
+            log.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {log:?}"
+        );
+    }
+
+    /// Regression for #1228 C1: `pep508_rs::Pep508Error::Display` echoes its raw input
+    /// verbatim ("The input string so we can print it underlined"), so a requirement with a
+    /// *valid* leading name that fails parsing *later* (an unterminated `[extras` clause here)
+    /// takes a different branch than the leading-name pre-check — one that used to interpolate
+    /// the raw `pep508_rs` error (`{}`/`{e}`) straight into the WARN, re-leaking the credential
+    /// through the error text even though the adjacent value was already redacted. Now logged
+    /// via `PypiError::reason_for_log`'s fixed category (see
+    /// `test_credential_free_parse_failure_still_reports_a_useful_reason` for why that category
+    /// isn't just `truncate_for_log`'s URL-credential redaction applied to the error text too).
+    #[test]
+    fn test_parse_failure_redacts_credential_embedded_in_pep508_error_display() {
+        let content = r#"
+[project]
+dependencies = ["mypkg[ @ https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/simple/mypkg-1.0.tar.gz"]
+"#;
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = PypiParser::new()
+                .parse_content(content, &test_uri())
+                .unwrap();
+            assert!(result.dependencies.is_empty());
+        });
+        assert!(
+            !log.contains("ghp_SUPERSECRETTOKEN123") && !log.contains("svcacct"),
+            "credential embedded in the pep508_rs error's Display must not survive: {log:?}"
+        );
+        assert!(
+            log.contains("invalid PEP 508 syntax"),
+            "the WARN should still say why parsing failed, not just redact into oblivion: {log:?}"
+        );
+        assert!(
+            log.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {log:?}"
+        );
+    }
+
+    /// Regression for #1228 C2: a Poetry string dependency's `; <marker>` suffix is handed to
+    /// `normalize_marker_string`, which used to log both the raw marker text and its
+    /// `MarkerTree::from_str` error (also a `pep508_rs::Pep508Error`, unwrapped by `PypiError`
+    /// at all here) with no redaction or truncation whatsoever.
+    #[test]
+    fn test_poetry_marker_parse_failure_redacts_credential() {
+        let content = r#"
+[tool.poetry.dependencies]
+mypkg = "^1.0; https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/x ==="
+"#;
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = PypiParser::new()
+                .parse_content(content, &test_uri())
+                .unwrap();
+            assert_eq!(result.dependencies.len(), 1);
+            assert_eq!(result.dependencies[0].markers, None);
+        });
+        assert!(
+            !log.contains("ghp_SUPERSECRETTOKEN123") && !log.contains("svcacct"),
+            "credential embedded in the marker text or its parse error must not survive: {log:?}"
+        );
+        assert!(
+            log.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {log:?}"
+        );
+    }
+
+    /// Regression for #1228 S1: a Poetry dependency's TOML *key* is attacker-controlled (TOML
+    /// allows arbitrary quoted keys) and was logged raw — unbounded and unredacted — on an
+    /// unsupported-format rejection.
+    #[test]
+    fn test_poetry_unsupported_format_redacts_key_shaped_as_url() {
+        let content = r#"
+[tool.poetry.dependencies]
+"https://svcacct:ghp_SUPERSECRETTOKEN123@pypi.internal.corp/evil" = true
+"#;
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = PypiParser::new()
+                .parse_content(content, &test_uri())
+                .unwrap();
+            assert!(result.dependencies.is_empty());
+        });
+        assert!(
+            !log.contains("ghp_SUPERSECRETTOKEN123") && !log.contains("svcacct"),
+            "credential-shaped TOML key must not survive into the log: {log:?}"
+        );
+        assert!(
+            log.contains("pypi.internal.corp"),
+            "host should stay visible for diagnosability: {log:?}"
+        );
+    }
+
+    /// Regression for #1228, critic round 2: an earlier fix ran the *error's own* `Display`
+    /// text through `truncate_for_log`'s URL-credential redaction (the same helper used for the
+    /// adjacent offending-value field) — safe against a real credential, but that redactor is
+    /// tuned for URL-shaped values, not free-form prose, and over-triggers on an ordinary
+    /// English sentence containing an unrelated `:`, collapsing the *entire* reason to `***`
+    /// even when nothing in it was ever credential-shaped. This requirement has no `@`, no `:`
+    /// in a credential position, and no URL anywhere — there is nothing to redact — so the WARN
+    /// must still explain what was wrong instead of masking the reason unconditionally.
+    #[test]
+    fn test_credential_free_parse_failure_still_reports_a_useful_reason() {
+        let content = r#"
+[project]
+dependencies = ["otherpkg >=< 2.0"]
+"#;
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = PypiParser::new()
+                .parse_content(content, &test_uri())
+                .unwrap();
+            assert!(result.dependencies.is_empty());
+        });
+        assert!(
+            log.contains("invalid PEP 508 syntax"),
+            "a credential-free malformed requirement must still get a real reason, not '***': {log:?}"
+        );
+        assert!(
+            !log.contains("***"),
+            "there is nothing here to redact — a bare '***' means real diagnostic text was lost: {log:?}"
+        );
     }
 }
