@@ -38,7 +38,8 @@ pub use code_lenses::{
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, generate_diagnostics_from_cache,
-    redact_name_for_diagnostic, requirement_is_unsatisfiable, truncate_for_diagnostic,
+    redact_name_for_diagnostic, requirement_is_unsatisfiable, sanitize_and_truncate_for_diagnostic,
+    truncate_for_diagnostic,
 };
 pub use formatter::{
     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
@@ -1292,9 +1293,11 @@ impl LineOffsetTable {
 /// written into completion-item link labels and link destinations. Every ASCII
 /// punctuation character is backslash-escaped (CommonMark's full escapable set — not
 /// just brackets/parens, which would still leave e.g. `<https://evil.example>`
-/// autolinks live), and control characters (including newlines) are replaced with a
-/// space so the text cannot terminate the single-line block it is embedded in and
-/// splice in new content.
+/// autolinks live), and control characters (including newlines) plus a narrow set of
+/// invisible/bidi-override characters (see `is_markdown_unsafe`, #1248) are replaced
+/// with a space so the text cannot terminate the single-line block it is embedded in,
+/// splice in new content, or visually spoof the rendered name via a Trojan Source
+/// (CVE-2021-42574) bidi override.
 ///
 /// Backslash-escaping is valid in link destinations as well as regular text, so this
 /// also neutralizes `)`/`]` breakout attempts in a `[label](destination)` URL. It does
@@ -1315,7 +1318,7 @@ impl LineOffsetTable {
 pub fn escape_markdown(s: &str) -> String {
     let mut escaped = String::with_capacity(s.len());
     for c in s.chars() {
-        if c.is_control() {
+        if is_markdown_unsafe(c) {
             escaped.push(' ');
             continue;
         }
@@ -1327,6 +1330,40 @@ pub fn escape_markdown(s: &str) -> String {
     escaped
 }
 
+/// Narrow, explicit predicate for a character that must not survive [`escape_markdown`]
+/// or [`markdown_code_span`] unescaped (#1248): ASCII/C1 control characters plus a
+/// fixed set of invisible/bidi-override Unicode characters with a demonstrated Trojan
+/// Source (CVE-2021-42574) or text-smuggling use, and no legitimate mid-string use in
+/// registry-supplied free text.
+///
+/// Deliberately narrower than [`crate::net_policy::sanitize_invisible`]'s whole-category
+/// (`Cf`/`Zl`/`Zp`) sweep: both `escape_markdown` and `markdown_code_span` also process
+/// free text (registry descriptions) that can legitimately carry `Cf` marks such as
+/// U+200F RIGHT-TO-LEFT MARK, U+061C ARABIC LETTER MARK, U+200E LEFT-TO-RIGHT MARK, or
+/// U+200C/U+200D (ZWNJ/ZWJ, load-bearing in Persian/Arabic/Indic text and emoji
+/// sequences) — a category-wide check would mangle genuine RTL text or emoji. This list
+/// covers only the bidi-override/invisible characters with no such legitimate use:
+/// explicit bidi overrides/isolates (U+202A-U+202E, U+2066-U+2069), the zero-width
+/// space (U+200B) and word joiner (U+2060, functionally identical to — and Unicode's
+/// recommended replacement for — U+FEFF used as a ZWNBSP rather than a byte-order mark),
+/// the line/paragraph separators (U+2028/U+2029, `Zl`/`Zp` — not `Cf`, so a `Cf`-only
+/// check would miss them), the byte-order mark (U+FEFF), interlinear annotation
+/// characters (U+FFF9-U+FFFB), and the Unicode tag characters (U+E0000-U+E007F, the
+/// canonical invisible "ASCII smuggling" vector).
+fn is_markdown_unsafe(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{202A}'..='\u{202E}'   // LRE RLE PDF LRO RLO
+          | '\u{2066}'..='\u{2069}'   // LRI RLI FSI PDI
+          | '\u{200B}'               // ZWSP
+          | '\u{2060}'               // WORD JOINER
+          | '\u{2028}' | '\u{2029}'  // LS, PS
+          | '\u{FEFF}'               // ZWNBSP / BOM
+          | '\u{FFF9}'..='\u{FFFB}'  // interlinear annotation anchor/separator/terminator
+          | '\u{E0000}'..='\u{E007F}' // Unicode tag characters
+        )
+}
+
 /// Wraps `content` in a Markdown inline code span (backticks included) that safely
 /// contains arbitrary untrusted text, regardless of embedded backticks.
 ///
@@ -1334,8 +1371,10 @@ pub fn escape_markdown(s: &str) -> String {
 /// this fences with one more backtick than the longest run found in `content`, and
 /// pads with a single space on each side when `content` starts or ends with a
 /// backtick or space (required by CommonMark to keep the fence unambiguous). Control
-/// characters (including newlines) are replaced with a space first, since the raw
-/// hover string is otherwise free to merge into an adjacent Markdown block.
+/// characters (including newlines) plus the same narrow invisible/bidi-override subset
+/// `escape_markdown` neutralizes (see `is_markdown_unsafe`, #1248) are replaced with a
+/// space first, since the raw hover string is otherwise free to merge into an adjacent
+/// Markdown block or carry a Trojan Source bidi override into the rendered code span.
 ///
 /// # Examples
 ///
@@ -1348,7 +1387,7 @@ pub fn escape_markdown(s: &str) -> String {
 pub fn markdown_code_span(content: &str) -> String {
     let sanitized: String = content
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| if is_markdown_unsafe(c) { ' ' } else { c })
         .collect();
 
     let max_backtick_run = sanitized
@@ -2829,6 +2868,69 @@ mod tests {
             !inner.contains(&"`".repeat(opening_fence_len)),
             "content contains a run of backticks as long as the fence: {span}"
         );
+    }
+
+    #[test]
+    fn test_escape_markdown_replaces_bidi_and_invisible_characters() {
+        for c in [
+            '\u{202E}',  // RLO — the Trojan Source vector
+            '\u{2066}',  // LRI
+            '\u{200B}',  // ZWSP
+            '\u{2060}',  // WORD JOINER
+            '\u{2028}',  // LS
+            '\u{FEFF}',  // BOM
+            '\u{FFFA}',  // interlinear annotation separator
+            '\u{E0041}', // Unicode tag character ("A")
+        ] {
+            let escaped = escape_markdown(&format!("a{c}b"));
+            assert_eq!(escaped, "a b", "{c:?} must be replaced with a space");
+        }
+    }
+
+    #[test]
+    fn test_escape_markdown_preserves_legitimate_bidi_marks() {
+        for c in [
+            '\u{200F}', // RLM
+            '\u{061C}', // ALM
+            '\u{200E}', // LRM
+            '\u{200D}', // ZWJ
+        ] {
+            let escaped = escape_markdown(&format!("a{c}b"));
+            assert_eq!(
+                escaped,
+                format!("a{c}b"),
+                "{c:?} must survive verbatim (legitimate RTL/emoji use)"
+            );
+        }
+    }
+
+    #[test]
+    fn test_markdown_code_span_replaces_bidi_and_invisible_characters() {
+        for c in [
+            '\u{202E}',
+            '\u{2066}',
+            '\u{200B}',
+            '\u{2060}',
+            '\u{2029}',
+            '\u{FEFF}',
+            '\u{FFFA}',
+            '\u{E0041}',
+        ] {
+            let span = markdown_code_span(&format!("a{c}b"));
+            assert_eq!(span, "`a b`", "{c:?} must be replaced with a space");
+        }
+    }
+
+    #[test]
+    fn test_markdown_code_span_preserves_legitimate_bidi_marks() {
+        for c in ['\u{200F}', '\u{061C}', '\u{200E}', '\u{200D}'] {
+            let span = markdown_code_span(&format!("a{c}b"));
+            assert_eq!(
+                span,
+                format!("`a{c}b`"),
+                "{c:?} must survive verbatim (legitimate RTL/emoji use)"
+            );
+        }
     }
 
     #[test]

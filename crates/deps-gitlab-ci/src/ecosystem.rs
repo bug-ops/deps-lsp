@@ -20,7 +20,7 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
-    lsp_helpers::{EcosystemFormatter, truncate_for_diagnostic},
+    lsp_helpers::{EcosystemFormatter, sanitize_and_truncate_for_diagnostic},
 };
 
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
@@ -607,15 +607,20 @@ fn unresolved_host_diagnostics(parse_result: &dyn ParseResultTrait) -> Vec<Diagn
             // actively wrong.
             let message = match &gl_dep.host {
                 HostRef::Unresolved(raw) => {
-                    let raw = truncate_for_diagnostic(raw, MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS);
+                    let raw = sanitize_and_truncate_for_diagnostic(
+                        raw,
+                        MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS,
+                    );
                     format!(
                         "Cannot determine the GitLab instance host for '{raw}'. Set the \
                          `registries.gitlab_instance_host` setting to enable version resolution."
                     )
                 }
                 HostRef::CapacityRefused(origin) => {
-                    let origin =
-                        truncate_for_diagnostic(origin, MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS);
+                    let origin = sanitize_and_truncate_for_diagnostic(
+                        origin,
+                        MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS,
+                    );
                     format!(
                         "'{origin}' was not registered for version resolution because a \
                          GitLab CI host/route capacity limit was reached. Reduce the number of \
@@ -666,10 +671,7 @@ fn mutable_ref_pin_diagnostics(
         .into_iter()
         .filter_map(|dep| {
             let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
-            let name = truncate_for_diagnostic(
-                gl_dep.name.as_str(),
-                MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
-            );
+            let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gl_dep.name);
             let noun = match gl_dep.kind {
                 IncludeKind::Project => "project",
                 IncludeKind::Component => "component",
@@ -707,7 +709,8 @@ fn mutable_ref_pin_diagnostics(
                 .version_req
                 .as_ref()
                 .map(deps_core::VersionReq::as_str)?;
-            let tag = truncate_for_diagnostic(tag, MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS);
+            let tag =
+                sanitize_and_truncate_for_diagnostic(tag, MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS);
 
             // Issue #643/S1,S2: `sha_pin_quickfix_kind` is the single source of truth for
             // whether a quickfix is actually available for this dependency — the same
@@ -860,7 +863,10 @@ async fn build_dynamic_component_pin_action(
     let changes = deps_core::single_file_edit(uri, version_range, resolved.sha);
 
     Some(CodeAction {
-        title: format!("Pin {} to commit SHA", gl_dep.name.as_str()),
+        title: format!(
+            "Pin {} to commit SHA",
+            deps_core::lsp_helpers::redact_name_for_diagnostic(&gl_dep.name)
+        ),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: Some(changes),
@@ -1164,6 +1170,60 @@ mod tests {
                 .contains("Set the `registries.gitlab_instance_host`")
         );
         assert!(diagnostics[1].message.contains("capacity"));
+    }
+
+    /// Security audit finding (#1252): a bidi-override character in an `Unresolved` host
+    /// expression and a raw newline in a `CapacityRefused` origin must not survive into the
+    /// rendered diagnostic message (Trojan Source, CVE-2021-42574, or a forged report row).
+    #[test]
+    fn test_unresolved_host_diagnostics_sanitizes_bidi_and_newline() {
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let range = deps_core::position::Range::default();
+        let make_dep = |host: HostRef| crate::types::GitlabCiDependency {
+            name: "org/proj/comp".into(),
+            name_range: range,
+            version_req: Some("1.0.0".into()),
+            version_range: Some(range),
+            version_literal: None,
+            source: deps_core::parser::DependencySource::CustomRegistry { url: "x".into() },
+            is_plain_scalar: true,
+            is_alias_occurrence: false,
+            kind: IncludeKind::Component,
+            host,
+            pin: Some(PinStyle::Tag),
+            project_path: "org/proj".to_string(),
+        };
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![
+                make_dep(HostRef::Unresolved("ci\u{202E}host".to_string())),
+                make_dep(HostRef::CapacityRefused(
+                    "https://gitlab\n.example".to_string(),
+                )),
+            ],
+            routes: vec![],
+            uri,
+            dependency_truncation: None,
+            blocked_registries: Vec::new(),
+        };
+
+        let diagnostics = unresolved_host_diagnostics(&parse_result);
+
+        assert_eq!(diagnostics.len(), 2);
+        // Asserts the full sanitized message, not just absence of the bad characters —
+        // a regression that sanitized the message down to nothing (or dropped unrelated
+        // content) must fail loudly rather than vacuously pass a "does not contain" check.
+        assert_eq!(
+            diagnostics[0].message,
+            "Cannot determine the GitLab instance host for 'ci host'. Set the \
+             `registries.gitlab_instance_host` setting to enable version resolution."
+        );
+        assert_eq!(
+            diagnostics[1].message,
+            "'https://gitlab .example' was not registered for version resolution because a \
+             GitLab CI host/route capacity limit was reached. Reduce the number of distinct \
+             GitLab hosts or includes referenced in this workspace (unrelated to the \
+             `registries.gitlab_instance_host` setting)."
+        );
     }
 
     /// Regression for the FR-012 diagnostic: an unresolved-host dependency must get the
@@ -1496,6 +1556,54 @@ mod tests {
             "a registry-confirmed-but-Branch ref has no quickfix, so the message must say \
              so; got: {}",
             found.message
+        );
+    }
+
+    /// Security audit finding (#1252): a bidi-override character in the dependency name and
+    /// a raw newline in the tag/ref text must not survive into the rendered mutable-ref-pin
+    /// diagnostic message (Trojan Source, CVE-2021-42574, or a forged report row).
+    #[test]
+    fn test_mutable_ref_pin_diagnostics_sanitizes_bidi_and_newline() {
+        let range = deps_core::position::Range::default();
+        let dep = GitlabCiDependency {
+            name: "org\u{202E}/proj".into(),
+            name_range: range,
+            version_req: Some("v1\n.0".into()),
+            version_range: Some(range),
+            version_literal: None,
+            source: deps_core::parser::DependencySource::AlternateRegistry {
+                index: "route".to_string(),
+                mirrors_crates_io: false,
+            },
+            is_plain_scalar: true,
+            is_alias_occurrence: false,
+            kind: IncludeKind::Project,
+            host: HostRef::Literal(crate::host::GitlabHost::for_test("gitlab.com")),
+            pin: Some(PinStyle::Tag),
+            project_path: "org/proj".to_string(),
+        };
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![dep],
+            routes: vec![],
+            uri: deps_core::test_util::test_uri("/repo/.gitlab-ci.yml"),
+            dependency_truncation: None,
+            blocked_registries: Vec::new(),
+        };
+        let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
+
+        let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
+
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a mutable-ref-pin diagnostic");
+        // Asserts the full sanitized message, not just absence of the bad characters —
+        // a regression that sanitized the message down to nothing (or dropped unrelated
+        // content) must fail loudly rather than vacuously pass a "does not contain" check.
+        assert_eq!(
+            found.message,
+            "org /proj project is pinned to the mutable ref `v1 .0`; pin to a full commit \
+             SHA to guard against ref mutation"
         );
     }
 
@@ -2104,6 +2212,108 @@ mod tests {
                 .new_text,
             sha
         );
+    }
+
+    /// Security audit finding (#1252, critic follow-up C2): the one CodeAction title fixed
+    /// in this PR (`build_dynamic_component_pin_action`'s "Pin {name} to commit SHA") had no
+    /// regression test — a bidi override in the dependency name must not survive into the
+    /// title, and an oversized name must not grow it unbounded.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_build_dynamic_component_pin_action_title_sanitizes_and_caps_name() {
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        let _releases_mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
+        let instance_host = Arc::new(crate::host::GitlabInstanceHost::new(
+            Arc::new(RwLock::new(None)),
+            Arc::clone(&policy),
+        ));
+        let client = Arc::new(GitlabApiClient::new(
+            Arc::new(HttpCache::new()),
+            instance_host,
+        ));
+        let registry = GitlabCiRegistry::new(client);
+        let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
+
+        let host_bare = server.url();
+        let long_suffix = "x".repeat(200);
+        // The bidi override and the length go into the trailing component-name segment
+        // only: `project_path_from_name`'s `Releases` branch derives the fetch path via
+        // `rsplit_once('/')`, keeping everything before the last `/` as the project path
+        // (must stay exactly "org/proj" to match the mock below) and treating the last
+        // segment as the (here, deliberately hostile) component name.
+        let name = PackageName::new(format!("{host_bare}/org/proj/co\u{202E}mp{long_suffix}"));
+        let index = "gitlab:component-pin-title-test".to_string();
+        registry.register_alternate(&[(
+            index.clone(),
+            crate::types::GitlabRoute {
+                origin: host_bare.clone(),
+                endpoint: EndpointKind::Releases,
+            },
+        )]);
+
+        let version_req = "~latest";
+        let range = tower_lsp_server::ls_types::Range::new(
+            tower_lsp_server::ls_types::Position::new(0, 0),
+            tower_lsp_server::ls_types::Position::new(0, version_req.len() as u32),
+        );
+        let dep = GitlabCiDependency {
+            name,
+            name_range: range.into(),
+            version_req: Some(version_req.into()),
+            version_range: Some(range.into()),
+            version_literal: None,
+            source: deps_core::parser::DependencySource::AlternateRegistry {
+                index,
+                mirrors_crates_io: false,
+            },
+            is_plain_scalar: true,
+            is_alias_occurrence: false,
+            kind: IncludeKind::Component,
+            host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
+            pin: Some(PinStyle::Latest),
+            project_path: "org/proj".to_string(),
+        };
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let parse_result = crate::types::GitlabCiParseResult {
+            dependencies: vec![dep],
+            routes: vec![],
+            uri: uri.clone(),
+            dependency_truncation: None,
+            blocked_registries: Vec::new(),
+        };
+
+        let action = build_dynamic_component_pin_action(
+            &parse_result,
+            range.start,
+            &uri,
+            &formatter,
+            &registry,
+        )
+        .await
+        .expect("expected a quickfix resolving ~latest to a concrete SHA");
+
+        assert!(
+            !action.title.contains('\u{202E}'),
+            "bidi override must not survive into the title: {:?}",
+            action.title
+        );
+        assert!(
+            action.title.len() < long_suffix.len(),
+            "an oversized name must not render in full inside the title: {:?}",
+            action.title
+        );
+        assert!(action.title.contains('…'));
     }
 
     #[cfg(feature = "lsp-responses")]

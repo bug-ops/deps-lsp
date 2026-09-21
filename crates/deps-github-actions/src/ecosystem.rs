@@ -550,11 +550,8 @@ fn mutable_ref_pin_diagnostics(
                 .version_req
                 .as_ref()
                 .map(deps_core::VersionReq::as_str)?;
-            let name = deps_core::lsp_helpers::truncate_for_diagnostic(
-                gha_dep.name.as_str(),
-                MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
-            );
-            let tag = deps_core::lsp_helpers::truncate_for_diagnostic(
+            let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gha_dep.name);
+            let tag = deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic(
                 tag,
                 MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
             );
@@ -724,6 +721,64 @@ mod tests {
             "a 10,000-char tag must not render in full inside the diagnostic message"
         );
         assert!(found.message.contains('…'));
+    }
+
+    /// Security audit finding (#1252): a bidi-override character in the `owner/repo` name
+    /// and a raw newline in the tag ref must not survive into the rendered diagnostic
+    /// message — either could forge a fake report row or spoof the displayed name
+    /// (Trojan Source, CVE-2021-42574). Constructs the dependency directly rather than
+    /// through YAML parsing: `is_valid_github_identity` already rejects a non-ASCII name
+    /// at the parser boundary, so this exercises the sink's own sanitization in depth
+    /// rather than relying on that unrelated upstream gate.
+    #[tokio::test]
+    async fn test_generate_diagnostics_mutable_ref_pin_sanitizes_bidi_and_newline() {
+        use crate::types::GithubActionsParseResult;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        let range = Range::new(Position::new(0, 0), Position::new(0, 10));
+        let parse_result = GithubActionsParseResult {
+            dependencies: vec![GithubActionsDependency {
+                name: "ac\u{202E}tions/checkout".into(),
+                name_range: range,
+                version_req: Some("v4\n0".into()),
+                version_range: Some(range),
+                version_literal: None,
+                pin: Some(PinStyle::Tag),
+                source: DependencySource::Registry,
+                is_plain_scalar: true,
+                is_last_on_line: true,
+            }],
+            uri: deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml"),
+            dependency_truncation: None,
+        };
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let eco = GithubActionsEcosystem::new(cache);
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let diagnostics = eco
+            .generate_diagnostics(
+                &parse_result,
+                deps_core::VersionData::new(&cached, &resolved),
+                &parse_result.uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        let found = diagnostics
+            .iter()
+            .find(|d| d.code == Some(mutable_ref_pin_code()))
+            .expect("expected a mutable-ref-pin diagnostic");
+        // Asserts the full sanitized message, not just absence of the bad characters —
+        // a regression that sanitized the message down to nothing (or dropped unrelated
+        // content) must fail loudly rather than vacuously pass a "does not contain" check.
+        assert_eq!(
+            found.message,
+            "ac tions/checkout is pinned to the mutable tag ref `v4 0`; pin to a full commit \
+             SHA to guard against tag mutation"
+        );
     }
 
     #[tokio::test]

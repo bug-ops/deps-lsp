@@ -757,6 +757,14 @@ pub trait ShaPinning: Send + Sync {
     fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin>;
 }
 
+/// Maximum character count of the dependency name interpolated into
+/// [`build_sha_pin_action`]'s CodeAction title, before truncation with an ellipsis marker.
+/// Mirrors `diagnostics::MAX_DIAGNOSTIC_NAME_CHARS`'s and each ecosystem's own
+/// `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS`'s bound (#1252 critic follow-up C1): this is the
+/// *primary* `PinStyle::Tag` quickfix title, shared by both `deps-github-actions` and
+/// `deps-gitlab-ci`, so it needs the same cap as the diagnostic sinks it sits next to.
+const MAX_SHA_PIN_TITLE_NAME_CHARS: usize = 128;
+
 /// Builds the "Pin `{name}` to commit SHA" [`CodeAction`] for the dependency at `position`.
 ///
 /// The boilerplate `deps-github-actions`'s and `deps-gitlab-ci`'s own `build_sha_pin_action`
@@ -786,8 +794,12 @@ pub fn build_sha_pin_action<F: EcosystemFormatter + ShaPinning>(
         .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
     let resolved = formatter.resolve_static_sha_pin(dep)?;
     let changes = single_file_edit(uri, resolved.version_range, resolved.replacement);
+    let display_name = super::diagnostics::sanitize_and_truncate_for_diagnostic(
+        &resolved.display_name,
+        MAX_SHA_PIN_TITLE_NAME_CHARS,
+    );
     Some(CodeAction {
-        title: format!("Pin {} to commit SHA", resolved.display_name),
+        title: format!("Pin {display_name} to commit SHA"),
         kind: Some(CodeActionKind::QUICKFIX),
         edit: Some(WorkspaceEdit {
             changes: Some(changes),

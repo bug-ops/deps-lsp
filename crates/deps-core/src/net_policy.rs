@@ -2371,13 +2371,15 @@ pub fn redact_declaration_key(key: &str) -> String {
 /// still line terminators for JS/`eval` consumers of `--format json` output and are treated
 /// as breaks by some editor renderers (critic follow-up M1, #1246).
 ///
-/// This is deliberately wider than [`crate::lsp_helpers::escape_markdown`]'s `Cc`-only
-/// [`char::is_control`] check: that helper runs on registry-supplied hover *descriptions*,
-/// where legitimate right-to-left text carries real `Cf` marks (e.g. U+200F RIGHT-TO-LEFT
-/// MARK), so widening it to `Cf` there would mangle genuine Arabic/Hebrew text. A
-/// manifest-declared package/coordinate *name*, by contrast, has no legitimate use for any
-/// `Cf`/`Zl`/`Zp` character, so this dedicated helper — for name-shaped values only — can
-/// safely treat the whole categories as unsafe.
+/// This is deliberately wider than [`crate::lsp_helpers::escape_markdown`] and
+/// [`crate::lsp_helpers::markdown_code_span`]'s own narrow, explicit bidi/invisible-character
+/// list (`is_markdown_unsafe`, #1248): those helpers also run on registry-supplied hover
+/// *descriptions*, where legitimate right-to-left text carries real `Cf` marks (e.g. U+200F
+/// RIGHT-TO-LEFT MARK, U+061C ARABIC LETTER MARK) and emoji ZWJ sequences carry U+200D, so
+/// treating the whole `Cf` category as unsafe there would mangle genuine Arabic/Hebrew text
+/// or emoji. A manifest-declared package/coordinate *name*, by contrast, has no legitimate
+/// use for any `Cf`/`Zl`/`Zp` character, so this dedicated helper — for name-shaped values
+/// only — can safely treat the whole categories as unsafe.
 ///
 /// # Examples
 ///

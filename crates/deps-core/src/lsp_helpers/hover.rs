@@ -3757,6 +3757,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_generate_hover_bidi_override_in_name_cannot_spoof_rendered_label() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        // Trojan Source (CVE-2021-42574, #1248): a RIGHT-TO-LEFT OVERRIDE in the
+        // dependency name must not reach the rendered hover label, where it could
+        // visually reorder the name into a spoofed, different-looking package.
+        let malicious_name = "real\u{202E}gnp.sj";
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: malicious_name.into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(
+                    Position::new(0, 0),
+                    Position::new(0, malicious_name.len() as u32),
+                ),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("expected markup hover contents");
+        };
+
+        // The link label (the escape_markdown sink #1248 targets) must not carry the bidi
+        // override; the link *destination* is a separate, unescaped URL-construction path
+        // outside this fix's scope (tracked separately, see #1252/#1248 follow-up).
+        let header_line = content
+            .value
+            .lines()
+            .next()
+            .expect("hover markdown has a header line");
+        let label = header_line
+            .strip_prefix("# [")
+            .expect("header starts with link label")
+            .split("](")
+            .next()
+            .expect("header contains label/url separator");
+        assert!(!label.contains('\u{202E}'));
+    }
+
+    #[tokio::test]
     async fn test_generate_hover_marker_with_parens_renders_unescaped() {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
