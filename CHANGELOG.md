@@ -30,11 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-maven**: `maven-metadata.xml` parse errors are now redacted before reaching `DepsError::CacheError`, closing a credential leak from a malformed tag name (resolves #1249) (#1301)
 - **deps-core, deps-lsp**: raw-text fallback completion now rewrites `filter_text` to the raw typed prefix for registries that normalize search queries, fixing PyPI PEP 503 dotted-name completions dropped by some LSP clients (resolves #1289) (#1306)
 - **deps-cargo**: feature-flag completion is now capped at 5 items with deterministic alphabetical truncation and an accurate `is_incomplete` flag, instead of an unbounded, arbitrarily-ordered list (resolves #1302) (#1307)
+- **deps-core**: an unauthenticated GitHub 403/429 is now classified as a genuine rate limit only when the response confirms exhaustion (`X-RateLimit-Remaining: 0` or a `Retry-After` header), so `unwrap_or_skip_github_rate_limit` no longer silently skips an unrelated 403 cause as expected (resolves #1295) (#1308)
+- **deps-core**: `DepsError::fetch_failure` and its telemetry-label sibling classifier are now exhaustive matches with no wildcard arm, so a future variant cannot silently lose its diagnostic hint (resolves #1244) (#1308)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
 - **deps-core**: `completion::build_package_completion` gains `index: usize` and `prefix: &str` parameters, used to preserve registry relevance ranking in `sort_text` (resolves #1282) (#1293)
 - **deps-core**: `completion::build_feature_completion` now returns `Option<CompletionItem>` instead of `CompletionItem`, dropping the item when `feature_name` fails `is_safe_feature_name` (resolves #1296)
+- **deps-core**: `DepsError::RateLimited` gains `verified: bool` and `source_status: Option<u16>` fields (now `#[non_exhaustive]` itself, so future field additions won't repeat this); a downstream crate matching or constructing it without `..` needs updating (part of #1295) (#1308)
 
 ### Changed
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)

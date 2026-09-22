@@ -173,6 +173,77 @@ fn ensure_https(url: &str) -> Result<()> {
     )))
 }
 
+/// Whether a non-2xx response carries explicit evidence of genuine rate-limit exhaustion —
+/// a 403/429 with `X-RateLimit-Remaining: 0`, or a `Retry-After` header on either (#1295) —
+/// as opposed to a 403 for some other reason (abuse-detection false positive, an
+/// access-restricted resource).
+///
+/// `Retry-After` covers GitHub's *secondary* rate limit, which arrives as 403 or 429 with a
+/// non-zero (or absent) `X-RateLimit-Remaining` — a `remaining == 0` check alone misses it
+/// (critic S4). `429` is included alongside `403` since GitHub returns 429 for some rate-limit
+/// responses too, not only 403.
+///
+/// **Residual false positive** (critic N4): `Retry-After` alone on a 403, with no
+/// `X-RateLimit-Remaining` at all, is not *unambiguous* evidence — a WAF/Cloudflare
+/// bot-challenge 403 can also carry `Retry-After`, and this predicate cannot distinguish that
+/// from a genuine secondary rate limit. This is a narrower false-positive surface than the
+/// bug #1295 fixes (which treated *every* untokened 403 as a rate limit with zero
+/// corroborating evidence), and considered an acceptable trade-off rather than a bug to
+/// eliminate here — see the issue for the full evidence-strength discussion.
+///
+/// Checked generically here (any header-carrying non-2xx response, not pinned to a GitHub
+/// host) rather than in `crate::github`: the response's headers are only available at this
+/// live-fetch chokepoint — by the time a caller like `GithubTagsClient` sees the error, it has
+/// already collapsed to [`DepsError::HttpStatus`] with no header data left (the exact gap
+/// `crate::test_util::unwrap_or_skip_github_rate_limit`'s doc used to describe). Not pinning
+/// to a GitHub-shaped `url` also means a `mockito`-backed test can exercise this without a
+/// real `api.github.com` request — including from non-GitHub ecosystem crates (`deps-gitlab-ci`)
+/// whose registries can send the same evidence shape.
+#[inline]
+fn confirmed_rate_limit_exhaustion(status: StatusCode, headers: &header::HeaderMap) -> bool {
+    if !matches!(
+        status,
+        StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS
+    ) {
+        return false;
+    }
+    let remaining_exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        == Some(0);
+    remaining_exhausted || headers.contains_key("retry-after")
+}
+
+/// Fixed, registry-neutral message for a confirmed rate-limit-exhaustion classification
+/// (#1295, critic S1). Deliberately generic — [`http_status_error`] runs at every
+/// [`HttpCache`] live-fetch site, shared by all 14 ecosystems, not only GitHub, so it must not
+/// assume a GitHub-specific remedy (`GITHUB_TOKEN`) applies to whichever registry actually
+/// sent the confirming evidence. A GitHub-aware caller
+/// (`crate::github::classify_tags_fetch_error`) swaps in the GitHub-specific hint on top of
+/// this while keeping `verified: true`; `deps-gitlab-ci` does the equivalent for its own gate.
+const CONFIRMED_RATE_LIMIT_MESSAGE: &str =
+    "registry rate limit exceeded (confirmed by the response)";
+
+/// Builds the `Err` for a non-2xx `response`: a *verified* [`DepsError::RateLimited`] when
+/// [`confirmed_rate_limit_exhaustion`] holds, else the usual [`DepsError::HttpStatus`]. Shared
+/// by every live-fetch call site in this module so the check can't be forgotten at a new one
+/// (#1295).
+#[inline]
+fn http_status_error(url: &str, status: StatusCode, headers: &header::HeaderMap) -> DepsError {
+    if confirmed_rate_limit_exhaustion(status, headers) {
+        return DepsError::RateLimited {
+            message: CONFIRMED_RATE_LIMIT_MESSAGE.to_string(),
+            verified: true,
+            source_status: Some(status.as_u16()),
+        };
+    }
+    DepsError::HttpStatus {
+        url: RedactedUrl::new(url),
+        status: status.as_u16(),
+    }
+}
+
 /// True when a redirect hop moves from an `https` origin to a plain `http` one.
 ///
 /// A redirect to any scheme other than `http`/`https` is already rejected by reqwest
@@ -1510,15 +1581,45 @@ impl HttpCache {
                     return Ok(new_body);
                 }
                 Err(e) => {
+                    debug_assert!(
+                        !matches!(
+                            &e,
+                            DepsError::RateLimited {
+                                source_status: None,
+                                ..
+                            }
+                        ),
+                        "a RateLimited reaching this eviction guard must always carry \
+                         source_status — only http_status_error's confirmed-evidence branch \
+                         produces RateLimited here; None would silently bypass FR-015/NFR-004 \
+                         eviction on a genuine 401/403 credential-revocation signal"
+                    );
                     // FR-015/NFR-004: a 401/403 revalidation against an *authenticated*
                     // pinned-tier entry must evict rather than serve the possibly-revoked
                     // credential's last-known-good body — every other tier keeps today's
                     // stale-while-revalidate fallback unchanged.
+                    //
+                    // `RateLimited { source_status: Some(401 | 403), .. }` is included here
+                    // (#1295 critic C1): `e` is always this match's own
+                    // `conditional_request_with_headers`'s `Err`, whose only source of that
+                    // variant is `http_status_error`'s confirmed-evidence branch — without this
+                    // arm, a confirmed-evidence 403 would silently bypass eviction and keep
+                    // serving the possibly-revoked credential's stale body. Deliberately
+                    // narrowed to `source_status` 401/403 only, not a bare `RateLimited { .. }`
+                    // (critic N1 regression fix): `confirmed_rate_limit_exhaustion` also
+                    // classifies a 429 this way, but a 429 is mere throttling, not a
+                    // credential-revocation signal — NFR-004's scope is "401/403", and evicting
+                    // on 429 would drop a still-good cached body the client can no longer
+                    // re-fetch until the throttle clears, purely because of a signal unrelated
+                    // to the credential's validity.
                     if transport.tier.is_authenticated()
                         && matches!(
                             &e,
                             DepsError::HttpStatus {
                                 status: 401 | 403,
+                                ..
+                            } | DepsError::RateLimited {
+                                source_status: Some(401 | 403),
                                 ..
                             }
                         )
@@ -1599,10 +1700,11 @@ impl HttpCache {
         }
 
         if !response.status().is_success() {
-            return Err(DepsError::HttpStatus {
-                url: RedactedUrl::new(url),
-                status: response.status().as_u16(),
-            });
+            return Err(http_status_error(
+                url,
+                response.status(),
+                response.headers(),
+            ));
         }
 
         let etag = response
@@ -1638,7 +1740,9 @@ impl HttpCache {
     ///
     /// # Errors
     ///
-    /// Returns `DepsError::HttpStatus` if the server returns a non-2xx status code,
+    /// Returns `DepsError::HttpStatus` if the server returns a non-2xx status code
+    /// (or `DepsError::RateLimited` when that status is a 403 with confirmed
+    /// `X-RateLimit-Remaining: 0` evidence — see [`http_status_error`], #1295),
     /// `DepsError::RegistryError` if the network request fails, or
     /// `DepsError::ResponseTooLarge` if the response body exceeds the
     /// configured size cap.
@@ -1672,10 +1776,11 @@ impl HttpCache {
         })?;
 
         if !response.status().is_success() {
-            return Err(DepsError::HttpStatus {
-                url: RedactedUrl::new(url),
-                status: response.status().as_u16(),
-            });
+            return Err(http_status_error(
+                url,
+                response.status(),
+                response.headers(),
+            ));
         }
 
         let etag = response
@@ -1743,10 +1848,11 @@ impl HttpCache {
             })?;
 
         if !response.status().is_success() {
-            return Err(DepsError::HttpStatus {
-                url: RedactedUrl::new(url),
-                status: response.status().as_u16(),
-            });
+            return Err(http_status_error(
+                url,
+                response.status(),
+                response.headers(),
+            ));
         }
 
         read_body_capped(url, response, BodyLimit::DEFAULT).await
@@ -1867,10 +1973,11 @@ impl HttpCache {
         })?;
 
         if !response.status().is_success() {
-            return Err(DepsError::HttpStatus {
-                url: RedactedUrl::new(url),
-                status: response.status().as_u16(),
-            });
+            return Err(http_status_error(
+                url,
+                response.status(),
+                response.headers(),
+            ));
         }
 
         read_body_capped(url, response, limit).await
@@ -3027,6 +3134,183 @@ mod tests {
             }
             _ => panic!("Expected HttpStatus"),
         }
+    }
+
+    /// #1295 (a): a 403 carrying confirmed `X-RateLimit-Remaining: 0` evidence classifies as
+    /// a *verified* rate limit, not a bare `HttpStatus`.
+    #[tokio::test]
+    async fn test_fetch_and_store_403_with_confirmed_evidence_is_verified_rate_limited() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _m = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "0")
+            .with_body(r#"{"message":"API rate limit exceeded"}"#)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let url = format!("{}/repos/owner/repo/tags", server.url());
+        let result: Result<Bytes> = cache
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
+            .await;
+
+        match result {
+            Err(DepsError::RateLimited { verified, .. }) => {
+                assert!(verified, "expected verified: true");
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// #1295 (b): a plain 403 with no `X-RateLimit-Remaining` header at all — the shape a
+    /// non-rate-limit 403 cause (abuse-detection false positive, secondary rate limit, an
+    /// access-restricted repo) would have — stays a bare `HttpStatus`, distinguishable from
+    /// the confirmed case above.
+    #[tokio::test]
+    async fn test_fetch_and_store_403_without_evidence_stays_http_status() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _m = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .with_status(403)
+            .with_body(r#"{"message":"Resource not accessible by integration"}"#)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let url = format!("{}/repos/owner/repo/tags", server.url());
+        let result: Result<Bytes> = cache
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
+            .await;
+
+        match result {
+            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 403),
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    /// #1295: a non-zero `X-RateLimit-Remaining` on a 403 is not confirming evidence either —
+    /// the request was rejected for some other reason while quota remains.
+    #[tokio::test]
+    async fn test_fetch_and_store_403_with_nonzero_remaining_stays_http_status() {
+        let mut server = mockito::Server::new_async().await;
+
+        let _m = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "42")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let url = format!("{}/repos/owner/repo/tags", server.url());
+        let result: Result<Bytes> = cache
+            .fetch_and_store_with_headers(&url, &[], &cache.baseline.client, &url)
+            .await;
+
+        match result {
+            Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 403),
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    /// #1295: a `X-RateLimit-Remaining: 0` header on a status other than 403/429 is not
+    /// rate-limit evidence — [`confirmed_rate_limit_exhaustion`] must stay status-gated.
+    #[test]
+    fn test_confirmed_rate_limit_exhaustion_requires_403_or_429_status() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining",
+            header::HeaderValue::from_static("0"),
+        );
+        assert!(!confirmed_rate_limit_exhaustion(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &headers
+        ));
+        assert!(confirmed_rate_limit_exhaustion(
+            StatusCode::FORBIDDEN,
+            &headers
+        ));
+    }
+
+    /// #1295 critic S4: GitHub's primary rate limit can also arrive as 429 (not only 403),
+    /// with `X-RateLimit-Remaining: 0`.
+    #[test]
+    fn test_confirmed_rate_limit_exhaustion_accepts_429_with_zero_remaining() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining",
+            header::HeaderValue::from_static("0"),
+        );
+        assert!(confirmed_rate_limit_exhaustion(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers
+        ));
+    }
+
+    /// #1295 critic S4: a secondary rate limit arrives as 403/429 with `Retry-After` and a
+    /// *non-zero* (or absent) `X-RateLimit-Remaining` — `Retry-After` alone must count as
+    /// evidence, since `remaining == 0` alone would miss this shape entirely.
+    #[test]
+    fn test_confirmed_rate_limit_exhaustion_accepts_retry_after_without_remaining() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("retry-after", header::HeaderValue::from_static("60"));
+        assert!(confirmed_rate_limit_exhaustion(
+            StatusCode::FORBIDDEN,
+            &headers
+        ));
+        assert!(confirmed_rate_limit_exhaustion(
+            StatusCode::TOO_MANY_REQUESTS,
+            &headers
+        ));
+    }
+
+    /// #1295 critic S4: `Retry-After` evidence still requires a 403/429 status — an unrelated
+    /// 503 with a `Retry-After` header (ordinary server-maintenance semantics) is not a
+    /// rate-limit confirmation.
+    #[test]
+    fn test_confirmed_rate_limit_exhaustion_retry_after_still_status_gated() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("retry-after", header::HeaderValue::from_static("60"));
+        assert!(!confirmed_rate_limit_exhaustion(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &headers
+        ));
+    }
+
+    /// #1295 critic M4: a malformed/padded `X-RateLimit-Remaining` value (not a bare `"0"`)
+    /// must not be treated as confirming evidence — `confirmed_rate_limit_exhaustion` parses
+    /// the value rather than comparing it as an exact string, so this is evidence-neutral
+    /// (falls through to `HttpStatus`) rather than a false positive or a panic.
+    #[test]
+    fn test_confirmed_rate_limit_exhaustion_rejects_malformed_remaining() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining",
+            header::HeaderValue::from_static("not-a-number"),
+        );
+        assert!(!confirmed_rate_limit_exhaustion(
+            StatusCode::FORBIDDEN,
+            &headers
+        ));
+    }
+
+    /// #1295 critic M4: a padded numeric value (e.g. `"00"`) parses to the same integer `0`
+    /// and must still count as evidence — the point of switching from string equality to
+    /// `parse::<u64>()`.
+    #[test]
+    fn test_confirmed_rate_limit_exhaustion_accepts_padded_zero() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-remaining",
+            header::HeaderValue::from_static("00"),
+        );
+        assert!(confirmed_rate_limit_exhaustion(
+            StatusCode::FORBIDDEN,
+            &headers
+        ));
     }
 
     #[tokio::test]
@@ -4295,6 +4579,111 @@ mod tests {
             cache.len(),
             0,
             "the revoked-credential entry must be evicted, not left cached"
+        );
+    }
+
+    /// #1295 critic C1 regression test: a 403 revalidation carrying confirmed
+    /// `X-RateLimit-Remaining: 0` evidence now classifies as `DepsError::RateLimited` rather
+    /// than `HttpStatus` (see `http_status_error`) — without the eviction guard's
+    /// `RateLimited` arm, this would silently bypass FR-015/NFR-004 and keep serving the
+    /// possibly-revoked credential's stale body.
+    #[tokio::test]
+    async fn test_pinned_authenticated_403_with_confirmed_evidence_still_evicts() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/api/data", server.url());
+
+        let _m1 = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("etag", "\"abc123\"")
+            .with_body("private data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let first = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(first.as_ref(), b"private data");
+        assert_eq!(cache.len(), 1);
+        drop(_m1);
+
+        let _m2 = server
+            .mock("GET", "/api/data")
+            .match_header("if-none-match", "\"abc123\"")
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "0")
+            .create_async()
+            .await;
+
+        let result = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(7))
+            .await;
+
+        assert!(
+            matches!(result, Err(DepsError::RateLimited { verified: true, .. })),
+            "expected the confirmed-evidence 403 to surface as verified RateLimited: {result:?}"
+        );
+        assert_eq!(
+            cache.len(),
+            0,
+            "the revoked-credential entry must still be evicted on a confirmed-evidence 403, \
+             not left cached"
+        );
+    }
+
+    /// #1295 critic N1 regression test: a confirmed-evidence 429 (mere throttling, not a
+    /// credential-revocation signal) must NOT evict an authenticated pinned-tier entry —
+    /// NFR-004's scope is 401/403 only. Counterpart to the 403 test above: same setup, only
+    /// the revalidation status differs, and the assertion flips (kept, not evicted).
+    #[tokio::test]
+    async fn test_pinned_authenticated_429_with_confirmed_evidence_does_not_evict() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/api/data", server.url());
+
+        let _m1 = server
+            .mock("GET", "/api/data")
+            .with_status(200)
+            .with_header("etag", "\"abc123\"")
+            .with_body("private data")
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let first = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(first.as_ref(), b"private data");
+        assert_eq!(cache.len(), 1);
+        drop(_m1);
+
+        let _m2 = server
+            .mock("GET", "/api/data")
+            .match_header("if-none-match", "\"abc123\"")
+            .with_status(429)
+            .with_header("retry-after", "60")
+            .create_async()
+            .await;
+
+        let result = cache
+            .get_cached_pinned(&url, &trusted_origin, true, Some(7))
+            .await;
+
+        assert_eq!(
+            result.unwrap().as_ref(),
+            b"private data",
+            "a confirmed-evidence 429 must still fall back to stale-while-revalidate, not \
+             propagate an error"
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "a 429 (throttling, not a credential-revocation signal) must not evict the \
+             authenticated pinned-tier entry"
         );
     }
 

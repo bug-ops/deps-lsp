@@ -160,25 +160,49 @@ impl GithubActionsRegistry {
         Arc::clone(&self.tag_index)
     }
 
-    fn rate_limited_error() -> DepsError {
-        deps_core::github::github_rate_limit_error()
+    /// Builds the error for a request short-circuited by an already-tripped
+    /// [`RateLimitGate`], replaying the `verified` state that gate's trip was recorded with
+    /// (#1295 critic S3) — not always the plain unverified guess. Without this, every call
+    /// inside the cooldown window after the *first* confirmed trip would report `verified:
+    /// false`, which `test_util::unwrap_or_skip_github_rate_limit` treats as an unexpected
+    /// failure to investigate rather than an expected skip, regressing #1297's live-test
+    /// skip-not-panic behavior for exactly the multi-package runs it protects.
+    fn rate_limited_error(&self) -> DepsError {
+        if self.rate_limit.verified() {
+            deps_core::github::github_rate_limit_error_verified()
+        } else {
+            deps_core::github::github_rate_limit_error()
+        }
     }
 
+    /// Classifies a tags-fetch error via the shared
+    /// [`deps_core::github::classify_tags_fetch_error`] (#1295/#472 DRY), then applies this
+    /// registry's own side effect on top: trip the local cooldown gate whenever the
+    /// classified result is a [`DepsError::RateLimited`] — whether that came from the shared
+    /// classifier's no-token/no-evidence inference, or from `deps_core::cache`'s
+    /// header-evidence-confirmed classification (which fires regardless of `has_token`, since
+    /// confirmed exhaustion is no longer a guess scoped to "no token"). A tokened 403 with no
+    /// such evidence still never trips the gate — likely an org-policy/SAML restriction scoped
+    /// to this one repo (critic M3), unchanged from before #1295.
+    ///
+    /// Trips with the classified result's own `verified` flag (critic S3) so a later
+    /// short-circuited call via [`Self::rate_limited_error`] reports the same confidence this
+    /// trip actually had, instead of always the unverified default.
     fn map_tags_error(&self, name: &str, e: DepsError) -> DepsError {
-        match &e {
-            // Only a no-token 403 trips the shared gate: a tokened 403 is likely an
-            // org-policy/SAML restriction scoped to this one repo (critic M3).
-            DepsError::HttpStatus { status: 403, .. } if self.github.has_token() => e,
-            DepsError::HttpStatus { status: 403, .. } => {
-                self.rate_limit.trip();
-                Self::rate_limited_error()
-            }
-            DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
-                package: name.to_string().into(),
-                registry: REGISTRY,
-            },
-            _ => e,
+        let classified = deps_core::github::classify_tags_fetch_error(
+            e,
+            name,
+            REGISTRY,
+            self.github.has_token(),
+        );
+        match classified {
+            DepsError::RateLimited { verified: true, .. } => self.rate_limit.trip_verified(),
+            DepsError::RateLimited {
+                verified: false, ..
+            } => self.rate_limit.trip(),
+            _ => {}
         }
+        classified
     }
 
     fn acquire_in_flight_lock(&self, name: &PackageName) -> Arc<tokio::sync::Mutex<()>> {
@@ -266,7 +290,7 @@ impl GithubActionsRegistry {
     pub async fn get_versions(&self, name: &str) -> Result<Vec<GithubActionsVersion>> {
         validate_owner_repo(name)?;
         if self.rate_limit.is_tripped() {
-            return Err(Self::rate_limited_error());
+            return Err(self.rate_limited_error());
         }
 
         let package_name = PackageName::new(name);
@@ -276,7 +300,7 @@ impl GithubActionsRegistry {
         // Re-check: an earlier waiter may have tripped the gate, or already
         // populated the tag index, while this task waited for the lock.
         if self.rate_limit.is_tripped() {
-            return Err(Self::rate_limited_error());
+            return Err(self.rate_limited_error());
         }
 
         // Applied to the outcome, not inside the per-page closure: pages fetch concurrently,
@@ -795,6 +819,39 @@ mod tests {
         mock.assert_async().await;
     }
 
+    /// #1295 critic S3 regression test: once the gate is tripped by a *confirmed-evidence*
+    /// 403, every subsequent short-circuited call within the cooldown window must keep
+    /// reporting `verified: true` — not silently degrade to the unverified guess, which would
+    /// make `test_util::unwrap_or_skip_github_rate_limit` panic instead of skip for every
+    /// package after the first in a multi-package live test run (regressing #1297).
+    #[tokio::test]
+    async fn test_get_versions_403_confirmed_evidence_trip_stays_verified_on_short_circuit() {
+        let mut server = mockito::Server::new_async().await;
+        // `.expect(1)`: the second `get_versions` call below must NOT reach the network.
+        let mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "0")
+            .with_body("{}")
+            .expect(1)
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        let first_err = registry.get_versions("owner/repo").await.unwrap_err();
+        assert_matches!(first_err, DepsError::RateLimited { verified: true, .. });
+        assert!(registry.rate_limit.is_tripped());
+
+        let second_err = registry.get_versions("owner/repo").await.unwrap_err();
+        assert_matches!(
+            second_err,
+            DepsError::RateLimited { verified: true, .. },
+            "short-circuited call must replay the verified trip, not degrade to unverified"
+        );
+        mock.assert_async().await;
+    }
+
     /// Regression for critic S2 (#553 review): `paginate_tags` fetches a batch's pages
     /// concurrently via ordered `buffered`, which polls every in-flight future on each
     /// poll regardless of which one it's currently waiting to yield. So a discarded page
@@ -901,6 +958,28 @@ mod tests {
             .unwrap_err();
         assert_matches!(err, DepsError::HttpStatus { status: 403, .. });
         assert!(!registry.rate_limit.is_tripped());
+    }
+
+    /// #1295: unlike the unconfirmed tokened 403 above, a 403 carrying confirmed
+    /// `X-RateLimit-Remaining: 0` evidence is genuine tokened-quota exhaustion (5000/h),
+    /// not a repo-scoped access restriction — it must still trip the shared gate even with a
+    /// token configured.
+    #[tokio::test]
+    async fn test_get_versions_403_with_token_and_confirmed_evidence_trips_gate() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "0")
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), true);
+        let err = registry.get_versions("owner/repo").await.unwrap_err();
+        assert_matches!(err, DepsError::RateLimited { verified: true, .. });
+        assert!(registry.rate_limit.is_tripped());
     }
 
     #[tokio::test]
