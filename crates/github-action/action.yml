@@ -52,7 +52,7 @@ outputs:
       exit code other than 0 or 1.
 runs:
   using: docker
-  image: docker://ghcr.io/bug-ops/deps-lsp-github-action:1
+  image: docker://ghcr.io/bug-ops/deps-lsp-github-action@sha256:4361896940340be0daaf44c1db14ff0a45a094c830809c3fca8e0c7adae3973d
   env:
     DEPS_CLI_PATHS: ${{ inputs.paths }}
     DEPS_CLI_FAIL_ON: ${{ inputs.fail-on }}
