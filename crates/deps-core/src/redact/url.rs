@@ -64,14 +64,33 @@ use std::borrow::Cow;
 /// );
 /// assert_eq!(redact_userinfo("c:/user:hunter2@evil"), "c:***@evil");
 /// ```
+#[must_use]
+pub fn redact_userinfo(raw: &str) -> String {
+    redact_userinfo_with_parsed(raw, None)
+}
+
+/// [`redact_userinfo`], but reusing an already-parsed [`url::Url`] for `raw` when the caller has
+/// one on hand (e.g. from [`is_authority_bearing_url`]) instead of parsing `raw` a second time
+/// (#1317). `parsed` must be the result of parsing exactly `raw`, unmodified — passing a `Url`
+/// parsed from any other string produces incorrect output.
 #[expect(
     clippy::string_slice,
     reason = "#901: authority_start (from find(':') + scheme_separator_end) is an ASCII-byte \
               scan, so it always lands on a char boundary"
 )]
 #[must_use]
-pub fn redact_userinfo(raw: &str) -> String {
-    let Ok(mut url) = url::Url::parse(raw) else {
+pub(super) fn redact_userinfo_with_parsed(raw: &str, parsed: Option<url::Url>) -> String {
+    debug_assert!(
+        parsed
+            .as_ref()
+            .is_none_or(|u| url::Url::parse(raw).ok().as_ref() == Some(u)),
+        "parsed must be the result of parsing exactly raw"
+    );
+    let parse_result = match parsed {
+        Some(url) => Ok(url),
+        None => url::Url::parse(raw),
+    };
+    let Ok(mut url) = parse_result else {
         return redact_userinfo_unparseable(raw);
     };
     // #536 C2: a schemeless `user:pass@host` parses as an opaque scheme+path with no authority,
@@ -1720,20 +1739,38 @@ fn redact_userinfo_opaque_path(raw: &str) -> String {
 /// );
 /// ```
 #[must_use]
+pub fn url_for_tracing(raw: &str) -> String {
+    url_for_tracing_with_parsed(raw, None)
+}
+
+/// [`url_for_tracing`], but reusing an already-parsed [`url::Url`] for `raw` when the caller has
+/// one on hand (e.g. from [`is_authority_bearing_url`]) instead of parsing `raw` a second time
+/// (#1317). `parsed` is only actually reused when `raw` has no `?`/`#` to truncate away — it was
+/// parsed from the untruncated `raw`, so reusing it once a query/fragment must be dropped would
+/// serialize that query/fragment back into the output; the truncated-input case falls back to
+/// [`redact_userinfo`]'s own parse of the (shorter) truncated slice.
+#[must_use]
 #[expect(
     clippy::string_slice,
     reason = "`end` comes from `find` of ASCII '?'/'#' bytes on the raw input string, so it \
               always lands on a valid char boundary"
 )]
-pub fn url_for_tracing(raw: &str) -> String {
+pub(super) fn url_for_tracing_with_parsed(raw: &str, parsed: Option<url::Url>) -> String {
     // #866: truncate raw at the first `?`/`#` before redacting, not after — a credential-shaped
     // `@` in the query/fragment would otherwise get widened over by `extend_credential_at`,
     // consuming that boundary before it can be truncated and leaking the rest of the query.
     let end = raw.find(['?', '#']).unwrap_or(raw.len());
+    if end == raw.len() {
+        return redact_userinfo_with_parsed(raw, parsed);
+    }
     redact_userinfo(&raw[..end])
 }
 
-/// Whether `raw` parses as a URL with an actual authority (`host()` is `Some`).
+/// Parses `raw` as a URL, returning the parsed [`url::Url`] when it has an actual authority
+/// (`host()` is `Some`) — `None` otherwise, whether `raw` failed to parse at all or parsed with
+/// no host. Returning the parsed value rather than a plain `bool` lets a caller (e.g.
+/// [`redact_declaration_key`]) reuse this same parse for its own follow-up redaction call instead
+/// of parsing `raw` a second time (#1317).
 ///
 /// This is not proof [`redact_userinfo`] takes any *particular* internal branch for `raw` — a
 /// host-having URL with no userinfo of its own can still be reached by its aggressive
@@ -1756,8 +1793,8 @@ pub fn url_for_tracing(raw: &str) -> String {
 /// predicate alone (without also checking for credential shape) is not a safe redaction gate on
 /// its own — see that function's doc for why.
 #[must_use]
-pub(super) fn is_authority_bearing_url(raw: &str) -> bool {
-    url::Url::parse(raw).is_ok_and(|url| url.host().is_some())
+pub(super) fn is_authority_bearing_url(raw: &str) -> Option<url::Url> {
+    url::Url::parse(raw).ok().filter(|url| url.host().is_some())
 }
 
 #[cfg(test)]
@@ -1766,20 +1803,18 @@ mod tests {
 
     #[test]
     fn is_authority_bearing_url_true_for_real_urls_including_scheme_colon_slash_less_ones() {
-        assert!(is_authority_bearing_url("https://registry.example/index"));
-        assert!(is_authority_bearing_url(
-            "https:user:hunter2@10.0.0.1/index"
-        ));
-        assert!(is_authority_bearing_url("https:169.254.169.254/index"));
+        assert!(is_authority_bearing_url("https://registry.example/index").is_some());
+        assert!(is_authority_bearing_url("https:user:hunter2@10.0.0.1/index").is_some());
+        assert!(is_authority_bearing_url("https:169.254.169.254/index").is_some());
     }
 
     #[test]
     fn is_authority_bearing_url_false_for_opaque_declaration_key_labels() {
-        assert!(!is_authority_bearing_url("scope:@myorg"));
-        assert!(!is_authority_bearing_url("source:Blocked"));
-        assert!(!is_authority_bearing_url("top-level"));
-        assert!(!is_authority_bearing_url("component-host:10.0.0.1"));
-        assert!(!is_authority_bearing_url("named:internal"));
+        assert!(is_authority_bearing_url("scope:@myorg").is_none());
+        assert!(is_authority_bearing_url("source:Blocked").is_none());
+        assert!(is_authority_bearing_url("top-level").is_none());
+        assert!(is_authority_bearing_url("component-host:10.0.0.1").is_none());
+        assert!(is_authority_bearing_url("named:internal").is_none());
     }
 
     #[test]

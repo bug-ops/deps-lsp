@@ -58,7 +58,7 @@ impl private::Sealed for NameRedaction {}
 
 impl RedactionKind for NameRedaction {
     fn redact(raw: &str) -> String {
-        redact_declaration_key(raw)
+        redact_declaration_key(raw).into_owned()
     }
 }
 
@@ -69,9 +69,10 @@ impl RedactionKind for NameRedaction {
 /// Eagerly redacted at construction: [`Self::new`] applies `K::redact` immediately and
 /// retains only the resulting text, so the raw value passed in is never stored, not even
 /// transiently. The only public read surface — [`Display`](std::fmt::Display),
-/// [`AsRef<str>`], and a [`Debug`](std::fmt::Debug) impl that forwards to the redacted text —
-/// is therefore always safe to log: there is no `expose()`-style escape hatch, because
-/// nothing raw remains to expose.
+/// [`AsRef<str>`], a [`Debug`](std::fmt::Debug) impl that forwards to the redacted text, and
+/// [`Self::into_inner`] (which hands back that same already-redacted text by value) — is
+/// therefore always safe to log: there is no `expose()`-style escape hatch, because nothing raw
+/// remains to expose.
 ///
 /// `PartialEq`/`Eq`/`Hash` compare the *redacted* text, not the original input — see
 /// [`RedactedUrl`]'s own doc for why this is intentional and what it means for using either
@@ -102,6 +103,14 @@ impl<K: RedactionKind> RedactedText<K> {
     #[must_use]
     pub fn new(raw: &str) -> Self {
         Self(K::redact(raw), PhantomData)
+    }
+
+    /// Takes ownership of the redacted text without allocating a second copy — unlike
+    /// [`Display`](std::fmt::Display)/[`AsRef<str>`], which only ever hand back a borrow and so
+    /// require the caller to clone if it needs an owned `String`.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
     }
 }
 
@@ -271,8 +280,10 @@ mod tests {
         }
     }
 
-    /// NFR-004: the only public read surface (`Display`/`AsRef<str>`) returns redacted text
-    /// only, for a known-sensitive input — there is no accessor that could return `raw`.
+    /// NFR-004: the public read surface (`Display`/`AsRef<str>`/`into_inner`) returns redacted
+    /// text only, for a known-sensitive input — there is no accessor that could return `raw`.
+    /// `into_inner` is checked last since it consumes `self` (#1317 critic S3: this accessor
+    /// was added after this test was written and had gone uncovered by it).
     #[test]
     fn test_redacted_url_display_and_as_ref_never_expose_raw_credential() {
         let raw = "https://user:hunter2@registry.example/simple?token=super-secret-value";
@@ -282,6 +293,36 @@ mod tests {
         assert!(!redacted.as_ref().contains("hunter2"));
         assert!(!redacted.as_ref().contains("super-secret-value"));
         assert_eq!(redacted.to_string(), "https://***@registry.example/simple");
+
+        let owned = redacted.into_inner();
+        assert!(!owned.contains("hunter2"));
+        assert!(!owned.contains("super-secret-value"));
+        assert_eq!(owned, "https://***@registry.example/simple");
+    }
+
+    /// `into_inner`'s equivalent of the `RedactedUrl`/`RedactedName` byte-for-byte checks above
+    /// (#1317 critic S3): it must never diverge from `Display`, since it hands back the exact
+    /// same already-redacted `String` instead of a clone of it.
+    #[test]
+    fn test_into_inner_matches_display_byte_for_byte() {
+        for raw in [
+            "https://npm.internal/pkg?token=super-secret-value",
+            "https://user:hunter2@registry.example/simple?token=x",
+            "https://registry.example/simple",
+            "@types/node",
+        ] {
+            assert_eq!(RedactedUrl::new(raw).into_inner(), url_for_tracing(raw));
+        }
+        for raw in [
+            "com.google.guava:guava",
+            "com.google.guava:deploy:TOKEN@git.internal.corp",
+            "source:Blocked",
+        ] {
+            assert_eq!(
+                RedactedName::new(raw).into_inner(),
+                redact_declaration_key(raw)
+            );
+        }
     }
 
     /// `Debug` forwards to the redacted text's own quoted-string rendering, not a

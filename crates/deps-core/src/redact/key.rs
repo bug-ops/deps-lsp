@@ -3,7 +3,8 @@
 //! error message), unlike [`super::url`]'s URL-specific redaction.
 
 use super::url::{
-    is_authority_bearing_url, redact_userinfo, segment_has_credential_colon, url_for_tracing,
+    is_authority_bearing_url, redact_userinfo_with_parsed, segment_has_credential_colon,
+    url_for_tracing_with_parsed,
 };
 
 /// Redacts a [`crate::ecosystem::BlockedRegistryOccurrence::declaration_key`] value for safe
@@ -12,7 +13,7 @@ use super::url::{
 /// `key` is not always a URL: most ecosystems set it to a short opaque label (`"top-level"`,
 /// `"source:Blocked"`, `"scope:@myorg"`), and only some set it to a real registry URL, sometimes
 /// prefixed with an opaque label of the ecosystem's own choosing
-/// (`"source:https://user:pass@host/index"`). Running [`url_for_tracing`]'s aggressive
+/// (`"source:https://user:pass@host/index"`). Running [`super::url::url_for_tracing`]'s aggressive
 /// text-scan fallbacks unconditionally would mangle a label like `"scope:@myorg"` into
 /// `"***@myorg"` (#981), so redaction only runs when `key` shows real URL structure
 /// (`is_authority_bearing_url`) or a credential shape of its own: at least one `@` whose own
@@ -33,8 +34,8 @@ use super::url::{
 /// query/fragment-strip fallback instead.
 ///
 /// Two accepted trade-offs, both favoring over-redaction over under-redaction per this module's
-/// own stated design (see [`redact_userinfo`]'s doc):
-/// - Once triggered, the actual redaction ([`url_for_tracing`]) can still destroy more of `key`
+/// own stated design (see [`super::url::redact_userinfo`]'s doc):
+/// - Once triggered, the actual redaction ([`super::url::url_for_tracing`]) can still destroy more of `key`
 ///   than just the credential — e.g. `"source:feed//user:hunter2@h"` redacts to `"***@h"`,
 ///   losing the `"source:feed//"` label entirely — since the fallback scan this reaches has no
 ///   way to tell where the opaque label ends and true userinfo begins once neither
@@ -81,11 +82,34 @@ use super::url::{
 /// );
 /// ```
 #[must_use]
-pub fn redact_declaration_key(key: &str) -> String {
-    if is_authority_bearing_url(key) || has_credential_shape(key) {
-        url_for_tracing(key)
+#[expect(
+    clippy::string_slice,
+    reason = "idx comes from find of ASCII '?'/'#' bytes on key, so it always lands on a char \
+              boundary"
+)]
+pub fn redact_declaration_key(key: &str) -> std::borrow::Cow<'_, str> {
+    // Parsed once and reused for both the authority-bearing check and the redaction call below
+    // (#1317) — `is_authority_bearing_url` hands back the parsed `Url` instead of a plain `bool`
+    // for exactly this reason.
+    let parsed = is_authority_bearing_url(key);
+    if parsed.is_some() || has_credential_shape(key) {
+        // The gate firing doesn't mean the text actually changed (e.g. an authority-bearing,
+        // credential-free URL) — a value-equality check is needed to still borrow in that case,
+        // not just when the gate never fires at all (critic S1, #1317). Note this still costs
+        // `url_for_tracing_with_parsed`'s own internal `String` allocation on that no-op path
+        // (code-review follow-up, #1317) — the `Cow::Borrowed` below only avoids a caller
+        // re-allocating a second time on top of it via `Display`/`.to_string()`.
+        let redacted = url_for_tracing_with_parsed(key, parsed);
+        if redacted == key {
+            std::borrow::Cow::Borrowed(key)
+        } else {
+            std::borrow::Cow::Owned(redacted)
+        }
     } else {
-        key.split(['?', '#']).next().unwrap_or_default().to_string()
+        match key.find(['?', '#']) {
+            Some(idx) => std::borrow::Cow::Owned(key[..idx].to_string()),
+            None => std::borrow::Cow::Borrowed(key),
+        }
     }
 }
 
@@ -181,11 +205,13 @@ pub const MAX_PARSE_ERROR_LOG_BYTES: usize = 200;
 /// or forward the result avoids a second clone) when redaction was a no-op and it's already
 /// short enough.
 ///
-/// Note: this does not currently avoid the *first* allocation — [`redact_declaration_key`]
-/// itself always builds an owned `String`, even on its own no-op branch, so a `Cow::Borrowed`
-/// here still follows one allocation inside it. Making [`redact_declaration_key`] itself
-/// `Cow`-returning would close that gap, but it has ~20 other call sites across the workspace,
-/// so that's out of scope here (a possible follow-up, not done by this PR).
+/// [`redact_declaration_key`] itself returns a `Cow`, so this function's own no-op path never
+/// re-allocates on top of it (#1317) — it just forwards `redact_declaration_key`'s own
+/// `Cow::Borrowed`. This is guaranteed allocation-free only for `redact_declaration_key`'s plain
+/// opaque-key fallback (no `?`/`#`, no URL/credential shape); its authority-bearing,
+/// credential-free case (e.g. a plain registry URL with no query) still allocates internally
+/// before that `Cow::Borrowed` short-circuit discards the allocation (code-review follow-up,
+/// #1317) — the win there is one fewer allocation, not zero.
 ///
 /// This is the single shared implementation behind both `deps-core`'s own parse-error sinks and
 /// `deps_pypi::parser::truncate_for_log`'s delegation to it — see CLAUDE.md's cross-ecosystem
@@ -213,12 +239,7 @@ pub const MAX_PARSE_ERROR_LOG_BYTES: usize = 200;
               boundary"
 )]
 pub fn redact_parse_error_for_log(raw: &str) -> std::borrow::Cow<'_, str> {
-    let redacted = redact_declaration_key(raw);
-    let text: std::borrow::Cow<'_, str> = if redacted == raw {
-        std::borrow::Cow::Borrowed(raw)
-    } else {
-        std::borrow::Cow::Owned(redacted)
-    };
+    let text = redact_declaration_key(raw);
     if text.len() <= MAX_PARSE_ERROR_LOG_BYTES {
         return text;
     }
@@ -253,9 +274,25 @@ pub fn redact_parse_error_for_log(raw: &str) -> std::borrow::Cow<'_, str> {
 /// ```
 #[must_use]
 pub fn parse_error_source(e: &dyn std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
-    Box::new(std::io::Error::other(
-        redact_parse_error_for_log(&e.to_string()).into_owned(),
-    ))
+    Box::new(std::io::Error::other(redact_parse_error_for_log_owned(
+        e.to_string(),
+    )))
+}
+
+/// [`redact_parse_error_for_log`]'s owned-input counterpart: `raw` is already an owned
+/// allocation the caller has no further use for, so the no-op path returns it directly instead
+/// of cloning a borrow of it via `Cow::into_owned` (#1317) — the exact allocation
+/// [`parse_error_source`] used to pay twice for on the benign (no-credential) path.
+#[must_use]
+fn redact_parse_error_for_log_owned(raw: String) -> String {
+    // Relies on `Borrowed` always meaning "the full, untruncated `raw`" — true today, since
+    // `redact_parse_error_for_log`'s truncation branch always returns `Owned` (never a
+    // `Cow::Borrowed(&raw[..boundary])` slice) specifically so this substitution stays correct;
+    // that invariant would need to move here too if the truncation branch ever changed.
+    match redact_parse_error_for_log(&raw) {
+        std::borrow::Cow::Borrowed(_) => raw,
+        std::borrow::Cow::Owned(s) => s,
+    }
 }
 
 /// The segment-bounded `@`/`:` scan shared by [`redact_declaration_key`] (decides whether a
@@ -284,11 +321,11 @@ fn has_credential_shape(key: &str) -> bool {
 /// Detects, in order:
 /// - a `?`/`#` anywhere in `value` (#1206 S2) — a query string is exactly where a token can
 ///   travel (`?token=...`, `?access_token=...`) without ever taking the `user:pass@host`
-///   shape the checks below look for, and [`url_for_tracing`] already treats *any* query or
+///   shape the checks below look for, and [`super::url::url_for_tracing`] already treats *any* query or
 ///   fragment as untrusted-by-default (it drops both unconditionally, per #866/#858) — this
 ///   function applies that same always-suspect rule to the reject-before-search decision, not
 ///   just to what gets logged afterward;
-/// - for a real URL authority (`host()` is `Some`), whether [`redact_userinfo`] would change
+/// - for a real URL authority (`host()` is `Some`), whether [`super::url::redact_userinfo`] would change
 ///   `value` at all — not just a non-empty username/password on the authority itself. A
 ///   credential-shaped `user:pass@host` span can also sit *after* the authority, later in the
 ///   path (e.g. `https://mirror.example/redirect/user:pass@evil.com`, code-review round 1
@@ -306,7 +343,7 @@ fn has_credential_shape(key: &str) -> bool {
 /// "does this parse as a URL at all" — an ordinary credential-free, query-free URL
 /// (`https://host/path`) returns `false` here.
 ///
-/// Narrower than [`url_for_tracing`]'s own redaction coverage in one specific way: a
+/// Narrower than [`super::url::url_for_tracing`]'s own redaction coverage in one specific way: a
 /// scheme-stripped, colon-less, token-only userinfo (e.g. `ghp_TOKEN@host/path`, with no `:`
 /// anywhere) is not flagged here, even though `url_for_tracing` would still redact it via
 /// `find_token_prefix_at`'s prefix sniffing. Not widened to match: probe-testing found that
@@ -365,11 +402,14 @@ pub fn is_credential_or_query_bearing(value: &str) -> bool {
     if value.contains(['?', '#']) {
         return true;
     }
-    if let Ok(url) = url::Url::parse(value)
-        && !url.cannot_be_a_base()
-        && url.host().is_some()
+    // Parsed once and reused below (#1317) instead of parsing `value` again inside
+    // `redact_userinfo`.
+    let parsed = url::Url::parse(value).ok();
+    if parsed
+        .as_ref()
+        .is_some_and(|url| !url.cannot_be_a_base() && url.host().is_some())
     {
-        return redact_userinfo(value) != value;
+        return redact_userinfo_with_parsed(value, parsed) != value;
     }
     has_credential_shape(value)
 }
@@ -407,6 +447,21 @@ mod tests {
                 "credential in {adversarial:?} must not survive redaction"
             );
         }
+    }
+
+    /// Critic S2 (#1317): pins `url_for_tracing_with_parsed`'s `end != raw.len()` fallback —
+    /// when `key` has a query/fragment to truncate away, the `Url` parsed from the *untruncated*
+    /// `key` by `is_authority_bearing_url` must be discarded and the truncated slice re-parsed,
+    /// or the query string (and any credential inside it) would leak past #866's truncate-first
+    /// guarantee.
+    #[test]
+    fn redact_declaration_key_truncates_query_credential_on_authority_bearing_url() {
+        let redacted =
+            redact_declaration_key("https://user:hunter2@registry.example/index?token=SECRET");
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("SECRET"));
+        assert!(!redacted.contains("token"));
+        assert_eq!(redacted, "https://***@registry.example/index");
     }
 
     #[test]

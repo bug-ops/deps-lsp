@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **ci**: bump `taiki-e/install-action` to v2.87.18 and `jsonschema` to 0.57 (#1315)
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-dart, deps-npm**: new `deps_core::check_yaml_bounds` helper centralizes duplicated YAML nesting-depth/expansion-guard wiring across 5 call sites (resolves #1245) (#1314)
 - **deps-core**: URL/declaration-key/parse-error redaction and the in-memory secret wrapper moved from `net_policy`/`secret` into a new `redact` module; old paths are kept as re-exports, so no call site needs updating (resolves #1247, #1216) (#1316)
+- **deps-core**: `redact` module dedupes the double URL-parse on the declaration-key redaction hot path and avoids a second allocation on its opaque-key no-op path (resolves #1317)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)

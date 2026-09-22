@@ -1167,7 +1167,7 @@ fn blocked_registry_diagnostics(
 fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> Diagnostic {
     // #936: redact before truncating so host/path stay identifiable while a query-string
     // credential never reaches this client-visible diagnostic.
-    let redacted_value = RedactedUrl::new(&occurrence.raw_value).to_string();
+    let redacted_value = RedactedUrl::new(&occurrence.raw_value).into_inner();
     // `declaration_key` is opaque (e.g. "top-level") for most ecosystems and would be mangled
     // by an unconditional userinfo-scan, so redaction only runs when the key looks like a URL —
     // see `redact_declaration_key`'s own doc comment for the exact gate and its history (#981,

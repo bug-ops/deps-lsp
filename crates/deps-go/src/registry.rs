@@ -411,7 +411,7 @@ impl GoRegistry {
         // both cheaper and immune to a future fallback-chain-length bump multiplying the cost.
         let redacted_module_path = deps_core::net_policy::redact_declaration_key(module_path);
         let mut last_miss: Result<Vec<GoVersion>> = Err(DepsError::PackageNotFound {
-            package: redacted_module_path.clone().into(),
+            package: redacted_module_path.clone().into_owned().into(),
             registry: REGISTRY,
         });
 
@@ -434,7 +434,7 @@ impl GoRegistry {
                 Ok(empty) => last_miss = Ok(empty),
                 Err(DepsError::PackageNotFound { .. }) => {
                     last_miss = Err(DepsError::PackageNotFound {
-                        package: redacted_module_path.clone().into(),
+                        package: redacted_module_path.clone().into_owned().into(),
                         registry: REGISTRY,
                     });
                 }

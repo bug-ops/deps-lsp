@@ -877,10 +877,15 @@ mod truncate_for_log_tests {
 
     #[test]
     fn short_credential_free_input_is_borrowed_unchanged() {
-        assert!(matches!(
-            truncate_for_log("requests==2.31.0"),
-            std::borrow::Cow::Borrowed("requests==2.31.0")
-        ));
+        // `"https://pypi.org/simple"` pins #1317's critic S1: an authority-bearing,
+        // credential-free URL must still borrow — the redaction gate firing is not itself
+        // proof the text changed.
+        for benign in ["requests==2.31.0", "https://pypi.org/simple"] {
+            assert!(
+                matches!(truncate_for_log(benign), std::borrow::Cow::Borrowed(b) if b == benign),
+                "{benign:?} has no credential to redact and must be borrowed unchanged"
+            );
+        }
     }
 
     #[test]
@@ -905,6 +910,7 @@ mod truncate_for_log_tests {
             "test:unit",
             "isabella@example.com",
             "duplicate key: `name`",
+            "https://pypi.org/simple",
         ] {
             assert!(
                 matches!(truncate_for_log(benign), std::borrow::Cow::Borrowed(b) if b == benign),
