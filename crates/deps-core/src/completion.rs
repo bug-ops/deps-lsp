@@ -741,8 +741,18 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 /// `Some(CompletionItem)` ready to send to the LSP client, or `None` when
 /// `metadata.name()` fails [`crate::is_safe_package_name`] — a malicious/compromised
 /// registry search result must not reach the manifest as an unsanitized `label`,
-/// `insert_text`, `text_edit`, `sort_text`, or `filter_text`, so the item is dropped
-/// rather than built with unsafe text.
+/// `insert_text`, `text_edit`, `sort_text`, or `filter_text` (all derived from `name`), so
+/// the item is dropped rather than built with unsafe text.
+///
+/// `None` also when `metadata.latest_version()` (whenever non-empty) fails
+/// [`crate::lsp_helpers::is_safe_version_string`]. `latest` only ever reaches `detail`
+/// and the (already markdown-escaped) documentation body, never the five `name`-derived
+/// fields above, but a version string this malformed isn't a plausible version either —
+/// rather than partially render an item around a value that failed its own allowlist, the
+/// whole item is dropped, consistent with how `name` failing its allowlist drops the item.
+/// Shared by every caller that builds a package-name completion item, including
+/// `deps-lsp`'s raw-text fallback path (issue #1284) — both paths gain this gate together
+/// rather than one silently lacking it.
 ///
 /// # Examples
 ///
@@ -774,6 +784,15 @@ pub fn build_package_completion(
         return None;
     }
     let latest = metadata.latest_version().as_str();
+
+    if !latest.is_empty() && !is_safe_version_string(latest) {
+        warn_rejected_value(
+            "is_safe_version_string",
+            "primary completion path latest version",
+            latest,
+        );
+        return None;
+    }
 
     let header = if latest.is_empty() {
         format!("**{}**", escape_markdown(name.as_str()))
@@ -3127,9 +3146,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_package_completion_escapes_malicious_version_link_breakout() {
-        // `latest_version` isn't gated by `is_safe_package_name` (that only guards `name`),
-        // so it must still be escaped to prevent the same link-breakout injection.
+    fn test_build_package_completion_rejects_unsafe_latest_version() {
+        // #1284: an unsafe `latest_version` is now rejected outright, not just escaped.
         let malicious_latest = "1.0.0)[click](https://evil.example";
         let metadata = MockMetadata {
             name: "test-pkg".into(),
@@ -3140,15 +3158,27 @@ mod tests {
         };
 
         let range = Range::default();
+        assert!(build_package_completion(&metadata, range).is_none());
+    }
+
+    #[test]
+    fn test_build_package_completion_escapes_markdown_active_chars_in_safe_version() {
+        // The allowlist still permits markdown-active chars (`*`/`!`/`^`/`~`/`:`), so escaping stays required.
+        let latest = "1.0.0-alpha*evil*";
+        let metadata = MockMetadata {
+            name: "test-pkg".into(),
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version: latest.into(),
+        };
+
+        let range = Range::default();
         let item = build_package_completion(&metadata, range).unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
-            assert!(!content.value.contains(")[click]("));
-            assert!(
-                content
-                    .value
-                    .contains(r"1\.0\.0\)\[click\]\(https\:\/\/evil\.example")
-            );
+            assert!(!content.value.contains("*evil*"));
+            assert!(content.value.contains(r"\*evil\*"));
         } else {
             panic!("Expected MarkupContent documentation");
         }

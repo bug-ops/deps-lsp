@@ -10,6 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **github-action**: `action.yml` now pins the Docker image by digest instead of the mutable `:1` tag; the release workflow opens a PR repointing `action.yml` at the newly published digest on every release, for a maintainer to review and merge (resolves #1274) (#1292)
 
+### Fixed
+- **deps-lsp**: raw-text fallback package completion now matches the primary path's `sort_text`/`filter_text`/`detail`/`documentation`/`insert_text_format`, and gains the same latest-version safety gate (resolves #1284) (#1291)
+
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
 
