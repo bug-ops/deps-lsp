@@ -2120,21 +2120,21 @@ macro_rules! complete_versions_test_shim {
 
 /// URL-shaped credential probe for [`crate::debug_redaction_conformance!`] — plant into a
 /// `url`-typed field a manual `Debug` impl is expected to run through
-/// [`crate::net_policy::RedactedUrl`].
+/// [`crate::redact::RedactedUrl`].
 pub const CREDENTIAL_PROBE_URL: &str = "https://deploy:hunter2@git.internal.corp/team/x.git";
 
 /// Coordinate/key-shaped credential probe for [`crate::debug_redaction_conformance!`].
 ///
 /// Plant into a name/path/key-typed field a manual `Debug` impl is expected to run through
-/// [`crate::net_policy::redact_declaration_key`].
+/// [`crate::redact::redact_declaration_key`].
 pub const CREDENTIAL_PROBE_KEY: &str = "org.example:deploy:hunter2@git.internal.corp";
 
 /// The password half of both probe constants — must never appear in a redacted `Debug`
 /// rendering.
 pub const CREDENTIAL_PROBE_SECRET: &str = "hunter2";
 
-/// The marker both [`crate::net_policy::RedactedUrl`] and
-/// [`crate::net_policy::redact_declaration_key`] converge on for either probe constant —
+/// The marker both [`crate::redact::RedactedUrl`] and
+/// [`crate::redact::redact_declaration_key`] converge on for either probe constant —
 /// the anti-vacuity signal [`assert_debug_redacts_credentials`] counts occurrences of.
 const PROBE_MARKER: &str = "***@git.internal.corp";
 
@@ -2208,7 +2208,7 @@ pub fn assert_debug_redacts_credentials<T: std::fmt::Debug>(
 /// impl std::fmt::Debug for Fake {
 ///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 ///         f.debug_struct("Fake")
-///             .field("url", &deps_core::net_policy::RedactedUrl::new(&self.url))
+///             .field("url", &deps_core::redact::RedactedUrl::new(&self.url))
 ///             .finish()
 ///     }
 /// }

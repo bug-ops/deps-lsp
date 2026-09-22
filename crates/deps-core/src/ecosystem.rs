@@ -304,11 +304,11 @@ impl std::fmt::Debug for BlockedRegistryOccurrence {
             .field("class", &self.class)
             .field(
                 "raw_value",
-                &crate::net_policy::RedactedUrl::new(&self.raw_value),
+                &crate::redact::RedactedUrl::new(&self.raw_value),
             )
             .field(
                 "declaration_key",
-                &crate::net_policy::redact_declaration_key(&self.declaration_key),
+                &crate::redact::redact_declaration_key(&self.declaration_key),
             )
             .finish()
     }
@@ -348,11 +348,11 @@ impl std::fmt::Debug for BlockedSourceClass {
             .field("class", &self.class)
             .field(
                 "raw_value",
-                &crate::net_policy::RedactedUrl::new(&self.raw_value),
+                &crate::redact::RedactedUrl::new(&self.raw_value),
             )
             .field(
                 "declaration_key",
-                &crate::net_policy::redact_declaration_key(&self.declaration_key),
+                &crate::redact::redact_declaration_key(&self.declaration_key),
             )
             .finish()
     }

@@ -1344,7 +1344,7 @@ pub fn escape_markdown(s: &str) -> String {
 /// Source (CVE-2021-42574) or text-smuggling use, and no legitimate mid-string use in
 /// registry-supplied free text.
 ///
-/// Deliberately narrower than [`crate::net_policy::sanitize_invisible`]'s whole-category
+/// Deliberately narrower than [`crate::redact::sanitize_invisible`]'s whole-category
 /// (`Cf`/`Zl`/`Zp`) sweep: both `escape_markdown` and `markdown_code_span` also process
 /// free text (registry descriptions) that can legitimately carry `Cf` marks such as
 /// U+200F RIGHT-TO-LEFT MARK, U+061C ARABIC LETTER MARK, U+200E LEFT-TO-RIGHT MARK, or

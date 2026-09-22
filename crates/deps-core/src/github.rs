@@ -105,7 +105,7 @@ pub fn validate_owner_repo(name: &str) -> Result<()> {
     }
     Err(DepsError::InvalidUri(format!(
         "invalid owner/repo format: '{}'",
-        crate::net_policy::redact_declaration_key(name)
+        crate::redact::redact_declaration_key(name)
     )))
 }
 
@@ -390,7 +390,7 @@ impl GithubTagsClient {
     /// Propagates the underlying HTTP/cache error unchanged.
     #[tracing::instrument(
         skip(self),
-        fields(url = %crate::net_policy::RedactedUrl::new(url))
+        fields(url = %crate::redact::RedactedUrl::new(url))
     )]
     pub async fn fetch_authenticated(&self, url: &str) -> Result<Bytes> {
         self.cache
@@ -410,7 +410,7 @@ impl GithubTagsClient {
     /// Propagates the underlying HTTP/cache error unchanged.
     #[tracing::instrument(
         skip(self),
-        fields(name = %crate::net_policy::redact_declaration_key(name), page = page)
+        fields(name = %crate::redact::redact_declaration_key(name), page = page)
     )]
     pub async fn fetch_tags_page(&self, name: &str, page: u32) -> Result<Bytes> {
         let url = format!(
@@ -782,7 +782,7 @@ impl ReleaseDatesCache {
     /// ```
     #[tracing::instrument(
         skip(self, github),
-        fields(name = %crate::net_policy::redact_declaration_key(name), ecosystem = ecosystem)
+        fields(name = %crate::redact::redact_declaration_key(name), ecosystem = ecosystem)
     )]
     pub async fn fetch(
         &self,
@@ -829,14 +829,14 @@ impl ReleaseDatesCache {
             Ok(Err(e)) => {
                 let (status, cause) = e.safe_tracing_summary();
                 tracing::debug!(
-                    package = %crate::net_policy::redact_declaration_key(name),
+                    package = %crate::redact::redact_declaration_key(name),
                     status = ?status,
                     cause,
                     "release dates fetch failed"
                 );
             }
             Err(_) => tracing::debug!(
-                package = %crate::net_policy::redact_declaration_key(name),
+                package = %crate::redact::redact_declaration_key(name),
                 "release dates fetch timed out"
             ),
             Ok(Ok(_)) => {}

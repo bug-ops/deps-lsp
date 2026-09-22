@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::net_policy::{RedactedName, RedactedUrl};
+use crate::redact::{RedactedName, RedactedUrl};
 
 /// Reconstructs the "{status} {reason}" text `reqwest::StatusCode`'s `Display`
 /// produces, since `HttpStatus` stores a bare `u16` for structural matching
@@ -27,7 +27,7 @@ fn http_status_message(status: u16, url: &RedactedUrl) -> String {
 /// [`RedactedUrl`] rather than a plain `String` — a no-op for an actual package name
 /// (including an npm-scoped one like `@types/node`, which an earlier revision of this
 /// function mangled into `***@types/node` before
-/// [`crate::net_policy::redact_userinfo`]'s empty-userinfo false positive was fixed at the
+/// [`crate::redact::redact_userinfo`]'s empty-userinfo false positive was fixed at the
 /// root — #767 M1/code-review follow-up). `source`'s own `Display` can no longer re-embed the
 /// raw URL either: [`SanitizedRegistryError`]'s only constructor strips it unconditionally.
 fn registry_error_message(package: &RedactedUrl, source: &SanitizedRegistryError) -> String {

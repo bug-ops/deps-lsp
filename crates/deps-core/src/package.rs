@@ -28,7 +28,7 @@ use std::fmt;
 /// as it would silently break those ecosystems.
 ///
 /// This type has no [`Display`](fmt::Display) impl, and its [`Debug`](fmt::Debug) impl
-/// redacts via [`crate::net_policy::redact_declaration_key`] rather than deriving (#1217) —
+/// redacts via [`crate::redact::redact_declaration_key`] rather than deriving (#1217) —
 /// see [`Self::for_tracing`] for why, and use [`Self::as_str`]/[`Self::as_ref`]/
 /// [`Self::into_string`] for the raw value.
 ///
@@ -94,7 +94,7 @@ impl PackageName {
     }
 
     /// Renders this name for `tracing`/log output, redacting it via
-    /// [`crate::net_policy::redact_declaration_key`] first (#1209).
+    /// [`crate::redact::redact_declaration_key`] first (#1209).
     ///
     /// A manifest can hold a credential in a name-shaped field (e.g. a Maven
     /// `group:artifact:secret@host` coordinate produced by property
@@ -119,18 +119,18 @@ impl PackageName {
     /// ```
     #[must_use]
     pub fn for_tracing(&self) -> String {
-        crate::net_policy::redact_declaration_key(&self.0)
+        crate::redact::redact_declaration_key(&self.0)
     }
 }
 
 impl fmt::Debug for PackageName {
     /// Forwards to the redacted text's own `Debug` (a quoted string), not a struct-wrapper
-    /// rendering — mirrors [`crate::net_policy::RedactedName`]'s `Debug` impl. This makes
+    /// rendering — mirrors [`crate::redact::RedactedName`]'s `Debug` impl. This makes
     /// `?name`, and any `#[derive(Debug)]` struct/enum that embeds a `PackageName`, safe by
     /// construction against the credential-in-a-name-shaped-field case [`Self::for_tracing`]
     /// documents (#1217).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&crate::net_policy::redact_declaration_key(&self.0), f)
+        fmt::Debug::fmt(&crate::redact::redact_declaration_key(&self.0), f)
     }
 }
 

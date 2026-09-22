@@ -868,7 +868,7 @@ pub struct RegistriesConfig {
 /// verbatim into `server.rs`'s `tracing::debug!("loaded configuration: {:?}", config)` at
 /// `RUST_LOG=debug`, before `deps_gitlab_ci::host::GitlabInstanceHost::get` ever gets a
 /// chance to reject it. Every field is still shown (this is not a summary); only
-/// `gitlab_instance_host` is routed through [`crate::net_policy::RedactedUrl`] first.
+/// `gitlab_instance_host` is routed through [`crate::redact::RedactedUrl`] first.
 impl std::fmt::Debug for RegistriesConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RegistriesConfig")
@@ -879,7 +879,7 @@ impl std::fmt::Debug for RegistriesConfig {
             )
             .field(
                 "gitlab_instance_host",
-                &crate::net_policy::RedactedUrl::new(&self.gitlab_instance_host),
+                &crate::redact::RedactedUrl::new(&self.gitlab_instance_host),
             )
             .finish()
     }
@@ -983,7 +983,7 @@ impl std::fmt::Debug for RegistryRuntimeSettings {
                 &self
                     .gitlab_instance_host
                     .as_deref()
-                    .map(crate::net_policy::RedactedUrl::new),
+                    .map(crate::redact::RedactedUrl::new),
             )
             .finish()
     }

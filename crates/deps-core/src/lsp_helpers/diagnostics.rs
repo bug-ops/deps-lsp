@@ -4,9 +4,9 @@ use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severit
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
-use crate::net_policy::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::osv::{ScanOutcome, diagnostic_severity_for};
 use crate::position::{Position, Range};
+use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, FetchFailure, PackageName,
     ParseResult, PublishTime, RemovalStatus, VersionReq, format_relative_age, is_within_cooldown,
@@ -177,7 +177,7 @@ pub(crate) const MAX_VERSION_DIAGNOSTIC_CHARS: usize = MAX_DIAGNOSTIC_VALUE_CHAR
 ///    that turned out to hold `https://user:TOKEN@host/path`) to `***@host/...` first —
 ///    truncating before this step could cut the string exactly at the boundary the
 ///    credential-shape scan depends on, leaking a credential that straddles the cut (the
-///    same ordering [`crate::net_policy::redact_parse_error_for_log`] uses, #1240).
+///    same ordering [`crate::redact::redact_parse_error_for_log`] uses, #1240).
 /// 2. [`sanitize_invisible`] then neutralizes any remaining control/format character (in the
 ///    host/path remainder, or on the non-credential branch) that could splice a fabricated
 ///    line into a table row or forge a bidi-spoofed display name (#1246).

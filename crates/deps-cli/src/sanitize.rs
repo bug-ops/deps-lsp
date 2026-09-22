@@ -8,7 +8,7 @@
 //! missed two sites on the first pass — the omission class this module exists to make
 //! structurally impossible instead of just individually fixed (#1299 round 2).
 
-use deps_core::net_policy::sanitize_invisible;
+use deps_core::redact::sanitize_invisible;
 use std::path::{Path, PathBuf};
 
 /// Sanitizes `path` for any client-visible path sink.
@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 /// Neutralizes every raw ANSI escape byte or Unicode control/format/line/paragraph-separator
 /// character (in particular a bidi override such as U+202E, the Trojan Source /
 /// CVE-2021-42574 vector) a crafted directory or file name could embed, using
-/// [`deps_core::net_policy::sanitize_invisible`]. Deliberately does not truncate — unlike a
+/// [`deps_core::redact::sanitize_invisible`]. Deliberately does not truncate — unlike a
 /// package name or requirement, a legitimate path has no natural short bound, and truncating
 /// it would make the reported location misleading rather than just shorter.
 #[must_use]

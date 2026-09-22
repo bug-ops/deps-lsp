@@ -392,7 +392,7 @@ impl DepsDevClient {
     /// [`DEPS_DEV_CALL_TIMEOUT`].
     #[tracing::instrument(
         skip(self),
-        fields(url = %crate::net_policy::RedactedUrl::new(url))
+        fields(url = %crate::redact::RedactedUrl::new(url))
     )]
     async fn get(&self, url: &str) -> Result<bytes::Bytes, DepsDevFetchError> {
         match tokio::time::timeout(
@@ -453,7 +453,7 @@ impl DepsDevClient {
             }
             Err(DepsDevFetchError::TimedOut) => {
                 tracing::debug!(
-                    package = %crate::net_policy::redact_declaration_key(name),
+                    package = %crate::redact::redact_declaration_key(name),
                     "deps.dev version fetch timed out"
                 );
                 return (None, DEPS_DEV_ERROR_TTL);
