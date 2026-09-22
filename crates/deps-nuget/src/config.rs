@@ -335,7 +335,7 @@ pub type InvalidEntry = deps_core::net_policy::InvalidEntry<NuGetFeedUrlError>;
 /// Output-only: constructed internally by this module's own resolution logic, never by
 /// external code — no constructor is provided.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PackageSourceEntry {
     /// The declared `<add key>` name, case preserved.
     pub key: String,
@@ -347,6 +347,22 @@ pub struct PackageSourceEntry {
     /// Set only by [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::UserProfile`] — never
     /// during accumulation (`upsert_source` always writes `None` here; see its doc).
     pub auth: Option<NuGetAuth>,
+}
+
+impl std::fmt::Debug for PackageSourceEntry {
+    /// Manual, not derived: `key` sits next to `value`'s already-redacted [`NuGetFeedUrl`] —
+    /// the weaker #1217 name-shape sibling of the #1222 sweep (#1237).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PackageSourceEntry")
+            .field(
+                "key",
+                &deps_core::net_policy::redact_declaration_key(&self.key),
+            )
+            .field("value", &self.value)
+            .field("tier", &self.tier)
+            .field("auth", &self.auth)
+            .finish()
+    }
 }
 
 /// One resolved hop in a [`NuGetSourceChain`] (issue #561, FR-016).
@@ -4565,4 +4581,19 @@ mod tests {
              MAX_CONFIG_ANCESTOR_DEPTH levels"
         );
     }
+
+    deps_core::debug_redaction_conformance!(
+        test_package_source_entry_debug_redacts_credentials,
+        1,
+        PackageSourceEntry {
+            key: deps_core::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            value: Ok(NuGetFeedUrl::new(
+                "https://feed.mycorp.example/v3/index.json",
+                &all_policy()
+            )
+            .unwrap(),),
+            tier: ConfigTier::Repo,
+            auth: None,
+        },
+    );
 }

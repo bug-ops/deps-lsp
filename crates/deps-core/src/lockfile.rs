@@ -321,7 +321,7 @@ pub fn locate_lockfile_for_manifest(
 /// Contains the exact version and source information for a dependency
 /// as resolved by the package manager.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedPackage {
     /// Package name
     pub name: String,
@@ -331,6 +331,30 @@ pub struct ResolvedPackage {
     pub source: ResolvedSource,
     /// Dependencies of this package (for dependency tree analysis)
     pub dependencies: Vec<String>,
+}
+
+impl std::fmt::Debug for ResolvedPackage {
+    /// Manual, not derived: `name` and `dependencies` are raw lock-file package names (the
+    /// weaker #1217 name shape), and `source`'s own `Debug` (see [`ResolvedSource`]) redacts
+    /// the credential-capable URL its `Registry`/`Git` variants carry (#1237).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedPackage")
+            .field(
+                "name",
+                &crate::net_policy::redact_declaration_key(&self.name),
+            )
+            .field("version", &self.version)
+            .field("source", &self.source)
+            .field(
+                "dependencies",
+                &self
+                    .dependencies
+                    .iter()
+                    .map(|name| crate::net_policy::redact_declaration_key(name))
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
 }
 
 impl ResolvedPackage {
@@ -377,7 +401,7 @@ impl ResolvedPackage {
 ///
 /// Indicates where the package was downloaded from or how it was resolved.
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum ResolvedSource {
     /// From a registry with optional checksum
     Registry {
@@ -398,6 +422,32 @@ pub enum ResolvedSource {
         /// Relative or absolute path
         path: String,
     },
+}
+
+impl std::fmt::Debug for ResolvedSource {
+    /// Manual, not derived: `Registry`/`Git`'s `url` is copied verbatim from the lock file
+    /// (e.g. Cargo's `git+https://user:token@host/repo`, npm's `resolved`) and can carry a
+    /// credential; `Path`'s `path` is also redacted defensively, since it is the catch-all a
+    /// caller may put an unrecognized URL scheme into (e.g. Cargo's `sparse+https://` sources)
+    /// rather than a filesystem path (CWE-532, #1237).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Registry { url, checksum } => f
+                .debug_struct("Registry")
+                .field("url", &crate::net_policy::RedactedUrl::new(url))
+                .field("checksum", checksum)
+                .finish(),
+            Self::Git { url, rev } => f
+                .debug_struct("Git")
+                .field("url", &crate::net_policy::RedactedUrl::new(url))
+                .field("rev", rev)
+                .finish(),
+            Self::Path { path } => f
+                .debug_struct("Path")
+                .field("path", &crate::net_policy::redact_declaration_key(path))
+                .finish(),
+        }
+    }
 }
 
 /// Collection of resolved packages from a lock file.
@@ -1850,4 +1900,38 @@ mod tests {
         assert!(located.is_some());
         assert_eq!(located.unwrap(), poetry_lock);
     }
+
+    crate::debug_redaction_conformance!(
+        test_resolved_package_debug_redacts_credentials,
+        3,
+        ResolvedPackage {
+            name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            version: "1.0.0".to_string(),
+            source: ResolvedSource::Git {
+                url: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
+                rev: "deadbeef".to_string(),
+            },
+            dependencies: vec![crate::conformance::CREDENTIAL_PROBE_KEY.to_string()],
+        },
+    );
+
+    crate::debug_redaction_conformance!(
+        test_resolved_source_registry_debug_redacts_credentials,
+        1,
+        ResolvedSource::Registry {
+            url: crate::conformance::CREDENTIAL_PROBE_URL.to_string(),
+            checksum: "abc123".to_string(),
+        },
+    );
+
+    // Regression for #1237 S3: `parse_cargo_source` funnels every unrecognized scheme
+    // (including Cargo's own `sparse+https://` default registry protocol since 1.70) into
+    // `Path` rather than `Registry`, so `Path`'s `path` field must redact a credential too.
+    crate::debug_redaction_conformance!(
+        test_resolved_source_path_debug_redacts_sparse_registry_credential,
+        1,
+        ResolvedSource::Path {
+            path: format!("sparse+{}", crate::conformance::CREDENTIAL_PROBE_URL),
+        },
+    );
 }
