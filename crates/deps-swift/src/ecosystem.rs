@@ -40,6 +40,8 @@ use crate::types::SwiftPackage;
 fn build_url_completion(
     package: &SwiftPackage,
     replace_range: Option<LspRange>,
+    index: usize,
+    prefix: &str,
 ) -> Option<CompletionItem> {
     let url = package
         .repository
@@ -51,11 +53,18 @@ fn build_url_completion(
         return None;
     }
 
-    let mut item = deps_core::completion::build_package_completion(package, LspRange::default())?;
+    let mut item = deps_core::completion::build_package_completion(
+        package,
+        LspRange::default(),
+        index,
+        prefix,
+    )?;
 
     item.insert_text = Some(url.clone());
     item.filter_text = Some(url.clone());
-    item.sort_text = Some(url.clone());
+    // `sort_text` is left as `build_package_completion` computed it: `prefix` here is
+    // already the GitHub-scheme-stripped query (see `strip_github_prefix`), which is the
+    // same shape as `package.name()`, so the shared tiering is correct as-is (#1282 S1).
     item.text_edit = replace_range.map(|range| {
         CompletionTextEdit::Edit(TextEdit {
             range,
@@ -132,7 +141,10 @@ impl SwiftEcosystem {
 
         results
             .iter()
-            .filter_map(|package| build_url_completion(package, replace_range))
+            .enumerate()
+            .filter_map(|(index, package)| {
+                build_url_completion(package, replace_range, index, query)
+            })
             .collect()
     }
 }
@@ -275,7 +287,7 @@ mod tests {
     #[test]
     fn test_build_url_completion_uses_repository_url() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
-        let item = build_url_completion(&package, None).unwrap();
+        let item = build_url_completion(&package, None, 0, "").unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -287,7 +299,7 @@ mod tests {
     #[test]
     fn test_build_url_completion_falls_back_to_constructed_url() {
         let package = test_package(None);
-        let item = build_url_completion(&package, None).unwrap();
+        let item = build_url_completion(&package, None, 0, "").unwrap();
 
         assert_eq!(
             item.insert_text,
@@ -297,10 +309,24 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[test]
+    fn test_build_url_completion_preserves_shared_sort_text() {
+        // #1282 S1: `build_url_completion` must not overwrite the `sort_text` that
+        // `build_package_completion` computed from `index`/`prefix` — `query` here is
+        // already GitHub-scheme-stripped (see `strip_github_prefix`), matching
+        // `package.name()`'s bare `owner/repo` shape, so the shared tiering is correct
+        // as-is and must survive unmodified.
+        let package = test_package(Some("https://github.com/apple/swift-nio"));
+        let item = build_url_completion(&package, None, 4, "apple/swift-n").unwrap();
+
+        assert_eq!(item.sort_text, Some("00000000004".to_string()));
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
     fn test_build_url_completion_with_range_sets_text_edit() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
         let range = test_range();
-        let item = build_url_completion(&package, Some(range)).unwrap();
+        let item = build_url_completion(&package, Some(range), 0, "").unwrap();
 
         assert_eq!(
             item.text_edit,
@@ -317,7 +343,7 @@ mod tests {
         // Defensive fallback: when the containing dependency's range can't be resolved,
         // insert_text-only is safer than guessing a range that might not contain the cursor.
         let package = test_package(Some("https://github.com/apple/swift-nio"));
-        let item = build_url_completion(&package, None).unwrap();
+        let item = build_url_completion(&package, None, 0, "").unwrap();
 
         assert_eq!(item.text_edit, None);
     }
@@ -327,7 +353,7 @@ mod tests {
     fn test_build_url_completion_clears_detail_when_latest_version_empty() {
         let package = test_package(Some("https://github.com/apple/swift-nio"));
         assert!(package.latest_version.as_str().is_empty());
-        let item = build_url_completion(&package, None).unwrap();
+        let item = build_url_completion(&package, None, 0, "").unwrap();
 
         assert_eq!(item.detail, None);
     }
@@ -337,7 +363,7 @@ mod tests {
     fn test_build_url_completion_keeps_detail_when_latest_version_present() {
         let mut package = test_package(Some("https://github.com/apple/swift-nio"));
         package.latest_version = "2.40.0".into();
-        let item = build_url_completion(&package, None).unwrap();
+        let item = build_url_completion(&package, None, 0, "").unwrap();
 
         assert_eq!(item.detail, Some("v2.40.0".to_string()));
     }
@@ -349,7 +375,7 @@ mod tests {
             "https://evil.example\", .exact(\"1.0.0\")), .package(url: \"https://real",
         ));
 
-        assert!(build_url_completion(&package, None).is_none());
+        assert!(build_url_completion(&package, None, 0, "").is_none());
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -357,7 +383,7 @@ mod tests {
     fn test_build_url_completion_rejects_non_http_scheme() {
         let package = test_package(Some("file:///etc/passwd"));
 
-        assert!(build_url_completion(&package, None).is_none());
+        assert!(build_url_completion(&package, None, 0, "").is_none());
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -366,7 +392,7 @@ mod tests {
         let mut package = test_package(None);
         package.name = "apple/swift-nio\", .exact(\"1\")) //".to_string().into();
 
-        assert!(build_url_completion(&package, None).is_none());
+        assert!(build_url_completion(&package, None, 0, "").is_none());
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -379,7 +405,7 @@ mod tests {
         let mut package = test_package(Some("https://github.com/apple/swift-nio"));
         package.name = "apple swift-nio\" evil".to_string().into();
 
-        assert!(build_url_completion(&package, None).is_none());
+        assert!(build_url_completion(&package, None, 0, "").is_none());
     }
 
     #[cfg(feature = "lsp-responses")]

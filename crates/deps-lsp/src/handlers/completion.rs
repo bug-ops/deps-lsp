@@ -309,7 +309,10 @@ async fn search_packages(
 
     results
         .iter()
-        .filter_map(|metadata| create_package_completion_item(metadata.as_ref(), ecosystem, bare))
+        .enumerate()
+        .filter_map(|(index, metadata)| {
+            create_package_completion_item(metadata.as_ref(), ecosystem, bare, index, query)
+        })
         .collect()
 }
 
@@ -338,12 +341,21 @@ async fn search_packages(
 /// routes to `Ecosystem::fallback_bare_insert_text` (the cursor already sits inside
 /// open manifest markup that can only safely hold the bare candidate text — #724/
 /// #728), `false` to `Ecosystem::completion_insert_text` (the normal full snippet).
+///
+/// `index`/`prefix` are forwarded to [`deps_core::completion::build_package_completion`]
+/// unchanged — issue #1294: this fallback path previously hardcoded `sort_text` to the
+/// package name (alphabetical, discarding the registry's relevance ranking), the same
+/// #1282 shape bug already fixed on the primary completion path but missed here since
+/// this path builds its `CompletionItem` independently.
 fn create_package_completion_item(
     metadata: &dyn deps_core::Metadata,
     ecosystem: &dyn deps_core::Ecosystem,
     bare: bool,
+    index: usize,
+    prefix: &str,
 ) -> Option<CompletionItem> {
-    let mut item = deps_core::completion::build_package_completion(metadata, Range::default())?;
+    let mut item =
+        deps_core::completion::build_package_completion(metadata, Range::default(), index, prefix)?;
 
     item.insert_text = Some(if bare {
         ecosystem.fallback_bare_insert_text(metadata)?
@@ -1558,7 +1570,7 @@ ser"
             bare_insert_text: default_insert_text,
         };
 
-        assert!(create_package_completion_item(&meta, &ecosystem, false).is_none());
+        assert!(create_package_completion_item(&meta, &ecosystem, false, 0, "").is_none());
     }
 
     /// Issue #336: a registry-reported name breaking out of a manifest string literal
@@ -1605,7 +1617,7 @@ ser"
             bare_insert_text: default_insert_text,
         };
 
-        assert!(create_package_completion_item(&meta, &ecosystem, false).is_none());
+        assert!(create_package_completion_item(&meta, &ecosystem, false, 0, "").is_none());
     }
 
     struct NoopRegistry;
@@ -1844,6 +1856,67 @@ ser"
         assert_eq!(items[0].label, "safe-package");
     }
 
+    /// #1294: `search_packages` must thread each result's registry-response position
+    /// through to `create_package_completion_item`/`build_package_completion` via
+    /// `.enumerate()`, so `sort_text` preserves the registry's own relevance ranking
+    /// instead of every item hardcoding the same value.
+    #[tokio::test]
+    async fn test_search_packages_preserves_registry_relevance_sort_text() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct TwoResultRegistry;
+        impl Registry for TwoResultRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![
+                        Box::new(MockMetadata {
+                            name: deps_core::PackageName::new("serde"),
+                            latest_version: "1.0.0".into(),
+                        }) as Box<dyn Metadata>,
+                        Box::new(MockMetadata {
+                            name: deps_core::PackageName::new("serde_json"),
+                            latest_version: "1.0.0".into(),
+                        }) as Box<dyn Metadata>,
+                    ])
+                })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Cargo, Arc::new(TwoResultRegistry));
+        let items = search_packages(ecosystem.as_ref(), "serde", false).await;
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].sort_text, Some("00000000000".to_string()));
+        assert_eq!(items[1].sort_text, Some("00000000001".to_string()));
+    }
+
     /// #724/#728 plumbing guard: `create_package_completion_item` must route to
     /// `Ecosystem::fallback_bare_insert_text` when `bare` is `true`, never
     /// `completion_insert_text` — proven with a `MockEcosystem` whose
@@ -1868,7 +1941,7 @@ ser"
         };
 
         assert_eq!(
-            create_package_completion_item(&meta, &ecosystem, true)
+            create_package_completion_item(&meta, &ecosystem, true, 0, "")
                 .and_then(|item| item.insert_text),
             Some("bare:guava".to_string())
         );
@@ -1893,9 +1966,11 @@ ser"
         let primary = deps_core::completion::build_package_completion(
             &meta,
             tower_lsp_server::ls_types::Range::default(),
+            2,
+            "ser",
         )
         .unwrap();
-        let fallback = create_package_completion_item(&meta, &ecosystem, false).unwrap();
+        let fallback = create_package_completion_item(&meta, &ecosystem, false, 2, "ser").unwrap();
 
         assert_eq!(fallback.label, primary.label);
         assert_eq!(fallback.kind, primary.kind);
@@ -1908,6 +1983,31 @@ ser"
         // Diverges by design: no known insert range in the fallback path.
         assert!(fallback.text_edit.is_none());
         assert!(primary.text_edit.is_some());
+    }
+
+    /// #1294: the fallback path previously hardcoded `sort_text` to the package name
+    /// (forcing alphabetical client-side sorting, the same #1282 shape bug already fixed
+    /// on the primary completion path) rather than threading `index`/`prefix` through to
+    /// [`deps_core::completion::build_package_completion`] — pins the actual tiered value,
+    /// not just that this path and the primary path happen to agree.
+    #[test]
+    fn test_create_package_completion_item_preserves_registry_relevance_sort_text() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("serde"),
+            latest_version: "1.0.214".into(),
+        };
+        let ecosystem = MockEcosystem {
+            ecosystem_id: deps_core::EcosystemId::Cargo,
+            registry: Arc::new(NoopRegistry),
+            fallback_prefix: None,
+            insert_text: default_insert_text,
+            is_bare: false,
+            bare_insert_text: default_insert_text,
+        };
+
+        // "ser" is an exact prefix of "serde" -> tier 0, index 2.
+        let item = create_package_completion_item(&meta, &ecosystem, false, 2, "ser").unwrap();
+        assert_eq!(item.sort_text, Some("00000000002".to_string()));
     }
 
     #[tokio::test(start_paused = true)]

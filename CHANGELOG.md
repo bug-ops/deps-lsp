@@ -9,19 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **ci**: new weekly/manual `live-registry-tests` workflow runs the workspace's `#[ignore]`d, network-gated tests with a real `GITHUB_TOKEN`, non-blocking for PRs (#1297)
+- **deps-core**: new `completion::build_completion_sort_text`/`starts_with_ascii_case_insensitive` helpers computing exact-prefix-tiered `sort_text`, shared by deps-maven and deps-swift's field/url completion overrides (resolves #1282) (#1293)
 
 ### Security
 - **github-action**: `action.yml` now pins the Docker image by digest instead of the mutable `:1` tag; the release workflow opens a PR repointing `action.yml` at the newly published digest on every release, for a maintainer to review and merge (resolves #1274) (#1292)
 - **deps-core**: hover no longer renders unbounded OSV advisory `id`/`fixed`/`version`/`summary`/`aliases` text (resolves #1272) (#1298)
+- **deps-core**: `completion::build_package_completion` gates a search result's `repository`/`documentation` URL through `is_safe_registry_url` before embedding it as a Markdown link destination, dropping a `javascript:`/`data:`/non-HTTPS URL instead of only backslash-escaping it; a `http://`/`git+ssh://`/`git://` repository link is now also dropped rather than rendered, since only `https://` passes the gate (resolves #1285) (#1293)
+- **deps-core**: `completion::build_package_completion` now rejects the whole completion item outright when the registry-supplied `latest_version` fails `is_safe_version_string`, instead of rendering a `detail`/documentation-header field built from an unbounded or bidi-bearing value; a passing value is additionally sanitized and length-capped in both fields as defense-in-depth (resolves #1286) (#1293)
 
 ### Fixed
+- **deps-core, deps-maven, deps-swift**: package-name completion items now preserve the registry's own relevance ranking in `sort_text` (tiering an exact-prefix match ahead of a same-rank fuzzy match) instead of forcing alphabetical client-side sorting (resolves #1282) (#1293)
 - **deps-lsp**: raw-text fallback package completion now matches the primary path's `sort_text`/`filter_text`/`detail`/`documentation`/`insert_text_format`, and gains the same latest-version safety gate (resolves #1284) (#1291)
 - **deps-swift, deps-cli, deps-lsp**: GitHub-backed live tests now skip instead of panicking when rate-limited with no `GITHUB_TOKEN` configured (#1297)
 - **deps-npm**: live-search test no longer asserts that npm's tokenized search returns a specific package for a partial-prefix query (#1297)
 - **tests**: every bare `#[ignore]` annotation across the workspace now carries a reason string (#1297)
+- **deps-lsp**: raw-text fallback package completion now also threads the registry result's index/typed prefix into `sort_text`, closing the same relevance-ranking gap as #1282 on this second, independently-built completion path (resolves #1294) (#1293)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
+- **deps-core**: `completion::build_package_completion` gains `index: usize` and `prefix: &str` parameters, used to preserve registry relevance ranking in `sort_text` (resolves #1282) (#1293)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)

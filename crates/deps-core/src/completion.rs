@@ -16,7 +16,10 @@
 //! machinery via [`crate::Ecosystem::complete_package_name`],
 //! [`crate::Ecosystem::complete_version`], [`crate::Ecosystem::complete_feature`].
 
-use crate::lsp_helpers::{escape_markdown, is_safe_version_string, warn_rejected_value};
+use crate::lsp_helpers::{
+    MAX_VERSION_DIAGNOSTIC_CHARS, escape_markdown, is_safe_registry_url, is_safe_version_string,
+    replace_markdown_unsafe_chars, truncate_for_diagnostic, warn_rejected_value,
+};
 use crate::{
     ConcreteVersion, FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
     format_relative_age,
@@ -726,6 +729,77 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
         .to_string()
 }
 
+/// Whether `candidate` starts with `prefix`, ignoring ASCII case and `-`/`_`/`.` separators.
+///
+/// Used to tier an exact-prefix completion match ahead of a same-rank substring/fuzzy
+/// match (#1282). Ignoring case handles registry-reported casing differences (NuGet's
+/// case-insensitive ids); ignoring separator characters handles PyPI's PEP 503 name
+/// normalization, which folds `-`/`_`/`.` together server-side — its own search index
+/// already matches `zope.int` against `zope-interface` (see `deps-pypi`'s
+/// `complete_package_names`, which rewrites `filter_text` for the same normalization gap),
+/// so comparing the raw strings here would silently defeat the tier boost for every
+/// PyPI completion typed with a different separator than the registry reports. This is a
+/// soft ranking hint, not a security gate, so an approximate (not exact PEP 503)
+/// equivalence is an acceptable trade for staying ecosystem-agnostic —
+/// [`build_package_completion`] has no access to any ecosystem's
+/// `PackageNaming::normalize_package_name`. Compares `char`-by-`char` rather than
+/// byte-slicing `candidate` at `prefix.len()`, which would panic when that byte offset
+/// falls inside a multi-byte `char` in `candidate`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::completion::starts_with_ascii_case_insensitive;
+///
+/// assert!(starts_with_ascii_case_insensitive("Serde", "ser"));
+/// assert!(!starts_with_ascii_case_insensitive("actix-serde", "ser"));
+/// // PEP 503: separator characters are ignored on both sides.
+/// assert!(starts_with_ascii_case_insensitive("zope-interface", "zope.int"));
+/// ```
+#[must_use]
+pub fn starts_with_ascii_case_insensitive(candidate: &str, prefix: &str) -> bool {
+    fn significant(c: char) -> Option<char> {
+        (!matches!(c, '-' | '_' | '.')).then(|| c.to_ascii_lowercase())
+    }
+
+    let mut candidate_chars = candidate.chars().filter_map(significant);
+    prefix
+        .chars()
+        .filter_map(significant)
+        .all(|p| candidate_chars.next().is_some_and(|c| c == p))
+}
+
+/// Builds a `sort_text` value tiering an exact-prefix match ahead of a same-rank match.
+///
+/// `candidate` starts with `prefix` (per [`starts_with_ascii_case_insensitive`]) puts an
+/// item in tier 0, otherwise tier 1; ties within a tier are broken by the registry's own
+/// relevance `index` (#1282). Exposed (rather than kept private to
+/// [`build_package_completion`]) so a caller that must override that function's
+/// `sort_text` with a field-specific value — e.g. deps-maven's per-coordinate-field
+/// completion — can still compute the tier against the *correct* candidate string.
+/// `build_package_completion` itself only ever compares `prefix` against
+/// `metadata.name()`, which is the wrong candidate for, say, a bare Maven `artifactId`
+/// field when `name()` is the full `group:artifact` coordinate.
+///
+/// `index` is zero-padded to 10 digits — comfortably wider than any registry search
+/// response this project issues (capped at 20-50 results), so byte-lexicographic
+/// comparison never inverts order the way a narrower, e.g. 5-digit, padding would past
+/// index 99_999 (`"0100000"` would sort before `"099999"`).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::completion::build_completion_sort_text;
+///
+/// assert_eq!(build_completion_sort_text(3, "ser", "serde"), "00000000003");
+/// assert_eq!(build_completion_sort_text(0, "ser", "actix-serde"), "10000000000");
+/// ```
+#[must_use]
+pub fn build_completion_sort_text(index: usize, prefix: &str, candidate: &str) -> String {
+    let tier = u8::from(!starts_with_ascii_case_insensitive(candidate, prefix));
+    format!("{tier}{index:010}")
+}
+
 /// Builds a completion item for a package name.
 ///
 /// Creates a properly formatted LSP CompletionItem with documentation,
@@ -735,6 +809,15 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 ///
 /// * `metadata` - Package metadata from registry search
 /// * `insert_range` - LSP range where the completion should be inserted
+/// * `index` - This result's position in the registry's own relevance ranking (0 = most
+///   relevant), preserved in `sort_text` so the client doesn't re-sort search results
+///   alphabetically and discard that ranking (#1282). This tier/index pairing reflects
+///   the ranking of the search response that produced this one item — a later response
+///   (e.g. from the next keystroke) recomputes it from scratch, it is never persisted or
+///   reused across requests.
+/// * `prefix` - The user's typed prefix, compared against `metadata.name()`
+///   ASCII-case-insensitively (see [`starts_with_ascii_case_insensitive`]) to tier an
+///   exact-prefix match ahead of a substring/fuzzy match with the same registry rank
 ///
 /// # Returns
 ///
@@ -762,7 +845,7 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 ///
 /// # async fn example(metadata: &dyn deps_core::Metadata) {
 /// let range = Range::default(); // Use actual range from context
-/// let item = build_package_completion(metadata, range).unwrap();
+/// let item = build_package_completion(metadata, range, 0, "").unwrap();
 /// assert_eq!(item.label, metadata.name().as_str());
 /// # }
 /// ```
@@ -773,6 +856,8 @@ pub fn extract_feature_prefix(content: &str, position: Position) -> String {
 pub fn build_package_completion(
     metadata: &dyn Metadata,
     insert_range: Range,
+    index: usize,
+    prefix: &str,
 ) -> Option<CompletionItem> {
     let name = metadata.name();
     if !crate::is_safe_package_name(name.as_str()) {
@@ -784,7 +869,6 @@ pub fn build_package_completion(
         return None;
     }
     let latest = metadata.latest_version().as_str();
-
     if !latest.is_empty() && !is_safe_version_string(latest) {
         warn_rejected_value(
             "is_safe_version_string",
@@ -793,6 +877,15 @@ pub fn build_package_completion(
         );
         return None;
     }
+    // #1286 (S4): cap once, reuse for both the Markdown header and the plain-text `detail`
+    // field below — truncate the raw value first (same ordering `description` uses above),
+    // then each sink applies its own escaping on top. `is_safe_version_string` above
+    // already bounds `latest` to 64 ASCII chars from a fixed allowlist (no control/bidi
+    // chars, well under `MAX_VERSION_DIAGNOSTIC_CHARS`), so this is now a defense-in-depth
+    // backstop rather than the primary safety gate for this value — kept for the same
+    // reason `Diagnostic::new` re-sanitizes on top of producer-side sanitization (#1279):
+    // a future weakening of the allowlist above should not silently remove this layer too.
+    let capped_latest = truncate_for_diagnostic(latest, MAX_VERSION_DIAGNOSTIC_CHARS);
 
     let header = if latest.is_empty() {
         format!("**{}**", escape_markdown(name.as_str()))
@@ -800,7 +893,7 @@ pub fn build_package_completion(
         format!(
             "**{}** v{}",
             escape_markdown(name.as_str()),
-            escape_markdown(latest)
+            escape_markdown(&capped_latest)
         )
     };
     let mut doc_parts = vec![header];
@@ -818,12 +911,35 @@ pub fn build_package_completion(
         doc_parts.push(truncated);
     }
 
+    // #1285: gate both link destinations against `javascript:`/`data:`/etc. scheme injection
+    // before embedding them as a Markdown link destination — `escape_markdown` only prevents
+    // breaking out of the surrounding Markdown, not an unsafe URI scheme. A rejected link is
+    // dropped (rest of the documentation is kept) rather than normalized: `is_safe_registry_url`
+    // requires `https://`, so a plain `http://` or npm's `git+ssh://`/`git://` `repository.url`
+    // form is dropped too, matching the `deps-swift` precedent rather than inventing a new
+    // scheme-normalization helper for this one sink.
     let mut links = Vec::new();
     if let Some(repo) = metadata.repository() {
-        links.push(format!("[Repository]({})", escape_markdown(repo)));
+        if is_safe_registry_url(repo) {
+            links.push(format!("[Repository]({})", escape_markdown(repo)));
+        } else {
+            warn_rejected_value(
+                "is_safe_registry_url",
+                "package completion repository link",
+                repo,
+            );
+        }
     }
     if let Some(docs) = metadata.documentation() {
-        links.push(format!("[Documentation]({})", escape_markdown(docs)));
+        if is_safe_registry_url(docs) {
+            links.push(format!("[Documentation]({})", escape_markdown(docs)));
+        } else {
+            warn_rejected_value(
+                "is_safe_registry_url",
+                "package completion documentation link",
+                docs,
+            );
+        }
     }
 
     if !links.is_empty() {
@@ -831,13 +947,24 @@ pub fn build_package_completion(
         doc_parts.push(links.join(" | "));
     }
 
+    // #1282: preserve the registry's own relevance order instead of forcing alphabetical
+    // client-side sorting — `sort_text` tiers an exact-prefix match ahead of a
+    // substring/fuzzy match at the same rank, then breaks ties by registry-reported index.
+    let sort_text = build_completion_sort_text(index, prefix, name.as_str());
+
     Some(CompletionItem {
         label: name.as_str().to_string(),
         kind: Some(CompletionItemKind::MODULE),
+        // #1286: `latest` is registry-supplied and otherwise reaches this plain-text field
+        // raw and uncapped; sanitize control/bidi characters and reuse the same length cap
+        // as the header above.
         detail: if latest.is_empty() {
             None
         } else {
-            Some(format!("v{}", latest))
+            Some(format!(
+                "v{}",
+                replace_markdown_unsafe_chars(&capped_latest)
+            ))
         },
         documentation: Some(Documentation::MarkupContent(MarkupContent {
             kind: MarkupKind::Markdown,
@@ -848,7 +975,7 @@ pub fn build_package_completion(
             range: insert_range,
             new_text: name.as_str().to_string(),
         })),
-        sort_text: Some(name.as_str().to_string()),
+        sort_text: Some(sort_text),
         filter_text: Some(name.as_str().to_string()),
         ..Default::default()
     })
@@ -1219,6 +1346,7 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
 /// let item = build_feature_completion("derive", &deps_core::PackageName::new("serde"), None);
 /// assert_eq!(item.label, "derive");
 /// ```
+// TODO(critic): gate feature_name through a name allowlist before these sinks (follow-up to #1285)
 pub fn build_feature_completion(
     feature_name: &str,
     package_name: &PackageName,
@@ -1344,7 +1472,10 @@ pub async fn complete_package_names_generic(
 
     results
         .into_iter()
-        .filter_map(|metadata| build_package_completion(metadata.as_ref(), insert_range))
+        .enumerate()
+        .filter_map(|(index, metadata)| {
+            build_package_completion(metadata.as_ref(), insert_range, index, prefix)
+        })
         .collect()
 }
 
@@ -2986,12 +3117,25 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 3, "ser").unwrap();
 
         assert_eq!(item.label, "serde");
         assert_eq!(item.kind, Some(CompletionItemKind::MODULE));
         assert_eq!(item.detail, Some("v1.0.214".to_string()));
         assert_matches!(item.documentation, Some(Documentation::MarkupContent(_)));
+        // Every name-carrying sink is the raw (already `is_safe_package_name`-gated) name,
+        // unescaped — unlike the Markdown documentation body, these are plain-value sinks.
+        assert_eq!(item.insert_text, Some("serde".to_string()));
+        assert_eq!(item.filter_text, Some("serde".to_string()));
+        assert_eq!(
+            item.text_edit,
+            Some(CompletionTextEdit::Edit(TextEdit {
+                range,
+                new_text: "serde".to_string(),
+            }))
+        );
+        // "ser" is an exact prefix of "serde" -> tier 0, index 3.
+        assert_eq!(item.sort_text, Some("00000000003".to_string()));
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(content.value.contains("**serde** v1\\.0\\.214"));
@@ -2999,6 +3143,70 @@ mod tests {
             assert!(content.value.contains("Repository"));
             assert!(content.value.contains("Documentation"));
         }
+    }
+
+    #[test]
+    fn test_build_package_completion_sort_text_tiers_exact_prefix_match() {
+        // #1282: registry relevance order (`index`) is preserved instead of forcing
+        // alphabetical client-side sorting, and an exact-prefix match is tiered ahead of a
+        // same-rank substring/fuzzy match.
+        let exact_match = MockMetadata {
+            name: "serde".into(),
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".into(),
+        };
+        let fuzzy_match = MockMetadata {
+            name: "actix-serde".into(),
+            description: None,
+            repository: None,
+            documentation: None,
+            latest_version: "1.0.0".into(),
+        };
+
+        let range = Range::default();
+        // Registry ranks the fuzzy match first (lower index) but the exact prefix match
+        // must still sort ahead of it.
+        let exact_item = build_package_completion(&exact_match, range, 1, "ser").unwrap();
+        let fuzzy_item = build_package_completion(&fuzzy_match, range, 0, "ser").unwrap();
+
+        assert_eq!(exact_item.sort_text, Some("00000000001".to_string()));
+        assert_eq!(fuzzy_item.sort_text, Some("10000000000".to_string()));
+        assert!(exact_item.sort_text < fuzzy_item.sort_text);
+    }
+
+    #[test]
+    fn test_starts_with_ascii_case_insensitive_ignores_pep503_separators() {
+        // #1282 follow-up: PyPI's PEP 503 normalization folds `-`/`_`/`.` together
+        // server-side, so a raw-string prefix comparison would defeat the tier boost for
+        // every PyPI completion typed with a different separator than the registry
+        // reports (e.g. typing "zope.int" for the registry name "zope-interface").
+        assert!(starts_with_ascii_case_insensitive(
+            "zope-interface",
+            "zope.int"
+        ));
+        assert!(starts_with_ascii_case_insensitive(
+            "zope_interface",
+            "ZOPE-INT"
+        ));
+        assert!(!starts_with_ascii_case_insensitive(
+            "zope-interface",
+            "interface"
+        ));
+    }
+
+    #[test]
+    fn test_build_completion_sort_text_index_padding_preserves_order_past_5_digits() {
+        // #1282 follow-up: a narrower, e.g. 5-digit, zero-pad would make index 100_000
+        // ("0100000", 7 chars) sort before index 99_999 ("099999", 6 chars) under
+        // byte-lexicographic comparison — inverted order. 10-digit padding keeps every
+        // same-tier `sort_text` a fixed width, so comparison stays correct regardless of
+        // how large `index` gets.
+        let lower = build_completion_sort_text(99_999, "", "pkg");
+        let higher = build_completion_sort_text(100_000, "", "pkg");
+        assert_eq!(lower.len(), higher.len());
+        assert!(lower < higher);
     }
 
     #[test]
@@ -3012,7 +3220,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         assert_eq!(item.label, "test-pkg");
         assert_eq!(item.detail, Some("v0.1.0".to_string()));
@@ -3034,7 +3242,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         assert_eq!(item.detail, None);
 
@@ -3055,7 +3263,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(!content.value.contains("*bold*"));
@@ -3070,8 +3278,11 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_escapes_repository_link_breakout() {
-        // Attempts to close `[Repository](...)` early and splice in an attacker-controlled link.
-        let malicious_repo = "https://legit.example)[Click here](https://evil.example";
+        // Attempts to close `[Repository](...)` early and splice in an attacker-controlled
+        // link. No space: `)`/`[`/`]`/`(` are all valid RFC 3986 URL characters that
+        // `is_safe_registry_url` accepts, so this still needs `escape_markdown`'s
+        // Markdown-breakout defense on top of the scheme/charset gate (#1285).
+        let malicious_repo = "https://legit.example)[ClickHere](https://evil.example";
         let metadata = MockMetadata {
             name: "test-pkg".into(),
             description: None,
@@ -3081,11 +3292,80 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
-            assert!(!content.value.contains(")[Click here]("));
-            assert!(content.value.contains(r"\)\[Click here\]\("));
+            assert!(!content.value.contains(")[ClickHere]("));
+            assert!(content.value.contains(r"\)\[ClickHere\]\("));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_rejects_javascript_scheme_repository_link() {
+        // #1285: `escape_markdown` alone only prevents Markdown breakout, not an unsafe URI
+        // scheme — the link must be dropped entirely by the `is_safe_registry_url` gate.
+        let metadata = MockMetadata {
+            name: "test-pkg".into(),
+            description: None,
+            repository: Some("javascript:alert(document.cookie)".to_string()),
+            documentation: None,
+            latest_version: "1.0.0".into(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains("javascript:"));
+            assert!(!content.value.contains("Repository"));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_rejects_data_scheme_repository_link() {
+        let metadata = MockMetadata {
+            name: "test-pkg".into(),
+            description: None,
+            repository: Some("data:text/html,<script>alert(1)</script>".to_string()),
+            documentation: None,
+            latest_version: "1.0.0".into(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains("data:"));
+            assert!(!content.value.contains("Repository"));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_rejects_whitespace_bearing_repository_url() {
+        // M4: the original link-breakout fixture (before it was changed to `ClickHere`,
+        // no space, so the other breakout tests could still exercise `escape_markdown`)
+        // — a raw space is not a valid RFC 3986 URL character, so `is_safe_registry_url`
+        // must reject and drop this link outright, never reaching `escape_markdown` at all.
+        let metadata = MockMetadata {
+            name: "test-pkg".into(),
+            description: None,
+            repository: Some("https://legit.example)[Click here](https://evil.example".to_string()),
+            documentation: None,
+            latest_version: "1.0.0".into(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains("Click here"));
+            assert!(!content.value.contains("Repository"));
         } else {
             panic!("Expected MarkupContent documentation");
         }
@@ -3093,7 +3373,8 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_escapes_documentation_link_breakout() {
-        let malicious_docs = "https://legit.example)[Click here](https://evil.example";
+        // No space, for the same reason as the repository-link test above (#1285).
+        let malicious_docs = "https://legit.example)[ClickHere](https://evil.example";
         let metadata = MockMetadata {
             name: "test-pkg".into(),
             description: None,
@@ -3103,11 +3384,53 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
-            assert!(!content.value.contains(")[Click here]("));
-            assert!(content.value.contains(r"\)\[Click here\]\("));
+            assert!(!content.value.contains(")[ClickHere]("));
+            assert!(content.value.contains(r"\)\[ClickHere\]\("));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_rejects_javascript_scheme_documentation_link() {
+        let metadata = MockMetadata {
+            name: "test-pkg".into(),
+            description: None,
+            repository: None,
+            documentation: Some("javascript:alert(document.cookie)".to_string()),
+            latest_version: "1.0.0".into(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains("javascript:"));
+            assert!(!content.value.contains("Documentation"));
+        } else {
+            panic!("Expected MarkupContent documentation");
+        }
+    }
+
+    #[test]
+    fn test_build_package_completion_rejects_data_scheme_documentation_link() {
+        let metadata = MockMetadata {
+            name: "test-pkg".into(),
+            description: None,
+            repository: None,
+            documentation: Some("data:text/html,<script>alert(1)</script>".to_string()),
+            latest_version: "1.0.0".into(),
+        };
+
+        let range = Range::default();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
+
+        if let Some(Documentation::MarkupContent(content)) = item.documentation {
+            assert!(!content.value.contains("data:"));
+            assert!(!content.value.contains("Documentation"));
         } else {
             panic!("Expected MarkupContent documentation");
         }
@@ -3130,7 +3453,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
@@ -3147,7 +3470,9 @@ mod tests {
 
     #[test]
     fn test_build_package_completion_rejects_unsafe_latest_version() {
-        // #1284: an unsafe `latest_version` is now rejected outright, not just escaped.
+        // #1284: an unsafe `latest_version` is now rejected outright, not just escaped —
+        // this supersedes the old #1285/#1286 approach of escaping/sanitizing-in-place for
+        // any value this malformed; `)`/`[`/`]`/`(`/`/` all fail `is_safe_version_string`.
         let malicious_latest = "1.0.0)[click](https://evil.example";
         let metadata = MockMetadata {
             name: "test-pkg".into(),
@@ -3158,7 +3483,7 @@ mod tests {
         };
 
         let range = Range::default();
-        assert!(build_package_completion(&metadata, range).is_none());
+        assert!(build_package_completion(&metadata, range, 0, "").is_none());
     }
 
     #[test]
@@ -3174,7 +3499,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(!content.value.contains("*evil*"));
@@ -3182,6 +3507,10 @@ mod tests {
         } else {
             panic!("Expected MarkupContent documentation");
         }
+        // `detail` is a plain-text field, not rendered as Markdown, so `*` is not a
+        // link-breakout hazard there — unlike `documentation`, it is not
+        // `escape_markdown`-backslash-escaped (#1286).
+        assert_eq!(item.detail, Some(format!("v{latest}")));
     }
 
     #[test]
@@ -3198,7 +3527,7 @@ mod tests {
         };
 
         let range = Range::default();
-        assert!(build_package_completion(&metadata, range).is_none());
+        assert!(build_package_completion(&metadata, range, 0, "").is_none());
     }
 
     #[test]
@@ -3214,7 +3543,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let unescaped: String = content.value.chars().filter(|&c| c != '\\').collect();
@@ -3235,7 +3564,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(!content.value.contains("<img src=x onerror=alert(1)>"));
@@ -3260,7 +3589,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             assert!(content.value.starts_with(r"**test\-pkg** v1\.0\.0"));
@@ -3287,7 +3616,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
@@ -4230,7 +4559,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
@@ -4258,7 +4587,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();
@@ -4283,7 +4612,7 @@ mod tests {
         };
 
         let range = Range::default();
-        let item = build_package_completion(&metadata, range).unwrap();
+        let item = build_package_completion(&metadata, range, 0, "").unwrap();
 
         if let Some(Documentation::MarkupContent(content)) = item.documentation {
             let lines: Vec<_> = content.value.lines().collect();

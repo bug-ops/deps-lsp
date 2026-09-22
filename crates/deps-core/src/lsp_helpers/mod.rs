@@ -42,6 +42,13 @@ pub use diagnostics::{
     sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
     truncate_for_diagnostic,
 };
+// `pub(crate)` (not `pub`, matching the constant's own visibility) so `completion.rs` can
+// share this bound with `inlay_hints`/`hover` rather than declaring a duplicate cap.
+// `completion` is itself `#[cfg(feature = "lsp-responses")]` (see `lib.rs`) and is this
+// re-export's only consumer outside `lsp_helpers`, so without this gate a default-features
+// build (e.g. `fuzz`'s workspace check) sees it as unused.
+#[cfg(feature = "lsp-responses")]
+pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
     PackageRendering, RequirementResolution, SourcePolicy,
