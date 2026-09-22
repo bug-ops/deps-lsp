@@ -20,6 +20,7 @@ status: moc
 | ID | Feature | Phase | Status |
 |----|---------|-------|--------|
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
+| 067 | [[067-redaction-enforcement-guardrails/spec\|Redaction Enforcement Guardrails: RedactingDebug derive + non-exhaustive ParseError construction]] | tasks | draft — testing-infra/security, P4, 13 tasks ready, 0 open `[NEEDS CLARIFICATION]` items, issues #1238/#1250 |
 | 015 | [[015-lsp-3-18-diagnostic-markup-tooltip-gap/spec\|LSP 3.18 diagnostic markup / command-tooltip support blocked by ls-types 0.0.6]] | specify | draft — research/dependency-gap, P4, 3 open `[NEEDS CLARIFICATION]` items, blocked on upstream — no `/sdd plan` (issue #308) |
 | 025 | [[025-osv-fix-target-scan-gap/spec\|OSV fix-target scan gap — recommended fix version is never independently scanned]] | specify | draft — bug, P2, 4 open `[NEEDS CLARIFICATION]` items |
 | 038 | [[038-workspace-diagnostics-pull-support/spec\|Workspace Diagnostics Pull Support]] | specify | parked — research/enhancement, P4, adoption-question resolved 2026-09-08 (wait for client support), 3 open plan-level `[NEEDS CLARIFICATION]` items remain moot until revisited (issue #547) |
