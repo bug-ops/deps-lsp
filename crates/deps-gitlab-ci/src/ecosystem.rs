@@ -15,6 +15,8 @@ use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
+use deps_core::lsp_helpers::truncate_for_diagnostic;
+#[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
 use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
@@ -22,7 +24,6 @@ use deps_core::{
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::{
         EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, sanitize_and_truncate_for_diagnostic,
-        truncate_for_diagnostic,
     },
 };
 
