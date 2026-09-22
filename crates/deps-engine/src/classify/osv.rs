@@ -283,8 +283,8 @@ fn resolve_fix_target(
 ///         "RUSTSEC-2024-0001".to_string(),
 ///         "2024-01-01T00:00:00Z".to_string(),
 ///         VulnSeverity::High,
-///         String::new(),
 ///     )
+///     .expect("valid osv id")
 ///     .with_fixed_versions(vec!["1.2.0".to_string()]),
 /// );
 /// let latest_status = UpgradeStatus::CandidateClean {
@@ -359,12 +359,14 @@ pub fn collect_fix_target_resolutions(
 /// use std::collections::HashMap;
 /// use std::sync::Arc;
 ///
-/// let advisory = Arc::new(Advisory::new(
-///     "RUSTSEC-2024-0001".to_string(),
-///     "2024-01-01T00:00:00Z".to_string(),
-///     VulnSeverity::High,
-///     String::new(),
-/// ));
+/// let advisory = Arc::new(
+///     Advisory::new(
+///         "RUSTSEC-2024-0001".to_string(),
+///         "2024-01-01T00:00:00Z".to_string(),
+///         VulnSeverity::High,
+///     )
+///     .expect("valid osv id"),
+/// );
 /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
 ///
 /// let mut vulnerabilities = VulnerabilityMap::new();
@@ -1171,8 +1173,8 @@ mod tests {
                     id.to_string(),
                     "2023-01-01T00:00:00Z".to_string(),
                     VulnSeverity::High,
-                    String::new(),
                 )
+                .expect("valid osv id")
                 .with_fixed_versions(fixed_versions.iter().map(ToString::to_string).collect()),
             )
         }

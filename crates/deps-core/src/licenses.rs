@@ -818,18 +818,22 @@ fn contains_ci(haystack: &[String], needle: &str) -> bool {
     haystack.iter().any(|h| h.eq_ignore_ascii_case(needle))
 }
 
-/// Joins `licenses` with `", "`, capping the number of entries rendered at `max_entries`
-/// and collapsing the remainder into a `"(+N more)"` suffix (issue #660/#661 critic
-/// security P2) — mirrors `lsp_helpers::hover::format_license_list`'s shape for the same
-/// registry-controlled, unbounded-length data.
-fn join_capped(licenses: &[String], max_entries: usize) -> String {
-    let shown = licenses.len().min(max_entries);
-    // `shown <= licenses.len()` by construction (the `.min` above), so `.get(..shown)`
-    // never actually falls back — `unwrap_or(licenses)` just satisfies
+/// Joins `entries` with `", "`, capping the number rendered at `max_entries` and
+/// collapsing the remainder into a `"(+N more)"` suffix (issue #660/#661 critic security
+/// P2) — for a caller that needs a per-entry length cap too (registry data is often
+/// unbounded in both dimensions), truncate each entry before calling this.
+///
+/// `pub(crate)`, not module-private: shared with
+/// `lsp_helpers::hover::format_advisory_aliases` (#1272 round 3) rather than
+/// reimplementing this same count-cap-and-join shape a second time.
+pub(crate) fn join_capped(entries: &[String], max_entries: usize) -> String {
+    let shown = entries.len().min(max_entries);
+    // `shown <= entries.len()` by construction (the `.min` above), so `.get(..shown)`
+    // never actually falls back — `unwrap_or(entries)` just satisfies
     // `clippy::indexing_slicing` (issue #678 hardening) without panicking if that
     // invariant is ever violated.
-    let mut joined = licenses.get(..shown).unwrap_or(licenses).join(", ");
-    let remaining = licenses.len() - shown;
+    let mut joined = entries.get(..shown).unwrap_or(entries).join(", ");
+    let remaining = entries.len() - shown;
     if remaining > 0 {
         joined.push_str(&format!(" (+{remaining} more)"));
     }

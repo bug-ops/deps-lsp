@@ -556,8 +556,8 @@ serde = "1.0.0"
                                 "RUSTSEC-2020-0071".to_string(),
                                 "2023-01-01T00:00:00Z".to_string(),
                                 VulnSeverity::High,
-                                String::new(),
                             )
+                            .expect("valid osv id")
                             .with_fixed_versions(vec!["1.0.5".to_string()]),
                         )],
                         1,
@@ -806,8 +806,8 @@ serde = "1.0.0"
                                 "GHSA-test-0001".to_string(),
                                 "2023-01-01T00:00:00Z".to_string(),
                                 VulnSeverity::High,
-                                String::new(),
                             )
+                            .expect("valid osv id")
                             .with_fixed_versions(vec!["4.50.1".to_string()]),
                         )],
                         1,

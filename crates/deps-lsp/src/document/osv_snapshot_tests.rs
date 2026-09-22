@@ -35,8 +35,8 @@ fn sample_advisory() -> Arc<Advisory> {
             "GHSA-xxxx-yyyy-zzzz".to_string(),
             "2023-01-01T00:00:00Z".to_string(),
             VulnSeverity::High,
-            "https://osv.dev/vulnerability/GHSA-xxxx-yyyy-zzzz".to_string(),
         )
+        .expect("valid osv id")
         .with_summary("Example vulnerability for snapshot testing".to_string())
         .with_aliases(vec!["CVE-2023-00000".to_string()])
         .with_fixed_versions(vec!["9.9.9".to_string()]),
