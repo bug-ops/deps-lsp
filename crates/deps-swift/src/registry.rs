@@ -5,10 +5,10 @@
 
 use crate::types::{SwiftPackage, SwiftVersion};
 use deps_core::github::{
-    GithubTag, GithubTagsClient, ReleaseDatesCache, github_rate_limit_error, normalize_tag,
+    GithubTag, GithubTagsClient, ReleaseDatesCache, classify_tags_fetch_error, normalize_tag,
     paginate_tags, validate_owner_repo,
 };
-use deps_core::{DepsError, HttpCache, PublishTime, Result};
+use deps_core::{HttpCache, PublishTime, Result};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
@@ -58,16 +58,7 @@ impl SwiftRegistry {
             self.github
                 .fetch_tags_page(name, page)
                 .await
-                .map_err(|e| match &e {
-                    DepsError::HttpStatus { status: 403, .. } if !self.github.has_token() => {
-                        github_rate_limit_error()
-                    }
-                    DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
-                        package: name.to_string().into(),
-                        registry: REGISTRY,
-                    },
-                    _ => e,
-                })
+                .map_err(|e| classify_tags_fetch_error(e, name, REGISTRY, self.github.has_token()))
         })
         .await?;
         Ok(tags_to_versions(tags))
@@ -666,6 +657,60 @@ mod tests {
             github: GithubTagsClient::for_test(Arc::new(HttpCache::new()), base, has_token),
             release_dates: Arc::new(deps_core::github::ReleaseDatesCache::new()),
         }
+    }
+
+    // --- get_versions: 403 classification (#1295) ---
+
+    /// A confirmed rate limit (`X-RateLimit-Remaining: 0`) classifies as a *verified*
+    /// `RateLimited`, via the shared `deps_core::github::classify_tags_fetch_error`.
+    #[tokio::test]
+    async fn test_get_versions_403_with_confirmed_evidence_is_verified_rate_limited() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_header("x-ratelimit-remaining", "0")
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        let err = registry.get_versions("owner/repo").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                deps_core::DepsError::RateLimited { verified: true, .. }
+            ),
+            "expected verified RateLimited, got {err:?}"
+        );
+    }
+
+    /// An unconfirmed no-token 403 still classifies as `RateLimited` for its actionable hint,
+    /// but `verified: false` — distinguishable from the confirmed case above (#1295).
+    #[tokio::test]
+    async fn test_get_versions_403_without_evidence_is_unverified_rate_limited() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(403)
+            .with_body("{}")
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        let err = registry.get_versions("owner/repo").await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                deps_core::DepsError::RateLimited {
+                    verified: false,
+                    ..
+                }
+            ),
+            "expected unverified RateLimited, got {err:?}"
+        );
     }
 
     // --- Registry::get_versions_with: freshness.enabled gate (M2) ---

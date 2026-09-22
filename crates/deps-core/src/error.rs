@@ -193,10 +193,36 @@ pub enum DepsError {
     /// `message` is a pre-vetted, IP-free, actionable hint safe to surface verbatim in a
     /// per-dependency diagnostic (see [`Self::fetch_failure`]) — never build one from a raw
     /// registry error body, which can embed the caller's public IP (`github.rs:332-346`).
+    ///
+    /// `#[non_exhaustive]` on the variant itself (#1295 critic M1, added alongside `verified`):
+    /// a future field addition to this variant specifically should not need to be a breaking
+    /// change again — unlike the enum-level `#[non_exhaustive]` above, which only blocks an
+    /// exhaustive top-level `match` on [`DepsError`], not an exhaustive struct-literal pattern
+    /// on this one variant's own fields.
     #[error("{message}")]
+    #[non_exhaustive]
     RateLimited {
         /// Pre-vetted, IP-free message safe to surface verbatim in a diagnostic.
         message: String,
+        /// Whether this classification is backed by explicit server evidence (e.g. a
+        /// confirmed `X-RateLimit-Remaining: 0` response header, checked in
+        /// `crate::cache`) rather than merely inferred from a status code and request
+        /// context alone (#1295). An unauthenticated GitHub 403 with no such evidence —
+        /// which could be an abuse-detection false positive, a secondary rate limit, or an
+        /// access-restricted repo — still gets classified as `RateLimited` for its actionable
+        /// hint, but with `verified: false`, so a caller like
+        /// `test_util::unwrap_or_skip_github_rate_limit` can tell a confirmed exhaustion apart
+        /// from an assumed one instead of silently treating both as the same expected case.
+        verified: bool,
+        /// The HTTP status this classification was built from, when known (#1295 critic N1).
+        /// `Some(403)`/`Some(429)` for a `crate::cache`-classified confirmed rate limit —
+        /// `None` for a canned, inference-only construction (e.g.
+        /// `crate::github::github_rate_limit_error`) that never saw a live response. Exists
+        /// so a caller like the authenticated pinned-tier cache-eviction guard (FR-015/
+        /// NFR-004, `crate::cache`) can restrict itself to a genuine 401/403
+        /// credential-rejection signal without also matching a 429 (mere throttling, not a
+        /// credential-revocation signal) that happens to also classify as `RateLimited`.
+        source_status: Option<u16>,
     },
 
     /// A package name was not found on the given registry.
@@ -319,9 +345,15 @@ impl std::fmt::Debug for DepsError {
                 .field("source", source)
                 .finish(),
             Self::CacheError(message) => f.debug_tuple("CacheError").field(message).finish(),
-            Self::RateLimited { message } => f
+            Self::RateLimited {
+                message,
+                verified,
+                source_status,
+            } => f
                 .debug_struct("RateLimited")
                 .field("message", message)
+                .field("verified", verified)
+                .field("source_status", source_status)
                 .finish(),
             Self::PackageNotFound { package, registry } => f
                 .debug_struct("PackageNotFound")
@@ -366,6 +398,36 @@ impl std::fmt::Debug for DepsError {
 }
 
 impl DepsError {
+    /// Constructs a [`Self::RateLimited`] error.
+    ///
+    /// The only way to build this `#[non_exhaustive]` variant from outside this crate (#1295
+    /// critic M1: `#[non_exhaustive]` on the variant blocks a downstream crate's struct
+    /// literal, not just an exhaustive match) — an ecosystem crate with its own rate-limit
+    /// classification distinct from `crate::github`'s (e.g. `deps-gitlab-ci`) uses this
+    /// instead. `message` must be a pre-vetted, IP-free, actionable hint (see the variant's own
+    /// doc); `verified` should be `true` only when the caller has confirmed genuine exhaustion
+    /// from explicit server evidence, not merely inferred it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DepsError;
+    ///
+    /// let err = DepsError::rate_limited("set MY_TOKEN to increase the limit", false);
+    /// assert!(matches!(err, DepsError::RateLimited { verified: false, .. }));
+    /// ```
+    #[must_use]
+    pub fn rate_limited(message: impl Into<String>, verified: bool) -> Self {
+        Self::RateLimited {
+            message: message.into(),
+            verified,
+            // No live response is available at this generic construction site — only
+            // `crate::cache`'s own confirmed-evidence classification knows a real status
+            // (#1295 critic N1).
+            source_status: None,
+        }
+    }
+
     /// Returns `true` when this error means the registry was successfully asked and
     /// answered "this package doesn't exist", as opposed to the registry not having
     /// been answerable at all (network failure, timeout, malformed response, 5xx).
@@ -417,19 +479,26 @@ impl DepsError {
     /// (#478), distinguishing a failure with a safe, actionable hint to show the user from
     /// one whose raw text must never reach a diagnostic.
     ///
-    /// **Security-load-bearing invariant**: [`FetchFailure::Actionable`] is produced *only*
-    /// from [`Self::RateLimited`]'s pre-vetted, IP-free canned message. Every other variant
-    /// must classify as [`FetchFailure::Transient`] — never call `.to_string()`/`Display` on
-    /// an arbitrary `DepsError` to build an `Actionable` value, since a raw `HttpStatus` or
-    /// `RegistryError` body can embed the caller's public IP (`github.rs:332-346`, exercised
-    /// by the `github` crate's `test_parse_tags_page_github_rate_limit_returns_error`).
+    /// **Security-load-bearing invariant**: [`FetchFailure::Actionable`] is produced only from
+    /// a fixed, pre-vetted, IP-free message — never by calling `.to_string()`/`Display` on an
+    /// arbitrary `DepsError` to build one, since a raw `HttpStatus` or `RegistryError` body can
+    /// embed the caller's public IP (`github.rs:332-346`, exercised by the `github` crate's
+    /// `test_parse_tags_page_github_rate_limit_returns_error`).
+    ///
+    /// **Exhaustive by design, no wildcard arm** (#1244 — the same bug class already fixed
+    /// twice for `CompletionContext` (#793, #819) and designed against for `EcosystemId`
+    /// (#118)): every current and future [`DepsError`] variant must be listed explicitly, so a
+    /// new variant that should carry [`FetchFailure::Actionable`] guidance cannot silently fall
+    /// through to [`FetchFailure::Transient`] just by being added after this match was written.
+    /// `#[non_exhaustive]` on this enum does not block an exhaustive match here, since this
+    /// method is defined in the same crate that declares the enum.
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_core::error::{DepsError, FetchFailure};
     ///
-    /// let rate_limited = DepsError::RateLimited { message: "set GITHUB_TOKEN".into() };
+    /// let rate_limited = DepsError::rate_limited("set GITHUB_TOKEN", true);
     /// assert_eq!(
     ///     rate_limited.fetch_failure(),
     ///     FetchFailure::Actionable("set GITHUB_TOKEN".into())
@@ -441,7 +510,9 @@ impl DepsError {
     #[must_use]
     pub fn fetch_failure(&self) -> FetchFailure {
         match self {
-            Self::RateLimited { message } => FetchFailure::Actionable(message.clone()),
+            // `verified` does not change the classification: even an unverified rate-limit
+            // guess still carries a safe, actionable hint worth showing (#1295).
+            Self::RateLimited { message, .. } => FetchFailure::Actionable(message.clone()),
             // Fixed, pre-vetted message — see `Self::ChainResolutionHalted`'s own doc for why
             // this is safe to build as `Actionable` the same way `RateLimited` is.
             Self::ChainResolutionHalted => FetchFailure::Actionable(
@@ -449,7 +520,29 @@ impl DepsError {
                  index"
                     .to_string(),
             ),
-            _ => FetchFailure::Transient,
+            // Deliberately `Transient`, not `Actionable` (#1295 critic S5, reverted from an
+            // earlier `Actionable` attempt): `lsp_helpers::diagnostics` already suppresses
+            // every per-dependency fetch-failure message while `versions.offline` is set,
+            // rendering a single file-level notice instead
+            // (`test_generate_diagnostics_from_cache_offline_suppresses_per_dependency_warning`)
+            // — an `Actionable` message here would be unreachable in the normal case and would
+            // reintroduce exactly the per-dependency duplication that test forbids if it ever
+            // did render (a config-flip race between fetch and render). #1244 only asks for
+            // exhaustiveness, not a behavior change here.
+            Self::Offline { .. }
+            | Self::ParseError { .. }
+            | Self::RegistryError { .. }
+            | Self::CacheError(_)
+            | Self::PackageNotFound { .. }
+            | Self::HttpStatus { .. }
+            | Self::ApiResponse { .. }
+            | Self::ResponseTooLarge { .. }
+            | Self::InvalidVersionReq(_)
+            | Self::Io(_)
+            | Self::Json(_)
+            | Self::UnsupportedEcosystem(_)
+            | Self::AmbiguousEcosystem(_)
+            | Self::InvalidUri(_) => FetchFailure::Transient,
         }
     }
 
@@ -490,6 +583,10 @@ impl DepsError {
     /// URL-free cause discriminant for every variant — so a routine transport
     /// failure/timeout still carries some triage signal instead of collapsing to `status =
     /// None` with nothing else.
+    ///
+    /// **Exhaustive by design, no wildcard arm** (#1244 — see [`Self::fetch_failure`]'s doc for
+    /// why): kept in lockstep with that method so the two classifiers cannot silently drift
+    /// apart on which variants they know about.
     #[must_use]
     pub(crate) const fn safe_tracing_summary(&self) -> (Option<u16>, &'static str) {
         match self {
@@ -498,10 +595,23 @@ impl DepsError {
             Self::CacheError(_) => (None, "cache"),
             Self::Offline { .. } => (None, "offline"),
             Self::ResponseTooLarge { .. } => (None, "response-too-large"),
-            Self::RateLimited { .. } => (None, "rate-limited"),
+            // Split by `verified` (#1295 critic S2): a human triaging logs can tell a
+            // confirmed rate limit apart from an unverified guess at this label alone,
+            // without needing to also inspect the message text.
+            Self::RateLimited { verified: true, .. } => (None, "rate-limited"),
+            Self::RateLimited {
+                verified: false, ..
+            } => (None, "rate-limited-unverified"),
             Self::ApiResponse { .. } => (None, "api-response"),
             Self::PackageNotFound { .. } => (None, "not-found"),
-            _ => (None, "other"),
+            Self::ParseError { .. } => (None, "parse-error"),
+            Self::InvalidVersionReq(_) => (None, "invalid-version-req"),
+            Self::Io(_) => (None, "io"),
+            Self::Json(_) => (None, "json"),
+            Self::UnsupportedEcosystem(_) => (None, "unsupported-ecosystem"),
+            Self::AmbiguousEcosystem(_) => (None, "ambiguous-ecosystem"),
+            Self::InvalidUri(_) => (None, "invalid-uri"),
+            Self::ChainResolutionHalted => (None, "chain-resolution-halted"),
         }
     }
 }
@@ -517,8 +627,10 @@ impl DepsError {
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FetchFailure {
-    /// The fetch failed with a pre-vetted, safe-to-display hint (currently only produced
-    /// from [`DepsError::RateLimited`]).
+    /// The fetch failed with a pre-vetted, safe-to-display hint — produced from
+    /// [`DepsError::RateLimited`] or [`DepsError::ChainResolutionHalted`] (see
+    /// [`DepsError::fetch_failure`] for the exhaustive, deliberately-chosen list of which
+    /// variants produce this versus [`Self::Transient`]).
     Actionable(String),
     /// The fetch failed for a reason with no safe user-facing detail to show — the
     /// diagnostic falls back to a generic "lookup failed" message.
@@ -625,6 +737,10 @@ mod tests {
     /// variants) — pinning the exact `(status, cause)` pairs for every variant a `HttpCache`/
     /// `OsvClient` call site can actually produce, so a routine transport failure still
     /// carries triage signal (`cause`) instead of collapsing to `(None, "other")`.
+    ///
+    /// #1295 critic M2: genuinely exhaustive now, matching the method's own no-wildcard-arm
+    /// match — every `DepsError` variant gets its own assertion, not a handful of spot checks,
+    /// so a typo'd or missing label can't ship silently.
     #[test]
     fn test_safe_tracing_summary_covers_every_reachable_variant() {
         assert_eq!(
@@ -665,6 +781,82 @@ mod tests {
             }
             .safe_tracing_summary(),
             (None, "response-too-large")
+        );
+        assert_eq!(
+            DepsError::RateLimited {
+                message: "set GITHUB_TOKEN".into(),
+                verified: true,
+                source_status: Some(403),
+            }
+            .safe_tracing_summary(),
+            (None, "rate-limited")
+        );
+        assert_eq!(
+            DepsError::RateLimited {
+                message: "set GITHUB_TOKEN".into(),
+                verified: false,
+                source_status: None,
+            }
+            .safe_tracing_summary(),
+            (None, "rate-limited-unverified")
+        );
+        assert_eq!(
+            DepsError::ApiResponse {
+                package: "flask".into(),
+                registry: "PyPI",
+                source: serde_json::from_str::<serde_json::Value>("{invalid}").unwrap_err(),
+            }
+            .safe_tracing_summary(),
+            (None, "api-response")
+        );
+        assert_eq!(
+            DepsError::PackageNotFound {
+                package: "flask".into(),
+                registry: "PyPI",
+            }
+            .safe_tracing_summary(),
+            (None, "not-found")
+        );
+        assert_eq!(
+            DepsError::ParseError {
+                file_type: "Cargo.toml".into(),
+                source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, "bad")),
+            }
+            .safe_tracing_summary(),
+            (None, "parse-error")
+        );
+        assert_eq!(
+            DepsError::InvalidVersionReq("bad range".into()).safe_tracing_summary(),
+            (None, "invalid-version-req")
+        );
+        assert_eq!(
+            DepsError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not found"
+            ))
+            .safe_tracing_summary(),
+            (None, "io")
+        );
+        assert_eq!(
+            DepsError::Json(serde_json::from_str::<serde_json::Value>("{bad}").unwrap_err())
+                .safe_tracing_summary(),
+            (None, "json")
+        );
+        assert_eq!(
+            DepsError::UnsupportedEcosystem("unknown".into()).safe_tracing_summary(),
+            (None, "unsupported-ecosystem")
+        );
+        assert_eq!(
+            DepsError::AmbiguousEcosystem("file.txt".into()).safe_tracing_summary(),
+            (None, "ambiguous-ecosystem")
+        );
+        assert_eq!(
+            DepsError::InvalidUri("not a uri".into()).safe_tracing_summary(),
+            (None, "invalid-uri")
+        );
+        assert_eq!(
+            DepsError::ChainResolutionHalted.safe_tracing_summary(),
+            (None, "chain-resolution-halted")
         );
     }
 
@@ -1001,13 +1193,14 @@ mod tests {
 
     /// Exhaustive companion to the doc-test on [`DepsError::fetch_failure`]: every variant
     /// other than [`DepsError::RateLimited`] and [`DepsError::ChainResolutionHalted`] must
-    /// classify as [`FetchFailure::Transient`]. This is the invariant the doc comment calls
-    /// security-load-bearing (a future variant wired to `Actionable` by mistake could leak
-    /// raw, potentially IP-bearing error text into a diagnostic), so it must be a real test
-    /// enumerating every variant, not just a handful of spot checks. `ChainResolutionHalted`
-    /// is exempted from the "everything else is Transient" list — like `RateLimited`, it
-    /// carries no arbitrary payload, only a fixed, pre-vetted message, so it is safe to be
-    /// the second `Actionable`-producing variant (see its own doc and #513's M2 fix).
+    /// classify as [`FetchFailure::Transient`] — including [`DepsError::Offline`] (#1295
+    /// critic S5: deliberately *not* `Actionable`, see `fetch_failure`'s own comment on that
+    /// arm). This is the invariant the doc comment calls security-load-bearing (a future
+    /// variant wired to `Actionable` by mistake could leak raw, potentially IP-bearing error
+    /// text into a diagnostic), so it must be a real test enumerating every variant, not just a
+    /// handful of spot checks. The two exempted variants carry no arbitrary payload, only a
+    /// fixed, pre-vetted message, so each is safe to be an `Actionable`-producing variant (see
+    /// their own docs, and #513's M2 fix for `ChainResolutionHalted`).
     #[test]
     fn test_fetch_failure_classifies_every_non_rate_limited_variant_as_transient() {
         // A `reqwest::Error` built from an invalid URL — `RequestBuilder::build`
@@ -1066,13 +1259,18 @@ mod tests {
             );
         }
 
-        let rate_limited = DepsError::RateLimited {
-            message: "set GITHUB_TOKEN to increase the rate limit".into(),
-        };
-        assert_eq!(
-            rate_limited.fetch_failure(),
-            FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".into())
-        );
+        for verified in [true, false] {
+            let rate_limited = DepsError::RateLimited {
+                message: "set GITHUB_TOKEN to increase the rate limit".into(),
+                verified,
+                source_status: None,
+            };
+            assert_eq!(
+                rate_limited.fetch_failure(),
+                FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".into()),
+                "verified={verified}"
+            );
+        }
 
         assert_eq!(
             DepsError::ChainResolutionHalted.fetch_failure(),

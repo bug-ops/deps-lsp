@@ -109,14 +109,105 @@ pub fn validate_owner_repo(name: &str) -> Result<()> {
     )))
 }
 
+/// Message for a *confirmed* rate limit (`verified: true`, #1295): the response itself
+/// confirmed exhaustion (`X-RateLimit-Remaining: 0` or `Retry-After` — see
+/// `crate::cache::confirmed_rate_limit_exhaustion`).
+const GITHUB_RATE_LIMIT_MESSAGE_VERIFIED: &str = "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit \
+     (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)";
+
+/// Message for an *inferred* rate limit (`verified: false`, #1295): a 403 with no token and
+/// no corroborating response evidence — usually the rate limit, but not confirmed. Distinct
+/// text from [`GITHUB_RATE_LIMIT_MESSAGE_VERIFIED`] (critic S2) so a human triaging a real
+/// regression — e.g. via `safe_tracing_summary`'s `"rate-limited-unverified"` label, or this
+/// message reaching a diagnostic — has something to distinguish it by, instead of an
+/// unverified guess rendering byte-identical to a confirmed exhaustion.
+const GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED: &str = "GitHub API request forbidden (403) with no GITHUB_TOKEN configured. This is usually the \
+     unauthenticated rate limit (60 req/h), but could also be an access-restricted repository \
+     or an abuse-detection false positive. Set GITHUB_TOKEN to rule out the rate limit and \
+     increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)";
+
 /// The actionable error returned when a request hits GitHub's unauthenticated rate limit
 /// (60 req/h per IP, vs 5000 req/h with a token).
+///
+/// Inferred from a 403 status and the absence of a token alone, with no corroborating
+/// response evidence — `verified: false` (#1295). Use [`github_rate_limit_error_verified`]
+/// instead when the response already confirmed exhaustion.
 #[must_use]
 pub fn github_rate_limit_error() -> DepsError {
     DepsError::RateLimited {
-        message: "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit \
-                   (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)"
-            .into(),
+        message: GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED.into(),
+        verified: false,
+        // No live response at this canned, inference-only construction site (#1295 N1).
+        source_status: None,
+    }
+}
+
+/// The actionable error for a *confirmed* rate limit (`verified: true`, #1295).
+///
+/// `crate::cache` already established, via response evidence, that the request was rejected
+/// for genuine rate-limit exhaustion.
+///
+/// `pub`, not `pub(crate)`: needed both by [`classify_tags_fetch_error`] (this crate) and by
+/// `deps_github_actions::registry::GithubActionsRegistry`'s rate-limit-gate short-circuit
+/// (critic S3), which must replay the same verified state a gate was tripped with rather than
+/// always reporting an unverified guess.
+#[must_use]
+pub fn github_rate_limit_error_verified() -> DepsError {
+    DepsError::RateLimited {
+        message: GITHUB_RATE_LIMIT_MESSAGE_VERIFIED.into(),
+        verified: true,
+        // Reconstructed fresh (see `classify_tags_fetch_error`'s enrichment arm) rather than
+        // carrying forward whatever `source_status` the incoming error had — this constructor
+        // is also called from `deps-github-actions`'s gate-replay path, which has no live
+        // response at all (#1295 N1).
+        source_status: None,
+    }
+}
+
+/// Classifies a GitHub tags-API fetch error into the shape every GitHub-tags-backed
+/// ecosystem's `get_versions` returns.
+///
+/// So `deps-swift` and `deps-github-actions` cannot silently diverge on it (#472-style DRY,
+/// surfaced by #1295): an already-verified [`DepsError::RateLimited`] from `crate::cache`'s
+/// registry-neutral header-evidence check (critic S1 — that check has no GitHub-specific
+/// wording, since it runs for every ecosystem) gets GitHub's specific remedy swapped in via
+/// [`github_rate_limit_error_verified`], a 403 with no `has_token` evidence maps to
+/// [`github_rate_limit_error`], a 404 maps to [`DepsError::PackageNotFound`], and everything
+/// else passes through unchanged.
+///
+/// A caller that needs a side effect when the result is a rate limit (e.g.
+/// `deps-github-actions`'s local cooldown gate) should check the *returned* error's shape
+/// with `matches!(.., DepsError::RateLimited { .. })` rather than re-deriving the 403/404
+/// classification itself.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::DepsError;
+/// use deps_core::github::classify_tags_fetch_error;
+///
+/// let not_found = DepsError::HttpStatus {
+///     url: "https://api.github.com/repos/owner/repo/tags".into(),
+///     status: 404,
+/// };
+/// let classified = classify_tags_fetch_error(not_found, "owner/repo", "GitHub", true);
+/// assert!(matches!(classified, DepsError::PackageNotFound { .. }));
+/// ```
+#[must_use]
+pub fn classify_tags_fetch_error(
+    e: DepsError,
+    name: &str,
+    registry: &'static str,
+    has_token: bool,
+) -> DepsError {
+    match &e {
+        DepsError::RateLimited { verified: true, .. } => github_rate_limit_error_verified(),
+        DepsError::HttpStatus { status: 403, .. } if !has_token => github_rate_limit_error(),
+        DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
+            package: name.to_string().into(),
+            registry,
+        },
+        _ => e,
     }
 }
 
@@ -1113,6 +1204,60 @@ mod tests {
         let result = parse_tags_page(json.as_bytes());
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("rate limit"));
+    }
+
+    // --- classify_tags_fetch_error (#1295) ---
+
+    /// Critic S1/S2: an already-verified `RateLimited` from `crate::cache`'s registry-neutral
+    /// check gets the GitHub-specific remedy swapped in, keeping `verified: true` — and the
+    /// resulting message is distinct from the unverified one (S2).
+    #[test]
+    fn test_classify_tags_fetch_error_enriches_verified_rate_limit_with_github_hint() {
+        let generic = DepsError::RateLimited {
+            message: "registry rate limit exceeded (confirmed by the response)".into(),
+            verified: true,
+            source_status: Some(403),
+        };
+        let classified = classify_tags_fetch_error(generic, "owner/repo", "GitHub", false);
+        match classified {
+            DepsError::RateLimited {
+                message, verified, ..
+            } => {
+                assert!(verified);
+                assert!(message.contains("GITHUB_TOKEN"));
+                assert_ne!(message, GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED);
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_tags_fetch_error_unverified_403_no_token() {
+        let e = DepsError::HttpStatus {
+            url: "https://api.github.com/repos/owner/repo/tags".into(),
+            status: 403,
+        };
+        let classified = classify_tags_fetch_error(e, "owner/repo", "GitHub", false);
+        assert!(matches!(
+            classified,
+            DepsError::RateLimited {
+                verified: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_classify_tags_fetch_error_tokened_403_passes_through_unchanged() {
+        let e = DepsError::HttpStatus {
+            url: "https://api.github.com/repos/owner/repo/tags".into(),
+            status: 403,
+        };
+        let classified = classify_tags_fetch_error(e, "owner/repo", "GitHub", true);
+        assert!(matches!(
+            classified,
+            DepsError::HttpStatus { status: 403, .. }
+        ));
     }
 
     // --- GithubTagsClient ---
