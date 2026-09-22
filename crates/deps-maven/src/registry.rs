@@ -8,8 +8,10 @@ use crate::version::compare_versions;
 use bytes::Bytes;
 use dashmap::DashMap;
 use deps_core::{
-    DepsError, HttpCache, PublishTime, Result, lsp_helpers::warn_rejected_value,
-    maven_coordinate_path, net_policy::RedactedUrl,
+    DepsError, HttpCache, PublishTime, Result,
+    lsp_helpers::warn_rejected_value,
+    maven_coordinate_path,
+    net_policy::{RedactedUrl, redact_parse_error_for_log},
 };
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
@@ -675,7 +677,11 @@ fn metadata_urls(name: &str) -> Result<Vec<String>> {
 ///
 /// Returns `DepsError::CacheError` if the XML is malformed, or if the document exceeds
 /// [`deps_core::xml_bounds::MAX_METADATA_VERSIONS`]/[`deps_core::xml_bounds::MAX_METADATA_BYTES_SCANNED`]
-/// (#698). A truncated `versions` list — whether from silently stopping at a parse error or
+/// (#698). A malformed-XML error's `Display` text is passed through
+/// [`deps_core::net_policy::redact_parse_error_for_log`] before being wrapped into
+/// `CacheError` (#1249): `quick_xml::Error` can embed the offending tag/attribute name
+/// verbatim, which can itself be credential-shaped when the metadata response body is
+/// attacker-influenced. A truncated `versions` list — whether from silently stopping at a parse error or
 /// from silently breaking out of the scan loop once the budget is exhausted, rather than
 /// surfacing either as an error — would itself be a source of the same "real version missing
 /// from `available`" false-positive class this PR's diagnostic guards against elsewhere; a
@@ -730,7 +736,8 @@ fn parse_metadata_xml(data: &[u8]) -> Result<(Vec<MavenVersion>, Option<String>)
             Ok(Event::Eof) => break,
             Err(e) => {
                 return Err(DepsError::CacheError(format!(
-                    "malformed maven-metadata.xml: {e}"
+                    "malformed maven-metadata.xml: {}",
+                    redact_parse_error_for_log(&e.to_string())
                 )));
             }
             _ => {}
@@ -1397,6 +1404,27 @@ mod tests {
         let xml = b"<metadata><versioning><versions><version>1.0.0</version></versions></wrong></metadata>";
         let result = parse_metadata_xml(xml);
         assert!(result.is_err());
+    }
+
+    /// #1249: `quick_xml`'s `IllFormed::MismatchedEndTag` embeds the raw tag-name text
+    /// verbatim in its `Display` output, so a credential-shaped tag name in a malformed
+    /// `maven-metadata.xml` response must be redacted before reaching `DepsError::CacheError`,
+    /// the same way the `deps-nuget`/`toml_span`/`yaml_rust2` parse-error sites already are
+    /// (#1240/#1241/#1243). Mirrors `deps-nuget`'s
+    /// `test_parse_mismatched_end_tag_error_redacts_credential`.
+    #[test]
+    fn test_parse_metadata_xml_mismatched_end_tag_error_redacts_credential() {
+        let xml =
+            b"<metadata><https://svcacct:ghp_SUPERSECRETTOKEN123@pkg.internal.corp/x ></metadata>";
+
+        let message = parse_metadata_xml(xml).unwrap_err().to_string();
+
+        assert!(!message.contains("ghp_SUPERSECRETTOKEN123"));
+        assert!(!message.contains("svcacct"));
+        assert!(message.contains("pkg.internal.corp"));
+        // Positively proves the redaction branch fired, not just that the credential is
+        // absent (mirrors #1240 M5's convention).
+        assert!(message.contains("***@"));
     }
 
     /// #698: a `maven-metadata.xml` flooded with more `<version>` entries than
