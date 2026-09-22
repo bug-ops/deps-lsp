@@ -296,6 +296,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -327,6 +329,7 @@ jobs:
         # scan-github-action-image (needs above): a CRITICAL/HIGH Trivy finding there fails
         # this job before it ever runs, so a vulnerable image is never pushed to GHCR.
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build
         with:
           context: crates/github-action
           platforms: linux/amd64,linux/arm64
@@ -338,6 +341,86 @@ jobs:
             ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.minor }}
             ghcr.io/bug-ops/deps-lsp-github-action:${{ steps.tags.outputs.major }}
             ghcr.io/bug-ops/deps-lsp-github-action:latest
+
+  pin-action-digest:
+    name: Pin action.yml to Published Image Digest
+    needs: [create-release, build-github-action-image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Update action.yml image digest
+        # build-github-action-image's `digest` output is the pushed manifest
+        # list's digest (docker/build-push-action resolves it after push), so
+        # `runs.image:` in action.yml always tracks the image bytes the tag
+        # aliases (:version/:minor/:major/:latest) currently point to, not a
+        # mutable tag consumers would otherwise resolve at run time (#1274).
+        # The output is validated before use: docker/build-push-action has
+        # had bugs producing an empty digest output, and sed's `[0-9a-f]*`
+        # (zero-or-more) would otherwise silently rewrite the line to
+        # `...@` with nothing after it and still "look" edited.
+        run: |
+          DIGEST="${{ needs.build-github-action-image.outputs.digest }}"
+          if ! [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::build-github-action-image produced an invalid digest: '${DIGEST}'"
+            exit 1
+          fi
+          sed -i \
+            "s|image: docker://ghcr.io/bug-ops/deps-lsp-github-action@sha256:[0-9a-f]*|image: docker://ghcr.io/bug-ops/deps-lsp-github-action@${DIGEST}|" \
+            crates/github-action/action.yml
+          grep -F "image: docker://ghcr.io/bug-ops/deps-lsp-github-action@${DIGEST}" crates/github-action/action.yml
+
+      - name: Open a PR with the pinned digest
+        # main requires a reviewed, status-checked PR (branch protection) —
+        # a direct push is rejected outright, so this opens a PR on its own
+        # branch instead of pushing to main. Note this PR cannot fully
+        # auto-merge on its own: GitHub does not trigger `pull_request`-
+        # triggered workflows (ci.yml's required status checks) for events
+        # authored by the default GITHUB_TOKEN, so `required_status_checks`
+        # stays pending indefinitely for a PR opened this way. A maintainer
+        # needs to close/reopen the PR (or push an empty commit) to get
+        # checks running, then review and merge it manually.
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet; then
+            echo "action.yml digest already up to date"
+            exit 0
+          fi
+          branch="chore/pin-action-digest-${{ github.run_id }}"
+          git checkout -b "$branch"
+          git add crates/github-action/action.yml
+          git commit -m "chore(github-action): pin action.yml to published image digest v${{ needs.create-release.outputs.version }}"
+          git push origin "$branch"
+          pr_url=$(gh pr create \
+            --base main \
+            --head "$branch" \
+            --title "chore(github-action): pin action.yml to published image digest v${{ needs.create-release.outputs.version }}" \
+            --body "Automated update: repoints \`crates/github-action/action.yml\`'s \`runs.image\` at the digest published for v${{ needs.create-release.outputs.version }} by this release run.
+
+            This PR was opened by the default \`GITHUB_TOKEN\`, so GitHub will not run \`pull_request\`-triggered checks on it automatically (required status checks will stay pending). Close and reopen this PR, or push an empty commit, to trigger checks, then review and merge.")
+          echo "url=$pr_url" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: steps.pr.outputs.url != ''
+        # Harmless best-effort: arms auto-merge so the PR can complete on
+        # its own if/when a maintainer gets required checks running (see the
+        # comment above) — does not fail the job if "Allow auto-merge" is
+        # disabled on the repo or the PR isn't in a mergeable state yet.
+        continue-on-error: true
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ steps.pr.outputs.url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-wasm:
     name: Build WASM (Zed Extension)
