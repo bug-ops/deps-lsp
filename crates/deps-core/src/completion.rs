@@ -1354,7 +1354,6 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
 ///     build_feature_completion("derive", &deps_core::PackageName::new("serde"), None).unwrap();
 /// assert_eq!(item.label, "derive");
 /// ```
-// TODO(critic): gate feature_name through a name allowlist before these sinks (follow-up to #1285)
 pub fn build_feature_completion(
     feature_name: &str,
     package_name: &PackageName,
@@ -4322,10 +4321,7 @@ mod tests {
 
     #[test]
     fn test_build_feature_completion_accepts_legitimate_names() {
-        // Real Cargo feature-name syntax: ASCII alphanumerics, `_`, `-`, `+`, `.`
-        // (https://doc.rust-lang.org/cargo/reference/features.html#the-features-section).
-        // `dep:`/`?`/`/` are enable-syntax that appears only in a feature's *value* list,
-        // never in the name (map key) itself, so they are not covered here.
+        // Real feature-name syntax: ASCII alphanumerics, `_`, `-`, `+`, `.`.
         for name in ["derive", "std_alloc-v2+extra", "full.1"] {
             assert!(
                 build_feature_completion(name, &pkg("serde"), None).is_some(),
@@ -4336,10 +4332,7 @@ mod tests {
 
     #[test]
     fn test_build_feature_completion_rejects_unsafe_names() {
-        // Not real feature-name syntax: `:`/`?`/`/` and control characters are only ever
-        // legal in a feature's *value* list (`dep:`, weak `?/`), never in the name key,
-        // so a registry response using them here is malformed/malicious and must be
-        // dropped rather than partially rendered.
+        // `dep:`/`?`/`/` are enable-syntax, only in a feature's value list, never in its name key.
         for name in [
             "dep:ravif",
             "rgb?/serde",

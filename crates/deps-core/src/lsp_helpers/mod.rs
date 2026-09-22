@@ -3353,9 +3353,7 @@ mod tests {
 
     #[test]
     fn test_is_safe_feature_name_rejects_non_ascii() {
-        // Unicode XID characters are legal in Cargo's own feature-name grammar but not
-        // in crates.io's stricter publish-time check this predicate mirrors — rejected
-        // to avoid homograph/bidi-spoofing risk (see the function's own doc comment).
+        // ASCII-only, so homograph/bidi-spoofing characters are rejected outright.
         assert!(!is_safe_feature_name("café"));
         // U+202E RIGHT-TO-LEFT OVERRIDE.
         assert!(!is_safe_feature_name("evil\u{202E}reversed"));
@@ -3363,8 +3361,7 @@ mod tests {
 
     #[test]
     fn test_is_safe_feature_name_rejects_enable_syntax() {
-        // `dep:`/`?`/`/` are enable-syntax that only ever appears in a feature's
-        // *value* list, never in the name (map key) itself.
+        // `dep:`/`?`/`/` are enable-syntax, only in a feature's value list, never in its name key.
         for bad in ["dep:ravif", "rgb?/serde"] {
             assert!(
                 !is_safe_feature_name(bad),
