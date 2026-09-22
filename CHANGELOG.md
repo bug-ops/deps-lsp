@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **deps-lsp**: raw-text fallback package completion now matches the primary path's `sort_text`/`filter_text`/`detail`/`documentation`/`insert_text_format`, and gains the same latest-version safety gate (resolves #1284)
+- **deps-lsp**: raw-text fallback package completion now matches the primary path's `sort_text`/`filter_text`/`detail`/`documentation`/`insert_text_format`, and gains the same latest-version safety gate (resolves #1284) (#1291)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
