@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: raw-text fallback package completion now also threads the registry result's index/typed prefix into `sort_text`, closing the same relevance-ranking gap as #1282 on this second, independently-built completion path (resolves #1294) (#1293)
 - **deps-cli**: `CheckFinding.requirement` is now sanitized and length-capped before reaching JSON output, closing an ANSI-escape/bidi-override leak (resolves #1258) (#1301)
 - **deps-maven**: `maven-metadata.xml` parse errors are now redacted before reaching `DepsError::CacheError`, closing a credential leak from a malformed tag name (resolves #1249) (#1301)
-- **deps-cli**: `CheckFinding.manifest_path` is now sanitized before reaching table (default) and JSON output, and every other path-carrying warning/error message deps-cli prints is sanitized at a single construction-time chokepoint instead of per call site, closing the same Trojan-Source-class ANSI-escape/bidi-override leak class as #1301 (resolves #1299)
-- **deps-cli, deps-core**: `CheckFinding.requirement` sanitization now also redacts credential-shaped text via a new `deps_core::lsp_helpers::redact_requirement_for_diagnostic` helper, replacing deps-cli's locally duplicated length-cap constant (resolves #1300)
+- **deps-cli**: `CheckFinding.manifest_path` is now sanitized before reaching table (default) and JSON output, and every other path-carrying warning/error message deps-cli prints is sanitized at a single construction-time chokepoint instead of per call site, closing the same Trojan-Source-class ANSI-escape/bidi-override leak class as #1301 (resolves #1299) (#1304)
+- **deps-cli, deps-core**: `CheckFinding.requirement` sanitization now also redacts credential-shaped text via a new `deps_core::lsp_helpers::redact_requirement_for_diagnostic` helper, replacing deps-cli's locally duplicated length-cap constant (resolves #1300) (#1304)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
