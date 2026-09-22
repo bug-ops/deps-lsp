@@ -1130,6 +1130,14 @@ pub enum KeyShape {
 }
 
 /// Outcome of a [`register_capped`]/[`register_capped_with_occupied`] call.
+///
+/// `#[non_exhaustive]`: this is a result-shaped enum (introduced in #1218), and a distinct
+/// outcome for a new capacity-related edge case is a realistic future addition — e.g.
+/// distinguishing an eviction from a refusal, should this map ever gain eviction. No
+/// consumer outside this workspace depends on it yet, making now the cheapest point to
+/// mark it non-exhaustive; doing so later, once external crates match on it, would itself
+/// be a breaking change (part of #1226).
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CapResult {
     /// `make()` ran and its value was inserted (the `Vacant`, under-capacity arm).

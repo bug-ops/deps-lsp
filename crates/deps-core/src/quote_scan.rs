@@ -44,6 +44,13 @@ use std::ops::Range;
 /// here (and an exhaustive `match` on it forces every scan function to handle it) instead
 /// of a cross product of independent style flags.
 ///
+/// `#[non_exhaustive]`: this enum gains a variant every time deps-lsp adds support for a
+/// manifest family with its own quoting/comment syntax — it already grew `Groovy` once
+/// (#1186), as an undocumented break against a matching downstream `match`. Ecosystem support
+/// is expected to keep expanding, and exhaustiveness on this type buys callers nothing (no
+/// scan function is meant to special-case "any other syntax"), so a future addition should
+/// ship as a non-breaking patch instead of forcing a major version bump.
+///
 /// # Examples
 ///
 /// ```
@@ -54,6 +61,7 @@ use std::ops::Range;
 ///     r#"gem "x", source: "https://h" "#,
 /// );
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanSyntax {
     /// Ruby (Gemfile) syntax: `"` and `'` string literals, both backslash-escaped; `#` starts
