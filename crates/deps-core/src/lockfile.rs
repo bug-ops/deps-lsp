@@ -428,8 +428,9 @@ impl std::fmt::Debug for ResolvedSource {
     /// Manual, not derived: `Registry`/`Git`'s `url` is copied verbatim from the lock file
     /// (e.g. Cargo's `git+https://user:token@host/repo`, npm's `resolved`) and can carry a
     /// credential; `Path`'s `path` is also redacted defensively, since it is the catch-all a
-    /// caller may put an unrecognized URL scheme into (e.g. Cargo's `sparse+https://` sources)
-    /// rather than a filesystem path (CWE-532, #1237).
+    /// caller may put an unrecognized URL scheme into (e.g. Cargo's `unknown-scheme+https://`
+    /// sources — `sparse+` itself is classified as `Registry` since #1320) rather than a
+    /// filesystem path (CWE-532, #1237).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Registry { url, checksum } => f
@@ -476,9 +477,38 @@ impl std::fmt::Debug for ResolvedSource {
 /// assert_eq!(packages.version("serde"), Some("1.0.195"));
 /// assert_eq!(packages.len(), 1);
 /// ```
-#[derive(Debug, Default, Clone)]
+#[derive(Default, Clone)]
 pub struct ResolvedPackages {
     packages: HashMap<String, Vec<ResolvedPackage>>,
+}
+
+impl std::fmt::Debug for ResolvedPackages {
+    /// Manual, not derived: the `HashMap` key is the same lock-file package name
+    /// [`ResolvedPackage::name`] carries, so a derived impl would print it twice — once raw
+    /// (as the key) and once through whatever redaction `ResolvedPackage`'s own `Debug` applies
+    /// (#1319).
+    ///
+    /// Renders through [`std::fmt::Formatter::debug_map`] rather than collecting redacted keys
+    /// into a real `HashMap` first: two distinct names that happen to redact to the same marker
+    /// (e.g. two different credentials against the same host) would otherwise collide and
+    /// silently drop one package from the output.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        struct RedactedMap<'a>(&'a HashMap<String, Vec<ResolvedPackage>>);
+
+        impl std::fmt::Debug for RedactedMap<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_map()
+                    .entries(self.0.iter().map(|(name, versions)| {
+                        (crate::net_policy::redact_declaration_key(name), versions)
+                    }))
+                    .finish()
+            }
+        }
+
+        f.debug_struct("ResolvedPackages")
+            .field("packages", &RedactedMap(&self.packages))
+            .finish()
+    }
 }
 
 /// Orders two version strings, preferring a valid semver parse over a non-parseable one and
@@ -1924,14 +1954,85 @@ mod tests {
         },
     );
 
-    // Regression for #1237 S3: `parse_cargo_source` funnels every unrecognized scheme
-    // (including Cargo's own `sparse+https://` default registry protocol since 1.70) into
-    // `Path` rather than `Registry`, so `Path`'s `path` field must redact a credential too.
+    // Regression for #1237 S3: `Path` is `parse_cargo_source`'s catch-all for any source
+    // prefix it doesn't recognize (`sparse+` itself is classified as `Registry` since #1320),
+    // so `Path`'s `path` field must still redact a credential for whatever unrecognized prefix
+    // reaches it.
     crate::debug_redaction_conformance!(
-        test_resolved_source_path_debug_redacts_sparse_registry_credential,
+        test_resolved_source_path_debug_redacts_unrecognized_scheme_credential,
         1,
         ResolvedSource::Path {
-            path: format!("sparse+{}", crate::conformance::CREDENTIAL_PROBE_URL),
+            path: format!(
+                "unknown-scheme+{}",
+                crate::conformance::CREDENTIAL_PROBE_URL
+            ),
         },
     );
+
+    // #1319 M3: plants the probe in both the map key and `ResolvedPackage.name` — the shape
+    // `ResolvedPackages::insert` always produces (key == value.name) — so this also locks the
+    // duplicated-name scenario the issue is about, not just an unrealistic key/name mismatch.
+    crate::debug_redaction_conformance!(
+        test_resolved_packages_debug_redacts_map_key,
+        2,
+        ResolvedPackages {
+            packages: HashMap::from([(
+                crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+                vec![ResolvedPackage::new(
+                    crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+                    "1.0.0".to_string(),
+                    ResolvedSource::Path {
+                        path: String::new(),
+                    },
+                )],
+            )]),
+        },
+    );
+
+    #[test]
+    fn test_resolved_packages_debug_preserves_colliding_redacted_keys() {
+        // Two distinct raw names that redact to the identical marker `***@git.internal.corp`
+        // (#1319 S2 regression guard): a naive `.collect::<HashMap<_, _>>()` over the redacted
+        // keys would collapse both into one map entry, silently dropping a package from the
+        // rendered output. The `debug_map()`-based impl must emit one entry per original
+        // package regardless of redacted-key collisions.
+        let name_a = "orgA:deployA:secretA@git.internal.corp";
+        let name_b = "orgB.other:deployB:secretB@git.internal.corp";
+
+        let mut packages = ResolvedPackages::new();
+        packages.insert(ResolvedPackage::new(
+            name_a.to_string(),
+            "1.0.0".to_string(),
+            ResolvedSource::Path {
+                path: String::new(),
+            },
+        ));
+        packages.insert(ResolvedPackage::new(
+            name_b.to_string(),
+            "2.0.0".to_string(),
+            ResolvedSource::Path {
+                path: String::new(),
+            },
+        ));
+
+        assert_eq!(packages.len(), 2);
+
+        let rendered = format!("{packages:?}");
+
+        assert!(!rendered.contains("secretA"));
+        assert!(!rendered.contains("secretB"));
+        assert!(
+            rendered.contains("1.0.0"),
+            "package a's version must survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("2.0.0"),
+            "package b's version must survive: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("***@git.internal.corp").count(),
+            4,
+            "expected 2 redacted map keys + 2 redacted ResolvedPackage.name fields, found: {rendered}"
+        );
+    }
 }

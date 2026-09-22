@@ -164,6 +164,7 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
 /// # Source Formats
 ///
 /// - `"registry+https://github.com/rust-lang/crates.io-index"` → Registry
+/// - `"sparse+https://index.crates.io/"` → Registry (Cargo's default registry protocol since 1.70)
 /// - `"git+https://github.com/user/repo#commit"` → Git
 /// - None (path dependencies don't have source field) → Path
 fn parse_cargo_source(source_str: Option<&str>) -> ResolvedSource {
@@ -173,7 +174,11 @@ fn parse_cargo_source(source_str: Option<&str>) -> ResolvedSource {
         };
     };
 
-    if let Some(registry_url) = source.strip_prefix("registry+") {
+    // `parser.rs`'s `is_public_crates_io_index` still matches the unstripped `sparse+` URL.
+    if let Some(registry_url) = source
+        .strip_prefix("registry+")
+        .or_else(|| source.strip_prefix("sparse+"))
+    {
         ResolvedSource::Registry {
             url: registry_url.to_string(),
             checksum: String::new(),
@@ -187,6 +192,11 @@ fn parse_cargo_source(source_str: Option<&str>) -> ResolvedSource {
 
         ResolvedSource::Git { url, rev }
     } else {
+        // Other unrecognized `SourceId` kinds also land here; log so misclassification is visible.
+        tracing::debug!(
+            "Unrecognized Cargo.lock source prefix, treating as path: {}",
+            deps_core::net_policy::redact_declaration_key(source)
+        );
         ResolvedSource::Path {
             path: source.to_string(),
         }
@@ -291,6 +301,18 @@ b = 2
         match source {
             ResolvedSource::Registry { url, .. } => {
                 assert_eq!(url, "https://github.com/rust-lang/crates.io-index");
+            }
+            _ => panic!("Expected Registry source"),
+        }
+    }
+
+    #[test]
+    fn test_parse_cargo_source_sparse() {
+        let source = parse_cargo_source(Some("sparse+https://index.crates.io/"));
+
+        match source {
+            ResolvedSource::Registry { url, .. } => {
+                assert_eq!(url, "https://index.crates.io/");
             }
             _ => panic!("Expected Registry source"),
         }
@@ -488,6 +510,38 @@ source = "git+https://github.com/user/repo#abc123"
                 assert_eq!(rev, "abc123");
             }
             _ => panic!("Expected Git source"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_parse_cargo_lock_with_sparse_registry() {
+        // See the comment in `test_parse_cargo_lock_rejects_excessive_nesting` on why this
+        // guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let lockfile_content = r#"
+version = 4
+
+[[package]]
+name = "serde"
+version = "1.0.195"
+source = "sparse+https://index.crates.io/"
+"#;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(&lockfile_path, lockfile_content).unwrap();
+
+        let parser = CargoLockParser;
+        let resolved = parser.parse_lockfile(&lockfile_path).await.unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        let pkg = resolved.get("serde").unwrap();
+
+        match &pkg.source {
+            ResolvedSource::Registry { url, .. } => {
+                assert_eq!(url, "https://index.crates.io/");
+            }
+            _ => panic!("Expected Registry source"),
         }
     }
 
