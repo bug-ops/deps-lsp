@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `completion::build_package_completion` gains `index: usize` and `prefix: &str` parameters, used to preserve registry relevance ranking in `sort_text` (resolves #1282) (#1293)
 - **deps-core**: `completion::build_feature_completion` now returns `Option<CompletionItem>` instead of `CompletionItem`, dropping the item when `feature_name` fails `is_safe_feature_name` (resolves #1296)
 - **deps-core**: `DepsError::RateLimited` gains `verified: bool` and `source_status: Option<u16>` fields (now `#[non_exhaustive]` itself, so future field additions won't repeat this); a downstream crate matching or constructing it without `..` needs updating (part of #1295) (#1308)
+- **deps-core**: `quote_scan::ScanSyntax` is now `#[non_exhaustive]`, so a future scanner dialect variant (like `Groovy`, added in #1186) won't repeat that break silently (resolves #1226) (#1321)
+- **deps-core**: `registry::CapResult` is now `#[non_exhaustive]` (part of #1226) (#1321)
 
 ### Changed
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)
