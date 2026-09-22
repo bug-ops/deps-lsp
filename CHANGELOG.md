@@ -24,6 +24,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-npm**: live-search test no longer asserts that npm's tokenized search returns a specific package for a partial-prefix query (#1297)
 - **tests**: every bare `#[ignore]` annotation across the workspace now carries a reason string (#1297)
 - **deps-lsp**: raw-text fallback package completion now also threads the registry result's index/typed prefix into `sort_text`, closing the same relevance-ranking gap as #1282 on this second, independently-built completion path (resolves #1294) (#1293)
+- **deps-cli**: `CheckFinding.requirement` is now sanitized and length-capped before reaching JSON output, closing an ANSI-escape/bidi-override leak (resolves #1258) (#1301)
+- **deps-maven**: `maven-metadata.xml` parse errors are now redacted before reaching `DepsError::CacheError`, closing a credential leak from a malformed tag name (resolves #1249) (#1301)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)

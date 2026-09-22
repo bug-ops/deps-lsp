@@ -14,6 +14,7 @@ use deps_core::diagnostic::{Diagnostic, Severity};
 use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, DependencyOutcomes, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic,
+    sanitize_and_truncate_for_diagnostic,
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
@@ -166,6 +167,12 @@ impl std::fmt::Display for Category {
     }
 }
 
+/// Maximum character count of [`CheckFinding::requirement`] before it is truncated with an
+/// ellipsis marker (issue #1258). Mirrors `deps_core::lsp_helpers::diagnostics::
+/// MAX_VERSION_DIAGNOSTIC_CHARS`'s bound for the same version-shaped-string class, redeclared
+/// here since that constant is `pub(crate)` to `deps-core` and not reachable from this crate.
+const MAX_REQUIREMENT_CHARS: usize = 128;
+
 /// One reported issue, derived 1:1 from a [`Diagnostic`] `generate_diagnostics` produced.
 #[derive(Debug, Clone)]
 pub struct CheckFinding {
@@ -179,7 +186,9 @@ pub struct CheckFinding {
     /// [`deps_core::lsp_helpers::redact_name_for_diagnostic`] (#1242, #1246), so this is
     /// never the raw manifest value.
     pub dependency_name: Option<String>,
-    /// The dependency's declared version requirement, when known.
+    /// The dependency's declared version requirement, when known. Passed through
+    /// [`deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic`] (#1258), so this is
+    /// never the raw manifest value.
     pub requirement: Option<String>,
     /// The classified category (see [`Category`]).
     pub category: Category,
@@ -728,7 +737,7 @@ fn to_finding(
         dependency_name: dep.map(|d| redact_name_for_diagnostic(d.name())),
         requirement: dep
             .and_then(Dependency::version_requirement)
-            .map(ToString::to_string),
+            .map(|req| sanitize_and_truncate_for_diagnostic(req.as_ref(), MAX_REQUIREMENT_CHARS)),
         category,
         code,
         advisory_url,
@@ -996,9 +1005,11 @@ mod tests {
     /// A single-dependency [`deps_core::Dependency`]/[`deps_core::ParseResult`] fixture whose
     /// name is caller-controlled — unlike [`dep_index_with_one_dependency`]'s fixed `dep-0`,
     /// needed to exercise `to_finding`'s `dependency_name` redaction (#1242, #1246) with an
-    /// attacker-controlled manifest key.
+    /// attacker-controlled manifest key. `requirement` is likewise caller-controlled to
+    /// exercise `to_finding`'s `requirement` sanitization (#1258).
     struct NamedFixtureDep {
         name: PackageName,
+        requirement: Option<deps_core::VersionReq>,
     }
 
     impl deps_core::Dependency for NamedFixtureDep {
@@ -1009,7 +1020,7 @@ mod tests {
             Range::default()
         }
         fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
-            None
+            self.requirement.as_ref()
         }
         fn version_range(&self) -> Option<Range> {
             None
@@ -1046,6 +1057,17 @@ mod tests {
         Box::new(NamedFixtureParseResult {
             dep: NamedFixtureDep {
                 name: PackageName::new(name),
+                requirement: None,
+            },
+            uri: "file:///project/manifest.toml".parse().expect("valid URI"),
+        })
+    }
+
+    fn dep_index_with_requirement(requirement: &str) -> Box<dyn deps_core::ParseResult> {
+        Box::new(NamedFixtureParseResult {
+            dep: NamedFixtureDep {
+                name: PackageName::new("dep-0"),
+                requirement: Some(deps_core::VersionReq::from(requirement)),
             },
             uri: "file:///project/manifest.toml".parse().expect("valid URI"),
         })
@@ -1202,6 +1224,62 @@ mod tests {
             decoded.contains("***@gitlab.corp"),
             "expected the redacted '***@host' marker, got: {decoded}"
         );
+    }
+
+    /// #1258: `to_finding`'s `requirement` field is built from the raw
+    /// `Dependency::version_requirement().to_string()` — a manifest-controlled value that can
+    /// carry ANSI escapes or bidi overrides (CWE-117, Trojan Source class) and reaches JSON
+    /// output (which escapes `\n` but not ANSI/bidi) verbatim. `requirement` construction must
+    /// sanitize it, mirroring the `dependency_name` fix above.
+    #[test]
+    fn test_to_finding_sanitizes_bidi_and_ansi_in_requirement() {
+        let parse_result = dep_index_with_requirement("\u{202E}^1.0\u{1b}[31mfake\u{1b}[0m");
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Unknown package");
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let requirement = finding.requirement.expect("range matched the dependency");
+        assert!(!requirement.contains('\u{202E}'));
+        assert!(!requirement.contains('\u{1b}'));
+        assert!(requirement.contains("^1.0"));
+    }
+
+    /// #1258 (JSON sink): a bidi/ANSI-laden `requirement` must not appear verbatim in the JSON
+    /// document either — proving sanitization at `to_finding` construction, not `to_document`
+    /// itself (which just clones the field), is what protects this sink, mirroring the SARIF
+    /// end-to-end test above for `dependency_name`.
+    #[test]
+    fn test_json_output_never_carries_raw_bidi_or_ansi_through_requirement() {
+        let parse_result = dep_index_with_requirement("\u{202E}^1.0\u{1b}[31mfake\u{1b}[0m");
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Unknown package");
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let document = crate::format::json::to_document(&CheckReport {
+            findings: vec![finding],
+        });
+        let json = serde_json::to_string(&document).expect("document serializes");
+
+        assert!(!json.contains('\u{202E}'));
+        assert!(!json.contains('\u{1b}'));
     }
 
     #[test]
