@@ -232,6 +232,8 @@ async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
 /// The CPU-bound half of [`parse_pnpm_lock`], run inside
 /// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
+    deps_core::check_yaml_bounds(content, "pnpm-lock.yaml")?;
+
     let to_parse_error = |message: String| DepsError::ParseError {
         file_type: "pnpm-lock.yaml".into(),
         source: Box::new(std::io::Error::new(
@@ -239,14 +241,6 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
             message,
         )),
     };
-
-    if deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH).is_err()
-        || deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES).is_err()
-    {
-        return Err(to_parse_error(
-            "exceeds YAML nesting depth or expansion bounds".into(),
-        ));
-    }
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| {
         to_parse_error(format!(
@@ -1021,6 +1015,53 @@ importers:
             panic!("expected DepsError::ParseError, got {result:?}");
         };
         assert!(file_type.contains("pnpm-lock.yaml"));
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_nesting_over_max_depth_rejected() {
+        // #1245: pins that this guard reports the specific bound tripped, not a generic message.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let lockfile_content = format!("{}1", "- ".repeat(deps_core::MAX_YAML_NESTING_DEPTH + 1));
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, &lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+
+        let err = result.expect_err("expected the nesting-depth guard to reject this");
+        assert!(
+            err.to_string().contains("YAML nesting depth"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parse_pnpm_lock_expansion_over_max_bytes_rejected() {
+        // #1245: same as the nesting-depth test above, for the expansion bound.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let mut lockfile_content = String::from("a0: &a0 [x, x]\n");
+        for i in 1..=30 {
+            lockfile_content.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("pnpm-lock.yaml");
+        tokio::fs::write(&lockfile_path, &lockfile_content)
+            .await
+            .unwrap();
+
+        let parser = NpmLockParser;
+        let result = parser.parse_lockfile(&lockfile_path).await;
+
+        let err = result.expect_err("expected the expansion budget to reject this");
+        assert!(
+            err.to_string().contains("YAML expansion"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[tokio::test]

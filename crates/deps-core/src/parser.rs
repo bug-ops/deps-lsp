@@ -4,6 +4,7 @@ use yaml_rust2::Event;
 use yaml_rust2::parser::{MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
 
+use crate::error::{DepsError, Result};
 use crate::net_policy::RedactedUrl;
 
 /// Maximum allowed nesting depth for TOML table/array recursion before
@@ -760,6 +761,51 @@ pub fn check_yaml_expansion(content: &str, max_bytes: usize) -> std::result::Res
     } else {
         Ok(())
     }
+}
+
+/// Runs [`check_yaml_nesting_depth`] and [`check_yaml_expansion`] against `content`,
+/// converting either rejection into a [`DepsError::ParseError`] labeled with `file_type`.
+///
+/// The single shared entry point for every workspace call site that guards untrusted YAML
+/// before handing it to `yaml-rust2`'s real parser — collapses what would otherwise be a
+/// per-crate copy of both checks plus their `DepsError` construction (and the risk of the
+/// copies drifting in what they report) into one call.
+///
+/// # Errors
+///
+/// Returns [`DepsError::ParseError`] if `content` nests deeper than
+/// [`MAX_YAML_NESTING_DEPTH`] or would expand past [`MAX_YAML_EXPANDED_BYTES`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::check_yaml_bounds;
+///
+/// assert!(check_yaml_bounds("a:\n  b: 1\n", "example.yml").is_ok());
+///
+/// let deeply_nested = format!("{}1", "- ".repeat(100));
+/// let err = check_yaml_bounds(&deeply_nested, "example.yml").unwrap_err();
+/// assert!(err.to_string().contains("example.yml"));
+/// assert!(err.to_string().contains("nesting depth"));
+/// ```
+pub fn check_yaml_bounds(content: &str, file_type: &str) -> Result<()> {
+    if let Err(depth) = check_yaml_nesting_depth(content, MAX_YAML_NESTING_DEPTH) {
+        return Err(DepsError::ParseError {
+            file_type: file_type.into(),
+            source: Box::new(std::io::Error::other(format!(
+                "YAML nesting depth {depth} exceeds maximum of {MAX_YAML_NESTING_DEPTH}"
+            ))),
+        });
+    }
+    if let Err(bytes) = check_yaml_expansion(content, MAX_YAML_EXPANDED_BYTES) {
+        return Err(DepsError::ParseError {
+            file_type: file_type.into(),
+            source: Box::new(std::io::Error::other(format!(
+                "YAML expansion {bytes} bytes exceeds maximum of {MAX_YAML_EXPANDED_BYTES} bytes"
+            ))),
+        });
+    }
+    Ok(())
 }
 
 /// Maximum allowed nesting depth for JSON array/object recursion before
@@ -1883,6 +1929,55 @@ dev_dependencies:
                 "oracle mismatch for {content:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_check_yaml_bounds_within_limits_ok() {
+        assert!(check_yaml_bounds("a:\n  b: 1\n", "example.yml").is_ok());
+    }
+
+    #[test]
+    fn test_check_yaml_bounds_nesting_exceeded_reports_depth_message() {
+        let content = format!("{}1", "- ".repeat(MAX_YAML_NESTING_DEPTH + 1));
+        // Cross-checked against the oracle rather than hardcoded, in case depth accounting changes.
+        let expected_depth = check_yaml_nesting_depth(&content, MAX_YAML_NESTING_DEPTH)
+            .expect_err("fixture should already exceed the nesting-depth budget");
+
+        let err = check_yaml_bounds(&content, "example.yml")
+            .expect_err("expected the nesting-depth guard to reject this");
+        let DepsError::ParseError { file_type, source } = err else {
+            panic!("expected DepsError::ParseError");
+        };
+        assert_eq!(file_type, "example.yml");
+        assert_eq!(
+            source.to_string(),
+            format!(
+                "YAML nesting depth {expected_depth} exceeds maximum of {MAX_YAML_NESTING_DEPTH}"
+            )
+        );
+    }
+
+    #[test]
+    fn test_check_yaml_bounds_expansion_exceeded_reports_expansion_message() {
+        let mut content = String::from("a0: &a0 [x, x]\n");
+        for i in 1..=20 {
+            content.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+        let expected_bytes = check_yaml_expansion(&content, MAX_YAML_EXPANDED_BYTES)
+            .expect_err("fixture should already exceed the expansion budget");
+
+        let err = check_yaml_bounds(&content, "example.yml")
+            .expect_err("expected the expansion budget to reject this");
+        let DepsError::ParseError { file_type, source } = err else {
+            panic!("expected DepsError::ParseError");
+        };
+        assert_eq!(file_type, "example.yml");
+        assert_eq!(
+            source.to_string(),
+            format!(
+                "YAML expansion {expected_bytes} bytes exceeds maximum of {MAX_YAML_EXPANDED_BYTES} bytes"
+            )
+        );
     }
 
     #[test]
