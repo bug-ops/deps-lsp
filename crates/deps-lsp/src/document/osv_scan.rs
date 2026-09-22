@@ -559,12 +559,9 @@ mod tests {
 
         /// Live end-to-end, mirroring the Dart test above: a real `Package.swift`
         /// dependency, routed through the real `EcosystemRegistry`, fetching
-        /// `apple/swift-nio`'s license from the real GitHub repository API.
-        ///
-        /// Unauthenticated GitHub API calls are capped at 60 req/h — this can fail
-        /// with an empty result under an exhausted rate limit (no `GITHUB_TOKEN` set)
-        /// rather than a genuine regression; that is the same graceful-degradation
-        /// path `SwiftRegistry::get_license` takes for any fetch failure (NFR-003).
+        /// `apple/swift-nio`'s license from the real GitHub repository API. Skips (rather
+        /// than fails) on an expected unauthenticated rate limit — see
+        /// `deps_core::test_util::should_skip_on_empty_result`'s doc (#1283).
         #[cfg(feature = "swift")]
         #[tokio::test]
         #[ignore = "hits the real GitHub API"]
@@ -590,14 +587,32 @@ mod tests {
             );
             state.update_document(uri.clone(), doc_state);
 
-            run_license_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+            // `ecosystem` itself (not just a clone) is kept alive past this call so it can
+            // still probe below on a missing license (#1283 S2).
+            run_license_prefetch(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5).await;
 
-            let doc = state.get_document(&uri).unwrap();
+            // Scoped so the `DashMap` shard-lock guard `get_document` returns is dropped
+            // before the probe below ever awaits (`clippy::await_holding_invalid_type`).
+            let licenses = state.get_document(&uri).unwrap().licenses.clone();
+            let has_license = licenses.contains_key(&PackageName::new("apple/swift-nio"));
+            // #1283 S2: `run_license_prefetch` swallows *any* fetch error to "no license
+            // populated", so a missing entry alone can't tell an expected rate limit apart
+            // from a real bug — see `should_skip_on_empty_result`'s doc.
+            if deps_core::test_util::should_skip_on_empty_result(
+                !has_license,
+                "run_license_prefetch_live_swift_populates_document_licenses",
+                ecosystem
+                    .registry()
+                    .get_versions(&PackageName::new("apple/swift-nio")),
+            )
+            .await
+            {
+                return;
+            }
             assert!(
-                doc.licenses
-                    .contains_key(&PackageName::new("apple/swift-nio")),
+                has_license,
                 "expected a pre-fetched license for 'apple/swift-nio', got: {:?}",
-                doc.licenses
+                licenses
             );
         }
 

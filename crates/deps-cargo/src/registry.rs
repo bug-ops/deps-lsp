@@ -721,7 +721,7 @@ mod tests {
     /// extraction — `search` stayed on `CratesIoRegistry`, so this test's home is
     /// unchanged from before that refactor. `#[ignore]`d: not run in CI, only on demand.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_search_real() {
         let cache = Arc::new(HttpCache::new());
         let registry = CratesIoRegistry::new(cache);

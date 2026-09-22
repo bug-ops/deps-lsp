@@ -1450,7 +1450,7 @@ mod tests {
     /// via `cargo test -p deps-maven -- --ignored` to sanity-check against the real
     /// endpoint.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_search_real_guava() {
         let cache = Arc::new(HttpCache::new());
         let registry = MavenCentralRegistry::new(cache);
@@ -2468,7 +2468,7 @@ mod tests {
     // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_maven_central_attaches_publish_times() {
         let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
         let versions = registry
@@ -2483,7 +2483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_google_maven_never_attaches_publish_times() {
         let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
         let versions = registry
@@ -2498,7 +2498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_gradle_plugin_portal_never_attaches_publish_times() {
         let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
         // The Gradle plugin marker artifact for `com.gradle.develocity` (404s on Maven

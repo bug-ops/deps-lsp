@@ -1381,7 +1381,7 @@ mod tests {
     /// systems): the real npm `express` version response carries a non-empty
     /// `licenses[]` array, threaded through into `SupplyChainTrustSignal.licenses`.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn trust_signal_real_npm_express_carries_license() {
         let client = client();
         let signal = client

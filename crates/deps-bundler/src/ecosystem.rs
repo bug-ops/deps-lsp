@@ -434,7 +434,7 @@ gem 'rails', '~> 7.0'";
     /// `deps_cargo::ecosystem::tests::test_complete_versions_real`).
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_generate_completions_version_context_dispatches_to_registry() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = BundlerEcosystem::new(cache);

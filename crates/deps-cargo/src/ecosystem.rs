@@ -705,7 +705,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_package_names_real_search() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
@@ -719,7 +719,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_versions_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
@@ -743,7 +743,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_versions_with_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
@@ -767,7 +767,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_features_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
@@ -781,7 +781,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_features_with_prefix() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
@@ -1055,7 +1055,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_features_empty_list() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);
@@ -1069,7 +1069,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_package_names_special_chars_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = CargoEcosystem::new(cache);

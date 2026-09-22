@@ -2504,7 +2504,7 @@ mod tests {
     // network tests).
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_generate_completions_version_arm_dispatches_by_position() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = MavenEcosystem::new(cache);
@@ -2770,7 +2770,7 @@ mod tests {
     // withholding it (round 2's reverted trigger, fixed properly this time).
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_generate_completions_offers_completion_for_self_closing_version_tag() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = MavenEcosystem::new(cache);

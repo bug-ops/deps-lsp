@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // requires network access
+    #[ignore = "requires network access"]
     async fn test_deno_registry_get_versions_dispatches_npm_live() {
         // Exercises the npm arm's dispatch through `DenoRegistry::new`'s private
         // `NpmRegistry` end-to-end against the real registry; mockable dispatch via a
@@ -1511,7 +1511,7 @@ mod tests {
     // samples quoted in the architecture plan.
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_jsr_get_versions_std_fs() {
         let registry = JsrRegistry::new(Arc::new(HttpCache::new()));
         let versions = registry.get_versions("std", "fs").await.unwrap();
@@ -1531,7 +1531,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_jsr_search_fs() {
         let registry = JsrRegistry::new(Arc::new(HttpCache::new()));
         let results = registry.search("fs", 5).await.unwrap();
@@ -1541,7 +1541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_jsr_search_scoped_query_ranks_exact_scope_first() {
         // N1: live-verified 2026-08-24 that an unfixed scoped query buries `@std/fs`
         // ~17th of 20 results; this must now come back first.
@@ -1553,7 +1553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_jsr_get_versions_missing_package_is_not_found() {
         let registry = JsrRegistry::new(Arc::new(HttpCache::new()));
         let err = registry

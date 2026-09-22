@@ -426,7 +426,7 @@ mod tests {
     /// (review finding #8) after being dropped, undisclosed, during the extraction of
     /// this module out of `registry.rs`. `#[ignore]`d: not run in CI, only on demand.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_fetch_real_serde_versions() {
         let cache = Arc::new(HttpCache::new());
         let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache);
@@ -439,7 +439,7 @@ mod tests {
     /// Live-network smoke test against the real crates.io sparse index. Restored
     /// (review finding #8), same provenance as `test_fetch_real_serde_versions` above.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_get_latest_matching_real() {
         let cache = Arc::new(HttpCache::new());
         let client = SparseIndexClient::new(test_index("https://index.crates.io"), cache);

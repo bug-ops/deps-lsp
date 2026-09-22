@@ -2087,7 +2087,7 @@ dependencies {
     // characterization test.
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_generate_completions_version_arm_dispatches_by_position() {
         // See the comment in `test_parse_manifest_kts` on why this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;

@@ -29,6 +29,14 @@
 //! call, to avoid an untraced sibling test permanently poisoning a shared callsite's
 //! `tracing-core` `Interest` cache before the capturing test's own subscriber was installed
 //! (#1006).
+//!
+//! [`github_token_configured`]/[`unwrap_or_skip_github_rate_limit`] let a live,
+//! GitHub-API-backed `#[ignore]`d test distinguish "the unauthenticated 60 req/h rate limit
+//! was hit because no `GITHUB_TOKEN` is configured" (expected in CI/local runs without a
+//! token — skip) from "the live API genuinely changed or broke" (a real failure, even with
+//! a token present) (#1283). [`should_skip_on_empty_result`] builds on the same primitive
+//! for a test whose production call swallows the underlying error to an empty/missing
+//! result rather than surfacing a `Result` directly.
 
 /// Builds a [`url::Url`] from a Unix-style absolute test path.
 ///
@@ -611,6 +619,144 @@ impl crate::ParseResult for StubParseResult {
     }
 }
 
+/// Whether a non-empty `GITHUB_TOKEN` is configured in the current process's environment.
+///
+/// GitHub-backed live tests (Swift's registry is GitHub-tags-based) use this to tell an
+/// expected unauthenticated-rate-limit skip apart from a genuine API regression (#1283).
+///
+/// Matches [`crate::github::GithubTagsClient::new`]'s own `.filter(|t| !t.is_empty())`
+/// predicate exactly: an empty `GITHUB_TOKEN` (e.g. an unset GitHub Actions secret, or
+/// `export GITHUB_TOKEN=$(gh auth token)` when `gh` isn't authenticated — the exact remedy
+/// [`crate::github::github_rate_limit_error`]'s message prints) makes the client go
+/// unauthenticated the same as an unset one, so it must count as "not configured" here too.
+/// The actual predicate is `is_configured_token`, a pure function over an already-read
+/// `Option<String>` rather than reading the env var itself, since `std::env::set_var` is
+/// `unsafe` (forbidden workspace-wide) and no test can mutate the real env var to exercise
+/// this branching directly.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::github_token_configured;
+///
+/// // No assertion on the value itself — it depends on the calling environment.
+/// let _ = github_token_configured();
+/// ```
+#[must_use]
+pub fn github_token_configured() -> bool {
+    is_configured_token(std::env::var("GITHUB_TOKEN").ok())
+}
+
+/// Pure predicate behind [`github_token_configured`] — see its doc for why this is split out.
+fn is_configured_token(token: Option<String>) -> bool {
+    token.is_some_and(|t| !t.is_empty())
+}
+
+/// Unwraps `result`, or returns `None` after printing a skip notice on an expected rate limit.
+///
+/// The skip case is `result` holding an `Err` that is a [`crate::DepsError::RateLimited`]
+/// with no `GITHUB_TOKEN` configured — the expected shape for an unauthenticated GitHub-backed
+/// live test hitting the 60 req/h cap (#1283). `test_name` is included in the skip notice and
+/// any panic message, to identify which test emitted them when run with `--no-fail-fast`.
+///
+/// Known limitation: every unauthenticated GitHub 403 maps to `RateLimited` (see
+/// `crate::github`'s call sites), without narrowing on a response header (e.g.
+/// `X-RateLimit-Remaining: 0`) to confirm true rate-limit exhaustion versus another 403 cause
+/// (abuse-detection false positive, secondary rate limit, an access-restricted repo). An
+/// unauthenticated run can therefore still skip a genuine 403-shaped regression as if it were
+/// an expected rate limit. Narrowing this would need response-header plumbing through
+/// `crate::cache`/`DepsError` — out of scope for the test-skip helper itself (#1283 follow-up).
+///
+/// # Panics
+///
+/// Panics on any error other than `RateLimited`, and on `RateLimited` itself when
+/// `GITHUB_TOKEN` *is* configured — in both cases the rate limit was not the expected cause,
+/// so the failure is surfaced rather than silently skipped.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::unwrap_or_skip_github_rate_limit;
+///
+/// let result: Result<u32, deps_core::DepsError> = Ok(42);
+/// assert_eq!(
+///     unwrap_or_skip_github_rate_limit(result, "doctest"),
+///     Some(42)
+/// );
+/// ```
+pub fn unwrap_or_skip_github_rate_limit<T>(
+    result: Result<T, crate::DepsError>,
+    test_name: &str,
+) -> Option<T> {
+    rate_limit_skip_decision(result, test_name, github_token_configured())
+}
+
+/// Pure decision behind [`unwrap_or_skip_github_rate_limit`], factored out so its 3 branches
+/// (skip / panic on a rate limit with a token configured / panic on any other error) are
+/// unit-testable with a synthetic `token_configured` value — see [`github_token_configured`]'s
+/// doc for why the real env var can't be mutated in a test here.
+fn rate_limit_skip_decision<T>(
+    result: Result<T, crate::DepsError>,
+    test_name: &str,
+    token_configured: bool,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(crate::DepsError::RateLimited { message }) if !token_configured => {
+            eprintln!(
+                "{test_name}: skipping — GitHub API rate-limited and no GITHUB_TOKEN is \
+                 configured: {message}"
+            );
+            None
+        }
+        Err(e) => panic!(
+            "{test_name}: unexpected error (GITHUB_TOKEN configured: {token_configured}): {e:?}"
+        ),
+    }
+}
+
+/// `true` when a caller should skip its own test (return early) after a degraded result.
+///
+/// `primary_is_empty` signals a degraded result; when it's `true`, `probe` is awaited and
+/// this returns `true` only if that determines an expected rate limit. Otherwise (`probe`
+/// proved the API healthy, or `primary_is_empty` was never true) this returns `false`,
+/// meaning the caller should fall through to its own assertion, which then fails loudly.
+///
+/// Factors out the repeated "probe on an empty/missing primary result, skip only if that's
+/// an expected unauthenticated rate limit, else fall through to fail loudly" shape 3
+/// `#[ignore]`d live tests share (`deps-swift::ecosystem`, `deps-cli::check_integration`,
+/// `deps-lsp::document::osv_scan`): each calls production code that swallows a registry
+/// error to an empty `Vec`/missing entry (graceful degradation), so that emptiness alone
+/// can't tell an expected rate limit apart from a real regression — `probe` re-exercises the
+/// same host through a call that surfaces the real [`crate::DepsError`] instead (#1283).
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn example(registry: &dyn deps_core::Registry) {
+/// use deps_core::PackageName;
+///
+/// let direct = Vec::<()>::new(); // stand-in for a degraded completion result
+/// if deps_core::test_util::should_skip_on_empty_result(
+///     direct.is_empty(),
+///     "doctest",
+///     registry.get_versions(&PackageName::new("apple/swift-nio")),
+/// )
+/// .await
+/// {
+///     return;
+/// }
+/// # }
+/// ```
+pub async fn should_skip_on_empty_result<T>(
+    primary_is_empty: bool,
+    test_name: &str,
+    probe: impl std::future::Future<Output = Result<T, crate::DepsError>>,
+) -> bool {
+    primary_is_empty
+        && rate_limit_skip_decision(probe.await, test_name, github_token_configured()).is_none()
+}
+
 /// Builds a [`crate::ParseResult`] fixture with `count` synthetic dependencies.
 ///
 /// Names them `"dep-0"`, `"dep-1"`, ... — for tests exercising dependency-count-ceiling
@@ -640,6 +786,48 @@ pub fn stub_parse_result_with_dependencies(count: usize) -> Box<dyn crate::Parse
 #[cfg(all(test, feature = "test-util"))]
 mod tests {
     use super::capture_tracing_output;
+    use super::{is_configured_token, rate_limit_skip_decision};
+
+    #[test]
+    fn is_configured_token_rejects_missing_and_empty() {
+        assert!(!is_configured_token(None));
+        assert!(!is_configured_token(Some(String::new())));
+        assert!(is_configured_token(Some("ghp_x".to_string())));
+    }
+
+    #[test]
+    fn rate_limit_skip_decision_skips_on_rate_limit_without_token() {
+        let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
+            message: "rate limited".to_string(),
+        });
+        assert_eq!(rate_limit_skip_decision(result, "unit-test", false), None);
+    }
+
+    #[test]
+    fn rate_limit_skip_decision_passes_through_ok() {
+        let result: Result<u32, crate::DepsError> = Ok(7);
+        assert_eq!(
+            rate_limit_skip_decision(result, "unit-test", false),
+            Some(7)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected error")]
+    fn rate_limit_skip_decision_panics_on_rate_limit_with_token_configured() {
+        let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
+            message: "rate limited".to_string(),
+        });
+        let _ = rate_limit_skip_decision(result, "unit-test", true);
+    }
+
+    #[test]
+    #[should_panic(expected = "unexpected error")]
+    fn rate_limit_skip_decision_panics_on_non_rate_limit_error_even_without_token() {
+        let result: Result<u32, crate::DepsError> =
+            Err(crate::DepsError::InvalidUri("bad uri".to_string()));
+        let _ = rate_limit_skip_decision(result, "unit-test", false);
+    }
 
     /// Regression test for #1006: a sibling thread's untraced touch of a callsite,
     /// while a capture is in flight on this thread, must not poison that callsite

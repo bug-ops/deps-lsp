@@ -889,7 +889,7 @@ mod tests {
     /// live-network test for this feature — every other case above runs against
     /// mockito fixtures so CI stays network-free.
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_pypi_simple_index_parses_and_contains_requests() {
         let cache = HttpCache::new();
         let body = cache

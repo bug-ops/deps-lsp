@@ -741,12 +741,26 @@ mod tier3_license_prefetch_parity {
             .await
             .expect("check_manifest must not fail for a well-formed fixture");
 
+        let has_license_finding = result.findings.iter().any(|f| {
+            f.category == Category::License
+                && f.dependency_name.as_deref() == Some("apple/swift-nio")
+        });
+        // #1283 S2: the license feed swallows *any* fetch error to "no license found", so a
+        // missing finding alone can't tell an expected rate limit apart from a real bug —
+        // see `should_skip_on_empty_result`'s doc.
+        if deps_core::test_util::should_skip_on_empty_result(
+            !has_license_finding,
+            "test_live_swift_tier3_license_feeds_check_license_policy",
+            ecosystem
+                .registry()
+                .get_versions(&deps_core::PackageName::new("apple/swift-nio")),
+        )
+        .await
+        {
+            return;
+        }
         assert!(
-            result
-                .findings
-                .iter()
-                .any(|f| f.category == Category::License
-                    && f.dependency_name.as_deref() == Some("apple/swift-nio")),
+            has_license_finding,
             "expected a license-policy finding for 'apple/swift-nio', got: {:?}",
             result.findings
         );

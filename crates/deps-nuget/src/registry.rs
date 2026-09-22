@@ -2740,7 +2740,7 @@ mod tests {
     // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_nuget_attaches_publish_times() {
         let registry = NuGetRegistry::new(Arc::new(HttpCache::new()));
         let versions = registry

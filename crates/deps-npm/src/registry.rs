@@ -1342,7 +1342,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_fetch_real_express_versions() {
         let cache = Arc::new(HttpCache::new());
         let registry = NpmRegistry::new(cache);
@@ -1357,7 +1357,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_search_real() {
         let cache = Arc::new(HttpCache::new());
         let registry = NpmRegistry::new(cache);
@@ -1368,7 +1368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_get_latest_matching_real() {
         let cache = Arc::new(HttpCache::new());
         let registry = NpmRegistry::new(cache);
@@ -2314,7 +2314,7 @@ mod tests {
     // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_npm_get_versions_with_attaches_publish_times() {
         use deps_core::{FreshnessSettings, PackageName, Registry};
 
@@ -2332,7 +2332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_live_npm_publish_times_ttl_cache_avoids_second_fetch() {
         let registry = NpmRegistry::new(Arc::new(HttpCache::new()));
         let top8 = vec!["4.18.2".to_string()];

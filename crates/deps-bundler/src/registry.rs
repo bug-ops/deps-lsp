@@ -952,7 +952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_fetch_real_rails_versions() {
         let cache = Arc::new(HttpCache::new());
         let registry = RubyGemsRegistry::new(cache);
