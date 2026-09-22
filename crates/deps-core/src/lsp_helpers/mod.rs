@@ -1423,6 +1423,7 @@ pub(crate) fn replace_markdown_unsafe_chars(s: &str) -> String {
 /// `push_header_hover_section` in `lsp_helpers/hover.rs`), so this document-wide pass finds
 /// nothing left to fire on a correctly-sanitized destination — but a future call site that
 /// skips the per-site strip would silently break instead of just risking a hazard.
+#[cfg(feature = "lsp-responses")]
 pub(crate) fn replace_markdown_unsafe_chars_keep_newlines(s: &str) -> String {
     s.chars()
         .map(|c| {
