@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 - **deps-core, deps-nuget, deps-pypi**: `ResolvedPackage`/`ResolvedSource`, `ScanTarget`, `ResolvedShaPin`, `PackageSourceEntry`, and `RequirementRef` now redact credential-shaped fields in `Debug` output (resolves #1237) (#1318)
+- **deps-core**: `ResolvedPackages`' `Debug` output now redacts its `HashMap` key too, closing a gap where the key duplicated the already-redacted `ResolvedPackage.name` (resolves #1319) (#1324)
 - **github-action**: `action.yml` now pins the Docker image by digest instead of the mutable `:1` tag; the release workflow opens a PR repointing `action.yml` at the newly published digest on every release, for a maintainer to review and merge (resolves #1274) (#1292)
 - **deps-core, deps-gitlab-ci**: hover no longer renders unbounded resolved/requirement/marker/latest/recent-version text, deprecation reason/replacement, GHA/GitLab CI's resolved tag, or a GitLab `component:` include's project-path link label, closing the same length-cap gap #1272 already closed for OSV advisory fields; name/version-shaped fields (versions, marker expressions, deprecation replacement names, git tags) are now also swept for the full invisible/bidi-override character class before rendering, closing a gap where a non-bidi Unicode format character (e.g. U+206A) survived into hover but not the equivalent diagnostic (resolves #1311) (#1322)
 - **deps-core**: hover no longer renders unbounded OSV advisory `id`/`fixed`/`version`/`summary`/`aliases` text (resolves #1272) (#1298)
@@ -38,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cargo**: feature-flag completion is now capped at 5 items with deterministic alphabetical truncation and an accurate `is_incomplete` flag, instead of an unbounded, arbitrarily-ordered list (resolves #1302) (#1307)
 - **deps-core**: an unauthenticated GitHub 403/429 is now classified as a genuine rate limit only when the response confirms exhaustion (`X-RateLimit-Remaining: 0` or a `Retry-After` header), so `unwrap_or_skip_github_rate_limit` no longer silently skips an unrelated 403 cause as expected (resolves #1295) (#1308)
 - **deps-core**: `DepsError::fetch_failure` and its telemetry-label sibling classifier are now exhaustive matches with no wildcard arm, so a future variant cannot silently lose its diagnostic hint (resolves #1244) (#1308)
+- **deps-cargo**: `Cargo.lock` `sparse+` sources now classify as `ResolvedSource::Registry` instead of falling through to the `::Path` catch-all (latent — no current consumer branches on the variant yet) (resolves #1320) (#1324)
 
 ### Breaking
 - **deps-core**: `Ecosystem::generate_hover` and `lsp_helpers::generate_hover` now return the protocol-agnostic `deps_core::hover::Hover` instead of `tower_lsp_server::ls_types::Hover` (resolves #1277) (#1309)
