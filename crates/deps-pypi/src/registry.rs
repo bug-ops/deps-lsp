@@ -117,10 +117,10 @@ fn not_found_or(err: DepsError, name: &str) -> DepsError {
 /// [`PypiRegistry::search`] serves unranked prefix matches from a local index that
 /// carries only names, not metadata, so every other field is left at its "unknown"
 /// value. This is safe for completion: `build_package_completion`
-/// (`deps_core::completion`) and `create_package_completion_item`
-/// (`deps-lsp`'s fallback path) both already guard `detail` on `latest_version` being
-/// non-empty, so an empty `latest_version` here renders as no detail line rather than
-/// a misleading `Latest: `.
+/// (`deps_core::completion`) guards `detail` on `latest_version` being non-empty —
+/// and `deps-lsp`'s fallback-path `create_package_completion_item` delegates to that
+/// same builder (issue #1284) rather than re-deriving its own `detail` — so an empty
+/// `latest_version` here renders as no detail line rather than a misleading bare `v`.
 fn package_stub(name: &str) -> PypiPackage {
     PypiPackage {
         name: deps_core::PackageName::new(name),
