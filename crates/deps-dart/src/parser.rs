@@ -1065,28 +1065,7 @@ fn build_dependency(
 /// assert_eq!(result.dependencies[0].version_req, Some("^1.0.0".into()));
 /// ```
 pub fn parse_pubspec_yaml(content: &str, doc_uri: &Url) -> Result<DartParseResult> {
-    if let Err(depth) =
-        deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "pubspec.yaml".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_YAML_NESTING_DEPTH
-            ))),
-        });
-    }
-
-    if let Err(bytes) = deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "pubspec.yaml".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML expansion {bytes} bytes exceeds maximum of {} bytes",
-                deps_core::MAX_YAML_EXPANDED_BYTES
-            ))),
-        });
-    }
+    deps_core::check_yaml_bounds(content, "pubspec.yaml")?;
 
     let mut receiver = PubspecReceiver::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
     let mut parser = Parser::new_from_str(content);

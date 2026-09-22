@@ -48,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-npm**: six of the nine `= 128` diagnostic-value length-cap constants now share one `deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`, removing a duplicate `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` independently declared in two crates (resolves #1278) (#1313)
 - **ci**: bump `taiki-e/install-action` to v2.87.18 and `jsonschema` to 0.57 (#1315)
+- **deps-core, deps-github-actions, deps-gitlab-ci, deps-dart, deps-npm**: new `deps_core::check_yaml_bounds` helper centralizes duplicated YAML nesting-depth/expansion-guard wiring across 5 call sites (resolves #1245) (#1314)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)

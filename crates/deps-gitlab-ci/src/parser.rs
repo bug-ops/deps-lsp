@@ -34,6 +34,7 @@ use crate::types::{
     EndpointKind, GitlabCiDependency, GitlabCiParseResult, GitlabRoute, HostRef, IncludeKind,
     PinStyle,
 };
+use deps_core::Result;
 use deps_core::lsp_helpers::{
     LineOffsetTable, MarkedScalar, byte_span_to_range, is_full_sha, is_plain_null, is_tag_shaped,
     marker_byte_offset, warn_rejected_value,
@@ -42,7 +43,6 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::parser::DependencySource;
 use deps_core::yaml_anchor::{AnchorLimits, ScalarAnchorTable};
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
-use deps_core::{DepsError, Result};
 use std::collections::{HashMap, HashSet};
 use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser, Tag};
@@ -1367,13 +1367,13 @@ fn build_dependency(
 /// Parses a `.gitlab-ci.yml`-syntax file and returns every `include:` dependency found,
 /// with LSP position tracking, host resolution, and routing.
 ///
-/// Gated first by [`deps_core::check_yaml_nesting_depth`]/[`deps_core::check_yaml_expansion`],
-/// which return a real [`DepsError::ParseError`]. A downstream YAML syntax error degrades to
-/// an **empty** [`GitlabCiParseResult`] (logged at `debug`) rather than propagating.
+/// Gated first by [`deps_core::check_yaml_bounds`], which returns a real
+/// [`deps_core::DepsError::ParseError`]. A downstream YAML syntax error degrades to an
+/// **empty** [`GitlabCiParseResult`] (logged at `debug`) rather than propagating.
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::ParseError`] only when `content` exceeds the shared YAML
+/// Returns [`deps_core::DepsError::ParseError`] only when `content` exceeds the shared YAML
 /// nesting-depth or expansion-size gate.
 ///
 /// # Examples
@@ -1400,27 +1400,7 @@ pub fn parse_gitlab_ci_yaml(
     policy: &RegistryAccessPolicy,
     instance_host: &GitlabInstanceHost,
 ) -> Result<GitlabCiParseResult> {
-    if let Err(depth) =
-        deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "gitlab-ci.yml".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_YAML_NESTING_DEPTH
-            ))),
-        });
-    }
-    if let Err(bytes) = deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "gitlab-ci.yml".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML expansion {bytes} bytes exceeds maximum of {} bytes",
-                deps_core::MAX_YAML_EXPANDED_BYTES
-            ))),
-        });
-    }
+    deps_core::check_yaml_bounds(content, "gitlab-ci.yml")?;
 
     let mut receiver = GitlabCiReceiver::new();
     let mut parser = Parser::new_from_str(content);
@@ -1504,6 +1484,7 @@ pub fn parse_gitlab_ci_yaml(
 mod tests {
     use super::*;
     use deps_core::Dependency;
+    use deps_core::DepsError;
     use deps_core::net_policy::WorkspaceRegistryAccess;
     use deps_core::position::Range;
     use std::sync::{Arc, RwLock};
@@ -1903,6 +1884,22 @@ mod tests {
         let payload = format!("{}1", "- ".repeat(deps_core::MAX_YAML_NESTING_DEPTH + 1));
         let result = parse_gitlab_ci_yaml(&payload, &test_uri(), &policy, &instance_host);
         assert!(matches!(result, Err(DepsError::ParseError { .. })));
+    }
+
+    #[test]
+    fn test_expanded_yaml_rejected_as_parse_error() {
+        // #1245: pins that the expansion bound is also wired through `check_yaml_bounds`.
+        let (policy, instance_host) = ctx();
+        let mut payload = String::from("a0: &a0 [x, x]\n");
+        for i in 1..=20 {
+            payload.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+        let result = parse_gitlab_ci_yaml(&payload, &test_uri(), &policy, &instance_host);
+        let err = result.expect_err("expected the expansion budget to reject this");
+        assert!(
+            err.to_string().contains("YAML expansion"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]
