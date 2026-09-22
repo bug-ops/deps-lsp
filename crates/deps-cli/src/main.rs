@@ -128,7 +128,7 @@ async fn run_check(
         symlink_policy,
     );
     let mut had_execution_error = false;
-    for error in &walk_outcome.walk_errors {
+    for error in walk_outcome.walk_errors() {
         eprintln!("deps-cli: warning: {error}");
         // S2 (spec 062 review): an unreadable path means the report may be incomplete — must not silently exit 0.
         had_execution_error = true;
@@ -140,7 +140,7 @@ async fn run_check(
         );
         had_execution_error = true;
     }
-    for path in &walk_outcome.unrecognized_explicit_paths {
+    for path in walk_outcome.unrecognized_explicit_paths() {
         // M4 (spec 062 review), spec §6: not fatal, does not affect the exit code.
         // #1299 round 2: `path` is already display-sanitized by `walk::walk` at push time —
         // `main.rs` prints every `WalkOutcome` path as-is, on the strength of that boundary
@@ -150,7 +150,7 @@ async fn run_check(
             path.display()
         );
     }
-    for path in &walk_outcome.ignored_manifests {
+    for path in walk_outcome.ignored_manifests() {
         // #1109 / reviewer follow-up / #1112: a manifest an ecosystem would have claimed was
         // excluded from the scan without being asked to — an ignore rule under
         // --respect-gitignore, a PRUNED_DIRECTORIES match in any mode, or a symlink reachable
@@ -162,7 +162,7 @@ async fn run_check(
         );
         had_execution_error = true;
     }
-    for path in &walk_outcome.broken_manifest_symlinks {
+    for path in walk_outcome.broken_manifest_symlinks() {
         // #1124: distinct from `ignored_manifests` — this path produced no manifest at all
         // (unresolvable or non-regular-file target), a stronger tampering signal.
         eprintln!(
@@ -171,7 +171,7 @@ async fn run_check(
         );
         had_execution_error = true;
     }
-    if walk_outcome.manifests.is_empty() {
+    if walk_outcome.manifests().is_empty() {
         // Defensive visibility (#1108, reviewer follow-up #1): zero manifests discovered at
         // all is operationally different from manifests found but clean — the former is far
         // more likely to be a walk/routing bug (wrong root, every manifest pruned) than a
@@ -189,7 +189,7 @@ async fn run_check(
     // sequentially, not fanned out via `buffer_unordered`, deliberately — per-manifest fetch
     // concurrency is already bounded by `fetch_latest_versions_parallel`, which is what NFR-004
     // gates; only affects wall-clock time on monorepo-of-monorepos scale (perf-reviewed, non-blocking).
-    for manifest in walk_outcome.manifests {
+    for manifest in walk_outcome.manifests() {
         match deps_core::fs_probe::read_to_string_capped(&manifest.path, MAX_MANIFEST_FILE_SIZE) {
             Ok(Some(content)) => {
                 // Review finding M2: `check_manifest`'s `manifest_path` drives URI derivation

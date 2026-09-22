@@ -81,7 +81,7 @@ async fn run_pipeline(dir: &std::path::Path) -> (CheckReport, bool) {
 
     let mut findings = Vec::new();
     let mut had_execution_error = false;
-    for manifest in outcome.manifests {
+    for manifest in outcome.manifests() {
         let content = deps_core::fs_probe::read_to_string_capped(&manifest.path, 10_000_000)
             .expect("read fixture manifest")
             .expect("fixture manifest under size cap");
@@ -275,13 +275,13 @@ async fn test_walk_paths_default_to_current_directory_semantics_via_single_file(
         walk::GitignorePolicy::Ignore,
         walk::SymlinkPolicy::Skip,
     );
-    assert_eq!(outcome.manifests.len(), 1);
+    assert_eq!(outcome.manifests().len(), 1);
 
     let content = deps_core::fs_probe::read_to_string_capped(&manifest, 10_000_000)
         .expect("read manifest")
         .expect("under size cap");
     let result = check_manifest(
-        &outcome.manifests[0].ecosystem,
+        &outcome.manifests()[0].ecosystem,
         &manifest,
         &manifest,
         &content,
@@ -317,9 +317,9 @@ async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
         walk::GitignorePolicy::Ignore,
         walk::SymlinkPolicy::Skip,
     );
-    assert_eq!(outcome.manifests.len(), 1);
+    assert_eq!(outcome.manifests().len(), 1);
     assert!(
-        outcome.manifests[0].display_path.is_absolute(),
+        outcome.manifests()[0].display_path.is_absolute(),
         "test setup bug: this must exercise the absolute-display_path branch"
     );
 
@@ -327,7 +327,7 @@ async fn test_sarif_formatter_relativizes_an_absolute_single_file_path() {
         .expect("read manifest")
         .expect("under size cap");
     let result = check_manifest(
-        &outcome.manifests[0].ecosystem,
+        &outcome.manifests()[0].ecosystem,
         &manifest,
         &manifest,
         &content,
@@ -557,13 +557,13 @@ async fn test_follow_symlinks_lockfile_lookup_uses_symlinks_directory_not_target
         walk::SymlinkPolicy::Follow,
     );
     assert_eq!(
-        outcome.manifests.len(),
+        outcome.manifests().len(),
         1,
         "ignored_manifests: {:?}, walk_errors: {:?}",
-        outcome.ignored_manifests,
-        outcome.walk_errors
+        outcome.ignored_manifests(),
+        outcome.walk_errors()
     );
-    let manifest = &outcome.manifests[0];
+    let manifest = &outcome.manifests()[0];
 
     // Sanity check on the fields M2's fix relies on: `path` (content read, canonicalized by
     // the C1/S3 containment check) resolves to B's real file; `uri_path` (lockfile lookup)

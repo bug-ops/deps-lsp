@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 - **deps-core**: `Ecosystem::generate_hover` and `lsp_helpers::generate_hover` now return the protocol-agnostic `deps_core::hover::Hover` instead of `tower_lsp_server::ls_types::Hover` (resolves #1277) (#1309)
+- **deps-cli**: `WalkOutcome`'s `manifests`/`walk_errors`/`unrecognized_explicit_paths`/`ignored_manifests`/`broken_manifest_symlinks` fields are private now, read via new `manifests()`/`walk_errors()`/`unrecognized_explicit_paths()`/`ignored_manifests()`/`broken_manifest_symlinks()` accessors (resolves #1305) (#1312)
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
 - **deps-core**: `completion::build_package_completion` gains `index: usize` and `prefix: &str` parameters, used to preserve registry relevance ranking in `sort_text` (resolves #1282) (#1293)
 - **deps-core**: `completion::build_feature_completion` now returns `Option<CompletionItem>` instead of `CompletionItem`, dropping the item when `feature_name` fails `is_safe_feature_name` (resolves #1296)
