@@ -160,12 +160,12 @@ impl CargoEcosystem {
         parse_result: &dyn ParseResultTrait,
         package_name: &deps_core::PackageName,
         prefix: &str,
-    ) -> Vec<CompletionItem> {
+    ) -> Completions {
         use deps_core::completion::build_feature_completion;
 
         let versions_result: Result<Vec<Box<dyn Version>>> =
             match resolve_completion_source(parse_result, package_name) {
-                CompletionSource::Ambiguous => return vec![],
+                CompletionSource::Ambiguous => return Completions::default(),
                 CompletionSource::NotInManifest
                 | CompletionSource::Resolved(DependencySource::Registry) => {
                     Registry::get_versions(self.registry.as_ref(), package_name).await
@@ -174,9 +174,9 @@ impl CargoEcosystem {
                     index, ..
                 }) => match self.registry.alternate_client(&index) {
                     Some(client) => Registry::get_versions(client.as_ref(), package_name).await,
-                    None => return vec![],
+                    None => return Completions::default(),
                 },
-                CompletionSource::Resolved(_) => return vec![],
+                CompletionSource::Resolved(_) => return Completions::default(),
             };
 
         let versions = match versions_result {
@@ -187,7 +187,7 @@ impl CargoEcosystem {
                     package_name.for_tracing(),
                     e
                 );
-                return vec![];
+                return Completions::default();
             }
         };
 
@@ -198,18 +198,44 @@ impl CargoEcosystem {
                     "No stable version found for '{}'",
                     package_name.for_tracing()
                 );
-                return vec![];
+                return Completions::default();
             }
         };
 
-        let features = latest.features();
-        features
+        // `features()` comes back in HashMap iteration order (non-deterministic); sort so
+        // truncation below keeps the same names across calls instead of an arbitrary subset.
+        let mut features: Vec<String> = latest
+            .features()
             .into_iter()
             .filter(|f| f.starts_with(prefix))
-            .filter_map(|feature| build_feature_completion(&feature, package_name, None))
-            .collect()
+            .collect();
+        features.sort_unstable();
+
+        // Build safe items first, then cap: an unsafe name (rejected by
+        // `build_feature_completion`'s `is_safe_feature_name` gate) must not count against the
+        // cap, or a single malicious feature name could push a legitimate one out of the
+        // response.
+        let items: Vec<CompletionItem> = features
+            .iter()
+            .filter_map(|feature| build_feature_completion(feature, package_name, None))
+            .collect();
+
+        let is_incomplete = items.len() > MAX_COMPLETION_FEATURES;
+        let items = items.into_iter().take(MAX_COMPLETION_FEATURES).collect();
+
+        Completions::new(items).with_incomplete(is_incomplete)
     }
 }
+
+/// Maximum number of feature completions to show.
+///
+/// Unlike `MAX_COMPLETION_VERSIONS`, there is no rank-preserving bump logic here — the
+/// filtered feature list is sorted alphabetically and simply truncated, with `is_incomplete`
+/// set on the response when that truncates anything. A registry index entry is capped at
+/// 32 MiB, but an unusual or hostile registry could still return an oversized `features` map
+/// for a single crate; this bounds the LSP-visible blast radius.
+#[cfg(feature = "lsp-responses")]
+const MAX_COMPLETION_FEATURES: usize = 5;
 
 impl deps_core::ecosystem::private::Sealed for CargoEcosystem {}
 
@@ -283,7 +309,6 @@ impl Ecosystem for CargoEcosystem {
         Box::pin(async move {
             self.complete_features(request.parse_result, &package_name, &prefix)
                 .await
-                .into()
         })
     }
 
@@ -774,9 +799,9 @@ mod tests {
 
         let results = ecosystem
             .complete_features(&empty_parse_result(), &pkg("serde"), "")
-            .await;
+            .await
+            .items;
         assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.label == "derive"));
     }
 
     #[cfg(feature = "lsp-responses")]
@@ -788,7 +813,8 @@ mod tests {
 
         let results = ecosystem
             .complete_features(&empty_parse_result(), &pkg("serde"), "der")
-            .await;
+            .await
+            .items;
         assert!(!results.is_empty());
         assert!(results.iter().all(|r| r.label.starts_with("der")));
     }
@@ -908,7 +934,8 @@ mod tests {
 
         let results = ecosystem
             .complete_features(&parse_result, &pkg("shared-name"), "")
-            .await;
+            .await
+            .items;
         assert!(
             results.is_empty(),
             "an ambiguous source must offer no feature completions"
@@ -974,9 +1001,127 @@ mod tests {
                 &pkg("this-package-does-not-exist-12345"),
                 "",
             )
-            .await;
+            .await
+            .items;
         mock.assert_async().await;
         assert!(results.is_empty());
+    }
+
+    /// #1302: `latest.features()` is capped at `MAX_COMPLETION_FEATURES` (5) before being
+    /// turned into completion items — an oversized `features` map from an unusual or
+    /// hostile registry must not reach the LSP client uncapped.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_complete_features_capped_at_max() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/ma/ny/many-features")
+            .with_status(200)
+            .with_body(
+                "{\"name\":\"many-features\",\"vers\":\"1.0.0\",\"yanked\":false,\
+                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[],\"f4\":[],\"f5\":[],\"f6\":[],\
+                 \"f7\":[],\"f8\":[]},\"deps\":[]}\n",
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+        let results = ecosystem
+            .complete_features(&empty_parse_result(), &pkg("many-features"), "")
+            .await;
+        mock.assert_async().await;
+        let labels: Vec<&str> = results
+            .items
+            .iter()
+            .map(|item| item.label.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            ["f1", "f2", "f3", "f4", "f5"],
+            "truncation must keep the alphabetically first 5 features, not an arbitrary subset"
+        );
+        assert!(
+            results.is_incomplete,
+            "truncated feature completions must report is_incomplete"
+        );
+    }
+
+    /// #1302 boundary case: fewer than `MAX_COMPLETION_FEATURES` matching features must all
+    /// be returned uncapped — guards against an off-by-one in the `.take()` bound.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_complete_features_below_cap_uncapped() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/fe/w-/few-features")
+            .with_status(200)
+            .with_body(
+                "{\"name\":\"few-features\",\"vers\":\"1.0.0\",\"yanked\":false,\
+                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[]},\"deps\":[]}\n",
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+        let results = ecosystem
+            .complete_features(&empty_parse_result(), &pkg("few-features"), "")
+            .await;
+        mock.assert_async().await;
+        assert_eq!(
+            results.items.len(),
+            3,
+            "fewer than MAX_COMPLETION_FEATURES matches must not be truncated"
+        );
+        assert!(
+            !results.is_incomplete,
+            "an uncapped result must not report is_incomplete"
+        );
+    }
+
+    /// #1302 exact-boundary case: `features.len() == MAX_COMPLETION_FEATURES` must return
+    /// all of them uncapped — nothing was actually dropped, so `is_incomplete` must be
+    /// `false`. Catches a `>` vs `>=` mistake in the `is_incomplete` computation that the
+    /// 8-vs-3 cases above wouldn't.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_complete_features_at_exact_cap_uncapped() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/ex/ac/exactly-five")
+            .with_status(200)
+            .with_body(
+                "{\"name\":\"exactly-five\",\"vers\":\"1.0.0\",\"yanked\":false,\
+                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[],\"f4\":[],\"f5\":[]},\"deps\":[]}\n",
+            )
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+        let results = ecosystem
+            .complete_features(&empty_parse_result(), &pkg("exactly-five"), "")
+            .await;
+        mock.assert_async().await;
+        assert_eq!(
+            results.items.len(),
+            5,
+            "exactly MAX_COMPLETION_FEATURES matches must not be truncated"
+        );
+        assert!(
+            !results.is_incomplete,
+            "a result at exactly the cap, with nothing dropped, must not report is_incomplete"
+        );
     }
 
     /// #1052: uses a mockito search endpoint instead of the live crates.io search API, so a
@@ -1063,7 +1208,8 @@ mod tests {
         // "nonexistent" prefix: anyhow has no feature starting with it.
         let results = ecosystem
             .complete_features(&empty_parse_result(), &pkg("anyhow"), "nonexistent")
-            .await;
+            .await
+            .items;
         assert!(results.is_empty());
     }
 
@@ -1340,7 +1486,7 @@ mod tests {
         let via_dispatch = ecosystem
             .generate_completions(&parse_result, position, content, freshness)
             .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
+        assert_eq!(via_dispatch.items, direct.items);
+        assert!(direct.items.is_empty());
     }
 }

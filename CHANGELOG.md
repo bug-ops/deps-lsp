@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `CheckFinding.requirement` is now sanitized and length-capped before reaching JSON output, closing an ANSI-escape/bidi-override leak (resolves #1258) (#1301)
 - **deps-maven**: `maven-metadata.xml` parse errors are now redacted before reaching `DepsError::CacheError`, closing a credential leak from a malformed tag name (resolves #1249) (#1301)
 - **deps-core, deps-lsp**: raw-text fallback completion now rewrites `filter_text` to the raw typed prefix for registries that normalize search queries, fixing PyPI PEP 503 dotted-name completions dropped by some LSP clients (resolves #1289) (#1306)
+- **deps-cargo**: feature-flag completion is now capped at 5 items with deterministic alphabetical truncation and an accurate `is_incomplete` flag, instead of an unbounded, arbitrarily-ordered list (resolves #1302) (#1307)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
