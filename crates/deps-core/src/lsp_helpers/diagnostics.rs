@@ -30,15 +30,34 @@ pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
 /// spec 010 Phase 2). See `apply_license_policy_rule`.
 pub const LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE: &str = "license-policy-violation";
 
-/// Maximum character count of a blocked-registry diagnostic's raw declared value (an alias
-/// or literal URL) before it is truncated with an ellipsis marker.
+/// Shared upper bound on an attacker-controlled fragment interpolated into a diagnostic
+/// or hover message before truncation (issue #1278).
 ///
-/// The value is attacker-controlled — an arbitrary string from a cloned repository's
-/// `Cargo.toml`/`.cargo/config.toml` — and nothing upstream in the TOML parse pipeline caps
-/// an individual string field's length (only nesting depth and table count are bounded), so
-/// this is the last chokepoint before it renders inline in the editor as a
-/// [`Severity::Information`] message.
-const MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS: usize = 128;
+/// Counted in Unicode scalar values, not bytes. Nine call sites across `deps-core` and
+/// three ecosystem crates (`deps-github-actions`,
+/// `deps-gitlab-ci`, `deps-npm`) each independently declared their own `= 128` constant for
+/// this exact concern — most critically, `deps-github-actions` and `deps-gitlab-ci` each
+/// declared a byte-for-byte identical `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS`, free to
+/// drift apart since neither referenced the other. This is the single source of truth all of
+/// them now share: `deps-core`'s own blocked-registry/license-policy/license-id sinks, and
+/// the three ecosystem crates' mutable-ref-pin / pnpm-catalog sinks (see each call site's own
+/// doc for why 128 is the right bound for *its* attacker-controlled value — this constant
+/// only centralizes the number, not the reasoning, which differs per sink).
+///
+/// `MAX_DIAGNOSTIC_PROSE_CHARS`, `MAX_DIAGNOSTIC_NAME_CHARS`, and
+/// `MAX_VERSION_DIAGNOSTIC_CHARS` are deliberately *not* folded into this constant despite
+/// also equaling 128: each already has exactly one canonical declaration reused by name
+/// across several call sites (not independent duplicates), and each name documents a
+/// distinct semantic category (free-form prose vs. an identifier vs. a version string) that
+/// a caller reading `MAX_DIAGNOSTIC_NAME_CHARS` at a use site depends on — collapsing them
+/// into one generically-named constant would trade that self-documentation for no actual
+/// deduplication. They do derive their value from this constant, though, so there is one
+/// literal `128` shared by the nine sanitize-and-cap-sweep constants #1278 identified.
+/// Other unrelated `= 128` consts elsewhere in the workspace — `licenses::MAX_SPDX_ID_CHARS`
+/// and `git_ref::MAX_SHA_PIN_TITLE_NAME_CHARS` — are a different bound class, were never
+/// part of #1278's list, and are deliberately left untouched; this constant makes no claim
+/// about them.
+pub const MAX_DIAGNOSTIC_VALUE_CHARS: usize = 128;
 
 /// Maximum number of sibling occurrences a collapsed blocked-registry diagnostic's
 /// `related_information` names individually before folding the rest into one "+N more" entry
@@ -53,17 +72,6 @@ const MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS: usize = 128;
 /// too").
 const MAX_BLOCKED_REGISTRY_RELATED_INFO: usize = 9;
 
-/// Maximum character count of the license text interpolated into the license-policy
-/// violation diagnostic message (issue #660/#661 critic security P2).
-///
-/// `violation.license` is registry-declared, untrusted-length data (a single denied entry,
-/// or — for [`crate::licenses::ViolationReason::NotAllowed`] — a list already capped in
-/// *entry count* by `crate::licenses::evaluate`, but not yet in character length); this
-/// bounds its per-message character length the same way
-/// [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`] bounds the blocked-registry diagnostic's
-/// attacker-controlled value.
-const MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS: usize = 128;
-
 /// Maximum character count of a free-text prose value — an OSV advisory's `id`/`summary`, or
 /// a registry-reported deprecation `reason` — interpolated into a diagnostic message before
 /// it is truncated with an ellipsis marker (#1262, #1263 follow-up). Shared across both sinks
@@ -72,7 +80,7 @@ const MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS: usize = 128;
 /// prose that can legitimately carry RTL marks/emoji ZWJ), so a single cap keeps their
 /// behavior in lockstep instead of letting two near-duplicate constants drift apart.
 ///
-/// Mirrors [`MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS`]'s bound. `advisory.summary` and
+/// Mirrors [`MAX_DIAGNOSTIC_VALUE_CHARS`]'s bound (issue #1278). `advisory.summary` and
 /// `deprecation.reason` are both genuinely untrusted, unbounded-length prose — OSV.dev
 /// aggregates GHSA/RustSec/PyPA advisory databases plus community submissions, and
 /// `summary`/a registry's deprecation `reason` both pass through unvalidated
@@ -84,8 +92,16 @@ const MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS: usize = 128;
 ///
 /// `pub(crate)`, not module-private: `lsp_helpers::hover`'s `push_vulnerability_hover_section`
 /// (#1272) shares this exact bound for the same `advisory.summary` field rather than declaring
-/// its own duplicate constant, per this project's shared-constant DRY rule.
-pub(crate) const MAX_DIAGNOSTIC_PROSE_CHARS: usize = 128;
+/// its own duplicate constant, per this project's shared-constant DRY rule. Kept as its own
+/// named constant rather than folded into [`MAX_DIAGNOSTIC_VALUE_CHARS`] directly at each call
+/// site (issue #1278) — its name documents "this is free-form prose" at every use, which a
+/// bare `MAX_DIAGNOSTIC_VALUE_CHARS` would not. Deriving its value from that shared constant
+/// is numeric convenience today (one literal `128` to change), not a semantic guarantee the
+/// two bounds must always match — a future change tightening
+/// [`MAX_DIAGNOSTIC_VALUE_CHARS`] for a URL/identifier-shaped value would silently also
+/// shrink this prose bound with no test catching the coupling; give this constant its own
+/// literal if that ever needs to be decoupled.
+pub(crate) const MAX_DIAGNOSTIC_PROSE_CHARS: usize = MAX_DIAGNOSTIC_VALUE_CHARS;
 
 /// Truncates `value` to at most `max_chars` characters, appending `…` when truncated.
 ///
@@ -118,15 +134,20 @@ pub fn truncate_for_diagnostic(value: &str, max_chars: usize) -> std::borrow::Co
 /// the hover header's link label, before it is truncated with an ellipsis marker
 /// (#1242, #1246, #1259 critic S4).
 ///
-/// Mirrors [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]'s bound: [`PackageName`] itself is
+/// Mirrors [`MAX_DIAGNOSTIC_VALUE_CHARS`]'s bound (issue #1278): [`PackageName`] itself is
 /// deliberately unvalidated (see its own doc), so a manifest key of unbounded length would
 /// otherwise reach these sinks unbounded too.
 ///
 /// `pub(crate)`, not module-private: `lsp_helpers::hover`'s header label (#1259 critic
 /// S4) shares this exact bound rather than declaring its own duplicate constant, per
 /// this project's shared-constant DRY rule — the same reasoning
-/// [`MAX_VERSION_DIAGNOSTIC_CHARS`]'s doc gives for its own `inlay_hints` reuse.
-pub(crate) const MAX_DIAGNOSTIC_NAME_CHARS: usize = 128;
+/// [`MAX_VERSION_DIAGNOSTIC_CHARS`]'s doc gives for its own `inlay_hints` reuse. Kept as its
+/// own named constant rather than folded into [`MAX_DIAGNOSTIC_VALUE_CHARS`] directly at each
+/// call site — its name documents "this is an identifier" at every use. Deriving its value
+/// from that shared constant is numeric convenience today, not a semantic guarantee the two
+/// bounds must always match (see [`MAX_DIAGNOSTIC_PROSE_CHARS`]'s doc for the concrete
+/// drift scenario this note is guarding against).
+pub(crate) const MAX_DIAGNOSTIC_NAME_CHARS: usize = MAX_DIAGNOSTIC_VALUE_CHARS;
 
 /// Maximum character count of a version-shaped string (a manifest-declared requirement,
 /// a lockfile-resolved version, or a registry-reported yanked/latest version)
@@ -141,8 +162,13 @@ pub(crate) const MAX_DIAGNOSTIC_NAME_CHARS: usize = 128;
 ///
 /// `pub(crate)`, not module-private: `lsp_helpers::inlay_hints`' "update available"/"up
 /// to date"/offline-marker labels (#1268) share this exact bound rather than declaring
-/// their own duplicate constant, per this project's shared-constant DRY rule.
-pub(crate) const MAX_VERSION_DIAGNOSTIC_CHARS: usize = 128;
+/// their own duplicate constant, per this project's shared-constant DRY rule. Kept as its
+/// own named constant rather than folded into [`MAX_DIAGNOSTIC_VALUE_CHARS`] directly at
+/// each call site (issue #1278) — its name documents "this is a version string" at every
+/// use. Deriving its value from that shared bound is numeric convenience today, not a
+/// semantic guarantee the two must always match (see [`MAX_DIAGNOSTIC_PROSE_CHARS`]'s doc
+/// for the concrete drift scenario this note is guarding against).
+pub(crate) const MAX_VERSION_DIAGNOSTIC_CHARS: usize = MAX_DIAGNOSTIC_VALUE_CHARS;
 
 /// Renders `name` safely for a client-visible diagnostic message or `dependency_name`-shaped
 /// field (#1242, #1246): redact, then sanitize, then truncate, in that order.
@@ -1066,7 +1092,7 @@ fn offline_notice(
 /// Reads: `parse_result.blocked_registries()`.
 /// Emits: one [`Severity::Information`] per **distinct declaration key**, anchored
 /// at the first affected dependency's range — message truncated at
-/// [`MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`]. Every *other* dependency sharing that
+/// [`MAX_DIAGNOSTIC_VALUE_CHARS`]. Every *other* dependency sharing that
 /// declaration key survives via `related_information` on that same diagnostic, up to
 /// [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] named individually plus a trailing "+N more" entry
 /// beyond that (#944 M8/S2; see [`push_collapsed_blocked_registries`]) rather than being
@@ -1152,15 +1178,9 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
         format!(
             "registry index \"{}\" blocked by registries.workspace_registries policy \
              (host class: {}; declaration: {})",
-            sanitize_and_truncate_for_diagnostic(
-                &redacted_value,
-                MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS
-            ),
+            sanitize_and_truncate_for_diagnostic(&redacted_value, MAX_DIAGNOSTIC_VALUE_CHARS),
             occurrence.class,
-            sanitize_and_truncate_for_diagnostic(
-                &redacted_key,
-                MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS
-            ),
+            sanitize_and_truncate_for_diagnostic(&redacted_key, MAX_DIAGNOSTIC_VALUE_CHARS),
         ),
     )
     .with_severity(Severity::Information)
@@ -1322,7 +1342,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
                 redact_name_for_diagnostic(ctx.dep.name()),
                 sanitize_and_truncate_for_diagnostic(
                     &violation.license,
-                    MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS
+                    MAX_DIAGNOSTIC_VALUE_CHARS
                 ),
                 violation.reason
             ),
@@ -7671,7 +7691,7 @@ mod tests {
         }
 
         /// Critic follow-up S1 (#1242, #1246): the license-policy diagnostic already
-        /// truncates the *license* (`MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS`) but, before
+        /// truncates the *license* (`MAX_DIAGNOSTIC_VALUE_CHARS`) but, before
         /// this fix, interpolated the raw dependency *name* — same client-visible
         /// `Diagnostic.message()`, same CWE-532/CWE-117 exposure as R5a/R5c/R5d.
         #[test]
@@ -8180,7 +8200,7 @@ mod tests {
         }
 
         /// Issue #660/#661 critic security P2: a registry-declared license entry longer
-        /// than `MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS` must be truncated in the
+        /// than `MAX_DIAGNOSTIC_VALUE_CHARS` must be truncated in the
         /// rendered diagnostic message rather than interpolated verbatim. Uses the
         /// `NotAllowed` branch (not `Denied`): an entry long enough to matter here can
         /// never also be a `policy.deny` match, since `LicensePolicy::new` itself caps
@@ -8196,7 +8216,7 @@ mod tests {
                 PackageVersions::latest_only("1.0.0"),
             );
             let resolved_versions = HashMap::new();
-            let overlong = "X".repeat(MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS + 50);
+            let overlong = "X".repeat(MAX_DIAGNOSTIC_VALUE_CHARS + 50);
             let mut license_prefetch = HashMap::new();
             license_prefetch.insert(PackageName::from("serde"), vec![overlong.clone()]);
             let policy = LicensePolicy::new(vec!["MIT".to_string()], vec![]);
