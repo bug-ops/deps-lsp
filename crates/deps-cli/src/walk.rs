@@ -161,57 +161,136 @@ pub struct DiscoveredManifest {
     pub ecosystem: Arc<dyn Ecosystem>,
 }
 
-/// The result of walking one or more roots.
-#[derive(Default)]
-pub struct WalkOutcome {
-    /// Every manifest discovered and routed to an ecosystem.
-    pub manifests: Vec<DiscoveredManifest>,
-    /// Paths that `ignore` could not read (permission error, broken symlink, ...) — reported
-    /// as warnings, never fatal (FR-002's "no ecosystem recognizes / cannot be read" edge
-    /// case).
-    pub walk_errors: Vec<String>,
-    /// Whether [`MAX_WALKED_FILES`] was reached before the walk finished.
-    pub truncated: bool,
-    /// A `root` that was itself a single file (not a directory) but that no ecosystem's
-    /// `manifest_filenames`/`manifest_patterns`/`manifest_extensions`/
-    /// `manifest_directory_patterns` claimed (M4, spec 062 review) — spec §6 requires a
-    /// warning line for exactly this case: an explicitly-given path, unlike an unmatched file
-    /// encountered while walking a directory (the overwhelming majority of files in any real
-    /// tree, never worth a warning each).
-    pub unrecognized_explicit_paths: Vec<PathBuf>,
-    /// Manifest-shaped files excluded from the scan without the caller asking for that
-    /// exclusion — either an ignore rule while [`GitignorePolicy::Respect`] was in effect
-    /// (issue #1109),
-    /// or a `PRUNED_DIRECTORIES` match in *any* mode (reviewer follow-up: an unusual monorepo
-    /// layout can have a real subproject's manifest sitting directly inside a directory named
-    /// `vendor`/`build`/`dist`/...). Unlike
-    /// [`unrecognized_explicit_paths`](Self::unrecognized_explicit_paths), this is a warning
-    /// about data loss (a real manifest silently skipped), not a benign non-match.
-    pub ignored_manifests: Vec<PathBuf>,
-    /// A manifest-shaped symlink whose target is not a manifest — unresolvable (dangling,
-    /// broken chain, unreadable) or resolves to a non-regular-file (issue #1124). Distinct from
-    /// [`ignored_manifests`](Self::ignored_manifests): that means "a real file existed and we
-    /// chose not to read it" (unfollowed symlink, `.gitignore`, pruned directory); this means
-    /// the manifest-shaped path produced no manifest at all, a stronger tampering signal.
-    /// Reported regardless of `--follow-symlinks`/`--respect-gitignore`, except a structural
-    /// ancestor loop under `--follow-symlinks`, which surfaces via `walk_errors` instead (still
-    /// a non-zero exit, just a generic message rather than this specific one).
-    pub broken_manifest_symlinks: Vec<PathBuf>,
-}
+// `WalkOutcome` lives in its own submodule: field privacy is module-scoped, so this confines
+// the push bypass to a compile error anywhere else in `walk.rs`, not just a convention (#1305).
+pub use outcome::WalkOutcome;
 
-/// Pushes `message` onto `outcome.walk_errors`, sanitizing it first (#1299 round 2).
-///
-/// The one chokepoint every `walk_errors` producer in this module goes through — including a
-/// third-party error's own `Display` output (`ignore::Error`, whose message can embed an
-/// attacker-controlled path verbatim, the class of leak a per-call-site `.display()` fix
-/// cannot see). Sanitizing the whole formatted message, not just an extracted path substring,
-/// is safe here: see `crate::sanitize::sanitize_message_for_display`'s doc for why.
-fn push_walk_error(outcome: &mut WalkOutcome, message: impl std::fmt::Display) {
-    outcome
-        .walk_errors
-        .push(crate::sanitize::sanitize_message_for_display(
-            &message.to_string(),
-        ));
+mod outcome {
+    use super::DiscoveredManifest;
+    use std::path::PathBuf;
+
+    /// The result of walking one or more roots.
+    ///
+    /// Every collection field (`manifests`, `walk_errors`, `unrecognized_explicit_paths`,
+    /// `ignored_manifests`, `broken_manifest_symlinks`) is private to this submodule: each one
+    /// ultimately surfaces in `deps-cli`'s terminal/JSON output, built from attacker-controlled
+    /// scanned-path content, so the only way to populate them — from anywhere in `walk.rs`, not
+    /// merely from outside the crate — is through the `pub(super)` push helpers below, a
+    /// type-level guarantee a future call site cannot bypass by pushing a raw value directly
+    /// (issue #1305, follow-up to #1304's sanitization chokepoint). Read access is via the
+    /// `&[...]`-returning accessor methods.
+    #[derive(Default)]
+    pub struct WalkOutcome {
+        /// Every manifest discovered and routed to an ecosystem. `DiscoveredManifest`'s own
+        /// fields (e.g. `display_path`) carry the same attacker-controlled-path risk as the
+        /// four collections below, and `deps-cli` is a publishable library crate with `walk` as
+        /// a public module — leaving this field `pub` would let an external consumer construct
+        /// an arbitrary `DiscoveredManifest` and push it in directly, bypassing `route_file`
+        /// (issue #1305 follow-up).
+        manifests: Vec<DiscoveredManifest>,
+        /// Paths that `ignore` could not read (permission error, broken symlink, ...) — reported
+        /// as warnings, never fatal (FR-002's "no ecosystem recognizes / cannot be read" edge
+        /// case).
+        walk_errors: Vec<String>,
+        /// Whether [`super::MAX_WALKED_FILES`] was reached before the walk finished.
+        pub truncated: bool,
+        /// A `root` that was itself a single file (not a directory) but that no ecosystem's
+        /// `manifest_filenames`/`manifest_patterns`/`manifest_extensions`/
+        /// `manifest_directory_patterns` claimed (M4, spec 062 review) — spec §6 requires a
+        /// warning line for exactly this case: an explicitly-given path, unlike an unmatched
+        /// file encountered while walking a directory (the overwhelming majority of files in
+        /// any real tree, never worth a warning each).
+        unrecognized_explicit_paths: Vec<PathBuf>,
+        /// Manifest-shaped files excluded from the scan without the caller asking for that
+        /// exclusion — either an ignore rule while [`super::GitignorePolicy::Respect`] was in
+        /// effect (issue #1109),
+        /// or a `PRUNED_DIRECTORIES` match in *any* mode (reviewer follow-up: an unusual
+        /// monorepo layout can have a real subproject's manifest sitting directly inside a
+        /// directory named `vendor`/`build`/`dist`/...). Unlike
+        /// [`unrecognized_explicit_paths`](Self::unrecognized_explicit_paths), this is a
+        /// warning about data loss (a real manifest silently skipped), not a benign non-match.
+        ignored_manifests: Vec<PathBuf>,
+        /// A manifest-shaped symlink whose target is not a manifest — unresolvable (dangling,
+        /// broken chain, unreadable) or resolves to a non-regular-file (issue #1124). Distinct
+        /// from [`ignored_manifests`](Self::ignored_manifests): that means "a real file existed
+        /// and we chose not to read it" (unfollowed symlink, `.gitignore`, pruned directory);
+        /// this means the manifest-shaped path produced no manifest at all, a stronger
+        /// tampering signal. Reported regardless of `--follow-symlinks`/`--respect-gitignore`,
+        /// except a structural ancestor loop under `--follow-symlinks`, which surfaces via
+        /// `walk_errors` instead (still a non-zero exit, just a generic message rather than
+        /// this specific one).
+        broken_manifest_symlinks: Vec<PathBuf>,
+    }
+
+    impl WalkOutcome {
+        /// Every manifest discovered and routed to an ecosystem.
+        #[must_use]
+        pub fn manifests(&self) -> &[DiscoveredManifest] {
+            &self.manifests
+        }
+
+        /// Every warning produced while walking — an unreadable path, a symlink loop, a path
+        /// that could not be resolved to a file URI, ...
+        #[must_use]
+        pub fn walk_errors(&self) -> &[String] {
+            &self.walk_errors
+        }
+
+        /// Every explicitly-given root this run's ecosystem registry did not recognize.
+        #[must_use]
+        pub fn unrecognized_explicit_paths(&self) -> &[PathBuf] {
+            &self.unrecognized_explicit_paths
+        }
+
+        /// Every manifest-shaped file excluded from the scan without being asked to.
+        #[must_use]
+        pub fn ignored_manifests(&self) -> &[PathBuf] {
+            &self.ignored_manifests
+        }
+
+        /// Every manifest-shaped symlink whose target is not itself a manifest.
+        #[must_use]
+        pub fn broken_manifest_symlinks(&self) -> &[PathBuf] {
+            &self.broken_manifest_symlinks
+        }
+
+        /// The single mutation point for `manifests` — mirrors `route_file`'s own role as the
+        /// sole place a `DiscoveredManifest` is constructed.
+        pub(super) fn push_manifest(&mut self, manifest: DiscoveredManifest) {
+            self.manifests.push(manifest);
+        }
+
+        /// The single mutation point for `walk_errors` — sanitizes (#1304's chokepoint,
+        /// folded in here per #1305) before storing, so every caller in `walk.rs` gets
+        /// sanitization for free instead of calling a separate helper at each push site.
+        /// `pub(super)`, not `pub`: callable from anywhere in `walk.rs` (the parent module),
+        /// never from `main.rs` or an external crate.
+        pub(super) fn push_walk_error(&mut self, error: String) {
+            self.walk_errors
+                .push(crate::sanitize::sanitize_message_for_display(&error));
+        }
+
+        /// The single mutation point for `unrecognized_explicit_paths` — sanitizes before
+        /// storing (see [`Self::push_walk_error`]).
+        pub(super) fn push_unrecognized_explicit_path(&mut self, path: PathBuf) {
+            self.unrecognized_explicit_paths
+                .push(crate::sanitize::sanitize_path_for_display(&path));
+        }
+
+        /// The single mutation point for `ignored_manifests` — sanitizes before storing (see
+        /// [`Self::push_walk_error`]).
+        pub(super) fn push_ignored_manifest(&mut self, path: PathBuf) {
+            self.ignored_manifests
+                .push(crate::sanitize::sanitize_path_for_display(&path));
+        }
+
+        /// The single mutation point for `broken_manifest_symlinks` — sanitizes before storing
+        /// (see [`Self::push_walk_error`]).
+        pub(super) fn push_broken_manifest_symlink(&mut self, path: PathBuf) {
+            self.broken_manifest_symlinks
+                .push(crate::sanitize::sanitize_path_for_display(&path));
+        }
+    }
 }
 
 /// Whether `.gitignore`/`.ignore` rules exclude manifests from the walk (issue #1109).
@@ -360,10 +439,8 @@ fn walk_with_limit(
         // reported zero manifests. `display_path`s below are still derived relative to
         // `root` as given, so reported paths stay exactly as the caller typed them.
         let Ok(absolute_root) = std::path::absolute(root) else {
-            push_walk_error(
-                &mut ctx.outcome,
-                format!("could not resolve path: {}", root.display()),
-            );
+            ctx.outcome
+                .push_walk_error(format!("could not resolve path: {}", root.display()));
             continue;
         };
 
@@ -377,7 +454,7 @@ fn walk_with_limit(
                 break;
             }
             ctx.entries_walked += 1;
-            let matched_before = ctx.outcome.manifests.len();
+            let matched_before = ctx.outcome.manifests().len();
             route_file(
                 &absolute_root,
                 &absolute_root,
@@ -385,10 +462,8 @@ fn walk_with_limit(
                 registry,
                 &mut ctx.outcome,
             );
-            if ctx.outcome.manifests.len() == matched_before {
-                ctx.outcome
-                    .unrecognized_explicit_paths
-                    .push(crate::sanitize::sanitize_path_for_display(root));
+            if ctx.outcome.manifests().len() == matched_before {
+                ctx.outcome.push_unrecognized_explicit_path(root.clone());
             }
             continue;
         }
@@ -397,14 +472,19 @@ fn walk_with_limit(
         // `classify_symlink` the walk uses, so it can't both fall through as a directory walk
         // and get independently re-flagged as `Broken` at the root entry (S1/S3 contradiction).
         if is_symlink(root) {
-            let sink = match classify_symlink(&absolute_root, registry) {
-                SymlinkClassification::Broken => Some(&mut ctx.outcome.broken_manifest_symlinks),
-                SymlinkClassification::Irrelevant if std::fs::metadata(root).is_err() => {
-                    Some(&mut ctx.outcome.unrecognized_explicit_paths)
-                }
-                SymlinkClassification::Resolvable | SymlinkClassification::Irrelevant => None,
-            };
-            if let Some(sink) = sink {
+            // A fn pointer, not a `&mut Vec<PathBuf>` reference into `ctx.outcome`, since the
+            // fields it would point at are private (#1305).
+            let sink: Option<fn(&mut WalkOutcome, PathBuf)> =
+                match classify_symlink(&absolute_root, registry) {
+                    SymlinkClassification::Broken => {
+                        Some(WalkOutcome::push_broken_manifest_symlink)
+                    }
+                    SymlinkClassification::Irrelevant if std::fs::metadata(root).is_err() => {
+                        Some(WalkOutcome::push_unrecognized_explicit_path)
+                    }
+                    SymlinkClassification::Resolvable | SymlinkClassification::Irrelevant => None,
+                };
+            if let Some(push) = sink {
                 if ctx.entries_walked >= ctx.limit {
                     ctx.outcome.truncated = true;
                     tracing::warn!(
@@ -414,7 +494,7 @@ fn walk_with_limit(
                     break;
                 }
                 ctx.entries_walked += 1;
-                sink.push(crate::sanitize::sanitize_path_for_display(root));
+                push(&mut ctx.outcome, root.clone());
                 continue;
             }
         }
@@ -637,9 +717,7 @@ fn walk_directory(
                     if options.respect_gitignore {
                         visited.insert(display.clone());
                     }
-                    ctx.outcome
-                        .broken_manifest_symlinks
-                        .push(crate::sanitize::sanitize_path_for_display(&display));
+                    ctx.outcome.push_broken_manifest_symlink(display);
                     true
                 } else {
                     false
@@ -647,7 +725,7 @@ fn walk_directory(
                 // Bug 3 (background review): don't also emit the generic IO error once the
                 // specific broken-manifest warning already covers this path.
                 if !classified_as_broken {
-                    push_walk_error(&mut ctx.outcome, error);
+                    ctx.outcome.push_walk_error(error.to_string());
                 }
             }
         }
@@ -748,7 +826,7 @@ fn detect_ignored_manifests(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                push_walk_error(&mut ctx.outcome, error);
+                ctx.outcome.push_walk_error(error.to_string());
                 continue;
             }
         };
@@ -773,20 +851,15 @@ fn detect_ignored_manifests(
         match url::Url::from_file_path(path) {
             Ok(uri) => {
                 if ctx.registry.for_uri(&uri).is_some() {
-                    ctx.outcome
-                        .ignored_manifests
-                        .push(crate::sanitize::sanitize_path_for_display(&display));
+                    ctx.outcome.push_ignored_manifest(display);
                 }
             }
             Err(()) => {
-                push_walk_error(
-                    &mut ctx.outcome,
-                    format!(
-                        "could not convert to a file URI while checking for ignore-suppressed \
-                         manifests, skipping: {}",
-                        display.display()
-                    ),
-                );
+                ctx.outcome.push_walk_error(format!(
+                    "could not convert to a file URI while checking for ignore-suppressed \
+                     manifests, skipping: {}",
+                    display.display()
+                ));
             }
         }
     }
@@ -858,15 +931,12 @@ enum SymlinkClassification {
 
 impl SymlinkClassification {
     /// Routes `display` to the matching `outcome` sink (no-op for `Irrelevant`) — the one place
-    /// this Resolvable/Broken/Irrelevant → push/push/noop mapping lives.
-    ///
-    /// Sanitizes `display` for client-visible display (#1299 round 2) at this single push
-    /// chokepoint, rather than trusting every caller to have sanitized it already.
+    /// this Resolvable/Broken/Irrelevant → push/push/noop mapping lives. Sanitization (#1299
+    /// round 2) happens inside the `push_*` methods themselves, not here.
     fn record(self, outcome: &mut WalkOutcome, display: PathBuf) {
-        let display = crate::sanitize::sanitize_path_for_display(&display);
         match self {
-            Self::Resolvable => outcome.ignored_manifests.push(display),
-            Self::Broken => outcome.broken_manifest_symlinks.push(display),
+            Self::Resolvable => outcome.push_ignored_manifest(display),
+            Self::Broken => outcome.push_broken_manifest_symlink(display),
             Self::Irrelevant => {}
         }
     }
@@ -941,17 +1011,14 @@ fn route_file(
     // reaches display-safety through this one chokepoint rather than at each call site.
     let display_path = crate::sanitize::sanitize_path_for_display(display_path);
     let Ok(uri) = url::Url::from_file_path(route_path) else {
-        push_walk_error(
-            outcome,
-            format!(
-                "could not convert to a file URI, skipping: {}",
-                display_path.display()
-            ),
-        );
+        outcome.push_walk_error(format!(
+            "could not convert to a file URI, skipping: {}",
+            display_path.display()
+        ));
         return;
     };
     if let Some(ecosystem) = registry.for_uri(&uri) {
-        outcome.manifests.push(DiscoveredManifest {
+        outcome.push_manifest(DiscoveredManifest {
             path: read_path.to_path_buf(),
             uri_path: route_path.to_path_buf(),
             display_path,
@@ -1020,7 +1087,7 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert!(outcome.manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
         assert!(!outcome.truncated);
     }
 
@@ -1035,12 +1102,12 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from("Cargo.toml")
         );
-        assert_eq!(outcome.manifests[0].ecosystem.id(), "cargo");
+        assert_eq!(outcome.manifests()[0].ecosystem.id(), "cargo");
     }
 
     /// With `respect_gitignore: true` (the opt-in, pre-#1109-fix behavior), a `.gitignore`
@@ -1062,9 +1129,9 @@ mod tests {
             GitignorePolicy::Respect,
             SymlinkPolicy::Skip,
         );
-        assert!(outcome.manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
         assert_eq!(
-            outcome.ignored_manifests,
+            outcome.ignored_manifests(),
             vec![PathBuf::from("ignored").join("Cargo.toml")]
         );
     }
@@ -1084,8 +1151,8 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert_eq!(outcome.manifests.len(), 1);
-        assert!(outcome.ignored_manifests.is_empty());
+        assert_eq!(outcome.manifests().len(), 1);
+        assert!(outcome.ignored_manifests().is_empty());
     }
 
     /// Issue #1109 repro 2: a nested `sub/.gitignore` (not just a top-level one) must not
@@ -1105,7 +1172,7 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
     }
 
     /// Issue #1109 repro 3: an `.ignore` file (no `.git` directory at all) must not suppress a
@@ -1121,7 +1188,7 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
     }
 
     /// Critic S1 (post-#1109 default-flip regression): disabling `.gitignore`/`.ignore` by
@@ -1149,9 +1216,9 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from("Cargo.toml")
         );
     }
@@ -1176,11 +1243,11 @@ mod tests {
         );
 
         assert!(
-            outcome.manifests.is_empty(),
+            outcome.manifests().is_empty(),
             "still pruned from the primary scan"
         );
         assert_eq!(
-            outcome.ignored_manifests,
+            outcome.ignored_manifests(),
             vec![PathBuf::from("vendor").join("Cargo.toml")]
         );
     }
@@ -1216,8 +1283,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert_eq!(outcome.ignored_manifests.len(), 1);
-        let reported = outcome.ignored_manifests[0].to_string_lossy().into_owned();
+        assert_eq!(outcome.ignored_manifests().len(), 1);
+        let reported = outcome.ignored_manifests()[0]
+            .to_string_lossy()
+            .into_owned();
         assert!(
             !reported.contains('\u{202E}'),
             "bidi override survived the walk: {reported:?}"
@@ -1253,8 +1322,8 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
     }
 
     /// Reviewer follow-up #3: `detect_ignored_manifests`'s diagnostic pass must use its own
@@ -1291,7 +1360,7 @@ mod tests {
             "the diagnostic pass' own budget exhaustion must not mark the primary walk truncated"
         );
         assert_eq!(
-            outcome.manifests.len(),
+            outcome.manifests().len(),
             1,
             "primary walk result must still be complete"
         );
@@ -1324,7 +1393,7 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
     }
 
     /// Critic S3: a manifest excluded only by the always-on, operator-controlled
@@ -1349,9 +1418,9 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
         assert!(
-            outcome.ignored_manifests.is_empty(),
+            outcome.ignored_manifests().is_empty(),
             ".git/info/exclude is operator-controlled, not a .gitignore/.ignore rule"
         );
     }
@@ -1368,7 +1437,7 @@ mod tests {
             GitignorePolicy::Respect,
             SymlinkPolicy::Skip,
         );
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
     }
 
     /// Critic finding S3: issue #1124's own repro command shape is `deps-cli check
@@ -1393,10 +1462,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
-        assert!(outcome.unrecognized_explicit_paths.is_empty());
-        assert_eq!(outcome.broken_manifest_symlinks, vec![manifest]);
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
+        assert!(outcome.unrecognized_explicit_paths().is_empty());
+        assert_eq!(outcome.broken_manifest_symlinks(), vec![manifest]);
     }
 
     /// Companion to the above: an explicit root that is a symlink to a real *directory* must
@@ -1420,8 +1489,8 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert_eq!(outcome.manifests.len(), 1);
-        assert!(outcome.broken_manifest_symlinks.is_empty());
+        assert_eq!(outcome.manifests().len(), 1);
+        assert!(outcome.broken_manifest_symlinks().is_empty());
     }
 
     /// Critic S4 + background-review Bug 1: a manifest-shaped symlink resolving to an existing
@@ -1451,25 +1520,25 @@ mod tests {
         );
 
         assert!(
-            outcome.manifests.is_empty(),
+            outcome.manifests().is_empty(),
             "must not also walk the target directory's contents: {:?}",
             outcome
-                .manifests
+                .manifests()
                 .iter()
                 .map(|m| &m.display_path)
                 .collect::<Vec<_>>()
         );
-        assert!(outcome.ignored_manifests.is_empty());
-        assert_eq!(outcome.broken_manifest_symlinks.len(), 1);
+        assert!(outcome.ignored_manifests().is_empty());
+        assert_eq!(outcome.broken_manifest_symlinks().len(), 1);
         assert!(
-            !outcome.broken_manifest_symlinks[0].as_os_str().is_empty(),
+            !outcome.broken_manifest_symlinks()[0].as_os_str().is_empty(),
             "must never report an empty display path"
         );
         assert_eq!(
-            outcome.broken_manifest_symlinks[0].file_name(),
+            outcome.broken_manifest_symlinks()[0].file_name(),
             Some(std::ffi::OsStr::new("Cargo.toml")),
             "reported path must still name the manifest: {:?}",
-            outcome.broken_manifest_symlinks
+            outcome.broken_manifest_symlinks()
         );
     }
 
@@ -1491,8 +1560,8 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.broken_manifest_symlinks.is_empty());
-        assert_eq!(outcome.unrecognized_explicit_paths, vec![notes]);
+        assert!(outcome.broken_manifest_symlinks().is_empty());
+        assert_eq!(outcome.unrecognized_explicit_paths(), vec![notes]);
     }
 
     /// Regression test for #1108: a *relative* walk root must still find manifests —
@@ -1516,10 +1585,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert_eq!(outcome.manifests.len(), 1);
-        assert!(outcome.walk_errors.is_empty());
+        assert_eq!(outcome.manifests().len(), 1);
+        assert!(outcome.walk_errors().is_empty());
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from("Cargo.toml")
         );
     }
@@ -1540,8 +1609,8 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert_eq!(outcome.manifests.len(), 1);
-        assert!(outcome.unrecognized_explicit_paths.is_empty());
+        assert_eq!(outcome.manifests().len(), 1);
+        assert!(outcome.unrecognized_explicit_paths().is_empty());
     }
 
     /// Regression test for S1 (spec 062 review): the cap must count every walked entry, not
@@ -1580,7 +1649,7 @@ mod tests {
             SymlinkPolicy::Skip,
         );
         assert!(!outcome.truncated);
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
     }
 
     /// Regression test for M4 (spec 062 review): an explicitly-given path no ecosystem
@@ -1596,8 +1665,8 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert!(outcome.manifests.is_empty());
-        assert_eq!(outcome.unrecognized_explicit_paths, vec![unknown]);
+        assert!(outcome.manifests().is_empty());
+        assert_eq!(outcome.unrecognized_explicit_paths(), vec![unknown]);
     }
 
     /// A file encountered while walking a directory (as opposed to given explicitly) must
@@ -1613,7 +1682,7 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert!(outcome.unrecognized_explicit_paths.is_empty());
+        assert!(outcome.unrecognized_explicit_paths().is_empty());
     }
 
     #[test]
@@ -1627,7 +1696,7 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert_eq!(outcome.manifests.len(), 2);
+        assert_eq!(outcome.manifests().len(), 2);
     }
 
     /// Regression test for background code-review fix 1 (spec 062 review): `.git`'s contents
@@ -1667,9 +1736,9 @@ mod tests {
             !outcome.truncated,
             ".git's 100 dummy files must never be walked, so a limit of 3 must suffice"
         );
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from("Cargo.toml")
         );
     }
@@ -1694,12 +1763,12 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from(".github").join("workflows").join("ci.yml")
         );
-        assert_eq!(outcome.manifests[0].ecosystem.id(), "github-actions");
+        assert_eq!(outcome.manifests()[0].ecosystem.id(), "github-actions");
     }
 
     /// Regression test for issue #1165: pins the `DotDirs::Descend` wiring at the
@@ -1729,9 +1798,9 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from(".github").join(".hidden").join("Cargo.toml")
         );
     }
@@ -1765,7 +1834,7 @@ mod tests {
             outcome.truncated,
             "a 2-entry limit against 5 explicit paths must truncate"
         );
-        assert_eq!(outcome.manifests.len(), 2);
+        assert_eq!(outcome.manifests().len(), 2);
     }
 
     /// Issue #1112, US-001: a symlinked manifest must never silently vanish from the scan
@@ -1787,8 +1856,11 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
+        assert!(outcome.manifests().is_empty());
+        assert_eq!(
+            outcome.ignored_manifests(),
+            vec![PathBuf::from("Cargo.toml")]
+        );
     }
 
     /// Issue #1124's own repro: a manifest-shaped broken symlink is reported via the
@@ -1811,10 +1883,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
     }
@@ -1838,9 +1910,9 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
-        assert!(outcome.broken_manifest_symlinks.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
+        assert!(outcome.broken_manifest_symlinks().is_empty());
     }
 
     /// `--follow-symlinks` does not defeat #1124's detection — a broken symlink still can't be
@@ -1867,17 +1939,17 @@ mod tests {
             SymlinkPolicy::Follow,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
         assert!(
-            outcome.walk_errors.is_empty(),
+            outcome.walk_errors().is_empty(),
             "Bug 3 (background code review): a mid-walk broken symlink already classified must \
              not also emit a duplicate generic IO walk error: {:?}",
-            outcome.walk_errors
+            outcome.walk_errors()
         );
     }
 
@@ -1902,10 +1974,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
     }
@@ -1945,10 +2017,10 @@ mod tests {
             return;
         }
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
     }
@@ -1976,12 +2048,12 @@ mod tests {
         );
 
         assert!(
-            outcome.manifests.is_empty(),
+            outcome.manifests().is_empty(),
             "still pruned from the primary scan"
         );
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("vendor").join("Cargo.toml")]
         );
     }
@@ -2010,10 +2082,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
     }
@@ -2042,7 +2114,7 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")],
             "a non-gitignored broken symlinked manifest must be reported exactly once"
         );
@@ -2065,9 +2137,9 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
-        assert!(outcome.broken_manifest_symlinks.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
+        assert!(outcome.broken_manifest_symlinks().is_empty());
     }
 
     /// Critic finding S1: a manifest-shaped symlink resolving to an existing *directory* is a
@@ -2090,10 +2162,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
     }
@@ -2125,10 +2197,10 @@ mod tests {
             SymlinkPolicy::Skip,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
     }
@@ -2171,16 +2243,16 @@ mod tests {
         }
 
         assert!(
-            !outcome.walk_errors.is_empty(),
+            !outcome.walk_errors().is_empty(),
             "sanity check: the walker's own descent into `blocked` must have failed for this \
              test to exercise anything"
         );
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert!(
-            outcome.broken_manifest_symlinks.is_empty(),
+            outcome.broken_manifest_symlinks().is_empty(),
             "a non-symlink, permission-denied directory must never be reported as symlink \
              tampering: {:?}",
-            outcome.broken_manifest_symlinks
+            outcome.broken_manifest_symlinks()
         );
     }
 
@@ -2206,11 +2278,11 @@ mod tests {
         );
 
         assert!(
-            outcome.manifests.is_empty(),
+            outcome.manifests().is_empty(),
             "still pruned from the primary scan"
         );
         assert_eq!(
-            outcome.ignored_manifests,
+            outcome.ignored_manifests(),
             vec![PathBuf::from("vendor").join("Cargo.toml")]
         );
     }
@@ -2234,12 +2306,12 @@ mod tests {
             SymlinkPolicy::Follow,
         );
 
-        assert_eq!(outcome.manifests.len(), 1);
-        assert!(outcome.ignored_manifests.is_empty());
-        assert_eq!(outcome.manifests[0].ecosystem.id(), "cargo");
+        assert_eq!(outcome.manifests().len(), 1);
+        assert!(outcome.ignored_manifests().is_empty());
+        assert_eq!(outcome.manifests()[0].ecosystem.id(), "cargo");
         // S3/FR-007: `path` (used for reading) is the resolved real path, not the symlink.
         assert_eq!(
-            outcome.manifests[0]
+            outcome.manifests()[0]
                 .path
                 .canonicalize()
                 .expect("canonicalize actual path"),
@@ -2251,7 +2323,7 @@ mod tests {
         // file) — assert the *raw*, non-canonicalized paths differ too, proving `path` is
         // genuinely the resolved target, not the symlink verbatim.
         assert_ne!(
-            outcome.manifests[0].path,
+            outcome.manifests()[0].path,
             dir.path().join("Cargo.toml"),
             "path must be the resolved real path, not the symlink's own raw path"
         );
@@ -2277,9 +2349,9 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Skip,
         );
-        assert!(disabled.manifests.is_empty());
+        assert!(disabled.manifests().is_empty());
         assert_eq!(
-            disabled.ignored_manifests,
+            disabled.ignored_manifests(),
             vec![PathBuf::from("Cargo.toml")]
         );
 
@@ -2289,8 +2361,8 @@ mod tests {
             GitignorePolicy::Ignore,
             SymlinkPolicy::Follow,
         );
-        assert_eq!(enabled.manifests.len(), 1);
-        assert!(enabled.ignored_manifests.is_empty());
+        assert_eq!(enabled.manifests().len(), 1);
+        assert!(enabled.ignored_manifests().is_empty());
     }
 
     /// FR-007: `display_path` reflects the symlink's own encountered path, not the resolved
@@ -2311,9 +2383,9 @@ mod tests {
             SymlinkPolicy::Follow,
         );
 
-        assert_eq!(outcome.manifests.len(), 1);
+        assert_eq!(outcome.manifests().len(), 1);
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from("Cargo.toml")
         );
     }
@@ -2346,12 +2418,12 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.manifests.len(),
+            outcome.manifests().len(),
             1,
             "a symlinked manifest inside a pruned directory must still be pruned, not routed"
         );
         assert_eq!(
-            outcome.manifests[0].display_path,
+            outcome.manifests()[0].display_path,
             PathBuf::from("Cargo.toml")
         );
     }
@@ -2413,10 +2485,13 @@ mod tests {
         );
 
         assert!(
-            outcome.manifests.is_empty(),
+            outcome.manifests().is_empty(),
             "must never route a symlink target outside the walked root"
         );
-        assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
+        assert_eq!(
+            outcome.ignored_manifests(),
+            vec![PathBuf::from("Cargo.toml")]
+        );
     }
 
     /// FR-005, US-003: a symlink loop must not hang or crash the walk; it is reported via
@@ -2442,16 +2517,16 @@ mod tests {
 
         assert!(
             outcome
-                .walk_errors
+                .walk_errors()
                 .iter()
                 .any(|error| error.to_lowercase().contains("loop")),
             "a symlink loop must be reported via walk_errors naming the loop, not just any \
              error, and must not hang or crash: {:?}",
-            outcome.walk_errors
+            outcome.walk_errors()
         );
         assert!(
             outcome
-                .manifests
+                .manifests()
                 .iter()
                 .any(|m| m.display_path == Path::new("Cargo.toml")),
             "other manifests in the same tree must still be found"
@@ -2482,14 +2557,14 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
         assert!(
-            outcome.walk_errors.is_empty(),
+            outcome.walk_errors().is_empty(),
             "must not duplicate the specific broken-manifest classification with a generic \
              IO walk error: {:?}",
-            outcome.walk_errors
+            outcome.walk_errors()
         );
     }
 
@@ -2516,10 +2591,10 @@ mod tests {
             SymlinkPolicy::Follow,
         );
 
-        assert!(outcome.manifests.is_empty());
-        assert!(outcome.ignored_manifests.is_empty());
+        assert!(outcome.manifests().is_empty());
+        assert!(outcome.ignored_manifests().is_empty());
         assert_eq!(
-            outcome.broken_manifest_symlinks,
+            outcome.broken_manifest_symlinks(),
             vec![PathBuf::from("Cargo.toml")]
         );
     }
@@ -2547,11 +2622,14 @@ mod tests {
         );
 
         assert!(
-            outcome.manifests.is_empty(),
+            outcome.manifests().is_empty(),
             "a .gitignore-excluded symlinked manifest must not be routed even under \
              --follow-symlinks"
         );
-        assert_eq!(outcome.ignored_manifests, vec![PathBuf::from("Cargo.toml")]);
+        assert_eq!(
+            outcome.ignored_manifests(),
+            vec![PathBuf::from("Cargo.toml")]
+        );
     }
 
     /// Critic finding C1 regression: a symlinked *directory* (not a symlinked leaf file) must
@@ -2579,19 +2657,19 @@ mod tests {
 
         assert!(
             outcome
-                .manifests
+                .manifests()
                 .iter()
                 .all(|m| m.display_path != PathBuf::from("evil").join("Cargo.toml")),
             "a manifest reached only by descending into a symlinked directory outside the \
              walked root must never be routed: {:?}",
             outcome
-                .manifests
+                .manifests()
                 .iter()
                 .map(|m| &m.display_path)
                 .collect::<Vec<_>>()
         );
         assert_eq!(
-            outcome.manifests.len(),
+            outcome.manifests().len(),
             1,
             "the root's own, non-escaping Cargo.toml must still be found"
         );
@@ -2637,7 +2715,7 @@ mod tests {
              budget, not exhaust it on external content"
         );
         assert_eq!(
-            outcome.manifests.len(),
+            outcome.manifests().len(),
             1,
             "the root's own manifest must still be found"
         );
@@ -2670,7 +2748,7 @@ mod tests {
         );
 
         assert_eq!(
-            outcome.ignored_manifests,
+            outcome.ignored_manifests(),
             vec![PathBuf::from("Cargo.toml")],
             "a non-gitignored symlinked manifest must be reported exactly once"
         );
@@ -2703,11 +2781,11 @@ mod tests {
         );
 
         assert!(
-            outcome.manifests.is_empty(),
+            outcome.manifests().is_empty(),
             "a symlinked .github escaping the walked root must never be scanned, even in the \
              default mode: {:?}",
             outcome
-                .manifests
+                .manifests()
                 .iter()
                 .map(|m| &m.display_path)
                 .collect::<Vec<_>>()
