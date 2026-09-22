@@ -149,6 +149,25 @@ pub fn to_lsp_related_information(
     }
 }
 
+/// Converts a domain [`deps_core::hover::Hover`] into the LSP-protocol `Hover`
+/// [`crate::handlers::hover::handle_hover`] returns to the client.
+///
+/// The domain type is what [`deps_core::ecosystem::Ecosystem::generate_hover`] returns.
+/// `MarkupKind::Markdown` is always the wire encoding: `deps-lsp` never produces any other
+/// `HoverContents` variant, so attaching the constant kind here (rather than carrying it
+/// through the domain type) is the same simplification [`to_lsp_diagnostic`]'s constant
+/// `source: "deps-lsp"` makes.
+#[must_use]
+pub fn to_lsp_hover(hover: deps_core::hover::Hover) -> ls_types::Hover {
+    ls_types::Hover {
+        contents: ls_types::HoverContents::Markup(ls_types::MarkupContent {
+            kind: ls_types::MarkupKind::Markdown,
+            value: hover.markdown().to_string(),
+        }),
+        range: hover.range.map(to_lsp_range),
+    }
+}
+
 /// Converts a domain [`deps_core::diagnostic::Diagnostic`] into the LSP-protocol `Diagnostic`
 /// [`crate::handlers::diagnostics`] publishes to the client.
 ///
@@ -371,6 +390,41 @@ mod tests {
         let ls_range =
             ls_types::Range::new(ls_types::Position::new(0, 0), ls_types::Position::new(2, 5));
         assert_eq!(to_lsp_range(domain), ls_range);
+    }
+
+    #[test]
+    fn test_to_lsp_hover_converts_markdown_and_range() {
+        use deps_core::hover::Hover;
+        use deps_core::position::{Position, Range};
+
+        let domain = Hover::new(
+            "# serde",
+            Some(Range::new(Position::new(0, 0), Position::new(0, 5))),
+        );
+        let ls_hover = to_lsp_hover(domain);
+        assert_eq!(
+            ls_hover.contents,
+            ls_types::HoverContents::Markup(ls_types::MarkupContent {
+                kind: ls_types::MarkupKind::Markdown,
+                value: "# serde".to_string(),
+            })
+        );
+        assert_eq!(
+            ls_hover.range,
+            Some(ls_types::Range::new(
+                ls_types::Position::new(0, 0),
+                ls_types::Position::new(0, 5)
+            ))
+        );
+    }
+
+    #[test]
+    fn test_to_lsp_hover_maps_no_range_to_none() {
+        use deps_core::hover::Hover;
+
+        let domain = Hover::new("# serde", None);
+        let ls_hover = to_lsp_hover(domain);
+        assert_eq!(ls_hover.range, None);
     }
 
     #[test]

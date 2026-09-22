@@ -6,11 +6,13 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Hover, HoverContents, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::hover::Hover;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
@@ -214,10 +216,8 @@ impl Ecosystem for NpmEcosystem {
                 .and_then(|dep| dep.as_any().downcast_ref::<NpmDependency>())
                 .and_then(catalog_hover_line);
 
-            if let Some(catalog_line) = catalog_line
-                && let HoverContents::Markup(content) = &mut hover.contents
-            {
-                content.value.push_str(&catalog_line);
+            if let Some(catalog_line) = catalog_line {
+                hover.push_markdown(&catalog_line);
             }
 
             Some(hover)
@@ -1444,17 +1444,11 @@ mod tests {
             .await
             .expect("hover must fire for a catalog-resolved dependency");
 
-        let tower_lsp_server::ls_types::HoverContents::Markup(content) = &hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(
-            content.value.contains("**Requirement**"),
-            "{}",
-            content.value
-        );
-        assert!(content.value.contains("^18.3.0"), "{}", content.value);
-        assert!(content.value.contains("**Catalog**"), "{}", content.value);
-        assert!(content.value.contains("catalog:"), "{}", content.value);
+        let content = hover.markdown();
+        assert!(content.contains("**Requirement**"), "{content}");
+        assert!(content.contains("^18.3.0"), "{content}");
+        assert!(content.contains("**Catalog**"), "{content}");
+        assert!(content.contains("catalog:"), "{content}");
     }
 
     #[tokio::test]

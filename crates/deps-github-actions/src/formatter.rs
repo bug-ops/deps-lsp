@@ -478,7 +478,6 @@ mod tests {
         use deps_core::lsp_helpers::generate_hover;
         use deps_core::{PublishTime, VersionData};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::HoverContents;
 
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
@@ -504,10 +503,7 @@ mod tests {
         .await
         .expect("hover should be generated for the dependency on this line");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        content.value
+        hover.markdown().to_string()
     }
 
     /// Hover escapes every name it renders (`# `/`# [...]` heading) via
@@ -608,7 +604,6 @@ mod tests {
         use deps_core::lsp_helpers::generate_hover;
         use deps_core::{PublishTime, VersionData};
         use std::collections::HashMap;
-        use tower_lsp_server::ls_types::HoverContents;
 
         struct OneVersionRegistry;
 
@@ -691,19 +686,17 @@ mod tests {
         .await
         .expect("hover should be generated for the dependency on this line");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**Recent versions**"),
+            content.contains("**Recent versions**"),
             "a non-empty live version list must render the section; got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("Press `Cmd+.`"),
+            content.contains("Press `Cmd+.`"),
             "a resolvable Registry source with real live version data must still show \
              the update footer; got: {}",
-            content.value
+            content
         );
     }
 

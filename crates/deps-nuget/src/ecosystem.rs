@@ -22,11 +22,13 @@ use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Hover, HoverContents, Position, Range};
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -347,9 +349,7 @@ impl Ecosystem for NuGetEcosystem {
                 return Some(hover);
             }
 
-            if let HoverContents::Markup(content) = &mut hover.contents {
-                content.value = annotate_unlisted_versions(&content.value, &unlisted);
-            }
+            hover.rewrite_markdown(|md| annotate_unlisted_versions(md, &unlisted));
 
             Some(hover)
         })
@@ -1330,18 +1330,16 @@ mod tests {
             .await
             .expect("hover for a resolvable in-range dependency must not be None");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("- `13.0.3` *(unlisted)*"),
+            content.contains("- `13.0.3` *(unlisted)*"),
             "unlisted version must be tagged, got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("`12.0.1` *(unlisted)*"),
+            !content.contains("`12.0.1` *(unlisted)*"),
             "listed version must not be tagged, got: {}",
-            content.value
+            content
         );
     }
 
@@ -1398,11 +1396,9 @@ mod tests {
             .await
             .expect("a registration-hive failure must still degrade to the base hover");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("`13.0.3`"));
-        assert!(!content.value.contains("*(unlisted)*"));
+        let content = hover.markdown();
+        assert!(content.contains("`13.0.3`"));
+        assert!(!content.contains("*(unlisted)*"));
     }
 
     /// S4 regression (#451 follow-up): with no dependency at `position`, the base render
@@ -1882,13 +1878,11 @@ mod tests {
             .await
             .expect("hover for a resolvable alternate-feed dependency must not be None");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("- `1.2.3` *(unlisted)*"),
+            content.contains("- `1.2.3` *(unlisted)*"),
             "expected the alternate-feed dependency's unlisted marker, got: {}",
-            content.value
+            content
         );
         _corp_index_mock.assert_async().await;
         _corp_flat_mock.assert_async().await;

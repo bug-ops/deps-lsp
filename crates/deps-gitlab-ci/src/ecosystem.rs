@@ -5,15 +5,15 @@ use std::sync::{Arc, RwLock};
 #[cfg(feature = "lsp-responses")]
 use std::time::Duration;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{
-    CodeAction, CodeActionKind, Hover, HoverContents, Position, TextEdit, WorkspaceEdit,
-};
+use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::PackageName;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
 use deps_core::net_policy::RegistryAccessPolicy;
@@ -486,10 +486,9 @@ impl Ecosystem for GitlabCiEcosystem {
             if gl_dep.kind == IncludeKind::Component
                 && let HostRef::Literal(host) = &gl_dep.host
                 && is_valid_gitlab_coordinate(&gl_dep.project_path)
-                && let HoverContents::Markup(content) = &mut hover.contents
             {
                 let url = format!("https://{}/{}", host.host(), gl_dep.project_path);
-                content.value = splice_project_line(&content.value, &url);
+                hover.rewrite_markdown(|md| splice_project_line(md, &url));
             }
 
             if gl_dep.pin == Some(PinStyle::Sha)
@@ -500,13 +499,10 @@ impl Ecosystem for GitlabCiEcosystem {
                 && let Some(resolved_tag) =
                     self.formatter
                         .resolved_tag_for_sha(gl_dep.kind.endpoint(), dep.name(), sha)
-                && let HoverContents::Markup(content) = &mut hover.contents
             {
-                content.value = deps_core::lsp_helpers::splice_resolved_line(
-                    &content.value,
-                    &resolved_tag,
-                    sha,
-                );
+                hover.rewrite_markdown(|md| {
+                    deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
+                });
             }
 
             // FR-007 (H1, #466 review): a `component:` `Latest`/`Partial` pin names no
@@ -531,13 +527,13 @@ impl Ecosystem for GitlabCiEcosystem {
                 .await;
                 match outcome {
                     Ok(Ok(Some(resolved))) => {
-                        if let HoverContents::Markup(content) = &mut hover.contents {
-                            content.value = deps_core::lsp_helpers::splice_resolved_line(
-                                &content.value,
+                        hover.rewrite_markdown(|md| {
+                            deps_core::lsp_helpers::splice_resolved_line(
+                                md,
                                 resolved.version.as_str(),
                                 &resolved.sha,
-                            );
-                        }
+                            )
+                        });
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(error)) => {

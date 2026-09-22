@@ -4,11 +4,13 @@ use dashmap::DashMap;
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CodeAction, Hover, HoverContents, Position, TextEdit};
+use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use deps_core::hover::Hover;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::ShaPinning;
 use deps_core::{
@@ -376,14 +378,11 @@ impl Ecosystem for GithubActionsEcosystem {
             // of `VersionData`. Restored post-hoc via `CMD_DOT_FOOTER`, idempotently, using
             // the same centralized eligibility check the quickfix/code-lens build on (#1177).
             if self.formatter.resolve_static_sha_pin(dep).is_some()
-                && let HoverContents::Markup(content) = &mut hover.contents
-                && !content
-                    .value
+                && !hover
+                    .markdown()
                     .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER)
             {
-                content
-                    .value
-                    .push_str(deps_core::lsp_helpers::CMD_DOT_FOOTER);
+                hover.push_markdown(deps_core::lsp_helpers::CMD_DOT_FOOTER);
             }
 
             let Some(sha) = crate::types::sha_pin_raw_sha(gha_dep) else {
@@ -399,13 +398,9 @@ impl Ecosystem for GithubActionsEcosystem {
                 return Some(hover);
             };
 
-            if let HoverContents::Markup(content) = &mut hover.contents {
-                content.value = deps_core::lsp_helpers::splice_resolved_line(
-                    &content.value,
-                    &resolved_tag,
-                    sha,
-                );
-            }
+            hover.rewrite_markdown(|md| {
+                deps_core::lsp_helpers::splice_resolved_line(md, &resolved_tag, sha)
+            });
 
             Some(hover)
         })
@@ -1453,15 +1448,13 @@ mod tests {
             .await
             .expect("hover should be generated for the dependency on this line");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("Press `Cmd+.` to update version"),
+            content.contains("Press `Cmd+.` to update version"),
             "a Tag-pinned step with a warm TagIndex entry still offers the SHA-pin quickfix \
              while offline, so the footer must be restored even with no VersionData signal; \
              got: {}",
-            content.value
+            content
         );
     }
 
@@ -1491,14 +1484,12 @@ mod tests {
             .await
             .expect("hover should be generated for the dependency on this line");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("Press `Cmd+.` to update version"),
+            !content.contains("Press `Cmd+.` to update version"),
             "no TagIndex entry exists, so there is no quickfix to restore the footer for; \
              got: {}",
-            content.value
+            content
         );
     }
 
@@ -1555,21 +1546,19 @@ mod tests {
             .await
             .expect("hover should be generated for the dependency on this line");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("**Recent versions**"),
+            !content.contains("**Recent versions**"),
             "an all-bare-major tag list has zero full-semver entries, so the section \
              must stay omitted; got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("Press `Cmd+.` to update version"),
+            content.contains("Press `Cmd+.` to update version"),
             "a Tag-pinned step whose live fetch genuinely succeeded empty still has a \
              real SHA-pin quickfix via TagIndex, so the footer must be restored online \
              too, not just offline; got: {}",
-            content.value
+            content
         );
     }
 
@@ -1610,14 +1599,12 @@ mod tests {
             .await
             .expect("hover should be generated for the dependency on this line");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("Press `Cmd+.` to update version"),
+            !content.contains("Press `Cmd+.` to update version"),
             "a quoted uses: scalar offers no SHA-pin quickfix even on a TagIndex hit, so the \
              footer must not be restored; got: {}",
-            content.value
+            content
         );
     }
 
@@ -1663,17 +1650,13 @@ mod tests {
             .await
             .expect("hover should be generated for the dependency on this line");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content
-                .value
-                .contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
+            !content.contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
             "a flow-style uses: step is not the last token on its line, so appending a SHA \
              pin comment would produce invalid YAML; the footer must not be restored even \
              on a TagIndex hit; got: {}",
-            content.value
+            content
         );
     }
 
