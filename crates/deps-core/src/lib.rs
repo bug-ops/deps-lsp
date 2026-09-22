@@ -224,9 +224,9 @@ pub use lsp_helpers::{
     LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, LineOffsetTable, OsvNaming, PackageNaming,
     PackageRendering, PackageVersions, RequirementMatcher, RequirementResolution,
     RequirementStatus, SourcePolicy, UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, is_dot_segment,
-    is_safe_maven_coordinate_segment, is_safe_package_name, is_safe_registry_url,
-    is_safe_version_string, is_same_major_minor, maven_coordinate_path, position_in_range,
-    requirement_is_unsatisfiable, warn_rejected_value,
+    is_safe_feature_name, is_safe_maven_coordinate_segment, is_safe_package_name,
+    is_safe_registry_url, is_safe_version_string, is_same_major_minor, maven_coordinate_path,
+    position_in_range, requirement_is_unsatisfiable, warn_rejected_value,
 };
 /// LSP-response-shaped re-exports, present only when the `lsp-responses` feature is enabled.
 #[cfg(feature = "lsp-responses")]

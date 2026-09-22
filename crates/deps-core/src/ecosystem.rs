@@ -843,8 +843,10 @@ impl LicenseSource {
 ///         prefix: String,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, Completions> {
 ///         Box::pin(async move {
-///             let item = build_feature_completion(&prefix, &package_name, None);
-///             Completions::new(vec![item])
+///             let items = build_feature_completion(&prefix, &package_name, None)
+///                 .into_iter()
+///                 .collect();
+///             Completions::new(items)
 ///         })
 ///     }
 ///

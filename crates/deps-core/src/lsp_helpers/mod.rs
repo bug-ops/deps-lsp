@@ -1816,6 +1816,44 @@ pub fn is_safe_package_name(name: &str) -> bool {
         })
 }
 
+/// Whether `name` is safe to embed as a Cargo feature name in a manifest `TextEdit` or
+/// completion item.
+///
+/// Guards [`crate::completion::build_feature_completion`] the same way
+/// [`is_safe_package_name`] guards [`crate::completion::build_package_completion`]:
+/// `feature_name` there is registry-supplied (a key of `Version::features()`, read from
+/// the index JSON's `features`/`features2` maps), not user-typed, so it must pass this
+/// allowlist before reaching `label`/`insert_text`/`text_edit`/`sort_text`.
+///
+/// An allowlist, narrower than [`is_safe_package_name`]: per Cargo's own feature-name
+/// grammar (<https://doc.rust-lang.org/cargo/reference/features.html#the-features-section>)
+/// and crates.io's stricter publish-time check on it, a feature name contains only ASCII
+/// alphanumerics, `_`, `-`, `+`, and `.`. `dep:`, `?`, and `/` are never part of a feature
+/// *name* (an index JSON map key) — they only ever appear inside a feature's *value* list
+/// (e.g. `"avif" = ["dep:ravif", "rgb?/serde"]`), which this predicate never sees. A
+/// registry-supplied string containing any of those characters is therefore not a
+/// plausible feature name regardless of intent, so it is rejected the same as any other
+/// out-of-allowlist character.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::is_safe_feature_name;
+///
+/// assert!(is_safe_feature_name("derive"));
+/// assert!(is_safe_feature_name("std_alloc-v2+extra"));
+/// assert!(!is_safe_feature_name("dep:ravif"));
+/// assert!(!is_safe_feature_name("rgb?/serde"));
+/// assert!(!is_safe_feature_name("evil\"\nbackdoor = \"9.9.9"));
+/// ```
+pub fn is_safe_feature_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
+}
+
 /// Logs a `tracing::warn!` for a value rejected by an `is_safe_*` predicate (or an
 /// equivalent value-rejecting gate) before it reaches a manifest edit or registry URL.
 ///
