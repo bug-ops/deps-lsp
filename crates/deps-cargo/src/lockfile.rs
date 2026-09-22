@@ -101,19 +101,16 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
-        return Err(DepsError::ParseError {
-            file_type: "Cargo.lock".into(),
-            source: Box::new(std::io::Error::other(format!(
+        return Err(DepsError::parse_error(
+            "Cargo.lock",
+            &format!(
                 "array/table nesting depth {depth} exceeds maximum of {}",
                 deps_core::MAX_TOML_NESTING_DEPTH
-            ))),
-        });
+            ),
+        ));
     }
 
-    let doc = toml_span::parse(&content).map_err(|e| DepsError::ParseError {
-        file_type: "Cargo.lock".into(),
-        source: deps_core::net_policy::parse_error_source(&e),
-    })?;
+    let doc = toml_span::parse(&content).map_err(|e| DepsError::parse_error("Cargo.lock", &e))?;
 
     let mut packages = ResolvedPackages::new();
 

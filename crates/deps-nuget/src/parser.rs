@@ -118,10 +118,9 @@ pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseR
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
     loop {
-        let event = reader.read_event().map_err(|e| DepsError::ParseError {
-            file_type: "NuGet project file".into(),
-            source: deps_core::net_policy::parse_error_source(&e),
-        })?;
+        let event = reader
+            .read_event()
+            .map_err(|e| DepsError::parse_error("NuGet project file", &e))?;
 
         match event {
             Event::Empty(ref e) | Event::Start(ref e) if e.local_name().as_ref() == "package" => {
@@ -218,10 +217,9 @@ fn parse_reference_elements(
 
     loop {
         let text_pos = reader.buffer_position();
-        let event = reader.read_event().map_err(|e| DepsError::ParseError {
-            file_type: "NuGet project file".into(),
-            source: deps_core::net_policy::parse_error_source(&e),
-        })?;
+        let event = reader
+            .read_event()
+            .map_err(|e| DepsError::parse_error("NuGet project file", &e))?;
 
         match event {
             Event::Empty(ref e) => {

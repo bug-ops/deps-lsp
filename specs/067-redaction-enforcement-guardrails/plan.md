@@ -219,7 +219,7 @@ N/A — no HTTP/LSP-facing API surface changes. The "API" here is the new public
 | System | Direction | Notes |
 |--------|-----------|-------|
 | All 14 ecosystem crates + `deps-lsp`/`deps-cli` | inbound (this feature is consumed by them) | Every external `DepsError::ParseError { .. }` construction site (~20+ per #1243's audit) must migrate to `DepsError::parse_error(..)` or the workspace fails to compile — this is the mechanism, not a side effect. |
-| `deps-cargo`, `deps-core::github`, `deps-gitlab-ci` (×2), `deps-nuget` (×3), `deps-pypi`, `deps-core::lsp_helpers::git_ref` | inbound | The 9 migration-batch types adopt `#[derive(RedactingDebug)]`, deleting their hand-written `impl Debug` blocks. |
+| `deps-nuget` (`PackageSourceEntry`), `deps-core::lsp_helpers::git_ref` (`ResolvedShaPin`) | inbound | **Revised during implementation**: only these 2 of the originally-planned 9 types are genuine named-field structs with unconditional per-field redaction; they adopt `#[derive(RedactingDebug)]`, deleting their hand-written `impl Debug` blocks. The other 7 (`AuthToken` ×3, `NuGetAuth`, `RedactedSecret`, `HostRef`, `ResolvedChain`) turned out to be tuple structs, an enum, or conditionally-redacted — see spec's Out of Scope. |
 | `#1316` (open PR, `deps_core::redact` module extraction) | soft dependency | Generated code calls whichever path (`net_policy::` or `redact::`) is canonical at merge time; implementation checks `main` at start of work, not this plan's fixed snapshot. |
 
 ## 6. Security
@@ -245,7 +245,7 @@ N/A — no HTTP/LSP-facing API surface changes. The "API" here is the new public
 |-------|-----------|---------------|------------------|
 | Compile-fail | `trybuild` (new dev-dep, `deps-core-macros`) | Unannotated field, conflicting attributes, non-struct/tuple-struct input | Every FR-005 failure mode listed in the spec |
 | Compile-fail (doctest) | `compile_fail` doctest in `error.rs` | External `ParseError { .. }` literal does not compile | SC-001 |
-| Unit / conformance | existing `debug_redaction_conformance!` (unchanged macro) | All 9 migration-batch types keep passing with byte-identical probe assertions | SC-003 |
+| Unit / conformance | existing `debug_redaction_conformance!` (unchanged macro) | Both actually-migrated types (`PackageSourceEntry`, `ResolvedShaPin`) keep passing with byte-identical probe assertions (revised down from 9 — see spec) | SC-003 |
 | Unit | `cargo nextest` | `DepsError::parse_error(..)` output matches `parse_error_source(..)` byte-for-byte for both credential-shaped and benign inputs | FR-002 |
 | Doctest | `cargo test --doc --all-features` | `RedactingDebug`'s own `# Examples` doctest (mirrors `debug_redaction_conformance!`'s existing `mod example` pattern) | Rustdoc gate |
 | Full workspace | `cargo nextest run --workspace --all-features --no-fail-fast` | No regression anywhere; migration compiles workspace-wide | SC-004 |
@@ -288,7 +288,7 @@ N/A — no HTTP/LSP-facing API surface changes. The "API" here is the new public
 | `#1316` merges mid-implementation, moving `net_policy::` redaction fns to `redact::` | low (rename only) | medium (PR is open, active) | Generated code path checked against `main` at implementation start, not hardcoded from this plan's snapshot; both paths are re-exported during #1316's transition window per its own PR description. |
 | Migrating a `ParseError` call site changes an existing error's exact `Display`/log text in a way a snapshot (`insta`) test depends on | low | low | `parse_error_source`'s output is unchanged by this feature (only the construction path changes) — `Display` text is provably identical; run `cargo insta test --workspace --all-features` before PR regardless. |
 | `syn` 3.0 API surface differs from commonly-referenced `syn` 2.x examples/tutorials | medium (implementation friction) | medium | Pin `syn = "3.0.6"`, `quote = "1.0.47"`, `proc-macro2 = "1.0.107"` (versions confirmed via `cargo add --dry-run` at plan time, context7 unavailable per project memory); consult `syn` 3.0's own docs.rs during implementation rather than assuming 2.x API shapes. |
-| Migration batch (9 types) turns out to include a field whose "redacted" treatment isn't a clean url/key split (e.g. a conditional redaction) | medium | low | Batch was selected specifically for being simple credential-adjacent types (spec's Data Model section); if one doesn't fit cleanly, drop it from the batch and add it to the follow-up-issue list rather than forcing an ill-fitting `#[raw]`/`#[redact]` split. |
+| Migration batch (9 types) turns out to include a field whose "redacted" treatment isn't a clean url/key split (e.g. a conditional redaction) | medium | low | **Materialized**: 7 of 9 didn't fit — 5 turned out to be single-field tuple structs (not even a field-shape question, a structural one), 1 an enum, 1 a conditionally-redacted field. Dropped all 7 per this mitigation exactly as planned; batch shrank to 2 (`PackageSourceEntry`, `ResolvedShaPin`). Root cause: the original batch was selected by grepping for "manual Debug impl + redaction helper usage" without checking each type's actual field shape — a lesson for scoping future batches (verify shape, not just helper usage, before committing to a migration table). |
 
 ## See Also
 

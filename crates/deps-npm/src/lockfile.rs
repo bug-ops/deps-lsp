@@ -155,11 +155,8 @@ async fn parse_package_lock_json(lockfile_path: &Path) -> Result<ResolvedPackage
 /// The CPU-bound half of [`parse_package_lock_json`], run inside
 /// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> {
-    let lock_data: PackageLockJson =
-        deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
-            file_type: "package-lock.json".into(),
-            source: Box::new(e),
-        })?;
+    let lock_data: PackageLockJson = deps_core::parse_json_checked(content.as_bytes())
+        .map_err(|e| DepsError::parse_error("package-lock.json", &e))?;
 
     let mut packages = ResolvedPackages::new();
 
@@ -234,13 +231,7 @@ async fn parse_pnpm_lock(lockfile_path: &Path) -> Result<ResolvedPackages> {
 fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
     deps_core::check_yaml_bounds(content, "pnpm-lock.yaml")?;
 
-    let to_parse_error = |message: String| DepsError::ParseError {
-        file_type: "pnpm-lock.yaml".into(),
-        source: Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            message,
-        )),
-    };
+    let to_parse_error = |message: String| DepsError::parse_error("pnpm-lock.yaml", &message);
 
     let docs = YamlLoader::load_from_str(content).map_err(|e| {
         to_parse_error(format!(
@@ -1122,7 +1113,10 @@ importers:
         let parser = NpmLockParser;
         let result = parser.parse_lockfile(&lockfile_path).await;
 
-        let Err(DepsError::ParseError { file_type, source }) = result else {
+        let Err(DepsError::ParseError {
+            file_type, source, ..
+        }) = result
+        else {
             panic!("expected DepsError::ParseError, got {result:?}");
         };
         assert!(file_type.contains("pnpm-lock.yaml"));

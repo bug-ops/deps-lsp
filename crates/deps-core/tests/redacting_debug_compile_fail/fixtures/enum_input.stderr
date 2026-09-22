@@ -1,0 +1,8 @@
+error: RedactingDebug only supports structs with named fields (enums are not supported — see issue #1238's Out of Scope; they need per-variant redaction logic)
+ --> tests/redacting_debug_compile_fail/fixtures/enum_input.rs:4:1
+  |
+4 | / enum HostKind {
+5 | |     Literal(String),
+6 | |     Unresolved,
+7 | | }
+  | |_^

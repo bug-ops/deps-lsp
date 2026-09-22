@@ -226,58 +226,72 @@ unannotated fields again.
 
 ---
 
-### T010: Migrate `AuthToken`/`HostRef` batch to `RedactingDebug`
+### T010: Migrate `AuthToken`/`HostRef` batch to `RedactingDebug` — **RESOLVED AS NOT APPLICABLE**
 
-**Context**: First real-world proof the derive works end-to-end, replacing hand-written impls
-for the simplest, most duplicated type in the migration batch (`AuthToken` appears three
-times independently).
-**Spec reference**: [[spec#FR-007]], [[spec#FR-008]], [[spec#US-001]]
+**Outcome (found during implementation)**: none of these four types fit the derive.
+`deps-cargo::config::AuthToken`, `deps-core::github::AuthToken`,
+`deps-gitlab-ci::client::AuthToken`, and `deps-nuget::config::NuGetAuth`/`RedactedSecret`
+(T011) are single-field tuple structs (`Self(Redacted)`), not named-field structs —
+FR-004/FR-005 only accept named-field structs. `deps-gitlab-ci::types::HostRef` is a
+4-variant enum, not a struct at all (misidentified when this task was originally written from
+a grep that didn't check field shape). All four left unchanged on their existing hand-written
+`impl Debug`, per tasks.md's own Gotchas guidance ("drop a mismatched type from the batch
+rather than force it"). Tracked in the spec's Open Questions / follow-up issue, categorized by
+gap shape (tuple-struct-wrapper vs. enum).
+**Spec reference**: [[spec#FR-007]], [[spec#FR-008]], [[spec#US-001]], [[spec#9-open-questions]]
 **Acceptance criteria**:
-- [ ] `deps-cargo::config::AuthToken`, `deps-core::github::AuthToken`, `deps-gitlab-ci::client::AuthToken`, `deps-gitlab-ci::types::HostRef` each get `#[derive(deps_core::redact_debug::RedactingDebug)]` with per-field `#[redact(url)]`/`#[redact(key)]`/`#[raw]` attributes matching their current hand-written impl's behavior exactly
-- [ ] The 4 hand-written `impl std::fmt::Debug for ...` blocks are deleted
-- [ ] Each type's existing `debug_redaction_conformance!` invocation is unchanged and still passes (byte-identical probe assertions — FR-008)
-- [ ] `cargo check -p deps-cargo -p deps-core -p deps-gitlab-ci --all-features` passes
+- [x] Verified against actual source (not assumed from the original migration table) that none of the 4 types are named-field structs
+- [x] No source changes made to any of the 4 files — hand-written impls and their `debug_redaction_conformance!` tests remain untouched and passing
+- [x] Finding documented in spec.md's migration table and Out of Scope section
 **Dependencies**: T008
-**Files**: `crates/deps-cargo/src/config.rs`, `crates/deps-core/src/github.rs`, `crates/deps-gitlab-ci/src/client.rs`, `crates/deps-gitlab-ci/src/types.rs`
-**Complexity**: medium
+**Files**: none changed (verification only)
+**Complexity**: low (once discovered)
 
 ---
 
-### T011: Migrate `NuGetAuth`/`RedactedSecret`/`PackageSourceEntry` batch
+### T011: Migrate `PackageSourceEntry` (revised — `NuGetAuth`/`RedactedSecret` not applicable)
 
-**Context**: Second migration batch — all three types live in the same file
-(`deps-nuget/src/config.rs`), so this is naturally one task.
+**Context**: All three types live in `deps-nuget/src/config.rs`. **Outcome (found during
+implementation)**: `NuGetAuth` and `RedactedSecret` are single-field tuple structs wrapping
+`Redacted` (same shape as T010's `AuthToken`s) — not applicable to the derive, left unchanged.
+Only `PackageSourceEntry` is a genuine named-field struct and was migrated.
 **Spec reference**: [[spec#FR-007]], [[spec#FR-008]]
 **Acceptance criteria**:
-- [ ] All three types get `#[derive(RedactingDebug)]` with field attributes matching current behavior
-- [ ] The 3 hand-written `impl Debug` blocks deleted
-- [ ] Existing `debug_redaction_conformance!` invocations for all three pass unchanged
-- [ ] `cargo check -p deps-nuget --all-features` passes
+- [x] `PackageSourceEntry` gets `#[derive(RedactingDebug)]` with field attributes (`#[redact(key)]` on `key`, `#[raw]` on `value`/`tier`/etc.) matching current behavior
+- [x] Its hand-written `impl Debug` block deleted
+- [x] Its `debug_redaction_conformance!` invocation passes unchanged
+- [x] `NuGetAuth`/`RedactedSecret` verified as tuple structs, left untouched, documented in spec's Out of Scope
+- [x] `cargo check -p deps-nuget --all-features` passes
 **Dependencies**: T008
 **Files**: `crates/deps-nuget/src/config.rs`
 **Complexity**: medium
 
 ---
 
-### T012: Migrate `ResolvedChain`/`ResolvedShaPin` batch + full workspace verification
+### T012: Migrate `ResolvedShaPin` (revised — `ResolvedChain` not applicable) + full workspace verification
 
 **Context**: Final migration-batch task, plus the point where every other task's work is
 verified together as a whole (this is the "does everything actually compile and pass as one
-PR" checkpoint).
+PR" checkpoint). **Outcome (found during implementation)**: `ResolvedChain`'s `key` field
+redaction is conditional on its sibling `key_shape` field's runtime value (URL-redact only
+when `KeyShape::Url`, left as-is when `KeyShape::Opaque`) — the derive's static per-field
+model can't express this branch. Left unchanged; only `ResolvedShaPin` (a genuine
+unconditional named-field struct) is migrated.
 **Spec reference**: [[spec#FR-007]], [[spec#FR-008]], [[spec#SC-003]], [[spec#SC-004]], [[spec#SC-005]]
 **Acceptance criteria**:
-- [ ] `deps-pypi::config::ResolvedChain` and `deps-core::lsp_helpers::git_ref::ResolvedShaPin` get `#[derive(RedactingDebug)]`; hand-written impls deleted
-- [ ] All 9 migration-batch types' `debug_redaction_conformance!` tests pass (SC-003)
+- [ ] `deps-core::lsp_helpers::git_ref::ResolvedShaPin` gets `#[derive(RedactingDebug)]` (`#[redact(key)]` on `display_name`, `#[raw]` on `version_range`/`replacement`); hand-written impl deleted
+- [ ] `ResolvedChain` verified as conditionally-redacted, left untouched, documented in spec's Out of Scope
+- [ ] Both actually-migrated types' (`PackageSourceEntry`, `ResolvedShaPin`) `debug_redaction_conformance!` tests pass (revised SC-003)
 - [ ] `cargo +nightly fmt --all -- --check` passes
 - [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes
 - [ ] `cargo nextest run --workspace --all-features --no-fail-fast` passes
 - [ ] `cargo test --workspace --doc --all-features` passes (including the T005 `compile_fail` doctest and T007's derive doctest)
 - [ ] `RUSTFLAGS="-D warnings" RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --all-features` passes
-- [ ] `cargo tree -p deps-lsp -e features,no-dev` and `cargo tree -p deps-cli -e features,no-dev` do not list `deps-core-macros` (SC-005) unless one of them ends up using the derive directly (not expected per this spec's migration batch)
+- [ ] SC-005 retracted (see spec) — no tree-shape check needed; `deps-core-macros` presence in every crate's tree is expected and accepted
 - [ ] `CHANGELOG.md`'s `[Unreleased]` section gets one line for this feature
-- [ ] Follow-up issue filed (P4, `testing-infra` + `type/refactor` labels) for the remaining ~26 unmigrated struct `Debug` impls, per spec's resolved Open Question
+- [ ] Follow-up issue filed (P4, `testing-infra` + `type/refactor` labels) per spec's revised Open Question — covering the remaining ~26 plain structs, the tuple-struct-wrapper types (`AuthToken` ×3, `NuGetAuth`, `RedactedSecret`), and the enum/conditional-field types (`HostRef`, `ResolvedChain`, `DepsError` and siblings), each flagged with which future derive extension it would need
 **Dependencies**: T001, T002, T003, T004, T005, T009, T010, T011
-**Files**: `crates/deps-pypi/src/config.rs`, `crates/deps-core/src/lsp_helpers/git_ref.rs`, `CHANGELOG.md`
+**Files**: `crates/deps-core/src/lsp_helpers/git_ref.rs`, `CHANGELOG.md`
 **Complexity**: medium
 
 ---

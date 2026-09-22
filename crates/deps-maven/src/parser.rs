@@ -90,10 +90,9 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
 
     loop {
         let pos = reader.buffer_position();
-        let event = reader.read_event().map_err(|e| DepsError::ParseError {
-            file_type: "pom.xml".into(),
-            source: deps_core::net_policy::parse_error_source(&e),
-        })?;
+        let event = reader
+            .read_event()
+            .map_err(|e| DepsError::parse_error("pom.xml", &e))?;
 
         match event {
             Event::Start(ref e) => {

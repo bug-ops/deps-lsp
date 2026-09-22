@@ -202,10 +202,7 @@ impl Ecosystem for PypiEcosystem {
                     )
                 }
             }
-            .map_err(|e| deps_core::DepsError::ParseError {
-                file_type: kind.file_type().into(),
-                source: Box::new(e),
-            })?;
+            .map_err(|e| deps_core::DepsError::parse_error(kind.file_type(), &e))?;
             // Registers every chain this file's --index-url/--extra-index-url/Poetry-source/
             // uv-index declarations imply (spec FR-002/003/005/007/013) into the shared
             // root registry — the only point where a per-document resolution and the

@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **deps-core, deps-nuget, deps-pypi**: `ResolvedPackage`/`ResolvedSource`, `ScanTarget`, `ResolvedShaPin`, `PackageSourceEntry`, and `RequirementRef` now redact credential-shaped fields in `Debug` output (resolves #1237) (#1318)
 - **deps-core**: `ResolvedPackages`' `Debug` output now redacts its `HashMap` key too, closing a gap where the key duplicated the already-redacted `ResolvedPackage.name` (resolves #1319) (#1324)
+- **deps-core**: `ParseError` construction and `Debug` field redaction are now enforced at compile time instead of test-time-only (resolves #1238, #1250)
 - **github-action**: `action.yml` now pins the Docker image by digest instead of the mutable `:1` tag; the release workflow opens a PR repointing `action.yml` at the newly published digest on every release, for a maintainer to review and merge (resolves #1274) (#1292)
 - **deps-core, deps-gitlab-ci**: hover no longer renders unbounded resolved/requirement/marker/latest/recent-version text, deprecation reason/replacement, GHA/GitLab CI's resolved tag, or a GitLab `component:` include's project-path link label, closing the same length-cap gap #1272 already closed for OSV advisory fields; name/version-shaped fields (versions, marker expressions, deprecation replacement names, git tags) are now also swept for the full invisible/bidi-override character class before rendering, closing a gap where a non-bidi Unicode format character (e.g. U+206A) survived into hover but not the equivalent diagnostic (resolves #1311) (#1322)
 - **deps-core**: hover no longer renders unbounded OSV advisory `id`/`fixed`/`version`/`summary`/`aliases` text (resolves #1272) (#1298)
@@ -51,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `DepsError::RateLimited` gains `verified: bool` and `source_status: Option<u16>` fields (now `#[non_exhaustive]` itself, so future field additions won't repeat this); a downstream crate matching or constructing it without `..` needs updating (part of #1295) (#1308)
 - **deps-core**: `quote_scan::ScanSyntax` is now `#[non_exhaustive]`, so a future scanner dialect variant (like `Groovy`, added in #1186) won't repeat that break silently (resolves #1226) (#1321)
 - **deps-core**: `registry::CapResult` is now `#[non_exhaustive]` (part of #1226) (#1321)
+- **deps-core**: `DepsError::ParseError` is now `#[non_exhaustive]`; a downstream crate matching or constructing it without `..` needs updating — use the new `DepsError::parse_error(file_type, source)` constructor instead of a struct literal (resolves #1250)
 
 ### Changed
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)

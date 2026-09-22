@@ -1,0 +1,5 @@
+error: RedactingDebug requires named fields (tuple structs and unit structs are not supported in this version — see issue #1238's Out of Scope)
+ --> tests/redacting_debug_compile_fail/fixtures/tuple_struct_input.rs:4:22
+  |
+4 | struct TupleAuthToken(String);
+  |                      ^^^^^^^^

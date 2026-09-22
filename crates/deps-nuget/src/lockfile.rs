@@ -130,11 +130,8 @@ impl LockFileProvider for NuGetLockParser {
 /// The CPU-bound half of [`NuGetLockParser::parse_lockfile`], run inside
 /// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_packages_lock_json(content: String) -> Result<ResolvedPackages> {
-    let lock_data: PackagesLock =
-        deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
-            file_type: "packages.lock.json".into(),
-            source: Box::new(e),
-        })?;
+    let lock_data: PackagesLock = deps_core::parse_json_checked(content.as_bytes())
+        .map_err(|e| DepsError::parse_error("packages.lock.json", &e))?;
 
     // Collect every TFM's resolved version per package name, then resolve the
     // cross-TFM tie-break with the crate's own `compare_versions` (S6) instead of

@@ -195,19 +195,16 @@ pub fn parse_cargo_toml_with_context(
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
-        return Err(DepsError::ParseError {
-            file_type: "Cargo.toml".into(),
-            source: Box::new(std::io::Error::other(format!(
+        return Err(DepsError::parse_error(
+            "Cargo.toml",
+            &format!(
                 "array/table nesting depth {depth} exceeds maximum of {}",
                 deps_core::MAX_TOML_NESTING_DEPTH
-            ))),
-        });
+            ),
+        ));
     }
 
-    let doc = toml_span::parse(content).map_err(|e| DepsError::ParseError {
-        file_type: "Cargo.toml".into(),
-        source: deps_core::net_policy::parse_error_source(&e),
-    })?;
+    let doc = toml_span::parse(content).map_err(|e| DepsError::parse_error("Cargo.toml", &e))?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -215,10 +212,9 @@ pub fn parse_cargo_toml_with_context(
     // not per-section.
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
 
-    let root_table = doc.as_table().ok_or_else(|| DepsError::ParseError {
-        file_type: "Cargo.toml".into(),
-        source: Box::new(std::io::Error::other("root is not a table")),
-    })?;
+    let root_table = doc
+        .as_table()
+        .ok_or_else(|| DepsError::parse_error("Cargo.toml", &"root is not a table"))?;
 
     parse_dependency_kind_tables(
         root_table,

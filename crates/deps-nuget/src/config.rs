@@ -335,34 +335,24 @@ pub type InvalidEntry = deps_core::net_policy::InvalidEntry<NuGetFeedUrlError>;
 /// Output-only: constructed internally by this module's own resolution logic, never by
 /// external code — no constructor is provided.
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, deps_core::redact_debug::RedactingDebug)]
 pub struct PackageSourceEntry {
     /// The declared `<add key>` name, case preserved.
+    #[redact(key)]
     pub key: String,
-    /// The resolved feed URL, or why it was rejected.
+    /// The resolved feed URL, or why it was rejected — already redacted by [`NuGetFeedUrl`]'s
+    /// and [`InvalidEntry`]'s own `Debug` impls (#1237).
+    #[raw]
     pub value: Result<NuGetFeedUrl, InvalidEntry>,
     /// Which tier's file last set [`Self::value`] (issue #561) — diagnostics/gating metadata
     /// only, see [`ConfigTier`]'s doc for the "never a credential gate" invariant.
+    #[raw]
     pub tier: ConfigTier,
     /// Set only by [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::UserProfile`] — never
-    /// during accumulation (`upsert_source` always writes `None` here; see its doc).
+    /// during accumulation (`upsert_source` always writes `None` here; see its doc). Already
+    /// redacted by [`NuGetAuth`]'s own `Debug` impl.
+    #[raw]
     pub auth: Option<NuGetAuth>,
-}
-
-impl std::fmt::Debug for PackageSourceEntry {
-    /// Manual, not derived: `key` sits next to `value`'s already-redacted [`NuGetFeedUrl`] —
-    /// the weaker #1217 name-shape sibling of the #1222 sweep (#1237).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PackageSourceEntry")
-            .field(
-                "key",
-                &deps_core::net_policy::redact_declaration_key(&self.key),
-            )
-            .field("value", &self.value)
-            .field("tier", &self.tier)
-            .field("auth", &self.auth)
-            .finish()
-    }
 }
 
 /// One resolved hop in a [`NuGetSourceChain`] (issue #561, FR-016).

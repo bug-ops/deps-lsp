@@ -20,19 +20,16 @@ pub fn parse_version_catalog(content: &str, uri: &Url) -> Result<GradleParseResu
     if let Err(depth) =
         deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
     {
-        return Err(DepsError::ParseError {
-            file_type: "Gradle".into(),
-            source: Box::new(std::io::Error::other(format!(
+        return Err(DepsError::parse_error(
+            "Gradle",
+            &format!(
                 "array/table nesting depth {depth} exceeds maximum of {}",
                 deps_core::MAX_TOML_NESTING_DEPTH
-            ))),
-        });
+            ),
+        ));
     }
 
-    let doc = toml_span::parse(content).map_err(|e| DepsError::ParseError {
-        file_type: "Gradle".into(),
-        source: deps_core::net_policy::parse_error_source(&e),
-    })?;
+    let doc = toml_span::parse(content).map_err(|e| DepsError::parse_error("Gradle", &e))?;
 
     let line_table = LineOffsetTable::new(content);
     let mut version_refs: HashMap<String, String> = HashMap::new();
