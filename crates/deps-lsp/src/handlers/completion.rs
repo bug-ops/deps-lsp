@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionList, CompletionParams, CompletionResponse, Range,
+    CompletionItem, CompletionList, CompletionParams, CompletionResponse,
 };
 
 // Keystroke-driven, so completion gets its own short timeout instead of sharing the 30s
@@ -307,31 +307,33 @@ async fn search_packages(
             }
         };
 
-    results
+    let mut items: Vec<CompletionItem> = results
         .iter()
         .enumerate()
         .filter_map(|(index, metadata)| {
             create_package_completion_item(metadata.as_ref(), ecosystem, bare, index, query)
         })
-        .collect()
+        .collect();
+    deps_core::completion::apply_raw_prefix_filter_text(&mut items, registry.as_ref(), query);
+    items
 }
 
 /// Creates a completion item for a package.
 ///
 /// Delegates the shared fields (`label`, `kind`, `detail`, `documentation`, `sort_text`,
-/// `filter_text`) to [`deps_core::completion::build_package_completion`] — including its
-/// [`deps_core::is_safe_package_name`]/[`deps_core::is_safe_version_string`] gates (issue
+/// `filter_text`) to [`deps_core::completion::build_package_completion_fields`] — including
+/// its [`deps_core::is_safe_package_name`]/[`deps_core::is_safe_version_string`] gates (issue
 /// #1284: this fallback path and the primary completion path must reject the same unsafe
-/// metadata and render the same fields the same way, not diverge silently) — then
-/// overrides only what this raw-text fallback path genuinely needs: `insert_text`, via
-/// the ecosystem's own manifest syntax
+/// metadata and render the same fields the same way, not diverge silently) — then builds
+/// `insert_text` itself, via the ecosystem's own manifest syntax
 /// ([`deps_core::Ecosystem::completion_insert_text`] — required, no default, so a new
-/// ecosystem must supply its own snippet instead of silently inheriting another
-/// ecosystem's syntax, see issue #118), and `text_edit`, dropped because this path has no
-/// known insert range (the client falls back to inserting `insert_text` at the cursor).
+/// ecosystem must supply its own snippet instead of silently inheriting another ecosystem's
+/// syntax, see issue #118). `text_edit` is left as the base builder leaves it (`None`) — this
+/// path has no known insert range, so the client falls back to inserting `insert_text` at the
+/// cursor.
 ///
-/// Returns `None` when [`deps_core::completion::build_package_completion`] does (see its
-/// doc for the rejection gates), or when the ecosystem's own `completion_insert_text`/
+/// Returns `None` when [`deps_core::completion::build_package_completion_fields`] does (see
+/// its doc for the rejection gates), or when the ecosystem's own `completion_insert_text`/
 /// `fallback_bare_insert_text` rejects the metadata for an ecosystem-specific reason (a
 /// Maven `groupId`/`artifactId` breakout, an unsafe Swift repository URL, GitHub Actions'
 /// `owner/repo` shape).
@@ -342,11 +344,12 @@ async fn search_packages(
 /// open manifest markup that can only safely hold the bare candidate text — #724/
 /// #728), `false` to `Ecosystem::completion_insert_text` (the normal full snippet).
 ///
-/// `index`/`prefix` are forwarded to [`deps_core::completion::build_package_completion`]
-/// unchanged — issue #1294: this fallback path previously hardcoded `sort_text` to the
-/// package name (alphabetical, discarding the registry's relevance ranking), the same
-/// #1282 shape bug already fixed on the primary completion path but missed here since
-/// this path builds its `CompletionItem` independently.
+/// `index`/`prefix` are forwarded to
+/// [`deps_core::completion::build_package_completion_fields`] unchanged — issue #1294: this
+/// fallback path previously hardcoded `sort_text` to the package name (alphabetical,
+/// discarding the registry's relevance ranking), the same #1282 shape bug already fixed on
+/// the primary completion path but missed here since this path builds its `CompletionItem`
+/// independently.
 fn create_package_completion_item(
     metadata: &dyn deps_core::Metadata,
     ecosystem: &dyn deps_core::Ecosystem,
@@ -354,15 +357,13 @@ fn create_package_completion_item(
     index: usize,
     prefix: &str,
 ) -> Option<CompletionItem> {
-    let mut item =
-        deps_core::completion::build_package_completion(metadata, Range::default(), index, prefix)?;
+    let mut item = deps_core::completion::build_package_completion_fields(metadata, index, prefix)?;
 
     item.insert_text = Some(if bare {
         ecosystem.fallback_bare_insert_text(metadata)?
     } else {
         ecosystem.completion_insert_text(metadata)?
     });
-    item.text_edit = None;
 
     Some(item)
 }
@@ -1725,6 +1726,120 @@ ser"
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "express");
+    }
+
+    /// #1289: `search_packages`'s raw-text fallback path must also rewrite `filter_text`
+    /// to the raw typed prefix when the registry normalizes its search query — before this
+    /// test, only the primary `complete_package_names_generic` path was covered end-to-end
+    /// (via deps-pypi's own `PypiRegistry` test), leaving this second, independently-built
+    /// call site of `apply_raw_prefix_filter_text` unverified.
+    #[tokio::test]
+    async fn test_search_packages_rewrites_filter_text_for_normalizing_registry() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct NormalizingRegistry;
+        impl Registry for NormalizingRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("zope-interface"),
+                        latest_version: "5.0.0".into(),
+                    }) as Box<dyn Metadata>])
+                })
+            }
+
+            fn search_normalizes_query(&self) -> bool {
+                true
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Pypi, Arc::new(NormalizingRegistry));
+        let items = search_packages(ecosystem.as_ref(), "zope.int", false).await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "zope-interface");
+        assert_eq!(items[0].filter_text.as_deref(), Some("zope.int"));
+    }
+
+    /// #1289: the negative case — a non-normalizing registry (the default) must leave
+    /// `filter_text` alone through the whole fallback path, not just in isolation.
+    #[tokio::test]
+    async fn test_search_packages_leaves_filter_text_alone_for_non_normalizing_registry() {
+        use deps_core::{Metadata, Registry, Version};
+        use std::any::Any;
+
+        struct PlainRegistry;
+        impl Registry for PlainRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a deps_core::PackageName,
+                _req: &'a deps_core::VersionReq,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockMetadata {
+                        name: deps_core::PackageName::new("express"),
+                        latest_version: "4.18.2".into(),
+                    }) as Box<dyn Metadata>])
+                })
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Npm, Arc::new(PlainRegistry));
+        let items = search_packages(ecosystem.as_ref(), "exp", false).await;
+
+        assert_eq!(items.len(), 1);
+        // Unchanged from what `build_package_completion_fields` set: the package name,
+        // not the raw typed prefix.
+        assert_eq!(items[0].filter_text.as_deref(), Some("express"));
     }
 
     /// #1206: `search_packages`'s own gate, called directly rather than through

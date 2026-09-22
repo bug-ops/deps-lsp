@@ -28,11 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: raw-text fallback package completion now also threads the registry result's index/typed prefix into `sort_text`, closing the same relevance-ranking gap as #1282 on this second, independently-built completion path (resolves #1294) (#1293)
 - **deps-cli**: `CheckFinding.requirement` is now sanitized and length-capped before reaching JSON output, closing an ANSI-escape/bidi-override leak (resolves #1258) (#1301)
 - **deps-maven**: `maven-metadata.xml` parse errors are now redacted before reaching `DepsError::CacheError`, closing a credential leak from a malformed tag name (resolves #1249) (#1301)
+- **deps-core, deps-lsp**: raw-text fallback completion now rewrites `filter_text` to the raw typed prefix for registries that normalize search queries, fixing PyPI PEP 503 dotted-name completions dropped by some LSP clients (resolves #1289) (#1306)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
 - **deps-core**: `completion::build_package_completion` gains `index: usize` and `prefix: &str` parameters, used to preserve registry relevance ranking in `sort_text` (resolves #1282) (#1293)
 - **deps-core**: `completion::build_feature_completion` now returns `Option<CompletionItem>` instead of `CompletionItem`, dropping the item when `feature_name` fails `is_safe_feature_name` (resolves #1296)
+
+### Changed
+- **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
