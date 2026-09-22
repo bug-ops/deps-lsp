@@ -1816,6 +1816,56 @@ pub fn is_safe_package_name(name: &str) -> bool {
         })
 }
 
+/// Whether `name` is safe to embed as a Cargo feature name in a manifest `TextEdit` or
+/// completion item.
+///
+/// Guards [`crate::completion::build_feature_completion`] the same way
+/// [`is_safe_package_name`] guards [`crate::completion::build_package_completion`]:
+/// `feature_name` there is registry-supplied (a key of `Version::features()`, read from
+/// the index JSON's `features`/`features2` maps), not user-typed, so it must pass this
+/// allowlist before reaching `label`/`insert_text`/`text_edit`/`sort_text`.
+///
+/// An allowlist, narrower than [`is_safe_package_name`]: Cargo's own feature-name grammar
+/// (<https://doc.rust-lang.org/cargo/reference/features.html#the-features-section>) permits
+/// Unicode `XID_Start`/`XID_Continue` characters, but crates.io's publish-time check — the
+/// registry `deps-cargo` actually talks to — is stricter and only accepts ASCII
+/// alphanumerics, `_`, `-`, and `+`; this predicate matches that stricter, ASCII-only set
+/// (plus `.`, this predicate's own addition, not part of crates.io's check, allowed because
+/// it's already permitted in [`is_safe_package_name`] and carries the same low risk here).
+/// `dep:`, `?`, and `/` are never part of a feature *name* (an index JSON map key) either
+/// way — they only ever appear inside a feature's *value* list (e.g.
+/// `"avif" = ["dep:ravif", "rgb?/serde"]`), which this predicate never sees. A
+/// registry-supplied string containing any of those characters is therefore not a
+/// plausible feature name regardless of intent, so it is rejected the same as any other
+/// out-of-allowlist character.
+///
+/// Tradeoff, accepted rather than incidental: a legitimate feature name published with a
+/// Unicode `XID` character to an *alternate* (non-crates.io) registry — which Cargo's own
+/// grammar permits but crates.io's check does not — would fail this allowlist and be
+/// silently dropped rather than rendered. Failing closed on a character class this
+/// predicate cannot cheaply distinguish from a homograph/bidi-spoofing attempt is judged
+/// safer than accepting the full Cargo grammar, consistent with [`is_safe_package_name`]'s
+/// own ASCII-only rationale.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::is_safe_feature_name;
+///
+/// assert!(is_safe_feature_name("derive"));
+/// assert!(is_safe_feature_name("std_alloc-v2+extra"));
+/// assert!(!is_safe_feature_name("dep:ravif"));
+/// assert!(!is_safe_feature_name("rgb?/serde"));
+/// assert!(!is_safe_feature_name("evil\"\nbackdoor = \"9.9.9"));
+/// ```
+pub fn is_safe_feature_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 256
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '+' | '.'))
+}
+
 /// Logs a `tracing::warn!` for a value rejected by an `is_safe_*` predicate (or an
 /// equivalent value-rejecting gate) before it reaches a manifest edit or registry URL.
 ///
@@ -3284,6 +3334,46 @@ mod tests {
     fn test_is_safe_package_name_length_cap() {
         assert!(is_safe_package_name(&"a".repeat(256)));
         assert!(!is_safe_package_name(&"a".repeat(257)));
+    }
+
+    #[test]
+    fn test_is_safe_feature_name_accepts_real_names() {
+        for good in ["derive", "std_alloc-v2+extra"] {
+            assert!(
+                is_safe_feature_name(good),
+                "expected {good:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_feature_name_rejects_empty() {
+        assert!(!is_safe_feature_name(""));
+    }
+
+    #[test]
+    fn test_is_safe_feature_name_rejects_non_ascii() {
+        // ASCII-only, so homograph/bidi-spoofing characters are rejected outright.
+        assert!(!is_safe_feature_name("café"));
+        // U+202E RIGHT-TO-LEFT OVERRIDE.
+        assert!(!is_safe_feature_name("evil\u{202E}reversed"));
+    }
+
+    #[test]
+    fn test_is_safe_feature_name_rejects_enable_syntax() {
+        // `dep:`/`?`/`/` are enable-syntax, only in a feature's value list, never in its name key.
+        for bad in ["dep:ravif", "rgb?/serde"] {
+            assert!(
+                !is_safe_feature_name(bad),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_safe_feature_name_length_cap() {
+        assert!(is_safe_feature_name(&"a".repeat(256)));
+        assert!(!is_safe_feature_name(&"a".repeat(257)));
     }
 
     #[test]

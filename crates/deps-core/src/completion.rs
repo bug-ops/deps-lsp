@@ -1336,23 +1336,39 @@ pub fn prepare_version_display_items<V: AsRef<dyn Version>>(
 ///
 /// # Returns
 ///
-/// A complete `CompletionItem` for the feature flag.
+/// `Some(CompletionItem)` ready to send to the LSP client, or `None` when `feature_name`
+/// fails [`crate::is_safe_feature_name`] — mirrors [`build_package_completion`]'s gate on
+/// `name`: `feature_name` is registry-supplied (a key of `Version::features()`) at this
+/// function's one call site (`deps-cargo`'s `complete_features`), not user-typed, and
+/// flows unsanitized into `label`/`insert_text`/`text_edit`/`sort_text` here, so a
+/// malicious/compromised registry response must not reach the manifest through it. The
+/// whole item is dropped rather than partially rendered, consistent with
+/// `build_package_completion`'s precedent.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use deps_core::completion::build_feature_completion;
 ///
-/// let item = build_feature_completion("derive", &deps_core::PackageName::new("serde"), None);
+/// let item =
+///     build_feature_completion("derive", &deps_core::PackageName::new("serde"), None).unwrap();
 /// assert_eq!(item.label, "derive");
 /// ```
-// TODO(critic): gate feature_name through a name allowlist before these sinks (follow-up to #1285)
 pub fn build_feature_completion(
     feature_name: &str,
     package_name: &PackageName,
     insert_range: Option<Range>,
-) -> CompletionItem {
-    CompletionItem {
+) -> Option<CompletionItem> {
+    if !crate::is_safe_feature_name(feature_name) {
+        warn_rejected_value(
+            "is_safe_feature_name",
+            "feature completion feature name",
+            feature_name,
+        );
+        return None;
+    }
+
+    Some(CompletionItem {
         label: feature_name.to_string(),
         kind: Some(CompletionItemKind::PROPERTY),
         detail: Some(format!("Feature of {}", package_name.as_str())),
@@ -1366,7 +1382,7 @@ pub fn build_feature_completion(
         }),
         sort_text: Some(feature_name.to_string()),
         ..Default::default()
-    }
+    })
 }
 
 /// Maximum number of version completions to show (matches Code Actions limit).
@@ -4284,7 +4300,7 @@ mod tests {
 
     #[test]
     fn test_build_feature_completion() {
-        let item = build_feature_completion("derive", &pkg("serde"), None);
+        let item = build_feature_completion("derive", &pkg("serde"), None).unwrap();
 
         assert_eq!(item.label, "derive");
         assert_eq!(item.kind, Some(CompletionItemKind::PROPERTY));
@@ -4297,10 +4313,37 @@ mod tests {
     #[test]
     fn test_build_feature_completion_with_range() {
         let range = Range::default();
-        let item = build_feature_completion("derive", &pkg("serde"), Some(range));
+        let item = build_feature_completion("derive", &pkg("serde"), Some(range)).unwrap();
 
         assert_eq!(item.label, "derive");
         assert!(item.text_edit.is_some());
+    }
+
+    #[test]
+    fn test_build_feature_completion_accepts_legitimate_names() {
+        // Real feature-name syntax: ASCII alphanumerics, `_`, `-`, `+`, `.`.
+        for name in ["derive", "std_alloc-v2+extra", "full.1"] {
+            assert!(
+                build_feature_completion(name, &pkg("serde"), None).is_some(),
+                "expected {name:?} to be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn test_build_feature_completion_rejects_unsafe_names() {
+        // `dep:`/`?`/`/` are enable-syntax, only in a feature's value list, never in its name key.
+        for name in [
+            "dep:ravif",
+            "rgb?/serde",
+            "jpeg-decoder/rayon",
+            "evil\"\nbackdoor = \"9.9.9",
+        ] {
+            assert!(
+                build_feature_completion(name, &pkg("serde"), None).is_none(),
+                "expected {name:?} to be rejected"
+            );
+        }
     }
 
     #[test]

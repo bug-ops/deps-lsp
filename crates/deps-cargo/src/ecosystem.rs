@@ -206,7 +206,7 @@ impl CargoEcosystem {
         features
             .into_iter()
             .filter(|f| f.starts_with(prefix))
-            .map(|feature| build_feature_completion(&feature, package_name, None))
+            .filter_map(|feature| build_feature_completion(&feature, package_name, None))
             .collect()
     }
 }
