@@ -56,10 +56,14 @@ jobs:
 
 ## Image tags
 
-The action's `image:` pins `ghcr.io/bug-ops/deps-lsp-github-action:1`, a rolling major-version
-tag that tracks the latest `deps-cli` release published under `1.x.y`. It is rebuilt whenever a
-new `deps-lsp`/`deps-cli` release is tagged (`.github/workflows/release.yml`). More specific
-tags are also published for each release: `X`, `X.Y`, `X.Y.Z`, and `latest`.
+The action's `image:` pins `ghcr.io/bug-ops/deps-lsp-github-action@sha256:<digest>` — an
+immutable digest, not a mutable tag, so the bytes a consumer runs never change without an
+explicit update to `action.yml` itself. Each release (`.github/workflows/release.yml`) rebuilds
+the image, publishes rolling tags (`X`, `X.Y`, `X.Y.Z`, and `latest`) for consumers who prefer
+to reference the action by tag directly, then opens a pull request against `main` repointing
+`action.yml` at the newly published image's digest. A maintainer needs to review and merge that
+PR (checks don't run automatically on a PR opened by the default `GITHUB_TOKEN`, so it isn't
+merged automatically) for the action's own reference to catch up to the release.
 
 Every image is scanned with [Trivy](https://github.com/aquasecurity/trivy) for CRITICAL/HIGH
 vulnerabilities before it's pushed — a finding blocks the publish and is reported to this
