@@ -45,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)
+- **ci**: bump `taiki-e/install-action` to v2.87.18 and `jsonschema` to 0.57
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
