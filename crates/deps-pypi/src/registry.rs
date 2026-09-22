@@ -816,6 +816,13 @@ impl deps_core::Registry for PypiRegistry {
         })
     }
 
+    /// PEP 503 normalizes `-`/`_`/`.` together before matching (see
+    /// [`Self::search`]/`crate::name::normalize`), so a returned package name may not be a
+    /// literal subsequence of the raw typed prefix (#1289).
+    fn search_normalizes_query(&self) -> bool {
+        true
+    }
+
     fn select_latest_matching(
         &self,
         versions: &[Box<dyn deps_core::Version>],

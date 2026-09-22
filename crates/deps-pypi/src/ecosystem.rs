@@ -110,34 +110,17 @@ impl PypiEcosystem {
 
     #[cfg(feature = "lsp-responses")]
     async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
-        let mut items = deps_core::completion::complete_package_names_generic(
+        // #419 S2 / #1289: `filter_text` rewriting for PyPI's PEP 503 normalized search is
+        // now handled generically by `complete_package_names_generic` via
+        // `Registry::search_normalizes_query` (see `PypiRegistry`'s override) and
+        // `deps_core::completion::apply_raw_prefix_filter_text` — no PyPI-local step needed.
+        deps_core::completion::complete_package_names_generic(
             self.registry.as_ref(),
             prefix,
             20,
             range,
         )
-        .await;
-
-        // #419 S2: the search index matches on the PEP 503 *normalized* name
-        // (`zope.int` typed -> normalized to `zope-int` -> `zope-interface`
-        // found), but `build_package_completion` sets `filter_text` to that same
-        // normalized name — and the LSP client re-filters every returned item
-        // against the RAW TEXT the user actually typed, independent of what the
-        // server matched on. `zope.int` is not a subsequence of `zope-interface`,
-        // so an editor like VS Code silently drops a result the server correctly
-        // found. Rewriting `filter_text` to the raw, as-typed `prefix` makes every
-        // returned item trivially self-matching against what's already on screen.
-        // Safe to do unconditionally (rather than something that must also match
-        // characters not yet typed): this method's caller always reports
-        // `is_incomplete: true` for the `PackageName` context (see
-        // `generate_completions`), so the client re-queries — and receives a
-        // fresh `filter_text` — on the very next keystroke rather than continuing
-        // to filter this same list locally.
-        for item in &mut items {
-            item.filter_text = Some(prefix.to_string());
-        }
-
-        items
+        .await
     }
 
     /// True when `uri`'s basename matches neither an exact
