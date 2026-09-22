@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `is_safe_feature_name` allowlist predicate, gating Cargo feature-completion names (resolves #1296)
 
 ### Security
-- **deps-core, deps-nuget, deps-pypi**: `ResolvedPackage`/`ResolvedSource`, `ScanTarget`, `ResolvedShaPin`, `PackageSourceEntry`, and `RequirementRef` now redact credential-shaped fields in `Debug` output (resolves #1237) (PR TBD)
+- **deps-core, deps-nuget, deps-pypi**: `ResolvedPackage`/`ResolvedSource`, `ScanTarget`, `ResolvedShaPin`, `PackageSourceEntry`, and `RequirementRef` now redact credential-shaped fields in `Debug` output (resolves #1237) (#1318)
 - **github-action**: `action.yml` now pins the Docker image by digest instead of the mutable `:1` tag; the release workflow opens a PR repointing `action.yml` at the newly published digest on every release, for a maintainer to review and merge (resolves #1274) (#1292)
 - **deps-core**: hover no longer renders unbounded OSV advisory `id`/`fixed`/`version`/`summary`/`aliases` text (resolves #1272) (#1298)
 - **deps-core**: `completion::build_package_completion` gates a search result's `repository`/`documentation` URL through `is_safe_registry_url` before embedding it as a Markdown link destination, dropping a `javascript:`/`data:`/non-HTTPS URL instead of only backslash-escaping it; a `http://`/`git+ssh://`/`git://` repository link is now also dropped rather than rendered, since only `https://` passes the gate (resolves #1285) (#1293)
