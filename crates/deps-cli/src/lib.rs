@@ -13,4 +13,5 @@ pub mod config;
 pub mod exit;
 pub mod format;
 pub mod report;
+mod sanitize;
 pub mod walk;

@@ -181,6 +181,42 @@ pub fn redact_name_for_diagnostic(name: &PackageName) -> String {
     )
 }
 
+/// Renders `req` safely for a client-visible diagnostic message or `requirement`-shaped
+/// field (#1258, #1300).
+///
+/// The same redact-then-sanitize-then-truncate pipeline [`redact_name_for_diagnostic`]
+/// applies to a package name, reused here for a version requirement so the two sinks can't
+/// drift apart. A requirement is not normally credential-bearing, but some ecosystems'
+/// requirement syntax can embed a full URL (e.g. a git/VCS-pinned dependency) with an
+/// authority-bearing credential in it, so the [`redact_declaration_key`] step stays
+/// defense-in-depth here rather than being dropped as unnecessary. Shares
+/// `MAX_VERSION_DIAGNOSTIC_CHARS` with `deps-core`'s own `inlay_hints`/diagnostic-message
+/// uses of a version-shaped string, rather than a second, ad hoc cap declared at the call
+/// site.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::VersionReq;
+/// use deps_core::lsp_helpers::redact_requirement_for_diagnostic;
+///
+/// let req = VersionReq::new("^1.0");
+/// assert_eq!(redact_requirement_for_diagnostic(&req), "^1.0");
+///
+/// let req = VersionReq::new("https://svcacct:hunter2@gitlab.corp/g/p.git");
+/// assert_eq!(
+///     redact_requirement_for_diagnostic(&req),
+///     "https://***@gitlab.corp/g/p.git"
+/// );
+/// ```
+#[must_use]
+pub fn redact_requirement_for_diagnostic(req: &VersionReq) -> String {
+    sanitize_and_truncate_for_diagnostic(
+        &redact_declaration_key(req.as_str()),
+        MAX_VERSION_DIAGNOSTIC_CHARS,
+    )
+}
+
 /// Sanitizes then truncates `value` for a client-visible diagnostic message,
 /// `CodeAction` title, or similar single-line surface (#1252).
 ///

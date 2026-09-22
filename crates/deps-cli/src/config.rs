@@ -140,7 +140,7 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
         for section in ignored_sections(&config.policy) {
             eprintln!(
                 "deps-cli: warning: {path}'s [{section}] section was auto-discovered, not given via --config, and is ignored — see `deps_cli::config::safe_auto_discovered_policy`'s doc for why",
-                path = path.display(),
+                path = crate::sanitize::sanitize_path_for_display(&path).display(),
             );
         }
         config.policy = safe_auto_discovered_policy(config.policy);

@@ -13,8 +13,7 @@
 use deps_core::diagnostic::{Diagnostic, Severity};
 use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, DependencyOutcomes, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic,
-    sanitize_and_truncate_for_diagnostic,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
@@ -167,18 +166,17 @@ impl std::fmt::Display for Category {
     }
 }
 
-/// Maximum character count of [`CheckFinding::requirement`] before it is truncated with an
-/// ellipsis marker (issue #1258). Mirrors `deps_core::lsp_helpers::diagnostics::
-/// MAX_VERSION_DIAGNOSTIC_CHARS`'s bound for the same version-shaped-string class, redeclared
-/// here since that constant is `pub(crate)` to `deps-core` and not reachable from this crate.
-const MAX_REQUIREMENT_CHARS: usize = 128;
-
 /// One reported issue, derived 1:1 from a [`Diagnostic`] `generate_diagnostics` produced.
 #[derive(Debug, Clone)]
 pub struct CheckFinding {
     /// Which ecosystem's manifest this finding came from.
     pub ecosystem: EcosystemId,
     /// Path to the manifest, relative to the walked root when discovered by [`crate::walk`].
+    /// Passed through `crate::sanitize::sanitize_path_for_display` (#1299) at `to_finding`
+    /// construction time, so a raw ANSI escape byte or bidi-override character embedded in
+    /// the walked path never reaches the table or JSON sink unescaped. Every other
+    /// `deps-cli` warning sink sanitizes at its own construction boundary the same way — see
+    /// that module's doc.
     pub manifest_path: PathBuf,
     /// The dependency's declared name, when a manifest occurrence's range matched the
     /// diagnostic's own range. `None` for a document-level finding not anchored to one
@@ -187,8 +185,8 @@ pub struct CheckFinding {
     /// never the raw manifest value.
     pub dependency_name: Option<String>,
     /// The dependency's declared version requirement, when known. Passed through
-    /// [`deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic`] (#1258), so this is
-    /// never the raw manifest value.
+    /// [`deps_core::lsp_helpers::redact_requirement_for_diagnostic`] (#1258, #1300), so this
+    /// is never the raw manifest value either.
     pub requirement: Option<String>,
     /// The classified category (see [`Category`]).
     pub category: Category,
@@ -733,11 +731,11 @@ fn to_finding(
     });
     CheckFinding {
         ecosystem,
-        manifest_path: display_path.to_path_buf(),
+        manifest_path: crate::sanitize::sanitize_path_for_display(display_path),
         dependency_name: dep.map(|d| redact_name_for_diagnostic(d.name())),
         requirement: dep
             .and_then(Dependency::version_requirement)
-            .map(|req| sanitize_and_truncate_for_diagnostic(req.as_ref(), MAX_REQUIREMENT_CHARS)),
+            .map(redact_requirement_for_diagnostic),
         category,
         code,
         advisory_url,
@@ -1003,10 +1001,10 @@ mod tests {
     }
 
     /// A single-dependency [`deps_core::Dependency`]/[`deps_core::ParseResult`] fixture whose
-    /// name is caller-controlled — unlike [`dep_index_with_one_dependency`]'s fixed `dep-0`,
-    /// needed to exercise `to_finding`'s `dependency_name` redaction (#1242, #1246) with an
-    /// attacker-controlled manifest key. `requirement` is likewise caller-controlled to
-    /// exercise `to_finding`'s `requirement` sanitization (#1258).
+    /// name (and, for the #1258/#1300 requirement-redaction tests, requirement) is
+    /// caller-controlled — unlike [`dep_index_with_one_dependency`]'s fixed `dep-0`, needed
+    /// to exercise `to_finding`'s `dependency_name`/`requirement` redaction (#1242, #1246,
+    /// #1258, #1300) with attacker-controlled manifest values.
     struct NamedFixtureDep {
         name: PackageName,
         requirement: Option<deps_core::VersionReq>,
@@ -1063,11 +1061,16 @@ mod tests {
         })
     }
 
-    fn dep_index_with_requirement(requirement: &str) -> Box<dyn deps_core::ParseResult> {
+    /// Like [`dep_index_with_named_dependency`], but also setting the dependency's
+    /// requirement — needed by the #1258/#1300 requirement-redaction regression tests.
+    fn dep_index_with_named_dependency_and_requirement(
+        name: &str,
+        requirement: &str,
+    ) -> Box<dyn deps_core::ParseResult> {
         Box::new(NamedFixtureParseResult {
             dep: NamedFixtureDep {
-                name: PackageName::new("dep-0"),
-                requirement: Some(deps_core::VersionReq::from(requirement)),
+                name: PackageName::new(name),
+                requirement: Some(deps_core::VersionReq::new(requirement)),
             },
             uri: "file:///project/manifest.toml".parse().expect("valid URI"),
         })
@@ -1226,16 +1229,85 @@ mod tests {
         );
     }
 
-    /// #1258: `to_finding`'s `requirement` field is built from the raw
-    /// `Dependency::version_requirement().to_string()` — a manifest-controlled value that can
-    /// carry ANSI escapes or bidi overrides (CWE-117, Trojan Source class) and reaches JSON
-    /// output (which escapes `\n` but not ANSI/bidi) verbatim. `requirement` construction must
-    /// sanitize it, mirroring the `dependency_name` fix above.
+    /// Regression test for #1299: `to_finding`'s `manifest_path` construction must strip a
+    /// raw ANSI escape byte and a bidi-override character before the finding is built, not
+    /// leave that to each sink. Drives the real `to_finding` -> `format::table::render` /
+    /// `format::json::to_document` pipelines end to end (mirrors
+    /// `test_to_sarif_fingerprint_never_carries_a_credential_through_to_finding`'s rationale
+    /// for #1242/#1246) so it actually fails if the sanitization at construction time is ever
+    /// reverted, while asserting the legitimate `src`/`Cargo.toml` path segments still show
+    /// up in both sinks.
     #[test]
-    fn test_to_finding_sanitizes_bidi_and_ansi_in_requirement() {
-        let parse_result = dep_index_with_requirement("\u{202E}^1.0\u{1b}[31mfake\u{1b}[0m");
+    fn test_to_finding_sanitizes_manifest_path_ansi_and_bidi() {
+        let malicious_path = Path::new("src/\u{202E}\x1Bsneaky/Cargo.toml");
+        let parse_result = empty_dep_index();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Unknown package");
+        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
+
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            malicious_path,
+            &dep_index,
+            &StubFormatter,
+            diagnostic,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+
+        let sanitized = finding.manifest_path.to_string_lossy().into_owned();
+        assert!(
+            !sanitized.contains('\u{202E}'),
+            "bidi override survived sanitization: {sanitized:?}"
+        );
+        assert!(
+            !sanitized.contains('\x1B'),
+            "raw ANSI escape byte survived sanitization: {sanitized:?}"
+        );
+        assert!(sanitized.contains("src"), "legitimate path info lost");
+        assert!(
+            sanitized.contains("Cargo.toml"),
+            "legitimate path info lost"
+        );
+
+        let report = CheckReport {
+            findings: vec![finding],
+        };
+
+        let table = crate::format::table::render(&report);
+        assert!(
+            !table.contains('\u{202E}'),
+            "bidi override reached table output"
+        );
+        assert!(
+            !table.contains('\x1B'),
+            "raw ANSI escape byte reached table output"
+        );
+
+        let json = crate::format::json::to_document(&report);
+        let manifest_path_json = &json.findings[0].manifest_path;
+        assert!(
+            !manifest_path_json.contains('\u{202E}'),
+            "bidi override reached JSON output"
+        );
+        assert!(
+            !manifest_path_json.contains('\x1B'),
+            "raw ANSI escape byte reached JSON output"
+        );
+        assert!(manifest_path_json.contains("Cargo.toml"));
+    }
+
+    /// Regression test for #1258/#1300: `to_finding`'s `requirement` construction must redact
+    /// a credential-shaped requirement string, mirroring
+    /// `test_to_finding_redacts_credential_shaped_dependency_name`'s coverage of the sibling
+    /// `dependency_name` field.
+    #[test]
+    fn test_to_finding_redacts_credential_shaped_requirement() {
+        let parse_result = dep_index_with_named_dependency_and_requirement(
+            "some-pkg",
+            "https://svcacct:hunter2@gitlab.corp/g/p.git",
+        );
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1248,20 +1320,26 @@ mod tests {
         );
 
         let requirement = finding.requirement.expect("range matched the dependency");
-        assert!(!requirement.contains('\u{202E}'));
-        assert!(!requirement.contains('\u{1b}'));
-        assert!(requirement.contains("^1.0"));
+        assert!(requirement.contains("***@"));
+        assert!(!requirement.contains("hunter2"));
     }
 
-    /// #1258 (JSON sink): a bidi/ANSI-laden `requirement` must not appear verbatim in the JSON
-    /// document either — proving sanitization at `to_finding` construction, not `to_document`
-    /// itself (which just clones the field), is what protects this sink, mirroring the SARIF
-    /// end-to-end test above for `dependency_name`.
+    /// Regression test for #1258: the requirement's own leak class (raw ANSI escape / bidi
+    /// override in `requirement`, reaching `format::json::to_document` — `requirement` has no
+    /// table or SARIF sink) must come out sanitized. Mirrors
+    /// `test_to_finding_sanitizes_manifest_path_ansi_and_bidi`'s payload and rationale for
+    /// the sibling `manifest_path` field. Supersedes #1301's near-identical
+    /// `test_json_output_never_carries_raw_bidi_or_ansi_through_requirement` /
+    /// `test_to_finding_sanitizes_bidi_and_ansi_in_requirement` (dropped at the #1299/#1300
+    /// rebase to avoid shipping two tests for the same regression): this one additionally
+    /// targets the exact `requirement` field rather than the whole serialized JSON blob, and
+    /// asserts the legitimate `^1.0` prefix survives, not just that the bad chars are gone.
     #[test]
-    fn test_json_output_never_carries_raw_bidi_or_ansi_through_requirement() {
-        let parse_result = dep_index_with_requirement("\u{202E}^1.0\u{1b}[31mfake\u{1b}[0m");
+    fn test_to_finding_sanitizes_ansi_and_bidi_in_requirement_json_sink() {
+        let parse_result =
+            dep_index_with_named_dependency_and_requirement("some-pkg", "^1.0\u{202E}\x1B[31m");
         let dep_index = DependencyIndex::build(parse_result.as_ref());
-        let diagnostic = diagnostic_with(None, "Unknown package");
+        let diagnostic = diagnostic_with(None, "Newer version available: 2.0.0");
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1273,13 +1351,27 @@ mod tests {
             &HashMap::new(),
         );
 
-        let document = crate::format::json::to_document(&CheckReport {
+        let report = CheckReport {
             findings: vec![finding],
-        });
-        let json = serde_json::to_string(&document).expect("document serializes");
+        };
+        let json = crate::format::json::to_document(&report);
+        let requirement_json = json.findings[0]
+            .requirement
+            .as_deref()
+            .expect("range matched the dependency");
 
-        assert!(!json.contains('\u{202E}'));
-        assert!(!json.contains('\u{1b}'));
+        assert!(
+            !requirement_json.contains('\u{202E}'),
+            "bidi override reached JSON output"
+        );
+        assert!(
+            !requirement_json.contains('\x1B'),
+            "raw ANSI escape byte reached JSON output"
+        );
+        assert!(
+            requirement_json.starts_with("^1.0"),
+            "legitimate requirement info lost"
+        );
     }
 
     #[test]
