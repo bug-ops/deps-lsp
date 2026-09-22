@@ -87,6 +87,7 @@ pub async fn handle_hover(
     ecosystem
         .generate_hover(parse_result.as_ref(), position, versions, freshness)
         .await
+        .map(crate::lsp_types_interop::to_lsp_hover)
 }
 
 #[cfg(test)]

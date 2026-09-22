@@ -1397,6 +1397,44 @@ pub(crate) fn replace_markdown_unsafe_chars(s: &str) -> String {
         .collect()
 }
 
+/// Same filter as [`replace_markdown_unsafe_chars`], except `\n` is never replaced.
+///
+/// [`is_markdown_unsafe`] starts with `c.is_control()`, which classifies `\n` as unsafe —
+/// correct for a single-line diagnostic message, but wrong for hover content: a hover card
+/// is a multi-section Markdown document that relies on structural newlines between
+/// sections, so running it through [`replace_markdown_unsafe_chars`] verbatim would
+/// collapse the whole card onto one line. Used as `crate::hover::Hover`'s constructor-path
+/// sanitization backstop (#1277), the hover equivalent of `Diagnostic::new`'s use of
+/// [`replace_markdown_unsafe_chars`] (#1276).
+///
+/// Idempotent for the same reason [`replace_markdown_unsafe_chars`] is: neither `' '` nor
+/// `'\n'` is itself [`is_markdown_unsafe`], so re-applying this to already-sanitized input
+/// (or to input already sanitized by [`replace_markdown_unsafe_chars`], which is strictly
+/// more aggressive) is a no-op.
+///
+/// Same **not destination-safe** caveat as [`replace_markdown_unsafe_chars`], but more load-
+/// bearing here: this filter runs over the *entire* hover document on every construction and
+/// mutation, so unlike the sibling's narrow, hand-picked call sites, it always spans any
+/// Markdown link destination the document happens to contain — a substituted space there
+/// would break the link (CommonMark forbids a literal space in an unbracketed destination)
+/// rather than neutralize a hazard. This is not a gap in practice: every hover-rendered URL
+/// is already stripped (not space-substituted) per-site via
+/// [`crate::lsp_helpers::strip_markdown_unsafe_chars`] before it reaches this filter (see
+/// `push_header_hover_section` in `lsp_helpers/hover.rs`), so this document-wide pass finds
+/// nothing left to fire on a correctly-sanitized destination — but a future call site that
+/// skips the per-site strip would silently break instead of just risking a hazard.
+pub(crate) fn replace_markdown_unsafe_chars_keep_newlines(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c != '\n' && is_markdown_unsafe(c) {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Removes every `is_markdown_unsafe` character from `s` outright, rather than
 /// substituting a space (`replace_markdown_unsafe_chars`'s behavior).
 ///

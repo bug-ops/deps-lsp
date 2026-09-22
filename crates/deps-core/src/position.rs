@@ -8,8 +8,10 @@
 //! dependency's position in its manifest.
 //!
 //! `deps-core`'s own [`crate::lsp_helpers`] still constructs real
-//! `tower_lsp_server::ls_types::{Hover, Diagnostic, CodeAction}` objects directly — that
-//! coupling is unaffected by this module (see `lib.rs`'s "LSP type stability" doc section)
+//! `tower_lsp_server::ls_types::CodeAction` objects directly (`Hover` and `Diagnostic` are
+//! now the protocol-agnostic [`crate::hover::Hover`]/[`crate::diagnostic::Diagnostic`]
+//! domain types instead, issues #1083/#1277) — that coupling is unaffected by this module
+//! (see `lib.rs`'s "LSP type stability" doc section)
 //! — and converts a [`Position`]/[`Range`] into its `ls_types` equivalent via the [`From`]
 //! impls below wherever one needs to be embedded in such a response. These impls are legal
 //! under Rust's orphan rules because [`Position`]/[`Range`] are local to this crate; the

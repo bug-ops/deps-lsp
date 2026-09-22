@@ -3,11 +3,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{
-    CodeAction, CodeLens, DocumentLink, Hover, InlayHint, Position, TextEdit,
+    CodeAction, CodeLens, DocumentLink, InlayHint, Position, TextEdit,
 };
 
 #[cfg(feature = "lsp-responses")]
 use crate::completion::Completions;
+#[cfg(feature = "lsp-responses")]
+use crate::hover::Hover;
 use crate::{
     Registry,
     diagnostic::Diagnostic,

@@ -690,7 +690,7 @@ mod tests {
         // M1: without this, the assertions never depended on the mocked response at all).
         assert!(hover.is_some());
         let hover_content = hover.unwrap();
-        let markdown = format!("{:?}", hover_content.contents);
+        let markdown = hover_content.markdown();
         assert!(markdown.contains("pkg.go.dev"));
         assert!(
             markdown.contains("**Latest**: `v1.10.0`"),

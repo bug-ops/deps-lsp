@@ -2395,10 +2395,7 @@ dependencies = []
             .await
             .expect("hover should be produced for a dependency at its name position");
 
-            let markdown = match hover.contents {
-                tower_lsp_server::ls_types::HoverContents::Markup(m) => m.value,
-                _ => panic!("expected Markup hover contents"),
-            };
+            let markdown = hover.markdown();
             assert!(
                 markdown.contains("**Current**") && markdown.contains("5.2.0"),
                 "hover should render the resolved lock file version: {markdown}"

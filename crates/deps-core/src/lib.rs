@@ -134,6 +134,15 @@ pub mod fallback_completion;
 pub mod freshness;
 pub mod fs_probe;
 pub mod github;
+/// Protocol-agnostic [`hover::Hover`] type (issue #1277).
+///
+/// The domain-level replacement for `tower_lsp_server::ls_types::Hover` returned by
+/// [`lsp_helpers::generate_hover`] and [`ecosystem::Ecosystem::generate_hover`]. Gated
+/// behind the `lsp-responses` feature, unlike [`diagnostic`] — see this module's own doc
+/// for why.
+#[cfg(feature = "lsp-responses")]
+#[cfg_attr(docsrs, doc(cfg(feature = "lsp-responses")))]
+pub mod hover;
 /// Shared bracket-interval version-range grammar (`[1.0,2.0)`-shaped), used by
 /// `deps-maven`, `deps-gradle`, and `deps-nuget` (#821).
 pub mod interval;

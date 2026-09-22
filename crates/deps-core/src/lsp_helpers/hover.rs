@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use tower_lsp_server::ls_types::{Hover, HoverContents, MarkupContent, MarkupKind, Position};
+use tower_lsp_server::ls_types::Position;
 
 use crate::deps_dev::deps_dev_system;
+use crate::hover::Hover;
 use crate::licenses::resolve_license_entries_for_display;
 use crate::osv::ScanOutcome;
 use crate::{
@@ -407,13 +408,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     push_offline_footer_hover_section(&mut markdown, resolvable, versions.offline);
 
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: markdown,
-        }),
-        range: Some(dep.name_range().into()),
-    })
+    Some(Hover::new(markdown, Some(dep.name_range())))
 }
 
 /// Spawns the deps.dev supply-chain trust-signal fetch (spec 037) as a detached
@@ -1401,18 +1396,12 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
+        assert!(content.contains("**License**: `MIT`"), "got: {}", content);
         assert!(
-            content.value.contains("**License**: `MIT`"),
-            "got: {}",
-            content.value
-        );
-        assert!(
-            content.value.contains("License changed"),
+            content.contains("License changed"),
             "resolved (1.0.0/MIT) and latest (2.0.0/Apache-2.0) licenses differ; got: {}",
-            content.value
+            content
         );
     }
 
@@ -1563,20 +1552,18 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("**License**: `MIT`"));
+        let content = hover.markdown();
+        assert!(content.contains("**License**: `MIT`"));
         assert!(
-            !content.value.contains("unavailable"),
+            !content.contains("unavailable"),
             "the resolved version is the latest version, so its already-known license \
              must be reused rather than reported unavailable; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("License changed"),
+            !content.contains("License changed"),
             "resolved and latest are the same version, so no change flag should fire; got: {}",
-            content.value
+            content
         );
     }
 
@@ -1620,19 +1607,17 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("**Current**"),
+            !content.contains("**Current**"),
             "no lock-file resolution exists, so no Current line should render; got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("**License**: `MIT`"),
+            content.contains("**License**: `MIT`"),
             "the concrete-pin fallback (=1.0.0) should still resolve a license even \
              without a lock-file match; got: {}",
-            content.value
+            content
         );
     }
 
@@ -1668,15 +1653,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("**License (detected)**: `BSD-3-Clause`"),
+            content.contains("**License (detected)**: `BSD-3-Clause`"),
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -1714,15 +1695,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("**License (detected)**: `Apache-2.0`"),
+            content.contains("**License (detected)**: `Apache-2.0`"),
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -1757,15 +1734,13 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**License**: `Apache-2.0`"),
+            content.contains("**License**: `Apache-2.0`"),
             "got: {}",
-            content.value
+            content
         );
-        assert!(!content.value.contains("(detected)"));
+        assert!(!content.contains("(detected)"));
     }
 
     /// Issue #687: hover must render the *normalized* SPDX id for a recognized Gradle
@@ -1804,15 +1779,13 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**License**: `Apache-2.0`"),
+            content.contains("**License**: `Apache-2.0`"),
             "expected the normalized SPDX id, not raw POM text, got: {}",
-            content.value
+            content
         );
-        assert!(!content.value.contains("The Apache Software License"));
+        assert!(!content.contains("The Apache Software License"));
     }
 
     /// Issue #687 critic S1: a Gradle POM free-text license the normalization table
@@ -1851,15 +1824,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("**License**: `Some Bespoke Corporate License`"),
+            content.contains("**License**: `Some Bespoke Corporate License`"),
             "expected the raw POM text as a fallback, got: {}",
-            content.value
+            content
         );
     }
 
@@ -1897,18 +1866,16 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**License**: `GPL-3.0`"),
+            content.contains("**License**: `GPL-3.0`"),
             "expected exactly one canonical id, got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("GPL-3.0-only") && !content.value.contains("GPL-3.0-or-later"),
+            !content.contains("GPL-3.0-only") && !content.contains("GPL-3.0-or-later"),
             "must not render the full policy-matching synonym slice in hover, got: {}",
-            content.value
+            content
         );
     }
 
@@ -1945,14 +1912,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("CDDL-1.1")
-                && content.value.contains("GPL-2.0-with-classpath-exception"),
+            content.contains("CDDL-1.1") && content.contains("GPL-2.0-with-classpath-exception"),
             "expected both disjunctive ids, got: {}",
-            content.value
+            content
         );
     }
 
@@ -2014,26 +1978,20 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("**Current**"),
+            !content.contains("**Current**"),
             "no lock-file resolution exists, so no Current line should render; got: {}",
-            content.value
+            content
         );
+        assert!(content.contains("**License**: `MIT`"), "got: {}", content);
         assert!(
-            content.value.contains("**License**: `MIT`"),
-            "got: {}",
-            content.value
-        );
-        assert!(
-            !content.value.contains("unavailable"),
+            !content.contains("unavailable"),
             "the exact pin (4.19.2) equals the only/live-latest version, so the \
              already-known license must be reused, not reported unavailable; got: {}",
-            content.value
+            content
         );
-        assert!(!content.value.contains("License changed"));
+        assert!(!content.contains("License changed"));
     }
 
     #[test]
@@ -2153,13 +2111,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("- `1.2.3` *(latest)* — 2 days ago"),
+            content.contains("- `1.2.3` *(latest)* — 2 days ago"),
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -2188,12 +2144,10 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         // Exactly the pre-feature line: no trailing age suffix.
-        assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
-        assert!(!content.value.contains("ago"));
+        assert!(content.contains("- `1.2.3` *(latest)*\n"));
+        assert!(!content.contains("ago"));
     }
 
     #[tokio::test]
@@ -2231,23 +2185,17 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
+        assert!(content.contains("**Latest**: `13.0.4`"), "got: {}", content);
         assert!(
-            content.value.contains("**Latest**: `13.0.4`"),
-            "got: {}",
-            content.value
-        );
-        assert!(
-            content.value.contains("- `13.0.4` *(latest)*"),
+            content.contains("- `13.0.4` *(latest)*"),
             "the stable version, not the raw-top pre-release, should carry the marker; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("13.0.5-beta1` *(latest)*"),
+            !content.contains("13.0.5-beta1` *(latest)*"),
             "the pre-release must not be tagged latest; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2285,39 +2233,29 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
+        assert!(content.contains("**Latest**: `1.9.0`"), "got: {}", content);
         assert!(
-            content.value.contains("**Latest**: `1.9.0`"),
-            "got: {}",
-            content.value
-        );
-        assert!(
-            content.value.contains("- `1.9.0` *(latest)*"),
+            content.contains("- `1.9.0` *(latest)*"),
             "the stable pick must be bumped into the capped list instead of omitted; got: {}",
-            content.value
+            content
         );
         assert_eq!(
-            content.value.matches("*(latest)*").count(),
+            content.matches("*(latest)*").count(),
             1,
             "exactly one entry should carry the marker; got: {}",
-            content.value
+            content
         );
         assert_eq!(
-            content
-                .value
-                .lines()
-                .filter(|l| l.starts_with("- `"))
-                .count(),
+            content.lines().filter(|l| l.starts_with("- `")).count(),
             HOVER_RECENT_VERSIONS,
             "the list must stay capped at HOVER_RECENT_VERSIONS entries even after the bump-in; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("2.0.0-alpha7"),
+            !content.contains("2.0.0-alpha7"),
             "the displaced 8th natural entry must not remain in the capped list; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2356,24 +2294,18 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert_eq!(
-            content.value.matches("- `1.9.0` *(latest)*").count(),
+            content.matches("- `1.9.0` *(latest)*").count(),
             1,
             "the in-window pick must render exactly once, not duplicated by a bump-in; got: {}",
-            content.value
+            content
         );
         assert_eq!(
-            content
-                .value
-                .lines()
-                .filter(|l| l.starts_with("- `"))
-                .count(),
+            content.lines().filter(|l| l.starts_with("- `")).count(),
             HOVER_RECENT_VERSIONS,
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -2412,30 +2344,22 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("- `1.9.0` *(latest)*"),
+            content.contains("- `1.9.0` *(latest)*"),
             "the pick at index HOVER_RECENT_VERSIONS must be bumped in; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content
-                .value
-                .contains(&format!("2.0.0-alpha{}", HOVER_RECENT_VERSIONS - 1)),
+            !content.contains(&format!("2.0.0-alpha{}", HOVER_RECENT_VERSIONS - 1)),
             "the displaced last natural entry must not remain in the capped list; got: {}",
-            content.value
+            content
         );
         assert_eq!(
-            content
-                .value
-                .lines()
-                .filter(|l| l.starts_with("- `"))
-                .count(),
+            content.lines().filter(|l| l.starts_with("- `")).count(),
             HOVER_RECENT_VERSIONS,
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -2474,18 +2398,16 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("- `5.0.99` *(latest)* *(yanked)*"),
+            content.contains("- `5.0.99` *(latest)* *(yanked)*"),
             "the bumped-in flagged pick must carry both the latest marker and its flag label; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("5.0.7`"),
+            !content.contains("5.0.7`"),
             "the displaced last natural entry must not remain in the capped list; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2528,23 +2450,21 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor, not panic");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("**Latest**:"),
+            !content.contains("**Latest**:"),
             "no stable version exists, so the header should be omitted rather than picking a pre-release; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("*(latest)*"),
+            !content.contains("*(latest)*"),
             "no stable version exists, so no entry in the list should be marked latest; got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("2.0.0-beta2"),
+            content.contains("2.0.0-beta2"),
             "the raw version list should still render even without a latest marker; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2579,19 +2499,17 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor, not panic");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("**Latest**:"),
+            !content.contains("**Latest**:"),
             "a live fetch with no stable entry must not fall back to a stale cached version \
              that isn't in the live list; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("1.5.0"),
+            !content.contains("1.5.0"),
             "the stale cached version must not leak into the response at all; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2633,14 +2551,12 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**Latest**: `v1.2.3`"),
+            content.contains("**Latest**: `v1.2.3`"),
             "the list-based pick failed, so hover must fall back to get_latest_matching's \
              result instead of omitting the Latest line; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2681,13 +2597,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**Latest**: `v1.2.3`"),
+            content.contains("**Latest**: `v1.2.3`"),
             "expected the list-based pick's own version, not the fallback's; got: {}",
-            content.value
+            content
         );
         assert_eq!(
             registry.get_latest_matching_calls.load(Ordering::Relaxed),
@@ -2719,18 +2633,16 @@ mod tests {
         .await
         .expect("hover must still render on a fetch failure, not disappear entirely");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("serde"),
+            content.contains("serde"),
             "basic card must still render the package name; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("**Latest**"),
+            !content.contains("**Latest**"),
             "no version data is available on a fetch failure; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2759,18 +2671,16 @@ mod tests {
         .await
         .expect("hover must still render when the primary fetch times out, not hang or panic");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("serde"),
+            content.contains("serde"),
             "basic card must still render the package name; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("**Latest**"),
+            !content.contains("**Latest**"),
             "no version data is available once the fetch times out; got: {}",
-            content.value
+            content
         );
     }
 
@@ -2940,18 +2850,16 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**Current**: `v0.8.1`"),
+            content.contains("**Current**: `v0.8.1`"),
             "expected hover to show go.mod's pinned version, got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("v0.9.1"),
+            !content.contains("v0.9.1"),
             "hover must not surface the stale go.sum version: {}",
-            content.value
+            content
         );
     }
 
@@ -2985,18 +2893,16 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         // Non-Go formatters must keep showing the lockfile-resolved version
         // ("1.2.0"), not the raw manifest requirement ("1.0.0") — confirms the Go
         // override does not leak into other ecosystems.
         assert!(
-            content.value.contains("**Current**: `1.2.0`"),
+            content.contains("**Current**: `1.2.0`"),
             "expected hover to show the resolved lockfile version, got: {}",
-            content.value
+            content
         );
-        assert!(!content.value.contains("**Current**: `1.0.0`"));
+        assert!(!content.contains("**Current**: `1.0.0`"));
     }
 
     #[tokio::test]
@@ -3034,15 +2940,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("- `1.2.1` *(yanked)* — 5 months ago"),
+            content.contains("- `1.2.1` *(yanked)* — 5 months ago"),
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -3076,11 +2978,9 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("- `1.2.3` *(latest)*\n"));
-        assert!(!content.value.contains("ago"));
+        let content = hover.markdown();
+        assert!(content.contains("- `1.2.3` *(latest)*\n"));
+        assert!(!content.contains("ago"));
     }
 
     /// Issue #227 §4.2a: the `**Latest**` line gets a publish-age suffix and, within the
@@ -3117,22 +3017,18 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("**Latest**: `2.0.0` *(published 1 hour ago)*"),
+            content.contains("**Latest**: `2.0.0` *(published 1 hour ago)*"),
             "got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains(
+            content.contains(
                 "> ⏳ **Recently published** — this release is still within the cooldown window."
             ),
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -3170,17 +3066,13 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("**Latest**: `2.0.0` *(published 1 week ago)*"),
+            content.contains("**Latest**: `2.0.0` *(published 1 week ago)*"),
             "got: {}",
-            content.value
+            content
         );
-        assert!(!content.value.contains("Recently published"));
+        assert!(!content.contains("Recently published"));
     }
 
     /// A `latest` with no known publish time renders exactly the pre-feature line — no age
@@ -3206,12 +3098,10 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("**Latest**: `2.0.0`\n\n"));
-        assert!(!content.value.contains("published"));
-        assert!(!content.value.contains("Recently published"));
+        let content = hover.markdown();
+        assert!(content.contains("**Latest**: `2.0.0`\n\n"));
+        assert!(!content.contains("published"));
+        assert!(!content.contains("Recently published"));
     }
 
     /// `freshness.enabled: false` suppresses both the age suffix and the cooldown callout
@@ -3250,12 +3140,10 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("**Latest**: `2.0.0`\n\n"));
-        assert!(!content.value.contains("published"));
-        assert!(!content.value.contains("Recently published"));
+        let content = hover.markdown();
+        assert!(content.contains("**Latest**: `2.0.0`\n\n"));
+        assert!(!content.contains("published"));
+        assert!(!content.contains("Recently published"));
     }
 
     /// Deterministic boundary test (issue #227 M4): `now` is threaded in as a parameter
@@ -3299,13 +3187,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("Recently published"),
+            !content.contains("Recently published"),
             "age exactly equal to cooldown_secs must not be within cooldown, got: {}",
-            content.value
+            content
         );
     }
 
@@ -3347,13 +3233,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("Recently published"),
+            content.contains("Recently published"),
             "age == cooldown_secs - 1 must be within cooldown, got: {}",
-            content.value
+            content
         );
     }
 
@@ -3416,29 +3300,23 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("**Latest**: `1.0.214` *(published 1 hour ago)*"),
+            content.contains("**Latest**: `1.0.214` *(published 1 hour ago)*"),
             "Latest line must reflect the live Ch2 fetch, not the stale Ch1 cache entry \
              `1.0.213`, got: {}",
-            content.value
-        );
-        assert!(
-            !content.value.contains("**Latest**: `1.0.213`"),
-            "must not render the stale Ch1 version, got: {}",
-            content.value
-        );
-        assert!(
             content
-                .value
-                .contains("- `1.0.214` *(latest)* — 1 hour ago"),
+        );
+        assert!(
+            !content.contains("**Latest**: `1.0.213`"),
+            "must not render the stale Ch1 version, got: {}",
+            content
+        );
+        assert!(
+            content.contains("- `1.0.214` *(latest)* — 1 hour ago"),
             "the Recent versions list's own *(latest)* entry must agree with the Latest \
              line above it, got: {}",
-            content.value
+            content
         );
     }
 
@@ -3485,27 +3363,25 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**Latest**: `1.9.0`"),
+            content.contains("**Latest**: `1.9.0`"),
             "hover must agree with select_latest_matching's non-deprecated-preferred pick \
              (1.9.0), not a naive is_stable() scan that would pick the newer but deprecated \
              2.0.0, got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("- `1.9.0` *(latest)*"),
+            content.contains("- `1.9.0` *(latest)*"),
             "the Recent versions list's own *(latest)* marker must agree with the Latest \
              line above it, got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("- `2.0.0` *(yanked)*"),
+            content.contains("- `2.0.0` *(yanked)*"),
             "2.0.0 must keep its flagged label even though it isn't the resolved latest, \
              got: {}",
-            content.value
+            content
         );
     }
 
@@ -3541,19 +3417,17 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**Latest**: `2.0.0`"),
+            content.contains("**Latest**: `2.0.0`"),
             "the only version resolves as latest even though it's flagged, got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("- `2.0.0` *(latest)* *(yanked)*"),
+            content.contains("- `2.0.0` *(latest)* *(yanked)*"),
             "the resolved latest must keep its flagged label instead of the warning \
              silently vanishing behind *(latest)*, got: {}",
-            content.value
+            content
         );
     }
 
@@ -3596,19 +3470,17 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**Latest**: `2.0.0`"),
+            content.contains("**Latest**: `2.0.0`"),
             "an all-yanked package still exists: hover must resolve the newest yanked \
              version as latest rather than showing no Latest line, got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("- `2.0.0` *(latest)* *(yanked)*"),
+            content.contains("- `2.0.0` *(latest)* *(yanked)*"),
             "the resolved latest must keep its yanked label, got: {}",
-            content.value
+            content
         );
     }
 
@@ -3682,35 +3554,29 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("### Deprecated"),
+            content.contains("### Deprecated"),
             "expected the package-level Deprecated section, got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("no longer maintained"),
+            content.contains("no longer maintained"),
             "expected the deprecation reason, got: {}",
-            content.value
+            content
         );
         // I3: the message and the reason must render as separate CommonMark paragraphs
         // (blank-line separated), not collapse into one joined paragraph.
         assert!(
-            content
-                .value
-                .contains("This package is deprecated\n\nno longer maintained"),
+            content.contains("This package is deprecated\n\nno longer maintained"),
             "expected the message and reason on separate paragraphs, got: {}",
-            content.value
+            content
         );
         assert!(
-            content
-                .value
-                .contains("- `1.0.0` *(latest)* *(deprecated)*"),
+            content.contains("- `1.0.0` *(latest)* *(deprecated)*"),
             "expected the pre-existing per-row label to still render alongside the new \
              section (deliberately not deduped, S4), got: {}",
-            content.value
+            content
         );
     }
 
@@ -3740,14 +3606,8 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(
-            content
-                .value
-                .contains("**Active when**: `python_full_version >= '3.9'`")
-        );
+        let content = hover.markdown();
+        assert!(content.contains("**Active when**: `python_full_version >= '3.9'`"));
     }
 
     #[tokio::test]
@@ -3776,10 +3636,8 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(!content.value.contains("Active when"));
+        let content = hover.markdown();
+        assert!(!content.contains("Active when"));
     }
 
     #[tokio::test]
@@ -3814,15 +3672,12 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
 
         // The link label (between the H1's "# [" and the "](") must be the fully
         // escaped name, with no raw "](" sequence that could close the label early
         // and splice in an attacker-controlled markdown link.
         let header_line = content
-            .value
             .lines()
             .next()
             .expect("hover markdown has a header line");
@@ -3872,15 +3727,12 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
 
         // The link label must be the exact single-line escaped name: no raw
         // newline breaking the ATX heading, and the autolink's `<`/`>` escaped so
         // it cannot render as a live link independent of the `[]`/`()` escaping.
         let header_line = content
-            .value
             .lines()
             .next()
             .expect("hover markdown has a header line");
@@ -3930,15 +3782,12 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
 
         // The link label (the escape_markdown sink #1248 targets) must not carry the bidi
         // override; the link *destination* is sanitized too (#1259), see the dedicated
         // `test_generate_hover_bidi_override_in_name_cannot_spoof_link_destination` test below.
         let header_line = content
-            .value
             .lines()
             .next()
             .expect("hover markdown has a header line");
@@ -3991,12 +3840,9 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
 
         let header_line = content
-            .value
             .lines()
             .next()
             .expect("hover markdown has a header line");
@@ -4061,12 +3907,9 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
 
         let header_line = content
-            .value
             .lines()
             .next()
             .expect("hover markdown has a header line");
@@ -4129,12 +3972,9 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
 
         let header_line = content
-            .value
             .lines()
             .next()
             .expect("hover markdown has a header line");
@@ -4186,14 +4026,8 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(
-            content
-                .value
-                .contains(&format!("**Active when**: `{marker}`"))
-        );
+        let content = hover.markdown();
+        assert!(content.contains(&format!("**Active when**: `{marker}`")));
     }
 
     #[tokio::test]
@@ -4237,12 +4071,10 @@ mod tests {
         .await
         .expect("hover should still be generated for a non-resolvable-source dependency");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(!content.value.contains("**Latest**"));
-        assert!(!content.value.contains("**Recent versions**"));
-        assert!(content.value.contains("**Requirement**"));
+        let content = hover.markdown();
+        assert!(!content.contains("**Latest**"));
+        assert!(!content.contains("**Recent versions**"));
+        assert!(content.contains("**Requirement**"));
 
         // Control: the same fixture on a Registry-source dependency DOES show
         // both registry-derived sections, proving the fixture isn't vacuous.
@@ -4261,11 +4093,9 @@ mod tests {
         )
         .await
         .expect("hover should be generated");
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("**Latest**"));
-        assert!(content.value.contains("**Recent versions**"));
+        let content = hover.markdown();
+        assert!(content.contains("**Latest**"));
+        assert!(content.contains("**Recent versions**"));
     }
 
     #[tokio::test]
@@ -4294,10 +4124,8 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("No known vulnerabilities"));
+        let content = hover.markdown();
+        assert!(content.contains("No known vulnerabilities"));
     }
 
     #[tokio::test]
@@ -4329,11 +4157,9 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(!content.value.contains("Security advisories"));
-        assert!(!content.value.contains("No known vulnerabilities"));
+        let content = hover.markdown();
+        assert!(!content.contains("Security advisories"));
+        assert!(!content.contains("No known vulnerabilities"));
     }
 
     #[tokio::test]
@@ -4378,18 +4204,13 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("Security advisories"));
-        assert!(content.value.contains("RUSTSEC-2020-0071"));
-        assert!(content.value.contains("Fixed in"));
-        assert!(
-            content.value.contains("1.5.0"),
-            "must show highest fixed version"
-        );
-        assert!(content.value.contains("+2 more advisories"));
-        assert!(content.value.contains("also affected"));
+        let content = hover.markdown();
+        assert!(content.contains("Security advisories"));
+        assert!(content.contains("RUSTSEC-2020-0071"));
+        assert!(content.contains("Fixed in"));
+        assert!(content.contains("1.5.0"), "must show highest fixed version");
+        assert!(content.contains("+2 more advisories"));
+        assert!(content.contains("also affected"));
     }
 
     /// #1272: `fixed_versions`, the candidate `version`, `summary`, and `aliases` are all
@@ -4503,12 +4324,10 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("MAL-2025-47141"));
-        assert!(content.value.contains("confirmed malicious package"));
-        assert!(!content.value.contains("unknown severity"));
+        let content = hover.markdown();
+        assert!(content.contains("MAL-2025-47141"));
+        assert!(content.contains("confirmed malicious package"));
+        assert!(!content.contains("unknown severity"));
     }
 
     #[tokio::test]
@@ -4561,20 +4380,16 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(content.value.contains("RUSTSEC-2024-0320"));
-        assert!(!content.value.contains("unknown severity"));
+        let content = hover.markdown();
+        assert!(content.contains("RUSTSEC-2024-0320"));
+        assert!(!content.contains("unknown severity"));
         // FR-003: even with no `summary`, the label itself must read as a
         // self-contained notice — not a bare category word that only makes
         // sense alongside prose the advisory doesn't have here.
         assert!(
-            content
-                .value
-                .contains(severity_label(VulnSeverity::Informational)),
+            content.contains(severity_label(VulnSeverity::Informational)),
             "label must stand alone as a comprehensible notice: {}",
-            content.value
+            content
         );
     }
 
@@ -4623,14 +4438,12 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("also affected"),
+            !content.contains("also affected"),
             "an all-Informational candidate-vulnerable set must not render the \
              misleading 'also affected' line: {}",
-            content.value
+            content
         );
     }
 
@@ -4687,14 +4500,12 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("also affected"),
+            content.contains("also affected"),
             "a mixed informational+graded candidate-vulnerable set must still \
              render the line: {}",
-            content.value
+            content
         );
     }
 
@@ -4768,15 +4579,13 @@ mod tests {
         )
         .await
         .expect("hover should be generated");
-        let HoverContents::Markup(patched_content) = hover_on_patched.contents else {
-            panic!("expected markup hover contents");
-        };
+        let patched_content = hover_on_patched.markdown();
         assert!(
-            !patched_content.value.contains("RUSTSEC-2020-0071"),
+            !patched_content.contains("RUSTSEC-2020-0071"),
             "the patched occurrence must not show the other occurrence's advisory: {}",
-            patched_content.value
+            patched_content
         );
-        assert!(patched_content.value.contains("No known vulnerabilities"));
+        assert!(patched_content.contains("No known vulnerabilities"));
 
         let hover_on_vulnerable = generate_hover(
             &parse_result,
@@ -4789,10 +4598,8 @@ mod tests {
         )
         .await
         .expect("hover should be generated");
-        let HoverContents::Markup(vulnerable_content) = hover_on_vulnerable.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(vulnerable_content.value.contains("RUSTSEC-2020-0071"));
+        let vulnerable_content = hover_on_vulnerable.markdown();
+        assert!(vulnerable_content.contains("RUSTSEC-2020-0071"));
     }
 
     /// Issue #649 US-001/US-002/SC-001/SC-002, end-to-end through `generate_hover` with a
@@ -4880,20 +4687,18 @@ mod tests {
         )
         .await
         .expect("hover should be generated");
-        let HoverContents::Markup(renamed_content) = hover_on_renamed.contents else {
-            panic!("expected markup hover contents");
-        };
+        let renamed_content = hover_on_renamed.markdown();
         assert!(
-            renamed_content.value.contains("0.9.15"),
+            renamed_content.contains("0.9.15"),
             "renamed occurrence must show its own resolved version, not the collapsed 1.0.219: {}",
-            renamed_content.value
+            renamed_content
         );
         assert!(
-            !renamed_content.value.contains("RUSTSEC-2020-0071"),
+            !renamed_content.contains("RUSTSEC-2020-0071"),
             "the renamed (0.9) occurrence must not show the other occurrence's advisory: {}",
-            renamed_content.value
+            renamed_content
         );
-        assert!(renamed_content.value.contains("No known vulnerabilities"));
+        assert!(renamed_content.contains("No known vulnerabilities"));
 
         let hover_on_current = generate_hover(
             &parse_result,
@@ -4906,11 +4711,9 @@ mod tests {
         )
         .await
         .expect("hover should be generated");
-        let HoverContents::Markup(current_content) = hover_on_current.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(current_content.value.contains("1.0.219"));
-        assert!(current_content.value.contains("RUSTSEC-2020-0071"));
+        let current_content = hover_on_current.markdown();
+        assert!(current_content.contains("1.0.219"));
+        assert!(current_content.contains("RUSTSEC-2020-0071"));
     }
 
     /// #366, revised by the PR-431 review's Critical finding #3: a registry error
@@ -4946,18 +4749,16 @@ mod tests {
         .await
         .expect("hover must still render the basic card on a registry error");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("**Latest**"),
+            !content.contains("**Latest**"),
             "no version data is available on a registry error; got: {}",
-            content.value
+            content
         );
         assert!(
-            !content.value.contains("Recent versions"),
+            !content.contains("Recent versions"),
             "must not render a broken version section from an empty list; got: {}",
-            content.value
+            content
         );
     }
 
@@ -4987,13 +4788,11 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("Press `Cmd+.` to update version"),
+            content.contains("Press `Cmd+.` to update version"),
             "a resolvable source with live version data must show the update footer; got: {}",
-            content.value
+            content
         );
     }
 
@@ -5035,14 +4834,12 @@ mod tests {
         .await
         .expect("hover should still be generated for a non-resolvable-source dependency");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("Press `Cmd+.` to update version"),
+            !content.contains("Press `Cmd+.` to update version"),
             "a non-resolvable source offers no update code action, even with a cached \
              latest value present; got: {}",
-            content.value
+            content
         );
     }
 
@@ -5086,21 +4883,17 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("Press `Cmd+.` to update version"),
+            !content.contains("Press `Cmd+.` to update version"),
             "no code action can be produced while offline with nothing cached, so the \
              footer must not render; got: {}",
-            content.value
+            content
         );
         assert!(
-            content
-                .value
-                .contains("📴 *Offline: version and vulnerability data not checked*"),
+            content.contains("📴 *Offline: version and vulnerability data not checked*"),
             "the existing offline notice must still render; got: {}",
-            content.value
+            content
         );
     }
 
@@ -5131,14 +4924,12 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("Press `Cmd+.` to update version"),
+            content.contains("Press `Cmd+.` to update version"),
             "a warm-cache live version list still offers a real REFACTOR action while \
              offline, so the footer must render; got: {}",
-            content.value
+            content
         );
     }
 
@@ -5169,16 +4960,12 @@ mod tests {
         .await
         .expect("hover should be generated for a dependency at the cursor");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("Offline: version and vulnerability data not checked"),
+            content.contains("Offline: version and vulnerability data not checked"),
             "a resolvable source must show the offline footer when versions.offline is set; \
              got: {}",
-            content.value
+            content
         );
     }
 
@@ -5219,14 +5006,12 @@ mod tests {
         .await
         .expect("hover should still be generated for a non-resolvable-source dependency");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("Offline:"),
+            !content.contains("Offline:"),
             "a non-resolvable source must not show the offline footer, even with \
              versions.offline set; got: {}",
-            content.value
+            content
         );
     }
 
@@ -5294,14 +5079,11 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         let line = content
-            .value
             .lines()
             .find(|l| l.contains("Supply chain"))
-            .unwrap_or_else(|| panic!("expected a Supply chain line, got: {}", content.value));
+            .unwrap_or_else(|| panic!("expected a Supply chain line, got: {}", content));
         insta::assert_snapshot!(line, @"🔐 **Supply chain**: OpenSSF Scorecard `8.5`/10 · Provenance: verified");
     }
 
@@ -5339,22 +5121,20 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("**License**: `MIT`"),
+            content.contains("**License**: `MIT`"),
             "expected the deps.dev-sourced license to render; got: {}",
-            content.value
+            content
         );
         // No live version list was fetched (`MockRegistryWithVersions { versions: vec![] }`),
         // so no `**Latest**` line exists either — the "(latest version license
         // unavailable)" note must not render for a dependency with no latest version
         // at all (impl-critic review S1).
         assert!(
-            !content.value.contains("unavailable"),
+            !content.contains("unavailable"),
             "no latest version exists to compare against; got: {}",
-            content.value
+            content
         );
     }
 
@@ -5388,15 +5168,11 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content
-                .value
-                .contains("Provenance: attested but unverified"),
+            content.contains("Provenance: attested but unverified"),
             "got: {}",
-            content.value
+            content
         );
     }
 
@@ -5438,18 +5214,16 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("Provenance: none found"),
+            content.contains("Provenance: none found"),
             "got: {}",
-            content.value
+            content
         );
         assert!(
-            content.value.contains("*(self-reported repo)*"),
+            content.contains("*(self-reported repo)*"),
             "an UNVERIFIED_METADATA-only relation must be disclosed; got: {}",
-            content.value
+            content
         );
     }
 
@@ -5488,13 +5262,11 @@ mod tests {
             .await
             .expect("hover should be generated");
 
-            let HoverContents::Markup(content) = hover.contents else {
-                panic!("expected markup hover contents");
-            };
+            let content = hover.markdown();
             assert!(
-                !content.value.contains("Supply chain"),
+                !content.contains("Supply chain"),
                 "{ecosystem:?}: got: {}",
-                content.value
+                content
             );
             never_called.assert_async().await;
         }
@@ -5545,13 +5317,11 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            !content.value.contains("Supply chain"),
+            !content.contains("Supply chain"),
             "a private registry's package name/version must never reach deps.dev; got: {}",
-            content.value
+            content
         );
         never_called.assert_async().await;
     }
@@ -5587,14 +5357,8 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(
-            !content.value.contains("Supply chain"),
-            "got: {}",
-            content.value
-        );
+        let content = hover.markdown();
+        assert!(!content.contains("Supply chain"), "got: {}", content);
         never_called.assert_async().await;
     }
 
@@ -5646,14 +5410,10 @@ mod tests {
         .await
         .expect("hover should be generated");
 
-        let HoverContents::Markup(a) = with_failing_trust.contents else {
-            panic!("expected markup hover contents");
-        };
-        let HoverContents::Markup(b) = without_trust.contents else {
-            panic!("expected markup hover contents");
-        };
-        assert!(!a.value.contains("Supply chain"), "got: {}", a.value);
-        assert_eq!(a.value, b.value);
+        let a = with_failing_trust.markdown();
+        let b = without_trust.markdown();
+        assert!(!a.contains("Supply chain"), "got: {}", a);
+        assert_eq!(a, b);
     }
 
     /// Exercises `generate_hover`'s own real `tokio::time::timeout(DEPS_DEV_WAIT_BUDGET,
@@ -5726,14 +5486,12 @@ mod tests {
         )
         .await
         .expect("hover should be generated");
-        let HoverContents::Markup(first_content) = first.contents else {
-            panic!("expected markup hover contents");
-        };
+        let first_content = first.markdown();
         assert!(
-            !first_content.value.contains("Supply chain"),
+            !first_content.contains("Supply chain"),
             "the real ~750ms two-call sequence must exceed the 700ms wait budget on the \
              first hover; got: {}",
-            first_content.value
+            first_content
         );
         // The detached task spawned above keeps running past this point by design
         // (that's the whole point of spawn-and-warm) — deliberately not awaited or
@@ -5792,14 +5550,12 @@ mod tests {
         )
         .await
         .expect("hover should be generated");
-        let HoverContents::Markup(content) = hover.contents else {
-            panic!("expected markup hover contents");
-        };
+        let content = hover.markdown();
         assert!(
-            content.value.contains("Supply chain"),
+            content.contains("Supply chain"),
             "a hover reading an already-warm memo must render the trust signal \
              immediately; got: {}",
-            content.value
+            content
         );
     }
 }
