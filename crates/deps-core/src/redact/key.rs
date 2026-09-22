@@ -126,18 +126,6 @@ pub fn redact_declaration_key(key: &str) -> String {
 /// ```
 #[must_use]
 pub fn sanitize_invisible(s: &str) -> std::borrow::Cow<'_, str> {
-    use unicode_general_category::{GeneralCategory, get_general_category};
-
-    fn is_invisible(c: char) -> bool {
-        matches!(
-            get_general_category(c),
-            GeneralCategory::Control
-                | GeneralCategory::Format
-                | GeneralCategory::LineSeparator
-                | GeneralCategory::ParagraphSeparator
-        )
-    }
-
     if !s.chars().any(is_invisible) {
         return std::borrow::Cow::Borrowed(s);
     }
@@ -145,6 +133,26 @@ pub fn sanitize_invisible(s: &str) -> std::borrow::Cow<'_, str> {
         s.chars()
             .map(|c| if is_invisible(c) { ' ' } else { c })
             .collect(),
+    )
+}
+
+/// Whether `c` belongs to the Unicode `Cc`/`Cf`/`Zl`/`Zp` general categories
+/// [`sanitize_invisible`] sweeps.
+///
+/// `pub(crate)` rather than private so `lsp_helpers::mod`'s drift-guard test (#1323) can
+/// scan the full Unicode code space and assert that every character this predicate
+/// flags is either blocked by `is_markdown_unsafe` or in that function's documented,
+/// named exempt set — without duplicating this category logic in the test itself,
+/// which would defeat the point of a drift guard.
+pub(crate) fn is_invisible(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+
+    matches!(
+        get_general_category(c),
+        GeneralCategory::Control
+            | GeneralCategory::Format
+            | GeneralCategory::LineSeparator
+            | GeneralCategory::ParagraphSeparator
     )
 }
 

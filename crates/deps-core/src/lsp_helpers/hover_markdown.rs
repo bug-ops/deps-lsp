@@ -503,16 +503,18 @@ mod tests {
     /// #1311/#1313: a `sanitize_invisible`-only codepoint — one `is_markdown_unsafe`
     /// (`Hover::new`'s whole-document sweep) does **not** name, so it survives that
     /// sweep untouched — must still be stripped from `Name`/`Version`-kind fields via
-    /// the sweep `push_code`/`push_text`/`push_label` now apply. U+206A (INHIBIT
-    /// SYMMETRIC SWAPPING) is one such codepoint.
+    /// the sweep `push_code`/`push_text`/`push_label` now apply. U+0600 (ARABIC NUMBER
+    /// SIGN) is one such codepoint — #1323 widened `is_markdown_unsafe` to close
+    /// several other such gaps, but U+0600 remains deliberately exempt from it (a
+    /// genuine Arabic prefixed-format sign, #1248), so it still pins this property.
     #[test]
     fn push_code_strips_sanitize_invisible_only_codepoints_for_name_and_version_kinds() {
         for kind in [FieldKind::Name, FieldKind::Version] {
             let mut markdown = HoverMarkdown::new();
-            markdown.push_code(&format!("1.0{}0", '\u{206a}'), kind);
+            markdown.push_code(&format!("1.0{}0", '\u{0600}'), kind);
             assert!(
-                !markdown.as_str().contains('\u{206a}'),
-                "kind={kind:?}: U+206A must be stripped; got: {markdown}"
+                !markdown.as_str().contains('\u{0600}'),
+                "kind={kind:?}: U+0600 must be stripped; got: {markdown}"
             );
         }
     }
@@ -521,10 +523,12 @@ mod tests {
     /// emoji ZWJ sequences and RTL marks that `sanitize_invisible`'s full
     /// `Cf`/`Zl`/`Zp` sweep would mangle (security's empirical finding — a ZWJ-joined
     /// emoji family splits into separate glyphs, an RTL mark is stripped outright).
-    /// Also pins that U+206A survives in `Prose` — a deliberate trade-off, not a
-    /// regression, since `Prose` only ever gets the narrower whole-document sweep.
+    /// Also pins that U+0600 (ARABIC NUMBER SIGN, a `sanitize_invisible`-stripped
+    /// codepoint `is_markdown_unsafe` deliberately still exempts, #1248/#1323) survives
+    /// in `Prose` — a deliberate trade-off, not a regression, since `Prose` only ever
+    /// gets the narrower whole-document sweep.
     #[test]
-    fn push_text_does_not_sweep_prose_preserving_zwj_and_rtl_marks_and_u206a() {
+    fn push_text_does_not_sweep_prose_preserving_zwj_and_rtl_marks_and_u0600() {
         let zwj_emoji = "👨\u{200d}👩\u{200d}👧"; // family emoji, ZWJ-joined
         let mut markdown = HoverMarkdown::new();
         markdown.push_text(zwj_emoji, FieldKind::Prose);
@@ -543,10 +547,10 @@ mod tests {
         );
 
         let mut markdown = HoverMarkdown::new();
-        markdown.push_text(&format!("note{}", '\u{206a}'), FieldKind::Prose);
+        markdown.push_text(&format!("note{}", '\u{0600}'), FieldKind::Prose);
         assert!(
-            markdown.as_str().contains('\u{206a}'),
-            "U+206A survives in Prose by design (weaker sanitization tier); got: {markdown}"
+            markdown.as_str().contains('\u{0600}'),
+            "U+0600 survives in Prose by design (weaker sanitization tier); got: {markdown}"
         );
     }
 

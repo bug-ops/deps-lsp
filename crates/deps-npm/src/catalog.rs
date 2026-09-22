@@ -468,8 +468,10 @@ impl CatalogOrigin {
     /// in full. For every outcome [`Self::diagnostic_message`] also renders (`render()`'s
     /// arms), this matches that sibling's existing sanitization strength, closing the gap
     /// for a non-bidi `Cf` character outside `is_markdown_unsafe`'s enumerated ranges (e.g.
-    /// U+206A INHIBIT SYMMETRIC SWAPPING), which previously reached hover unmodified while
-    /// the diagnostic already stripped it. [`CatalogOutcome::Resolved`]/
+    /// U+0600 ARABIC NUMBER SIGN — U+206A, this doc's original example, is itself now
+    /// blocked by `is_markdown_unsafe` as of #1323, but U+0600 remains a deliberately
+    /// exempt prefixed-format sign, see that function's own doc), which previously reached
+    /// hover unmodified while the diagnostic already stripped it. [`CatalogOutcome::Resolved`]/
     /// [`CatalogOutcome::NonSemverEntry`] have no `diagnostic_message` text at all
     /// (`render()` returns `None` for both, see that outcome's own doc) — for those two,
     /// this is new strengthening, not restored parity with a sibling that doesn't exist.
@@ -1386,12 +1388,21 @@ mod tests {
     /// `Cf`/`Zl`/`Zp` sub-ranges `is_markdown_unsafe` does not enumerate (critic M3: a
     /// single fixed code point is too weak a regression pin), not just the U+206A this
     /// issue's report happened to name:
-    /// - U+206A INHIBIT SYMMETRIC SWAPPING (deprecated format character block)
-    /// - U+2061 FUNCTION APPLICATION (invisible math operator block)
-    /// - U+180E MONGOLIAN VOWEL SEPARATOR (historically reclassified into `Cf`)
+    /// - U+206A INHIBIT SYMMETRIC SWAPPING (deprecated format character block) — kept as
+    ///   defense-in-depth even though #1323 made `is_markdown_unsafe` itself now block it
+    ///   too, so this one alone no longer isolates the extra `sanitize_invisible` sweep
+    /// - U+2061 FUNCTION APPLICATION (invisible math operator block) — likewise now also
+    ///   blocked directly by `is_markdown_unsafe` since #1323
+    /// - U+180E MONGOLIAN VOWEL SEPARATOR (historically reclassified into `Cf`) — likewise
+    ///   now also blocked directly by `is_markdown_unsafe` since #1323
+    /// - U+0600 ARABIC NUMBER SIGN — added by #1323: still exempt from `is_markdown_unsafe`
+    ///   (a deliberate prefixed-format-sign exemption, see that function's own doc), so this
+    ///   is the character that actually still isolates the extra `sanitize_invisible` sweep
+    ///   `hover_detail` layers on top; without it this test would pass even with that sweep
+    ///   removed entirely.
     #[test]
     fn test_hover_detail_sanitizes_non_bidi_format_chars_matching_diagnostic_message() {
-        for evil_char in ['\u{206A}', '\u{2061}', '\u{180E}'] {
+        for evil_char in ['\u{206A}', '\u{2061}', '\u{180E}', '\u{0600}'] {
             let evil_name = format!("pkg{evil_char}evil");
             let o = origin("catalog:", None, CatalogOutcome::MissingEntry);
 
@@ -1412,10 +1423,15 @@ mod tests {
 
     /// #1266: the same gap in the catalog name (`specifier`'s `strip_prefix("catalog:")`
     /// tail), and in the raw specifier text itself (the `code` closure), reached via
-    /// `UnknownCatalog`'s message shape.
+    /// `UnknownCatalog`'s message shape. Uses U+0600 rather than U+206A (this test's
+    /// pre-#1323 exemplar): #1323 made `is_markdown_unsafe` itself block U+206A, which
+    /// would make the assertion pass even without `hover_detail`'s extra
+    /// `sanitize_invisible` sweep — U+0600 remains deliberately exempt from
+    /// `is_markdown_unsafe` (see that function's own doc), so it still isolates the
+    /// property this test pins.
     #[test]
     fn test_hover_detail_sanitizes_non_bidi_format_char_in_catalog_name_and_specifier() {
-        let evil_catalog = "react\u{206A}17";
+        let evil_catalog = "react\u{0600}17";
         let specifier = format!("catalog:{evil_catalog}");
         let o = origin(
             &specifier,
@@ -1425,16 +1441,18 @@ mod tests {
 
         let hover = o.hover_detail("react");
         assert!(
-            !hover.contains('\u{206A}'),
-            "hover_detail did not sanitize U+206A in specifier/catalog name: {hover:?}"
+            !hover.contains('\u{0600}'),
+            "hover_detail did not sanitize U+0600 in specifier/catalog name: {hover:?}"
         );
     }
 
     /// #1266: the `Resolved`/`NonSemverEntry` arms build their hover text directly (not
-    /// through `render`), so they need their own coverage of the same sanitization.
+    /// through `render`), so they need their own coverage of the same sanitization. Uses
+    /// U+0600 for the same reason as the sibling test above (#1323 made U+206A no longer
+    /// isolate this property).
     #[test]
     fn test_hover_detail_sanitizes_non_bidi_format_char_in_resolved_range() {
-        let evil_range = "^1\u{206A}.0.0";
+        let evil_range = "^1\u{0600}.0.0";
         let o = origin(
             "catalog:",
             None,
@@ -1443,8 +1461,8 @@ mod tests {
 
         let hover = o.hover_detail("react");
         assert!(
-            !hover.contains('\u{206A}'),
-            "hover_detail did not sanitize U+206A in a Resolved range: {hover:?}"
+            !hover.contains('\u{0600}'),
+            "hover_detail did not sanitize U+0600 in a Resolved range: {hover:?}"
         );
     }
 

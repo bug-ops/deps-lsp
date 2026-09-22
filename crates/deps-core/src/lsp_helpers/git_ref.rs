@@ -951,17 +951,17 @@ mod tests {
     }
 
     /// #1311/#1313: `resolved_tag` is a git tag (name/version-shaped), so it must strip
-    /// a `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe` alone
-    /// does not catch — the same treatment `HoverMarkdown`'s `Name`/`Version` field
-    /// kinds now apply.
+    /// a `sanitize_invisible`-only codepoint (U+0600 ARABIC NUMBER SIGN) that
+    /// `is_markdown_unsafe` alone does not catch — deliberately exempt per #1248/#1323
+    /// — the same treatment `HoverMarkdown`'s `Name`/`Version` field kinds now apply.
     #[cfg(feature = "lsp-responses")]
     #[test]
-    fn splice_resolved_line_strips_u206a_from_resolved_tag() {
+    fn splice_resolved_line_strips_u0600_from_resolved_tag() {
         let sha = "a".repeat(40);
-        let out = splice_resolved_line("", &format!("v1.0{}0", '\u{206a}'), &sha);
+        let out = splice_resolved_line("", &format!("v1.0{}0", '\u{0600}'), &sha);
         assert!(
-            !out.contains('\u{206a}'),
-            "U+206A must be stripped from resolved_tag; got: {out}"
+            !out.contains('\u{0600}'),
+            "U+0600 must be stripped from resolved_tag; got: {out}"
         );
     }
 
