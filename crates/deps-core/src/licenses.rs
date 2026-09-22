@@ -28,10 +28,9 @@
 use std::fmt;
 
 /// Maximum length of a single SPDX identifier accepted into a
-/// [`LicensePolicy`] — mirrors `deps-core::lsp_helpers::hover`'s
-/// `MAX_LICENSE_ID_CHARS` cap on the untrusted-length side of this same data
-/// (registry-declared license strings), applied here to user-supplied policy
-/// config instead.
+/// [`LicensePolicy`] — mirrors `deps-core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`'s cap
+/// on the untrusted-length side of this same data (registry-declared license strings),
+/// applied here to user-supplied policy config instead.
 const MAX_SPDX_ID_CHARS: usize = 128;
 
 /// Cap on how many declared license entries [`evaluate`] joins into a
@@ -272,7 +271,7 @@ pub fn evaluate(license: &[String], policy: &LicensePolicy) -> Option<LicenseVio
 
 /// Maximum length of a raw free-text `<license><name>` value considered for normalization.
 ///
-/// Mirrors `deps-core::lsp_helpers::hover`'s `MAX_LICENSE_ID_CHARS` (issue #660/#661
+/// Mirrors `deps-core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS` (issue #660/#661
 /// critic security P2 precedent). The longest `KNOWN_POM_LICENSE_NAMES` key is under 60
 /// characters, so this rejects no real match; it exists purely to stop
 /// `collapse_whitespace`'s `split_whitespace().collect::<Vec<_>>().join(...)` from

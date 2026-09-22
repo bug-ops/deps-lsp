@@ -37,10 +37,10 @@ pub use code_lenses::{
 };
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, generate_diagnostics_from_cache,
-    redact_name_for_diagnostic, redact_requirement_for_diagnostic, requirement_is_unsatisfiable,
-    sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
-    truncate_for_diagnostic,
+    MAX_DIAGNOSTIC_VALUE_CHARS, UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless,
+    generate_diagnostics_from_cache, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
+    requirement_is_unsatisfiable, sanitize_advisory_text_for_diagnostic,
+    sanitize_and_truncate_for_diagnostic, truncate_for_diagnostic,
 };
 // `pub(crate)` (not `pub`, matching the constant's own visibility) so `completion.rs` can
 // share this bound with `inlay_hints`/`hover` rather than declaring a duplicate cap.
@@ -1358,6 +1358,15 @@ pub fn escape_markdown(s: &str) -> String {
 /// check would miss them), the byte-order mark (U+FEFF), interlinear annotation
 /// characters (U+FFF9-U+FFFB), and the Unicode tag characters (U+E0000-U+E007F, the
 /// canonical invisible "ASCII smuggling" vector).
+///
+/// This narrower list is a deliberate strength trade-off, not drift from
+/// [`crate::net_policy::sanitize_invisible`] — a caller whose Markdown fragments are
+/// name-shaped (an identifier, a version string, a specifier) rather than free text has no
+/// such legitimate-`Cf`-mark concern and should layer `sanitize_invisible` on top of
+/// [`escape_markdown`]/[`markdown_code_span`] for full parity with a sibling plain-text
+/// sink, the way `deps_npm::catalog::CatalogOrigin::hover_detail` does (#1266). This
+/// crate's own hover path does not yet do so for its name-shaped fragments (e.g.
+/// `deprecation.replacement`) — tracked separately as #1311, not fixed here.
 fn is_markdown_unsafe(c: char) -> bool {
     c.is_control()
         || matches!(c,

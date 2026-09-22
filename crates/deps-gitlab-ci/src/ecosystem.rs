@@ -20,7 +20,9 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::{
     Ecosystem, HttpCache, ParseResult as ParseResultTrait, Registry, Result,
     diagnostic::{Diagnostic, Severity},
-    lsp_helpers::{EcosystemFormatter, sanitize_and_truncate_for_diagnostic},
+    lsp_helpers::{
+        EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, sanitize_and_truncate_for_diagnostic,
+    },
 };
 
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
@@ -34,7 +36,9 @@ use crate::registry::GitlabCiRegistry;
 use crate::types::{GitlabCiDependency, HostRef, IncludeKind, PinStyle};
 
 /// Maximum character count of an interpolated raw host expression before truncation —
-/// mirrors `deps_github_actions`'s `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` precedent.
+/// mirrors `deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`'s numeric bound — a
+/// separate `= 128` literal, not derived from it, out of #1278's scope (that issue's
+/// nine-constant list did not include this one).
 const MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS: usize = 128;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
@@ -42,13 +46,6 @@ const MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS: usize = 128;
 /// with no comparison/caret/tilde operator syntax (#1137).
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &[];
-
-/// Maximum character count of `mutable_ref_pin_diagnostics`' interpolated `name`/`tag`
-/// values before truncation — mirrors
-/// `deps_github_actions::ecosystem::MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` exactly (same
-/// rationale: neither a `project:`/`component:` value nor a `ref:`/version pin has any
-/// upstream length cap before it renders inline in a diagnostic).
-const MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS: usize = 128;
 
 /// Whether `gl_dep`'s pin is diagnosable as a mutable tag ref — either because it was
 /// already classified [`PinStyle::Tag`] from its text shape, or because `tag_index`'s live
@@ -706,8 +703,7 @@ fn mutable_ref_pin_diagnostics(
                 .version_req
                 .as_ref()
                 .map(deps_core::VersionReq::as_str)?;
-            let tag =
-                sanitize_and_truncate_for_diagnostic(tag, MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS);
+            let tag = sanitize_and_truncate_for_diagnostic(tag, MAX_DIAGNOSTIC_VALUE_CHARS);
 
             // Issue #643/S1,S2: `sha_pin_quickfix_kind` is the single source of truth for
             // whether a quickfix is actually available for this dependency — the same

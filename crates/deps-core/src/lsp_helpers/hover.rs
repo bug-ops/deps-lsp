@@ -14,7 +14,8 @@ use crate::{
 };
 
 use super::diagnostics::{
-    MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS,
+    MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_PROSE_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS,
+    MAX_VERSION_DIAGNOSTIC_CHARS,
 };
 use super::{
     EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, await_versions_fetch, escape_markdown,
@@ -1068,16 +1069,13 @@ fn push_trust_signal_hover_section(markdown: &mut String, signal: Option<&Supply
 /// excessive number of license entries for a single version (security review S3-1).
 const MAX_LICENSE_ENTRIES_RENDERED: usize = 8;
 
-/// Cap on how many characters of a single license identifier
-/// [`format_license_list`] renders before truncating it — mirrors
-/// `diagnostics::MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`'s reasoning for the same
-/// untrusted-registry-string concern (security review S3-1).
-const MAX_LICENSE_ID_CHARS: usize = 128;
-
 /// Formats a license list as comma-separated Markdown code spans, e.g. `` `MIT`, `Apache-2.0` ``.
-/// Each identifier is truncated at [`MAX_LICENSE_ID_CHARS`] and the list itself capped at
-/// [`MAX_LICENSE_ENTRIES_RENDERED`] entries (with a "(+N more)" suffix) — `licenses` is
-/// registry-reported data, not validated or bounded upstream.
+/// Each identifier is truncated at [`MAX_DIAGNOSTIC_VALUE_CHARS`] — reuses
+/// `diagnostics::MAX_DIAGNOSTIC_VALUE_CHARS` directly (issue #1278) rather than declaring a
+/// separate constant, for the same untrusted-registry-string concern (security review
+/// S3-1) — and the list itself capped at [`MAX_LICENSE_ENTRIES_RENDERED`] entries (with a
+/// "(+N more)" suffix) — `licenses` is registry-reported data, not validated or bounded
+/// upstream.
 fn format_license_list(licenses: &[String]) -> String {
     let shown = licenses.len().min(MAX_LICENSE_ENTRIES_RENDERED);
     #[expect(
@@ -1087,7 +1085,12 @@ fn format_license_list(licenses: &[String]) -> String {
     )]
     let mut rendered: Vec<String> = licenses[..shown]
         .iter()
-        .map(|l| markdown_code_span(&super::truncate_for_diagnostic(l, MAX_LICENSE_ID_CHARS)))
+        .map(|l| {
+            markdown_code_span(&super::truncate_for_diagnostic(
+                l,
+                MAX_DIAGNOSTIC_VALUE_CHARS,
+            ))
+        })
         .collect();
     let remaining = licenses.len() - shown;
     if remaining > 0 {
