@@ -1577,4 +1577,13 @@ mod tests {
             "there is nothing here to redact: {log:?}"
         );
     }
+
+    deps_core::debug_redaction_conformance!(
+        test_requirement_ref_debug_redacts_credentials,
+        1,
+        RequirementRef {
+            range: deps_core::position::Range::default(),
+            target: deps_core::conformance::CREDENTIAL_PROBE_URL.to_string(),
+        },
+    );
 }

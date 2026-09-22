@@ -671,7 +671,7 @@ impl MarkedScalar {
 /// M3, #1138): `display_name` and `replacement` are both `String`, and a tuple return lets a
 /// future [`ShaPinning`] implementor transpose them silently.
 #[cfg(feature = "lsp-responses")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedShaPin {
     /// The dependency's human-readable name, for the quickfix title ("Pin `{display_name}`
     /// to commit SHA").
@@ -681,6 +681,22 @@ pub struct ResolvedShaPin {
     /// The commit-SHA text (plus any ecosystem-specific trailing comment, e.g. GitHub
     /// Actions' `{sha} # {tag}`) to splice into `version_range`.
     pub replacement: String,
+}
+
+#[cfg(feature = "lsp-responses")]
+impl std::fmt::Debug for ResolvedShaPin {
+    /// Manual, not derived: `display_name` is a raw dependency name — the weaker #1217
+    /// name-shape sibling of the #1222 sweep (#1237).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedShaPin")
+            .field(
+                "display_name",
+                &crate::net_policy::redact_declaration_key(&self.display_name),
+            )
+            .field("version_range", &self.version_range)
+            .field("replacement", &self.replacement)
+            .finish()
+    }
 }
 
 /// Resolves the *static* — warm-`TagIndex`-only, no live fetch — "pin a mutable ref to an
@@ -1505,4 +1521,15 @@ mod tests {
         let dep = sha_pin_test_dep("not-resolvable");
         assert!(sha_pin_text_edit(&MockFormatter, &dep).is_none());
     }
+
+    #[cfg(feature = "lsp-responses")]
+    crate::debug_redaction_conformance!(
+        test_resolved_sha_pin_debug_redacts_credentials,
+        1,
+        ResolvedShaPin {
+            display_name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            version_range: Range::default(),
+            replacement: "a".repeat(40),
+        },
+    );
 }

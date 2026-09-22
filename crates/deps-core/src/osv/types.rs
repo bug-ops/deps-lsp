@@ -45,7 +45,7 @@ use crate::lsp_helpers::is_safe_version_string;
 /// assert_eq!(target.key, target.osv_name);
 /// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ScanTarget {
     /// This project's internal lookup key — used to key [`VulnerabilityMap`].
     pub key: String,
@@ -60,6 +60,22 @@ pub struct ScanTarget {
     /// rewrite), for callers that need to display it back to the user rather
     /// than send it to OSV.
     pub display_version: String,
+}
+
+impl std::fmt::Debug for ScanTarget {
+    /// Manual, not derived: `key`/`osv_name` are raw package names — the weaker #1217
+    /// name-shape sibling of the #1222 sweep (#1237).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScanTarget")
+            .field("key", &crate::net_policy::redact_declaration_key(&self.key))
+            .field(
+                "osv_name",
+                &crate::net_policy::redact_declaration_key(&self.osv_name),
+            )
+            .field("version", &self.version)
+            .field("display_version", &self.display_version)
+            .finish()
+    }
 }
 
 impl ScanTarget {
@@ -87,6 +103,22 @@ impl ScanTarget {
             display_version,
         }
     }
+}
+
+#[cfg(test)]
+mod scan_target_debug_redaction_tests {
+    use super::ScanTarget;
+
+    crate::debug_redaction_conformance!(
+        test_scan_target_debug_redacts_credentials,
+        2,
+        ScanTarget {
+            key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            osv_name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            version: "1.0.0".to_string(),
+            display_version: "1.0.0".to_string(),
+        },
+    );
 }
 
 /// Severity bucket derived from an OSV advisory record.

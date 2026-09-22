@@ -383,7 +383,7 @@ fn looks_like_valid_pep508_name(name: &str) -> bool {
 /// Output-only: constructed internally by `parser::requirements`, never by external code —
 /// no constructor is provided.
 #[non_exhaustive]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RequirementRef {
     /// Source range of the referenced path text on the option line.
     pub range: Range,
@@ -392,6 +392,20 @@ pub struct RequirementRef {
     /// containing document's URI in `PypiEcosystem`'s
     /// [`Ecosystem::generate_document_links`](deps_core::Ecosystem::generate_document_links) override.
     pub target: String,
+}
+
+impl std::fmt::Debug for RequirementRef {
+    /// Manual, not derived: `target` is a raw `-r`/`-c` reference path — the weaker #1217
+    /// name-shape sibling of the #1222 sweep (#1237).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequirementRef")
+            .field("range", &self.range)
+            .field(
+                "target",
+                &deps_core::net_policy::redact_declaration_key(&self.target),
+            )
+            .finish()
+    }
 }
 
 /// Parse result containing all dependencies from a Python dependency manifest.
