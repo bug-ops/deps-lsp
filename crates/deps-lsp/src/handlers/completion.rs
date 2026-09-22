@@ -6,13 +6,11 @@ use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
 use deps_core::completion::{COMPLETION_SEARCH_TIMEOUT, is_valid_completion_prefix_len};
-use deps_core::{is_safe_package_name, is_safe_version_string, lsp_helpers::warn_rejected_value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::{
-    CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
-    InsertTextFormat,
+    CompletionItem, CompletionList, CompletionParams, CompletionResponse, Range,
 };
 
 // Keystroke-driven, so completion gets its own short timeout instead of sharing the 30s
@@ -317,21 +315,23 @@ async fn search_packages(
 
 /// Creates a completion item for a package.
 ///
-/// The insert text mirrors the ecosystem's own manifest syntax, via
-/// [`deps_core::Ecosystem::completion_insert_text`] — required, no default, so a new
+/// Delegates the shared fields (`label`, `kind`, `detail`, `documentation`, `sort_text`,
+/// `filter_text`) to [`deps_core::completion::build_package_completion`] — including its
+/// [`deps_core::is_safe_package_name`]/[`deps_core::is_safe_version_string`] gates (issue
+/// #1284: this fallback path and the primary completion path must reject the same unsafe
+/// metadata and render the same fields the same way, not diverge silently) — then
+/// overrides only what this raw-text fallback path genuinely needs: `insert_text`, via
+/// the ecosystem's own manifest syntax
+/// ([`deps_core::Ecosystem::completion_insert_text`] — required, no default, so a new
 /// ecosystem must supply its own snippet instead of silently inheriting another
-/// ecosystem's syntax (see issue #118).
+/// ecosystem's syntax, see issue #118), and `text_edit`, dropped because this path has no
+/// known insert range (the client falls back to inserting `insert_text` at the cursor).
 ///
-/// Returns `None` when `latest` (whenever non-empty) fails
-/// [`is_safe_version_string`], `name` fails [`is_safe_package_name`], or the
-/// ecosystem's own `completion_insert_text`/`fallback_bare_insert_text` rejects the
-/// metadata for an ecosystem-specific reason (a Maven `groupId`/`artifactId`
-/// breakout, an unsafe Swift repository URL, GitHub Actions' `owner/repo` shape).
-/// `metadata` comes straight from a registry search response, so a
-/// malicious/compromised registry must not be able to write structural characters
-/// into the manifest this text is inserted into. The two upfront gates run here,
-/// once, rather than being re-implemented by every `completion_insert_text`/
-/// `fallback_bare_insert_text` override — see those methods' docs.
+/// Returns `None` when [`deps_core::completion::build_package_completion`] does (see its
+/// doc for the rejection gates), or when the ecosystem's own `completion_insert_text`/
+/// `fallback_bare_insert_text` rejects the metadata for an ecosystem-specific reason (a
+/// Maven `groupId`/`artifactId` breakout, an unsafe Swift repository URL, GitHub Actions'
+/// `owner/repo` shape).
 ///
 /// `bare` (from `fallback_completion`'s `Ecosystem::fallback_completion_is_bare`
 /// call) selects which of the two ecosystem hooks builds `insert_text`: `true`
@@ -343,50 +343,16 @@ fn create_package_completion_item(
     ecosystem: &dyn deps_core::Ecosystem,
     bare: bool,
 ) -> Option<CompletionItem> {
-    let name = metadata.name();
-    let latest = metadata.latest_version().as_str();
-    let description = metadata.description();
+    let mut item = deps_core::completion::build_package_completion(metadata, Range::default())?;
 
-    if !is_safe_package_name(name.as_str()) {
-        warn_rejected_value(
-            "is_safe_package_name",
-            "package name completion item",
-            name.as_str(),
-        );
-        return None;
-    }
-
-    if !latest.is_empty() && !is_safe_version_string(latest) {
-        warn_rejected_value(
-            "is_safe_version_string",
-            "package name completion item",
-            latest,
-        );
-        return None;
-    }
-
-    let insert_text = if bare {
+    item.insert_text = Some(if bare {
         ecosystem.fallback_bare_insert_text(metadata)?
     } else {
         ecosystem.completion_insert_text(metadata)?
-    };
+    });
+    item.text_edit = None;
 
-    let detail = if latest.is_empty() {
-        None
-    } else {
-        Some(format!("Latest: {latest}"))
-    };
-
-    Some(CompletionItem {
-        label: name.as_str().to_string(),
-        kind: Some(CompletionItemKind::MODULE),
-        detail,
-        documentation: description
-            .map(|d| tower_lsp_server::ls_types::Documentation::String(d.into())),
-        insert_text: Some(insert_text),
-        insert_text_format: Some(InsertTextFormat::PLAIN_TEXT),
-        ..Default::default()
-    })
+    Some(item)
 }
 
 #[cfg(test)]
@@ -395,7 +361,7 @@ mod tests {
     use crate::document::DocumentState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use tower_lsp_server::ls_types::{
-        Position, TextDocumentIdentifier, TextDocumentPositionParams,
+        CompletionItemKind, Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
 
     struct MockFormatter;
@@ -1906,6 +1872,42 @@ ser"
                 .and_then(|item| item.insert_text),
             Some("bare:guava".to_string())
         );
+    }
+
+    // #1284: fallback item must agree with the primary builder on every shared field.
+    #[test]
+    fn test_create_package_completion_item_agrees_with_primary_builder_on_shared_fields() {
+        let meta = MockMetadata {
+            name: deps_core::PackageName::new("serde"),
+            latest_version: "1.0.214".into(),
+        };
+        let ecosystem = MockEcosystem {
+            ecosystem_id: deps_core::EcosystemId::Cargo,
+            registry: Arc::new(NoopRegistry),
+            fallback_prefix: None,
+            insert_text: default_insert_text,
+            is_bare: false,
+            bare_insert_text: default_insert_text,
+        };
+
+        let primary = deps_core::completion::build_package_completion(
+            &meta,
+            tower_lsp_server::ls_types::Range::default(),
+        )
+        .unwrap();
+        let fallback = create_package_completion_item(&meta, &ecosystem, false).unwrap();
+
+        assert_eq!(fallback.label, primary.label);
+        assert_eq!(fallback.kind, primary.kind);
+        assert_eq!(fallback.sort_text, primary.sort_text);
+        assert_eq!(fallback.filter_text, primary.filter_text);
+        assert_eq!(fallback.detail, primary.detail);
+        assert_eq!(fallback.documentation, primary.documentation);
+        assert_eq!(fallback.insert_text_format, primary.insert_text_format);
+
+        // Diverges by design: no known insert range in the fallback path.
+        assert!(fallback.text_edit.is_none());
+        assert!(primary.text_edit.is_some());
     }
 
     #[tokio::test(start_paused = true)]
