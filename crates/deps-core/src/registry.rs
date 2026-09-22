@@ -310,6 +310,32 @@ pub trait Registry: Send + Sync {
         limit: usize,
     ) -> BoxFuture<'a, Result<Vec<Box<dyn Metadata>>>>;
 
+    /// Whether [`search_raw`](Self::search_raw) matches `query` against a *normalized* form
+    /// of package names rather than the raw typed text.
+    ///
+    /// A `true` implementor guarantees its search is performed against normalized names (e.g.
+    /// PyPI's PEP 503 normalization, which folds `-`/`_`/`.` together), so a returned
+    /// [`Metadata::name`] is not guaranteed to be a literal subsequence of the raw `query` an
+    /// LSP client typed — the caller must not assume `filter_text` defaulting to `label` will
+    /// still match client-side. Callers use this to decide whether a completion response needs
+    /// its `filter_text` rewritten to the raw typed prefix (see
+    /// [`crate::completion::apply_raw_prefix_filter_text`]).
+    ///
+    /// Default `false` — the correct answer for every registry whose search already matches
+    /// literal substrings/prefixes of the raw query, which is every registry in this workspace
+    /// except `deps-pypi`'s `PypiRegistry` (see that crate's own override).
+    ///
+    /// An implementor returning `true` must be paired with its owning
+    /// `Ecosystem::package_search_is_incomplete` also returning `true`: the client re-issuing a
+    /// fresh search on the very next keystroke (and so discarding this response's rewritten
+    /// `filter_text` rather than continuing to filter it locally forever) is what makes the
+    /// rewrite in [`crate::completion::apply_raw_prefix_filter_text`] safe. This crate has no
+    /// compile-time way to enforce that pairing across the two traits — it is a contract on the
+    /// implementor, not a checked invariant.
+    fn search_normalizes_query(&self) -> bool {
+        false
+    }
+
     /// Index of the latest version in `versions` satisfying `req`, with no I/O.
     ///
     /// Filter with [`RemovalStatus::blocks_resolution`], never with

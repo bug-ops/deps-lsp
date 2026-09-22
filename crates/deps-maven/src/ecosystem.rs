@@ -233,13 +233,13 @@ async fn complete_self_closing_version(
 
 /// Builds a completion item for one field of a Maven coordinate.
 ///
-/// Reuses [`deps_core::completion::build_package_completion`] for documentation/detail
+/// Reuses [`deps_core::completion::build_package_completion_fields`] for documentation/detail
 /// formatting, then overrides the insertable text to just the requested field so it fits
 /// the single `<groupId>` or `<artifactId>` tag the cursor is inside. `replace_range` must
 /// span the entire existing tag value, not just the already-typed prefix (see
-/// [`MavenEcosystem::detect_xml_context`]) — the base builder's own range is a placeholder
-/// `(0,0)-(0,0)` that does not contain the real cursor position and would corrupt the
-/// document if used as-is.
+/// [`MavenEcosystem::detect_xml_context`]) — the base builder supplies no `insert_text`/
+/// `text_edit` at all, so this override is required, not a correction of a placeholder
+/// range.
 ///
 /// Returns `None` when the requested field's value doesn't pass
 /// [`is_safe_maven_coordinate_segment`], or when the base builder itself rejects the
@@ -272,20 +272,15 @@ fn build_field_completion(
         return None;
     }
 
-    let mut item = deps_core::completion::build_package_completion(
-        artifact,
-        LspRange::default(),
-        index,
-        prefix,
-    )?;
+    let mut item = deps_core::completion::build_package_completion_fields(artifact, index, prefix)?;
 
     item.insert_text = Some(value.clone());
     item.filter_text = Some(value.clone());
-    // `build_package_completion`'s own `sort_text` ties `prefix` to `artifact.name()`
+    // `build_package_completion_fields`'s own `sort_text` ties `prefix` to `artifact.name()`
     // (the full `group:artifact` coordinate), which is the wrong candidate for a bare
     // `artifactId` field completion — recompute it against `value` instead (#1282 S2).
-    // This discards the sort_text `build_package_completion` already computed above; not
-    // worth restructuring that function's signature to avoid one extra string format on
+    // This discards the sort_text `build_package_completion_fields` already computed above;
+    // not worth restructuring that function's signature to avoid one extra string format on
     // a result list capped at 20-50 items.
     item.sort_text = Some(deps_core::completion::build_completion_sort_text(
         index, prefix, &value,
