@@ -55,16 +55,34 @@ impl std::fmt::Debug for AuthToken {
     }
 }
 
+/// Fixed message shared by [`gitlab_rate_limit_error`] and [`gitlab_rate_limit_error_verified`]
+/// — the only difference between the two is [`DepsError::RateLimited`]'s `verified` flag.
+const GITLAB_RATE_LIMIT_MESSAGE: &str = "GitLab API rate limit exceeded or authentication required. Set \
+     GITLAB_TOKEN to a GitLab Personal/Project Access Token to increase the \
+     limit and access private projects.";
+
 /// The actionable error returned when a request hits GitLab's rate limit, or a 401/403
 /// with no `GITLAB_TOKEN` configured (spec FR-014).
+///
+/// Inferred from a bare status code, like `deps_core::github::github_rate_limit_error` before
+/// #1295 — this crate has the same unverified-403 ambiguity, out of scope here (`verified:
+/// false`). Use [`gitlab_rate_limit_error_verified`] instead when the response already
+/// confirmed exhaustion.
 #[must_use]
 pub fn gitlab_rate_limit_error() -> DepsError {
-    DepsError::RateLimited {
-        message: "GitLab API rate limit exceeded or authentication required. Set \
-                   GITLAB_TOKEN to a GitLab Personal/Project Access Token to increase the \
-                   limit and access private projects."
-            .into(),
-    }
+    // `DepsError::rate_limited`, not a struct literal: `RateLimited` is `#[non_exhaustive]`.
+    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, false)
+}
+
+/// Same message as [`gitlab_rate_limit_error`], but `verified: true` (#1295 critic N2).
+///
+/// `crate::registry::GitlabCiRegistry::map_error` uses this instead of passing the
+/// `deps_core::cache`-classified error through with its registry-neutral message, so a
+/// confirmed rate limit still gets GitLab's `GITLAB_TOKEN` remedy rather than a strictly less
+/// helpful generic message than the unverified guess gives.
+#[must_use]
+pub fn gitlab_rate_limit_error_verified() -> DepsError {
+    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, true)
 }
 
 /// GitLab tags API response item (`GET /projects/:id/repository/tags`).

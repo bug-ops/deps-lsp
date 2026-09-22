@@ -654,24 +654,27 @@ fn is_configured_token(token: Option<String>) -> bool {
 
 /// Unwraps `result`, or returns `None` after printing a skip notice on an expected rate limit.
 ///
-/// The skip case is `result` holding an `Err` that is a [`crate::DepsError::RateLimited`]
-/// with no `GITHUB_TOKEN` configured — the expected shape for an unauthenticated GitHub-backed
-/// live test hitting the 60 req/h cap (#1283). `test_name` is included in the skip notice and
-/// any panic message, to identify which test emitted them when run with `--no-fail-fast`.
+/// The skip case is `result` holding an `Err` that is a **verified**
+/// [`crate::DepsError::RateLimited`] with no `GITHUB_TOKEN` configured — the expected shape for
+/// an unauthenticated GitHub-backed live test hitting the 60 req/h cap (#1283). `test_name` is
+/// included in the skip notice and any panic message, to identify which test emitted them when
+/// run with `--no-fail-fast`.
 ///
-/// Known limitation: every unauthenticated GitHub 403 maps to `RateLimited` (see
-/// `crate::github`'s call sites), without narrowing on a response header (e.g.
-/// `X-RateLimit-Remaining: 0`) to confirm true rate-limit exhaustion versus another 403 cause
-/// (abuse-detection false positive, secondary rate limit, an access-restricted repo). An
-/// unauthenticated run can therefore still skip a genuine 403-shaped regression as if it were
-/// an expected rate limit. Narrowing this would need response-header plumbing through
-/// `crate::cache`/`DepsError` — out of scope for the test-skip helper itself (#1283 follow-up).
+/// #1295 fix: `RateLimited { verified: true, .. }` is produced only when `crate::cache`
+/// confirmed genuine exhaustion via the response's `X-RateLimit-Remaining: 0` (primary limit)
+/// or a `Retry-After` header (secondary limit, which does not always zero out `remaining` —
+/// critic S4) on a 403/429. Real GitHub API responses carry at least one of these on a true
+/// rate limit, so a live unauthenticated run reliably gets `verified: true` on that path. An
+/// unauthenticated 403 with neither signal still classifies as `RateLimited`, but with
+/// `verified: false` — it falls through to the panic arm below instead of being silently
+/// skipped, since it could be an abuse-detection false positive, an access-restricted repo, or
+/// a genuine regression.
 ///
 /// # Panics
 ///
-/// Panics on any error other than `RateLimited`, and on `RateLimited` itself when
-/// `GITHUB_TOKEN` *is* configured — in both cases the rate limit was not the expected cause,
-/// so the failure is surfaced rather than silently skipped.
+/// Panics on any error other than a *verified* `RateLimited`, and on a verified `RateLimited`
+/// itself when `GITHUB_TOKEN` *is* configured — in both cases the confirmed rate limit was not
+/// the expected cause, so the failure is surfaced rather than silently skipped.
 ///
 /// # Examples
 ///
@@ -702,7 +705,11 @@ fn rate_limit_skip_decision<T>(
 ) -> Option<T> {
     match result {
         Ok(value) => Some(value),
-        Err(crate::DepsError::RateLimited { message }) if !token_configured => {
+        Err(crate::DepsError::RateLimited {
+            message,
+            verified: true,
+            ..
+        }) if !token_configured => {
             eprintln!(
                 "{test_name}: skipping — GitHub API rate-limited and no GITHUB_TOKEN is \
                  configured: {message}"
@@ -796,11 +803,27 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_skip_decision_skips_on_rate_limit_without_token() {
+    fn rate_limit_skip_decision_skips_on_verified_rate_limit_without_token() {
         let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
             message: "rate limited".to_string(),
+            verified: true,
+            source_status: Some(403),
         });
         assert_eq!(rate_limit_skip_decision(result, "unit-test", false), None);
+    }
+
+    /// #1295 regression: an *unverified* rate-limit classification (no `X-RateLimit-Remaining`
+    /// evidence — could be an unrelated 403 cause) must not be silently skipped, even without
+    /// a token configured.
+    #[test]
+    #[should_panic(expected = "unexpected error")]
+    fn rate_limit_skip_decision_panics_on_unverified_rate_limit_without_token() {
+        let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
+            message: "rate limited".to_string(),
+            verified: false,
+            source_status: None,
+        });
+        let _ = rate_limit_skip_decision(result, "unit-test", false);
     }
 
     #[test]
@@ -817,6 +840,8 @@ mod tests {
     fn rate_limit_skip_decision_panics_on_rate_limit_with_token_configured() {
         let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
             message: "rate limited".to_string(),
+            verified: true,
+            source_status: Some(403),
         });
         let _ = rate_limit_skip_decision(result, "unit-test", true);
     }
