@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `completion::build_package_completion` gates a search result's `repository`/`documentation` URL through `is_safe_registry_url` before embedding it as a Markdown link destination, dropping a `javascript:`/`data:`/non-HTTPS URL instead of only backslash-escaping it; a `http://`/`git+ssh://`/`git://` repository link is now also dropped rather than rendered, since only `https://` passes the gate (resolves #1285) (#1293)
 - **deps-core**: `completion::build_package_completion` now rejects the whole completion item outright when the registry-supplied `latest_version` fails `is_safe_version_string`, instead of rendering a `detail`/documentation-header field built from an unbounded or bidi-bearing value; a passing value is additionally sanitized and length-capped in both fields as defense-in-depth (resolves #1286) (#1293)
 - **deps-core**: `completion::build_feature_completion` now gates registry-supplied `feature_name` through `is_safe_feature_name` before it reaches the completion item's `label`/`insert_text`/`text_edit`/`sort_text`, dropping the item outright on a malformed or spoofed name (resolves #1296)
+- **deps-npm**: pnpm catalog hover now sanitizes the invisible-character class as strongly as the sibling diagnostic message, closing a gap where a non-bidi Unicode format character survived into hover but not the diagnostic (resolves #1266) (#1313)
 
 ### Fixed
 - **deps-core, deps-maven, deps-swift**: package-name completion items now preserve the registry's own relevance ranking in `sort_text` (tiering an exact-prefix match ahead of a same-rank fuzzy match) instead of forcing alphabetical client-side sorting (resolves #1282) (#1293)
@@ -45,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)
+- **deps-core, deps-github-actions, deps-gitlab-ci, deps-npm**: six of the nine `= 128` diagnostic-value length-cap constants now share one `deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`, removing a duplicate `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` independently declared in two crates (resolves #1278) (#1313)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)

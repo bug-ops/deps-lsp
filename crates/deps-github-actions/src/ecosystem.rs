@@ -486,20 +486,6 @@ fn extract_prefix(line: &str, character: u32) -> &str {
     deps_core::fallback_completion::raw_prefix(line, character)
 }
 
-/// Builds one mutable-ref-pin [`Diagnostic`] (issue #473) per diagnosable-as-tag step in
-/// `parse_result` — every `PinStyle::Tag` step, plus a `PinStyle::Branch` step
-/// `tag_index` confirms is actually a real tag (issue #551, e.g.
-/// `taiki-e/install-action@cargo-deny`: see [`is_registry_confirmed_tag`]).
-/// `PinStyle::Sha` and a `PinStyle::Branch` `tag_index` cannot (yet) confirm produce no
-/// diagnostic (FR-003).
-/// Maximum character count of `mutable_ref_pin_diagnostics`' interpolated `name`/`tag`
-/// values before truncation (security audit finding). Mirrors
-/// `deps_core::lsp_helpers::diagnostics`' `MAX_BLOCKED_REGISTRY_MESSAGE_VALUE_CHARS`
-/// precedent: nothing upstream caps a workflow file's `owner/repo` or ref text length, so
-/// this is the last chokepoint before either renders inline in the editor, re-sent on
-/// every `publishDiagnostics`.
-const MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS: usize = 128;
-
 /// Whether `gha_dep` is structurally eligible for GitHub Actions' static "pin to commit
 /// SHA" resolution — `PinStyle::Tag` plus the two shape guards
 /// [`deps_core::lsp_helpers::ShaPinning::resolve_static_sha_pin`] enforces before it ever
@@ -527,6 +513,12 @@ pub(crate) fn is_sha_pinnable_tag(gha_dep: &GithubActionsDependency) -> bool {
     gha_dep.pin == Some(PinStyle::Tag) && gha_dep.is_plain_scalar && gha_dep.is_last_on_line
 }
 
+/// Builds one mutable-ref-pin [`Diagnostic`] (issue #473) per diagnosable-as-tag step in
+/// `parse_result` — every `PinStyle::Tag` step, plus a `PinStyle::Branch` step
+/// `tag_index` confirms is actually a real tag (issue #551, e.g.
+/// `taiki-e/install-action@cargo-deny`: see [`is_registry_confirmed_tag`]).
+/// `PinStyle::Sha` and a `PinStyle::Branch` `tag_index` cannot (yet) confirm produce no
+/// diagnostic (FR-003).
 fn mutable_ref_pin_diagnostics(
     parse_result: &dyn ParseResultTrait,
     severity: Severity,
@@ -548,7 +540,7 @@ fn mutable_ref_pin_diagnostics(
             let name = deps_core::lsp_helpers::redact_name_for_diagnostic(&gha_dep.name);
             let tag = deps_core::lsp_helpers::sanitize_and_truncate_for_diagnostic(
                 tag,
-                MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS,
+                deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS,
             );
             // Critic C2 (#551): a registry-confirmed `PinStyle::Branch` has no automated fix
             // (`build_sha_pin_action` stays restricted to `PinStyle::Tag`, FR-005) — the
