@@ -738,26 +738,24 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
-                        std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec!["1.1.0".to_string()],
-                            url: String::new(),
-                        }),
-                        std::sync::Arc::new(Advisory {
-                            id: "A2".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::Critical,
-                            cvss_vector: None,
-                            fixed_versions: vec!["1.2.0".to_string()],
-                            url: String::new(),
-                        }),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["1.1.0".to_string()]),
+                        ),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A2".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::Critical,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        ),
                     ],
                     2,
                 ),
@@ -825,26 +823,24 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
-                        std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec!["3.0.0".to_string()],
-                            url: String::new(),
-                        }),
-                        std::sync::Arc::new(Advisory {
-                            id: "A2".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::Medium,
-                            cvss_vector: None,
-                            fixed_versions: vec!["1.2.0".to_string()],
-                            url: String::new(),
-                        }),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["3.0.0".to_string()]),
+                        ),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A2".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::Medium,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        ),
                     ],
                     2,
                 ),
@@ -902,26 +898,23 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
-                        std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec![],
-                            url: String::new(),
-                        }),
-                        std::sync::Arc::new(Advisory {
-                            id: "A2".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::Medium,
-                            cvss_vector: None,
-                            fixed_versions: vec!["1.2.0".to_string()],
-                            url: String::new(),
-                        }),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id"),
+                        ),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A2".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::Medium,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        ),
                     ],
                     2,
                 ),
@@ -977,16 +970,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
@@ -1042,16 +1034,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 // A1 is claimed (it's the only advisory, with a known fix, and nothing
@@ -1111,26 +1102,23 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
-                        std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec!["1.2.0".to_string()],
-                            url: String::new(),
-                        }),
-                        std::sync::Arc::new(Advisory {
-                            id: "A2".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::Medium,
-                            cvss_vector: None,
-                            fixed_versions: vec![],
-                            url: String::new(),
-                        }),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        ),
+                        std::sync::Arc::new(
+                            Advisory::new(
+                                "A2".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::Medium,
+                            )
+                            .expect("valid osv id"),
+                        ),
                     ],
                     2,
                 ),
@@ -1188,16 +1176,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -1244,16 +1231,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["2.0.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["2.0.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -1308,16 +1294,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -1367,16 +1352,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -1540,16 +1524,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0\", \"evil\": \"true".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0\", \"evil\": \"true".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -1643,16 +1626,15 @@ mod tests {
             vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "GHSA-log4j".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::Critical,
-                        cvss_vector: None,
-                        fixed_versions: vec!["2.17.1".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "GHSA-log4j".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::Critical,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["2.17.1".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -1725,16 +1707,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.5".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.5".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -1852,16 +1833,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.0.2".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.0.2".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -1916,16 +1896,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -1983,16 +1962,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -2052,16 +2030,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.2.0".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -2413,16 +2390,15 @@ mod tests {
             "pkg".to_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
-                    vec![std::sync::Arc::new(Advisory {
-                        id: "A1".to_string(),
-                        modified: "2023-01-01T00:00:00Z".to_string(),
-                        summary: None,
-                        aliases: vec![],
-                        severity: VulnSeverity::High,
-                        cvss_vector: None,
-                        fixed_versions: vec!["1.0.2".to_string()],
-                        url: String::new(),
-                    })],
+                    vec![std::sync::Arc::new(
+                        Advisory::new(
+                            "A1".to_string(),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec!["1.0.2".to_string()]),
+                    )],
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
@@ -2700,16 +2676,15 @@ mod tests {
                 "serde".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
-                        vec![std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec!["2.0.0".to_string()],
-                            url: String::new(),
-                        })],
+                        vec![std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["2.0.0".to_string()]),
+                        )],
                         1,
                     ),
                     fix_target_status: UpgradeStatus::NotChecked,
@@ -3386,16 +3361,15 @@ mod tests {
                 "pkg".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
-                        vec![std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
-                            fixed_versions: vec!["5.5.5".to_string()],
-                            url: String::new(),
-                        })],
+                        vec![std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["5.5.5".to_string()]),
+                        )],
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {
@@ -3469,17 +3443,16 @@ mod tests {
                 "pkg".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
-                        vec![std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
+                        vec![std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
                             // Same target as the unsat fix's cached `latest` below.
-                            fixed_versions: vec!["9.9.9".to_string()],
-                            url: String::new(),
-                        })],
+                            .with_fixed_versions(vec!["9.9.9".to_string()]),
+                        )],
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {
@@ -3531,19 +3504,18 @@ mod tests {
                 "pkg".to_string(),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
-                        vec![std::sync::Arc::new(Advisory {
-                            id: "A1".to_string(),
-                            modified: "2023-01-01T00:00:00Z".to_string(),
-                            summary: None,
-                            aliases: vec![],
-                            severity: VulnSeverity::High,
-                            cvss_vector: None,
+                        vec![std::sync::Arc::new(
+                            Advisory::new(
+                                "A1".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
                             // Different raw version than the unsat fix's cached
                             // `latest` ("9.9.9") below, but `CollidingTextFormatter`
                             // rewrites both to the same "9.9.9" text.
-                            fixed_versions: vec!["9.9.5".to_string()],
-                            url: String::new(),
-                        })],
+                            .with_fixed_versions(vec!["9.9.5".to_string()]),
+                        )],
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {

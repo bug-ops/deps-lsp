@@ -1246,16 +1246,13 @@ pub(crate) fn sample_advisory(
     id: &str,
     severity: crate::osv::VulnSeverity,
 ) -> std::sync::Arc<crate::osv::Advisory> {
-    std::sync::Arc::new(crate::osv::Advisory {
-        id: id.to_string(),
-        modified: "2023-01-01T00:00:00Z".to_string(),
-        summary: Some("Something went wrong".to_string()),
-        aliases: vec!["CVE-2020-0001".to_string()],
-        severity,
-        cvss_vector: None,
-        fixed_versions: vec!["1.2.0".to_string(), "1.5.0".to_string()],
-        url: format!("https://osv.dev/vulnerability/{id}"),
-    })
+    std::sync::Arc::new(
+        crate::osv::Advisory::new(id.to_string(), "2023-01-01T00:00:00Z".to_string(), severity)
+            .expect("valid osv id")
+            .with_summary("Something went wrong".to_string())
+            .with_aliases(vec!["CVE-2020-0001".to_string()])
+            .with_fixed_versions(vec!["1.2.0".to_string(), "1.5.0".to_string()]),
+    )
 }
 
 pub(crate) fn dep_at(name: &str) -> MockDep {

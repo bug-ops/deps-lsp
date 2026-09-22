@@ -12,7 +12,9 @@ use crate::{
     format_relative_age, is_within_cooldown,
 };
 
-use super::diagnostics::MAX_DIAGNOSTIC_NAME_CHARS;
+use super::diagnostics::{
+    MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS,
+};
 use super::{
     EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, await_versions_fetch, escape_markdown,
     in_use_version, markdown_code_span, position_in_range, resolve_in_use_version,
@@ -896,6 +898,17 @@ fn candidate_vulnerable_line_should_render(
 /// "no known vulnerabilities", and `Skipped` (or no scan at all) says
 /// **nothing**: saying "clean" about a dependency that was never queried is
 /// worse than saying nothing at all (`architecture.md` §8 invariant 0).
+///
+/// Every OSV-reported field rendered here is length- (and, for `aliases`, count-) capped
+/// before display (#1272), truncated *before* escaping (not after, unlike
+/// `push_header_hover_section`'s label) so the cap bounds the same raw-character count
+/// `diagnostics.rs`'s sibling sinks use, matching [`format_advisory_aliases`]/
+/// [`format_license_list`]'s order: `id`/`summary` ([`MAX_DIAGNOSTIC_PROSE_CHARS`], the same
+/// cap `diagnostics.rs` uses for both), `fixed_versions`/the candidate `version`
+/// ([`MAX_VERSION_DIAGNOSTIC_CHARS`]), and `aliases` ([`format_advisory_aliases`]) are all
+/// untrusted, unbounded OSV data. `advisory.url()` is exempt: [`crate::osv::Advisory::new`]
+/// derives it from the already-validated, `<= 128`-byte `id` rather than accepting it raw
+/// (#1271), so no length cap applies to it here.
 fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&ScanOutcome>) {
     use std::fmt::Write;
 
@@ -908,29 +921,39 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
                 let _ = writeln!(
                     markdown,
                     "- **[{}]({})** — {}",
-                    escape_markdown(&advisory.id),
-                    advisory.url,
+                    escape_markdown(&super::truncate_for_diagnostic(
+                        &advisory.id,
+                        MAX_DIAGNOSTIC_PROSE_CHARS
+                    )),
+                    advisory.url(),
                     severity_label(advisory.severity)
                 );
                 let _ = writeln!(
                     markdown,
                     "  {}",
-                    escape_markdown(
+                    escape_markdown(&super::truncate_for_diagnostic(
                         advisory
                             .summary
                             .as_deref()
-                            .unwrap_or("(no summary provided)")
-                    )
+                            .unwrap_or("(no summary provided)"),
+                        MAX_DIAGNOSTIC_PROSE_CHARS,
+                    ))
                 );
 
                 let mut details = Vec::with_capacity(2);
                 if let Some(fixed) = advisory.fixed_versions.last() {
-                    details.push(format!("Fixed in: {}", markdown_code_span(fixed)));
+                    details.push(format!(
+                        "Fixed in: {}",
+                        markdown_code_span(&super::truncate_for_diagnostic(
+                            fixed,
+                            MAX_VERSION_DIAGNOSTIC_CHARS
+                        ))
+                    ));
                 }
                 if !advisory.aliases.is_empty() {
                     details.push(format!(
                         "Aliases: {}",
-                        escape_markdown(&advisory.aliases.join(", "))
+                        format_advisory_aliases(&advisory.aliases)
                     ));
                 }
                 if !details.is_empty() {
@@ -952,7 +975,10 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
                 let _ = writeln!(
                     markdown,
                     "\n\u{26a0}\u{fe0f} Latest version {} is also affected.",
-                    markdown_code_span(version)
+                    markdown_code_span(&super::truncate_for_diagnostic(
+                        version,
+                        MAX_VERSION_DIAGNOSTIC_CHARS
+                    ))
                 );
             }
 
@@ -963,6 +989,29 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
         }
         Some(ScanOutcome::Skipped(_)) | None => {}
     }
+}
+
+/// Cap on how many alias identifiers (CVE, GHSA, ...) [`push_vulnerability_hover_section`]
+/// renders from one advisory before collapsing the remainder into "(+N more)" — mirrors
+/// [`MAX_LICENSE_ENTRIES_RENDERED`]'s defense-in-depth reasoning for the same kind of
+/// OSV-reported, unbounded-count list (#1272).
+const MAX_ADVISORY_ALIASES_RENDERED: usize = 8;
+
+/// Formats an advisory's alias list (CVE, GHSA, ...) as an escaped, comma-separated string:
+/// each identifier is truncated at [`MAX_DIAGNOSTIC_NAME_CHARS`] (the same id/name-shaped
+/// bound `diagnostics.rs` uses), then the count-capped join itself delegates to
+/// [`crate::licenses::join_capped`] (capped at [`MAX_ADVISORY_ALIASES_RENDERED`] entries,
+/// with a "(+N more)" suffix) rather than a fourth hand-rolled copy of that shape — `aliases`
+/// is OSV-reported, unbounded in both dimensions (#1272).
+fn format_advisory_aliases(aliases: &[String]) -> String {
+    let truncated: Vec<String> = aliases
+        .iter()
+        .map(|a| super::truncate_for_diagnostic(a, MAX_DIAGNOSTIC_NAME_CHARS).into_owned())
+        .collect();
+    escape_markdown(&crate::licenses::join_capped(
+        &truncated,
+        MAX_ADVISORY_ALIASES_RENDERED,
+    ))
 }
 
 /// Appends the hover "Supply chain" line (spec 037): one line, no `###` header,
@@ -1187,6 +1236,47 @@ mod tests {
             rendered.len() < long_id.len(),
             "an untrusted, excessively long license id must be truncated; got len {}",
             rendered.len()
+        );
+    }
+
+    /// #1272: mirrors `format_license_list_caps_entries_and_labels_the_remainder`'s pattern
+    /// for `push_vulnerability_hover_section`'s alias list, the same kind of OSV-reported,
+    /// unbounded-count list.
+    #[test]
+    fn format_advisory_aliases_caps_entries_and_labels_the_remainder() {
+        // `format_advisory_aliases` runs the joined result through `escape_markdown`
+        // (backslash-escaping every ASCII punctuation character), so assertions match
+        // against digit substrings rather than the raw `-`-containing id.
+        let aliases: Vec<String> = (0..12).map(|i| format!("CVE-2020-{i:04}")).collect();
+        let rendered = format_advisory_aliases(&aliases);
+        assert!(rendered.contains("+4 more"), "got: {rendered}");
+        assert!(rendered.contains("0000"));
+        assert!(
+            !rendered.contains("0011"),
+            "the 12th entry must not render; got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn format_advisory_aliases_truncates_an_overlong_alias() {
+        let long_alias = "A".repeat(500);
+        let rendered = format_advisory_aliases(std::slice::from_ref(&long_alias));
+        assert_eq!(
+            rendered,
+            format!("{}…", "A".repeat(MAX_DIAGNOSTIC_NAME_CHARS))
+        );
+    }
+
+    /// #1272 round 2 critic M3: `truncate_for_diagnostic` is char-based, not byte-based —
+    /// pin that a multi-byte-per-char alias is cut on a char boundary rather than
+    /// panicking or corrupting the string mid-codepoint.
+    #[test]
+    fn format_advisory_aliases_truncates_a_multi_byte_alias_on_a_char_boundary() {
+        let long_alias = "é".repeat(500);
+        let rendered = format_advisory_aliases(std::slice::from_ref(&long_alias));
+        assert_eq!(
+            rendered,
+            format!("{}…", "é".repeat(MAX_DIAGNOSTIC_NAME_CHARS))
         );
     }
 
@@ -4302,6 +4392,76 @@ mod tests {
         assert!(content.value.contains("also affected"));
     }
 
+    /// #1272: `fixed_versions`, the candidate `version`, `summary`, and `aliases` are all
+    /// untrusted, unbounded OSV data — every one of them must be capped before rendering.
+    #[test]
+    fn push_vulnerability_hover_section_caps_fixed_version_summary_and_aliases() {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+        };
+
+        let mut advisory = Advisory::new(
+            "RUSTSEC-2020-0071".to_string(),
+            "2023-01-01T00:00:00Z".to_string(),
+            VulnSeverity::High,
+        )
+        .expect("valid osv id");
+        advisory.summary = Some("S".repeat(500));
+        advisory.fixed_versions = vec!["F".repeat(500)];
+        // A non-ASCII, multi-byte-per-char alias (within the first `MAX_ADVISORY_ALIASES_RENDERED`
+        // entries, so it actually renders) pins that the per-alias cap
+        // (`truncate_for_diagnostic`) is genuinely char-based, not byte-based — a
+        // byte-based cut through a multi-byte UTF-8 sequence would panic or corrupt the
+        // string (#1272 round 2 critic M3).
+        let mut aliases: Vec<String> = (0..7).map(|i| format!("CVE-2020-{i:04}")).collect();
+        aliases.push("é".repeat(500));
+        aliases.extend((7..11).map(|i| format!("CVE-2020-{i:04}")));
+        advisory.aliases = aliases;
+
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1))
+            .with_upgrade_status(UpgradeStatus::CandidateVulnerable {
+                version: "V".repeat(500),
+                advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
+            });
+
+        let outcome = ScanOutcome::Vulnerable(dv);
+        let mut markdown = String::new();
+        push_vulnerability_hover_section(&mut markdown, Some(&outcome));
+
+        // `S`/`F`/`V` are not ASCII punctuation, so `escape_markdown`/`markdown_code_span`
+        // leave them untouched — the rendered run is pinned to exactly
+        // `MAX_DIAGNOSTIC_PROSE_CHARS`/`MAX_VERSION_DIAGNOSTIC_CHARS` chars plus the `…`
+        // marker, not merely "shorter than 500".
+        assert!(
+            markdown.contains(&format!("{}…", "S".repeat(MAX_DIAGNOSTIC_PROSE_CHARS))),
+            "summary must be truncated to exactly {MAX_DIAGNOSTIC_PROSE_CHARS} chars plus an \
+             ellipsis; got: {markdown}"
+        );
+        assert!(
+            !markdown.contains(&"S".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 1)),
+            "summary must not exceed the cap; got: {markdown}"
+        );
+        assert!(
+            markdown.contains(&format!("{}…", "F".repeat(MAX_VERSION_DIAGNOSTIC_CHARS))),
+            "fixed version must be truncated to exactly {MAX_VERSION_DIAGNOSTIC_CHARS} chars \
+             plus an ellipsis; got: {markdown}"
+        );
+        assert!(
+            markdown.contains(&format!("{}…", "V".repeat(MAX_VERSION_DIAGNOSTIC_CHARS))),
+            "candidate version must be truncated to exactly {MAX_VERSION_DIAGNOSTIC_CHARS} \
+             chars plus an ellipsis; got: {markdown}"
+        );
+        assert!(
+            markdown.contains(&format!("{}…", "é".repeat(MAX_DIAGNOSTIC_NAME_CHARS))),
+            "a multi-byte alias must be truncated on a char boundary, not a byte boundary; \
+             got: {markdown}"
+        );
+        assert!(
+            markdown.contains("+4 more"),
+            "alias list must be capped; got: {markdown}"
+        );
+    }
+
     #[tokio::test]
     async fn test_generate_hover_malicious_advisory_never_renders_unknown_severity() {
         // SC-001: a MAL-* advisory (e.g. the live MAL-2025-47141 record for
@@ -4376,8 +4536,8 @@ mod tests {
             "RUSTSEC-2024-0320".to_string(),
             "2024-11-01T12:31:51Z".to_string(),
             VulnSeverity::Informational,
-            "https://osv.dev/vulnerability/RUSTSEC-2024-0320".to_string(),
-        );
+        )
+        .expect("valid osv id");
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(

@@ -81,7 +81,11 @@ const MAX_LICENSE_POLICY_VIOLATION_LICENSE_CHARS: usize = 128;
 /// fails `crate::osv::is_valid_osv_id` (ASCII alphanumeric/`.`/`_`/`-`, `<= 128` bytes) before
 /// an `Advisory` can exist, so this cap on `id` is defense-in-depth for a state that should
 /// already be unreachable, not a fix for a reachable gap.
-const MAX_DIAGNOSTIC_PROSE_CHARS: usize = 128;
+///
+/// `pub(crate)`, not module-private: `lsp_helpers::hover`'s `push_vulnerability_hover_section`
+/// (#1272) shares this exact bound for the same `advisory.summary` field rather than declaring
+/// its own duplicate constant, per this project's shared-constant DRY rule.
+pub(crate) const MAX_DIAGNOSTIC_PROSE_CHARS: usize = 128;
 
 /// Truncates `value` to at most `max_chars` characters, appending `…` when truncated.
 ///
@@ -1933,7 +1937,7 @@ fn push_vulnerability_diagnostics(
 
     for advisory in dv.advisories.items() {
         let code_description = advisory
-            .url
+            .url()
             .parse::<url::Url>()
             .ok()
             .map(CodeDescription::new);
@@ -5765,16 +5769,13 @@ mod tests {
         let resolved_versions = HashMap::new();
 
         let overlong_summary = "X".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 50);
-        let advisory = crate::osv::Advisory {
-            id: "RUSTSEC-2020-0071".to_string(),
-            modified: "2023-01-01T00:00:00Z".to_string(),
-            summary: Some(format!("bidi\u{202E}{overlong_summary}")),
-            aliases: vec![],
-            severity: VulnSeverity::High,
-            cvss_vector: None,
-            fixed_versions: vec![],
-            url: "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
-        };
+        let advisory = crate::osv::Advisory::new(
+            "RUSTSEC-2020-0071".to_string(),
+            "2023-01-01T00:00:00Z".to_string(),
+            VulnSeverity::High,
+        )
+        .expect("valid osv id")
+        .with_summary(format!("bidi\u{202E}{overlong_summary}"));
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
@@ -5891,16 +5892,16 @@ mod tests {
         let cached_versions = HashMap::new();
         let resolved_versions = HashMap::new();
 
-        let advisory = Arc::new(Advisory {
-            id: "MAL-2025-47141".to_string(),
-            modified: "2025-09-17T06:23:36Z".to_string(),
-            summary: Some("Malicious code in @ctrl/tinycolor (npm)".to_string()),
-            aliases: vec!["GHSA-qjqf-7j6f-82c4".to_string()],
-            severity: VulnSeverity::Malicious,
-            cvss_vector: None,
-            fixed_versions: vec![],
-            url: "https://osv.dev/vulnerability/MAL-2025-47141".to_string(),
-        });
+        let advisory = Arc::new(
+            Advisory::new(
+                "MAL-2025-47141".to_string(),
+                "2025-09-17T06:23:36Z".to_string(),
+                VulnSeverity::Malicious,
+            )
+            .expect("valid osv id")
+            .with_summary("Malicious code in @ctrl/tinycolor (npm)".to_string())
+            .with_aliases(vec!["GHSA-qjqf-7j6f-82c4".to_string()]),
+        );
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(

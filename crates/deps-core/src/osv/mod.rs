@@ -1312,30 +1312,26 @@ mod tests {
     fn record_cache_evicts_oldest_when_max_entries_reached() {
         let client = client();
         for i in 0..MAX_CACHE_ENTRIES {
-            let advisory = Arc::new(Advisory {
-                id: format!("ADV-{i}"),
-                modified: "2023-01-01T00:00:00Z".to_string(),
-                summary: None,
-                aliases: vec![],
-                severity: VulnSeverity::Unknown,
-                cvss_vector: None,
-                fixed_versions: vec![],
-                url: format!("https://osv.dev/vulnerability/ADV-{i}"),
-            });
+            let advisory = Arc::new(
+                Advisory::new(
+                    format!("ADV-{i}"),
+                    "2023-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::Unknown,
+                )
+                .expect("valid osv id"),
+            );
             client.store_record_cache(&advisory);
         }
         assert_eq!(client.record_cache.len(), MAX_CACHE_ENTRIES);
 
-        let overflow = Arc::new(Advisory {
-            id: "ADV-overflow".to_string(),
-            modified: "2023-01-01T00:00:00Z".to_string(),
-            summary: None,
-            aliases: vec![],
-            severity: VulnSeverity::Unknown,
-            cvss_vector: None,
-            fixed_versions: vec![],
-            url: "https://osv.dev/vulnerability/ADV-overflow".to_string(),
-        });
+        let overflow = Arc::new(
+            Advisory::new(
+                "ADV-overflow".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                VulnSeverity::Unknown,
+            )
+            .expect("valid osv id"),
+        );
         client.store_record_cache(&overflow);
 
         assert!(
@@ -1380,16 +1376,15 @@ mod tests {
         client.record_cache.insert(
             "ADV-1".to_string(),
             RecordCacheEntry {
-                advisory: Arc::new(Advisory {
-                    id: "ADV-1".to_string(),
-                    modified: "2020-01-01T00:00:00Z".to_string(),
-                    summary: Some("stale summary".to_string()),
-                    aliases: vec![],
-                    severity: VulnSeverity::Unknown,
-                    cvss_vector: None,
-                    fixed_versions: vec![],
-                    url: "https://osv.dev/vulnerability/ADV-1".to_string(),
-                }),
+                advisory: Arc::new(
+                    Advisory::new(
+                        "ADV-1".to_string(),
+                        "2020-01-01T00:00:00Z".to_string(),
+                        VulnSeverity::Unknown,
+                    )
+                    .expect("valid osv id")
+                    .with_summary("stale summary".to_string()),
+                ),
                 modified: "2020-01-01T00:00:00Z".to_string(),
                 fetched_at: Instant::now(),
             },

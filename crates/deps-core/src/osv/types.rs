@@ -147,8 +147,8 @@ pub enum VulnSeverity {
 ///     "RUSTSEC-2020-0071".to_string(),
 ///     "2023-01-01T00:00:00Z".to_string(),
 ///     VulnSeverity::High,
-///     "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
 /// )
+/// .expect("valid osv id")
 /// .with_summary("Potential segfault in the time crate".to_string())
 /// .with_aliases(vec!["CVE-2020-26235".to_string()])
 /// .with_fixed_versions(vec!["0.2.23".to_string()]);
@@ -173,14 +173,30 @@ pub struct Advisory {
     /// empty if OSV recorded no fix. The highest entry is the one to surface
     /// as "the fix" — see `architecture.md` §6 for why the *first* one is not.
     pub fixed_versions: Vec<String>,
-    /// `https://osv.dev/vulnerability/{id}`.
-    pub url: String,
+    /// `https://osv.dev/vulnerability/{id}`, always derived from [`Self::id`] via
+    /// [`validated_osv_url`]. Private (not `pub`) rather than a plain field — see
+    /// [`Self::new`]'s doc for why (#1271). Read via [`Self::url()`].
+    url: String,
 }
 
 impl Advisory {
-    /// Constructs an `Advisory` from its required fields, with [`Self::summary`],
-    /// [`Self::aliases`], [`Self::cvss_vector`], and [`Self::fixed_versions`] left
-    /// empty/`None` — chain the corresponding `with_*` setters to attach them.
+    /// Constructs an `Advisory` from its required fields, deriving [`Self::url()`] from `id`,
+    /// with [`Self::summary`], [`Self::aliases`], [`Self::cvss_vector`], and
+    /// [`Self::fixed_versions`] left empty/`None` — chain the corresponding `with_*` setters
+    /// to attach them.
+    ///
+    /// Returns `None` if `id` fails [`is_valid_osv_id`] — mirrors
+    /// `OsvVulnRecord::into_advisory`'s own early return for the same check, so a
+    /// caller cannot construct an `Advisory` whose URL [`validated_osv_url`] could not
+    /// build safely.
+    ///
+    /// This is the only way to set the URL outside this module: unlike a merely
+    /// `#[non_exhaustive]` `pub` field — which still allows a direct field write
+    /// (`advisory.url = "...".into()`) from any crate holding an owned value — the private
+    /// `url` field makes an unvalidated/unsanitized URL structurally unconstructible from
+    /// outside this file (#1271). Mirrors `Diagnostic`'s own private-field-plus-getter
+    /// pattern for `message`/`code`, adopted there for the identical reason (closing "a
+    /// sanitization-backstop bypass via ... a direct field write").
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate (including test code) must go through this
@@ -191,7 +207,6 @@ impl Advisory {
     /// * `id` - Advisory identifier (e.g. `"RUSTSEC-2020-0071"`, `"GHSA-..."`)
     /// * `modified` - RFC3339 last-modified timestamp — not the advisory's publish date
     /// * `severity` - Derived severity bucket
-    /// * `url` - `https://osv.dev/vulnerability/{id}`
     ///
     /// # Examples
     ///
@@ -202,14 +217,15 @@ impl Advisory {
     ///     "RUSTSEC-2020-0071".to_string(),
     ///     "2023-01-01T00:00:00Z".to_string(),
     ///     VulnSeverity::High,
-    ///     "https://osv.dev/vulnerability/RUSTSEC-2020-0071".to_string(),
     /// )
+    /// .expect("valid osv id")
     /// .with_fixed_versions(vec!["0.2.23".to_string()]);
     /// assert_eq!(advisory.fixed_versions.last(), Some(&"0.2.23".to_string()));
     /// ```
     #[must_use]
-    pub fn new(id: String, modified: String, severity: VulnSeverity, url: String) -> Self {
-        Self {
+    pub fn new(id: String, modified: String, severity: VulnSeverity) -> Option<Self> {
+        let url = validated_osv_url(&id)?;
+        Some(Self {
             id,
             modified,
             summary: None,
@@ -218,7 +234,32 @@ impl Advisory {
             cvss_vector: None,
             fixed_versions: Vec::new(),
             url,
-        }
+        })
+    }
+
+    /// Returns `https://osv.dev/vulnerability/{id}` — [`Self::id`]'s advisory page on
+    /// OSV.dev.
+    ///
+    /// The only accessor for the private `url` field (#1271): every `Advisory` in existence
+    /// was built by [`Self::new`], so this value is always [`validated_osv_url`]'s output for
+    /// [`Self::id`], never an arbitrary caller-supplied string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{Advisory, VulnSeverity};
+    ///
+    /// let advisory = Advisory::new(
+    ///     "RUSTSEC-2020-0071".to_string(),
+    ///     "2023-01-01T00:00:00Z".to_string(),
+    ///     VulnSeverity::High,
+    /// )
+    /// .expect("valid osv id");
+    /// assert_eq!(advisory.url(), "https://osv.dev/vulnerability/RUSTSEC-2020-0071");
+    /// ```
+    #[must_use]
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Attaches a human-readable one-line summary. See [`Self::summary`].
@@ -551,8 +592,8 @@ impl DependencyVulnerabilities {
     ///             id.to_string(),
     ///             "2023-01-01T00:00:00Z".to_string(),
     ///             VulnSeverity::High,
-    ///             String::new(),
     ///         )
+    ///         .expect("valid osv id")
     ///         .with_fixed_versions(vec![fixed.to_string()]),
     ///     )
     /// }
@@ -1120,10 +1161,7 @@ impl OsvVulnRecord {
         fixed_versions.sort_by(|a, b| super::compare_version_strings(a, b));
         fixed_versions.dedup();
 
-        // `is_valid_osv_id(&self.id)` already passed (the early return above), so this can
-        // never actually fail — going through the shared `validated_osv_url` anyway keeps one
-        // single formula for this URL rather than a second, independent `format!` that could
-        // drift out of sync with it.
+        // Exhaustive literal (not `Advisory::new`) so a future new field fails to compile here.
         let url = validated_osv_url(&self.id)?;
 
         Some(Advisory {
@@ -1355,6 +1393,48 @@ mod osv_version_validation_tests {
         // A `/` is not in the allowlist, so a multi-segment traversal attempt embedded in the
         // id (e.g. `../evil`) can never reach `Uri` parsing in the first place.
         assert_eq!(validated_osv_url("../evil"), None);
+    }
+
+    /// #1271: `Advisory::new` takes only `id`, never a caller-supplied `url` — this asserts
+    /// the derived value actually matches `validated_osv_url`'s own formula, so the two can't
+    /// drift apart.
+    #[test]
+    fn advisory_new_derives_url_from_id() {
+        let advisory = Advisory::new(
+            "RUSTSEC-2020-0071".to_string(),
+            "2023-01-01T00:00:00Z".to_string(),
+            VulnSeverity::High,
+        )
+        .expect("valid osv id");
+        assert_eq!(
+            advisory.url(),
+            validated_osv_url("RUSTSEC-2020-0071").unwrap()
+        );
+    }
+
+    /// #1271: an id that fails `is_valid_osv_id` (and so cannot produce a safe `url`) must
+    /// make `Advisory` unconstructible via `new` — a future caller cannot bypass this by
+    /// supplying a raw `url` directly, since the constructor no longer accepts one at all.
+    #[test]
+    fn advisory_new_rejects_a_malformed_id() {
+        assert!(
+            Advisory::new(
+                "..".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .is_none()
+        );
+        // #1272 round 2 critic M4: the length cap matters at least as much as the
+        // dot-segment case for the unbounded-length story this issue is about.
+        assert!(
+            Advisory::new(
+                "A".repeat(129),
+                "2023-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .is_none()
+        );
     }
 
     /// Regression test for issue #1077 review: a record whose id is a dot-segment must be

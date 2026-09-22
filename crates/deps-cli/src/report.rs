@@ -1285,8 +1285,8 @@ mod tests {
             "RUSTSEC-2024-0001".to_string(),
             "2024-01-01T00:00:00Z".to_string(),
             VulnSeverity::High,
-            "https://osv.dev/vulnerability/RUSTSEC-2024-0001".to_string(),
-        );
+        )
+        .expect("valid osv id");
         let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
         let mut map: VulnerabilityMap = HashMap::new();
         map.insert("serde".to_string(), ScanOutcome::Vulnerable(dv));
@@ -1307,12 +1307,14 @@ mod tests {
         use std::sync::Arc;
 
         let advisory_for = |severity: VulnSeverity| {
-            Arc::new(Advisory::new(
-                "GHSA-shared-id".to_string(),
-                "2024-01-01T00:00:00Z".to_string(),
-                severity,
-                "https://osv.dev/vulnerability/GHSA-shared-id".to_string(),
-            ))
+            Arc::new(
+                Advisory::new(
+                    "GHSA-shared-id".to_string(),
+                    "2024-01-01T00:00:00Z".to_string(),
+                    severity,
+                )
+                .expect("valid osv id"),
+            )
         };
         let mut map: VulnerabilityMap = HashMap::new();
         map.insert(
