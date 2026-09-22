@@ -38,7 +38,7 @@ pub use code_lenses::{
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, generate_diagnostics_from_cache,
-    redact_name_for_diagnostic, requirement_is_unsatisfiable,
+    redact_name_for_diagnostic, redact_requirement_for_diagnostic, requirement_is_unsatisfiable,
     sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
     truncate_for_diagnostic,
 };

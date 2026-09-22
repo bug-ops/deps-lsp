@@ -142,6 +142,9 @@ async fn run_check(
     }
     for path in &walk_outcome.unrecognized_explicit_paths {
         // M4 (spec 062 review), spec §6: not fatal, does not affect the exit code.
+        // #1299 round 2: `path` is already display-sanitized by `walk::walk` at push time —
+        // `main.rs` prints every `WalkOutcome` path as-is, on the strength of that boundary
+        // invariant, not a per-print-site sanitizer call.
         eprintln!(
             "deps-cli: warning: {} is not recognized by any ecosystem",
             path.display()

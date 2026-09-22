@@ -199,6 +199,21 @@ pub struct WalkOutcome {
     pub broken_manifest_symlinks: Vec<PathBuf>,
 }
 
+/// Pushes `message` onto `outcome.walk_errors`, sanitizing it first (#1299 round 2).
+///
+/// The one chokepoint every `walk_errors` producer in this module goes through — including a
+/// third-party error's own `Display` output (`ignore::Error`, whose message can embed an
+/// attacker-controlled path verbatim, the class of leak a per-call-site `.display()` fix
+/// cannot see). Sanitizing the whole formatted message, not just an extracted path substring,
+/// is safe here: see `crate::sanitize::sanitize_message_for_display`'s doc for why.
+fn push_walk_error(outcome: &mut WalkOutcome, message: impl std::fmt::Display) {
+    outcome
+        .walk_errors
+        .push(crate::sanitize::sanitize_message_for_display(
+            &message.to_string(),
+        ));
+}
+
 /// Whether `.gitignore`/`.ignore` rules exclude manifests from the walk (issue #1109).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitignorePolicy {
@@ -345,9 +360,10 @@ fn walk_with_limit(
         // reported zero manifests. `display_path`s below are still derived relative to
         // `root` as given, so reported paths stay exactly as the caller typed them.
         let Ok(absolute_root) = std::path::absolute(root) else {
-            ctx.outcome
-                .walk_errors
-                .push(format!("could not resolve path: {}", root.display()));
+            push_walk_error(
+                &mut ctx.outcome,
+                format!("could not resolve path: {}", root.display()),
+            );
             continue;
         };
 
@@ -370,7 +386,9 @@ fn walk_with_limit(
                 &mut ctx.outcome,
             );
             if ctx.outcome.manifests.len() == matched_before {
-                ctx.outcome.unrecognized_explicit_paths.push(root.clone());
+                ctx.outcome
+                    .unrecognized_explicit_paths
+                    .push(crate::sanitize::sanitize_path_for_display(root));
             }
             continue;
         }
@@ -396,7 +414,7 @@ fn walk_with_limit(
                     break;
                 }
                 ctx.entries_walked += 1;
-                sink.push(root.clone());
+                sink.push(crate::sanitize::sanitize_path_for_display(root));
                 continue;
             }
         }
@@ -619,7 +637,9 @@ fn walk_directory(
                     if options.respect_gitignore {
                         visited.insert(display.clone());
                     }
-                    ctx.outcome.broken_manifest_symlinks.push(display);
+                    ctx.outcome
+                        .broken_manifest_symlinks
+                        .push(crate::sanitize::sanitize_path_for_display(&display));
                     true
                 } else {
                     false
@@ -627,7 +647,7 @@ fn walk_directory(
                 // Bug 3 (background review): don't also emit the generic IO error once the
                 // specific broken-manifest warning already covers this path.
                 if !classified_as_broken {
-                    ctx.outcome.walk_errors.push(error.to_string());
+                    push_walk_error(&mut ctx.outcome, error);
                 }
             }
         }
@@ -728,7 +748,7 @@ fn detect_ignored_manifests(
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
-                ctx.outcome.walk_errors.push(error.to_string());
+                push_walk_error(&mut ctx.outcome, error);
                 continue;
             }
         };
@@ -753,15 +773,20 @@ fn detect_ignored_manifests(
         match url::Url::from_file_path(path) {
             Ok(uri) => {
                 if ctx.registry.for_uri(&uri).is_some() {
-                    ctx.outcome.ignored_manifests.push(display);
+                    ctx.outcome
+                        .ignored_manifests
+                        .push(crate::sanitize::sanitize_path_for_display(&display));
                 }
             }
             Err(()) => {
-                ctx.outcome.walk_errors.push(format!(
-                    "could not convert to a file URI while checking for ignore-suppressed \
-                     manifests, skipping: {}",
-                    display.display()
-                ));
+                push_walk_error(
+                    &mut ctx.outcome,
+                    format!(
+                        "could not convert to a file URI while checking for ignore-suppressed \
+                         manifests, skipping: {}",
+                        display.display()
+                    ),
+                );
             }
         }
     }
@@ -834,7 +859,11 @@ enum SymlinkClassification {
 impl SymlinkClassification {
     /// Routes `display` to the matching `outcome` sink (no-op for `Irrelevant`) — the one place
     /// this Resolvable/Broken/Irrelevant → push/push/noop mapping lives.
+    ///
+    /// Sanitizes `display` for client-visible display (#1299 round 2) at this single push
+    /// chokepoint, rather than trusting every caller to have sanitized it already.
     fn record(self, outcome: &mut WalkOutcome, display: PathBuf) {
+        let display = crate::sanitize::sanitize_path_for_display(&display);
         match self {
             Self::Resolvable => outcome.ignored_manifests.push(display),
             Self::Broken => outcome.broken_manifest_symlinks.push(display),
@@ -907,18 +936,25 @@ fn route_file(
     registry: &EcosystemRegistry,
     outcome: &mut WalkOutcome,
 ) {
+    // #1299 round 2: sanitized once here, the single place `DiscoveredManifest` is built —
+    // every caller's `display_path` (a walk root, a `display_relative_path` result, ...)
+    // reaches display-safety through this one chokepoint rather than at each call site.
+    let display_path = crate::sanitize::sanitize_path_for_display(display_path);
     let Ok(uri) = url::Url::from_file_path(route_path) else {
-        outcome.walk_errors.push(format!(
-            "could not convert to a file URI, skipping: {}",
-            display_path.display()
-        ));
+        push_walk_error(
+            outcome,
+            format!(
+                "could not convert to a file URI, skipping: {}",
+                display_path.display()
+            ),
+        );
         return;
     };
     if let Some(ecosystem) = registry.for_uri(&uri) {
         outcome.manifests.push(DiscoveredManifest {
             path: read_path.to_path_buf(),
             uri_path: route_path.to_path_buf(),
-            display_path: display_path.to_path_buf(),
+            display_path,
             ecosystem,
         });
     }
@@ -1147,6 +1183,43 @@ mod tests {
             outcome.ignored_manifests,
             vec![PathBuf::from("vendor").join("Cargo.toml")]
         );
+    }
+
+    /// Regression test for #1299 round 2: a raw ANSI escape byte or bidi-override character in
+    /// a walked directory name must never reach a `WalkOutcome` field unsanitized — exercised
+    /// through the real `walk::walk` entry point, not `sanitize`'s own isolated unit tests, so
+    /// it actually fails if a future `WalkOutcome` push (`push_walk_error`, `route_file`,
+    /// `SymlinkClassification::record`, or a new one) bypasses the sanitization chokepoint.
+    /// Mirrors the critic's exact live-repro payload and directory shape (a manifest directly
+    /// under a pruned `vendor/`, the same scenario as the test above).
+    #[test]
+    fn test_walk_sanitizes_bidi_and_ansi_in_a_walked_directory_name() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let payload_dir = dir.path().join("ev\u{202E}il\x1B[31m");
+        fs::create_dir(&payload_dir).expect("mkdir payload dir");
+        fs::create_dir(payload_dir.join("vendor")).expect("mkdir vendor");
+        fs::write(payload_dir.join("vendor").join("Cargo.toml"), "[package]\n")
+            .expect("write manifest directly under pruned dir");
+
+        let outcome = walk(
+            &[dir.path().to_path_buf()],
+            &test_registry(),
+            GitignorePolicy::Ignore,
+            SymlinkPolicy::Skip,
+        );
+
+        assert_eq!(outcome.ignored_manifests.len(), 1);
+        let reported = outcome.ignored_manifests[0].to_string_lossy().into_owned();
+        assert!(
+            !reported.contains('\u{202E}'),
+            "bidi override survived the walk: {reported:?}"
+        );
+        assert!(
+            !reported.contains('\x1B'),
+            "raw ANSI escape byte survived the walk: {reported:?}"
+        );
+        assert!(reported.contains("vendor"), "legitimate path info lost");
+        assert!(reported.contains("Cargo.toml"), "legitimate path info lost");
     }
 
     /// Companion to the above: a manifest nested two or more levels inside a pruned directory
