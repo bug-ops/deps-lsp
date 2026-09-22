@@ -2393,7 +2393,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_fetch_real_monolog_versions() {
         let cache = Arc::new(HttpCache::new());
         let registry = PackagistRegistry::new(cache);
@@ -2414,7 +2414,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_search_real() {
         let cache = Arc::new(HttpCache::new());
         let registry = PackagistRegistry::new(cache);

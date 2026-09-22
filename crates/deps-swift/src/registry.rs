@@ -530,11 +530,16 @@ mod tests {
     // primitives through `SwiftRegistry`'s own public API.
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "requires network access"]
     async fn test_fetch_real_versions() {
         let cache = Arc::new(HttpCache::new());
         let registry = SwiftRegistry::new(cache);
-        let versions = registry.get_versions("apple/swift-nio").await.unwrap();
+        let Some(versions) = deps_core::test_util::unwrap_or_skip_github_rate_limit(
+            registry.get_versions("apple/swift-nio").await,
+            "test_fetch_real_versions",
+        ) else {
+            return;
+        };
         assert!(!versions.is_empty());
     }
 

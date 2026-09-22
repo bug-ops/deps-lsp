@@ -1,0 +1,80 @@
+name: Live Registry Tests
+
+# Scheduled, non-blocking sweep of the workspace's `#[ignore]`d, network-gated tests (#1283).
+# These tests hit real registry APIs (crates.io, npm, PyPI, GitHub, Maven Central, JSR, ...)
+# and are never run on a PR/push, so they need their own authenticated, opt-in run to catch
+# live API drift per `.claude/rules/continuous-improvement.md`'s Registry Integration Gate.
+# This workflow is intentionally separate from `ci.yml`: it does not gate PRs or merges.
+
+on:
+  schedule:
+    - cron: '0 3 * * 1' # Weekly, Monday 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTUP_MAX_RETRIES: 10
+
+jobs:
+  live-registry-tests:
+    name: Live Registry Tests (ignored, network-gated)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: taiki-e/install-action@94c31af3204a9f15ab40b35ad084410b905bbc73 # v2.87.17
+        with:
+          tool: cargo-nextest
+
+      - name: Run ignored/network-gated tests
+        # A real GITHUB_TOKEN here (unlike a plain contributor's local run) is what lets the
+        # GitHub-API-backed tests (Swift's registry, deps-core's github.rs) actually exercise
+        # their live-response-parsing path instead of skipping on the unauthenticated 60
+        # req/h rate limit (see deps_core::test_util::unwrap_or_skip_github_rate_limit, #1283).
+        # `--retries 1` is specific to this scheduled sweep, not the PR-gating suite: a
+        # single transient blip against a real, uncontrolled third-party registry shouldn't
+        # by itself file a P1 "registry drifted" issue below. Kept at 1, not higher: a
+        # misconfigured (e.g. empty) GITHUB_TOKEN secret fails every retry identically, so
+        # more retries would only amplify live-API load without improving flake protection.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo nextest run --workspace --all-features --run-ignored ignored-only --no-fail-fast --retries 1
+
+      - name: File or update tracking issue on failure
+        # Mirrors ci.yml's `semver` job's identically named step: a scheduled failure here
+        # means a live registry API genuinely drifted (the same class of bug #1283's npm
+        # search-assertion fix addressed), so it's worth a persistent, deduplicated issue
+        # rather than only a red workflow run nobody watches.
+        if: failure()
+        run: |
+          title="live-registry-tests: scheduled ignored-test run failed"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body="Scheduled live-registry-tests run ${run_url} failed.
+
+          This workflow (\`.github/workflows/live-registry-tests.yml\`) runs the workspace's \`#[ignore]\`d, network-gated tests weekly with a real \`GITHUB_TOKEN\` available, to catch live-registry API drift that mocked unit tests can't (per \`.claude/rules/continuous-improvement.md\`'s Registry Integration Gate). It does not block PRs or merges. See the run log for which test(s) failed and whether the failure reflects a genuine upstream API change rather than an environment issue."
+          # `gh issue list --search "in:title ..."` is a fuzzy/tokenized match, so its
+          # results are filtered here for an exact title equality before taking one, rather
+          # than trusting `.[0]` of the fuzzy ranking — otherwise an unrelated open issue
+          # sharing common title words could get commented on instead of a genuine repeat.
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --search "in:title \"${title}\"" --state open --json number,title --jq --arg t "$title" 'map(select(.title == $t)) | .[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body" --label bug --label testing-infra --label P1
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

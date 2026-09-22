@@ -704,7 +704,7 @@ mod tests {
     /// runs one un-ignored.
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_generate_completions_version_context_dispatches_to_registry() {
         let name_range = deps_core::position::Range::new(
             deps_core::position::Position::new(0, 9),
@@ -746,6 +746,19 @@ mod tests {
         let direct = eco
             .complete_versions(&parse_result, position, &prefix, freshness)
             .await;
+        // #1283 S2: `complete_versions` swallows *any* registry error to an empty `Vec`, so
+        // an empty `direct` alone can't tell an expected rate limit apart from a real bug —
+        // see `should_skip_on_empty_result`'s doc.
+        if deps_core::test_util::should_skip_on_empty_result(
+            direct.is_empty(),
+            "test_generate_completions_version_context_dispatches_to_registry",
+            eco.registry()
+                .get_versions(&deps_core::PackageName::new("apple/swift-nio")),
+        )
+        .await
+        {
+            return;
+        }
         let via_dispatch = eco
             .generate_completions(&parse_result, position, content, freshness)
             .await;

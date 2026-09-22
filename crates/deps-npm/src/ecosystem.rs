@@ -555,7 +555,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_package_names_real_search() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
@@ -563,13 +563,41 @@ mod tests {
         let results = ecosystem
             .complete_package_names("expre", Range::default())
             .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.label == "express"));
+        // #1283: npm's `-/v1/search` tokenizes rather than prefix-matches, so "express" is
+        // not guaranteed among the results for a partial prefix — verified live against
+        // "expre", "expr", "exp", and "expres": none surface "express" itself, only the
+        // full name does. Assert the shape every live result must have instead of pinning
+        // to one package name (the production symptom of this drift is tracked separately
+        // in #1282; this only fixes the test's assertion).
+        assert!(!results.is_empty(), "expected non-empty search results");
+        // Query relevance, without re-pinning to one exact package: a regression where the
+        // search endpoint ignores the query entirely (wrong endpoint, dropped query param)
+        // would return arbitrary well-formed packages sharing none of the query's letters —
+        // vanishingly unlikely across 20 real results if the query is actually honored.
+        assert!(
+            results
+                .iter()
+                .any(|r| r.label.to_lowercase().contains("expr")),
+            "expected at least one result related to query 'expre', got: {:?}",
+            results.iter().map(|r| &r.label).collect::<Vec<_>>()
+        );
+        for item in &results {
+            // `detail` is `None` only when the registry's `latest_version` came back empty
+            // (`build_package_completion`), so this genuinely catches npm search-response
+            // version-field drift — unlike `label`/`documentation`, which the shared
+            // completion builder already guarantees non-empty/`Some` for every item
+            // reaching here, regardless of what the live response contains.
+            assert!(
+                item.detail.is_some(),
+                "completion item '{}' is missing a version detail",
+                item.label
+            );
+        }
     }
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_versions_real() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
@@ -593,7 +621,7 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
-    #[ignore] // Requires network access
+    #[ignore = "requires network access"]
     async fn test_complete_versions_with_operator() {
         let cache = Arc::new(deps_core::HttpCache::new());
         let ecosystem = NpmEcosystem::new(cache);
