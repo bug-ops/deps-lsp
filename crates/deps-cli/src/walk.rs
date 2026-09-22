@@ -1194,8 +1194,16 @@ mod tests {
     /// under a pruned `vendor/`, the same scenario as the test above).
     #[test]
     fn test_walk_sanitizes_bidi_and_ansi_in_a_walked_directory_name() {
+        // NTFS rejects ASCII control characters (including the raw ESC byte) in a path
+        // component, so a directory literally named with one cannot exist on Windows; the
+        // bidi override alone is legal there and still exercises the same chokepoint.
+        let payload_name = if cfg!(windows) {
+            "ev\u{202E}il"
+        } else {
+            "ev\u{202E}il\x1B[31m"
+        };
         let dir = tempfile::tempdir().expect("create temp dir");
-        let payload_dir = dir.path().join("ev\u{202E}il\x1B[31m");
+        let payload_dir = dir.path().join(payload_name);
         fs::create_dir(&payload_dir).expect("mkdir payload dir");
         fs::create_dir(payload_dir.join("vendor")).expect("mkdir vendor");
         fs::write(payload_dir.join("vendor").join("Cargo.toml"), "[package]\n")
@@ -1214,10 +1222,12 @@ mod tests {
             !reported.contains('\u{202E}'),
             "bidi override survived the walk: {reported:?}"
         );
-        assert!(
-            !reported.contains('\x1B'),
-            "raw ANSI escape byte survived the walk: {reported:?}"
-        );
+        if !cfg!(windows) {
+            assert!(
+                !reported.contains('\x1B'),
+                "raw ANSI escape byte survived the walk: {reported:?}"
+            );
+        }
         assert!(reported.contains("vendor"), "legitimate path info lost");
         assert!(reported.contains("Cargo.toml"), "legitimate path info lost");
     }
