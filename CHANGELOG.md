@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: raw-text fallback package completion now also threads the registry result's index/typed prefix into `sort_text`, closing the same relevance-ranking gap as #1282 on this second, independently-built completion path (resolves #1294) (#1293)
 - **deps-cli**: `CheckFinding.requirement` is now sanitized and length-capped before reaching JSON output, closing an ANSI-escape/bidi-override leak (resolves #1258) (#1301)
 - **deps-maven**: `maven-metadata.xml` parse errors are now redacted before reaching `DepsError::CacheError`, closing a credential leak from a malformed tag name (resolves #1249) (#1301)
+- **deps-cargo**: feature-flag completion is now capped at 5 items with deterministic alphabetical truncation and an accurate `is_incomplete` flag, instead of an unbounded, arbitrarily-ordered list (resolves #1302)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
