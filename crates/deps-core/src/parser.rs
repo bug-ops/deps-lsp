@@ -5,7 +5,7 @@ use yaml_rust2::parser::{MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
 
 use crate::error::{DepsError, Result};
-use crate::net_policy::RedactedUrl;
+use crate::redact::RedactedUrl;
 
 /// Maximum allowed nesting depth for TOML table/array recursion before
 /// [`check_toml_nesting_depth`] rejects the input.

@@ -42,7 +42,7 @@ pub fn warn_if_pagination_truncated(
     max_pages: u32,
 ) {
     if page == max_pages && page_has_more(page_len) {
-        let name = crate::net_policy::redact_declaration_key(name);
+        let name = crate::redact::redact_declaration_key(name);
         tracing::warn!(
             package = %name,
             pages_fetched = max_pages,

@@ -292,7 +292,7 @@ pub trait Registry: Send + Sync {
     /// Named `search_raw`, not `search` (#1215): this required method carries no
     /// credential-bearing-query gate of its own, and a `fn search` provided-method default
     /// could be silently skipped by an override — an *inherent* `search` on `dyn Registry`
-    /// (below) wraps this method with [`crate::net_policy::is_credential_or_query_bearing`]
+    /// (below) wraps this method with [`crate::redact::is_credential_or_query_bearing`]
     /// and cannot be silently overridden by an implementor, unlike a provided trait method
     /// default — every `&dyn Registry`/`Arc<dyn Registry>` call site through the gate gets it
     /// automatically. This is a dispatch-level guarantee, not a hard access barrier: `search_raw`
@@ -422,7 +422,7 @@ impl dyn Registry + '_ {
     /// it directly and skip this gate with one extra token — see that method's own doc.
     ///
     /// Returns `Ok(vec![])` without calling [`Registry::search_raw`] at all when `query` is
-    /// flagged by [`crate::net_policy::is_credential_or_query_bearing`] — a redacted value is
+    /// flagged by [`crate::redact::is_credential_or_query_bearing`] — a redacted value is
     /// not a useful search term, so the request is dropped rather than redacted-and-sent.
     ///
     /// # Errors
@@ -465,7 +465,7 @@ impl dyn Registry + '_ {
     /// # }
     /// ```
     pub async fn search(&self, query: &str, limit: usize) -> Result<Vec<Box<dyn Metadata>>> {
-        if crate::net_policy::is_credential_or_query_bearing(query) {
+        if crate::redact::is_credential_or_query_bearing(query) {
             crate::lsp_helpers::warn_rejected_value("credential_bearing", "registry search", query);
             return Ok(vec![]);
         }
@@ -517,7 +517,7 @@ pub fn has_default_prerelease_marker(version: &str) -> bool {
 ///
 /// ```
 /// use deps_core::DepsError;
-/// use deps_core::net_policy::RedactedUrl;
+/// use deps_core::redact::RedactedUrl;
 /// use deps_core::not_found_or;
 ///
 /// let url = RedactedUrl::new("https://example.test/pkg");
@@ -1108,7 +1108,7 @@ pub const MAX_ALTERNATE_REGISTRIES: usize = 256;
 /// How a [`register_capped`]/[`register_capped_with_occupied`] key must be rendered in the
 /// cap-reached log line (#969 S3).
 ///
-/// A URL-shaped key is redacted via [`crate::net_policy::RedactedUrl`]; an already-opaque
+/// A URL-shaped key is redacted via [`crate::redact::RedactedUrl`]; an already-opaque
 /// token (e.g. a [`hash_routing_key`] digest) is logged verbatim, since `RedactedUrl`'s
 /// Maven-coordinate/REST-path false-positive scan would otherwise collapse every such key —
 /// which is exactly one colon plus a hex digest, the shape that scan is designed to catch —
@@ -1122,7 +1122,7 @@ pub const MAX_ALTERNATE_REGISTRIES: usize = 256;
 /// begin with (the safe direction).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyShape {
-    /// Redact via [`crate::net_policy::RedactedUrl`] before logging.
+    /// Redact via [`crate::redact::RedactedUrl`] before logging.
     Url,
     /// Log verbatim — this value is known to never carry a credential (e.g. a
     /// [`hash_routing_key`] digest, or another fixed, non-URL literal).
@@ -1249,7 +1249,7 @@ where
                 // successful-registration path.
                 let key_ref = slot.key().as_ref();
                 let rendered_key = match key_shape {
-                    KeyShape::Url => crate::net_policy::RedactedUrl::new(key_ref).to_string(),
+                    KeyShape::Url => crate::redact::RedactedUrl::new(key_ref).to_string(),
                     KeyShape::Opaque => key_ref.to_string(),
                 };
                 tracing::warn!(

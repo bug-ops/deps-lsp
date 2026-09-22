@@ -1483,7 +1483,7 @@ pub fn is_valid_completion_prefix_len(prefix: &str) -> bool {
 /// ```
 #[must_use]
 pub fn reject_credential_bearing_value(value: &str, context: &str) -> Option<Vec<CompletionItem>> {
-    if crate::net_policy::is_credential_or_query_bearing(value) {
+    if crate::redact::is_credential_or_query_bearing(value) {
         warn_rejected_value("credential_bearing", context, value);
         return Some(vec![]);
     }
@@ -1587,7 +1587,7 @@ pub async fn complete_package_names_generic(
         Err(e) => {
             tracing::warn!(
                 "Registry search failed for '{}': {}",
-                crate::net_policy::url_for_tracing(prefix),
+                crate::redact::url_for_tracing(prefix),
                 e
             );
             return vec![];

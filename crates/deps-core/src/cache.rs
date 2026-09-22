@@ -8,7 +8,8 @@
 
 use crate::cache_policy::CACHE_EVICTION_PERCENTAGE;
 use crate::error::{DepsError, Result};
-use crate::net_policy::{RedactedUrl, RegistryAccessPolicy, WorkspaceRegistryAccess};
+use crate::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+use crate::redact::RedactedUrl;
 use bytes::{Bytes, BytesMut};
 use dashmap::DashMap;
 use reqwest::{Client, Response, StatusCode, Url, header};
@@ -428,7 +429,7 @@ fn trusted_origin_redirect_policy(trusted_origin: &str) -> reqwest::redirect::Po
         Ok(url) => Some(url),
         Err(error) => {
             tracing::warn!(
-                trusted_origin = crate::net_policy::url_for_tracing(trusted_origin),
+                trusted_origin = crate::redact::url_for_tracing(trusted_origin),
                 %error,
                 "trusted_origin failed to parse; every redirect hop on this transport will be rejected"
             );

@@ -338,7 +338,7 @@ impl OsvClient {
         let url = self.batch_url();
         tracing::Span::current().record(
             "url",
-            tracing::field::display(crate::net_policy::RedactedUrl::new(&url)),
+            tracing::field::display(crate::redact::RedactedUrl::new(&url)),
         );
 
         let queries: Vec<OsvQuery> = chunk
@@ -572,7 +572,7 @@ impl OsvClient {
         let url = self.vuln_record_url(id);
         tracing::Span::current().record(
             "url",
-            tracing::field::display(crate::net_policy::RedactedUrl::new(&url)),
+            tracing::field::display(crate::redact::RedactedUrl::new(&url)),
         );
         match self.cache.get_transport_only(&url).await {
             Ok(bytes) => match crate::parser::parse_json_checked::<OsvVulnRecord>(&bytes) {
@@ -605,7 +605,7 @@ impl OsvClient {
         let url = self.single_query_url();
         tracing::Span::current().record(
             "url",
-            tracing::field::display(crate::net_policy::RedactedUrl::new(&url)),
+            tracing::field::display(crate::redact::RedactedUrl::new(&url)),
         );
 
         let body = OsvQuery {

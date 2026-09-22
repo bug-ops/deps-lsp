@@ -184,10 +184,15 @@ pub mod quote_scan;
 ///
 /// [`rate_limit::RateLimitGate`] is shared by `deps-github-actions` and `deps-gitlab-ci`.
 pub mod rate_limit;
+/// Redaction: URL/declaration-key/parse-error text and in-memory secret values (issue #1247).
+///
+/// Extracted from [`net_policy`], which kept the old paths as re-exports.
+pub mod redact;
 /// The [`registry::Registry`] trait: version lookup and search that every
 /// ecosystem's registry client implements.
 pub mod registry;
-pub mod secret;
+/// Re-export of [`redact::secret`] at its pre-#1247 path.
+pub use redact::secret;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod version_matcher;

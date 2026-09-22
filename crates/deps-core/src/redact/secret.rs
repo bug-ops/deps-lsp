@@ -8,7 +8,7 @@
 //! place that pattern is implemented, so the four call sites cannot silently diverge on it
 //! and a fifth ecosystem crate needing the same guarantee does not reinvent it a fifth time.
 //!
-//! Placed beside [`crate::net_policy::redact_userinfo`], which owns the adjacent "a
+//! Placed beside [`crate::redact::redact_userinfo`], which owns the adjacent "a
 //! credential must not leak via a log line" concern for URLs specifically, while this module
 //! owns it for an owned secret value held in memory.
 //!
