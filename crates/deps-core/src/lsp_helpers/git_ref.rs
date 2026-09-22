@@ -10,6 +10,8 @@ use yaml_rust2::parser::Tag;
 use yaml_rust2::scanner::{Marker, TScalarStyle};
 
 #[cfg(feature = "lsp-responses")]
+use super::diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
+#[cfg(feature = "lsp-responses")]
 use super::{EcosystemFormatter, markdown_code_span, single_file_edit};
 #[cfg(feature = "lsp-responses")]
 use crate::{Dependency, ParseResult};
@@ -875,9 +877,18 @@ pub fn sha_pin_text_edit(pinning: &impl ShaPinning, dep: &dyn Dependency) -> Opt
 #[must_use]
 pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> String {
     let short_sha = sha.get(..7).unwrap_or(sha);
+    // `resolved_tag` is tag-index/registry-controlled and unbounded (#1311), and — like
+    // any git tag — has no legitimate use for an invisible/bidi character, so it gets
+    // the same `sanitize_invisible`-then-truncate treatment `HoverMarkdown`'s
+    // `Name`/`Version` field kinds apply (#1313), via the same combined helper
+    // `build_sha_pin_action`'s `display_name` above already uses, at
+    // `MAX_VERSION_DIAGNOSTIC_CHARS` (the version-shaped sibling cap).
     let line = format!(
         "**Resolved**: {} ({})\n\n",
-        markdown_code_span(resolved_tag),
+        markdown_code_span(&super::diagnostics::sanitize_and_truncate_for_diagnostic(
+            resolved_tag,
+            MAX_VERSION_DIAGNOSTIC_CHARS
+        )),
         markdown_code_span(&format!("{short_sha}…"))
     );
 
@@ -903,6 +914,56 @@ pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> St
 )]
 mod tests {
     use super::*;
+
+    /// #1311: `resolved_tag` is tag-index/registry-controlled and unbounded — mirrors
+    /// diagnostics.rs's `MAX_VERSION_DIAGNOSTIC_CHARS` truncation test pattern.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn splice_resolved_line_truncates_overlong_resolved_tag() {
+        let long_tag = "9".repeat(5000);
+        let sha = "a".repeat(40);
+        let out = splice_resolved_line("", &long_tag, &sha);
+        assert!(out.len() < long_tag.len(), "got: {out}");
+        assert!(out.contains('…'));
+    }
+
+    /// #1310 critic M2: boundary case using `MAX_VERSION_DIAGNOSTIC_CHARS` specifically,
+    /// not just the 5000-char extreme.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn splice_resolved_line_boundary_at_and_over_cap() {
+        let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
+        let sha = "a".repeat(40);
+
+        // `short_sha` always renders with a trailing `…` of its own (it's a fixed
+        // 7-char prefix of a 40-char SHA), so a blanket "no ellipsis anywhere"
+        // assertion would be wrong here — check the tag's own code span exactly instead.
+        let at_cap = "9".repeat(cap);
+        let out = splice_resolved_line("", &at_cap, &sha);
+        assert!(out.contains(&format!("`{at_cap}`")), "got: {out}");
+
+        let over_cap = "9".repeat(cap + 1);
+        let out = splice_resolved_line("", &over_cap, &sha);
+        assert!(
+            out.contains(&format!("`{}…`", "9".repeat(cap))),
+            "got: {out}"
+        );
+    }
+
+    /// #1311/#1313: `resolved_tag` is a git tag (name/version-shaped), so it must strip
+    /// a `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe` alone
+    /// does not catch — the same treatment `HoverMarkdown`'s `Name`/`Version` field
+    /// kinds now apply.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn splice_resolved_line_strips_u206a_from_resolved_tag() {
+        let sha = "a".repeat(40);
+        let out = splice_resolved_line("", &format!("v1.0{}0", '\u{206a}'), &sha);
+        assert!(
+            !out.contains('\u{206a}'),
+            "U+206A must be stripped from resolved_tag; got: {out}"
+        );
+    }
 
     #[test]
     fn test_is_full_sha_accepts_and_rejects() {

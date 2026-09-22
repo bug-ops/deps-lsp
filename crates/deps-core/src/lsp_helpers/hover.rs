@@ -10,13 +10,16 @@ use crate::osv::ScanOutcome;
 use crate::{
     ConcreteVersion, Dependency, DependencySource, Deprecation, LicenseSource, ParseResult,
     ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version, VersionReq,
-    format_relative_age, is_within_cooldown,
+    is_within_cooldown,
 };
 
-use super::diagnostics::{
-    MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_PROSE_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS,
-    MAX_VERSION_DIAGNOSTIC_CHARS,
-};
+use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
+// Only referenced from this module's own tests now that the corresponding
+// `push_*_hover_section` functions go through a `FieldKind` instead of the raw
+// constant (#1310).
+#[cfg(test)]
+use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
+use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, await_versions_fetch, escape_markdown,
     in_use_version, markdown_code_span, position_in_range, resolve_in_use_version,
@@ -33,19 +36,19 @@ use crate::github::normalize_tag;
 /// the short error TTL rather than getting a memo hit.
 const DEPS_DEV_WAIT_BUDGET: Duration = Duration::from_millis(700);
 
-/// Formats the relative-age suffix for one "Recent versions" hover entry.
+/// Computes the age (in seconds) of one "Recent versions" hover entry, for
+/// [`HoverMarkdown::push_relative_age`].
 ///
-/// Returns an empty string when the registry doesn't expose a publish timestamp for
-/// `version` (`published_at()` is `None`), so the entry renders exactly as it did
-/// before this feature existed (graceful degradation, US-003).
+/// Returns `None` when the registry doesn't expose a publish timestamp for `version`
+/// (`published_at()` is `None`), so the entry renders exactly as it did before this
+/// feature existed (graceful degradation, US-003).
 ///
 /// `now` is taken as an explicit parameter rather than read internally so every entry
 /// in the same "Recent versions" list is aged against one consistent instant.
-fn version_age_suffix(version: &dyn Version, now: PublishTime) -> String {
+fn version_age_secs(version: &dyn Version, now: PublishTime) -> Option<u64> {
     version
         .published_at()
-        .map(|published| format!(" — {}", format_relative_age(published.age_secs_from(now))))
-        .unwrap_or_default()
+        .map(|published| published.age_secs_from(now))
 }
 
 /// Bounds the `Registry::get_latest_matching` fallback (#373) hover fires when the
@@ -149,7 +152,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .then(|| formatter.package_url(dep.name()))
         .filter(|u| !u.is_empty());
 
-    let mut markdown = String::with_capacity(512);
+    let mut markdown = HoverMarkdown::new();
     push_header_hover_section(&mut markdown, dep, url.as_deref());
 
     let resolved: Option<&str> = if formatter.manifest_requirement_is_resolved_version(dep) {
@@ -409,7 +412,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     push_offline_footer_hover_section(&mut markdown, resolvable, versions.offline);
 
-    Some(Hover::new(markdown, Some(dep.name_range())))
+    Some(markdown.finish(Some(dep.name_range())))
 }
 
 /// Spawns the deps.dev supply-chain trust-signal fetch (spec 037) as a detached
@@ -479,62 +482,28 @@ fn spawn_trust_signal_fetch(
 /// (`crate::conformance::assert_package_url_hostile_input_safe`, run for every
 /// ecosystem formatter via `formatter_conformance!`) is the *primary* defense for this
 /// destination — every real `package_url` impl percent-encodes or allowlist-validates
-/// the name before building the URL. Stripping `url`'s bidi-override/invisible
-/// characters here (#1259) is consumer-side **defense-in-depth** on top of that gate,
-/// not a replacement for it: it covers only the narrow bidi/invisible subset
-/// `is_markdown_unsafe` names, not the structural breakout set (`(`, `)`,
-/// `[`, `]`, `` ` ``, `<`, `>`) the producer-side gate is the sole guard for.
-///
-/// [`super::strip_markdown_unsafe_chars`], not [`escape_markdown`] or
-/// `super::replace_markdown_unsafe_chars`: full markdown escaping backslash-escapes
-/// every ASCII punctuation character, mangling an ordinary, non-malicious URL's
-/// `/`/`:`/`.`; and `replace_markdown_unsafe_chars`'s space substitution — correct for
-/// label/code-span *text* — is wrong for a link *destination*, where CommonMark
-/// forbids an unescaped literal space outright, so a fired substitution would turn the
-/// link into broken non-link text instead of sanitizing it in place. Removing the
-/// character keeps the surrounding URL syntactically valid.
-///
-/// `url` is deliberately **not** length-capped (code-review follow-up to critic S4):
-/// an earlier version of this fix truncated `url` at a fixed raw-character boundary,
-/// which (1) broke legitimate long, non-malicious links — a Go module path or an npm
-/// scoped package near npm's 214-char limit routinely exceeds 128 chars once the
-/// registry prefix is added, well within normal (non-hostile) use — and (2) is not
-/// percent-encoding-aware, so a cut can land inside a `%XX` escape and leave a
-/// structurally malformed dangling `%X` right before the `…` marker. Given `url`'s
-/// *content* safety already rests on `package_url`'s producer-side gate (percent-
-/// encoding/allowlisting, per the paragraph above), a length cap here would add a
-/// real-world regression without closing a gap that gate doesn't already close, so
-/// `url` only goes through the (length-preserving-or-shrinking)
-/// `strip_markdown_unsafe_chars` filter, unbounded.
-///
-/// The **label** (`dep.name()`), by contrast, *is* capped at
-/// [`MAX_DIAGNOSTIC_NAME_CHARS`] — the same bound `diagnostics.rs`'s name-shaped sinks
-/// use, since [`crate::PackageName`] is explicitly unvalidated/unbounded (see its own
-/// doc) and this is always-visible rendered text, not an opaque link target. The
-/// truncation runs **after** [`escape_markdown`], not before (code-review follow-up):
-/// `escape_markdown` backslash-escapes every ASCII punctuation character — common in
-/// real package names (`-`, `_`, `.`, `@`) — so truncating the raw name first bounds
-/// only the *source* read, not the *rendered* length `escape_markdown` can more than
-/// double. Truncating the already-escaped string is what actually keeps the rendered
-/// label bounded, at the cost of a possible trailing lone backslash right before the
-/// `…` marker on the rare cut that lands between an escape's backslash and its
-/// punctuation character — cosmetically odd but harmless in label text (unlike the
-/// link-destination case above, this can't break Markdown structure).
-fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: Option<&str>) {
-    use std::fmt::Write as _;
-
-    let escaped_name = escape_markdown(dep.name().as_str());
-    let name = super::truncate_for_diagnostic(&escaped_name, MAX_DIAGNOSTIC_NAME_CHARS);
-
-    // `write!` here is infallible; result discarded (#673 M3).
-    let _ = match url {
-        Some(url) => write!(
-            markdown,
-            "# [{name}]({})\n\n",
-            super::strip_markdown_unsafe_chars(url)
-        ),
-        None => write!(markdown, "# {name}\n\n"),
-    };
+/// the name before building the URL. [`HoverMarkdown::push_link`]'s consumer-side
+/// stripping of `url`'s bidi-override/invisible characters (#1259) is
+/// defense-in-depth on top of that gate, not a replacement for it, and — per that
+/// method's own doc — deliberately does not length-cap `url` (#1272 critic S4). The
+/// **label** (`dep.name()`) *is* capped, at [`FieldKind::Name`], via
+/// [`HoverMarkdown::push_link`]/[`HoverMarkdown::push_label`]'s escape-then-truncate
+/// order (#1310, folding in #1259's original per-site cap).
+fn push_header_hover_section(
+    markdown: &mut HoverMarkdown,
+    dep: &dyn Dependency,
+    url: Option<&str>,
+) {
+    markdown.push_static("# ");
+    match url {
+        Some(url) => {
+            markdown.push_link(dep.name().as_str(), FieldKind::Name, url);
+        }
+        None => {
+            markdown.push_label(dep.name().as_str(), FieldKind::Name);
+        }
+    }
+    markdown.push_static("\n\n");
 }
 
 /// Appends the hover "Current"/"Requirement" line. `resolved` — already selecting
@@ -542,41 +511,37 @@ fn push_header_hover_section(markdown: &mut String, dep: &dyn Dependency, url: O
 /// version, per [`crate::lsp_helpers::RequirementResolution::manifest_requirement_is_resolved_version`] —
 /// wins over the bare manifest requirement when present.
 fn push_current_or_requirement_hover_section(
-    markdown: &mut String,
+    markdown: &mut HoverMarkdown,
     dep: &dyn Dependency,
     resolved: Option<&str>,
 ) {
-    use std::fmt::Write as _;
-
-    // `write!` here is infallible; result discarded (#673 M3).
+    // `resolved`/`version_requirement` are lockfile- and manifest-controlled,
+    // unbounded-length strings — `FieldKind::Version` matches diagnostics.rs's
+    // sibling sink for the same field shape (#1311).
     if let Some(resolved_ver) = resolved {
-        let _ = write!(
-            markdown,
-            "**Current**: {}\n\n",
-            markdown_code_span(resolved_ver)
-        );
+        markdown.push_static("**Current**: ");
+        markdown.push_code(resolved_ver, FieldKind::Version);
+        markdown.push_static("\n\n");
     } else if let Some(version_req) = dep.version_requirement() {
-        let _ = write!(
-            markdown,
-            "**Requirement**: {}\n\n",
-            markdown_code_span(version_req.as_str())
-        );
+        markdown.push_static("**Requirement**: ");
+        markdown.push_code(version_req.as_str(), FieldKind::Version);
+        markdown.push_static("\n\n");
     }
 }
 
 /// Appends the hover "Active when" line for an environment-marker-gated dependency
 /// (e.g. PEP 508's `python_version >= '3.8'`). Ecosystem-specific; renders nothing
 /// when [`Dependency::markers`] is `None`.
-fn push_markers_hover_section(markdown: &mut String, dep: &dyn Dependency) {
-    use std::fmt::Write as _;
-
+fn push_markers_hover_section(markdown: &mut HoverMarkdown, dep: &dyn Dependency) {
+    // `marker_expr` is manifest-controlled with no upstream length bound (#1311).
+    // `FieldKind::Name`, not `Prose` (#1313 reclassification): a PEP 508 marker
+    // expression is a version-constraint-shaped identifier, not free prose — it has no
+    // legitimate use for an invisible/bidi character, so it gets the `sanitize_invisible`
+    // sweep `Name`/`Version` carry.
     if let Some(marker_expr) = dep.markers() {
-        // `write!` here is infallible; result discarded (#673 M3).
-        let _ = write!(
-            markdown,
-            "**Active when**: {}\n\n",
-            markdown_code_span(marker_expr)
-        );
+        markdown.push_static("**Active when**: ");
+        markdown.push_code(marker_expr, FieldKind::Name);
+        markdown.push_static("\n\n");
     }
 }
 
@@ -587,26 +552,28 @@ fn push_markers_hover_section(markdown: &mut String, dep: &dyn Dependency) {
 /// versions" list below. See [`generate_hover`]'s derivation of `latest_line` for the
 /// full Ch1/Ch2/fallback precedence rules (issue #227 F5, #313, #373).
 fn push_latest_hover_section(
-    markdown: &mut String,
+    markdown: &mut HoverMarkdown,
     latest_line: Option<(&str, Option<PublishTime>)>,
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
 ) {
-    use std::fmt::Write as _;
-
     let Some((latest_ver, raw_published_at)) = latest_line else {
         return;
     };
     let published_at = freshness.enabled.then_some(raw_published_at).flatten();
     let age_secs = published_at.map(|p| p.age_secs_from(now));
-    // `write!` here is infallible; result discarded (#673 M3).
-    let _ = write!(markdown, "**Latest**: {}", markdown_code_span(latest_ver));
+    // `latest_ver` is registry-reported and unbounded — `FieldKind::Version` matches
+    // diagnostics.rs's sibling sink (#1311).
+    markdown.push_static("**Latest**: ");
+    markdown.push_code(latest_ver, FieldKind::Version);
     if let Some(age_secs) = age_secs {
-        let _ = write!(markdown, " *(published {})*", format_relative_age(age_secs));
+        markdown.push_static(" *(published ");
+        markdown.push_relative_age(age_secs);
+        markdown.push_static(")*");
     }
-    markdown.push_str("\n\n");
+    markdown.push_static("\n\n");
     if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
-        markdown.push_str(
+        markdown.push_static(
             "> ⏳ **Recently published** — this release is still within the cooldown window.\n\
              > It may still be yanked or superseded; consider verifying before upgrading.\n\n",
         );
@@ -634,15 +601,13 @@ fn push_latest_hover_section(
 /// Renders nothing when `available_versions` is empty (issue #550): an empty
 /// "Recent versions" header with no entries under it is never useful.
 fn push_recent_versions_hover_section(
-    markdown: &mut String,
+    markdown: &mut HoverMarkdown,
     available_versions: &[Box<dyn Version>],
     live_latest_idx: Option<usize>,
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
     formatter: &dyn EcosystemFormatter,
 ) {
-    use std::fmt::Write as _;
-
     if available_versions.is_empty() {
         return;
     }
@@ -661,40 +626,41 @@ fn push_recent_versions_hover_section(
         entries.push((idx, pick));
     }
 
-    markdown.push_str("**Recent versions**:\n");
+    markdown.push_static("**Recent versions**:\n");
     for (i, version) in entries {
-        let version_span = markdown_code_span(version.version_string().as_str());
-        let age_suffix = if freshness.enabled {
-            version_age_suffix(version.as_ref(), now)
-        } else {
-            String::new()
-        };
-        // `writeln!` here is infallible; result discarded (#673 M3).
-        if Some(i) == live_latest_idx {
-            if version.removal_status().is_flagged() {
-                // The resolved "latest" can itself be flagged (e.g. npm's ranking
-                // preference falls through to a deprecated version when no clean one
-                // exists) — the deprecation/yank warning must not silently vanish just
-                // because this entry also carries the `(latest)` marker (#347/#348 S1).
-                let _ = writeln!(
-                    markdown,
-                    "- {version_span} *(latest)* {}{age_suffix}",
-                    formatter.yanked_label()
-                );
-            } else {
-                let _ = writeln!(markdown, "- {version_span} *(latest)*{age_suffix}");
+        let age_secs = freshness
+            .enabled
+            .then(|| version_age_secs(version.as_ref(), now))
+            .flatten();
+        markdown.push_static("- ");
+        // `version_string()` is registry-reported and unbounded — `FieldKind::Version`
+        // matches diagnostics.rs's sibling sink (#1311).
+        markdown.push_code(version.version_string().as_str(), FieldKind::Version);
+        let is_latest = Some(i) == live_latest_idx;
+        let flagged = version.removal_status().is_flagged();
+        // The resolved "latest" can itself be flagged (e.g. npm's ranking preference
+        // falls through to a deprecated version when no clean one exists) — the
+        // deprecation/yank warning must not silently vanish just because this entry
+        // also carries the `(latest)` marker (#347/#348 S1).
+        match (is_latest, flagged) {
+            (true, true) => {
+                markdown.push_static(" *(latest)* ");
+                markdown.push_static(formatter.yanked_label());
             }
-        } else if version.removal_status().is_flagged() {
-            let _ = writeln!(
-                markdown,
-                "- {} {}{}",
-                version_span,
-                formatter.yanked_label(),
-                age_suffix
-            );
-        } else {
-            let _ = writeln!(markdown, "- {version_span}{age_suffix}");
+            (true, false) => {
+                markdown.push_static(" *(latest)*");
+            }
+            (false, true) => {
+                markdown.push_static(" ");
+                markdown.push_static(formatter.yanked_label());
+            }
+            (false, false) => {}
         }
+        if let Some(age_secs) = age_secs {
+            markdown.push_static(" — ");
+            markdown.push_relative_age(age_secs);
+        }
+        markdown.push_static("\n");
     }
 }
 
@@ -736,7 +702,7 @@ fn push_recent_versions_hover_section(
 /// online case (a non-empty live list, or no live fetch at all) keeps the pre-#550
 /// unconditional-when-resolvable behavior.
 fn push_cmd_dot_footer_hover_section(
-    markdown: &mut String,
+    markdown: &mut HoverMarkdown,
     resolvable: bool,
     available_versions: Option<&[Box<dyn Version>]>,
     cached_latest: Option<&super::PackageVersions>,
@@ -752,7 +718,7 @@ fn push_cmd_dot_footer_hover_section(
     let footer_actionable =
         has_offline_actionable_data || (!live_fetch_definitively_empty && !offline);
     if resolvable && footer_actionable {
-        markdown.push_str(CMD_DOT_FOOTER);
+        markdown.push_static(CMD_DOT_FOOTER);
     }
 }
 
@@ -768,9 +734,13 @@ fn push_cmd_dot_footer_hover_section(
 /// Docker image ref, a Git/path dependency) must not claim its version or
 /// vulnerability data went unchecked *because of* `network.offline` — nothing there
 /// was ever going to be checked regardless.
-fn push_offline_footer_hover_section(markdown: &mut String, resolvable: bool, offline: bool) {
+fn push_offline_footer_hover_section(
+    markdown: &mut HoverMarkdown,
+    resolvable: bool,
+    offline: bool,
+) {
     if offline && resolvable {
-        markdown.push_str("\n---\n📴 *Offline: version and vulnerability data not checked*");
+        markdown.push_static("\n---\n📴 *Offline: version and vulnerability data not checked*");
     }
 }
 
@@ -808,30 +778,34 @@ const fn severity_label(severity: crate::osv::VulnSeverity) -> &'static str {
 /// labels (S4, plan.md D6): suppressing those would require threading this finding into
 /// the version-list renderer, which takes no such parameter today.
 fn push_deprecation_hover_section(
-    markdown: &mut String,
+    markdown: &mut HoverMarkdown,
     formatter: &dyn EcosystemFormatter,
     deprecation: Option<&Deprecation>,
 ) {
-    use std::fmt::Write as _;
-
     let Some(deprecation) = deprecation else {
         return;
     };
 
     // I3: each part gets its own blank-line-separated paragraph, mirroring
-    // `push_vulnerability_hover_section` — bare consecutive `writeln!` lines with no blank
-    // line between them collapse into one CommonMark paragraph instead of distinct lines.
-    markdown.push_str("### Deprecated\n\n");
-    let _ = writeln!(markdown, "{}\n", formatter.deprecated_message());
+    // `push_vulnerability_hover_section` — consecutive lines with no blank line between
+    // them collapse into one CommonMark paragraph instead of distinct lines.
+    markdown.push_static("### Deprecated\n\n");
+    markdown.push_static(formatter.deprecated_message());
+    markdown.push_static("\n\n");
+    // `deprecation.reason`/`replacement` are registry-reported and unbounded (#1311).
+    // `reason` is genuinely free prose (`FieldKind::Prose`), matching diagnostics.rs's
+    // cap for the same field shape. `replacement` is a package *name*, not prose
+    // (`FieldKind::Name`, #1313 reclassification — this is the exact field #1313's own
+    // doc names as #1311's still-open gap): it has no legitimate use for an
+    // invisible/bidi character, so it gets the `sanitize_invisible` sweep.
     if let Some(reason) = deprecation.reason.as_deref().filter(|r| !r.is_empty()) {
-        let _ = writeln!(markdown, "{}\n", escape_markdown(reason));
+        markdown.push_text(reason, FieldKind::Prose);
+        markdown.push_static("\n\n");
     }
     if let Some(replacement) = deprecation.replacement.as_deref().filter(|r| !r.is_empty()) {
-        let _ = writeln!(
-            markdown,
-            "Suggested replacement: {}\n",
-            markdown_code_span(replacement)
-        );
+        markdown.push_static("Suggested replacement: ");
+        markdown.push_code(replacement, FieldKind::Name);
+        markdown.push_static("\n\n");
     }
 }
 
@@ -896,70 +870,66 @@ fn candidate_vulnerable_line_should_render(
 /// worse than saying nothing at all (`architecture.md` §8 invariant 0).
 ///
 /// Every OSV-reported field rendered here is length- (and, for `aliases`, count-) capped
-/// before display (#1272), truncated *before* escaping (not after, unlike
-/// `push_header_hover_section`'s label) so the cap bounds the same raw-character count
-/// `diagnostics.rs`'s sibling sinks use, matching [`format_advisory_aliases`]/
-/// [`format_license_list`]'s order: `id`/`summary` ([`MAX_DIAGNOSTIC_PROSE_CHARS`], the same
-/// cap `diagnostics.rs` uses for both), `fixed_versions`/the candidate `version`
-/// ([`MAX_VERSION_DIAGNOSTIC_CHARS`]), and `aliases` ([`format_advisory_aliases`]) are all
+/// before display (#1272) — but not all through the same order, since `id` is rendered
+/// as a link label and the rest are not: `id` ([`FieldKind::Prose`]) goes through
+/// [`HoverMarkdown::push_link`]'s escape-before-truncate order (rendered-length bound,
+/// the same as `push_header_hover_section`'s name label), while `summary`
+/// ([`FieldKind::Prose`]) and `fixed_versions`/the candidate `version`
+/// ([`FieldKind::Version`]) go through [`HoverMarkdown::push_text`]/
+/// [`HoverMarkdown::push_code`]'s truncate-before-escape order (raw-character bound,
+/// matching `diagnostics.rs`'s sibling sinks). `aliases` is capped/escaped per-element and
+/// count-capped by [`format_advisory_aliases`] itself before reaching the builder. All are
 /// untrusted, unbounded OSV data. `advisory.url()` is exempt: [`crate::osv::Advisory::new`]
 /// derives it from the already-validated, `<= 128`-byte `id` rather than accepting it raw
-/// (#1271), so no length cap applies to it here.
-fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&ScanOutcome>) {
-    use std::fmt::Write;
-
-    // `writeln!` here is infallible; result discarded (#673 M3).
+/// (#1271), so no length cap applies to it here — [`HoverMarkdown::push_link`] only strips
+/// it, matching that exemption.
+fn push_vulnerability_hover_section(markdown: &mut HoverMarkdown, outcome: Option<&ScanOutcome>) {
     match outcome {
         Some(ScanOutcome::Vulnerable(dv)) => {
-            markdown.push_str("### Security advisories\n\n");
+            markdown.push_static("### Security advisories\n\n");
 
             for advisory in dv.advisories.items() {
-                let _ = writeln!(
-                    markdown,
-                    "- **[{}]({})** — {}",
-                    escape_markdown(&super::truncate_for_diagnostic(
-                        &advisory.id,
-                        MAX_DIAGNOSTIC_PROSE_CHARS
-                    )),
-                    advisory.url(),
-                    severity_label(advisory.severity)
+                markdown.push_static("- **");
+                markdown.push_link(&advisory.id, FieldKind::Prose, advisory.url());
+                markdown.push_static("** — ");
+                markdown.push_static(severity_label(advisory.severity));
+                markdown.push_static("\n  ");
+                markdown.push_text(
+                    advisory
+                        .summary
+                        .as_deref()
+                        .unwrap_or("(no summary provided)"),
+                    FieldKind::Prose,
                 );
-                let _ = writeln!(
-                    markdown,
-                    "  {}",
-                    escape_markdown(&super::truncate_for_diagnostic(
-                        advisory
-                            .summary
-                            .as_deref()
-                            .unwrap_or("(no summary provided)"),
-                        MAX_DIAGNOSTIC_PROSE_CHARS,
-                    ))
-                );
+                markdown.push_static("\n");
 
-                let mut details = Vec::with_capacity(2);
-                if let Some(fixed) = advisory.fixed_versions.last() {
-                    details.push(format!(
-                        "Fixed in: {}",
-                        markdown_code_span(&super::truncate_for_diagnostic(
-                            fixed,
-                            MAX_VERSION_DIAGNOSTIC_CHARS
-                        ))
-                    ));
-                }
-                if !advisory.aliases.is_empty() {
-                    details.push(format!(
-                        "Aliases: {}",
-                        format_advisory_aliases(&advisory.aliases)
-                    ));
-                }
-                if !details.is_empty() {
-                    let _ = writeln!(markdown, "  {}", details.join(" \u{b7} "));
+                let has_fixed = advisory.fixed_versions.last().is_some();
+                let has_aliases = !advisory.aliases.is_empty();
+                if has_fixed || has_aliases {
+                    markdown.push_static("  ");
+                    if let Some(fixed) = advisory.fixed_versions.last() {
+                        markdown.push_static("Fixed in: ");
+                        markdown.push_code(fixed, FieldKind::Version);
+                    }
+                    if has_aliases {
+                        if has_fixed {
+                            markdown.push_static(" \u{b7} ");
+                        }
+                        markdown.push_static("Aliases: ");
+                        // `format_advisory_aliases` already caps/escapes each alias and the
+                        // list itself before returning — a pre-sanitized fragment, not raw
+                        // OSV text (#1310 critic S1).
+                        markdown.push_trusted(format_advisory_aliases(&advisory.aliases));
+                    }
+                    markdown.push_static("\n");
                 }
             }
 
             let remaining = dv.advisories.remaining();
             if remaining > 0 {
-                let _ = writeln!(markdown, "- *(+{remaining} more advisories)*");
+                markdown.push_static("- *(+");
+                markdown.push_number(remaining);
+                markdown.push_static(" more advisories)*\n");
             }
 
             if let crate::osv::UpgradeStatus::CandidateVulnerable {
@@ -968,20 +938,15 @@ fn push_vulnerability_hover_section(markdown: &mut String, outcome: Option<&Scan
             } = &dv.upgrade_status
                 && candidate_vulnerable_line_should_render(advisory_ids, dv.advisories.items())
             {
-                let _ = writeln!(
-                    markdown,
-                    "\n\u{26a0}\u{fe0f} Latest version {} is also affected.",
-                    markdown_code_span(&super::truncate_for_diagnostic(
-                        version,
-                        MAX_VERSION_DIAGNOSTIC_CHARS
-                    ))
-                );
+                markdown.push_static("\n\u{26a0}\u{fe0f} Latest version ");
+                markdown.push_code(version, FieldKind::Version);
+                markdown.push_static(" is also affected.\n");
             }
 
-            markdown.push('\n');
+            markdown.push_static("\n");
         }
         Some(ScanOutcome::Clean) => {
-            markdown.push_str("**No known vulnerabilities** (OSV.dev)\n\n");
+            markdown.push_static("**No known vulnerabilities** (OSV.dev)\n\n");
         }
         Some(ScanOutcome::Skipped(_)) | None => {}
     }
@@ -1020,9 +985,10 @@ fn format_advisory_aliases(aliases: &[String]) -> String {
 /// FR-006/US-004. A `Some` signal whose scorecard and provenance are *both*
 /// `None` (possible only via `SupplyChainTrustSignal::default()`, never returned by
 /// `DepsDevClient::trust_signal` itself) also renders nothing, defensively.
-fn push_trust_signal_hover_section(markdown: &mut String, signal: Option<&SupplyChainTrustSignal>) {
-    use std::fmt::Write;
-
+fn push_trust_signal_hover_section(
+    markdown: &mut HoverMarkdown,
+    signal: Option<&SupplyChainTrustSignal>,
+) {
     let Some(signal) = signal else {
         return;
     };
@@ -1054,13 +1020,11 @@ fn push_trust_signal_hover_section(markdown: &mut String, signal: Option<&Supply
         parts.push(format!("Provenance: {label}"));
     }
 
-    // `writeln!` here is infallible; result discarded (#673 M3).
-    let _ = writeln!(
-        markdown,
-        "\u{1f510} **Supply chain**: {}",
-        parts.join(" \u{b7} ")
-    );
-    markdown.push('\n');
+    // `scorecard.overall_score`/`provenance` are both structurally bounded (a fixed-precision
+    // float, a 3-way enum), not attacker-controlled — `push_trusted`.
+    markdown.push_static("\u{1f510} **Supply chain**: ");
+    markdown.push_trusted(parts.join(" \u{b7} "));
+    markdown.push_static("\n\n");
 }
 
 /// Cap on how many license identifiers [`format_license_list`] renders from one
@@ -1138,41 +1102,38 @@ fn license_sets_differ(a: &[String], b: &[String]) -> bool {
 /// break, which strict renderers (e.g. VS Code's hover widget) collapse onto the same
 /// visual line as the License line above it (impl-critic review S3).
 fn push_license_hover_section(
-    markdown: &mut String,
+    markdown: &mut HoverMarkdown,
     resolved_license: &[String],
     latest_license: Option<&[String]>,
     detected: bool,
 ) {
-    use std::fmt::Write;
-
     if resolved_license.is_empty() {
         return;
     }
 
-    // `write!` here is infallible; result discarded (#673 M3).
-    let _ = write!(
-        markdown,
-        "**License{}**: {}",
-        if detected { " (detected)" } else { "" },
-        format_license_list(resolved_license)
-    );
+    // `format_license_list`'s output is already capped/escaped internally —
+    // `push_trusted`, not `push_text`.
+    markdown.push_static("**License");
+    if detected {
+        markdown.push_static(" (detected)");
+    }
+    markdown.push_static("**: ");
+    markdown.push_trusted(format_license_list(resolved_license));
 
     match latest_license {
         None => {}
         Some([]) => {
-            markdown.push_str(" *(latest version license unavailable)*");
+            markdown.push_static(" *(latest version license unavailable)*");
         }
         Some(latest) if license_sets_differ(resolved_license, latest) => {
-            let _ = write!(
-                markdown,
-                "\n\n\u{26a0}\u{fe0f} **License changed**: {} \u{2192} {}",
-                format_license_list(resolved_license),
-                format_license_list(latest)
-            );
+            markdown.push_static("\n\n\u{26a0}\u{fe0f} **License changed**: ");
+            markdown.push_trusted(format_license_list(resolved_license));
+            markdown.push_static(" \u{2192} ");
+            markdown.push_trusted(format_license_list(latest));
         }
         Some(_) => {}
     }
-    markdown.push_str("\n\n");
+    markdown.push_static("\n\n");
 }
 
 #[cfg(test)]
@@ -1278,11 +1239,481 @@ mod tests {
         );
     }
 
+    /// #1311: `resolved`/`version_requirement` are lockfile- and manifest-controlled,
+    /// unbounded-length strings — mirrors the diagnostics.rs `MAX_VERSION_DIAGNOSTIC_CHARS`
+    /// truncation test pattern.
+    #[test]
+    fn push_current_or_requirement_hover_section_truncates_overlong_current() {
+        let dep = MockDep {
+            name: "pkg".into(),
+            version_req: "1.0".into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let long = "9".repeat(5000);
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, Some(&long));
+        assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
+        assert!(markdown.as_str().contains('…'));
+    }
+
+    #[test]
+    fn push_current_or_requirement_hover_section_truncates_overlong_requirement() {
+        let long = "9".repeat(5000);
+        let dep = MockDep {
+            name: "pkg".into(),
+            version_req: long.as_str().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, None);
+        assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
+        assert!(markdown.as_str().contains('…'));
+    }
+
+    /// #1310 critic M2: boundary (at cap / over cap) using `MAX_VERSION_DIAGNOSTIC_CHARS`
+    /// specifically, not the 5000-char extreme — catches an off-by-one in the cap logic
+    /// or a `FieldKind` swap, which an extreme-only test can't (all three kinds resolve
+    /// to the same literal 128 today).
+    #[test]
+    fn push_current_or_requirement_hover_section_current_boundary_at_and_over_cap() {
+        let dep = MockDep {
+            name: "pkg".into(),
+            version_req: "1.0".into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
+
+        let at_cap = "9".repeat(cap);
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, Some(&at_cap));
+        assert_eq!(markdown.as_str(), format!("**Current**: `{at_cap}`\n\n"));
+
+        let over_cap = "9".repeat(cap + 1);
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, Some(&over_cap));
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Current**: `{}…`\n\n", "9".repeat(cap))
+        );
+    }
+
+    #[test]
+    fn push_current_or_requirement_hover_section_requirement_boundary_at_and_over_cap() {
+        let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
+
+        let at_cap = "9".repeat(cap);
+        let dep = MockDep {
+            name: "pkg".into(),
+            version_req: at_cap.as_str().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, None);
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Requirement**: `{at_cap}`\n\n")
+        );
+
+        let over_cap = "9".repeat(cap + 1);
+        let dep = MockDep {
+            name: "pkg".into(),
+            version_req: over_cap.as_str().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, None);
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Requirement**: `{}…`\n\n", "9".repeat(cap))
+        );
+    }
+
+    /// #1311/#1313: `resolved`/`version_requirement` are `FieldKind::Version`, so they
+    /// must strip a `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe`
+    /// alone does not catch.
+    #[test]
+    fn push_current_or_requirement_hover_section_strips_u206a() {
+        let value = format!("1.0{}0", '\u{206a}');
+        let dep = MockDep {
+            name: "pkg".into(),
+            version_req: value.as_str().into(),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, Some(&value));
+        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+
+        let mut markdown = HoverMarkdown::new();
+        push_current_or_requirement_hover_section(&mut markdown, &dep, None);
+        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+    }
+
+    #[test]
+    fn push_markers_hover_section_truncates_overlong_marker_expr() {
+        let long = "x".repeat(5000);
+        let dep = MockMarkedDep {
+            name: "pkg".into(),
+            name_range: Range::default(),
+            markers: Some(long.clone()),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_markers_hover_section(&mut markdown, &dep);
+        assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
+        assert!(markdown.as_str().contains('…'));
+    }
+
+    /// #1310 critic M2: boundary case using `MAX_DIAGNOSTIC_NAME_CHARS` specifically —
+    /// `marker_expr` moved off `FieldKind::Prose` onto `FieldKind::Name` (#1313
+    /// reclassification), so this now matches the name-shaped cap, not the prose one.
+    #[test]
+    fn push_markers_hover_section_boundary_at_and_over_cap() {
+        let cap = MAX_DIAGNOSTIC_NAME_CHARS;
+
+        let at_cap = "x".repeat(cap);
+        let dep = MockMarkedDep {
+            name: "pkg".into(),
+            name_range: Range::default(),
+            markers: Some(at_cap.clone()),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_markers_hover_section(&mut markdown, &dep);
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Active when**: `{at_cap}`\n\n")
+        );
+
+        let over_cap = "x".repeat(cap + 1);
+        let dep = MockMarkedDep {
+            name: "pkg".into(),
+            name_range: Range::default(),
+            markers: Some(over_cap),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_markers_hover_section(&mut markdown, &dep);
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Active when**: `{}…`\n\n", "x".repeat(cap))
+        );
+    }
+
+    #[test]
+    fn push_latest_hover_section_truncates_overlong_latest_version() {
+        let long = "9".repeat(5000);
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some((long.as_str(), None)),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        );
+        assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
+        assert!(markdown.as_str().contains('…'));
+    }
+
+    /// #1310 critic M2: boundary case using `MAX_VERSION_DIAGNOSTIC_CHARS` specifically.
+    #[test]
+    fn push_latest_hover_section_boundary_at_and_over_cap() {
+        let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
+
+        let at_cap = "9".repeat(cap);
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some((at_cap.as_str(), None)),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        );
+        assert_eq!(markdown.as_str(), format!("**Latest**: `{at_cap}`\n\n"));
+
+        let over_cap = "9".repeat(cap + 1);
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some((over_cap.as_str(), None)),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        );
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Latest**: `{}…`\n\n", "9".repeat(cap))
+        );
+    }
+
+    /// #1311/#1313: `latest_ver` is `FieldKind::Version`, so it must strip a
+    /// `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe` alone
+    /// does not catch.
+    #[test]
+    fn push_latest_hover_section_strips_u206a() {
+        let value = format!("1.0{}0", '\u{206a}');
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some((value.as_str(), None)),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        );
+        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+    }
+
+    #[test]
+    fn push_recent_versions_hover_section_truncates_overlong_version_string() {
+        let long = "9".repeat(5000);
+        let versions: Vec<Box<dyn crate::Version>> = vec![Box::new(TestVersion {
+            version: long.as_str().into(),
+            yanked: false,
+        })];
+        let mut markdown = HoverMarkdown::new();
+        push_recent_versions_hover_section(
+            &mut markdown,
+            &versions,
+            None,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+            &MockFormatter,
+        );
+        assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
+        assert!(markdown.as_str().contains('…'));
+    }
+
+    /// #1310 critic M2: boundary case using `MAX_VERSION_DIAGNOSTIC_CHARS` specifically.
+    #[test]
+    fn push_recent_versions_hover_section_boundary_at_and_over_cap() {
+        let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
+
+        let at_cap = "9".repeat(cap);
+        let versions: Vec<Box<dyn crate::Version>> = vec![Box::new(TestVersion {
+            version: at_cap.as_str().into(),
+            yanked: false,
+        })];
+        let mut markdown = HoverMarkdown::new();
+        push_recent_versions_hover_section(
+            &mut markdown,
+            &versions,
+            None,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+            &MockFormatter,
+        );
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Recent versions**:\n- `{at_cap}`\n")
+        );
+
+        let over_cap = "9".repeat(cap + 1);
+        let versions: Vec<Box<dyn crate::Version>> = vec![Box::new(TestVersion {
+            version: over_cap.as_str().into(),
+            yanked: false,
+        })];
+        let mut markdown = HoverMarkdown::new();
+        push_recent_versions_hover_section(
+            &mut markdown,
+            &versions,
+            None,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+            &MockFormatter,
+        );
+        assert_eq!(
+            markdown.as_str(),
+            format!("**Recent versions**:\n- `{}…`\n", "9".repeat(cap))
+        );
+    }
+
+    /// #1311/#1313: `version_string()` is `FieldKind::Version`, so it must strip a
+    /// `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe` alone
+    /// does not catch.
+    #[test]
+    fn push_recent_versions_hover_section_strips_u206a() {
+        let value = format!("1.0{}0", '\u{206a}');
+        let versions: Vec<Box<dyn crate::Version>> = vec![Box::new(TestVersion {
+            version: value.as_str().into(),
+            yanked: false,
+        })];
+        let mut markdown = HoverMarkdown::new();
+        push_recent_versions_hover_section(
+            &mut markdown,
+            &versions,
+            None,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+            &MockFormatter,
+        );
+        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+    }
+
+    #[test]
+    fn push_deprecation_hover_section_truncates_overlong_reason_and_replacement() {
+        let long_reason = "r".repeat(5000);
+        let long_replacement = "p".repeat(5000);
+        let deprecation = Deprecation {
+            reason: Some(long_reason.clone()),
+            replacement: Some(long_replacement.clone()),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            markdown.as_str().len() < long_reason.len() + long_replacement.len(),
+            "got: {markdown}"
+        );
+        assert!(markdown.as_str().contains('…'));
+    }
+
+    /// #1310 critic M2: boundary case using `MAX_DIAGNOSTIC_PROSE_CHARS` specifically,
+    /// for `reason` (via `push_text`).
+    #[test]
+    fn push_deprecation_hover_section_reason_boundary_at_and_over_cap() {
+        let cap = MAX_DIAGNOSTIC_PROSE_CHARS;
+
+        let at_cap = "r".repeat(cap);
+        let deprecation = Deprecation {
+            reason: Some(at_cap.clone()),
+            replacement: None,
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            markdown.as_str().contains(&format!("{at_cap}\n\n")),
+            "got: {markdown}"
+        );
+        assert!(!markdown.as_str().contains('…'));
+
+        let over_cap = "r".repeat(cap + 1);
+        let deprecation = Deprecation {
+            reason: Some(over_cap),
+            replacement: None,
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            markdown
+                .as_str()
+                .contains(&format!("{}…\n\n", "r".repeat(cap))),
+            "got: {markdown}"
+        );
+    }
+
+    /// Same as above, for `replacement` (via `push_code`) — `MAX_DIAGNOSTIC_NAME_CHARS`,
+    /// not `MAX_DIAGNOSTIC_PROSE_CHARS`: `replacement` moved off `FieldKind::Prose` onto
+    /// `FieldKind::Name` (#1313 reclassification, a package name is not free prose).
+    #[test]
+    fn push_deprecation_hover_section_replacement_boundary_at_and_over_cap() {
+        let cap = MAX_DIAGNOSTIC_NAME_CHARS;
+
+        let at_cap = "p".repeat(cap);
+        let deprecation = Deprecation {
+            reason: None,
+            replacement: Some(at_cap.clone()),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            markdown
+                .as_str()
+                .contains(&format!("Suggested replacement: `{at_cap}`\n\n")),
+            "got: {markdown}"
+        );
+
+        let over_cap = "p".repeat(cap + 1);
+        let deprecation = Deprecation {
+            reason: None,
+            replacement: Some(over_cap),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            markdown.as_str().contains(&format!(
+                "Suggested replacement: `{}…`\n\n",
+                "p".repeat(cap)
+            )),
+            "got: {markdown}"
+        );
+    }
+
+    /// #1309 regression guard: the length cap must not reintroduce a bidi/invisible
+    /// spoofing gap — `deprecation.reason` still goes through `escape_markdown`'s
+    /// narrow filter, which deliberately preserves ZWJ (U+200D) while blocking the
+    /// RLO override (U+202E).
+    #[test]
+    fn push_deprecation_hover_section_still_blocks_rlo_override_after_truncation() {
+        let reason = format!("safe {}text", '\u{202e}');
+        let deprecation = Deprecation {
+            reason: Some(reason),
+            replacement: None,
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            !markdown.as_str().contains('\u{202e}'),
+            "RLO override must still be blocked; got: {markdown:?}"
+        );
+    }
+
+    /// #1313 reclassification: `deprecation.replacement` moved off `FieldKind::Prose`
+    /// onto `FieldKind::Name`, so it must now strip a `sanitize_invisible`-only
+    /// codepoint (U+206A) that `is_markdown_unsafe` alone does not catch — the exact
+    /// gap #1313's own doc names as #1311's still-open example.
+    #[test]
+    fn push_deprecation_hover_section_replacement_strips_u206a() {
+        let replacement = format!("left{}pad", '\u{206a}');
+        let deprecation = Deprecation {
+            reason: None,
+            replacement: Some(replacement),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            !markdown.as_str().contains('\u{206a}'),
+            "U+206A must be stripped from the name-shaped replacement field; got: {markdown:?}"
+        );
+    }
+
+    /// `deprecation.reason` is genuine prose and stays on `FieldKind::Prose` — it must
+    /// still carry U+206A and legitimate RTL/ZWJ content unchanged (by design), so this
+    /// reclassification doesn't accidentally sweep the one field that must stay untouched.
+    #[test]
+    fn push_deprecation_hover_section_reason_does_not_strip_u206a_or_rtl_marks() {
+        let reason = format!("note{} with RTL{}mark", '\u{206a}', '\u{200f}');
+        let deprecation = Deprecation {
+            reason: Some(reason),
+            replacement: None,
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        assert!(
+            markdown.as_str().contains('\u{206a}') && markdown.as_str().contains('\u{200f}'),
+            "reason (Prose) must preserve U+206A and RTL marks unchanged; got: {markdown:?}"
+        );
+    }
+
+    /// #1313 reclassification: `marker_expr` moved off `FieldKind::Prose` onto
+    /// `FieldKind::Name`, so it must now strip U+206A too.
+    #[test]
+    fn push_markers_hover_section_strips_u206a() {
+        let dep = MockMarkedDep {
+            name: "pkg".into(),
+            name_range: Range::default(),
+            markers: Some(format!("python_version{}>= '3.8'", '\u{206a}')),
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_markers_hover_section(&mut markdown, &dep);
+        assert!(
+            !markdown.as_str().contains('\u{206a}'),
+            "U+206A must be stripped from the name-shaped marker expression; got: {markdown:?}"
+        );
+    }
+
     #[test]
     fn push_license_hover_section_renders_nothing_when_resolved_unknown() {
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_license_hover_section(&mut markdown, &[], Some(&["MIT".to_string()]), false);
-        assert!(markdown.is_empty());
+        assert!(markdown.as_str().is_empty());
     }
 
     /// impl-critic review S1: no latest version exists at all (`None`, distinct from
@@ -1290,34 +1721,38 @@ mod tests {
     /// against.
     #[test]
     fn push_license_hover_section_renders_nothing_extra_when_no_latest_version_exists() {
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_license_hover_section(&mut markdown, &["MIT".to_string()], None, false);
-        assert!(markdown.contains("**License**: `MIT`"));
-        assert!(!markdown.contains("unavailable"));
-        assert!(!markdown.contains("License changed"));
+        assert!(markdown.as_str().contains("**License**: `MIT`"));
+        assert!(!markdown.as_str().contains("unavailable"));
+        assert!(!markdown.as_str().contains("License changed"));
     }
 
     #[test]
     fn push_license_hover_section_renders_resolved_only_when_latest_unavailable() {
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_license_hover_section(&mut markdown, &["MIT".to_string()], Some(&[]), false);
-        assert!(markdown.contains("**License**: `MIT`"));
-        assert!(markdown.contains("latest version license unavailable"));
-        assert!(!markdown.contains("License changed"));
+        assert!(markdown.as_str().contains("**License**: `MIT`"));
+        assert!(
+            markdown
+                .as_str()
+                .contains("latest version license unavailable")
+        );
+        assert!(!markdown.as_str().contains("License changed"));
     }
 
     #[test]
     fn push_license_hover_section_flags_change_when_licenses_differ() {
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_license_hover_section(
             &mut markdown,
             &["MIT".to_string()],
             Some(&["Apache-2.0".to_string()]),
             false,
         );
-        assert!(markdown.contains("**License**: `MIT`"));
-        assert!(markdown.contains("License changed"));
-        assert!(markdown.contains("`MIT` \u{2192} `Apache-2.0`"));
+        assert!(markdown.as_str().contains("**License**: `MIT`"));
+        assert!(markdown.as_str().contains("License changed"));
+        assert!(markdown.as_str().contains("`MIT` \u{2192} `Apache-2.0`"));
     }
 
     /// Issue #660: Dart's best-effort detected license must render with the
@@ -1325,9 +1760,9 @@ mod tests {
     /// genuinely registry-declared license field (spec 010 NFR-005 exception).
     #[test]
     fn push_license_hover_section_detected_flag_adds_qualifier() {
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_license_hover_section(&mut markdown, &["MIT".to_string()], None, true);
-        assert!(markdown.contains("**License (detected)**: `MIT`"));
+        assert!(markdown.as_str().contains("**License (detected)**: `MIT`"));
     }
 
     /// impl-critic review S3: the "License changed" line must be its own Markdown
@@ -1336,7 +1771,7 @@ mod tests {
     /// line above it.
     #[test]
     fn push_license_hover_section_change_line_is_a_separate_paragraph() {
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_license_hover_section(
             &mut markdown,
             &["MIT".to_string()],
@@ -1344,23 +1779,25 @@ mod tests {
             false,
         );
         assert!(
-            markdown.contains("`MIT`\n\n\u{26a0}\u{fe0f} **License changed**"),
+            markdown
+                .as_str()
+                .contains("`MIT`\n\n\u{26a0}\u{fe0f} **License changed**"),
             "expected a blank line (paragraph break) before the License changed line; got: {markdown:?}"
         );
     }
 
     #[test]
     fn push_license_hover_section_no_flag_when_licenses_equal() {
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_license_hover_section(
             &mut markdown,
             &["MIT".to_string()],
             Some(&["MIT".to_string()]),
             false,
         );
-        assert!(markdown.contains("**License**: `MIT`"));
-        assert!(!markdown.contains("License changed"));
-        assert!(!markdown.contains("unavailable"));
+        assert!(markdown.as_str().contains("**License**: `MIT`"));
+        assert!(!markdown.as_str().contains("License changed"));
+        assert!(!markdown.as_str().contains("unavailable"));
     }
 
     /// Issue #204 end-to-end: a native version-list source (Composer/tier-1 shape,
@@ -4249,7 +4686,7 @@ mod tests {
             });
 
         let outcome = ScanOutcome::Vulnerable(dv);
-        let mut markdown = String::new();
+        let mut markdown = HoverMarkdown::new();
         push_vulnerability_hover_section(&mut markdown, Some(&outcome));
 
         // `S`/`F`/`V` are not ASCII punctuation, so `escape_markdown`/`markdown_code_span`
@@ -4257,31 +4694,41 @@ mod tests {
         // `MAX_DIAGNOSTIC_PROSE_CHARS`/`MAX_VERSION_DIAGNOSTIC_CHARS` chars plus the `…`
         // marker, not merely "shorter than 500".
         assert!(
-            markdown.contains(&format!("{}…", "S".repeat(MAX_DIAGNOSTIC_PROSE_CHARS))),
+            markdown
+                .as_str()
+                .contains(&format!("{}…", "S".repeat(MAX_DIAGNOSTIC_PROSE_CHARS))),
             "summary must be truncated to exactly {MAX_DIAGNOSTIC_PROSE_CHARS} chars plus an \
              ellipsis; got: {markdown}"
         );
         assert!(
-            !markdown.contains(&"S".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 1)),
+            !markdown
+                .as_str()
+                .contains(&"S".repeat(MAX_DIAGNOSTIC_PROSE_CHARS + 1)),
             "summary must not exceed the cap; got: {markdown}"
         );
         assert!(
-            markdown.contains(&format!("{}…", "F".repeat(MAX_VERSION_DIAGNOSTIC_CHARS))),
+            markdown
+                .as_str()
+                .contains(&format!("{}…", "F".repeat(MAX_VERSION_DIAGNOSTIC_CHARS))),
             "fixed version must be truncated to exactly {MAX_VERSION_DIAGNOSTIC_CHARS} chars \
              plus an ellipsis; got: {markdown}"
         );
         assert!(
-            markdown.contains(&format!("{}…", "V".repeat(MAX_VERSION_DIAGNOSTIC_CHARS))),
+            markdown
+                .as_str()
+                .contains(&format!("{}…", "V".repeat(MAX_VERSION_DIAGNOSTIC_CHARS))),
             "candidate version must be truncated to exactly {MAX_VERSION_DIAGNOSTIC_CHARS} \
              chars plus an ellipsis; got: {markdown}"
         );
         assert!(
-            markdown.contains(&format!("{}…", "é".repeat(MAX_DIAGNOSTIC_NAME_CHARS))),
+            markdown
+                .as_str()
+                .contains(&format!("{}…", "é".repeat(MAX_DIAGNOSTIC_NAME_CHARS))),
             "a multi-byte alias must be truncated on a char boundary, not a byte boundary; \
              got: {markdown}"
         );
         assert!(
-            markdown.contains("+4 more"),
+            markdown.as_str().contains("+4 more"),
             "alias list must be capped; got: {markdown}"
         );
     }

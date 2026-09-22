@@ -22,6 +22,8 @@ mod formatter;
 mod git_ref;
 #[cfg(feature = "lsp-responses")]
 mod hover;
+#[cfg(feature = "lsp-responses")]
+mod hover_markdown;
 mod in_use_version;
 #[cfg(feature = "lsp-responses")]
 mod inlay_hints;
@@ -64,6 +66,8 @@ pub use git_ref::{
 };
 #[cfg(feature = "lsp-responses")]
 pub use hover::{CMD_DOT_FOOTER, generate_hover};
+#[cfg(feature = "lsp-responses")]
+pub use hover_markdown::{FieldKind, HoverMarkdown, SafeNumber};
 pub use in_use_version::{concrete_pin_version, is_full_semver_shape, resolve_in_use_version};
 #[cfg(feature = "lsp-responses")]
 pub use inlay_hints::generate_inlay_hints;

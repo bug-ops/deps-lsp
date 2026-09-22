@@ -22,6 +22,7 @@ use deps_core::{
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::{
         EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, sanitize_and_truncate_for_diagnostic,
+        truncate_for_diagnostic,
     },
 };
 
@@ -1003,12 +1004,23 @@ fn reconstitute_component_releases(
 
 /// Inserts a `**Project**: [name](url)` line immediately after the hover heading, for a
 /// `component:` include whose heading link is suppressed (spec §8.2).
+///
+/// The link *label* half is capped at [`MAX_DIAGNOSTIC_VALUE_CHARS`] — `url` is built
+/// from `gl_dep.project_path`, a manifest-controlled string `is_valid_gitlab_coordinate`
+/// bounds only by charset, not length or segment count (#1310 critic S3 — `deps-core`'s
+/// `git_ref.rs::splice_resolved_line` fixed the same class for `resolved_tag`). Only the
+/// *label* is capped, matching `HoverMarkdown::push_link`'s label-capped/
+/// destination-unbounded contract. The label is truncated only, not escaped — safe
+/// because `is_valid_gitlab_coordinate`'s charset gate (`is_valid_path_segment`,
+/// `[A-Za-z0-9._-]`-only per segment) already runs before this function's only caller
+/// builds `url`, so no Markdown-special character can reach it in the first place.
 // `pos`/`insert_at` come from `find("\n\n")`, an ASCII token, so both are always char
 // boundaries.
 #[allow(clippy::string_slice)]
 #[cfg(feature = "lsp-responses")]
 fn splice_project_line(markdown: &str, url: &str) -> String {
-    let line = format!("**Project**: [{url}]({url})\n\n");
+    let label = truncate_for_diagnostic(url, MAX_DIAGNOSTIC_VALUE_CHARS);
+    let line = format!("**Project**: [{label}]({url})\n\n");
     if let Some(pos) = markdown.find("\n\n") {
         let insert_at = pos + 2;
         let mut out = String::with_capacity(markdown.len() + line.len());
@@ -1098,6 +1110,55 @@ mod tests {
         let spliced = splice_project_line(markdown, "https://gitlab.com/org/proj");
         assert!(spliced.contains("**Project**"));
         assert!(spliced.find("**Project**").unwrap() < spliced.find("**Requirement**").unwrap());
+    }
+
+    /// #1310 critic S3: `project_path` is manifest-controlled and `is_valid_gitlab_coordinate`
+    /// bounds only its charset, not its length — the label half of the `**Project**` line
+    /// must be capped, matching `deps-core::git_ref.rs`'s `splice_resolved_line` fix for the
+    /// same class of gap.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn splice_project_line_caps_label_but_not_destination() {
+        let long_url = format!("https://gitlab.example.com/{}", "a".repeat(5000));
+        let spliced = splice_project_line("", &long_url);
+        assert!(
+            spliced.contains(&format!("]({long_url})")),
+            "the destination must not be truncated; got: {spliced}"
+        );
+        assert!(
+            spliced.contains('…'),
+            "the label must be truncated; got: {spliced}"
+        );
+        let label_start = spliced.find('[').unwrap() + 1;
+        let label_end = spliced.find(']').unwrap();
+        assert!(
+            spliced[label_start..label_end].chars().count() <= MAX_DIAGNOSTIC_VALUE_CHARS + 1,
+            "label must be bounded by the cap plus the ellipsis marker; got: {spliced}"
+        );
+    }
+
+    /// Boundary case (at cap / over cap), not just the 5000-char extreme.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn splice_project_line_label_boundary_at_and_over_cap() {
+        let prefix = "https://gitlab.example.com/";
+        let cap = MAX_DIAGNOSTIC_VALUE_CHARS;
+
+        let at_cap_url = format!("{prefix}{}", "a".repeat(cap - prefix.len()));
+        let spliced = splice_project_line("", &at_cap_url);
+        assert!(
+            spliced.contains(&format!("[{at_cap_url}]({at_cap_url})")),
+            "a url whose label is exactly at the cap must render whole; got: {spliced}"
+        );
+
+        let over_cap_url = format!("{prefix}{}", "a".repeat(cap - prefix.len() + 1));
+        let spliced = splice_project_line("", &over_cap_url);
+        let truncated_label = format!("{}…", &over_cap_url[..cap]);
+        assert!(
+            spliced.contains(&format!("[{truncated_label}]({over_cap_url})")),
+            "a url one char over the cap must truncate the label to exactly `cap` chars \
+             plus the ellipsis, while leaving the destination whole; got: {spliced}"
+        );
     }
 
     #[cfg(feature = "lsp-responses")]
