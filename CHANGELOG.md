@@ -31,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli**: `CheckFinding.manifest_path` is now sanitized before reaching table (default) and JSON output, and every other path-carrying warning/error message deps-cli prints is sanitized at a single construction-time chokepoint instead of per call site, closing the same Trojan-Source-class ANSI-escape/bidi-override leak class as #1301 (resolves #1299) (#1304)
 - **deps-cli, deps-core**: `CheckFinding.requirement` sanitization now also redacts credential-shaped text via a new `deps_core::lsp_helpers::redact_requirement_for_diagnostic` helper, replacing deps-cli's locally duplicated length-cap constant (resolves #1300) (#1304)
 - **deps-core, deps-lsp**: raw-text fallback completion now rewrites `filter_text` to the raw typed prefix for registries that normalize search queries, fixing PyPI PEP 503 dotted-name completions dropped by some LSP clients (resolves #1289) (#1306)
+- **deps-cargo**: feature-flag completion is now capped at 5 items with deterministic alphabetical truncation and an accurate `is_incomplete` flag, instead of an unbounded, arbitrarily-ordered list (resolves #1302) (#1307)
 
 ### Breaking
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
