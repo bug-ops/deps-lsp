@@ -759,8 +759,10 @@ pub trait ShaPinning: Send + Sync {
 
 /// Maximum character count of the dependency name interpolated into
 /// [`build_sha_pin_action`]'s CodeAction title, before truncation with an ellipsis marker.
-/// Mirrors `diagnostics::MAX_DIAGNOSTIC_NAME_CHARS`'s and each ecosystem's own
-/// `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS`'s bound (#1252 critic follow-up C1): this is the
+/// Mirrors `diagnostics::MAX_DIAGNOSTIC_NAME_CHARS`'s and
+/// `deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`'s numeric bound (#1252 critic
+/// follow-up C1) — a separate `= 128` literal, not derived from either, out of #1278's
+/// scope (that issue's nine-constant list did not include this one): this is the
 /// *primary* `PinStyle::Tag` quickfix title, shared by both `deps-github-actions` and
 /// `deps-gitlab-ci`, so it needs the same cap as the diagnostic sinks it sits next to.
 #[cfg(feature = "lsp-responses")]

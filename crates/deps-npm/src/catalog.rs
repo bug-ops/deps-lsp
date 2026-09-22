@@ -393,18 +393,28 @@ impl std::fmt::Debug for CatalogOrigin {
     }
 }
 
-/// Upper bound (Unicode scalar values) on how much of any single attacker-controlled fragment
-/// (the raw specifier, a dependency name, or a catalog name — all ultimately sourced from a
-/// cloned repository's `package.json`/`pnpm-workspace.yaml`) is ever interpolated into a
-/// diagnostic or hover message. Mirrors `deps-github-actions`'s
-/// `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` precedent (security audit LOW finding: without a
-/// bound, a multi-megabyte catalog entry value renders in full on every hover).
-const MAX_CATALOG_MESSAGE_VALUE_CHARS: usize = 128;
-
-/// Length-bounds `s` before it is wrapped for interpolation — see
-/// [`MAX_CATALOG_MESSAGE_VALUE_CHARS`].
+/// Length-bounds `s` (Unicode scalar values) before it is wrapped for interpolation into a
+/// diagnostic or hover message — bounds any single attacker-controlled fragment (the raw
+/// specifier, a dependency name, or a catalog name, all ultimately sourced from a cloned
+/// repository's `package.json`/`pnpm-workspace.yaml`; security audit LOW finding: without a
+/// bound, a multi-megabyte catalog entry value renders in full on every hover). Shares
+/// [`deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`] rather than declaring its own
+/// duplicate constant (issue #1278).
 fn bounded(s: &str) -> std::borrow::Cow<'_, str> {
-    deps_core::lsp_helpers::truncate_for_diagnostic(s, MAX_CATALOG_MESSAGE_VALUE_CHARS)
+    deps_core::lsp_helpers::truncate_for_diagnostic(
+        s,
+        deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS,
+    )
+}
+
+/// Composes [`deps_core::net_policy::sanitize_invisible`] with `escape`, sanitizing *before*
+/// escaping — the ordering both [`CatalogOrigin::diagnostic_message`] and
+/// [`CatalogOrigin::hover_detail`] depend on (an unescaped invisible/bidi character must
+/// never reach `escape`, which doesn't itself neutralize it). Both methods build their
+/// `code`/`text` closures as this same composition with a different `escape`, so this is the
+/// one place that ordering invariant is expressed rather than four near-identical closures.
+fn sanitize_then(escape: impl Fn(&str) -> String) -> impl Fn(&str) -> String {
+    move |s: &str| escape(&deps_core::net_policy::sanitize_invisible(s))
 }
 
 impl CatalogOrigin {
@@ -429,8 +439,8 @@ impl CatalogOrigin {
     pub fn diagnostic_message(&self, dependency_name: &str) -> Option<String> {
         self.render(
             dependency_name,
-            |s: &str| format!("`{}`", deps_core::net_policy::sanitize_invisible(s)),
-            |s: &str| deps_core::net_policy::sanitize_invisible(s).into_owned(),
+            sanitize_then(|s: &str| format!("`{s}`")),
+            sanitize_then(str::to_string),
         )
     }
 
@@ -443,24 +453,46 @@ impl CatalogOrigin {
     /// [`deps_core::lsp_helpers::escape_markdown`] (a dependency or catalog name) before
     /// interpolation, closing the Markdown-breakout (`` ` `` / `]( `) and auto-loaded-image
     /// (`![]()`) vectors a raw `format!` would otherwise open.
+    ///
+    /// #1266: every fragment is also run through
+    /// [`deps_core::net_policy::sanitize_invisible`] *before* the Markdown escaping above,
+    /// matching [`Self::diagnostic_message`]'s strength rather than
+    /// `markdown_code_span`/`escape_markdown`'s own narrower, bidi/invisible-only filter
+    /// (`is_markdown_unsafe`). That narrower filter is deliberately kept as-is for its
+    /// *other* callers — it also renders genuinely free-form registry prose (hover
+    /// descriptions, OSV advisory summaries), which can legitimately carry a right-to-left
+    /// mark or an emoji ZWJ sequence a whole-category sweep would mangle (see
+    /// `is_markdown_unsafe`'s own doc). None of `CatalogOrigin`'s fields are free text,
+    /// though: `specifier`/`range`/`value` are catalog-entry version strings and
+    /// `dependency_name`/catalog name are identifiers — the same name-shaped category
+    /// [`deps_core::net_policy::sanitize_invisible`]'s own doc says is always safe to sweep
+    /// in full. For every outcome [`Self::diagnostic_message`] also renders (`render()`'s
+    /// arms), this matches that sibling's existing sanitization strength, closing the gap
+    /// for a non-bidi `Cf` character outside `is_markdown_unsafe`'s enumerated ranges (e.g.
+    /// U+206A INHIBIT SYMMETRIC SWAPPING), which previously reached hover unmodified while
+    /// the diagnostic already stripped it. [`CatalogOutcome::Resolved`]/
+    /// [`CatalogOutcome::NonSemverEntry`] have no `diagnostic_message` text at all
+    /// (`render()` returns `None` for both, see that outcome's own doc) — for those two,
+    /// this is new strengthening, not restored parity with a sibling that doesn't exist.
     #[must_use]
     pub fn hover_detail(&self, dependency_name: &str) -> String {
         use deps_core::lsp_helpers::{escape_markdown, markdown_code_span};
 
+        let code = sanitize_then(markdown_code_span);
+        let text = sanitize_then(escape_markdown);
+
         match &self.outcome {
             CatalogOutcome::Resolved(range) => format!(
                 "{} → {}",
-                markdown_code_span(&bounded(&self.specifier)),
-                markdown_code_span(&bounded(range))
+                code(&bounded(&self.specifier)),
+                code(&bounded(range))
             ),
             CatalogOutcome::NonSemverEntry { value } => format!(
                 "{} → {} (not a version range)",
-                markdown_code_span(&bounded(&self.specifier)),
-                markdown_code_span(&bounded(value))
+                code(&bounded(&self.specifier)),
+                code(&bounded(value))
             ),
-            _ => self
-                .render(dependency_name, markdown_code_span, escape_markdown)
-                .unwrap_or_default(),
+            _ => self.render(dependency_name, code, text).unwrap_or_default(),
         }
     }
 
@@ -1345,6 +1377,75 @@ mod tests {
             message,
             "`catalog:react 17 ` requires a pnpm-workspace.yaml in an ancestor directory; \
              none was found"
+        );
+    }
+
+    /// #1266: a non-bidi `Cf` character outside `is_markdown_unsafe`'s narrow enumerated
+    /// list must be neutralized in `hover_detail` just as it already is in
+    /// `diagnostic_message` — both render the same dependency name for the same outcome, so
+    /// the two sinks must agree. Property-style over several characters spanning distinct
+    /// `Cf`/`Zl`/`Zp` sub-ranges `is_markdown_unsafe` does not enumerate (critic M3: a
+    /// single fixed code point is too weak a regression pin), not just the U+206A this
+    /// issue's report happened to name:
+    /// - U+206A INHIBIT SYMMETRIC SWAPPING (deprecated format character block)
+    /// - U+2061 FUNCTION APPLICATION (invisible math operator block)
+    /// - U+180E MONGOLIAN VOWEL SEPARATOR (historically reclassified into `Cf`)
+    #[test]
+    fn test_hover_detail_sanitizes_non_bidi_format_chars_matching_diagnostic_message() {
+        for evil_char in ['\u{206A}', '\u{2061}', '\u{180E}'] {
+            let evil_name = format!("pkg{evil_char}evil");
+            let o = origin("catalog:", None, CatalogOutcome::MissingEntry);
+
+            let diagnostic = o.diagnostic_message(&evil_name).unwrap();
+            assert!(
+                !diagnostic.contains(evil_char),
+                "diagnostic_message did not sanitize {evil_char:?}: {diagnostic:?}"
+            );
+
+            let hover = o.hover_detail(&evil_name);
+            assert!(
+                !hover.contains(evil_char),
+                "hover_detail did not sanitize {evil_char:?}, diverging from \
+                 diagnostic_message: {hover:?}"
+            );
+        }
+    }
+
+    /// #1266: the same gap in the catalog name (`specifier`'s `strip_prefix("catalog:")`
+    /// tail), and in the raw specifier text itself (the `code` closure), reached via
+    /// `UnknownCatalog`'s message shape.
+    #[test]
+    fn test_hover_detail_sanitizes_non_bidi_format_char_in_catalog_name_and_specifier() {
+        let evil_catalog = "react\u{206A}17";
+        let specifier = format!("catalog:{evil_catalog}");
+        let o = origin(
+            &specifier,
+            Some(evil_catalog),
+            CatalogOutcome::UnknownCatalog,
+        );
+
+        let hover = o.hover_detail("react");
+        assert!(
+            !hover.contains('\u{206A}'),
+            "hover_detail did not sanitize U+206A in specifier/catalog name: {hover:?}"
+        );
+    }
+
+    /// #1266: the `Resolved`/`NonSemverEntry` arms build their hover text directly (not
+    /// through `render`), so they need their own coverage of the same sanitization.
+    #[test]
+    fn test_hover_detail_sanitizes_non_bidi_format_char_in_resolved_range() {
+        let evil_range = "^1\u{206A}.0.0";
+        let o = origin(
+            "catalog:",
+            None,
+            CatalogOutcome::Resolved(evil_range.to_string()),
+        );
+
+        let hover = o.hover_detail("react");
+        assert!(
+            !hover.contains('\u{206A}'),
+            "hover_detail did not sanitize U+206A in a Resolved range: {hover:?}"
         );
     }
 
