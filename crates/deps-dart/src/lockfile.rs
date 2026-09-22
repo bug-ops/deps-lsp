@@ -44,28 +44,7 @@ impl LockFileProvider for PubspecLockParser {
 /// Returns [`DepsError::ParseError`] if the YAML nesting depth exceeds the
 /// configured limit or the content is not valid YAML.
 pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
-    if let Err(depth) =
-        deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "pubspec.lock".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_YAML_NESTING_DEPTH
-            ))),
-        });
-    }
-
-    if let Err(bytes) = deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "pubspec.lock".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML expansion {bytes} bytes exceeds maximum of {} bytes",
-                deps_core::MAX_YAML_EXPANDED_BYTES
-            ))),
-        });
-    }
+    deps_core::check_yaml_bounds(content, "pubspec.lock")?;
 
     let mut packages = ResolvedPackages::new();
 

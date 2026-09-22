@@ -26,7 +26,7 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::parser::DependencySource;
 use deps_core::yaml_walk::{FrameKind, FrameStack, ScalarPosition};
-use deps_core::{DepsError, Range, Result};
+use deps_core::{Range, Result};
 use url::Url;
 use yaml_rust2::parser::{Event, MarkedEventReceiver, Parser};
 use yaml_rust2::scanner::Marker;
@@ -597,16 +597,15 @@ fn build_dependency(
 /// Parses a `.github/workflows/*.yml`/`*.yaml` file and returns every `uses:` dependency
 /// found, with LSP position tracking.
 ///
-/// Gated first (as `deps-dart`'s pubspec.yaml parser) by
-/// [`deps_core::check_yaml_nesting_depth`]/[`deps_core::check_yaml_expansion`], which return
-/// a real [`DepsError::ParseError`]. A downstream YAML syntax error, by contrast, degrades to
-/// an **empty** [`GithubActionsParseResult`] (logged at `debug`) rather than propagating —
-/// workflows are numerous per repository, and one malformed file should not disable hover/
-/// completion for every other open workflow.
+/// Gated first (as `deps-dart`'s pubspec.yaml parser) by [`deps_core::check_yaml_bounds`],
+/// which returns a real [`deps_core::DepsError::ParseError`]. A downstream YAML syntax
+/// error, by contrast, degrades to an **empty** [`GithubActionsParseResult`] (logged at
+/// `debug`) rather than propagating — workflows are numerous per repository, and one
+/// malformed file should not disable hover/completion for every other open workflow.
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::ParseError`] only when `content` exceeds the shared YAML
+/// Returns [`deps_core::DepsError::ParseError`] only when `content` exceeds the shared YAML
 /// nesting-depth or expansion-size gate.
 ///
 /// # Examples
@@ -623,27 +622,7 @@ fn build_dependency(
 /// assert_eq!(result.dependencies[0].name(), "actions/checkout");
 /// ```
 pub fn parse_workflow_yaml(content: &str, uri: &Url) -> Result<GithubActionsParseResult> {
-    if let Err(depth) =
-        deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "workflow.yml".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_YAML_NESTING_DEPTH
-            ))),
-        });
-    }
-    if let Err(bytes) = deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES)
-    {
-        return Err(DepsError::ParseError {
-            file_type: "workflow.yml".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML expansion {bytes} bytes exceeds maximum of {} bytes",
-                deps_core::MAX_YAML_EXPANDED_BYTES
-            ))),
-        });
-    }
+    deps_core::check_yaml_bounds(content, "workflow.yml")?;
 
     let mut receiver = WorkflowReceiver::new();
     let mut parser = Parser::new_from_str(content);
@@ -711,7 +690,7 @@ fn is_action_manifest_filename(uri: &Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::Dependency;
+    use deps_core::{Dependency, DepsError};
     use std::assert_matches;
     use yaml_rust2::scanner::TScalarStyle;
 
@@ -1314,6 +1293,21 @@ mod tests {
         let payload = format!("{}1", "- ".repeat(deps_core::MAX_YAML_NESTING_DEPTH + 1));
         let result = parse_workflow_yaml(&payload, &test_uri());
         assert_matches!(result, Err(DepsError::ParseError { .. }));
+    }
+
+    #[test]
+    fn test_expanded_yaml_rejected_as_parse_error() {
+        // #1245: pins that the expansion bound is also wired through `check_yaml_bounds`.
+        let mut payload = String::from("a0: &a0 [x, x]\n");
+        for i in 1..=20 {
+            payload.push_str(&format!("a{i}: &a{i} [*a{prev}, *a{prev}]\n", prev = i - 1));
+        }
+        let result = parse_workflow_yaml(&payload, &test_uri());
+        let err = result.expect_err("expected the expansion budget to reject this");
+        assert!(
+            err.to_string().contains("YAML expansion"),
+            "unexpected error message: {err}"
+        );
     }
 
     // --- classify_uses_value / ref classification unit coverage ---

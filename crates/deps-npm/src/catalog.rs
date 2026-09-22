@@ -154,9 +154,8 @@ fn classify_catalogs_section(node: &Yaml) -> Result<Option<&yaml_rust2::yaml::Ha
 /// so a broken workspace file degrades this dependency's resolution instead of panicking or
 /// blocking the rest of the document's diagnostics (NFR-003).
 fn parse_pnpm_workspace(content: &str) -> PnpmWorkspaceConfig {
-    if deps_core::check_yaml_nesting_depth(content, deps_core::MAX_YAML_NESTING_DEPTH).is_err()
-        || deps_core::check_yaml_expansion(content, deps_core::MAX_YAML_EXPANDED_BYTES).is_err()
-    {
+    // Discards the `Result` since this fn must stay infallible (NFR-003).
+    if deps_core::check_yaml_bounds(content, "pnpm-workspace.yaml").is_err() {
         return PnpmWorkspaceConfig::defective(ConfigDefect::Malformed);
     }
 
