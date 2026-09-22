@@ -8,13 +8,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **ci**: new weekly/manual `live-registry-tests` workflow runs the workspace's `#[ignore]`d, network-gated tests with a real `GITHUB_TOKEN`, non-blocking for PRs
+- **ci**: new weekly/manual `live-registry-tests` workflow runs the workspace's `#[ignore]`d, network-gated tests with a real `GITHUB_TOKEN`, non-blocking for PRs (#1297)
 
 ### Fixed
 - **deps-lsp**: raw-text fallback package completion now matches the primary path's `sort_text`/`filter_text`/`detail`/`documentation`/`insert_text_format`, and gains the same latest-version safety gate (resolves #1284) (#1291)
-- **deps-swift, deps-cli, deps-lsp**: GitHub-backed live tests now skip instead of panicking when rate-limited with no `GITHUB_TOKEN` configured
-- **deps-npm**: live-search test no longer asserts that npm's tokenized search returns a specific package for a partial-prefix query
-- **tests**: every bare `#[ignore]` annotation across the workspace now carries a reason string
+- **deps-swift, deps-cli, deps-lsp**: GitHub-backed live tests now skip instead of panicking when rate-limited with no `GITHUB_TOKEN` configured (#1297)
+- **deps-npm**: live-search test no longer asserts that npm's tokenized search returns a specific package for a partial-prefix query (#1297)
+- **tests**: every bare `#[ignore]` annotation across the workspace now carries a reason string (#1297)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
