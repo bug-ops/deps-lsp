@@ -26,11 +26,11 @@ use crate::types::SwiftPackage;
 /// full URL — never the bare `owner/repo` identity — regardless of how much of the
 /// scheme the user has typed so far. `replace_range` should be the dependency's
 /// `name_range()` (the byte span of the whole URL literal) whenever the caller can resolve
-/// it — the base builder's own range is a placeholder `(0,0)-(0,0)` that does not contain
-/// the real cursor position and would corrupt the document if used as-is. When `None` (the
-/// dependency containing the cursor could not be found), falls back to `insert_text`-only
-/// — the same safe pattern used by `create_package_completion_item` in `deps-lsp` — rather
-/// than guessing a range.
+/// it — [`deps_core::completion::build_package_completion_fields`] supplies no
+/// `insert_text`/`text_edit` at all, so this function always builds them itself. When
+/// `None` (the dependency containing the cursor could not be found), falls back to
+/// `insert_text`-only — the same safe pattern used by `create_package_completion_item` in
+/// `deps-lsp` — rather than guessing a range.
 ///
 /// Returns `None` when `url` doesn't pass [`is_safe_registry_url`], or when the base
 /// builder itself rejects `package.name` — a malicious/compromised search result must
@@ -53,16 +53,11 @@ fn build_url_completion(
         return None;
     }
 
-    let mut item = deps_core::completion::build_package_completion(
-        package,
-        LspRange::default(),
-        index,
-        prefix,
-    )?;
+    let mut item = deps_core::completion::build_package_completion_fields(package, index, prefix)?;
 
     item.insert_text = Some(url.clone());
     item.filter_text = Some(url.clone());
-    // `sort_text` is left as `build_package_completion` computed it: `prefix` here is
+    // `sort_text` is left as `build_package_completion_fields` computed it: `prefix` here is
     // already the GitHub-scheme-stripped query (see `strip_github_prefix`), which is the
     // same shape as `package.name()`, so the shared tiering is correct as-is (#1282 S1).
     item.text_edit = replace_range.map(|range| {

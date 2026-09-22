@@ -824,8 +824,11 @@ pub fn build_completion_sort_text(index: usize, prefix: &str, candidate: &str) -
 /// `Some(CompletionItem)` ready to send to the LSP client, or `None` when
 /// `metadata.name()` fails [`crate::is_safe_package_name`] — a malicious/compromised
 /// registry search result must not reach the manifest as an unsanitized `label`,
-/// `insert_text`, `text_edit`, `sort_text`, or `filter_text` (all derived from `name`), so
-/// the item is dropped rather than built with unsafe text.
+/// `insert_text`, `text_edit`, `sort_text`, or `filter_text` (all derived from `name` as
+/// this function returns them), so the item is dropped rather than built with unsafe text.
+/// A caller may still overwrite `filter_text` afterward with locally-typed buffer text
+/// rather than registry data (see [`apply_raw_prefix_filter_text`]) — that value never
+/// needs this gate, since it never came from `metadata` in the first place.
 ///
 /// `None` also when `metadata.latest_version()` (whenever non-empty) fails
 /// [`crate::lsp_helpers::is_safe_version_string`]. `latest` only ever reaches `detail`
@@ -849,13 +852,56 @@ pub fn build_completion_sort_text(index: usize, prefix: &str, candidate: &str) -
 /// assert_eq!(item.label, metadata.name().as_str());
 /// # }
 /// ```
+pub fn build_package_completion(
+    metadata: &dyn Metadata,
+    insert_range: Range,
+    index: usize,
+    prefix: &str,
+) -> Option<CompletionItem> {
+    let mut item = build_package_completion_fields(metadata, index, prefix)?;
+    let name = metadata.name();
+    item.insert_text = Some(name.as_str().to_string());
+    item.text_edit = Some(CompletionTextEdit::Edit(TextEdit {
+        range: insert_range,
+        new_text: name.as_str().to_string(),
+    }));
+    Some(item)
+}
+
+/// Builds every field of a package-name completion item except `insert_text`/`text_edit`.
+///
+/// Holds the rejection gates and field-construction logic [`build_package_completion`] used
+/// to build entirely on its own; that function is now a thin wrapper adding
+/// `insert_text`/`text_edit` on top of this one, so every caller shares one body and the
+/// same field set stays in lockstep by construction rather than by review (#1290). Use this
+/// function directly when the caller has no LSP insert range to offer (e.g. a raw-text
+/// fallback completion path) or needs to override `insert_text`/`text_edit` itself.
+///
+/// # Returns
+///
+/// `Some(CompletionItem)` with `insert_text` and `text_edit` both left `None` — the caller
+/// MUST populate at least one of them before returning the item to an LSP client, or `None`
+/// under the same rejection conditions as [`build_package_completion`] (unsafe package name
+/// or version string).
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::build_package_completion_fields;
+///
+/// # async fn example(metadata: &dyn deps_core::Metadata) {
+/// let item = build_package_completion_fields(metadata, 0, "").unwrap();
+/// assert_eq!(item.label, metadata.name().as_str());
+/// assert!(item.insert_text.is_none());
+/// assert!(item.text_edit.is_none());
+/// # }
+/// ```
 #[expect(
     clippy::string_slice,
     reason = "end is floor_char_boundary-clamped just below before slicing desc"
 )]
-pub fn build_package_completion(
+pub fn build_package_completion_fields(
     metadata: &dyn Metadata,
-    insert_range: Range,
     index: usize,
     prefix: &str,
 ) -> Option<CompletionItem> {
@@ -970,11 +1016,8 @@ pub fn build_package_completion(
             kind: MarkupKind::Markdown,
             value: doc_parts.join("\n"),
         })),
-        insert_text: Some(name.as_str().to_string()),
-        text_edit: Some(CompletionTextEdit::Edit(TextEdit {
-            range: insert_range,
-            new_text: name.as_str().to_string(),
-        })),
+        insert_text: None,
+        text_edit: None,
         sort_text: Some(sort_text),
         filter_text: Some(name.as_str().to_string()),
         ..Default::default()
@@ -1447,6 +1490,71 @@ pub fn reject_credential_bearing_value(value: &str, context: &str) -> Option<Vec
     None
 }
 
+/// Rewrites `filter_text` to the raw, as-typed `query` for every item, when `registry`
+/// matches search results against a normalized form of package names.
+///
+/// #419 S2: a registry like PyPI matches search results against the PEP 503 *normalized*
+/// name (`zope.int` typed -> normalized to `zope-int` -> `zope-interface` found), but
+/// [`build_package_completion`] sets `filter_text` to that same normalized name — and the
+/// LSP client re-filters every returned item against the RAW TEXT the user actually typed,
+/// independent of what the server matched on. `zope.int` is not a subsequence of
+/// `zope-interface`, so an editor like VS Code silently drops a result the server correctly
+/// found. Rewriting `filter_text` to the raw, as-typed `query` makes every returned item
+/// trivially self-matching against what's already on screen. Safe to apply unconditionally
+/// (rather than requiring a match against characters not yet typed): every caller of this
+/// function reports `is_incomplete: true` for its completion context, so the client
+/// re-queries — and receives a fresh `filter_text` — on the very next keystroke rather than
+/// continuing to filter this same list locally.
+///
+/// No-op when [`crate::Registry::search_normalizes_query`] returns `false` — the default,
+/// correct for every registry whose search already matches literal substrings/prefixes of
+/// `query`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::completion::apply_raw_prefix_filter_text;
+/// use deps_core::{Metadata, PackageName, Registry, Version};
+/// use std::any::Any;
+/// use std::pin::Pin;
+/// use tower_lsp_server::ls_types::CompletionItem;
+///
+/// struct NormalizingRegistry;
+/// impl Registry for NormalizingRegistry {
+/// #   fn get_versions<'a>(&'a self, _name: &'a PackageName)
+/// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Version>>>> + Send + 'a>>
+/// #   { Box::pin(async move { Ok(vec![]) }) }
+/// #   fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq)
+/// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Option<Box<dyn Version>>>> + Send + 'a>>
+/// #   { Box::pin(async move { Ok(None) }) }
+/// #   fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
+/// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Metadata>>>> + Send + 'a>>
+/// #   { Box::pin(async move { Ok(vec![]) }) }
+///     fn search_normalizes_query(&self) -> bool { true }
+/// #   fn as_any(&self) -> &dyn Any { self }
+/// }
+///
+/// let registry = NormalizingRegistry;
+/// let mut items = vec![CompletionItem {
+///     filter_text: Some("zope-interface".to_string()),
+///     ..Default::default()
+/// }];
+/// apply_raw_prefix_filter_text(&mut items, &registry, "zope.int");
+/// assert_eq!(items[0].filter_text.as_deref(), Some("zope.int"));
+/// ```
+pub fn apply_raw_prefix_filter_text(
+    items: &mut [CompletionItem],
+    registry: &dyn crate::Registry,
+    query: &str,
+) {
+    if !registry.search_normalizes_query() {
+        return;
+    }
+    for item in items {
+        item.filter_text = Some(query.to_string());
+    }
+}
+
 /// Generic package name completion using any `Registry` implementation.
 ///
 /// Searches the registry for packages matching `prefix` and returns up to `limit`
@@ -1486,13 +1594,15 @@ pub async fn complete_package_names_generic(
         }
     };
 
-    results
+    let mut items: Vec<CompletionItem> = results
         .into_iter()
         .enumerate()
         .filter_map(|(index, metadata)| {
             build_package_completion(metadata.as_ref(), insert_range, index, prefix)
         })
-        .collect()
+        .collect();
+    apply_raw_prefix_filter_text(&mut items, registry, prefix);
+    items
 }
 
 /// Generic version completion logic used by all ecosystems, resolved through
@@ -2150,6 +2260,85 @@ mod tests {
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].label, "serde");
+    }
+
+    /// #1289: a registry whose search does not normalize the query (the default, and every
+    /// registry in this workspace except `deps-pypi`) must leave `filter_text` exactly as
+    /// [`build_package_completion`] set it — no-op is the correct behavior, not "harmlessly
+    /// overwrite with the same value".
+    #[test]
+    fn test_apply_raw_prefix_filter_text_noop_for_non_normalizing_registry() {
+        let registry = MockSearchRegistry { results: vec![] };
+        let mut items = vec![CompletionItem {
+            filter_text: Some("serde".to_string()),
+            ..Default::default()
+        }];
+
+        apply_raw_prefix_filter_text(&mut items, &registry, "ser");
+
+        assert_eq!(items[0].filter_text.as_deref(), Some("serde"));
+    }
+
+    /// #1289: a registry whose search normalizes the query (e.g. PyPI's PEP 503 folding)
+    /// must have every item's `filter_text` rewritten to the raw, as-typed query, regardless
+    /// of what value it held before.
+    #[test]
+    fn test_apply_raw_prefix_filter_text_rewrites_for_normalizing_registry() {
+        struct NormalizingRegistry;
+        impl crate::Registry for NormalizingRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a crate::PackageName,
+                _req: &'a crate::VersionReq,
+            ) -> crate::ecosystem::BoxFuture<
+                'a,
+                crate::error::Result<Option<Box<dyn crate::Version>>>,
+            > {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn search_normalizes_query(&self) -> bool {
+                true
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let registry = NormalizingRegistry;
+        let mut items = vec![
+            CompletionItem {
+                filter_text: Some("zope-interface".to_string()),
+                ..Default::default()
+            },
+            CompletionItem {
+                filter_text: None,
+                ..Default::default()
+            },
+        ];
+
+        apply_raw_prefix_filter_text(&mut items, &registry, "zope.int");
+
+        assert_eq!(items[0].filter_text.as_deref(), Some("zope.int"));
+        assert_eq!(items[1].filter_text.as_deref(), Some("zope.int"));
     }
 
     #[test]
