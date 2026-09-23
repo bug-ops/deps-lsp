@@ -140,12 +140,23 @@ impl PackageRendering for GitlabCiFormatter {
     /// update; `Partial`/`Latest` pins are returned unchanged — bumping `1.2` to `1.3.0`
     /// changes the pin's *kind*, not just its value, so the shared no-op guard correctly
     /// suppresses the code action instead of writing a value-changing-but-kind-wrong edit.
+    ///
+    /// #1365 hardening: `current` containing an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI
+    /// variable reference (see `contains_unresolved_gitlab_variable`) is also returned
+    /// unchanged, checked ahead of the `PinStyle` match — a variable reference can be
+    /// embedded inside an otherwise `Tag`-shaped ref (`is_tag_shaped` only inspects the
+    /// leading characters, e.g. `v1.2-$BUILD` or `v1-%BUILD%`), not just the `Branch`
+    /// catch-all a bare `$VAR` classifies as, so gating on `PinStyle` alone would miss that
+    /// case.
     fn format_version_replacing_for(
         &self,
         dep: &dyn Dependency,
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
+        if contains_unresolved_gitlab_variable(current) {
+            return current.to_string();
+        }
         let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return self.format_version_for_text_edit(version);
         };
@@ -256,6 +267,59 @@ impl RequirementResolution for GitlabCiFormatter {
         };
         status_for_pin(pin, requirement.as_str(), latest.as_str())
     }
+}
+
+/// The length of the maximal `[a-zA-Z_][a-zA-Z0-9_]*`-shaped identifier starting at
+/// `start` in `bytes` — GitLab's own variable-name grammar (`lib/expand_variables.rb`'s
+/// `/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/`) — or `None` if `bytes[start]` does not
+/// start one.
+fn identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start)?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// Whether `text` contains an unresolved GitLab CI variable reference — `$VARIABLE_NAME`
+/// (bare, POSIX-shell style), `${VARIABLE_NAME}` (braced), or `%VARIABLE_NAME%` (percent,
+/// GitLab's Windows-`cmd`-style form) — per GitLab's own variable-expansion grammar
+/// (`lib/expand_variables.rb`'s `/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/`, which
+/// `ExpandVariables.expand` applies to `include:` ref/component values, not just shell
+/// scripts — #1365 critic S1: this is not runner-OS-specific in this context), anywhere in
+/// `text`, not just as the whole value: `ref: $DEPLOY_VERSION`, `ref: ${DEPLOY_VERSION}`,
+/// `ref: %DEPLOY_VERSION%`, and an embedded form like `release-$VERSION` or `v1-%BUILD%` are
+/// all detected. The percent form requires a closing `%` immediately after the identifier
+/// (matching GitLab's own regex); the bare/braced forms do not require a closing `}` (#1365
+/// critic M3: failing safe on an unclosed `${VAR` — still not rewriting it — is acceptable).
+///
+/// GitLab expands these at pipeline run time; this crate parses `.gitlab-ci.yml` statically
+/// and can never resolve one, so a ref/pin containing this shape is not a value this crate
+/// should ever treat as bumpable — distinct from `RequirementResolution::requirement_is_unresolved`
+/// (issue #1365), which stays a broad "any SHA or branch ref, can't tell if outdated"
+/// diagnostic predicate; this is a narrower predicate consulted only by
+/// `PackageRendering::format_version_replacing_for`'s guard, to tell a genuinely unresolvable
+/// variable reference apart from an ordinary, intentionally-bumpable branch name like `main`
+/// (both currently classify as `PinStyle::Branch`). Mirrors `deps_bundler`'s
+/// `requirement_contains_unresolved_interpolation` and `deps_swift`'s equivalent guard
+/// (#1354/#1367).
+fn contains_unresolved_gitlab_variable(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| match b {
+        b'$' => match bytes.get(i + 1) {
+            Some(b'{') => identifier_end(bytes, i + 2).is_some(),
+            _ => identifier_end(bytes, i + 1).is_some(),
+        },
+        b'%' => identifier_end(bytes, i + 1).is_some_and(|end| bytes.get(end) == Some(&b'%')),
+        _ => false,
+    })
 }
 
 /// The shared classification -> status rule every [`RequirementResolution`] method on
@@ -668,5 +732,248 @@ mod tests {
     fn test_osv_version_strips_v_prefix() {
         let fmt = formatter();
         assert_eq!(fmt.osv_version("v1.2.3"), "1.2.3");
+    }
+
+    // --- #1365: unresolved GitLab CI $VAR/${VAR} ref placeholders must never be rewritten ---
+
+    #[test]
+    fn test_contains_unresolved_gitlab_variable_bare_and_braced() {
+        assert!(contains_unresolved_gitlab_variable("$DEPLOY_VERSION"));
+        assert!(contains_unresolved_gitlab_variable("${DEPLOY_VERSION}"));
+        assert!(contains_unresolved_gitlab_variable("release-$VERSION"));
+        assert!(contains_unresolved_gitlab_variable("v$MAJOR.$MINOR"));
+    }
+
+    /// #1365 critic S1 (live-reproduced against gitlab.com): GitLab's own
+    /// `lib/expand_variables.rb` regex (`/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/`)
+    /// expands the `%VAR%` form for `include:` ref/component values too, not only in shell
+    /// scripts run on a Windows runner — a `ref: "v1-%BUILD%"` was rewritten to a literal
+    /// version by `deps-cli update --dry-run` before this predicate covered it.
+    #[test]
+    fn test_contains_unresolved_gitlab_variable_percent_form() {
+        assert!(contains_unresolved_gitlab_variable("%DEPLOY_VERSION%"));
+        assert!(contains_unresolved_gitlab_variable("v1-%BUILD%"));
+        assert!(contains_unresolved_gitlab_variable("v16.0-%BUILD%"));
+        // No closing '%' — GitLab's own regex requires one, so this is not variable syntax.
+        assert!(!contains_unresolved_gitlab_variable("50% done"));
+        assert!(!contains_unresolved_gitlab_variable("trailing-%NOCLOSE"));
+    }
+
+    /// #1365 tester suggestion: variable names are case-sensitive in GitLab's grammar but
+    /// the detector itself must not be case-sensitive about which letters count as an
+    /// identifier — lowercase and mixed-case names must be detected in all three forms.
+    #[test]
+    fn test_contains_unresolved_gitlab_variable_lowercase_and_mixed_case_names() {
+        assert!(contains_unresolved_gitlab_variable("$deploy_version"));
+        assert!(contains_unresolved_gitlab_variable("${Deploy_Version}"));
+        assert!(contains_unresolved_gitlab_variable("%buildNumber%"));
+    }
+
+    #[test]
+    fn test_contains_unresolved_gitlab_variable_ordinary_refs_are_not_flagged() {
+        assert!(!contains_unresolved_gitlab_variable("main"));
+        assert!(!contains_unresolved_gitlab_variable("v1.0.0"));
+        assert!(!contains_unresolved_gitlab_variable(&"a".repeat(40)));
+        // A bare '$' not followed by an identifier-starting character is not variable syntax.
+        assert!(!contains_unresolved_gitlab_variable("price-is-$5"));
+        assert!(!contains_unresolved_gitlab_variable("trailing-$"));
+        assert!(!contains_unresolved_gitlab_variable("empty-${}"));
+        // #1365 tester suggestion: a leading digit never starts a GitLab variable name.
+        assert!(!contains_unresolved_gitlab_variable("${123}"));
+        assert!(!contains_unresolved_gitlab_variable("%123%"));
+    }
+
+    #[test]
+    fn test_format_version_replacing_for_guards_bare_variable_reference() {
+        let fmt = formatter();
+        let d = dep(
+            Some(PinStyle::Branch),
+            "org/proj",
+            DependencySource::Registry,
+        );
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("2.0.0"), "$DEPLOY_VERSION"),
+            "$DEPLOY_VERSION"
+        );
+        assert_eq!(
+            fmt.format_version_replacing_for(
+                &d,
+                &ConcreteVersion::new("2.0.0"),
+                "${DEPLOY_VERSION}"
+            ),
+            "${DEPLOY_VERSION}"
+        );
+    }
+
+    /// A variable reference can be embedded inside an otherwise `Tag`-shaped ref
+    /// (`is_tag_shaped` only inspects the leading characters), so the guard must not rely on
+    /// `PinStyle` alone — `v1.2-$BUILD` classifies as `PinStyle::Tag` yet still contains an
+    /// unresolvable placeholder.
+    #[test]
+    fn test_format_version_replacing_for_guards_embedded_variable_in_tag_shaped_ref() {
+        let fmt = formatter();
+        let d = dep(Some(PinStyle::Tag), "org/proj", DependencySource::Registry);
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("2.0.0"), "v1.2-$BUILD"),
+            "v1.2-$BUILD"
+        );
+    }
+
+    /// #1365 critic S1: the `%VAR%` form, live-reproduced as a real destructive rewrite
+    /// against gitlab.com before this guard covered it.
+    #[test]
+    fn test_format_version_replacing_for_guards_percent_variable_reference() {
+        let fmt = formatter();
+        let d = dep(Some(PinStyle::Tag), "org/proj", DependencySource::Registry);
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("19.4.1"), "v1-%BUILD%"),
+            "v1-%BUILD%"
+        );
+    }
+
+    /// Regression: an ordinary branch name with no variable syntax must still be treated as a
+    /// normal, bumpable pin — the guard must not over-fire on every `Branch` pin.
+    #[test]
+    fn test_format_version_replacing_for_ordinary_branch_still_rewritten() {
+        let fmt = formatter();
+        let d = dep(
+            Some(PinStyle::Branch),
+            "org/proj",
+            DependencySource::Registry,
+        );
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("2.0.0"), "main"),
+            "2.0.0"
+        );
+    }
+
+    /// #1365 security audit: exercises `deps_core::edit::plan_vulnerability_fix` with the
+    /// *real* `GitlabCiFormatter` and a `GitlabCiDependency` obtained from the real
+    /// `crate::parser::parse_gitlab_ci_yaml` path, on a `ref:` whose declared value is an
+    /// unresolved `$VAR` placeholder — mirrors `deps-bundler`'s
+    /// `test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite` (#1367).
+    ///
+    /// GitLab CI's parser does not degrade `$VAR` to `version_requirement: None` (it is
+    /// preserved verbatim, same as Bundler's `#{...}`), so this scenario reaches
+    /// `format_version_replacing_for` directly whenever `plan_vulnerability_fix` is called for
+    /// a GitLab CI dependency — the same `NoOpRewrite` gate this test asserts is the only thing
+    /// standing between an unresolved placeholder and a destructive rewrite (`plan_verified_fix`
+    /// itself never consults `requirement_is_unresolved`, see that function's own doc).
+    #[test]
+    fn test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite() {
+        use deps_core::ParseResult;
+        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::net_policy::RegistryAccessPolicy;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use std::sync::{Arc, RwLock};
+
+        let content = "include:\n  - project: org/proj\n    ref: $DEPLOY_VERSION\n";
+        let uri = deps_core::test_util::test_uri("/test/.gitlab-ci.yml");
+        let instance_host = crate::GitlabInstanceHost::new(
+            Arc::new(RwLock::new(None)),
+            Arc::new(RegistryAccessPolicy::default()),
+        );
+        let policy = RegistryAccessPolicy::default();
+        let result = crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+            .expect("valid gitlab-ci.yml");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("parser preserves the raw $VAR ref text")
+            .as_str();
+        assert_eq!(current, "$DEPLOY_VERSION");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-1365".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["2.0.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "2.0.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            dep.version_range().expect("ref has a version range"),
+            current,
+            &dv,
+            &formatter(),
+        );
+
+        assert!(
+            matches!(planned, Err(VulnFixSkip::NoOpRewrite)),
+            "expected NoOpRewrite (the format_version_replacing_for guard firing), got {planned:?}"
+        );
+    }
+
+    /// #1365 critic S2 (blocking): the vulnerability-fix path above is not the reachable sink
+    /// in production — `EcosystemId::GitlabCi::osv_ecosystem()` is `None`, so
+    /// `plan_vulnerability_fix` is never called for a real GitLab CI dependency. The sink that
+    /// *is* reachable is the bulk-update path (`deps-cli update`, the LSP "update all" code
+    /// lens) via `deps_core::edit::collect_update_candidates`. Live-reproduced by the critic:
+    /// `v16.0-$BUILD` classifies as `PinStyle::Tag`, is marked `Outdated` by
+    /// `requirement_status_for`, and without the guard would reach
+    /// `format_version_replacing_for` through this exact path and be rewritten. Exercises the
+    /// real formatter, a real parsed dependency, and the real `collect_update_candidates` entry
+    /// point — not `plan_vulnerability_fix` — asserting `Unplannable { reason: NoOpRewrite, .. }`.
+    #[test]
+    fn test_collect_update_candidates_var_placeholder_in_tag_shaped_ref_is_unplannable() {
+        use deps_core::edit::{UnplannableReason, UpdateCandidate, collect_update_candidates};
+        use deps_core::net_policy::RegistryAccessPolicy;
+        use deps_core::{PackageVersions, ParseResult, VersionData};
+        use std::collections::HashMap;
+        use std::sync::{Arc, RwLock};
+
+        let content = "include:\n  - project: org/proj\n    ref: v16.0-$BUILD\n";
+        let uri = deps_core::test_util::test_uri("/test/.gitlab-ci.yml");
+        let instance_host = crate::GitlabInstanceHost::new(
+            Arc::new(RwLock::new(None)),
+            Arc::new(RegistryAccessPolicy::default()),
+        );
+        let policy = RegistryAccessPolicy::default();
+        let result = crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+            .expect("valid gitlab-ci.yml");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("v16.0-$BUILD"),
+            "parser preserves the raw $VAR-embedded tag-shaped ref text"
+        );
+
+        let fmt = formatter();
+        let mut cached = HashMap::new();
+        cached.insert(dep.name().clone(), PackageVersions::latest_only("16.0.1"));
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved);
+
+        let candidates = collect_update_candidates(&result, content, versions, &fmt);
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "expected exactly one Outdated candidate"
+        );
+        assert!(
+            matches!(
+                &candidates[0],
+                UpdateCandidate::Unplannable {
+                    reason: UnplannableReason::NoOpRewrite,
+                    ..
+                }
+            ),
+            "expected Unplannable{{ reason: NoOpRewrite, .. }} (the \
+             format_version_replacing_for guard firing via the real bulk-update path), got \
+             {:?}",
+            candidates[0]
+        );
     }
 }
