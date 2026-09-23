@@ -872,6 +872,33 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --doc --all-features
 
+  test-aarch64-linux:
+    name: Test (aarch64 Linux)
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    # Native GitHub-hosted arm64 runner (#1358/#1359): catches Linux-arch-dependent constant/cfg
+    # bugs (e.g. a hand-rolled O_NOFOLLOW value correct only on x86_64) that `cross-check`'s
+    # build-only aarch64-unknown-linux-musl leg never runs a test binary for. Scoped to
+    # deps-core (not --workspace) to keep this leg's wall-clock/runner-minute cost low while
+    # still covering the crate that owns the arch-sensitive fs_probe/net_policy code.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        with:
+          # Distinct from the default `test` job's implicit x86_64 cache key so this arm64
+          # runner never restores/saves a cache built for the wrong architecture.
+          cache-target: aarch64-unknown-linux-gnu
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: taiki-e/install-action@ef6302df50adb496d123b03ae2b53322d688ffa1  # nextest
+
+      - name: Run deps-core tests
+        run: cargo nextest run -p deps-core --all-features --no-fail-fast --profile ci
+
   cross-check:
     name: Cross-compile Check (${{ matrix.target }})
     needs: changes
@@ -1319,6 +1346,7 @@ jobs:
         doc-and-hygiene,
         security,
         test,
+        test-aarch64-linux,
         cross-check,
         coverage,
         msrv,
@@ -1355,6 +1383,7 @@ jobs:
           check_job "${{ needs.doc-and-hygiene.result }}" "doc-and-hygiene" || failed=1
           check_job "${{ needs.security.result }}" "security" || failed=1
           check_job "${{ needs.test.result }}" "test" || failed=1
+          check_job "${{ needs.test-aarch64-linux.result }}" "test-aarch64-linux" || failed=1
           check_job "${{ needs.cross-check.result }}" "cross-check" || failed=1
           check_job "${{ needs.coverage.result }}" "coverage" || failed=1
           check_job "${{ needs.msrv.result }}" "msrv" || failed=1
