@@ -9,13 +9,17 @@
 //! `packages.<project_name>.lock.json` (per-project lock files, used when multiple projects
 //! share a directory) cannot be expressed as an exact name, so
 //! [`NuGetLockParser::locate_lockfile`] adds that computed name (`<project_name>` being the
-//! manifest's own file stem, NuGet's convention) as a second candidate alongside the exact
-//! `packages.lock.json` name, both passed to the shared
+//! manifest's own file stem with spaces mapped to `_`, matching
+//! `PackagesLockFileUtilities.GetNuGetLockFilePath` in NuGet.Client) as a candidate alongside
+//! the exact `packages.lock.json` name, both passed to the shared
 //! [`deps_core::lockfile::locate_lockfile_for_manifest_with_max_depth`] search in one call
-//! (#1351), restricted to the manifest's own directory only (`max_ancestor_depth: 0`, #1357).
-//! Candidate order within a directory is preserved: the exact name is checked first, so it
-//! still wins over the per-project name when both sit in the same directory (D3, #451). This
-//! must be an exact match against *this* manifest's project name, not the first
+//! (#1351), restricted to the manifest's own directory only (`max_ancestor_depth: 0`, #1357) —
+//! an ancestor's `packages.lock.json` (belonging to a different project) never shadows this
+//! manifest's own `packages.<project_name>.lock.json` one level closer. Candidate order within
+//! a directory matches NuGet.Client's own lookup order: the per-project name is checked first
+//! and wins over the plain name when both sit in the same directory, with the plain name only
+//! a fallback (#1364; this project's own D3/#451 precedence order had it backwards). This must
+//! be an exact match against *this* manifest's project name, not the first
 //! `packages.*.lock.json` found in the directory — a directory shared by multiple projects
 //! can hold several such files, and taking the first one silently attaches an unrelated
 //! project's resolved versions (#451 follow-up, tester-found regression).
@@ -55,7 +59,9 @@ fn multi_project_lockfile_name(manifest_uri: &Url) -> Option<String> {
     if project_name.is_empty() {
         return None;
     }
-    Some(format!("packages.{project_name}.lock.json"))
+    // Matches `PackagesLockFileUtilities.GetNuGetLockFilePath`'s
+    // `projectName.Replace(' ', '_')` in NuGet.Client.
+    Some(format!("packages.{}.lock.json", project_name.replace(' ', "_")))
 }
 
 #[derive(Deserialize)]
@@ -77,8 +83,10 @@ struct LockEntry {
 impl LockFileProvider for NuGetLockParser {
     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         let multi_project_name = multi_project_lockfile_name(manifest_uri);
-        let candidates: Vec<&str> = std::iter::once(Self::EXACT_LOCKFILE_NAME)
-            .chain(multi_project_name.as_deref())
+        let candidates: Vec<&str> = multi_project_name
+            .as_deref()
+            .into_iter()
+            .chain(std::iter::once(Self::EXACT_LOCKFILE_NAME))
             .collect();
         // NuGet lock files are per-project, not workspace-shared — never walk up to an
         // ancestor's (#1357).
@@ -408,8 +416,13 @@ mod tests {
         assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
     }
 
+    /// #1364: ground truth is `PackagesLockFileUtilities.GetNuGetLockFilePath` in NuGet.Client,
+    /// which builds `packages.<project>.lock.json` and returns it immediately if it exists,
+    /// falling back to the plain name only when it doesn't — i.e. the per-project name wins
+    /// when both sit in the same directory. This project's own D3/#451 precedence had it
+    /// backwards; this test now pins the corrected order.
     #[test]
-    fn test_locate_lockfile_prefers_exact_name_over_multi_project() {
+    fn test_locate_lockfile_prefers_multi_project_name_over_exact() {
         // See the comment in `test_locate_lockfile_multi_project_matches_own_project_not_first_found`
         // on why this guard is needed here.
         let _guard = deps_core::fs_probe::snapshot_guard();
@@ -423,7 +436,25 @@ mod tests {
 
         let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
         let parser = NuGetLockParser;
-        assert_eq!(parser.locate_lockfile(&manifest_uri), Some(exact_lock_path));
+        assert_eq!(parser.locate_lockfile(&manifest_uri), Some(multi_lock_path));
+    }
+
+    /// #1364: NuGet.Client's `GetNuGetLockFilePath` maps spaces in the project name to `_`
+    /// (`projectName.Replace(' ', '_')`) when building the per-project lock file name.
+    #[test]
+    fn test_locate_lockfile_multi_project_name_replaces_spaces_with_underscores() {
+        // See the comment in `test_locate_lockfile_multi_project_matches_own_project_not_first_found`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("My App.csproj");
+        let lock_path = temp_dir.path().join("packages.My_App.lock.json");
+        std::fs::write(&manifest_path, "<Project></Project>").unwrap();
+        std::fs::write(&lock_path, "{}").unwrap();
+
+        let manifest_uri = Url::from_file_path(&manifest_path).unwrap();
+        let parser = NuGetLockParser;
+        assert_eq!(parser.locate_lockfile(&manifest_uri), Some(lock_path));
     }
 
     /// #1357 regression: NuGet lock files are per-project, so an ancestor directory's
