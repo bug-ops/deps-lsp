@@ -12,27 +12,16 @@
 
 use deps_core::diagnostic::{Diagnostic, Severity};
 use deps_core::lsp_helpers::{
-    DEPRECATED_DIAGNOSTIC_CODE, DependencyOutcomes, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
+    DEPRECATED_DIAGNOSTIC_CODE, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
 };
 use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
 use deps_core::position::Range;
-use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache, PackageName, VersionData};
-use deps_engine::classify::diff::{
-    merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
-};
-use deps_engine::classify::fetch::{
-    apply_fetch_outcomes, composer_minimum_stability, dedup_dependencies_by_source,
-    fetch_latest_versions_parallel,
-};
-use deps_engine::classify::license::prefetch_tier3_licenses;
-use deps_engine::classify::osv::build_scan_targets;
-use deps_engine::classify::resolved::{collect_in_use_versions, load_resolved_versions};
+use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 
 /// Every non-`deps-core` diagnostic code constant in the workspace, mirrored here as
 /// literals rather than importing `deps-github-actions`/`deps-gitlab-ci` directly (both are
@@ -53,12 +42,6 @@ const GITLAB_CI_MUTABLE_REF_PIN_CODE: &str = "gitlab-ci-mutable-ref-pin";
 /// `registries.gitlab_instance_host` is unset/invalid. See
 /// [`GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE`]'s doc for why this is a literal.
 const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
-
-/// Ceiling on the OSV scan timeout, independent of the configured `fetch_timeout_secs` —
-/// mirrors `deps-lsp`'s `document::osv_scan::OSV_SCAN_TIMEOUT_CEILING_SECS`: the shared
-/// `reqwest` client behind [`HttpCache`] already imposes its own client-wide 30s timeout, so
-/// a longer per-phase timeout would never actually bind.
-const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 
 /// A category a [`CheckFinding`] can be classified into — the seven `--fail-on` tokens FR-009
 /// defines, plus [`Category::Other`].
@@ -412,200 +395,43 @@ pub async fn check_manifest(
     content: &str,
     ctx: &CheckContext,
 ) -> Result<ManifestCheckResult, CheckError> {
-    let uri = path_to_uri(manifest_path).ok_or_else(|| CheckError::InvalidPath {
-        path: manifest_path.to_path_buf(),
-    })?;
-    let parse_result = deps_core::parse_manifest_blocking(ecosystem, content, &uri)
-        .await
-        .map_err(|source| CheckError::Parse {
-            path: manifest_path.to_path_buf(),
-            source,
-        })?;
-    let formatter = ecosystem.formatter();
-    let ecosystem_id = ecosystem.ecosystem_id();
-
-    let (resolved_versions, resolved_version_candidates) =
-        load_resolved_versions(&uri, &ctx.lockfile_cache, ecosystem.as_ref()).await;
-
-    let (dep_sources, collided_names) =
-        dedup_dependencies_by_source(parse_result.as_ref(), formatter);
-    let in_use = collect_in_use_versions(
-        parse_result.as_ref(),
-        &resolved_versions,
-        &resolved_version_candidates,
-        formatter,
-        ecosystem_id,
-    );
-    let minimum_stability = composer_minimum_stability(parse_result.as_ref());
-    let attempted_names: Vec<PackageName> = dep_sources.keys().cloned().collect();
-
-    let fetch_result = fetch_latest_versions_parallel(
-        ecosystem.registry(),
-        dep_sources.into_iter().collect(),
-        &in_use,
-        None,
-        ctx.policy.freshness.to_settings(),
-        ctx.policy.cache.fetch_timeout_secs,
-        ctx.policy.cache.max_concurrent_fetches,
-        minimum_stability.as_deref(),
+    let analysis = crate::analyze::analyze_manifest(
+        ecosystem,
+        manifest_path,
+        content,
+        ctx,
+        crate::analyze::AnalysisScope::all(),
     )
-    .await;
-    // `failed_count` also counts not-found lookups, which aren't evidence of an unreachable
-    // registry — using it here made any repo with one typo'd dependency exit 2 every run.
-    let registry_unreachable = !ctx.policy.network.offline && !fetch_result.fetch_failed.is_empty();
-
-    let mut outcomes = DependencyOutcomes::new();
-    let fetched_names: Vec<PackageName> = fetch_result.versions.keys().cloned().collect();
-    apply_fetch_outcomes(
-        &mut outcomes,
-        fetch_result.yanked_versions,
-        fetch_result.fetch_failed,
-        collided_names,
-        formatter,
-    );
-    merge_deprecations_after_fetch(
-        &mut outcomes,
-        &fetched_names,
-        fetch_result.deprecations,
-        formatter,
-    );
-    merge_no_comparable_versions_after_fetch(
-        &mut outcomes,
-        &attempted_names,
-        fetch_result.no_comparable_versions,
-        formatter,
-    );
-    let cached_versions = fetch_result.versions;
-    // Tier-1 license backfill (issue #660/#661 precedent): populated for native-list
-    // ecosystems (PyPI, Composer) whose registry response carries a license field.
-    let mut licenses = fetch_result.licenses;
-
-    // Hoisted so both the tier-3 gate below and `.with_license_policy(&license_policy)`
-    // further down share one computed policy (issue #1133 critic M1).
-    let license_policy = ctx.policy.license_policy.to_policy();
-
-    // Tier-3 license prefetch (issue #1133, populated for Dart/Swift/Gradle/Deno, a no-op
-    // for every other ecosystem — see `deps_engine::classify::license`'s doc) and the OSV
-    // scan are independent (OSV never reads licenses) and both make network round trips, so
-    // they run concurrently via `tokio::join!` rather than sequentially (critic M2) —
-    // mirrors `deps-lsp`, which spawns both as separate concurrent tasks.
-    //
-    // Only `!offline` is gated here — the non-empty-`license_policy` check (critic M1) is
-    // enforced *inside* `prefetch_tier3_licenses` itself (code-review finding #3), not
-    // re-derived at this call site, so it can't be silently forgotten by a future caller:
-    // `licenses`' only consumer in this crate is `apply_license_policy_rule`, a no-op when
-    // no policy is configured, so with the default (empty) policy this call would otherwise
-    // issue N network round trips for a result nothing reads — burning Swift's
-    // unauthenticated 60 req/h GitHub budget among others for nothing.
-    let run_tier3_prefetch = !ctx.policy.network.offline;
-    let tier3_license_fetch = async {
-        if run_tier3_prefetch {
-            prefetch_tier3_licenses(
-                ecosystem.as_ref(),
-                parse_result.as_ref(),
-                &resolved_versions,
-                &resolved_version_candidates,
-                &license_policy,
-                ctx.policy.cache.fetch_timeout_secs,
-                ctx.policy.cache.max_concurrent_fetches,
-            )
-            .await
-        } else {
-            deps_engine::classify::license::TierThreeLicenseFetch::default()
-        }
-    };
-
-    let run_osv_scan =
-        ctx.policy.diagnostics.vulnerabilities_enabled && !ctx.policy.network.offline;
-    let osv_scan = async {
-        if run_osv_scan {
-            let (targets, skipped) = build_scan_targets(
-                parse_result.as_ref(),
-                &resolved_versions,
-                &resolved_version_candidates,
-                formatter,
-                ecosystem_id,
-            );
-            let mut vulns = skipped;
-            if !targets.is_empty() {
-                let timeout = Duration::from_secs(
-                    ctx.policy
-                        .cache
-                        .fetch_timeout_secs
-                        .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
-                );
-                let scanned = ctx.osv.scan(ecosystem_id, &targets, timeout).await;
-                vulns.extend(scanned);
-            }
-            Some(vulns)
-        } else {
-            None
-        }
-    };
-
-    let (tier3_result, vulnerabilities): (_, Option<VulnerabilityMap>) =
-        tokio::join!(tier3_license_fetch, osv_scan);
-
-    // Merged (not replaced) alongside the tier-1 backfill above via `entry().or_insert()`,
-    // not `extend` (critic nit): the two sources are disjoint today (only Composer
-    // populates `FetchResult::licenses`, and it's `RegistryDeclaredSpdx`, never a tier-3
-    // ecosystem), but `or_insert` makes the intended precedence explicit — an
-    // author-declared tier-1 license must win over a heuristic tier-3 one if that ever
-    // stops holding, rather than whichever call happened to run last.
-    for (name, license) in tier3_result.licenses {
-        licenses.entry(name).or_insert(license);
-    }
-    // A confirmed tier-3 timeout feeds `main.rs`'s same exit-2 "incomplete report" signal a
-    // registry-unreachable manifest does, but through its own field (issue #1133 code-review
-    // finding #1) — not `registry_unreachable` itself: a Maven Central outage while the
-    // version registry is fully reachable is a different failure than an unreachable
-    // registry, and a caller inspecting `registry_unreachable` must not be misled into
-    // diagnosing the wrong system. Does not catch every tier-3 failure mode:
-    // `Ecosystem::fetch_license` returns a bare `Vec<String>` with no error channel, so a
-    // network error/404/rate-limit a tier-3 implementation swallows internally (all four
-    // documented implementations do) never reaches here — see
-    // `TierThreeLicenseFetch::timed_out`'s doc for the full caveat.
-    let license_fetch_incomplete = tier3_result.timed_out > 0;
-
-    let mut version_data = VersionData::new(&cached_versions, &resolved_versions)
-        .with_resolved_version_candidates(&resolved_version_candidates)
-        .with_outcomes(&outcomes)
-        .with_ecosystem(ecosystem_id)
-        .with_offline(ctx.policy.network.offline)
-        .with_license_source(ecosystem.license_source())
-        .with_license_policy(&license_policy)
-        .with_license_prefetch(&licenses);
-    if let Some(vulnerabilities) = vulnerabilities.as_ref() {
-        version_data = version_data.with_vulnerabilities(vulnerabilities);
-    }
+    .await?;
+    let formatter = ecosystem.formatter();
 
     let severities = ctx.policy.diagnostics.to_severities();
     let diagnostics = ecosystem
         .generate_diagnostics(
-            parse_result.as_ref(),
-            version_data,
-            &uri,
+            analysis.parse_result.as_ref(),
+            analysis.version_data(),
+            &analysis.uri,
             ctx.policy.freshness.to_settings(),
             severities,
         )
         .await;
 
-    let dep_index = DependencyIndex::build(parse_result.as_ref());
-    let advisory_severities = advisory_severity_index(vulnerabilities.as_ref());
+    let dep_index = DependencyIndex::build(analysis.parse_result.as_ref());
+    let advisory_severities = advisory_severity_index(analysis.vulnerabilities.as_ref());
     // Same per-occurrence key `vulnerabilities` was built under, so a shared advisory id
     // across two dependencies can never resolve to the wrong one's severity (issue #1077 review #4).
     let vuln_keys = deps_core::osv::vulnerability_keys(
-        parse_result.as_ref(),
-        &resolved_versions,
-        Some(&resolved_version_candidates),
+        analysis.parse_result.as_ref(),
+        &analysis.resolved_versions,
+        Some(&analysis.resolved_version_candidates),
         formatter,
-        ecosystem_id,
+        analysis.ecosystem_id,
     );
     let findings = diagnostics
         .into_iter()
         .map(|diagnostic| {
             to_finding(
-                ecosystem_id,
+                analysis.ecosystem_id,
                 display_path,
                 &dep_index,
                 formatter,
@@ -617,8 +443,8 @@ pub async fn check_manifest(
         .collect();
     Ok(ManifestCheckResult {
         findings,
-        registry_unreachable,
-        license_fetch_incomplete,
+        registry_unreachable: analysis.registry_unreachable,
+        license_fetch_incomplete: analysis.license_fetch_incomplete,
     })
 }
 
@@ -799,7 +625,7 @@ fn classify(
 /// themselves are supported, just not any other Windows path prefix shape. The caller
 /// surfaces a `None` here as [`CheckError::InvalidPath`] rather than fabricating a
 /// synthetic, unusable URI.
-fn path_to_uri(path: &Path) -> Option<url::Url> {
+pub(crate) fn path_to_uri(path: &Path) -> Option<url::Url> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -813,6 +639,7 @@ fn path_to_uri(path: &Path) -> Option<url::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::PackageName;
 
     fn finding(category: Category) -> CheckFinding {
         CheckFinding {

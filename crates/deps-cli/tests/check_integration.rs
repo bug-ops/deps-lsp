@@ -916,4 +916,46 @@ mod tier3_wiring_regression {
         .expect("must not hang: an empty license_policy must skip the tier-3 fetch entirely")
         .expect("check_manifest must not fail for this fixture");
     }
+
+    /// Code review finding 6: `deps-cli update`'s default mode declares
+    /// `AnalysisScope::none()`, which must skip the tier-3 license prefetch even when a
+    /// non-empty `license_policy` is configured — proving this is a genuinely separate gate
+    /// from the pre-existing empty-policy short-circuit the test above covers, not the same
+    /// mechanism under a different name. A `TestTier3Ecosystem::pending()` would hang this
+    /// test forever if `analyze_manifest` reached `Ecosystem::fetch_license` at all.
+    #[tokio::test]
+    async fn analyze_manifest_scope_none_skips_tier3_prefetch_even_with_a_configured_policy() {
+        let policy = PolicyConfig {
+            diagnostics: DiagnosticsConfig::new().with_vulnerabilities_enabled(false),
+            license_policy: deps_core::policy_config::LicensePolicyConfig::new()
+                .with_allow(vec!["0BSD".to_string()]),
+            ..PolicyConfig::default()
+        };
+        assert!(
+            !policy.license_policy.to_policy().is_empty(),
+            "test setup bug: this policy must have a configured license_policy"
+        );
+        let ctx = wiring_test_context(policy);
+
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(TestTier3Ecosystem::pending());
+        let url = deps_core::test_util::test_uri("/test/manifest.toml");
+        let manifest_path = url.to_file_path().expect("file-scheme uri");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            deps_cli::analyze::analyze_manifest(
+                &ecosystem,
+                &manifest_path,
+                "unused",
+                &ctx,
+                deps_cli::analyze::AnalysisScope::none(),
+            ),
+        )
+        .await
+        .expect(
+            "must not hang: AnalysisScope::none() must skip the tier-3 fetch regardless of \
+             license_policy",
+        )
+        .expect("analyze_manifest must not fail for this fixture");
+    }
 }

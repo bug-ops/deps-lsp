@@ -124,6 +124,89 @@ pub fn render(report: &CheckReport) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&to_document(report))
 }
 
+/// The current `schema_version` [`update_to_document`] emits.
+pub const UPDATE_SCHEMA_VERSION: u32 = 1;
+
+/// Top-level JSON document shape for an `update` run (FR-021).
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
+pub struct UpdateReportDocument {
+    /// The schema version this document was produced under.
+    pub schema_version: u32,
+    /// Whether `--dry-run` was passed — when `true`, every `"applied"` item's edit was
+    /// planned but **not** written to disk (critic finding M1/US-005: without this marker,
+    /// a `--dry-run` document is indistinguishable from a real run that wrote its edits).
+    pub dry_run: bool,
+    /// One entry per candidate dependency the planner considered.
+    pub items: Vec<UpdateItemDocument>,
+}
+
+/// One `update` plan item's JSON shape.
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
+pub struct UpdateItemDocument {
+    /// The dependency's declared (raw) name.
+    pub name: String,
+    /// The current (resolved in-use, or declared) version.
+    pub current: String,
+    /// The version this item's edit would move the dependency to, when applicable.
+    pub target: String,
+    /// One of `applied` / `skipped` / `requires-lockfile-update` / `unfixable`.
+    pub outcome: String,
+    /// A one-line human-readable reason for `outcome`.
+    pub reason: String,
+    /// OSV advisory ids this item resolves — non-empty only in `--security-only` mode.
+    pub advisory_ids: Vec<String>,
+}
+
+/// Builds the versioned [`UpdateReportDocument`] for `plan`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::format::json::{UPDATE_SCHEMA_VERSION, update_to_document};
+/// use deps_cli::update::UpdatePlan;
+///
+/// let document = update_to_document(&UpdatePlan::default(), false);
+/// assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
+/// assert!(!document.dry_run);
+/// assert!(document.items.is_empty());
+/// ```
+#[must_use]
+pub fn update_to_document(plan: &crate::update::UpdatePlan, dry_run: bool) -> UpdateReportDocument {
+    // Security-S3: same sanitizer `format::table::render_update` routes `name`/`current`
+    // through — a JSON consumer that prints these fields verbatim gets the same protection.
+    let items = plan
+        .items
+        .iter()
+        .map(|item| UpdateItemDocument {
+            name: crate::sanitize::sanitize_message_for_display(&item.name),
+            current: crate::sanitize::sanitize_message_for_display(&item.current),
+            target: item.target.clone(),
+            outcome: item.outcome.wire_token().to_string(),
+            reason: item.reason(),
+            advisory_ids: item.advisory_ids.clone(),
+        })
+        .collect();
+
+    UpdateReportDocument {
+        schema_version: UPDATE_SCHEMA_VERSION,
+        dry_run,
+        items,
+    }
+}
+
+/// Renders `plan` as a pretty-printed JSON string.
+///
+/// # Errors
+///
+/// Returns an error only if [`UpdateReportDocument`]'s `Serialize` impl fails, which does not
+/// happen for the plain-data shape this module builds.
+pub fn render_update(
+    plan: &crate::update::UpdatePlan,
+    dry_run: bool,
+) -> Result<String, serde_json::Error> {
+    serde_json::to_string_pretty(&update_to_document(plan, dry_run))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,5 +290,48 @@ mod tests {
             findings: vec![finding(), other],
         });
         insta::assert_json_snapshot!(document);
+    }
+
+    fn update_item(outcome: crate::update::Outcome) -> crate::update::PlannedUpdateItem {
+        crate::update::PlannedUpdateItem {
+            name: "serde".to_string(),
+            current: "1.0.0".to_string(),
+            target: "1.2.0".to_string(),
+            outcome,
+            edit: None,
+            advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],
+            ignore_rule_overridden: false,
+        }
+    }
+
+    /// S5: `update_to_document` on a non-empty plan — every field (including the `dry_run`
+    /// marker and advisory ids) must survive into the document, not just the empty-plan
+    /// doctest's shape.
+    #[test]
+    fn test_update_to_document_non_empty_plan_maps_every_field() {
+        let plan = crate::update::UpdatePlan {
+            items: vec![update_item(crate::update::Outcome::Applied)],
+        };
+        let document = update_to_document(&plan, true);
+        assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
+        assert!(document.dry_run);
+        assert_eq!(document.items.len(), 1);
+        let item = &document.items[0];
+        assert_eq!(item.name, "serde");
+        assert_eq!(item.current, "1.0.0");
+        assert_eq!(item.target, "1.2.0");
+        assert_eq!(item.outcome, "applied");
+        assert_eq!(item.advisory_ids, vec!["RUSTSEC-2024-0001".to_string()]);
+    }
+
+    #[test]
+    fn test_render_update_non_empty_plan_round_trips_through_serde_json() {
+        let plan = crate::update::UpdatePlan {
+            items: vec![update_item(crate::update::Outcome::Applied)],
+        };
+        let rendered = render_update(&plan, false).expect("render must succeed");
+        let parsed: UpdateReportDocument =
+            serde_json::from_str(&rendered).expect("must round-trip");
+        assert_eq!(parsed, update_to_document(&plan, false));
     }
 }

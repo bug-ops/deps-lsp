@@ -408,6 +408,37 @@ pub fn apply_live_fix_target_statuses(
         }
     }
 }
+
+/// Projects `targets` down to `key -> osv_name`.
+///
+/// A two-line helper centralizing an identical inline `HashMap` build `deps-lsp` used to
+/// duplicate at `document/osv_scan.rs:116` and `deps-cli`'s `--security-only` planner (#1329)
+/// needs too — both consume this instead of re-deriving it from [`build_scan_targets`]'s own
+/// `Vec<deps_core::osv::ScanTarget>` output.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::ScanTarget;
+/// use deps_engine::classify::osv::osv_name_by_key;
+///
+/// let targets = vec![ScanTarget::new(
+///     "serde".to_string(),
+///     "serde".to_string(),
+///     "1.0.0".to_string(),
+///     "1.0.0".to_string(),
+/// )];
+/// let map = osv_name_by_key(&targets);
+/// assert_eq!(map.get("serde").map(String::as_str), Some("serde"));
+/// ```
+#[must_use]
+pub fn osv_name_by_key(targets: &[deps_core::osv::ScanTarget]) -> HashMap<String, String> {
+    targets
+        .iter()
+        .map(|t| (t.key.clone(), t.osv_name.clone()))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

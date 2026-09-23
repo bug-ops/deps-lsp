@@ -96,6 +96,20 @@ Explicitly deferred — do not design or task any of the following here:
   ignored-major dependency to the highest non-major version) — an ignored
   update is skipped entirely, not retargeted; this must be documented in
   the book, not silently assumed away.
+- **Fixing `deps-lsp`'s `build_vulnerability_fix_action`'s own S1 gap**
+  (implementation code review, round 3) — the CLI's `--security-only`
+  planner (`deps-cli::update::security`) checks whether the declared
+  requirement already admits the fix target before rewriting it
+  (`RequiresLockfileUpdate` instead); `deps-lsp`'s shared
+  `plan_vulnerability_fix`-backed code action does not have this check,
+  and can still offer a rewrite that would collapse to a no-op. Fixing it
+  there is explicitly out of scope for this PR — FR-001 requires
+  `deps-lsp`'s code-lens/code-action behavior to stay byte-identical
+  (zero snapshot changes) after the `deps_core::edit` extraction, and
+  this divergence exists precisely because the S1 fix was scoped to the
+  CLI-only wrapper to satisfy that constraint, not shared `plan_vulnerability_fix`
+  logic touching frozen LSP behavior. A follow-up GitHub issue tracks the
+  `deps-lsp` side separately.
 
 ## 2. User Stories
 
@@ -314,12 +328,22 @@ never honored in `--security-only` mode (FR-008, override not suppression).
 
 | Code | Meaning |
 |------|---------|
-| `0` | Every selected update was applied, or nothing was eligible |
-| `1` | At least one requested or security-motivated update was not applied — an ignore rule, an unsafe/unrecognized span, `RequiresLockfileUpdate`, or `Unfixable` |
+| `0` | Every selected update was applied, or nothing was eligible, or every non-applied item was a deliberate operator exclusion — a `--package` narrowing (`NotRequested`) or an `[update].ignore` match (`IgnoreRule`) — per US-004's acceptance criterion |
+| `1` | At least one item the run *wanted* to fix but could not — an unsafe/unrecognized span (`NotSafelyEditable`), `RequiresLockfileUpdate`, or `Unfixable` |
 | `2` | Execution error — not a single recognized manifest (FR-002), oversized/unreadable manifest, parse error, registry unreachable, stale content detected before write (FR-019), write failure, symlinked manifest path (FR-017), or `--security-only` combined with `network.offline`/`vulnerabilities_enabled = false` (FR-015) |
 
 FR-022 applies across this table: exit `1` or `2` never implies the working
 tree is byte-identical to before the run.
+
+**Amendment (implementation review S3)**: this table originally listed
+*any* `Skipped` item — including an operator-requested `--package`
+exclusion or an `[update].ignore` match — under exit `1`, which directly
+contradicted US-004's own acceptance criterion ("still exits 0"). The `0`/`1`
+rows above are the corrected, implemented behavior: an operator explicitly
+asking to skip something is not a failure; only an item the run *wanted* to
+apply but could not (`NotSafelyEditable`/`RequiresLockfileUpdate`/`Unfixable`)
+drives a non-zero exit. See `exit.rs::update_exit_code`'s doc comment for
+the authoritative implementation.
 
 ## 6. Edge Cases and Error Handling
 

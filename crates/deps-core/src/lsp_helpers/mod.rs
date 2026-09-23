@@ -30,12 +30,19 @@ mod inlay_hints;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+/// Generic replacement for this module's former `TextEdit`-only `dedup_overlapping_edits`
+/// (#1329) — re-exported here so every existing `lsp_helpers::dedup_overlapping_edits(edits,
+/// caller)` call site (e.g. `deps_github_actions::collect_pin_all_to_sha_edits`) keeps
+/// compiling unchanged, with `E = ls_types::TextEdit` inferred from the call's own argument
+/// type.
+#[cfg(feature = "lsp-responses")]
+pub use crate::edit::dedup_overlapping_edits;
 #[cfg(feature = "lsp-responses")]
 pub use code_actions::generate_code_actions;
 #[cfg(feature = "lsp-responses")]
 pub use code_lenses::{
     PIN_ALL_TO_SHA_COMMAND_ID, PinNoun, build_pin_all_to_sha_lens, collect_update_all_edits,
-    dedup_overlapping_edits, generate_code_lenses,
+    generate_code_lenses,
 };
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
@@ -2082,7 +2089,7 @@ pub fn single_file_edit(
 /// which compare a declared requirement
 /// string against a differently-normalized counterpart — e.g. pep508's `>=1.7, <2.0` vs. a
 /// formatter's `>=1.7,<2.0`.
-fn strip_whitespace(s: &str) -> String {
+pub(crate) fn strip_whitespace(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
@@ -2092,7 +2099,11 @@ fn strip_whitespace(s: &str) -> String {
 /// `table` is document-invariant — callers iterating over multiple dependencies in the
 /// same document must build it once and reuse it, rather than rebuilding it (an O(n)
 /// scan of `content`) per dependency.
-fn slice_for_range<'a>(content: &'a str, table: &LineOffsetTable, range: Range) -> &'a str {
+pub(crate) fn slice_for_range<'a>(
+    content: &'a str,
+    table: &LineOffsetTable,
+    range: Range,
+) -> &'a str {
     let start = table.position_to_byte_offset(content, range.start);
     let end = table.position_to_byte_offset(content, range.end);
     if start > end {
@@ -2118,7 +2129,7 @@ fn slice_for_range<'a>(content: &'a str, table: &LineOffsetTable, range: Range) 
 /// `crates/deps-nuget/src/formatter.rs` explicitly supports) leaves `[1.0.0]` vs
 /// `1.0.0` and **falsely rejects** an editable dependency. Wrapping only the slice side
 /// handles both spellings without that false reject.
-fn literal_span_matches(slice: &str, requirement: &str) -> bool {
+pub(crate) fn literal_span_matches(slice: &str, requirement: &str) -> bool {
     let norm_slice = strip_whitespace(slice);
     let norm_req = strip_whitespace(requirement);
     norm_slice == norm_req || format!("[{norm_slice}]") == norm_req

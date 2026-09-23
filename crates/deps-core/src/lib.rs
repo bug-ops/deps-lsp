@@ -135,6 +135,7 @@ pub mod diagnostic;
 pub mod ecosystem;
 /// Routes a manifest path to its owning [`ecosystem::Ecosystem`] implementation.
 pub mod ecosystem_registry;
+pub mod edit;
 /// Unified error types (`DepsError`, `FetchFailure`) shared across ecosystems.
 pub mod error;
 pub mod fallback_completion;
@@ -228,6 +229,11 @@ pub use ecosystem::{
     EcosystemId, LicenseSource, ParseResult, parse_manifest_blocking,
 };
 pub use ecosystem_registry::EcosystemRegistry;
+pub use edit::{
+    EditSpan, ManifestEdit, PlannedUpdate, UnplannableReason, UpdateCandidate, UpdateKind,
+    apply_edits, classify_update, collect_update_candidates, collect_update_edits,
+    dedup_overlapping_edits, fix_target_is_verified, plan_vulnerability_fix,
+};
 pub use error::{DepsError, FetchFailure, Result};
 pub use freshness::{
     DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
