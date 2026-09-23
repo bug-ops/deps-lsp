@@ -1442,6 +1442,57 @@ mod tests {
 
     use std::assert_matches;
 
+    /// Awaits the next server-to-client JSON-RPC message sent through `socket`, panicking
+    /// if none arrives within a bounded timeout.
+    ///
+    /// Only reliable for a message that is one of `tower-lsp-server` 0.23.0's four
+    /// `_unchecked` `Client` methods — `show_message`, `show_message_request`,
+    /// `log_message`, `telemetry_event` — which enqueue onto this loopback channel
+    /// unconditionally. Every other `Client` method (`apply_edit`,
+    /// `publish_diagnostics`, `register_capability`, the `*_refresh` requests, ...) goes
+    /// through `send_notification`/`send_request`, which is gated on `State::Initialized`
+    /// and silently drops/refuses instead of enqueueing when the test `Backend` was never
+    /// `initialize`d (as these tests' `Backend`s never are) — a timeout waiting on one of
+    /// those means the gate suppressed it, not that the code path under test never ran.
+    ///
+    /// Gated to match its only two call sites (the `not(windows)`-gated canonicalization
+    /// tests below, themselves gated on the `cargo`/`github-actions` features): without
+    /// this gate, the function would have zero callers on the `windows` target, or on any
+    /// feature slice with both `cargo` and `github-actions` disabled (e.g. CI's `cargo
+    /// hack --each-feature`, which runs `deps-lsp` with exactly one ecosystem feature at
+    /// a time), and trip `dead_code` under this workspace's `RUSTFLAGS="-D warnings"` gate.
+    #[cfg(all(not(windows), any(feature = "cargo", feature = "github-actions")))]
+    async fn next_client_message(
+        socket: &mut tower_lsp_server::ClientSocket,
+    ) -> tower_lsp_server::jsonrpc::Request {
+        use futures::StreamExt as _;
+        // Twice `CLIENT_REFRESH_TIMEOUT`: inert today (the messages this helper awaits
+        // are unchecked and enqueue near-instantly), but keeps this bound clearly above
+        // `apply_batch_edit`'s own `CLIENT_REFRESH_TIMEOUT`-bounded `apply_edit` wait in
+        // case a future test ever chains through that gated path too.
+        tokio::time::timeout(CLIENT_REFRESH_TIMEOUT * 2, socket.next())
+            .await
+            .expect("no server-to-client message observed within the timeout")
+            .expect("client socket closed before sending a message")
+    }
+
+    /// Extracts the `message` field of a captured `window/showMessage` notification.
+    ///
+    /// Gated for the same reason as `next_client_message`: its only callers are the two
+    /// canonicalization tests below.
+    #[cfg(all(not(windows), any(feature = "cargo", feature = "github-actions")))]
+    fn show_message_text(message: &tower_lsp_server::jsonrpc::Request) -> String {
+        assert_eq!(message.method(), "window/showMessage");
+        let params: tower_lsp_server::ls_types::ShowMessageParams = serde_json::from_value(
+            message
+                .params()
+                .expect("window/showMessage must carry params")
+                .clone(),
+        )
+        .unwrap();
+        params.message
+    }
+
     #[test]
     fn test_server_capabilities() {
         let caps = Backend::server_capabilities();
@@ -2123,10 +2174,24 @@ mod tests {
     /// Does not cover the `updateAllOutdated`/`pinAllToSha` `executeCommand` arms: unlike
     /// every method here, neither ever creates or removes a `ServerState::documents`
     /// entry on a lookup miss (`execute_update_all_outdated`/`execute_pin_all_to_sha`
-    /// just call `get_document` and refuse), so there is no `document_count()`-based (or
-    /// otherwise state-observable) signal available without a message-capturing test
-    /// client this codebase does not have; both call sites are covered by code
-    /// inspection and `cargo clippy`/compilation only.
+    /// just call `get_document` and refuse), so there is no `document_count()`-based
+    /// signal available for them. See
+    /// `update_all_outdated_execute_command_tests::test_execute_command_update_all_outdated_canonicalizes_uri_before_lookup`
+    /// and
+    /// `pin_all_to_sha_execute_command_tests::test_execute_command_pin_all_to_sha_canonicalizes_uri_before_lookup`
+    /// (issue #1199) instead, which capture the `Client`'s outgoing
+    /// `window/showMessage` notification via `LspService`'s loopback `ClientSocket` and
+    /// distinguish "document found after canonicalization" from "lookup missed" by its
+    /// message text.
+    ///
+    /// Also does not cover `commands::UPDATE_VERSION`'s own `canonicalize_uri` call
+    /// (server.rs, in `execute_command`'s first arm): still uncovered by any test, and
+    /// not coverable by the message-capture technique above either — that arm's only
+    /// client-observable effect on success is a `workspace/applyEdit` request, and
+    /// `apply_edit` is gated on `State::Initialized` (see `next_client_message`'s doc
+    /// comment), so nothing reaches this test harness's loopback socket for it, success
+    /// or failure. A different observation technique (e.g. a real `initialize`d service)
+    /// would be needed to close this gap; tracked in #1335.
     ///
     /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path`
     /// (which `parse_manifest`'s workspace-root discovery and `ensure_document_loaded`'s
@@ -3576,6 +3641,106 @@ mod tests {
             let result = backend.execute_command(command_params(&uri)).await;
             assert!(result.is_ok());
         }
+
+        /// Message-capture regression (issue #1199): `updateAllOutdated` has no
+        /// `document_count()`-based signal on a lookup miss (see the doc comment on
+        /// `test_canonicalize_uri_chokepoint_covers_every_document_reading_entry_point`),
+        /// so a dropped `canonicalize_uri` call in this arm would fail zero prior tests.
+        /// Stores a document under its canonical `Uri`, then dispatches the command with a
+        /// *different*, non-canonical spelling of the same `Uri` and inspects the
+        /// `window/showMessage` the (uninitialized, so `apply_edit` always fails fast)
+        /// `Client` sends back via `LspService`'s loopback `ClientSocket`:
+        /// "failed to apply dependency updates" only fires after `get_document` finds the
+        /// document and `collect_update_all_edits` returns a non-empty batch, so it proves
+        /// canonicalization ran before the lookup; "dependency data is not ready for this
+        /// document" is what a missed lookup (a dropped `canonicalize_uri` call) would
+        /// produce instead — the same refusal
+        /// `test_execute_command_update_all_outdated_closed_document_no_op` exercises for a
+        /// genuinely absent document.
+        ///
+        /// Unix-only: `deps_core::test_util::test_uri` prefixes a `C:` drive letter on
+        /// Windows, which the `FILE://{path}` non-canonical spelling below does not
+        /// account for — matches the adjacent chokepoint test's own platform gate.
+        #[tokio::test]
+        #[cfg(not(windows))]
+        async fn test_execute_command_update_all_outdated_canonicalizes_uri_before_lookup() {
+            let canonical_url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let canonical_uri = crate::lsp_types_interop::to_lsp_uri(&canonical_url);
+            let non_canonical_uri: Uri =
+                format!("FILE://{}", canonical_url.path()).parse().unwrap();
+            assert_eq!(
+                crate::lsp_types_interop::canonicalize_uri(&non_canonical_uri),
+                canonical_uri,
+                "test premise: both spellings must canonicalize to the same Uri"
+            );
+            assert_ne!(
+                canonical_uri, non_canonical_uri,
+                "test premise: the command-argument spelling must be non-canonical"
+            );
+
+            let (service, mut socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(&content, &canonical_url)
+                .await
+                .unwrap();
+            let mut cached = HashMap::new();
+            cached.insert(
+                "serde".into(),
+                deps_core::PackageVersions::latest_only("1.2.0"),
+            );
+            // Pin the precondition this test actually exercises (impl-critic M2): without
+            // this, the test below cannot distinguish "applied a non-empty edit batch"
+            // from "refused for an unrelated reason" (both would fail the same
+            // `assert_eq!` on the message text, just with a less informative diff).
+            let empty_resolved = HashMap::new();
+            assert_eq!(
+                deps_core::collect_update_all_edits(
+                    parse_result.as_ref(),
+                    &content,
+                    deps_core::VersionData::new(&cached, &empty_resolved),
+                    ecosystem.formatter(),
+                )
+                .len(),
+                1,
+                "fixture must have exactly one outdated, safely-editable dependency for \
+                 this to test the apply-edit path, not the no-outdated-dependencies refusal"
+            );
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.set_version(Some(1));
+            doc_state.set_loaded();
+            doc_state.update_cached_versions(cached);
+            assert!(doc_state.is_ready_for_batch_update());
+            backend.state.update_document(canonical_uri, doc_state);
+
+            let result = backend
+                .execute_command(ExecuteCommandParams {
+                    command: commands::UPDATE_ALL_OUTDATED.to_string(),
+                    arguments: vec![serde_json::json!({ "uri": non_canonical_uri.as_str() })],
+                    work_done_progress_params: Default::default(),
+                })
+                .await;
+            assert_eq!(
+                result,
+                Ok(None),
+                "execute_command must succeed and return no LSP response for this command"
+            );
+
+            let message = next_client_message(&mut socket).await;
+            assert_eq!(
+                show_message_text(&message),
+                "deps-lsp: failed to apply dependency updates",
+                "a non-canonical uri argument must resolve the document stored under its \
+                 canonical form and reach the apply-edit path — the 'not ready' refusal \
+                 would instead mean canonicalize_uri was skipped before the \
+                 ServerState::documents lookup"
+            );
+        }
     }
 
     #[cfg(feature = "github-actions")]
@@ -3839,6 +4004,95 @@ mod tests {
             // being refused earlier.
             let result = backend.execute_command(command_params(&uri)).await;
             assert!(result.is_ok());
+        }
+
+        /// Message-capture regression (issue #1199): `pinAllToSha` has the same
+        /// document_count()-blind lookup-miss gap `updateAllOutdated`'s own
+        /// `test_execute_command_update_all_outdated_canonicalizes_uri_before_lookup`
+        /// closes — see that test and the doc comment on
+        /// `test_canonicalize_uri_chokepoint_covers_every_document_reading_entry_point`.
+        /// Same technique: store under the canonical `Uri`, dispatch with a differently
+        /// spelled one, and read which `window/showMessage` the loopback `ClientSocket`
+        /// observes — "failed to apply SHA pins" only fires once `get_document` finds the
+        /// document and `collect_pin_all_to_sha_edits` returns a non-empty batch, proving
+        /// canonicalization ran before the lookup.
+        ///
+        /// Unix-only: `deps_core::test_util::test_uri` prefixes a `C:` drive letter on
+        /// Windows, which the `FILE://{path}` non-canonical spelling below does not
+        /// account for — matches the adjacent chokepoint test's own platform gate.
+        #[tokio::test]
+        #[cfg(not(windows))]
+        async fn test_execute_command_pin_all_to_sha_canonicalizes_uri_before_lookup() {
+            let canonical_url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let canonical_uri = crate::lsp_types_interop::to_lsp_uri(&canonical_url);
+            let non_canonical_uri: Uri =
+                format!("FILE://{}", canonical_url.path()).parse().unwrap();
+            assert_eq!(
+                crate::lsp_types_interop::canonicalize_uri(&non_canonical_uri),
+                canonical_uri,
+                "test premise: both spellings must canonicalize to the same Uri"
+            );
+            assert_ne!(
+                canonical_uri, non_canonical_uri,
+                "test premise: the command-argument spelling must be non-canonical"
+            );
+
+            let (service, mut socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get("github-actions")
+                .unwrap();
+            seed_gha_tag_index(
+                ecosystem.as_ref(),
+                "actions/checkout",
+                "v4",
+                &"a".repeat(40),
+            );
+            let parse_result = ecosystem
+                .parse_manifest(content, &canonical_url)
+                .await
+                .unwrap();
+            assert_eq!(
+                gha_edit_count(ecosystem.as_ref(), parse_result.as_ref()),
+                1,
+                "fixture must have exactly one resolvable edit for this to test the \
+                 apply-edit path, not the no-resolvable-step refusal"
+            );
+            let mut doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::GithubActions,
+                content.to_string(),
+                parse_result,
+            );
+            doc_state.set_version(Some(1));
+            doc_state.set_loaded();
+            backend.state.update_document(canonical_uri, doc_state);
+
+            let result = backend
+                .execute_command(ExecuteCommandParams {
+                    command: commands::PIN_ALL_TO_SHA.to_string(),
+                    arguments: vec![serde_json::json!({ "uri": non_canonical_uri.as_str() })],
+                    work_done_progress_params: Default::default(),
+                })
+                .await;
+            assert_eq!(
+                result,
+                Ok(None),
+                "execute_command must succeed and return no LSP response for this command"
+            );
+
+            let message = next_client_message(&mut socket).await;
+            assert_eq!(
+                show_message_text(&message),
+                "deps-lsp: failed to apply SHA pins",
+                "a non-canonical uri argument must resolve the document stored under its \
+                 canonical form and reach the apply-edit path — the 'not ready' refusal \
+                 would instead mean canonicalize_uri was skipped before the \
+                 ServerState::documents lookup"
+            );
         }
     }
 
