@@ -8,7 +8,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy,
-    requirement_contains_dollar_placeholder,
+    requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -69,8 +69,9 @@ impl PackageRendering for DartFormatter {
         format!("^{version}")
     }
 
-    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
-    /// (see `requirement_contains_dollar_placeholder`) in `current` leaves `current`
+    /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
+    /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>` — see
+    /// `requirement_contains_template_placeholder`) in `current` leaves `current`
     /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
     /// latest" edit can never hardcode a literal version over a `pubspec.yaml` version
     /// constraint pre-processed by `envsubst`/CI templating — mirrors
@@ -79,7 +80,7 @@ impl PackageRendering for DartFormatter {
     /// dependency-identity-dependent rewrite logic, unlike `GitlabCiFormatter`/
     /// `BundlerFormatter`, which override `format_version_replacing_for` instead).
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if requirement_contains_dollar_placeholder(current) {
+        if requirement_contains_template_placeholder(current) {
             return current.to_string();
         }
         self.format_version_for_text_edit(version)
@@ -116,20 +117,21 @@ impl RequirementResolution for DartFormatter {
         Some(Box::new(PubDevMatcher(normalized)))
     }
 
-    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
-    /// — see `requirement_contains_dollar_placeholder`. `pubspec.yaml`'s own version-
+    /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
+    /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>`) — see
+    /// `requirement_contains_template_placeholder`. `pubspec.yaml`'s own version-
     /// constraint grammar has no such syntax; this only fires for a value pre-processed
     /// (and left unexpanded) by tooling outside Dart, e.g. `envsubst`.
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_dollar_placeholder(requirement.as_str())
+        requirement_contains_template_placeholder(requirement.as_str())
     }
 
     /// #1370: Dart has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — a
-    /// `$VAR`/`${VAR}`-style placeholder is the only unresolved shape Dart has, so both
-    /// predicates key off the same `requirement_contains_dollar_placeholder` detector.
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// external-templating placeholder is the only unresolved shape Dart has, so both
+    /// predicates key off the same `requirement_contains_template_placeholder` detector.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_dollar_placeholder(requirement.as_str())
+        requirement_contains_template_placeholder(requirement.as_str())
     }
 }
 

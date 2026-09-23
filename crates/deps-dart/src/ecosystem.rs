@@ -230,19 +230,28 @@ mod tests {
         non_registry_fixture: "pubspec.yaml" => "name: my_app\ndependencies:\n  local_pkg:\n    path: ../local_pkg\n";
     }
 
-    // #1374: `pubspec.yaml`'s own version-constraint grammar has no placeholder/environment-
-    // variable interpolation syntax, but a manifest pre-processed by external templating
-    // (`envsubst`, CI templating) commonly leaves a `$VAR`/`${VAR}`-shaped literal in the
-    // version slot; the YAML parser has no way to distinguish that from an ordinary string,
-    // so it stays a normal `Some(version_requirement)` and reaches
-    // `plan_vulnerability_fix`/`format_version_replacing_for` directly — depends on
-    // `DartFormatter`'s own `requirement_contains_dollar_placeholder` guard.
+    // #1374/#1379: `pubspec.yaml`'s own version-constraint grammar has no placeholder/
+    // interpolation syntax, but a manifest pre-processed by external templating (`envsubst`,
+    // CI templating) commonly leaves an unresolved `$VAR`/`${VAR}`/`{{ }}`/`@VAR@`/`%VAR%`/
+    // `<%= %>`-shaped literal in the version slot; the YAML parser has no way to distinguish
+    // that from an ordinary string, so it stays a normal `Some(version_requirement)` and
+    // reaches `plan_vulnerability_fix`/`format_version_replacing_for` directly — depends on
+    // `DartFormatter`'s own `requirement_contains_template_placeholder` guard. `{{ }}`/`@VAR@`/
+    // `%VAR%` are quoted here (unlike the bare `$`/`<%` forms) because YAML plain scalars may
+    // not start with `{`, `@`, or `%` — a grammar-level quoting requirement, unrelated to the
+    // placeholder detector itself.
     deps_core::unresolved_requirement_conformance! {
         mod dart_unresolved_requirement_conformance;
         build: DartEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         reachable: true;
-        fixture: "pubspec.yaml" =>
-            "name: my_app\ndependencies:\n  http: ${HTTP_VERSION}\n";
+        fixture: "pubspec.yaml" => "name: my_app
+dependencies:
+  http: ${HTTP_VERSION}
+  path: \"{{ PATH_VERSION }}\"
+  yaml: \"@YAML_VERSION@\"
+  args: \"%ARGS_VERSION%\"
+  intl: <%= INTL_VERSION %>
+";
     }
 
     // #758: the shared completion-prefix-length guard

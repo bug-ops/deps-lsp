@@ -10,7 +10,8 @@
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, warn_rejected_value,
+    RequirementMatcher, RequirementResolution, SourcePolicy,
+    requirement_contains_template_placeholder, warn_rejected_value,
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
@@ -90,6 +91,23 @@ impl PackageRendering for DenoFormatter {
         version.to_string()
     }
 
+    /// #1377 hardening: an unresolved `$VAR`/`${VAR}`/`{{ }}`/`@VAR@`/`%VAR%`/`<%= %>`-style
+    /// external-templating placeholder (see `requirement_contains_template_placeholder`) in
+    /// `current` leaves `current` unchanged instead of substituting `version`, so a
+    /// vulnerability-fix or "update to latest" edit can never hardcode a literal version over
+    /// a `deno.json`/`deno.jsonc` version requirement pre-processed by `envsubst`/CI templating
+    /// — mirrors `NpmFormatter`/`CargoFormatter`'s identical-shaped guard, on this same
+    /// non-`dep`-aware hook (Deno has no dependency-identity-dependent rewrite logic).
+    /// `current` is already just the version-requirement text (`parse_specifier` isolates it
+    /// from the `jsr:`/`npm:` scheme and package name before this is ever reached), so no
+    /// additional prefix-stripping is needed here.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_contains_template_placeholder(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         match split_scheme(name.as_str()) {
             Some((Scheme::Jsr, rest)) => match split_scoped(rest) {
@@ -119,10 +137,35 @@ impl PackageRendering for DenoFormatter {
 impl RequirementResolution for DenoFormatter {
     /// Compiles `requirement` via `node_semver::Range`, the same crate `deps-npm` uses —
     /// correct for JSR too, since JSR mandates semver.
+    ///
+    /// #1377 hardening: an unresolved placeholder (see [`Self::requirement_is_unresolved`])
+    /// never reaches `node_semver::Range::parse` — returning `None` up front keeps this
+    /// consistent with `requirement_is_unresolved` even for the rare case `node_semver` might
+    /// otherwise parse loosely.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        if self.requirement_is_unresolved(requirement) {
+            return None;
+        }
         node_semver::Range::parse(requirement.as_str())
             .ok()
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+    }
+
+    /// #1377 hardening: an unresolved `$VAR`/`${VAR}`/`{{ }}`/`@VAR@`/`%VAR%`/`<%= %>`-style
+    /// external-templating placeholder — see `requirement_contains_template_placeholder`.
+    /// `deno.json`/`deno.jsonc`'s own import-specifier grammar has no such syntax; this only
+    /// fires for a value pre-processed (and left unexpanded) by tooling outside Deno, e.g.
+    /// `envsubst`.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_template_placeholder(requirement.as_str())
+    }
+
+    /// #1370: Deno has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// external-templating placeholder is the only unresolved shape Deno has, so both
+    /// predicates key off the same `requirement_contains_template_placeholder` detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_template_placeholder(requirement.as_str())
     }
 }
 

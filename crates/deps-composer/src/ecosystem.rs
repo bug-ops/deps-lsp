@@ -251,12 +251,24 @@ mod tests {
     // `<branch-or-constraint> as <alias-version>`) and one from external templating
     // (`${VAR}`/`$VAR` left unexpanded, #1374 impl-critic M2) — see `ComposerFormatter`'s
     // `requirement_is_composer_unresolved` guard.
+    // impl-critic M3 (#1379 follow-up): fixtures now also cover the four template forms the
+    // shared `requirement_contains_template_placeholder` predicate gained for #1379 — Composer
+    // inherits them for free via `requirement_is_composer_unresolved`'s delegation, but had no
+    // fixture pinning that (the doc comment describing this was also stale, fixed alongside).
     deps_core::unresolved_requirement_conformance! {
         mod composer_unresolved_requirement_conformance;
         build: ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         reachable: true;
         fixture: "composer.json" =>
-            r#"{"require":{"monolog/monolog":"self.version","symfony/console":"dev-main as 1.0.0","psr/log":"${PSR_LOG}"}}"#;
+            r#"{"require":{
+                "monolog/monolog":"self.version",
+                "symfony/console":"dev-main as 1.0.0",
+                "psr/log":"${PSR_LOG}",
+                "guzzlehttp/guzzle":"{{ GUZZLE_VERSION }}",
+                "phpunit/phpunit":"@PHPUNIT_VERSION@",
+                "doctrine/orm":"%ORM_VERSION%",
+                "twig/twig":"<%= TWIG_VERSION %>"
+            }}"#;
     }
 
     // #758: the shared completion-prefix-length guard

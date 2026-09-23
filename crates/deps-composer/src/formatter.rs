@@ -6,7 +6,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
-    requirement_contains_dollar_placeholder,
+    requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -45,13 +45,14 @@ const COMPOSER_SELF_VERSION: &str = "self.version";
 ///   to satisfied dependents (#1373). Composer requires whitespace on both sides of `as`,
 ///   so a plain `" as "` substring check cannot false-positive against a hyphenated
 ///   branch/package token (e.g. `"feature-as-x"` has no surrounding spaces).
-/// - an unexpanded `$VAR`/`${VAR}` external-templating placeholder anywhere in the text
-///   (`requirement_contains_dollar_placeholder`, #1374 impl-critic M2) — `composer.json`
-///   has no such grammar itself, but a manifest pre-processed by external templating
-///   (`envsubst`, CI templating) can still leave one in place, e.g. `"${PSR_LOG}"`;
-///   `composer.json`'s parser preserves this as an ordinary string, so it reaches
-///   [`RequirementResolution`]/[`PackageRendering`] just like the two Composer-native forms
-///   above.
+/// - an unexpanded external-templating placeholder anywhere in the text
+///   (`requirement_contains_template_placeholder`, #1374/#1379 impl-critic M2/M3) — any of the
+///   five forms that predicate recognizes (`$VAR`/`${VAR}`, `{{ VAR }}`/`{% ... %}`, `@VAR@`,
+///   `%VAR%`, `<%= VAR %>`); `composer.json` has no such grammar itself, but a manifest
+///   pre-processed by external templating (`envsubst`, CI templating, `configure_file`) can
+///   still leave one in place, e.g. `"${PSR_LOG}"`; `composer.json`'s parser preserves this as
+///   an ordinary string, so it reaches [`RequirementResolution`]/[`PackageRendering`] just
+///   like the two Composer-native forms above.
 ///
 /// None of these three forms is ever resolved by `deps-lsp` itself — the first two are
 /// handled entirely by Composer's own installer, the third by whatever external tool
@@ -60,7 +61,7 @@ fn requirement_is_composer_unresolved(requirement: &str) -> bool {
     let trimmed = requirement.trim();
     trimmed == COMPOSER_SELF_VERSION
         || trimmed.contains(" as ")
-        || requirement_contains_dollar_placeholder(requirement)
+        || requirement_contains_template_placeholder(requirement)
 }
 
 /// Composer requirement matcher, compiled once per dependency by
@@ -1193,7 +1194,7 @@ mod tests {
 
     /// #1374 impl-critic M2: an unexpanded `$VAR`/`${VAR}` external-templating placeholder,
     /// anywhere in the requirement text, must be caught the same way npm/Cargo/Dart's own
-    /// `requirement_contains_dollar_placeholder`-based guards catch it.
+    /// `requirement_contains_template_placeholder`-based guards catch it.
     #[test]
     fn test_requirement_is_composer_unresolved_dollar_placeholder() {
         assert!(requirement_is_composer_unresolved("${PSR_LOG}"));

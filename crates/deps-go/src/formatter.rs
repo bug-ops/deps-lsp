@@ -2,6 +2,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    requirement_contains_template_placeholder,
 };
 use deps_core::{ConcreteVersion, Dependency, DepsError, InvalidPackageName, PackageName};
 
@@ -85,6 +86,22 @@ impl PackageRendering for GoFormatter {
         version.to_string()
     }
 
+    /// #1377/#1379 hardening: an unresolved `$VAR`/`${VAR}`/`{{ }}`/`@VAR@`/`%VAR%`/`<%= %>`-
+    /// style external-templating placeholder (see `requirement_contains_template_placeholder`)
+    /// in `current` leaves `current` unchanged instead of substituting `version`, so a
+    /// vulnerability-fix or "update to latest" edit can never hardcode a literal version over
+    /// a `go.mod` `require` line pre-processed by `envsubst`/CI templating — mirrors
+    /// `NpmFormatter`/`CargoFormatter`'s identical-shaped guard, on this same non-`dep`-aware
+    /// hook (Go has no dependency-identity-dependent rewrite logic). Defense-in-depth
+    /// alongside `parse_require_line`'s parse-time widening (see that function's doc), which
+    /// already keeps `current` the full placeholder text rather than a truncated fragment.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_contains_template_placeholder(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -96,22 +113,45 @@ impl RequirementResolution for GoFormatter {
         go_version_matches(version, requirement)
     }
 
+    /// #1377/#1379 hardening: an unresolved `$VAR`/`${VAR}`/`{{ }}`/`@VAR@`/`%VAR%`/`<%= %>`-
+    /// style external-templating placeholder — see `requirement_contains_template_placeholder`.
+    /// `go.mod`'s own grammar has no such syntax (a `require` line's version field is always a
+    /// single, space-free token); this only fires for a value pre-processed (and left
+    /// unexpanded) by tooling outside `go`, e.g. `envsubst` or a Go `text/template` pass over
+    /// the file before it is committed.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_template_placeholder(requirement.as_str())
+    }
+
+    /// #1370: Go has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// external-templating placeholder is the only unresolved shape Go has, so both
+    /// predicates key off the same `requirement_contains_template_placeholder` detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_template_placeholder(requirement.as_str())
+    }
+
     /// Compiles `requirement` into an `ExactMatcher` using the same exact/pseudo-version
     /// comparison `version_satisfies_requirement` uses — Go's requirement syntax has no
     /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`. Uses
     /// [`compile_requirement_unless`] (see that function and
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
     ///
-    /// The undecidable predicate is `crate::version::is_pseudo_version`:
-    /// `proxy.golang.org/<mod>/@v/list` — the source of `available` — never lists
-    /// pseudo-versions (they're derived per-commit, not enumerable), so a pseudo-version pin
-    /// can never be found in `available` even when the exact commit it names is real. A
-    /// `+incompatible`-suffixed *tag* (not a pseudo-version) is a real entry `/@v/list` does
-    /// return, so it needs no such guard.
+    /// The undecidable predicate is `crate::version::is_pseudo_version` — or an unresolved
+    /// external-templating placeholder ([`Self::requirement_is_unresolved`], #1377/#1379
+    /// hardening, defense-in-depth alongside `requirement_is_unsatisfiable`'s own upstream
+    /// `requirement_is_unresolved` gate): `proxy.golang.org/<mod>/@v/list` — the source of
+    /// `available` — never lists pseudo-versions (they're derived per-commit, not
+    /// enumerable), so a pseudo-version pin can never be found in `available` even when the
+    /// exact commit it names is real. A `+incompatible`-suffixed *tag* (not a pseudo-version)
+    /// is a real entry `/@v/list` does return, so it needs no such guard.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         compile_requirement_unless(
             requirement.as_str(),
-            crate::version::is_pseudo_version,
+            |req| {
+                crate::version::is_pseudo_version(req)
+                    || requirement_contains_template_placeholder(req)
+            },
             ExactMatcher,
         )
     }
