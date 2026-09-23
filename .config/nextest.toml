@@ -3,6 +3,16 @@ retries = 0
 slow-timeout = { period = "60s", terminate-after = 2 }
 fail-fast = false
 
+# `redacting_debug_compile_fail` (crates/deps-core/tests/, issue #1238) forks a real `rustc`
+# per trybuild fixture (6 as of this writing) to compile-fail-test the RedactingDebug derive.
+# That's inherently slower than a normal test and pushed past the workspace's default 120s
+# slow-timeout under the extra overhead of cross-compilation (i686-unknown-linux-gnu) and
+# coverage instrumentation (llvm-cov), even though it finishes well within the default window
+# on a normal native build. Give it more headroom instead of raising the timeout workspace-wide.
+[[profile.default.overrides]]
+filter = 'test(redacting_debug_compile_fail)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 [profile.ci]
 retries = 2
 fail-fast = true
