@@ -51,9 +51,11 @@ both fixes:
   list, sourced from the registration hive, without changing completion, inlay hints, or
   diagnostics (which all share the un-enriched cached version list).
 - `NuGetLockParser::locate_lockfile` finds a manifest's own
-  `packages.<project_name>.lock.json` when the exact `packages.lock.json` name is absent,
-  matched by the *requesting manifest's own* file stem — never the first
-  `packages.*.lock.json` file a directory scan happens to find.
+  `packages.<project_name>.lock.json`, matched by the *requesting manifest's own* file stem —
+  never the first `packages.*.lock.json` file a directory scan happens to find. When both that
+  file and the plain `packages.lock.json` sit in the same directory, the per-project name wins
+  (NuGet.Client's own precedence order; corrected by #1364, which found this project's original
+  order backwards).
 
 ### Out of Scope
 
@@ -117,7 +119,7 @@ THEN it resolves to packages.App1.lock.json, never packages.App2.lock.json, and 
 | FR-004 | WHEN the unlisted-version fetch fails (parse error, unreachable feed, no `RegistrationsBaseUrl` resource) THE SYSTEM SHALL degrade to an empty unlisted set and return the base hover unmodified, never surfacing a distinct error to the caller | must |
 | FR-005 | WHEN at least one version in the rendered "Recent versions" list is unlisted THE SYSTEM SHALL insert a `*(unlisted)*` marker immediately after the version literal and before any existing tag (`*(latest)*`, age suffix), leaving non-bullet lines (headers, footer) unchanged | must |
 | FR-006 | THE SYSTEM SHALL NOT thread unlisted status into `deps_core::Version::removal_status`, completion, inlay hints, or diagnostics — the marker is hover-only by design (see Out of Scope) | must |
-| FR-007 | WHEN `NuGetLockParser::locate_lockfile`'s exact-name search (`packages.lock.json`, same directory then up to 5 ancestor directories) finds nothing THE SYSTEM SHALL fall back to `packages.<project_name>.lock.json`, where `<project_name>` is the requesting manifest's own file stem, searched in the same directory then the same ancestor-walk order | must |
+| FR-007 | WHEN `NuGetLockParser::locate_lockfile` searches its own manifest directory (no ancestor walk — `max_ancestor_depth: 0`, #1357) THE SYSTEM SHALL check `packages.<project_name>.lock.json` first, where `<project_name>` is the requesting manifest's own file stem with spaces mapped to `_`, and fall back to the plain `packages.lock.json` name only if the per-project name is not found — matching NuGet.Client's own precedence (#1364) | must |
 | FR-008 | WHEN the multi-project fallback searches for `packages.<project_name>.lock.json` THE SYSTEM SHALL match only that exact computed filename — never the first `packages.*.lock.json` file found by a directory scan — so a directory holding multiple projects' per-project lock files never attaches an unrelated project's resolved versions to a manifest | must — regression, tester-found |
 | FR-009 | THE SYSTEM SHALL register `"packages.*.lock.json"` in `NuGetEcosystem::lockfile_filenames()` alongside the existing exact `"packages.lock.json"`, solely so `EcosystemRegistry`'s file-watch glob registration picks up per-project lock file changes — actual lock file *location* is unaffected by this list and is performed independently by `NuGetLockParser::locate_lockfile`'s own directory scan | must |
 | FR-010 | WHEN `EcosystemRegistry::get_for_lockfile` matches a filename against a single-`*`-wildcard `lockfile_filenames()` entry THE SYSTEM SHALL apply the same prefix/suffix matching scheme `manifest_patterns` already uses (`lockfile_pattern_matches`/`prefix_suffix_matches`), not a new matching mechanism | should |
@@ -138,7 +140,7 @@ THEN it resolves to packages.App1.lock.json, never packages.App2.lock.json, and 
 | `RegistrationEnrichment` (new, `deps-nuget::registry`) | Per-package result of one registration-hive walk | `published: HashMap<String, PublishTime>` (existing), `unlisted: HashSet<String>` (new) |
 | `CatalogEntry::listed` (new field) | Explicit unlist flag on a registration-hive entry, absent on entries predating the field | `Option<bool>` |
 | `NuGetRegistry::unlisted_versions_for_hover` (new method) | Hover-only accessor returning the unlisted subset of a package's recent versions | Degrades to an empty `HashSet` on any failure |
-| `NuGetLockParser::locate_multi_project_lockfile` (new function) | Computes and searches for `packages.<project_stem>.lock.json` | Mirrors `locate_lockfile_for_manifest`'s own directory-walk depth (`MAX_WORKSPACE_DEPTH = 5`) |
+| `NuGetLockParser::multi_project_lockfile_name` (function) | Computes `packages.<project_stem>.lock.json`, project stem with spaces mapped to `_` | Passed to `locate_lockfile_for_manifest_with_max_depth` ahead of the exact name, restricted to the manifest's own directory (`max_ancestor_depth: 0`, #1357) |
 | `EcosystemRegistry::get_for_directory_pattern` / `lockfile_pattern_matches` / `prefix_suffix_matches` (new, `deps-core::ecosystem_registry`) | Shared wildcard-matching primitives | `prefix_suffix_matches` is the single-`*` glob core reused by both the lockfile matcher here and the directory-pattern matcher used by the sibling pypi fix (see [[028-pypi-requirements-documentlinks-and-directory-layout/spec\|requirements.txt documentLinks and directory-layout support]]) |
 
 ## 6. Edge Cases and Error Handling
@@ -151,8 +153,9 @@ THEN it resolves to packages.App1.lock.json, never packages.App2.lock.json, and 
 | No unlisted versions among the rendered "Recent versions" | Hover markdown passes through `annotate_unlisted_versions` unchanged |
 | Two `.csproj` files in one directory, each with its own per-project lock file | Each resolves to its own lock file by exact file-stem match (FR-008) |
 | Only a sibling project's `packages.<OtherProject>.lock.json` exists, this manifest's own is absent | `locate_lockfile` returns `None` — no misattachment (FR-008) |
-| Both `packages.lock.json` (exact) and `packages.<project>.lock.json` present in the same directory | Exact name wins; multi-project fallback is never consulted |
-| Multi-project lock file located in an ancestor (workspace) directory, not the manifest's own directory | Found via the same ancestor-walk order `locate_lockfile_for_manifest` already uses, up to `MAX_WORKSPACE_DEPTH` |
+| Both `packages.lock.json` (exact) and `packages.<project>.lock.json` present in the same directory | Per-project name wins; the exact name is only checked if the per-project name isn't found (#1364) |
+| A lock file (either name) exists only in an ancestor (workspace) directory, not the manifest's own directory | Not found — NuGet lock files are per-project, not workspace-shared, so the search never walks ancestors (`max_ancestor_depth: 0`, #1357) |
+| Project file name contains a space, e.g. `My App.csproj` | Per-project lock file name is `packages.My_App.lock.json`, matching NuGet.Client's own `projectName.Replace(' ', '_')` (#1364) |
 | Unrelated files in the directory (`packages.json`, `packages..lock.json` with an empty project-name segment) | Not matched — `project_name.is_empty()` is rejected, and `packages.json` doesn't fit the computed pattern |
 
 ## 7. Success Criteria
@@ -162,7 +165,7 @@ THEN it resolves to packages.App1.lock.json, never packages.App2.lock.json, and 
 | SC-001 | Unlisted versions marked in hover | `*(unlisted)*` rendered for every version classified unlisted per FR-001 | `test_annotate_unlisted_versions_tags_matching_bullet`, `test_annotate_unlisted_versions_preserves_existing_tags_and_age_suffix` (deps-nuget/src/ecosystem.rs) |
 | SC-002 | No regression to completion/inlay-hints/diagnostics | Unaffected by this change — verified by the pre-existing `deps-nuget` test suite passing unmodified | Existing suite, unmodified |
 | SC-003 | Multi-project lock file resolves to the correct sibling | Each of two co-located per-project lock files resolves to its own manifest, never the other's | `test_locate_lockfile_multi_project_matches_own_project_not_first_found`, `test_locate_lockfile_multi_project_does_not_match_other_projects_lock_file` (deps-nuget/src/lockfile.rs) |
-| SC-004 | Exact lock file name still takes priority | `packages.lock.json` wins over the multi-project fallback when both exist | `test_locate_lockfile_prefers_exact_name_over_multi_project` |
+| SC-004 | Per-project lock file name takes priority | `packages.<project>.lock.json` wins over the plain `packages.lock.json` when both exist (#1364) | `test_locate_lockfile_prefers_multi_project_name_over_exact` |
 | SC-005 | File-watch glob registered for per-project lock files | `lockfile_filenames()` includes `"packages.*.lock.json"` | `test_lockfile_filenames` |
 
 ## 8. Agent Boundaries
@@ -197,7 +200,9 @@ None — this spec documents already-shipped, merged work with no outstanding sc
 - [[028-pypi-requirements-documentlinks-and-directory-layout/spec|requirements.txt documentLinks and directory-layout support]] — the pypi half of the same PR #458, sharing the new `ecosystem_registry.rs` wildcard-matching primitives
 - `crates/deps-nuget/src/registry.rs` — `RegistrationEnrichment`, `unlisted_versions_for_hover`, `accumulate_catalog_entries`
 - `crates/deps-nuget/src/ecosystem.rs` — `generate_hover` override, `annotate_unlisted_versions`
-- `crates/deps-nuget/src/lockfile.rs` — `locate_multi_project_lockfile`
+- `crates/deps-nuget/src/lockfile.rs` — `NuGetLockParser::locate_lockfile`, `multi_project_lockfile_name`
 - `crates/deps-core/src/ecosystem_registry.rs` — `prefix_suffix_matches`, `lockfile_pattern_matches`
 - Issue #451
+- Issue #1357, #1362 — restricted the ancestor walk to the manifest's own directory
+- Issue #1364 — corrected same-directory precedence and project-name space normalization
 - PR #458
