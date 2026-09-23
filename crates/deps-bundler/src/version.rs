@@ -255,8 +255,21 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 }
 
 /// Checks if a version matches the given requirement.
+///
+/// A Bundler `gem` call may declare more than one comma-separated constraint (`gem "rails",
+/// ">= 5.0", "< 6.0"`), which `deps-bundler`'s parser joins into a single `", "`-separated
+/// [`crate::types::BundlerDependency::version_req`] string (#1366) — mirroring RubyGems'
+/// `Gem::Requirement`, which is satisfied only when *every* declared constraint matches. Splits
+/// on the first top-level comma and recurses, ANDing each side, rather than parsing the whole
+/// string in one pass: a version string never contains a comma, so splitting is unambiguous, and
+/// this keeps the single-constraint fast path (the overwhelming common case) untouched below.
 pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
     let req = requirement.trim();
+
+    if let Some((first, rest)) = req.split_once(',') {
+        return version_matches_requirement(version, first)
+            && version_matches_requirement(version, rest);
+    }
 
     if req == "*" {
         return true;
@@ -770,6 +783,25 @@ mod tests {
         // starts with the requirement's digits must not match unless canonically equal.
         assert!(!version_matches_requirement("1.6.13", "1.6"));
         assert!(!version_matches_requirement("1.60.0", "1.6"));
+    }
+
+    /// #1366: a `gem` call may declare more than one comma-separated constraint, joined by the
+    /// parser into a single `", "`-separated requirement string — RubyGems' own
+    /// `Gem::Requirement` is satisfied only when every constraint matches (AND, not OR).
+    #[test]
+    fn test_version_matches_requirement_multi_constraint() {
+        assert!(version_matches_requirement("5.5.0", ">= 5.0, < 6.0"));
+        assert!(!version_matches_requirement("6.0.0", ">= 5.0, < 6.0"));
+        assert!(!version_matches_requirement("4.9.0", ">= 5.0, < 6.0"));
+
+        assert!(version_matches_requirement(
+            "5.5.0",
+            ">= 5.0, < 6.0, != 5.6.0"
+        ));
+        assert!(!version_matches_requirement(
+            "5.6.0",
+            ">= 5.0, < 6.0, != 5.6.0"
+        ));
     }
 
     #[test]
