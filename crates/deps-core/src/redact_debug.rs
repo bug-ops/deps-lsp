@@ -52,7 +52,10 @@ pub use deps_core_macros::RedactingDebug;
 ///
 /// `#[doc(hidden)]`: called only from the derive's macro-generated `impl Debug`, never meant
 /// to be called directly. Delegates to [`crate::redact::url_for_tracing`] — the same
-/// redactor every hand-written `Debug` impl this derive replaces already called.
+/// redactor every hand-written `Debug` impl this derive replaces already called. Returns
+/// `String` rather than mirroring [`__redact_key_field`]'s `Cow`: `url_for_tracing`'s chain
+/// builds a new `String` at every level, so there is no borrow to pass through — the two
+/// helpers are intentionally not signature-twins.
 #[doc(hidden)]
 #[must_use]
 pub fn __redact_url_field(value: &(impl AsRef<str> + ?Sized)) -> String {
@@ -63,14 +66,17 @@ pub fn __redact_url_field(value: &(impl AsRef<str> + ?Sized)) -> String {
 ///
 /// `#[doc(hidden)]`: called only from the derive's macro-generated `impl Debug`, never meant
 /// to be called directly. Delegates to [`crate::redact::redact_declaration_key`] — the
-/// same redactor every hand-written `Debug` impl this derive replaces already called.
-/// `redact_declaration_key` returns `Cow<'_, str>` (#1317, to skip allocating when the value
-/// needs no redaction); this helper always owns its output, matching [`__redact_url_field`]'s
-/// signature and the derive's `.field(name, &__redact_*_field(...))` call shape.
+/// same redactor every hand-written `Debug` impl this derive replaces already called. Returns
+/// the `Cow<'_, str>` as-is instead of forcing `.into_owned()`: in the `Borrowed` case this
+/// avoids the caller allocating a *second* time on top of whatever `redact_declaration_key`
+/// itself already paid for internally (its gate-fired-but-unchanged path still allocates and
+/// discards a `String` before returning `Borrowed` — see that function's doc), matching the
+/// hand-written `impl Debug` blocks this derive replaces, which passed the `Cow` straight to
+/// `.field()`.
 #[doc(hidden)]
 #[must_use]
-pub fn __redact_key_field(value: &(impl AsRef<str> + ?Sized)) -> String {
-    crate::redact::redact_declaration_key(value.as_ref()).into_owned()
+pub fn __redact_key_field(value: &(impl AsRef<str> + ?Sized)) -> std::borrow::Cow<'_, str> {
+    crate::redact::redact_declaration_key(value.as_ref())
 }
 
 #[cfg(test)]
@@ -122,6 +128,34 @@ mod tests {
         assert!(
             rendered.contains("retries: 3"),
             "expected #[raw] field unredacted in: {rendered}"
+        );
+    }
+
+    // Type-level guard: a rendered-string check can't tell `Cow` from `String` (#1317/#1332/#1333).
+    #[test]
+    fn redact_key_field_returns_borrowed_cow_for_non_credential_key() {
+        let key = String::from("source:Blocked");
+        assert!(matches!(
+            super::__redact_key_field(&key),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn redact_key_field_leaves_non_credential_key_unredacted_in_debug_output() {
+        let probe = Probe {
+            index_url: "https://registry.example/simple".to_string(),
+            declaration_key: "source:Blocked".to_string(),
+            retries: 3,
+        };
+        let rendered = format!("{probe:?}");
+        assert!(
+            rendered.contains(r#"declaration_key: "source:Blocked""#),
+            "expected non-credential key to pass through unredacted in: {rendered}"
+        );
+        assert!(
+            !rendered.contains("***"),
+            "non-credential key should not be redacted: {rendered}"
         );
     }
 }
