@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `lsp_helpers::HoverMarkdown` typed builder replaces `generate_hover`'s bare `&mut String` accumulator, structurally enforcing per-field-kind length caps and escaping instead of relying on call-site discipline (resolves #1310) (#1322)
 - **deps-lsp** (test infrastructure): new `server.rs` test-only helpers capture outgoing `window/showMessage` notifications via `LspService`'s loopback `ClientSocket`, closing the `executeCommand` `updateAllOutdated`/`pinAllToSha` URI-canonicalization coverage gap left open by #1198; no runtime behavior change (resolves #1199) (#1334)
 - **deps-lsp** (test infrastructure): new test drives a real `initialize`/`applyEdit` handshake through `LspService`'s loopback socket, closing `commands::UPDATE_VERSION`'s `canonicalize_uri` coverage gap (resolves #1335) (#1342)
-- **ci**: new native `ubuntu-24.04-arm` test leg runs `deps-core`'s test suite on real aarch64 Linux, catching Linux-arch-dependent ABI bugs that the build-only `cross-check` job never exercised (resolves #1359)
+- **ci**: new native `ubuntu-24.04-arm` test leg runs `deps-core`'s test suite on real aarch64 Linux, catching Linux-arch-dependent ABI bugs that the build-only `cross-check` job never exercised (resolves #1359) (#1360)
 
 ### Security
 - **deps-core**: `fs_probe::open_no_follow` now uses `libc::O_NOFOLLOW` instead of a hand-rolled per-`target_os` constant, fixing a wrong value on aarch64/arm/powerpc Linux that silently disabled symlink refusal in no-follow reads (resolves #1348) (#1358)
