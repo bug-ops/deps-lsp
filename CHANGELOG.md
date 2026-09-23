@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `is_markdown_unsafe` (backing `escape_markdown`/`markdown_code_span`, used by hover, diagnostics, and completion) now also blocks soft hyphen, MONGOLIAN VOWEL SEPARATOR, invisible math operators, the deprecated format-control block, and the Egyptian Hieroglyph/Shorthand/Musical Symbol format-control blocks, closing a gap where these `sanitize_invisible`-stripped characters survived; the RTL/ZWNJ/ZWJ and Arabic/Syriac/Kaithi prefixed-format-sign exemptions from #1248 are unchanged (resolves #1323) (#1326)
 
 ### Fixed
-- **deps-lsp**: `test_guarded_reparse_skip_does_not_abort_pre_existing_background_task` no longer flakes under CI-runner scheduling load, replacing a fixed 200ms sleep with a poll loop (resolves #1337)
+- **deps-lsp**: `test_guarded_reparse_skip_does_not_abort_pre_existing_background_task` no longer flakes under CI-runner scheduling load, replacing a fixed 200ms sleep with a poll loop (resolves #1337) (#1340)
 - **deps-core, deps-maven, deps-swift**: package-name completion items now preserve the registry's own relevance ranking in `sort_text` (tiering an exact-prefix match ahead of a same-rank fuzzy match) instead of forcing alphabetical client-side sorting (resolves #1282) (#1293)
 - **deps-lsp**: raw-text fallback package completion now matches the primary path's `sort_text`/`filter_text`/`detail`/`documentation`/`insert_text_format`, and gains the same latest-version safety gate (resolves #1284) (#1291)
 - **deps-swift, deps-cli, deps-lsp**: GitHub-backed live tests now skip instead of panicking when rate-limited with no `GITHUB_TOKEN` configured (#1297)
