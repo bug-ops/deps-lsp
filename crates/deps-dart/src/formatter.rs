@@ -123,6 +123,14 @@ impl RequirementResolution for DartFormatter {
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         requirement_contains_dollar_placeholder(requirement.as_str())
     }
+
+    /// #1370: Dart has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — a
+    /// `$VAR`/`${VAR}`-style placeholder is the only unresolved shape Dart has, so both
+    /// predicates key off the same `requirement_contains_dollar_placeholder` detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_dollar_placeholder(requirement.as_str())
+    }
 }
 
 impl DiagnosticMessages for DartFormatter {}
