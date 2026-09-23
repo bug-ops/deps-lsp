@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp** (test infrastructure): new test drives a real `initialize`/`applyEdit` handshake through `LspService`'s loopback socket, closing `commands::UPDATE_VERSION`'s `canonicalize_uri` coverage gap (resolves #1335) (#1342)
 
 ### Security
+- **deps-core**: `fs_probe::open_no_follow` now uses `libc::O_NOFOLLOW` instead of a hand-rolled per-`target_os` constant, fixing a wrong value on aarch64/arm/powerpc Linux that silently disabled symlink refusal in no-follow reads (resolves #1348) (#1358)
 - **deps-core, deps-nuget, deps-pypi**: `ResolvedPackage`/`ResolvedSource`, `ScanTarget`, `ResolvedShaPin`, `PackageSourceEntry`, and `RequirementRef` now redact credential-shaped fields in `Debug` output (resolves #1237) (#1318)
 - **deps-core**: `ResolvedPackages`' `Debug` output now redacts its `HashMap` key too, closing a gap where the key duplicated the already-redacted `ResolvedPackage.name` (resolves #1319) (#1324)
 - **deps-core**: `ParseError` construction and `Debug` field redaction are now enforced at compile time instead of test-time-only (resolves #1238, #1250)
