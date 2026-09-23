@@ -3269,6 +3269,125 @@ mod tests {
         _attacker_flat.assert_async().await;
     }
 
+    /// #1026: two different credentials against the same `NuGet.Config`-declared feed URL
+    /// must not share a cache entry — `own_auth_id` (FR-014) is the mechanism keeping
+    /// `HttpCache`'s `Pinned`-tier key distinct per credential.
+    ///
+    /// `HttpCache`'s online path has no freshness/TTL short-circuit: a cache *hit* still
+    /// issues a full network round trip when the stored response carries no
+    /// `ETag`/`Last-Modified` (as these mocks deliberately don't), so returned bodies and
+    /// mockito hit counts alone cannot distinguish a correctly-keyed cache from one that
+    /// folds both credentials' entries together — both shapes would still reach the network
+    /// and match the right `Authorization` header. `HttpCache::len()` is the only
+    /// discriminator: entry folding collapses the expected 4 (2 URLs x 2 credentials) down to
+    /// 2 (2 URLs, credential ignored). `deps-core`'s own
+    /// `test_get_cached_pinned_distinct_auth_id_never_shares_cache_entry` (`cache.rs`) only
+    /// verifies `cache_key`'s *string derivation* the same way, not this behavioral folding
+    /// question — see #1026's handoff discussion for detail.
+    #[tokio::test]
+    async fn test_distinct_credentials_against_same_feed_url_never_share_cache_entry() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth_a = NuGetAuth::new("user", "pat-a");
+        // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+        let auth_b = NuGetAuth::new("user", "pat-b");
+
+        let _index_a = server
+            .mock("GET", "/index.json")
+            .match_header("authorization", auth_a.header_value())
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+            ))
+            .create_async()
+            .await;
+        let _index_b = server
+            .mock("GET", "/index.json")
+            .match_header("authorization", auth_b.header_value())
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{base}/flat"),
+                &format!("{base}/search"),
+            ))
+            .create_async()
+            .await;
+        // `expect(2)`: the same-credential control below re-fetches through `client_a`,
+        // which hits this mock a second time (the service-index fetch does not, since
+        // `NuGetRegistry::service_index` caches it in a per-instance `OnceCell`).
+        let _flat_a = server
+            .mock("GET", "/flat/pkg/index.json")
+            .match_header("authorization", auth_a.header_value())
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0"]}"#)
+            .expect(2)
+            .create_async()
+            .await;
+        let _flat_b = server
+            .mock("GET", "/flat/pkg/index.json")
+            .match_header("authorization", auth_b.header_value())
+            .with_status(200)
+            .with_body(r#"{"versions": ["2.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let feed = NuGetFeedUrl::new(&format!("{base}/index.json"), &policy).unwrap();
+        let cache = Arc::new(HttpCache::new());
+        let client_a = NuGetRegistry::with_base(
+            Arc::clone(&cache),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat-a"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+        let client_b = NuGetRegistry::with_base(
+            Arc::clone(&cache),
+            // codeql[rust/hard-coded-cryptographic-value] -- test fixture literal, not a real credential
+            &auth_hop(&feed, "corpfeed", "user", "pat-b"),
+            Arc::clone(&policy),
+            Vec::new(),
+        );
+        assert_ne!(
+            client_a.own_auth_id, client_b.own_auth_id,
+            "two distinct credentials against the same feed URL must derive distinct auth_ids"
+        );
+
+        let versions_a = client_a.get_versions("pkg").await.unwrap();
+        let versions_b = client_b.get_versions("pkg").await.unwrap();
+
+        assert_eq!(versions_a[0].version.as_str(), "1.0.0");
+        assert_eq!(
+            versions_b[0].version.as_str(),
+            "2.0.0",
+            "credential B's fetch must not read back credential A's cached response"
+        );
+        assert_eq!(
+            cache.len(),
+            4,
+            "two credentials fetching the same 2 URLs (service index + flat container) must \
+             produce 4 cache entries, not 2 — a lower count means the entries folded together"
+        );
+
+        // Same-credential control: reusing credential A must hit the entries it already
+        // created, not grow the cache further (rules out an `own_auth_id` that varies
+        // per-instance even for an identical credential, which the distinctness assertion
+        // above alone would not catch).
+        let versions_a_again = client_a.get_versions("pkg").await.unwrap();
+        assert_eq!(versions_a_again[0].version.as_str(), "1.0.0");
+        assert_eq!(
+            cache.len(),
+            4,
+            "reusing the same credential must reuse its existing cache entries, not create new ones"
+        );
+
+        _index_a.assert_async().await;
+        _index_b.assert_async().await;
+        _flat_a.assert_async().await;
+        _flat_b.assert_async().await;
+    }
+
     /// SC-008/FR-016: a credential rotation on an already-registered chain replaces the head
     /// client in place even when `alternates` is at `MAX_ALTERNATE_REGISTRIES` — the replace
     /// arm must not be gated by the capacity check that governs only the Vacant-insertion arm.
