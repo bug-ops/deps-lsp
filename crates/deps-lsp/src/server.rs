@@ -2191,7 +2191,7 @@ mod tests {
     /// `apply_edit` is gated on `State::Initialized` (see `next_client_message`'s doc
     /// comment), so nothing reaches this test harness's loopback socket for it, success
     /// or failure. A different observation technique (e.g. a real `initialize`d service)
-    /// would be needed to close this gap; not yet tracked by a follow-up issue.
+    /// would be needed to close this gap; tracked in #1335.
     ///
     /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path`
     /// (which `parse_manifest`'s workspace-root discovery and `ensure_document_loaded`'s
