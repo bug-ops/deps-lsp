@@ -273,42 +273,25 @@ impl std::fmt::Display for EcosystemId {
 /// [`Self::declaration_key`] are both `String`s, so a positional tuple would let them be
 /// silently swapped at any call site with no compile error — the same shape as the value/key
 /// mixup this type exists to rule out.
-#[derive(Clone)]
+#[derive(Clone, crate::redact_debug::RedactingDebug)]
 pub struct BlockedRegistryOccurrence {
     /// Range of the affected dependency's name in the manifest.
+    #[raw]
     pub range: Range,
     /// The blocked host's classification.
+    #[raw]
     pub class: crate::net_policy::HostClass,
     /// The exact `registry`/`registry-index` alias or URL the dependency declared, so two
     /// different blocked aliases render as two distinguishable diagnostic messages, not one
     /// byte-identical warning.
+    #[redact(url)]
     pub raw_value: String,
     /// Implementation-opaque string identifying *which underlying config declaration*
     /// produced this entry — never the resolved value itself (code-review correctness fix,
     /// #925). See [`ParseResult::blocked_registries`]'s doc for why this must be distinct
     /// from [`Self::raw_value`].
+    #[redact(key)]
     pub declaration_key: String,
-}
-
-impl std::fmt::Debug for BlockedRegistryOccurrence {
-    /// Manual, not derived: `raw_value`/`declaration_key` are raw, potentially
-    /// credential-shaped strings, already redacted the same way on the Display path
-    /// (`lsp_helpers::diagnostics::build_blocked_registry_diagnostic`) but not on `Debug`
-    /// (CWE-532, #1222).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockedRegistryOccurrence")
-            .field("range", &self.range)
-            .field("class", &self.class)
-            .field(
-                "raw_value",
-                &crate::redact::RedactedUrl::new(&self.raw_value),
-            )
-            .field(
-                "declaration_key",
-                &crate::redact::redact_declaration_key(&self.declaration_key),
-            )
-            .finish()
-    }
 }
 
 /// One host-class/raw-value/declaration-key classification an ecosystem config's own
@@ -325,34 +308,19 @@ impl std::fmt::Debug for BlockedRegistryOccurrence {
 /// [`BlockedRegistryOccurrence`] itself was already converted off of (#944 M9). Implemented by
 /// `deps_nuget::config::NuGetConfig::blocked_class_for`, `deps_npm::config::NpmConfig::blocked_class_for`,
 /// and `deps_pypi::config::PypiIndexConfig::blocked_class_for`.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, crate::redact_debug::RedactingDebug)]
 pub struct BlockedSourceClass {
     /// The blocked host's classification.
+    #[raw]
     pub class: crate::net_policy::HostClass,
     /// The exact declared value (URL/alias) that resolved to a blocked host.
+    #[redact(url)]
     pub raw_value: String,
     /// Implementation-opaque string identifying which underlying config declaration produced
     /// this entry — see [`BlockedRegistryOccurrence::declaration_key`]'s doc for why this must
     /// stay distinct from [`Self::raw_value`].
+    #[redact(key)]
     pub declaration_key: String,
-}
-
-impl std::fmt::Debug for BlockedSourceClass {
-    /// Manual, not derived: same `raw_value`/`declaration_key` leak class and redactor pairing
-    /// as [`BlockedRegistryOccurrence`]'s own manual `Debug` impl (CWE-532, #1222).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BlockedSourceClass")
-            .field("class", &self.class)
-            .field(
-                "raw_value",
-                &crate::redact::RedactedUrl::new(&self.raw_value),
-            )
-            .field(
-                "declaration_key",
-                &crate::redact::redact_declaration_key(&self.declaration_key),
-            )
-            .finish()
-    }
 }
 
 impl BlockedSourceClass {

@@ -8,43 +8,33 @@ use deps_core::position::Range;
 /// Package names use `owner/repo` format derived from the Git URL.
 /// Position tracking enables hover, completion, and inlay hints.
 #[non_exhaustive]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, deps_core::redact_debug::RedactingDebug)]
 pub struct SwiftDependency {
     /// Package identity: owner/repo (e.g. "apple/swift-nio")
+    #[raw]
     pub name: deps_core::PackageName,
     /// LSP range of the URL string content (excluding quotes)
+    #[raw]
     pub name_range: Range,
     /// Normalized version requirement or None for branch/revision/path deps
+    #[raw]
     pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of the version string content (excluding quotes), None for non-registry deps
+    #[raw]
     pub version_range: Option<Range>,
     /// The bare literal text `version_range` spans (e.g. `"4.50.0"`), when it differs from
     /// `version_req` — every registry-form syntax synthesizes a comparator requirement
     /// (`.exact("4.50.0")` -> `"=4.50.0"`, `.upToNextMajor(from: "4.77.0")` ->
     /// `">=4.77.0, <5.0.0"`) that never matches the bare literal text at `version_range`.
     /// `None` for branch/revision/path deps, which have no `version_range` to guard.
+    #[raw]
     pub version_literal: Option<String>,
     /// Original Git URL from Package.swift
+    #[redact(url)]
     pub url: String,
     /// Dependency source (registry, git, or path)
+    #[raw]
     pub source: DependencySource,
-}
-
-impl std::fmt::Debug for SwiftDependency {
-    /// Manual, not derived: `url` is the raw Package.swift Git URL, which can carry a
-    /// credential (CWE-532, #1222) — redacted the same way its `source: DependencySource::Git`
-    /// sibling already renders the identical string (#935).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SwiftDependency")
-            .field("name", &self.name)
-            .field("name_range", &self.name_range)
-            .field("version_req", &self.version_req)
-            .field("version_range", &self.version_range)
-            .field("version_literal", &self.version_literal)
-            .field("url", &deps_core::net_policy::RedactedUrl::new(&self.url))
-            .field("source", &self.source)
-            .finish()
-    }
 }
 
 deps_core::impl_dependency!(SwiftDependency {

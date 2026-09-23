@@ -6,21 +6,28 @@ pub use deps_maven::MavenVersion as GradleVersion;
 
 /// A single dependency declaration parsed from a Gradle build script.
 #[non_exhaustive]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, deps_core::redact_debug::RedactingDebug)]
 pub struct GradleDependency {
     /// Maven `groupId`.
+    #[redact(key)]
     pub group_id: String,
     /// Maven `artifactId`.
+    #[redact(key)]
     pub artifact_id: String,
     /// Canonical identifier: "{groupId}:{artifactId}"
+    #[raw]
     pub name: deps_core::PackageName,
     /// Document range of the coordinate, for hover/diagnostic positioning.
+    #[raw]
     pub name_range: Range,
     /// Version requirement, if the build script specifies one.
+    #[raw]
     pub version_req: Option<deps_core::VersionReq>,
     /// Document range of the version string.
+    #[raw]
     pub version_range: Option<Range>,
     /// Gradle configuration (e.g. "implementation", "api", "testImplementation")
+    #[raw]
     pub configuration: String,
     /// Resolved source (#1212): `Registry` unless a `repositories { }` block declares a
     /// repository whose `content { includeGroup(...) }` (or `includeGroupByRegex`/
@@ -28,30 +35,8 @@ pub struct GradleDependency {
     /// (see `parser::parse_repository_content_restrictions`). General-purpose `repositories
     /// { }` evaluation (an arbitrary repo with no content filter) has no static per-package
     /// binding in the Gradle DSL at all, so those stay `Registry`.
+    #[raw]
     pub source: deps_core::parser::DependencySource,
-}
-
-impl std::fmt::Debug for GradleDependency {
-    /// Manual, not derived: same `group_id`/`artifact_id` leak class as
-    /// `deps_maven::MavenDependency`'s manual `Debug` impl (#1220).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GradleDependency")
-            .field(
-                "group_id",
-                &deps_core::net_policy::redact_declaration_key(&self.group_id),
-            )
-            .field(
-                "artifact_id",
-                &deps_core::net_policy::redact_declaration_key(&self.artifact_id),
-            )
-            .field("name", &self.name)
-            .field("name_range", &self.name_range)
-            .field("version_req", &self.version_req)
-            .field("version_range", &self.version_range)
-            .field("configuration", &self.configuration)
-            .field("source", &self.source)
-            .finish()
-    }
 }
 
 deps_core::impl_dependency!(GradleDependency {

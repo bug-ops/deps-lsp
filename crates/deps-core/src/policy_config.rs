@@ -830,12 +830,20 @@ where
 /// let config = RegistriesConfig::default();
 /// assert_eq!(config.workspace_registries, WorkspaceRegistriesSetting::PublicOnly);
 /// ```
+///
+/// `#[derive(RedactingDebug)]` (#936): `gitlab_instance_host` is a raw, unvalidated host
+/// literal that can be credential-shaped (e.g. `user:hunter2@gitlab.corp`) since no
+/// validation happens at deserialization time (see that field's own doc) — without redaction,
+/// a derived `Debug` would print it verbatim into `server.rs`'s
+/// `tracing::debug!("loaded configuration: {:?}", config)` at `RUST_LOG=debug`, before
+/// `deps_gitlab_ci::host::GitlabInstanceHost::get` ever gets a chance to reject it.
 #[non_exhaustive]
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, crate::redact_debug::RedactingDebug)]
 pub struct RegistriesConfig {
     /// Whether workspace-declared registry hosts (e.g. a manifest's own custom index
     /// URLs) may be reached at all, or only the default public registry.
     #[serde(default)]
+    #[raw]
     pub workspace_registries: WorkspaceRegistriesSetting,
     /// Issue #561, FR-006: whether a NuGet user-profile-tier `NuGet.Config` `<add>` with no
     /// repo-declared counterpart becomes a routing hop (`AlternateRegistry`-sourced, so
@@ -845,6 +853,7 @@ pub struct RegistriesConfig {
     /// `deny_unknown_fields`. Default `false` — zero routing effect from any user-profile file
     /// unless explicitly opted in.
     #[serde(default)]
+    #[raw]
     pub nuget_user_profile_sources: bool,
     /// Issue #466, spec FR-005a/FR-011a: the GitLab instance host that `project:` includes
     /// and `$CI_SERVER_FQDN`-relative `component:` includes resolve against, and — replacing,
@@ -859,30 +868,8 @@ pub struct RegistriesConfig {
     /// `deps_gitlab_ci::host::GitlabInstanceHost::get`, which also documents the
     /// already-open-document limitation of a live change to this setting.
     #[serde(default)]
+    #[redact(url)]
     pub gitlab_instance_host: String,
-}
-
-/// Hand-written, not derived (#936): `gitlab_instance_host` is a raw, unvalidated host
-/// literal that can be credential-shaped (e.g. `user:hunter2@gitlab.corp`) since **no
-/// validation happens here** (see the field's own doc) — a derived `Debug` would print it
-/// verbatim into `server.rs`'s `tracing::debug!("loaded configuration: {:?}", config)` at
-/// `RUST_LOG=debug`, before `deps_gitlab_ci::host::GitlabInstanceHost::get` ever gets a
-/// chance to reject it. Every field is still shown (this is not a summary); only
-/// `gitlab_instance_host` is routed through [`crate::redact::RedactedUrl`] first.
-impl std::fmt::Debug for RegistriesConfig {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RegistriesConfig")
-            .field("workspace_registries", &self.workspace_registries)
-            .field(
-                "nuget_user_profile_sources",
-                &self.nuget_user_profile_sources,
-            )
-            .field(
-                "gitlab_instance_host",
-                &crate::redact::RedactedUrl::new(&self.gitlab_instance_host),
-            )
-            .finish()
-    }
 }
 
 // Hand-written, not derived, delegating to `Self::new` for a single source of truth
@@ -1294,8 +1281,8 @@ mod tests {
         );
     }
 
-    /// #936: `RegistriesConfig`'s hand-written `Debug` impl must redact a credential-shaped
-    /// `gitlab_instance_host` while still identifying the host.
+    /// #936: `RegistriesConfig`'s `#[derive(RedactingDebug)]`-generated `Debug` impl must
+    /// redact a credential-shaped `gitlab_instance_host` while still identifying the host.
     #[test]
     fn test_registries_config_debug_redacts_gitlab_instance_host_credential() {
         let config = RegistriesConfig {

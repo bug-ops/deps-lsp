@@ -5,49 +5,33 @@ use std::any::Any;
 
 /// A single `<dependency>` declaration parsed from a `pom.xml`.
 #[non_exhaustive]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, deps_core::redact_debug::RedactingDebug)]
 pub struct MavenDependency {
     /// Maven `groupId`.
+    #[redact(key)]
     pub group_id: String,
     /// Maven `artifactId`.
+    #[redact(key)]
     pub artifact_id: String,
     /// Canonical identifier: "{groupId}:{artifactId}"
+    #[raw]
     pub name: deps_core::PackageName,
     /// Document range of the coordinate, for hover/diagnostic positioning.
+    #[raw]
     pub name_range: Range,
     /// Version requirement, if the `pom.xml` specifies one.
+    #[raw]
     pub version_req: Option<deps_core::VersionReq>,
     /// Document range of the version string.
+    #[raw]
     pub version_range: Option<Range>,
     /// Maven dependency scope (`compile`, `test`, `runtime`, etc.).
+    #[raw]
     pub scope: MavenScope,
     /// Resolved source (#1202): `Path` for a `scope: system` dependency's `<systemPath>`
     /// (an explicit, per-dependency local-jar binding), `Registry` otherwise.
+    #[raw]
     pub source: deps_core::parser::DependencySource,
-}
-
-impl std::fmt::Debug for MavenDependency {
-    /// Manual, not derived: `group_id`/`artifact_id` are raw coordinate segments that can carry
-    /// a credential via property interpolation (`group:artifact:secret@host`) — the same leak
-    /// class `PackageName`'s own `Debug` already redacts for `name` (#1220, mirrors #1217/#1219).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MavenDependency")
-            .field(
-                "group_id",
-                &deps_core::net_policy::redact_declaration_key(&self.group_id),
-            )
-            .field(
-                "artifact_id",
-                &deps_core::net_policy::redact_declaration_key(&self.artifact_id),
-            )
-            .field("name", &self.name)
-            .field("name_range", &self.name_range)
-            .field("version_req", &self.version_req)
-            .field("version_range", &self.version_range)
-            .field("scope", &self.scope)
-            .field("source", &self.source)
-            .finish()
-    }
 }
 
 // TODO(follow-up to #1202): `pom.xml`'s `<repositories>`/`<repository><url>file://...</url>`
@@ -147,42 +131,26 @@ impl MavenVersion {
 
 /// Artifact metadata as returned by Maven Central's search API.
 #[non_exhaustive]
-#[derive(Clone)]
+#[derive(Clone, deps_core::redact_debug::RedactingDebug)]
 pub struct ArtifactInfo {
     /// Maven `groupId`.
+    #[redact(key)]
     pub group_id: String,
     /// Maven `artifactId`.
+    #[redact(key)]
     pub artifact_id: String,
     /// "{groupId}:{artifactId}"
+    #[raw]
     pub name: deps_core::PackageName,
     /// Short artifact description, if available.
+    #[raw]
     pub description: Option<String>,
     /// Latest published version.
+    #[raw]
     pub latest_version: deps_core::ConcreteVersion,
     /// Source repository URL, if known.
+    #[raw]
     pub repository: Option<String>,
-}
-
-impl std::fmt::Debug for ArtifactInfo {
-    /// Manual, not derived: same `group_id`/`artifact_id` leak class as
-    /// [`MavenDependency`]'s manual `Debug` impl (#1220) — this struct sits next to a
-    /// redacted `name` too.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ArtifactInfo")
-            .field(
-                "group_id",
-                &deps_core::net_policy::redact_declaration_key(&self.group_id),
-            )
-            .field(
-                "artifact_id",
-                &deps_core::net_policy::redact_declaration_key(&self.artifact_id),
-            )
-            .field("name", &self.name)
-            .field("description", &self.description)
-            .field("latest_version", &self.latest_version)
-            .field("repository", &self.repository)
-            .finish()
-    }
 }
 
 impl ArtifactInfo {
