@@ -1070,20 +1070,36 @@ mod tests {
         non_registry_fixture: ".gitlab-ci.yml" => "include:\n  - project: org/proj\n    ref: v1.0.0\n";
     }
 
-    // #1354 security audit: GitLab CI's `$VAR`-in-ref placeholder syntax is real (unlike
-    // Cargo/Deno/Composer/Go/Dart), but it is unreachable through the vulnerability-fix
-    // pipeline today — `EcosystemFormatter::osv_ecosystem` returns `None` for GitLab CI, so
-    // `DependencyVulnerabilities` is never built for one of its dependencies and
-    // `plan_vulnerability_fix` is never called at all. `format_version_replacing`'s `Branch`
-    // arm does NOT independently no-op an unresolved `$VAR` ref (verified: it would rewrite
-    // it) — a latent gap, not exercised live, not fixed here since this PR's scope is the
-    // conformance macro plus the two newly-reachable ecosystems (Bundler, Swift), and a
-    // correct fix needs a new predicate distinguishing a `$VAR`-shaped ref from an ordinary
-    // branch name (both currently classify as `PinStyle::Branch`) rather than a one-line
-    // guard. Filed as #1365 (#1354 critic M1).
+    // #1365: GitLab CI's `$VAR`-in-ref placeholder is now guarded directly in
+    // `GitlabCiFormatter::format_version_replacing_for` (see
+    // `formatter::contains_unresolved_gitlab_variable`), with its own hand-written regression
+    // test exercising the real formatter + a real parsed dependency through
+    // `plan_vulnerability_fix`
+    // (`formatter::tests::test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite`),
+    // mirroring what `unresolved_requirement_conformance!`'s `reachable: true`/`reachable:
+    // false` arms assert generically for other ecosystems. This macro invocation stays on
+    // `no_placeholder_syntax` (not a genuine "no such syntax" claim, but the only arm this
+    // macro's shared assertion can actually express for GitLab CI) because both other arms are
+    // structurally unusable here, independent of the guard now existing:
+    // - `reachable: true` requires at least one dependency to reach the per-dependency check
+    //   loop, gated on `formatter.source_is_public_registry_content(&dep.source())`; GitLab CI
+    //   dependencies are always `DependencySource::AlternateRegistry`/`CustomRegistry`, never
+    //   plain `DependencySource::Registry`, so `source_is_public_registry_content` (default
+    //   impl, not overridden here) is `false` for every one — verified empirically, not just
+    //   read from the trait default. Overriding it just to satisfy this macro would be wrong:
+    //   that predicate also gates OSV/deps.dev/hover-trust-signal classification elsewhere
+    //   (`deps-engine`'s `classify::osv`/`classify::license`/`classify::resolved`), and GitLab
+    //   CI dependencies genuinely have no public-registry OSV/deps.dev identity.
+    // - `reachable: false` requires a control dependency named exactly
+    //   `UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME`; GitLab CI's `is_valid_gitlab_coordinate`
+    //   rejects any name with fewer than two `/`-separated segments, so a dependency with that
+    //   exact bare name can never be constructed under either the `project:` or `component:`
+    //   grammar — verified empirically. The parser also does not degrade `$VAR` to `None`
+    //   (mirrors `reachable: true` ecosystems, not `reachable: false` ones), so this arm would
+    //   be doubly wrong even setting the naming issue aside.
     deps_core::unresolved_requirement_conformance! {
         mod gitlab_ci_unresolved_requirement_conformance;
-        no_placeholder_syntax: "GitLab CI's $VAR ref placeholder exists but is currently unreachable via plan_vulnerability_fix (OSV coverage gap); see #1365 for the guard fix once reachable";
+        no_placeholder_syntax: "GitLab CI's $VAR ref placeholder is guarded directly in GitlabCiFormatter::format_version_replacing_for with its own regression test (see the comment above) — neither reachable: true nor reachable: false fits this ecosystem's source-policy/naming-grammar shape";
     }
 
     // #1137: regression guard, not independent parser verification (see
