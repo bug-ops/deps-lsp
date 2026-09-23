@@ -45,37 +45,25 @@ use crate::lsp_helpers::is_safe_version_string;
 /// assert_eq!(target.key, target.osv_name);
 /// ```
 #[non_exhaustive]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, crate::redact_debug::RedactingDebug)]
 pub struct ScanTarget {
     /// This project's internal lookup key — used to key [`VulnerabilityMap`].
+    #[redact(key)]
     pub key: String,
     /// OSV's canonical package name for this ecosystem — sent on the wire.
+    #[redact(key)]
     pub osv_name: String,
     /// Concrete version to query, resolved per the version-selection policy
     /// and rewritten to OSV's wire spelling via
     /// `EcosystemFormatter::osv_version`. Never surface this to the user —
     /// use [`Self::display_version`] instead.
+    #[raw]
     pub version: String,
     /// The same version in the ecosystem's native spelling (pre-`osv_version`
     /// rewrite), for callers that need to display it back to the user rather
     /// than send it to OSV.
+    #[raw]
     pub display_version: String,
-}
-
-impl std::fmt::Debug for ScanTarget {
-    /// Manual, not derived: `key`/`osv_name` are raw package names — the weaker #1217
-    /// name-shape sibling of the #1222 sweep (#1237).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScanTarget")
-            .field("key", &crate::net_policy::redact_declaration_key(&self.key))
-            .field(
-                "osv_name",
-                &crate::net_policy::redact_declaration_key(&self.osv_name),
-            )
-            .field("version", &self.version)
-            .field("display_version", &self.display_version)
-            .finish()
-    }
 }
 
 impl ScanTarget {

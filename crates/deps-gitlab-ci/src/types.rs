@@ -113,7 +113,7 @@ impl std::fmt::Debug for HostRef {
     /// Manual, not derived: `Unresolved`/`CapacityRefused`/`PolicyBlocked` carry raw,
     /// potentially credential-shaped host strings (CWE-532, #1222) — `PolicyBlocked::raw`
     /// mirrors the same `registries.gitlab_instance_host` value `RegistriesConfig`'s own
-    /// hand-written `Debug` already redacts (#936).
+    /// `#[derive(RedactingDebug)]`-generated `Debug` already redacts (#936).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Literal(host) => f.debug_tuple("Literal").field(host).finish(),
@@ -177,31 +177,38 @@ pub enum PinStyle {
 /// Parsed `include:` dependency from a `.gitlab-ci.yml`-syntax file, with position
 /// tracking.
 #[non_exhaustive]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, deps_core::redact_debug::RedactingDebug)]
 pub struct GitlabCiDependency {
     /// Host-qualified when the host is known: `{host}/{project_path}` for [`IncludeKind::Project`],
     /// `{host}/{project_path}/{component_name}` for [`IncludeKind::Component`]. The bare
     /// path alone (no host prefix) when [`Self::host`] is [`HostRef::Unresolved`] (spec
     /// §3.1 — this also means every name-keyed structure is automatically per-instance).
+    #[raw]
     pub name: deps_core::PackageName,
     /// LSP range of the `project:`/`component:` value text.
+    #[raw]
     pub name_range: Range,
     /// Normalized version requirement: the ref/pin text, or `None` for a `project:`
     /// include with no `ref:` at all (GitLab defaults that to the project's default
     /// branch, which this crate cannot resolve to a concrete version).
+    #[raw]
     pub version_req: Option<deps_core::VersionReq>,
     /// LSP range of the ref/pin text.
+    #[raw]
     pub version_range: Option<Range>,
     /// The raw literal text, when it differs from `version_req` (unused today — no
     /// GitLab CI pin form carries a comment-derived requirement the way GitHub Actions'
     /// SHA-with-comment form does; kept for [`deps_core::ecosystem::Dependency`] parity).
+    #[raw]
     pub version_literal: Option<String>,
     /// Dependency source: [`DependencySource::AlternateRegistry`] when [`Self::host`] is
     /// known and its route was registered; [`DependencySource::CustomRegistry`] otherwise
     /// (unresolved host, or a route the process-wide cap refused) — see spec §3.2.
+    #[raw]
     pub source: DependencySource,
     /// Whether the whole include-entry value was written as a plain (unquoted) YAML
     /// scalar, mirroring `deps-github-actions`'s identical field.
+    #[raw]
     pub is_plain_scalar: bool,
     /// Whether the field this dependency's edit/completion write paths actually target —
     /// the `ref:` field when one is present, otherwise the `project:`/`component:` field
@@ -215,41 +222,22 @@ pub struct GitlabCiDependency {
     /// withholds every SHA-pin code action, bulk-edit lens, and version-completion write
     /// path for this dependency: an alias token (`*pin`) is not an editable literal, so
     /// no automated fix may ever rewrite it.
+    #[raw]
     pub is_alias_occurrence: bool,
     /// Which `include:` form this dependency came from.
+    #[raw]
     pub kind: IncludeKind,
     /// This dependency's resolved (or not-yet-resolvable) host.
+    #[raw]
     pub host: HostRef,
     /// How the ref/pin is classified; `None` only for a hostless-ref `project:` include
     /// (no `ref:` key at all).
+    #[raw]
     pub pin: Option<PinStyle>,
     /// The bare `org/sub/proj[/component]` path, without a host prefix — kept for URL
     /// construction and the registry's own fetch-path use.
+    #[redact(key)]
     pub project_path: String,
-}
-
-impl std::fmt::Debug for GitlabCiDependency {
-    /// Manual, not derived: `project_path` is a raw path segment that can carry a credential
-    /// via CI variable interpolation (CWE-532, #1222).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GitlabCiDependency")
-            .field("name", &self.name)
-            .field("name_range", &self.name_range)
-            .field("version_req", &self.version_req)
-            .field("version_range", &self.version_range)
-            .field("version_literal", &self.version_literal)
-            .field("source", &self.source)
-            .field("is_plain_scalar", &self.is_plain_scalar)
-            .field("is_alias_occurrence", &self.is_alias_occurrence)
-            .field("kind", &self.kind)
-            .field("host", &self.host)
-            .field("pin", &self.pin)
-            .field(
-                "project_path",
-                &deps_core::net_policy::redact_declaration_key(&self.project_path),
-            )
-            .finish()
-    }
 }
 
 deps_core::impl_dependency!(GitlabCiDependency {
