@@ -379,6 +379,57 @@ mod tests {
         }
     }
 
+    /// #1347 C1 empirical guard: proves the real `GithubActionsFormatter`'s
+    /// tag-pin vulnerability-fix remediation is unaffected by NuGet's `$(...)` no-op fix
+    /// (`deps_nuget::NuGetFormatter::format_version_replacing`) — a real cross-crate check,
+    /// not `deps-core`'s `ShaPinFormatter` mock. `plan_vulnerability_fix` no longer gates on
+    /// `requirement_is_unresolved` at all (reverted after the critic's C1 finding), so this
+    /// also serves as a live regression test for that revert holding.
+    #[test]
+    fn test_plan_vulnerability_fix_still_offered_for_real_tag_pin() {
+        use deps_core::ParseResult;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v3\n";
+        let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
+        let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
+        let deps = result.dependencies();
+        let dep = deps
+            .iter()
+            .find(|d| d.name().as_str() == "actions/checkout")
+            .expect("actions/checkout parsed");
+        let version_range = dep.version_range().expect("tag pin has a version range");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0003".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["v4".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "v4".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(*dep, version_range, "v3", &dv, &formatter());
+
+        assert_eq!(
+            planned
+                .expect("tag-pin fix must still be planned")
+                .edit
+                .new_text,
+            "v4",
+            "the real GithubActionsFormatter's SHA/tag-pin remediation must be unaffected \
+             by NuGet's format_version_replacing no-op fix"
+        );
+    }
+
     // --- #474: hover suppress_package_url / footer regression coverage ---
 
     #[test]
@@ -1067,6 +1118,71 @@ mod tests {
         let new_text =
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v5.0.0"), "v4.2.0");
         assert_eq!(new_text, format!("{} # v5.0.0", "deadbeef".repeat(5)));
+    }
+
+    /// Issue #1347 critic finding (C1), real-formatter regression: `requirement_is_unresolved`
+    /// is `true` for every full-SHA pin (it means "not decidable from text alone", not
+    /// "unexpanded placeholder, don't touch") — `deps_core::edit::plan_vulnerability_fix` must
+    /// never gate on that predicate, or this ecosystem's working SHA-preserving vulnerability
+    /// remediation would be silently suppressed. Proven here against the real
+    /// `GithubActionsFormatter`, not a mock.
+    #[test]
+    fn test_plan_vulnerability_fix_still_remediates_sha_pin() {
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let fmt = formatter();
+        let name = PackageName::new("actions/checkout");
+        let mut index = TagIndex::default();
+        index
+            .tag_to_sha
+            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        fmt.tag_index.insert(name, Arc::new(index));
+
+        let old_sha = "a".repeat(40);
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4.2.0".to_string()),
+            }),
+            "actions/checkout",
+            Some(&format!("{old_sha} # v4.2.0")),
+        );
+        assert!(
+            fmt.requirement_is_unresolved(&VersionReq::new(old_sha)),
+            "sanity check: a bare SHA is 'unresolved' by this formatter's own definition"
+        );
+
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-test-0003".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["v5.0.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "v5.0.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            &d,
+            d.version_range.expect("test dep has a version range"),
+            "v4.2.0",
+            &dv,
+            &fmt,
+        );
+
+        assert_eq!(
+            planned
+                .expect("fix must still be planned for a SHA pin")
+                .edit
+                .new_text,
+            format!("{} # v5.0.0", "deadbeef".repeat(5))
+        );
     }
 
     /// FR-010 sibling fix (security audit finding): a quoted-scalar SHA pin must fall

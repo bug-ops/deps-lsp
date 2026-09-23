@@ -99,6 +99,28 @@ impl PackageRendering for NuGetFormatter {
         version.to_string()
     }
 
+    /// Issue #1347 hardening: an unexpanded MSBuild property reference (`$(SomeProperty)`) in
+    /// `current` leaves `current` unchanged instead of substituting `version`, so hardcoding a
+    /// literal version over a centrally-managed property is structurally impossible even if a
+    /// future caller reaches this method with such text. Returning `current` verbatim trips the
+    /// pre-existing textual no-op guards in `deps_core::edit::collect_update_candidates`/
+    /// `plan_vulnerability_fix`.
+    ///
+    /// Currently defense-in-depth only, not a fix for a reproducible defect: `crate::parser`
+    /// already degrades every `$(...)`-containing manifest shape to `version_requirement: None`
+    /// before either the LSP code-action path or `deps-cli` ever reaches this method (verified
+    /// across `.csproj` attribute/child-element form, `Directory.Packages.props`,
+    /// `packages.config`, and the bracketed `[$(Min),$(Max))` form — see
+    /// `parser::test_unresolved_msbuild_property_degrades_to_none`), so `current` never actually
+    /// contains `$(` in production today. This guards against that parser invariant ever
+    /// relaxing, at negligible cost.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if current.contains("$(") {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -107,7 +129,18 @@ impl PackageRendering for NuGetFormatter {
 impl RequirementResolution for NuGetFormatter {
     /// Overridden because the default npm caret/tilde semantics do not apply to NuGet's
     /// interval-notation ranges (`[1.0,2.0)`) and floating patterns (`1.1.*`).
+    ///
+    /// Issue #1347 hardening: an unresolved requirement (see
+    /// [`Self::requirement_is_unresolved`]) returns `true` (treated as satisfied) rather than
+    /// falling into `crate::version::satisfies`, which would otherwise coerce it to a
+    /// `0.0.0`-shaped floor matching almost any version — mirrors `MavenFormatter`'s identical
+    /// "skip comparison" precedent for its own unresolved-property case, and is what
+    /// `deps_core::lsp_helpers::in_use_version`'s `version_matches_requirement` (its
+    /// `compile_requirement`-`None` fallback) calls this method for.
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+            return true;
+        }
         let version = version.as_str();
         if requirement.contains('*') {
             let versions = [version.to_string()];
@@ -125,11 +158,21 @@ impl RequirementResolution for NuGetFormatter {
     /// `latest <= floor` here, not `latest == floor`. Exact pins, maximums, bounded ranges,
     /// and floating patterns (`1.1.*`) already express the intended forward-compatibility
     /// window, so those keep the general satisfies check.
+    ///
+    /// Issue #1347 hardening: an unresolved requirement (see
+    /// [`Self::requirement_is_unresolved`]) returns `true` (treated as up to date) before
+    /// reaching `crate::version::compare_minimum_floor`, which would otherwise coerce it to a
+    /// `0.0.0`-shaped floor that every `latest` compares `>=` against — the same
+    /// false-"satisfied" coercion [`Self::version_satisfies_requirement`]'s guard above
+    /// prevents, needed separately here since this floor branch never calls that method.
     fn is_requirement_up_to_date(
         &self,
         requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> bool {
+        if self.requirement_is_unresolved(requirement) {
+            return true;
+        }
         let requirement = requirement.as_str();
         if requirement.contains('*') {
             return self.version_satisfies_requirement(latest, requirement);
@@ -160,10 +203,25 @@ impl RequirementResolution for NuGetFormatter {
     /// (parsing fails) — without this guard, a malformed requirement string would make
     /// `satisfies`/`resolve_float` return `false` for every candidate, producing a false
     /// "unsatisfiable" verdict instead of correctly suppressing the check.
+    ///
+    /// Issue #1347 hardening: a bare (unbracketed) `$(SomeProperty)` reference is rejected
+    /// outright first, before the undecidable-predicate dispatch below — unlike the bracketed
+    /// `[$(Min),$(Max))` form, it has no nested-bracket shape for `parse_range` to trip on
+    /// (see [`Self::requirement_is_unresolved`]'s doc), so without this explicit check it
+    /// would parse as an ordinary `VersionRange::Minimum` floor and this method would
+    /// decisively (and wrongly) report every version as satisfying it. Not a fix for a
+    /// reproducible defect, though: `crate::parser` already degrades this input to
+    /// `version_requirement: None` before it ever reaches a `VersionReq` this method is called
+    /// with (see [`Self::format_version_replacing`]'s doc for the full unreachability
+    /// argument), so this guard is defense-in-depth, consistent with the parser's own treatment
+    /// of the same input as "no requirement" rather than a real constraint.
     // `compile_requirement_unless`'s contract only invokes the build closure when the
     // undecidable predicate returned `false`, i.e. parsing already succeeded.
     #[allow(clippy::expect_used)]
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        if self.requirement_is_unresolved(requirement) {
+            return None;
+        }
         let requirement = requirement.as_str();
         if requirement.contains('*') {
             compile_requirement_unless(
@@ -362,6 +420,33 @@ mod tests {
         );
     }
 
+    /// Code-review finding 1: `is_requirement_up_to_date`'s `compare_minimum_floor` branch
+    /// never calls `version_satisfies_requirement`, so it needs its own unresolved-requirement
+    /// guard — without it, `$(Property)` would coerce to a `0.0.0` floor that every `latest`
+    /// compares `>=` against, reporting "up to date" for the wrong reason (right answer,
+    /// coincidentally, but via undefined behavior rather than the intended `Unresolved` path).
+    #[test]
+    fn test_is_up_to_date_unresolved_property_returns_true() {
+        let f = NuGetFormatter;
+        assert!(f.is_requirement_up_to_date(
+            &VersionReq::new("$(SomePackageVersion)"),
+            &ConcreteVersion::new("13.0.3")
+        ));
+    }
+
+    /// Code-review finding 1: `version_satisfies_requirement` is `in_use_version.rs`'s
+    /// `version_matches_requirement` fallback whenever `compile_requirement` returns `None` —
+    /// now the case for every `$(...)` requirement — so it must not coerce the unparseable core
+    /// to a `0.0.0` floor that matches almost any candidate.
+    #[test]
+    fn test_version_satisfies_requirement_unresolved_property_returns_true() {
+        let f = NuGetFormatter;
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("13.0.3"),
+            "$(SomePackageVersion)"
+        ));
+    }
+
     #[test]
     fn test_normalize_lowercases() {
         let f = NuGetFormatter;
@@ -498,6 +583,23 @@ mod tests {
         assert!(f.compile_requirement(&VersionReq::new("1.*.0")).is_none());
     }
 
+    /// A bare `$(SomeProperty)` reference previously parsed as an ordinary
+    /// `VersionRange::Minimum` floor (no bracket for `parse_range`'s nested-bracket guard to
+    /// trip on), so `compile_requirement` would decisively (and wrongly) report every
+    /// candidate as satisfying it. See [`NuGetFormatter::compile_requirement`]'s doc for why
+    /// this is defense-in-depth rather than a fix for a live code path: were this text ever to
+    /// reach `deps-cli update --security-only`'s `requirement_already_admits_fix` gate, it
+    /// would rely on exactly this wrong answer — but `version_requirement()` is already `None`
+    /// for this input, so that gate is never actually reached with it today.
+    #[test]
+    fn test_compile_requirement_none_for_unresolved_bare_property() {
+        let f = NuGetFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("$(SomePackageVersion)"))
+                .is_none()
+        );
+    }
+
     /// M3: a bracketed MSBuild property reference must be classified as unresolved, not
     /// left to fall through as a generic malformed/undecidable requirement (#821:
     /// `crate::version::parse_range` now rejects this shape outright via the shared
@@ -514,6 +616,66 @@ mod tests {
         let f = NuGetFormatter;
         assert!(!f.requirement_is_unresolved(&VersionReq::new("13.0.3")));
         assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
+    }
+
+    /// Issue #1347, closing the deps-core mock-fidelity gap: exercises
+    /// `deps_core::edit::plan_vulnerability_fix` with the *real* `NuGetFormatter` (not a
+    /// hand-rolled mock) and a `NuGetDependency` obtained from the real
+    /// `crate::parser::parse_project_file` path, on a vulnerable package whose declared
+    /// version is an unexpanded MSBuild property reference.
+    ///
+    /// Note: on the real `generate_code_actions`/`deps-cli` call graph this scenario is
+    /// already unreachable before `plan_vulnerability_fix` is ever called — NuGet's own
+    /// parser degrades `$(...)` to `version_requirement: None`
+    /// (`test_unresolved_msbuild_property_degrades_to_none` in `parser.rs`), and both
+    /// callers bail out on `dep.version_requirement().is_none()` first. This test instead
+    /// calls `plan_vulnerability_fix` directly with the raw `$(...)` text as `current` (as a
+    /// caller reached some other way would), proving the new guard itself is correct against
+    /// the real formatter, independent of that caller-level gate.
+    #[test]
+    fn test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency() {
+        use deps_core::ParseResult;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let xml = r#"<Project><ItemGroup><PackageReference Include="AutoMapper" Version="$(AutoMapperVersion)" /></ItemGroup></Project>"#;
+        let uri = deps_core::test_util::test_uri("/test/real.csproj");
+        let result = crate::parser::parse_project_file(xml, &uri).expect("valid xml");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        assert!(
+            dep.version_requirement().is_none(),
+            "sanity check: parser must degrade $(...) to None"
+        );
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0001".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["1.2.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "1.2.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            deps_core::position::Range::default(),
+            "$(AutoMapperVersion)",
+            &dv,
+            &NuGetFormatter,
+        );
+
+        assert!(
+            planned.is_none(),
+            "the real NuGetFormatter must suppress the fix for an unresolved property reference"
+        );
     }
 
     #[test]

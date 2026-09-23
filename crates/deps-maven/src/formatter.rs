@@ -380,6 +380,27 @@ mod tests {
         );
     }
 
+    /// #1347 S1 deferral rationale: an unresolved `${property}` compiles to
+    /// `MavenMatcher::AlwaysSatisfied`, which reports `Some(true)` against *any* candidate —
+    /// including a vulnerability's fix target. `deps-cli`'s `requirement_already_admits_fix`
+    /// gate relies on exactly this to safely short-circuit `plan_vulnerability_fix` before it
+    /// would otherwise rewrite the unresolved property (Maven has no
+    /// `format_version_replacing` no-op guard mirroring NuGet's #1347 fix), so removing this
+    /// gate without first adding one would reintroduce the same destructive-rewrite bug for
+    /// Maven.
+    #[test]
+    fn test_compile_requirement_unresolved_property_always_satisfied() {
+        let f = MavenFormatter;
+        let matcher = f
+            .compile_requirement(&VersionReq::new("${undefined.property}"))
+            .expect("an unresolved property must be decidable (always-satisfied), not undecidable");
+        assert_eq!(matcher.matches(&ConcreteVersion::new("1.2.0")), Some(true));
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("99.99.99")),
+            Some(true)
+        );
+    }
+
     /// M2: `<version>1.0</version>` and a published `1.0.0` are equal under Maven's own
     /// `ComparableVersion` (trailing zero segments don't matter) — the exact-match branch
     /// must not fall back to raw string equality and report a false WARNING.
