@@ -131,15 +131,15 @@ pub fn read_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<Opt
 /// check-then-open TOCTOU race — an attacker with write access to the manifest's directory
 /// could swap in a symlink between the two calls).
 ///
-/// On Linux and macOS (the two Unix platforms this project's CI actually builds and tests
-/// against), the kernel enforces this atomically via `O_NOFOLLOW` on the `open(2)` call — a
-/// symlinked `path` fails the open outright, with no content ever read either way; this
-/// function then classifies that failure into the distinct, well-worded error described
-/// below rather than a generic read failure. On every other platform (Windows, and any
-/// untested Unix flavor), std exposes no portable `O_NOFOLLOW` equivalent, so this falls back
-/// to a `symlink_metadata` check immediately before the open — not atomic, but narrows the
-/// window to the two syscalls happening back to back with no attacker-controlled work between
-/// them, rather than leaving it open across this function's entire caller-side read path.
+/// On every Unix target (Linux on all architectures, macOS, and the BSDs), the kernel enforces
+/// this atomically via `libc::O_NOFOLLOW` on the `open(2)` call — a symlinked `path` fails the
+/// open outright, with no content ever read either way; this function then classifies that
+/// failure into the distinct, well-worded error described below rather than a generic read
+/// failure. On non-Unix platforms (Windows), std exposes no portable `O_NOFOLLOW` equivalent,
+/// so this falls back to a `symlink_metadata` check immediately before the open — not atomic,
+/// but narrows the window to the two syscalls happening back to back with no attacker-controlled
+/// work between them, rather than leaving it open across this function's entire caller-side
+/// read path.
 ///
 /// # Errors
 ///
@@ -170,16 +170,9 @@ fn symlink_refused_error(path: &Path) -> std::io::Error {
     )
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(unix)]
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
-    // Kernel ABI constants for `O_NOFOLLOW`, not exposed by `std` — stable across every libc
-    // on each OS (glibc, musl, and macOS's libSystem alike), so one constant per `target_os`
-    // covers every CI target that OS builds (including the musl cross-compile legs).
-    #[cfg(target_os = "linux")]
-    const O_NOFOLLOW: i32 = 0o400_000;
-    #[cfg(target_os = "macos")]
-    const O_NOFOLLOW: i32 = 0x0100;
 
     // The `O_NOFOLLOW` open itself is the atomic, race-free enforcement — it fails (ELOOP) if
     // `path`'s final component is a symlink, with no window between checking and opening. The
@@ -189,7 +182,7 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     // function exists to close.
     std::fs::OpenOptions::new()
         .read(true)
-        .custom_flags(O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|error| {
             if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
@@ -200,7 +193,7 @@ fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
         })
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(unix))]
 fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
     if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
         return Err(symlink_refused_error(path));
