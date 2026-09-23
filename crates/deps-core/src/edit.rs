@@ -1214,12 +1214,16 @@ mod tests {
         }
     }
 
-    // --- plan_vulnerability_fix: #1344 requirement-already-admits-fix gate ---
+    // --- plan_vulnerability_fix: #1344 requirement-already-admits-fix gate, #1347
+    // requirement_is_unresolved hardening ---
 
     mod plan_vulnerability_fix_tests {
         use super::*;
         use crate::PackageName;
-        use crate::lsp_helpers::test_support::{MockDep, MockFormatter, StrictSemverFormatter};
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::{
+            MockDep, MockFormatter, StrictSemverFormatter, pkg,
+        };
         use crate::lsp_helpers::{
             DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
             RequirementMatcher, RequirementResolution, SourcePolicy,
@@ -1253,6 +1257,42 @@ mod tests {
                 },
             )
         }
+
+        /// Reproduces `GithubActionsFormatter`'s real semantics: `requirement_is_unresolved`
+        /// is `true` for a full-SHA pin (it means "not decidable from text alone", not
+        /// "unexpanded placeholder"), yet `format_version_replacing_for` still produces a
+        /// legitimate SHA-preserving rewrite for it. Guards against reintroducing #1347's C1
+        /// regression (gating `plan_vulnerability_fix` on `requirement_is_unresolved`, which
+        /// would silently drop this ecosystem's working vulnerability remediation) — a real
+        /// cross-crate `GithubActionsFormatter` can't be used here (`deps-core` cannot depend
+        /// on `deps-github-actions`), so this mock reproduces its documented override shape
+        /// instead.
+        struct ShaPinFormatter;
+        impl PackageNaming for ShaPinFormatter {}
+        impl PackageRendering for ShaPinFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &crate::PackageName) -> String {
+                name.as_str().to_string()
+            }
+            fn format_version_replacing(
+                &self,
+                version: &ConcreteVersion,
+                _current: &str,
+            ) -> String {
+                format!("{version} # v-resolved")
+            }
+        }
+        impl RequirementResolution for ShaPinFormatter {
+            fn requirement_is_unresolved(&self, _requirement: &VersionReq) -> bool {
+                true
+            }
+        }
+        impl DiagnosticMessages for ShaPinFormatter {}
+        impl DiagnosticPolicy for ShaPinFormatter {}
+        impl SourcePolicy for ShaPinFormatter {}
+        impl OsvNaming for ShaPinFormatter {}
 
         /// A caret range ("^1" is what Cargo/npm-shaped bare "1" compiles to) that already
         /// admits the fix target must suppress the edit — the declared requirement needs no
@@ -1366,6 +1406,30 @@ mod tests {
                 plan_vulnerability_fix(&d, d.version_range, "1.0.0", &dv, &FloorFormatter)
                     .expect("a floor-shaped requirement must not suppress the fix");
             assert_eq!(planned.edit.new_text, "1.0.2");
+        }
+
+        #[test]
+        fn test_plan_vulnerability_fix_ignores_requirement_is_unresolved() {
+            let action_dep = MockDep {
+                name: pkg("some-action"),
+                version_req: VersionReq::new("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                version_range: range(0, 9, 0, 49),
+                name_range: crate::position::Range::default(),
+            };
+            let dv = verified_dv("1.2.0");
+
+            let planned = plan_vulnerability_fix(
+                &action_dep,
+                action_dep.version_range,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                &dv,
+                &ShaPinFormatter,
+            );
+
+            assert_eq!(
+                planned.expect("fix must still be planned").edit.new_text,
+                "1.2.0 # v-resolved"
+            );
         }
     }
 }

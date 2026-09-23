@@ -362,6 +362,56 @@ mod tests {
         hostile_package_url_expected: "";
     }
 
+    /// #1347 C1 empirical guard: proves the real `GitlabCiFormatter`'s tag-pin
+    /// vulnerability-fix remediation is unaffected by NuGet's `$(...)` no-op fix
+    /// (`deps_nuget::NuGetFormatter::format_version_replacing`) — a real cross-crate check,
+    /// not `deps-core`'s `ShaPinFormatter` mock. `plan_vulnerability_fix` no longer gates on
+    /// `requirement_is_unresolved` at all (reverted after the critic's C1 finding), so this
+    /// also serves as a live regression test for that revert holding.
+    #[test]
+    fn test_plan_vulnerability_fix_still_offered_for_real_tag_pin() {
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let gl_dep = dep(
+            Some(PinStyle::Tag),
+            "gitlab.com/org/proj",
+            DependencySource::AlternateRegistry {
+                index: "gitlab:abc".into(),
+                mirrors_crates_io: false,
+            },
+        );
+        let version_range = gl_dep.version_range.expect("tag pin has a version range");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0004".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["2.0.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "2.0.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(&gl_dep, version_range, "1.0.0", &dv, &formatter());
+
+        assert_eq!(
+            planned
+                .expect("tag-pin fix must still be planned")
+                .edit
+                .new_text,
+            "2.0.0",
+            "the real GitlabCiFormatter's tag-pin remediation must be unaffected by \
+             NuGet's format_version_replacing no-op fix"
+        );
+    }
+
     #[test]
     fn test_suppress_package_url_custom_registry_always_suppressed() {
         let fmt = formatter();
