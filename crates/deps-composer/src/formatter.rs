@@ -6,6 +6,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    requirement_contains_dollar_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -25,6 +26,41 @@ fn is_valid_composer_segment(segment: &str) -> bool {
         && segment
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Composer's own root-package version substitution keyword
+/// (`composer/composer`'s `RootPackageLoader::isRootPackage`/`VersionParser`): pins a
+/// dependency to the *root* package's own version, resolved by Composer itself at
+/// generation time — most common in a monorepo lock-step split-package layout (e.g. the
+/// Symfony/Laminas component split), where every split package's `composer.json` requires
+/// its parent monorepo package as `self.version`. deps-lsp never resolves this itself.
+const COMPOSER_SELF_VERSION: &str = "self.version";
+
+/// True when `requirement` is one of Composer's non-rewritable, non-numeric constraint
+/// forms that `deps-lsp` must never overwrite with a literal registry version:
+/// - the literal keyword [`COMPOSER_SELF_VERSION`] (#1373)
+/// - an inline alias, `<branch-or-constraint> as <alias-version>`
+///   (`composer/semver`'s `VersionParser::parseConstraints`, `\s+as\s+` grammar), e.g.
+///   `"dev-main as 1.0.0"` — pins a branch/constraint while presenting a different version
+///   to satisfied dependents (#1373). Composer requires whitespace on both sides of `as`,
+///   so a plain `" as "` substring check cannot false-positive against a hyphenated
+///   branch/package token (e.g. `"feature-as-x"` has no surrounding spaces).
+/// - an unexpanded `$VAR`/`${VAR}` external-templating placeholder anywhere in the text
+///   (`requirement_contains_dollar_placeholder`, #1374 impl-critic M2) — `composer.json`
+///   has no such grammar itself, but a manifest pre-processed by external templating
+///   (`envsubst`, CI templating) can still leave one in place, e.g. `"${PSR_LOG}"`;
+///   `composer.json`'s parser preserves this as an ordinary string, so it reaches
+///   [`RequirementResolution`]/[`PackageRendering`] just like the two Composer-native forms
+///   above.
+///
+/// None of these three forms is ever resolved by `deps-lsp` itself — the first two are
+/// handled entirely by Composer's own installer, the third by whatever external tool
+/// templated the manifest.
+fn requirement_is_composer_unresolved(requirement: &str) -> bool {
+    let trimmed = requirement.trim();
+    trimmed == COMPOSER_SELF_VERSION
+        || trimmed.contains(" as ")
+        || requirement_contains_dollar_placeholder(requirement)
 }
 
 /// Composer requirement matcher, compiled once per dependency by
@@ -89,6 +125,18 @@ impl PackageRendering for ComposerFormatter {
 
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
+    }
+
+    /// #1373 hardening: `self.version` or an inline alias (see
+    /// `requirement_is_composer_unresolved`) in `current` leaves `current` unchanged
+    /// instead of substituting `version`, so a vulnerability-fix or "update to latest" edit
+    /// can never hardcode a literal version over either native Composer form — mirrors
+    /// `BundlerFormatter::format_version_replacing`'s `#{...}` guard (#1354).
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_is_composer_unresolved(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
     }
 
     /// Widens the rename quickfix's discoverability: without this, only a cursor on
@@ -283,9 +331,24 @@ impl RequirementResolution for ComposerFormatter {
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         compile_requirement_unless(
             requirement.as_str().trim(),
-            |r| r.starts_with("dev-") || r.ends_with("-dev") || r.contains("@dev"),
+            |r| {
+                requirement_is_composer_unresolved(r)
+                    || r.starts_with("dev-")
+                    || r.ends_with("-dev")
+                    || r.contains("@dev")
+            },
             ComposerMatcher,
         )
+    }
+
+    /// #1373: `self.version` or an inline alias (see `requirement_is_composer_unresolved`)
+    /// must never be reported as an unsatisfiable requirement — both are resolved entirely
+    /// by Composer's own installer, not by any version published on Packagist, so
+    /// `deps_core::lsp_helpers::requirement_is_unsatisfiable` (which checks this before
+    /// calling `compile_requirement`) must treat them as unresolved instead of "no
+    /// published version satisfies this".
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_is_composer_unresolved(requirement.as_str())
     }
 }
 
@@ -1102,6 +1165,287 @@ mod tests {
                 .is_none()
         );
         assert!(f.compile_requirement(&VersionReq::new("2.0@dev")).is_none());
+    }
+
+    // --- #1373: self.version / inline-alias guard ---
+
+    #[test]
+    fn test_requirement_is_composer_unresolved_self_version() {
+        assert!(requirement_is_composer_unresolved("self.version"));
+        assert!(requirement_is_composer_unresolved("  self.version  "));
+    }
+
+    #[test]
+    fn test_requirement_is_composer_unresolved_inline_alias() {
+        assert!(requirement_is_composer_unresolved("dev-main as 1.0.0"));
+        assert!(requirement_is_composer_unresolved("1.0.x-dev as 1.0.0"));
+        assert!(requirement_is_composer_unresolved("^1.0 as 2.0"));
+    }
+
+    /// #1374 impl-critic M2: an unexpanded `$VAR`/`${VAR}` external-templating placeholder,
+    /// anywhere in the requirement text, must be caught the same way npm/Cargo/Dart's own
+    /// `requirement_contains_dollar_placeholder`-based guards catch it.
+    #[test]
+    fn test_requirement_is_composer_unresolved_dollar_placeholder() {
+        assert!(requirement_is_composer_unresolved("${PSR_LOG}"));
+        assert!(requirement_is_composer_unresolved("$PSR_LOG"));
+        assert!(requirement_is_composer_unresolved("^1.0.0-$BUILD"));
+    }
+
+    /// A hyphenated branch/package token containing `as` with no surrounding whitespace
+    /// must not false-positive against the inline-alias substring check.
+    #[test]
+    fn test_requirement_is_composer_unresolved_false_for_ordinary_requirements() {
+        assert!(!requirement_is_composer_unresolved("^1.2"));
+        assert!(!requirement_is_composer_unresolved("dev-feature-as-x"));
+        assert!(!requirement_is_composer_unresolved("dev-master"));
+        assert!(!requirement_is_composer_unresolved(""));
+    }
+
+    #[test]
+    fn test_requirement_is_unresolved_trait_matches_free_function() {
+        let f = ComposerFormatter;
+        assert!(f.requirement_is_unresolved(&VersionReq::new("self.version")));
+        assert!(f.requirement_is_unresolved(&VersionReq::new("dev-main as 1.0.0")));
+        assert!(f.requirement_is_unresolved(&VersionReq::new("${PSR_LOG}")));
+        assert!(!f.requirement_is_unresolved(&VersionReq::new("^1.2")));
+    }
+
+    #[test]
+    fn test_format_version_replacing_self_version_unchanged() {
+        let f = ComposerFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("3.12.0"), "self.version"),
+            "self.version"
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_inline_alias_unchanged() {
+        let f = ComposerFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.0.0"), "dev-main as 1.0.0"),
+            "dev-main as 1.0.0"
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_dollar_placeholder_unchanged() {
+        let f = ComposerFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("3.0.2"), "${PSR_LOG}"),
+            "${PSR_LOG}"
+        );
+    }
+
+    /// Positive control: an ordinary, resolved requirement must still be rewritten — the
+    /// guard must not over-broadly suppress legitimate fixes.
+    #[test]
+    fn test_format_version_replacing_resolved_requirement_still_rewritten() {
+        let f = ComposerFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "^1.0"),
+            "1.2.0"
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_self_version_returns_none() {
+        let f = ComposerFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("self.version"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_inline_alias_returns_none() {
+        let f = ComposerFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("dev-main as 1.0.0"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_compile_requirement_dollar_placeholder_returns_none() {
+        let f = ComposerFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("${PSR_LOG}"))
+                .is_none()
+        );
+    }
+
+    /// #1373: `self.version` must never be reported as an unsatisfiable requirement — it
+    /// is resolved entirely by Composer's own installer, not by any published version.
+    #[test]
+    fn test_requirement_is_unsatisfiable_self_version_suppressed() {
+        use deps_core::lsp_helpers::requirement_is_unsatisfiable;
+        let f = ComposerFormatter;
+        let available = vec![ConcreteVersion::new("1.0.0"), ConcreteVersion::new("2.0.0")];
+        assert!(!requirement_is_unsatisfiable(
+            &f,
+            &VersionReq::new("self.version"),
+            &available
+        ));
+    }
+
+    #[test]
+    fn test_requirement_is_unsatisfiable_inline_alias_suppressed() {
+        use deps_core::lsp_helpers::requirement_is_unsatisfiable;
+        let f = ComposerFormatter;
+        let available = vec![ConcreteVersion::new("1.0.0"), ConcreteVersion::new("2.0.0")];
+        assert!(!requirement_is_unsatisfiable(
+            &f,
+            &VersionReq::new("dev-main as 1.0.0"),
+            &available
+        ));
+    }
+
+    #[test]
+    fn test_requirement_is_unsatisfiable_dollar_placeholder_suppressed() {
+        use deps_core::lsp_helpers::requirement_is_unsatisfiable;
+        let f = ComposerFormatter;
+        let available = vec![ConcreteVersion::new("1.0.0"), ConcreteVersion::new("2.0.0")];
+        assert!(!requirement_is_unsatisfiable(
+            &f,
+            &VersionReq::new("${PSR_LOG}"),
+            &available
+        ));
+    }
+
+    fn vuln_fix_dv(fixed_version: &str) -> deps_core::osv::DependencyVulnerabilities {
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use std::sync::Arc;
+
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-0000-0000-0000".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec![fixed_version.to_string()]),
+        );
+        DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
+            UpgradeStatus::CandidateClean {
+                version: fixed_version.to_string(),
+            },
+        )
+    }
+
+    /// #1373 end-to-end regression: `plan_vulnerability_fix` must never rewrite
+    /// `self.version` to a literal fix version. `compile_requirement` now returns `None`
+    /// for it (undecidable), so the `RequirementAlreadyResolves` gate is inert here —
+    /// `format_version_replacing`'s own no-op guard is what actually stops the rewrite,
+    /// hence `NoOpRewrite`.
+    #[test]
+    fn test_plan_vulnerability_fix_self_version_is_not_rewritten() {
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 33));
+        let dep = ComposerDependency {
+            name: "monolog/monolog".into(),
+            name_range: Range::default(),
+            version_req: Some("self.version".into()),
+            version_range: Some(version_range),
+            section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("3.12.0");
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "self.version", &dv, &ComposerFormatter),
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            "self.version must never be overwritten with a literal fix version"
+        );
+    }
+
+    /// #1373 end-to-end regression: `plan_vulnerability_fix` must never rewrite an inline
+    /// alias to a literal fix version.
+    #[test]
+    fn test_plan_vulnerability_fix_inline_alias_is_not_rewritten() {
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 38));
+        let dep = ComposerDependency {
+            name: "symfony/console".into(),
+            name_range: Range::default(),
+            version_req: Some("dev-main as 1.0.0".into()),
+            version_range: Some(version_range),
+            section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("1.0.0");
+        assert_eq!(
+            plan_vulnerability_fix(
+                &dep,
+                version_range,
+                "dev-main as 1.0.0",
+                &dv,
+                &ComposerFormatter
+            ),
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            "an inline alias must never be overwritten with a literal fix version"
+        );
+    }
+
+    /// #1374 impl-critic M2 end-to-end regression: `plan_vulnerability_fix` must never
+    /// rewrite an unexpanded `${VAR}` external-templating placeholder to a literal fix
+    /// version — this is the exact shape `deps-cli update --dry-run` was observed live
+    /// rewriting (`"psr/log": "${PSR_LOG}"` -> `"psr/log": "3.0.2"`) before this guard.
+    #[test]
+    fn test_plan_vulnerability_fix_dollar_placeholder_is_not_rewritten() {
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 30));
+        let dep = ComposerDependency {
+            name: "psr/log".into(),
+            name_range: Range::default(),
+            version_req: Some("${PSR_LOG}".into()),
+            version_range: Some(version_range),
+            section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("3.0.2");
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "${PSR_LOG}", &dv, &ComposerFormatter),
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            "an unexpanded ${{VAR}} placeholder must never be overwritten with a literal fix \
+             version"
+        );
+    }
+
+    /// Positive control: a resolved, well-formed requirement on the same dependency shape
+    /// must still be rewritten. Uses an exact pin (not a `^`/`~` range) so the fix target
+    /// does not already satisfy `current` — otherwise `requirement_already_resolves_to`
+    /// would itself skip the edit as unnecessary, for an unrelated reason.
+    #[test]
+    fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 25));
+        let dep = ComposerDependency {
+            name: "guzzlehttp/guzzle".into(),
+            name_range: Range::default(),
+            version_req: Some("6.0.0".into()),
+            version_range: Some(version_range),
+            section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("6.5.0");
+        let planned = plan_vulnerability_fix(&dep, version_range, "6.0.0", &dv, &ComposerFormatter)
+            .expect("a resolved requirement must still be rewritten to the fix version");
+        assert_eq!(planned.edit.new_text, "6.5.0");
     }
 
     // --- #205 package-level deprecation ---

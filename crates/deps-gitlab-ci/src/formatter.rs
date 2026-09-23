@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementResolution, RequirementStatus, SourcePolicy, match_v_prefix_style,
-    warn_rejected_value,
+    requirement_contains_dollar_placeholder, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -272,7 +272,10 @@ impl RequirementResolution for GitlabCiFormatter {
 /// The length of the maximal `[a-zA-Z_][a-zA-Z0-9_]*`-shaped identifier starting at
 /// `start` in `bytes` — GitLab's own variable-name grammar (`lib/expand_variables.rb`'s
 /// `/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/`) — or `None` if `bytes[start]` does not
-/// start one.
+/// start one. Only the `%VAR%` scan in [`contains_unresolved_gitlab_variable`] still needs
+/// this directly; the `$VAR`/`${VAR}` forms are delegated to
+/// [`deps_core::lsp_helpers::requirement_contains_dollar_placeholder`] (#1374), which shares
+/// this identifier grammar via its own private copy.
 fn identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
     let first = *bytes.get(start)?;
     if !(first.is_ascii_alphabetic() || first == b'_') {
@@ -310,15 +313,18 @@ fn identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// (both currently classify as `PinStyle::Branch`). Mirrors `deps_bundler`'s
 /// `requirement_contains_unresolved_interpolation` and `deps_swift`'s equivalent guard
 /// (#1354/#1367).
+///
+/// #1374 (cross-ecosystem consistency, `CLAUDE.md`): the `$VAR`/`${VAR}` cases delegate to
+/// [`deps_core::lsp_helpers::requirement_contains_dollar_placeholder`], the shared predicate
+/// npm/Cargo/Dart/PyPI's equivalent guards also use — only the GitLab-specific `%VAR%` form
+/// stays local to this crate.
 fn contains_unresolved_gitlab_variable(text: &str) -> bool {
+    if requirement_contains_dollar_placeholder(text) {
+        return true;
+    }
     let bytes = text.as_bytes();
-    bytes.iter().enumerate().any(|(i, &b)| match b {
-        b'$' => match bytes.get(i + 1) {
-            Some(b'{') => identifier_end(bytes, i + 2).is_some(),
-            _ => identifier_end(bytes, i + 1).is_some(),
-        },
-        b'%' => identifier_end(bytes, i + 1).is_some_and(|end| bytes.get(end) == Some(&b'%')),
-        _ => false,
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'%' && identifier_end(bytes, i + 1).is_some_and(|end| bytes.get(end) == Some(&b'%'))
     })
 }
 

@@ -1,6 +1,7 @@
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy,
+    requirement_contains_dollar_placeholder,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
@@ -101,6 +102,22 @@ impl PackageRendering for CargoFormatter {
         crate::registry::crate_url(name.as_str())
     }
 
+    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
+    /// (see `requirement_contains_dollar_placeholder`) in `current` leaves `current`
+    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
+    /// latest" edit can never hardcode a literal version over a `Cargo.toml` version
+    /// requirement pre-processed by `envsubst`/CI templating — mirrors
+    /// `MavenFormatter`/`GradleFormatter`/`NuGetFormatter`'s identical-shaped
+    /// `${property}`/`$(Property)` guards, all on this same non-`dep`-aware hook (Cargo has no
+    /// dependency-identity-dependent rewrite logic, unlike `GitlabCiFormatter`/
+    /// `BundlerFormatter`, which override `format_version_replacing_for` instead).
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_contains_dollar_placeholder(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
     /// Suppresses the hover heading's crates.io link for any source other than plain
     /// [`DependencySource::Registry`] or a verified crates.io mirror (spec FR-014, F2) — a
     /// genuinely different `AlternateRegistry` resolves against a different index entirely,
@@ -119,11 +136,22 @@ impl RequirementResolution for CargoFormatter {
     /// unlike the default `version_satisfies_requirement` heuristic this method
     /// deliberately does not reuse (see that method's docs).
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        if self.requirement_is_unresolved(requirement) {
+            return None;
+        }
         requirement
             .as_str()
             .parse::<semver::VersionReq>()
             .ok()
             .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+    }
+
+    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
+    /// — see `requirement_contains_dollar_placeholder`. `Cargo.toml`'s own TOML grammar has
+    /// no such syntax; this only fires for a value pre-processed (and left unexpanded) by
+    /// tooling outside Cargo, e.g. `envsubst`.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_dollar_placeholder(requirement.as_str())
     }
 }
 

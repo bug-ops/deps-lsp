@@ -230,11 +230,19 @@ mod tests {
         non_registry_fixture: "pubspec.yaml" => "name: my_app\ndependencies:\n  local_pkg:\n    path: ../local_pkg\n";
     }
 
-    // #1354 security audit: `pubspec.yaml`'s version-constraint grammar has no
-    // placeholder/environment-variable interpolation syntax for a version requirement string.
+    // #1374: `pubspec.yaml`'s own version-constraint grammar has no placeholder/environment-
+    // variable interpolation syntax, but a manifest pre-processed by external templating
+    // (`envsubst`, CI templating) commonly leaves a `$VAR`/`${VAR}`-shaped literal in the
+    // version slot; the YAML parser has no way to distinguish that from an ordinary string,
+    // so it stays a normal `Some(version_requirement)` and reaches
+    // `plan_vulnerability_fix`/`format_version_replacing_for` directly — depends on
+    // `DartFormatter`'s own `requirement_contains_dollar_placeholder` guard.
     deps_core::unresolved_requirement_conformance! {
         mod dart_unresolved_requirement_conformance;
-        no_placeholder_syntax: "pubspec.yaml version constraints are plain YAML strings with no placeholder/variable interpolation grammar (#1354)";
+        build: DartEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: "pubspec.yaml" =>
+            "name: my_app\ndependencies:\n  http: ${HTTP_VERSION}\n";
     }
 
     // #758: the shared completion-prefix-length guard
