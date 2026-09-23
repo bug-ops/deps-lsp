@@ -188,8 +188,8 @@ where
 /// any client-supplied manifest/document URI to a real filesystem path before touching disk —
 /// not limited to lock file discovery despite living in this module. Shared by
 /// [`locate_lockfile_for_manifest`] and every ecosystem-local lock file locator that needs the
-/// same manifest-path resolution (e.g. `deps-nuget`'s multi-project fallback), as well as
-/// non-lock-file call sites across `deps-cargo`, `deps-nuget`, `deps-pypi`, `deps-npm`,
+/// same manifest-path resolution, as well as non-lock-file call sites across `deps-cargo`,
+/// `deps-nuget`, `deps-pypi`, `deps-npm`,
 /// `deps-gradle`, and `deps-lsp` (workspace-root and config discovery, document links,
 /// cold-start document loading, and watched-file-change handling) that resolve the same kind
 /// of URI for the same reason (#1090) — so the guard is defined once, not re-derived per call
@@ -241,7 +241,12 @@ pub fn resolve_manifest_file_path(manifest_uri: &Url) -> Option<PathBuf> {
 /// # Arguments
 ///
 /// * `manifest_uri` - URI of the manifest file
-/// * `lockfile_names` - List of possible lock file names to search for
+/// * `lockfile_names` - List of possible lock file names to search for, checked in the given
+///   order within each directory before moving up to its parent. A caller with more than one
+///   valid name for the same manifest should pass all of them in one call rather than
+///   searching separately — that makes the *nearest* directory win regardless of which name
+///   matches there, instead of an ancestor's unrelated file shadowing a closer, more specific
+///   one.
 ///
 /// # Returns
 ///
