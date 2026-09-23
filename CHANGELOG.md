@@ -37,8 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-nuget**: an ancestor directory's `packages.lock.json` no longer shadows a nested project's own `packages.<Project>.lock.json` one directory closer (resolves #1351) (#1356)
-- **deps-core, deps-engine, deps-cli**: `plan_vulnerability_fix` now returns a typed reason instead of collapsing every failure into `None` (resolves #1350)
-- **deps-cli**: `Outcome::Applied` now carries its edit directly, preventing a state where success is reported without writing (resolves #1349)
+- **deps-core, deps-engine, deps-cli**: `plan_vulnerability_fix` now returns a typed reason instead of collapsing every failure into `None` (resolves #1350) (#1361)
+- **deps-cli**: `Outcome::Applied` now carries its edit directly, preventing a state where success is reported without writing (resolves #1349) (#1361)
 - **deps-core, deps-lsp**: the vulnerability-fix code action no longer offers a manifest rewrite when the declared requirement already resolves forward to the recommended fix version under the ecosystem's own resolution rules, matching `deps-cli update --security-only`'s existing `RequiresLockfileUpdate` classification (resolves #1344) (#1346)
 - **deps-nuget**: a bare/minimum-floor `Version="1.0.0"` requirement no longer suppresses its own vulnerability-fix rewrite — NuGet resolves such a floor to its lowest satisfying version, not forward to the fix, unlike an auto-following range (resolves #1344) (#1346)
 - **deps-cli**: `update --security-only` now reports a requirement-admitting-fix-but-yanked dependency as `Unfixable(Yanked)` instead of `RequiresLockfileUpdate`, since a yanked fix target is never actually selected by re-resolving regardless of what the requirement admits (resolves #1344) (#1346)
@@ -62,8 +62,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-nuget**: added a regression test proving `own_auth_id` actually separates `HttpCache` entries between distinct credentials against the same feed URL, closing a coverage gap where the invariant was untested (resolves #1026) (#1331)
 
 ### Breaking
-- **deps-core**: `edit::plan_vulnerability_fix` returns `Result<PlannedUpdate, VulnFixSkip>` instead of `Option<PlannedUpdate>`; `edit::fix_target_is_verified` is `pub(crate)` again (part of #1350)
-- **deps-cli**: `update::Outcome::Applied` is now a tuple variant carrying `ManifestEdit`; `update::PlannedUpdateItem` no longer has a separate `edit` field (part of #1349)
+- **deps-core**: `edit::plan_vulnerability_fix` returns `Result<PlannedUpdate, VulnFixSkip>` instead of `Option<PlannedUpdate>`; `edit::fix_target_is_verified` is `pub(crate)` again (part of #1350) (#1361)
+- **deps-cli**: `update::Outcome::Applied` is now a tuple variant carrying `ManifestEdit`; `update::PlannedUpdateItem` no longer has a separate `edit` field (part of #1349) (#1361)
 - **deps-core**: `Ecosystem::generate_hover` and `lsp_helpers::generate_hover` now return the protocol-agnostic `deps_core::hover::Hover` instead of `tower_lsp_server::ls_types::Hover` (resolves #1277) (#1309)
 - **deps-cli**: `WalkOutcome`'s `manifests`/`walk_errors`/`unrecognized_explicit_paths`/`ignored_manifests`/`broken_manifest_symlinks` fields are private now, read via new `manifests()`/`walk_errors()`/`unrecognized_explicit_paths()`/`ignored_manifests()`/`broken_manifest_symlinks()` accessors (resolves #1305) (#1312)
 - **deps-core**: `osv::Advisory::url` is private now, read via a new `url()` getter; `Advisory::new` returns `Option<Self>` and no longer takes a `url` parameter (resolves #1271) (#1298)
