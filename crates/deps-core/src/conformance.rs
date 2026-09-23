@@ -876,10 +876,24 @@ pub async fn assert_unresolved_requirements_never_rewritten(
                 &dv,
                 formatter,
             );
+            // Only these two `VulnFixSkip` variants prove the unresolved-placeholder guard
+            // itself did its job — `RequirementAlreadyResolves` is the gate short-circuiting
+            // (the "coincidentally safe" case), `NoOpRewrite` is the formatter's own
+            // `format_version_replacing`/`format_version_replacing_for` guard firing (the
+            // "independently safe" case this macro primarily exists to catch). The other three
+            // variants (`NoRecommendedFix`, `UnsafeVersion`, `UnverifiedTarget`) would mean
+            // this fixture's synthetic `dv`/target setup is broken, not that the placeholder
+            // guard fired — accepting any `Err(_)` here would let a malformed fixture pass
+            // vacuously for the wrong reason.
             assert!(
-                planned.is_none(),
-                "plan_vulnerability_fix must return None for unresolved requirement {current:?} \
-                 (dependency {:?}) targeting {target}, got {planned:?}",
+                matches!(
+                    planned,
+                    Err(crate::edit::VulnFixSkip::RequirementAlreadyResolves
+                        | crate::edit::VulnFixSkip::NoOpRewrite)
+                ),
+                "plan_vulnerability_fix must skip an unresolved requirement {current:?} \
+                 (dependency {:?}) targeting {target} via RequirementAlreadyResolves or \
+                 NoOpRewrite, got {planned:?}",
                 dep.name().as_str()
             );
 

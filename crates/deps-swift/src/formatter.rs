@@ -724,7 +724,7 @@ mod tests {
     /// `format_version_replacing_for` only echoes `current` back unchanged (not the narrower
     /// literal) would pass this test despite still corrupting the manifest on the real path.
     #[test]
-    fn test_plan_vulnerability_fix_unresolved_interpolation_returns_none() {
+    fn test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite() {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
@@ -765,9 +765,16 @@ mod tests {
             &SwiftFormatter,
         );
 
-        assert!(
-            planned.is_none(),
-            "the real SwiftFormatter must suppress the fix for an unresolved interpolation"
+        // `NoOpRewrite`, not `RequirementAlreadyResolves`: `compile_requirement` is `None`
+        // here (undecidable, guarded by `requirement_is_unresolved`), so
+        // `requirement_already_resolves_to`'s default gate never short-circuits — it's
+        // `format_version_replacing_for`'s S1 override, reproducing `version_literal`
+        // unchanged, that makes the planner's textual no-op check fire.
+        assert_eq!(
+            planned,
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            "the real SwiftFormatter must suppress the fix for an unresolved interpolation via \
+             NoOpRewrite, got {planned:?}"
         );
     }
 }

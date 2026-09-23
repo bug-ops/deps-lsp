@@ -716,7 +716,7 @@ mod tests {
     /// `version_requirement: None` — this scenario is reachable through the real
     /// `generate_code_actions`/`deps-cli` call graph, not defense-in-depth only.
     #[test]
-    fn test_plan_vulnerability_fix_unresolved_interpolation_returns_none() {
+    fn test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite() {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
@@ -756,9 +756,15 @@ mod tests {
             &BundlerFormatter,
         );
 
-        assert!(
-            planned.is_none(),
-            "the real BundlerFormatter must suppress the fix for an unresolved interpolation"
+        // `NoOpRewrite`, not `RequirementAlreadyResolves`: `compile_requirement` is `None`
+        // here (undecidable), so `requirement_already_resolves_to`'s default gate never
+        // short-circuits — it's `format_version_replacing`'s own `#{`-guard, echoing `current`
+        // back unchanged, that makes the planner's textual no-op check fire.
+        assert_eq!(
+            planned,
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            "the real BundlerFormatter must suppress the fix for an unresolved interpolation \
+             via NoOpRewrite, got {planned:?}"
         );
     }
 }
