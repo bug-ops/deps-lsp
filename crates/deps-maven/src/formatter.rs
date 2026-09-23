@@ -152,6 +152,21 @@ impl PackageRendering for MavenFormatter {
         version.to_string()
     }
 
+    /// Issue #1353 hardening: an unresolved `${property}` in `current` leaves `current`
+    /// unchanged instead of substituting `version`, so a vulnerability-fix/update rewrite can
+    /// never hardcode a literal version over a centrally-managed property — mirrors
+    /// `deps-nuget`'s `$(...)`-property no-op guard (#1347/#1352). This is the guard that
+    /// closes the gap the default `requirement_already_resolves_to`/`compile_requirement`
+    /// pairing misses for a requirement that is *both* unresolved and an undecidable
+    /// malformed range (e.g. `[1.0,${hi}`), since `compile_requirement` returns `None` for
+    /// that shape rather than `MavenMatcher::AlwaysSatisfied`.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if is_unresolved(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -476,5 +491,184 @@ mod tests {
             matcher.matches(&ConcreteVersion::new("1.0-1-3")),
             Some(false)
         );
+    }
+
+    /// #1353: an unresolved `${property}` must be classified as unresolved directly (not
+    /// just observed as a side effect of `requirement_status`) — the same predicate
+    /// `requirement_status`, `requirement_is_unsatisfiable`, and `format_version_replacing`
+    /// all key off. Mirrors `deps-nuget`'s equivalent `$(...)`-property test.
+    #[test]
+    fn test_requirement_is_unresolved_property_placeholder() {
+        let f = MavenFormatter;
+        assert!(f.requirement_is_unresolved(&VersionReq::new("${ver}")));
+        assert!(f.requirement_is_unresolved(&VersionReq::new("${project.version}")));
+    }
+
+    /// #1353 counterpart: an ordinary requirement must never be misclassified as unresolved.
+    #[test]
+    fn test_requirement_is_unresolved_false_for_ordinary_requirements() {
+        let f = MavenFormatter;
+        assert!(!f.requirement_is_unresolved(&VersionReq::new("3.14.0")));
+        assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
+    }
+
+    /// #1353: `format_version_replacing` must leave an unresolved `${property}` unchanged
+    /// rather than substituting the fix/latest version — mirrors `deps-nuget`'s
+    /// `$(...)`-property no-op guard (#1347/#1352). This is what actually closes the gap
+    /// the default `requirement_already_resolves_to`/`compile_requirement` pairing misses
+    /// for a requirement that is *both* unresolved and an undecidable malformed range (see
+    /// the malformed-range test below) — `compile_requirement` returns `None` for that
+    /// shape, not `MavenMatcher::AlwaysSatisfied`, making the pairing inert.
+    #[test]
+    fn test_format_version_replacing_unresolved_property_is_unchanged() {
+        let f = MavenFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "${ver}"),
+            "${ver}"
+        );
+    }
+
+    /// #1353 S1: `[1.0,${hi}` is classified unresolved (`is_unresolved` matches `${`), but
+    /// it is *also* a malformed range — `is_range` is true and `crate::range::parse_range`
+    /// fails on it, so `compile_requirement`'s malformed-range guard returns `None` (not
+    /// `MavenMatcher::AlwaysSatisfied`), making the default `requirement_already_resolves_to`
+    /// inert. `format_version_replacing`'s direct `is_unresolved` check is what actually
+    /// closes this gap.
+    #[test]
+    fn test_format_version_replacing_unresolved_malformed_range_is_unchanged() {
+        let f = MavenFormatter;
+        assert!(
+            f.compile_requirement(&VersionReq::new("[1.0,${hi}"))
+                .is_none(),
+            "expected the malformed range to be undecidable"
+        );
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "[1.0,${hi}"),
+            "[1.0,${hi}"
+        );
+    }
+
+    /// Positive control for the two tests above: a resolved, well-formed requirement must
+    /// still be rewritten — the guard must not over-broadly suppress legitimate fixes.
+    #[test]
+    fn test_format_version_replacing_resolved_requirement_still_rewritten() {
+        let f = MavenFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "1.0.0"),
+            "1.2.0"
+        );
+    }
+
+    fn vuln_fix_dv(fixed_version: &str) -> deps_core::osv::DependencyVulnerabilities {
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use std::sync::Arc;
+
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-0000-0000-0000".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec![fixed_version.to_string()]),
+        );
+        DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
+            UpgradeStatus::CandidateClean {
+                version: fixed_version.to_string(),
+            },
+        )
+    }
+
+    /// #1353: `plan_vulnerability_fix` must never rewrite an unresolved `${property}`
+    /// placeholder to a literal fix version. `compile_requirement` classifies `${ver}` as
+    /// `AlwaysSatisfied` (matches every candidate), so the shared `requirement_already_resolves_to`
+    /// default already refuses the edit before `format_version_replacing_for` is ever
+    /// reached for this particular (non-malformed) shape — this end-to-end test is the
+    /// regression guard for that interaction.
+    #[test]
+    fn test_plan_vulnerability_fix_unresolved_property_is_not_rewritten() {
+        use crate::types::{MavenDependency, MavenScope};
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 27));
+        let dep = MavenDependency {
+            group_id: "com.example".into(),
+            artifact_id: "some-lib".into(),
+            name: PackageName::new("com.example:some-lib"),
+            name_range: Range::default(),
+            version_req: Some(VersionReq::new("${ver}")),
+            version_range: Some(version_range),
+            scope: MavenScope::Compile,
+            source: DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("1.2.0");
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "${ver}", &dv, &MavenFormatter),
+            Err(deps_core::edit::VulnFixSkip::RequirementAlreadyResolves),
+            "an unresolved property placeholder must never be overwritten with a literal fix version"
+        );
+    }
+
+    /// #1353 S1 end-to-end regression: `[1.0,${hi}` is unresolved but also an undecidable
+    /// malformed range, so the default `requirement_already_resolves_to` is inert for it —
+    /// `format_version_replacing`'s no-op guard (see the unit-level test above) is what
+    /// actually stops `plan_vulnerability_fix` from rewriting it.
+    #[test]
+    fn test_plan_vulnerability_fix_unresolved_malformed_range_is_not_rewritten() {
+        use crate::types::{MavenDependency, MavenScope};
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 30));
+        let dep = MavenDependency {
+            group_id: "com.example".into(),
+            artifact_id: "some-lib".into(),
+            name: PackageName::new("com.example:some-lib"),
+            name_range: Range::default(),
+            version_req: Some(VersionReq::new("[1.0,${hi}")),
+            version_range: Some(version_range),
+            scope: MavenScope::Compile,
+            source: DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("1.2.0");
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "[1.0,${hi}", &dv, &MavenFormatter),
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            "an unresolved malformed-range placeholder must never be overwritten with a literal fix version"
+        );
+    }
+
+    /// Positive control for the two `plan_vulnerability_fix` tests above: a resolved,
+    /// well-formed requirement on the same dependency shape must still be rewritten.
+    #[test]
+    fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {
+        use crate::types::{MavenDependency, MavenScope};
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 26));
+        let dep = MavenDependency {
+            group_id: "com.example".into(),
+            artifact_id: "some-lib".into(),
+            name: PackageName::new("com.example:some-lib"),
+            name_range: Range::default(),
+            version_req: Some(VersionReq::new("1.0.0")),
+            version_range: Some(version_range),
+            scope: MavenScope::Compile,
+            source: DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("1.2.0");
+        let planned = plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, &MavenFormatter)
+            .expect("a resolved requirement must still be rewritten to the fix version");
+        assert_eq!(planned.edit.new_text, "1.2.0");
     }
 }

@@ -191,9 +191,22 @@ impl PackageRendering for GradleFormatter {
     /// un-trimmed-catalog-value reason as `strip_strict_marker` above. A no-op
     /// return here is safely excluded from `deps-core`'s `collect_update_all_edits`
     /// ("Update N outdated dependencies" lens) by its own no-op guard.
+    ///
+    /// Issue #1353 hardening: an unresolved `$var`/`${var}` reference anywhere in
+    /// `current` (checked before the strict-marker handling above, so it also catches an
+    /// unresolved half of the `!!` shorthand, e.g. `${r}!!`) leaves `current` unchanged
+    /// instead of substituting `version` — mirrors `MavenFormatter`'s identical guard and
+    /// `deps-nuget`'s `$(...)`-property one (#1347/#1352). Closes the gap the default
+    /// `requirement_already_resolves_to`/`compile_requirement` pairing misses for a
+    /// requirement that is *both* unresolved and an undecidable malformed range (e.g.
+    /// `[1.0,$hi`), since `compile_requirement` returns `None` for that shape rather than
+    /// `GradleMatcher::AlwaysSatisfied`.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        let version = version.as_str();
         let trimmed = current.trim();
+        if is_unresolved(trimmed) {
+            return current.to_string();
+        }
+        let version = version.as_str();
         match trimmed.split_once("!!") {
             Some((_, "")) => format!("{version}!!"),
             Some(_) => trimmed.to_string(),
@@ -683,5 +696,231 @@ mod tests {
             .expect("strict range must still compile a matcher");
         assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
         assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
+    }
+
+    /// #1353: mirrors `deps-maven`'s equivalent test — an unresolved `$var`/`${var}`
+    /// reference must be classified as unresolved directly, the predicate
+    /// `requirement_status`, `requirement_is_unsatisfiable`, and (via `compile_requirement`)
+    /// `requirement_already_resolves_to` all key off.
+    #[test]
+    fn test_requirement_is_unresolved_variable_reference() {
+        let f = GradleFormatter;
+        assert!(f.requirement_is_unresolved(&VersionReq::new("$someVersion")));
+        assert!(f.requirement_is_unresolved(&VersionReq::new("${someVersion}")));
+    }
+
+    /// #1353 counterpart: an ordinary requirement must never be misclassified as unresolved.
+    #[test]
+    fn test_requirement_is_unresolved_false_for_ordinary_requirements() {
+        let f = GradleFormatter;
+        assert!(!f.requirement_is_unresolved(&VersionReq::new("3.2.0")));
+        assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
+    }
+
+    /// #1353: `format_version_replacing` must leave an unresolved `$var`/`${var}` reference
+    /// unchanged rather than substituting the fix/latest version — the guard mirrors
+    /// `MavenFormatter`'s and `deps-nuget`'s `$(...)`-property one (#1347/#1352). Covers both
+    /// a plain reference and one embedded in the strict-shorthand's degenerate suffix form
+    /// (`${r}!!`), which the pre-existing `!!`-handling logic alone would otherwise rewrite
+    /// to `{version}!!`, silently dropping the property reference.
+    #[test]
+    fn test_format_version_replacing_unresolved_variable_is_unchanged() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "$someVersion"),
+            "$someVersion"
+        );
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "${someVersion}"),
+            "${someVersion}"
+        );
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "${r}!!"),
+            "${r}!!"
+        );
+    }
+
+    /// #1353 S1: `[1.0,$hi` and `[$lo,` are classified unresolved (`is_unresolved` matches
+    /// `$`), but both are *also* malformed ranges — `compile_requirement`'s malformed-range
+    /// guard returns `None` for them (not `GradleMatcher::AlwaysSatisfied`), making the
+    /// default `requirement_already_resolves_to` inert. `format_version_replacing`'s direct
+    /// `is_unresolved` check is what actually closes this gap.
+    #[test]
+    fn test_format_version_replacing_unresolved_malformed_range_is_unchanged() {
+        let f = GradleFormatter;
+        for malformed_unresolved in ["[1.0,$hi", "[$lo,"] {
+            assert!(
+                f.compile_requirement(&VersionReq::new(malformed_unresolved))
+                    .is_none(),
+                "expected {malformed_unresolved:?} to be undecidable"
+            );
+            assert_eq!(
+                f.format_version_replacing(&ConcreteVersion::new("1.2.0"), malformed_unresolved),
+                malformed_unresolved
+            );
+        }
+    }
+
+    /// Positive control for the two tests above: a resolved, well-formed requirement must
+    /// still be rewritten — the guard must not over-broadly suppress legitimate fixes.
+    #[test]
+    fn test_format_version_replacing_resolved_requirement_still_rewritten() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "1.0.0"),
+            "1.2.0"
+        );
+    }
+
+    /// #1353: Gradle's parser preserves an undefined `$var`/`${var}` reference as literal
+    /// text in `version_req` (see `deps-gradle`'s `parser::resolve_variable_ref`,
+    /// `test_resolve_variables_not_found_keeps_raw`) exactly like Maven's `${property}` —
+    /// so `plan_vulnerability_fix` must never rewrite it to a literal fix version either.
+    /// `compile_requirement` classifies it `AlwaysSatisfied`, so the shared
+    /// `requirement_already_resolves_to` default already refuses the edit before
+    /// `format_version_replacing_for` is ever reached for this particular (non-malformed)
+    /// shape — this end-to-end test is the regression guard for that interaction.
+    #[test]
+    fn test_plan_vulnerability_fix_unresolved_variable_is_not_rewritten() {
+        use crate::types::GradleDependency;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+        use std::sync::Arc;
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 32));
+        let dep = GradleDependency {
+            group_id: "com.example".into(),
+            artifact_id: "some-lib".into(),
+            name: PackageName::new("com.example:some-lib"),
+            name_range: Range::default(),
+            version_req: Some(VersionReq::new("$unknownVar")),
+            version_range: Some(version_range),
+            configuration: "implementation".into(),
+            source: DependencySource::Registry,
+        };
+
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-0000-0000-0000".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["1.2.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "1.2.0".to_string(),
+            });
+
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "$unknownVar", &dv, &GradleFormatter),
+            Err(deps_core::edit::VulnFixSkip::RequirementAlreadyResolves),
+            "an unresolved variable reference must never be overwritten with a literal fix version"
+        );
+    }
+
+    fn vuln_fix_dv(fixed_version: &str) -> deps_core::osv::DependencyVulnerabilities {
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use std::sync::Arc;
+
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-0000-0000-0000".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec![fixed_version.to_string()]),
+        );
+        DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
+            UpgradeStatus::CandidateClean {
+                version: fixed_version.to_string(),
+            },
+        )
+    }
+
+    /// #1353 S1 end-to-end regression: `[1.0,$hi` and `[$lo,` are classified unresolved
+    /// (`is_unresolved` matches `$`), but both are *also* malformed ranges, so
+    /// `compile_requirement` returns `None` (not `AlwaysSatisfied`) and the default
+    /// `requirement_already_resolves_to` is inert for them. `format_version_replacing`'s
+    /// direct `is_unresolved` no-op guard (see the unit-level test above) is what actually
+    /// stops `plan_vulnerability_fix` from rewriting them.
+    #[test]
+    fn test_plan_vulnerability_fix_unresolved_malformed_range_is_not_rewritten() {
+        use crate::types::GradleDependency;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        for malformed_unresolved in ["[1.0,$hi", "[$lo,"] {
+            let version_range = Range::new(Position::new(0, 20), Position::new(0, 30));
+            let dep = GradleDependency {
+                group_id: "com.example".into(),
+                artifact_id: "some-lib".into(),
+                name: PackageName::new("com.example:some-lib"),
+                name_range: Range::default(),
+                version_req: Some(VersionReq::new(malformed_unresolved)),
+                version_range: Some(version_range),
+                configuration: "implementation".into(),
+                source: DependencySource::Registry,
+            };
+
+            // Sanity: confirms the malformed-range guard, not the unresolved-variable
+            // branch, is what `compile_requirement` hits for this shape.
+            assert!(
+                GradleFormatter
+                    .compile_requirement(&VersionReq::new(malformed_unresolved))
+                    .is_none(),
+                "expected {malformed_unresolved:?} to be undecidable"
+            );
+
+            let dv = vuln_fix_dv("1.2.0");
+            assert_eq!(
+                plan_vulnerability_fix(
+                    &dep,
+                    version_range,
+                    malformed_unresolved,
+                    &dv,
+                    &GradleFormatter
+                ),
+                Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+                "{malformed_unresolved:?}: an unresolved malformed-range placeholder must never be overwritten with a literal fix version"
+            );
+        }
+    }
+
+    /// Positive control for the two tests above: a resolved, well-formed requirement on the
+    /// same dependency shape must still be rewritten — the guard must not over-broadly
+    /// suppress legitimate fixes.
+    #[test]
+    fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {
+        use crate::types::GradleDependency;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        let version_range = Range::new(Position::new(0, 20), Position::new(0, 26));
+        let dep = GradleDependency {
+            group_id: "com.example".into(),
+            artifact_id: "some-lib".into(),
+            name: PackageName::new("com.example:some-lib"),
+            name_range: Range::default(),
+            version_req: Some(VersionReq::new("1.0.0")),
+            version_range: Some(version_range),
+            configuration: "implementation".into(),
+            source: DependencySource::Registry,
+        };
+
+        let dv = vuln_fix_dv("1.2.0");
+        let planned = plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, &GradleFormatter)
+            .expect("a resolved requirement must still be rewritten to the fix version");
+        assert_eq!(planned.edit.new_text, "1.2.0");
     }
 }
