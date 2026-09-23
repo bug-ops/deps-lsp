@@ -298,9 +298,15 @@ mod tests {
             current: "1.0.0".to_string(),
             target: "1.2.0".to_string(),
             outcome,
-            edit: None,
             advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],
             ignore_rule_overridden: false,
+        }
+    }
+
+    fn applied_edit() -> deps_core::edit::ManifestEdit {
+        deps_core::edit::ManifestEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            new_text: "1.2.0".to_string(),
         }
     }
 
@@ -310,7 +316,7 @@ mod tests {
     #[test]
     fn test_update_to_document_non_empty_plan_maps_every_field() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied)],
+            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
         let document = update_to_document(&plan, true);
         assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
@@ -327,7 +333,7 @@ mod tests {
     #[test]
     fn test_render_update_non_empty_plan_round_trips_through_serde_json() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied)],
+            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
         let rendered = render_update(&plan, false).expect("render must succeed");
         let parsed: UpdateReportDocument =

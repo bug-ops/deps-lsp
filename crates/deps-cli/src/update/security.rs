@@ -5,10 +5,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use deps_core::edit::{fix_target_is_verified, plan_vulnerability_fix};
+use deps_core::Ecosystem;
+use deps_core::edit::{VulnFixSkip, plan_verified_fix, resolve_verified_fix};
 use deps_core::lsp_helpers::resolve_in_use_version;
 use deps_core::osv::{OsvClient, ScanOutcome};
-use deps_core::{Ecosystem, is_safe_version_string};
 
 use crate::analyze::ManifestAnalysis;
 use crate::update::ignore::IgnoreRules;
@@ -254,25 +254,24 @@ fn classify_vulnerable_dependency(
         );
     }
 
-    let Some(fix) = dv.recommended_fix() else {
-        return unfixable_item(
-            dep,
-            &current,
-            UnfixableReason::NoVerifiedFix,
-            ignore_rule_overridden,
-        );
+    // #1350: `resolve_verified_fix` replaces this function's own copy of the
+    // `recommended_fix -> osv_version_to_native -> is_safe_version_string ->
+    // fix_target_is_verified` chain (`fix_target_is_verified` is `pub(crate)` in `deps-core`
+    // again since this is its only remaining caller outside it). S1 fix: this must run
+    // *before* the version_requirement/version_range/yanked checks below, exactly like the
+    // pre-#1350 code did, so an unverified fix target is never misreported as
+    // `RequiresLockfileUpdate`/`Unfixable(Yanked)` instead of `Unfixable(NoVerifiedFix)`.
+    let (fix, version_native) = match resolve_verified_fix(dv, formatter) {
+        Ok(pair) => pair,
+        Err(_) => {
+            return unfixable_item(
+                dep,
+                &current,
+                UnfixableReason::NoVerifiedFix,
+                ignore_rule_overridden,
+            );
+        }
     };
-    let version_native = formatter.osv_version_to_native(&fix.version);
-    if !is_safe_version_string(&version_native)
-        || !fix_target_is_verified(dv, &fix, &version_native)
-    {
-        return unfixable_item(
-            dep,
-            &current,
-            UnfixableReason::NoVerifiedFix,
-            ignore_rule_overridden,
-        );
-    }
 
     // C1 (critic finding, FR-010): a `Vulnerable` dependency with no declared
     // `version_requirement()` at all (a Cargo workspace-inherited dependency, a git/path
@@ -319,30 +318,55 @@ fn classify_vulnerable_dependency(
         );
     }
 
-    match plan_vulnerability_fix(dep, version_range, version_req.as_str(), dv, formatter) {
-        Some(planned) => PlannedUpdateItem {
+    // #1350 code review: `plan_verified_fix`, not `plan_vulnerability_fix` — this function
+    // already resolved and verified the fix above via `resolve_verified_fix`, so calling the
+    // higher-level `plan_vulnerability_fix` here would re-run that same resolve-and-verify
+    // chain a second time per dependency for no reason.
+    match plan_verified_fix(
+        dep,
+        version_range,
+        version_req.as_str(),
+        &version_native,
+        formatter,
+    ) {
+        Ok(planned) => PlannedUpdateItem {
             name: dep.name().as_str().to_string(),
             current,
             target: version_native,
-            outcome: Outcome::Applied,
-            edit: Some(planned.edit),
+            outcome: Outcome::Applied(planned.edit),
             advisory_ids: fix.advisory_ids,
             ignore_rule_overridden,
         },
-        // #1344: `plan_vulnerability_fix` returns `None` either because the declared
-        // requirement already resolves forward to the fix target (per
-        // `requirement_already_resolves_to`, which is ecosystem-aware — see its and
+        // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
+        // forward to the fix target — see `requirement_already_resolves_to`'s and
         // `NuGetFormatter`'s doc for why this is not simply "the requirement admits the fix")
-        // or, for ecosystems with no `compile_requirement` comparator (GitHub Actions/GitLab
-        // CI), because the declared literal already spells the fix text verbatim — both read
-        // as "nothing to rewrite here." Note this runs after the FR-012 yanked filter above,
-        // so a requirement that already resolves forward but whose fix target is yanked was
-        // already reported `Unfixable(Yanked)` and never reaches this match.
-        None => requires_lockfile_update_item(
+        // and `NoOpRewrite` (no `compile_requirement` comparator, e.g. GitHub Actions/GitLab
+        // CI, and the declared literal already spells the fix text verbatim) both read as
+        // "nothing to rewrite here." Note this runs after the FR-012 yanked filter above, so a
+        // requirement that already resolves forward but whose fix target is yanked was already
+        // reported `Unfixable(Yanked)` and never reaches this match. `NoRecommendedFix`/
+        // `UnsafeVersion`/`UnverifiedTarget` are structurally unreachable here — `plan_verified_fix`
+        // only ever constructs `RequirementAlreadyResolves`/`NoOpRewrite` — but `VulnFixSkip`
+        // has 5 variants regardless of which function returns it, so this match must still
+        // handle all of them exhaustively (a future `VulnFixSkip` variant is then a compile
+        // error here, not a silently-mishandled case).
+        Err(VulnFixSkip::RequirementAlreadyResolves | VulnFixSkip::NoOpRewrite) => {
+            requires_lockfile_update_item(
+                dep,
+                &current,
+                &version_native,
+                &fix.advisory_ids,
+                ignore_rule_overridden,
+            )
+        }
+        Err(
+            VulnFixSkip::UnverifiedTarget
+            | VulnFixSkip::NoRecommendedFix
+            | VulnFixSkip::UnsafeVersion,
+        ) => unfixable_item(
             dep,
             &current,
-            &version_native,
-            &fix.advisory_ids,
+            UnfixableReason::NoVerifiedFix,
             ignore_rule_overridden,
         ),
     }
@@ -376,7 +400,6 @@ fn skipped_not_requested(
         current,
         target: String::new(),
         outcome: Outcome::Skipped(crate::update::SkipReason::NotRequested),
-        edit: None,
         advisory_ids: Vec::new(),
         ignore_rule_overridden: false,
     }
@@ -393,7 +416,6 @@ fn unfixable_item(
         current: current.to_string(),
         target: String::new(),
         outcome: Outcome::Unfixable(reason),
-        edit: None,
         advisory_ids: Vec::new(),
         ignore_rule_overridden,
     }
@@ -411,7 +433,6 @@ fn requires_lockfile_update_item(
         current: current.to_string(),
         target: target.to_string(),
         outcome: Outcome::RequiresLockfileUpdate,
-        edit: None,
         advisory_ids: advisory_ids.to_vec(),
         ignore_rule_overridden,
     }
@@ -610,7 +631,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::Applied));
+        assert!(matches!(item.outcome, Outcome::Applied(_)));
         assert_eq!(item.target, "1.0.2");
     }
 
@@ -756,7 +777,7 @@ mod tests {
         );
 
         assert!(
-            matches!(rewrite_item.outcome, Outcome::Applied),
+            matches!(rewrite_item.outcome, Outcome::Applied(_)),
             "serde's requirement (\"0.9\") does not yet admit 1.0.2, so it must be rewritten"
         );
         assert_eq!(rewrite_item.target, "1.0.2");
@@ -881,6 +902,90 @@ mod tests {
             item.outcome,
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
         ));
+    }
+
+    /// #1350 S1 regression: an unverified fix target must report `Unfixable(NoVerifiedFix)`
+    /// even when the dependency also has no declared `version_requirement()` — the
+    /// `resolve_verified_fix` check must run BEFORE the C1 no-requirement guard, exactly as
+    /// the pre-#1350 code's `fix_target_is_verified` check did, or this misreports
+    /// `RequiresLockfileUpdate` for a fix that was never actually confirmed safe.
+    #[test]
+    fn test_classify_unverified_target_with_no_version_requirement_is_unfixable_not_lockfile() {
+        let dep = MockDep {
+            name: PackageName::new("serde"),
+            version_req: None,
+            version_range: None,
+        };
+        // `fix_target_status` left at `NotChecked` — never verified.
+        let dv = deps_core::osv::DependencyVulnerabilities::new(Capped::new(
+            vec![advisory("RUSTSEC-2024-0001", "1.0.2")],
+            1,
+        ));
+        let analysis = test_analysis(cached_with("serde", "1.0.2"), HashSet::new());
+        let formatter = TestFormatter {
+            requirement_already_admits_fix: false,
+            osv_native_differs: false,
+        };
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            "serde",
+            &analysis,
+            &formatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
+            ),
+            "got {:?}",
+            item.outcome
+        );
+    }
+
+    /// #1350 S1 regression: an unverified fix target must report `Unfixable(NoVerifiedFix)`
+    /// even when its (never-verified) target version also happens to appear in the registry's
+    /// yanked list — the verification check must run BEFORE the FR-012 yanked filter, exactly
+    /// as the pre-#1350 code's combined check did.
+    #[test]
+    fn test_classify_unverified_target_and_yanked_is_unfixable_no_verified_fix_not_yanked() {
+        let dep = dep("serde", "0.9");
+        // `fix_target_status` left at `NotChecked` — never verified.
+        let dv = deps_core::osv::DependencyVulnerabilities::new(Capped::new(
+            vec![advisory("RUSTSEC-2024-0001", "1.0.2")],
+            1,
+        ));
+        let mut cached = HashMap::new();
+        cached.insert(
+            PackageName::new("serde"),
+            PackageVersions::new("1.0.2".into(), std::sync::Arc::from([])).with_yanked(
+                std::sync::Arc::from([("1.0.2".into(), RemovalStatus::from_yanked(true))]),
+            ),
+        );
+        let analysis = test_analysis(cached, HashSet::new());
+        let formatter = TestFormatter {
+            requirement_already_admits_fix: false,
+            osv_native_differs: false,
+        };
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            "serde",
+            &analysis,
+            &formatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::NoVerifiedFix)
+            ),
+            "got {:?}",
+            item.outcome
+        );
     }
 
     /// FR-012: the fix target is present in the registry's yanked list — `Unfixable`, not
@@ -1020,7 +1125,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::Applied));
+        assert!(matches!(item.outcome, Outcome::Applied(_)));
     }
 
     /// FR-008: a matching `[update].ignore` rule is reported as overridden, never suppressed.
@@ -1049,7 +1154,7 @@ mod tests {
             EcosystemId::Cargo,
             &ignore_rules,
         );
-        assert!(matches!(item.outcome, Outcome::Applied));
+        assert!(matches!(item.outcome, Outcome::Applied(_)));
         assert!(
             item.ignore_rule_overridden,
             "a matching rule must be reported as overridden, not silently applied"

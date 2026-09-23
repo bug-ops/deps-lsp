@@ -84,7 +84,8 @@ fn build_vulnerability_fix_action(
     // --security-only` (#1329) reuses the identical decision logic instead of
     // reimplementing it.
     let planned =
-        crate::edit::plan_vulnerability_fix(dep, version_range.into(), version_req, dv, formatter)?;
+        crate::edit::plan_vulnerability_fix(dep, version_range.into(), version_req, dv, formatter)
+            .ok()?;
     let version_native = planned.target.as_str().to_string();
     let new_text = planned.edit.new_text;
 

@@ -202,21 +202,41 @@ fn resolve_fix_target(
     osv_name_by_key: &HashMap<String, String>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetResolution {
-    use deps_core::lsp_helpers::is_safe_version_string;
+    use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
     use deps_core::osv::ScanTarget;
 
-    let Some(fix) = dv.recommended_fix() else {
-        return FixTargetResolution::Skip;
+    // #1350: `resolve_recommended_fix` is the shared prefix (`recommended_fix` ->
+    // `osv_version_to_native` -> `is_safe_version_string`) this function used to duplicate.
+    // Deliberately the *unverified* helper, not `resolve_verified_fix`: this function is
+    // itself the producer of `dv.fix_target_status`, so it must not gate on a status it
+    // has not computed yet.
+    let (fix, version_native) = match resolve_recommended_fix(dv, formatter) {
+        Ok(pair) => pair,
+        Err(VulnFixSkip::NoRecommendedFix) => return FixTargetResolution::Skip,
+        // `resolve_recommended_fix` already emits a WARN via `warn_rejected_value` for this
+        // case (M1: consistent with every other unsafe-value rejection gate in this codebase,
+        // not the accidental DEBUG this call site used before #1350) — this DEBUG line adds
+        // only the batch-scan `key` that generic warning doesn't carry.
+        Err(VulnFixSkip::UnsafeVersion) => {
+            tracing::debug!(
+                key,
+                "OSV #462: fix-target version failed validation, skipping verification"
+            );
+            return FixTargetResolution::Skip;
+        }
+        // `resolve_recommended_fix` can only ever return `NoRecommendedFix`/`UnsafeVersion` —
+        // these three variants exist only for `plan_vulnerability_fix`'s later,
+        // `resolve_verified_fix`-based decision. Handled explicitly rather than folded into a
+        // wildcard (code review finding) so a future `VulnFixSkip` variant, or a change that
+        // starts surfacing one of these here, is a compile error instead of silently
+        // degrading to `Skip` — the same bug class `EcosystemId`'s exhaustive-match
+        // convention exists to catch project-wide.
+        Err(
+            VulnFixSkip::UnverifiedTarget
+            | VulnFixSkip::RequirementAlreadyResolves
+            | VulnFixSkip::NoOpRewrite,
+        ) => return FixTargetResolution::Skip,
     };
-    let version_native = formatter.osv_version_to_native(&fix.version);
-    if !is_safe_version_string(&version_native) {
-        tracing::debug!(
-            key,
-            version = %fix.version,
-            "OSV #462: fix-target version failed validation, skipping verification"
-        );
-        return FixTargetResolution::Skip;
-    }
 
     if latest_native_by_key.get(key) == Some(&version_native) {
         return FixTargetResolution::Resolved(dv.upgrade_status.clone());

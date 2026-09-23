@@ -28,8 +28,10 @@ impl UpdatePlan {
     fn applied_edits(&self) -> Vec<ManifestEdit> {
         self.items
             .iter()
-            .filter(|item| matches!(item.outcome, Outcome::Applied))
-            .filter_map(|item| item.edit.clone())
+            .filter_map(|item| match &item.outcome {
+                Outcome::Applied(edit) => Some(edit.clone()),
+                _ => None,
+            })
             .collect()
     }
 }
@@ -45,11 +47,10 @@ pub struct PlannedUpdateItem {
     /// The version this item's edit (when [`Self::outcome`] is [`Outcome::Applied`]) would
     /// move the dependency to — the target considered, even when no edit was written.
     pub target: String,
-    /// This item's disposition.
+    /// This item's disposition — the edit that would apply [`Self::target`] lives inside
+    /// [`Outcome::Applied`] itself (#1349: folding it in here as a second, independently
+    /// settable field made `Applied` with no edit a representable-but-invalid state).
     pub outcome: Outcome,
-    /// The edit that would apply this item's `target`, present only when [`Self::outcome`]
-    /// is [`Outcome::Applied`].
-    pub edit: Option<ManifestEdit>,
     /// OSV advisory ids this item resolves, populated only in `--security-only` mode.
     pub advisory_ids: Vec<String>,
     /// Whether a matching `[update].ignore` rule exists but was overridden (FR-008,
@@ -60,11 +61,36 @@ pub struct PlannedUpdateItem {
 }
 
 /// A dependency's disposition within an [`UpdatePlan`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// # The invalid state this makes unrepresentable (#1349)
+///
+/// Before this type carried [`ManifestEdit`] directly, [`PlannedUpdateItem`] stored `outcome`
+/// and `edit: Option<ManifestEdit>` as two independent fields the caller had to keep in sync by
+/// convention. Nothing stopped `PlannedUpdateItem { outcome: Outcome::Applied, edit: None, .. }`
+/// — empirically, that combination made `apply_plan` report success (`Ok(())`) without writing
+/// anything. `edit` no longer exists as a separate field, so that state fails to compile:
+///
+/// ```compile_fail
+/// use deps_cli::update::{Outcome, PlannedUpdateItem};
+///
+/// let item = PlannedUpdateItem {
+///     name: "serde".to_string(),
+///     current: "1.0.0".to_string(),
+///     target: "1.2.0".to_string(),
+///     outcome: Outcome::Applied,
+///     edit: None,
+///     advisory_ids: Vec::new(),
+///     ignore_rule_overridden: false,
+/// };
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// A fix plan existed and its edit was written (or would be, under `--dry-run`).
-    /// Contributes to exit 0.
-    Applied,
+    /// Contributes to exit 0. Carries the edit itself — #1349: this makes "applied, but no
+    /// edit to write" unrepresentable, where a separate `PlannedUpdateItem::edit: Option<_>`
+    /// field previously let the two drift out of sync (`apply_plan` would report success
+    /// without writing anything).
+    Applied(ManifestEdit),
     /// Excluded from this run, for [`SkipReason`].
     Skipped(SkipReason),
     /// (`--security-only` only) The dependency is `Vulnerable`, but its declared requirement
@@ -99,8 +125,8 @@ pub enum SkipReason {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnfixableReason {
     /// No independently-verified fix target exists: no advisory has a claimable fix, the fix
-    /// target failed the safety gate, or [`deps_core::edit::fix_target_is_verified`] could
-    /// not confirm it (FR-010).
+    /// target failed the safety gate, or `deps_core::edit`'s internal fix-target verification
+    /// could not confirm it — see [`deps_core::edit::VulnFixSkip`] (FR-010).
     NoVerifiedFix,
     /// The dependency's registry fetch failed/timed out, or produced no `PackageVersions`
     /// entry at all — the FR-011 two-signal, load-bearing rule.
@@ -116,9 +142,9 @@ impl Outcome {
     /// `unfixable` — a [`SkipReason`]/[`UnfixableReason`]'s own detail is carried in
     /// [`PlannedUpdateItem::reason`] instead, not folded into this token.
     #[must_use]
-    pub const fn wire_token(self) -> &'static str {
+    pub const fn wire_token(&self) -> &'static str {
         match self {
-            Self::Applied => "applied",
+            Self::Applied(_) => "applied",
             Self::Skipped(_) => "skipped",
             Self::RequiresLockfileUpdate => "requires-lockfile-update",
             Self::Unfixable(_) => "unfixable",
@@ -130,8 +156,8 @@ impl PlannedUpdateItem {
     /// A one-line human-readable reason for [`Self::outcome`] (FR-021's `reason` field).
     #[must_use]
     pub fn reason(&self) -> String {
-        let base = match self.outcome {
-            Outcome::Applied => "update applied",
+        let base = match &self.outcome {
+            Outcome::Applied(_) => "update applied",
             Outcome::Skipped(SkipReason::IgnoreRule) => "matched an [update].ignore rule",
             Outcome::Skipped(SkipReason::NotRequested) => "not named by --package",
             Outcome::Skipped(SkipReason::NotSafelyEditable(
@@ -275,7 +301,7 @@ pub fn is_requested(
 /// let plan = plan_updates(&analysis, content, &MockFormatter, &[], &IgnoreRules::empty());
 ///
 /// assert_eq!(plan.items.len(), 1);
-/// assert!(matches!(plan.items[0].outcome, Outcome::Applied));
+/// assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
 /// assert_eq!(plan.items[0].target, "1.2.0");
 /// ```
 #[must_use]
@@ -322,7 +348,6 @@ pub fn plan_updates(
                     current: p.current,
                     target,
                     outcome: Outcome::Skipped(SkipReason::NotRequested),
-                    edit: None,
                     advisory_ids: Vec::new(),
                     ignore_rule_overridden: false,
                 };
@@ -335,7 +360,6 @@ pub fn plan_updates(
                     current: p.current,
                     target,
                     outcome: Outcome::Skipped(reason),
-                    edit: None,
                     advisory_ids: Vec::new(),
                     ignore_rule_overridden: false,
                 };
@@ -345,8 +369,7 @@ pub fn plan_updates(
                 name: p.name,
                 current: p.current,
                 target,
-                outcome: Outcome::Applied,
-                edit: Some(p.edit),
+                outcome: Outcome::Applied(p.edit),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
             }
@@ -376,7 +399,6 @@ pub fn plan_updates(
             current: String::new(),
             target: String::new(),
             outcome,
-            edit: None,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
         });
@@ -444,8 +466,13 @@ pub fn dedup_applied_items(items: &mut [PlannedUpdateItem]) {
     let indexed: Vec<Indexed> = items
         .iter()
         .enumerate()
-        .filter(|(_, item)| matches!(item.outcome, Outcome::Applied))
-        .filter_map(|(index, item)| item.edit.clone().map(|edit| Indexed { index, edit }))
+        .filter_map(|(index, item)| match &item.outcome {
+            Outcome::Applied(edit) => Some(Indexed {
+                index,
+                edit: edit.clone(),
+            }),
+            _ => None,
+        })
         .collect();
     let kept_indices: std::collections::HashSet<usize> =
         dedup_overlapping_edits(indexed, "deps-cli update dedup_applied_items")
@@ -454,9 +481,8 @@ pub fn dedup_applied_items(items: &mut [PlannedUpdateItem]) {
             .collect();
 
     for (index, item) in items.iter_mut().enumerate() {
-        if matches!(item.outcome, Outcome::Applied) && !kept_indices.contains(&index) {
+        if matches!(item.outcome, Outcome::Applied(_)) && !kept_indices.contains(&index) {
             item.outcome = Outcome::Skipped(SkipReason::OverlapsAnotherEdit);
-            item.edit = None;
         }
     }
 }
@@ -663,7 +689,7 @@ mod tests {
         let applied: Vec<&str> = plan
             .items
             .iter()
-            .filter(|i| matches!(i.outcome, Outcome::Applied))
+            .filter(|i| matches!(i.outcome, Outcome::Applied(_)))
             .map(|i| i.name.as_str())
             .collect();
         assert_eq!(
@@ -713,7 +739,7 @@ mod tests {
         );
 
         let serde_item = plan.items.iter().find(|i| i.name == "serde").unwrap();
-        assert!(matches!(serde_item.outcome, Outcome::Applied));
+        assert!(matches!(serde_item.outcome, Outcome::Applied(_)));
         let tokio_item = plan.items.iter().find(|i| i.name == "tokio").unwrap();
         assert!(matches!(
             tokio_item.outcome,
@@ -848,7 +874,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(plan.items[0].outcome, Outcome::Applied));
+        assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
     }
 
     #[test]
@@ -880,8 +906,7 @@ mod tests {
                 name: "serde".to_string(),
                 current: "1.0.0".to_string(),
                 target: "1.2.0".to_string(),
-                outcome: Outcome::Applied,
-                edit: Some(ManifestEdit {
+                outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
                     new_text: "1.2.0".to_string(),
                 }),
@@ -909,8 +934,7 @@ mod tests {
                 name: "serde".to_string(),
                 current: "1.0.0".to_string(),
                 target: "1.2.0".to_string(),
-                outcome: Outcome::Applied,
-                edit: Some(ManifestEdit {
+                outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
                     new_text: "1.2.0".to_string(),
                 }),
@@ -937,8 +961,7 @@ mod tests {
                 name: "serde".to_string(),
                 current: "1.0.0".to_string(),
                 target: "1.2.0".to_string(),
-                outcome: Outcome::Applied,
-                edit: Some(ManifestEdit {
+                outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
                     new_text: "1.2.0".to_string(),
                 }),
@@ -966,10 +989,6 @@ mod tests {
                 current: "1.0.0".to_string(),
                 target: "1.2.0".to_string(),
                 outcome: Outcome::Skipped(SkipReason::IgnoreRule),
-                edit: Some(ManifestEdit {
-                    range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-                    new_text: "1.2.0".to_string(),
-                }),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
             }],
@@ -980,5 +999,65 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "serde = \"1.0.0\"\n"
         );
+    }
+
+    // --- dedup_applied_items (previously untested; touched by #1349's `Outcome::Applied`
+    // edit-extraction rewrite) ---
+
+    fn applied_item(name: &str, range: Range) -> PlannedUpdateItem {
+        PlannedUpdateItem {
+            name: name.to_string(),
+            current: "1.0.0".to_string(),
+            target: "1.2.0".to_string(),
+            outcome: Outcome::Applied(ManifestEdit {
+                range,
+                new_text: "1.2.0".to_string(),
+            }),
+            advisory_ids: Vec::new(),
+            ignore_rule_overridden: false,
+        }
+    }
+
+    #[test]
+    fn test_dedup_applied_items_keeps_non_overlapping_edits_applied() {
+        let mut items = vec![
+            applied_item(
+                "serde",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            ),
+            applied_item(
+                "tokio",
+                Range::new(Position::new(1, 9), Position::new(1, 14)),
+            ),
+        ];
+        dedup_applied_items(&mut items);
+        assert!(
+            items
+                .iter()
+                .all(|i| matches!(i.outcome, Outcome::Applied(_)))
+        );
+    }
+
+    /// M2/critic finding this dedup pass exists for: two vulnerable occurrences of one name
+    /// (or any other overlap) both reported `Applied` must have the loser demoted to
+    /// `Skipped(OverlapsAnotherEdit)` before `apply_plan` runs, not silently write only one.
+    #[test]
+    fn test_dedup_applied_items_demotes_the_later_overlap() {
+        let mut items = vec![
+            applied_item(
+                "serde",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            ),
+            applied_item(
+                "serde",
+                Range::new(Position::new(0, 11), Position::new(0, 16)),
+            ),
+        ];
+        dedup_applied_items(&mut items);
+        assert!(matches!(items[0].outcome, Outcome::Applied(_)));
+        assert!(matches!(
+            items[1].outcome,
+            Outcome::Skipped(SkipReason::OverlapsAnotherEdit)
+        ));
     }
 }

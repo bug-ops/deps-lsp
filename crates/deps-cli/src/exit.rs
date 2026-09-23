@@ -81,7 +81,8 @@ pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
     let has_unresolved_item = plan.items.iter().any(|item| {
         !matches!(
             item.outcome,
-            Outcome::Applied | Outcome::Skipped(SkipReason::NotRequested | SkipReason::IgnoreRule)
+            Outcome::Applied(_)
+                | Outcome::Skipped(SkipReason::NotRequested | SkipReason::IgnoreRule)
         )
     });
     if has_unresolved_item {
@@ -171,7 +172,7 @@ mod tests {
     // --- update_exit_code (spec 068, S3) ---
 
     use crate::update::{PlannedUpdateItem, UnfixableReason};
-    use deps_core::edit::UnplannableReason;
+    use deps_core::edit::{ManifestEdit, UnplannableReason};
 
     fn update_item(outcome: Outcome) -> PlannedUpdateItem {
         PlannedUpdateItem {
@@ -179,10 +180,16 @@ mod tests {
             current: "1.0.0".to_string(),
             target: "1.2.0".to_string(),
             outcome,
-            edit: None,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
         }
+    }
+
+    fn applied() -> Outcome {
+        Outcome::Applied(ManifestEdit {
+            range: Range::default(),
+            new_text: "1.2.0".to_string(),
+        })
     }
 
     #[test]
@@ -193,7 +200,7 @@ mod tests {
     #[test]
     fn test_update_exit_code_all_applied_is_clean() {
         let plan = UpdatePlan {
-            items: vec![update_item(Outcome::Applied), update_item(Outcome::Applied)],
+            items: vec![update_item(applied()), update_item(applied())],
         };
         assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
     }
@@ -203,7 +210,7 @@ mod tests {
     fn test_update_exit_code_ignore_rule_skip_alone_is_clean() {
         let plan = UpdatePlan {
             items: vec![
-                update_item(Outcome::Applied),
+                update_item(applied()),
                 update_item(Outcome::Skipped(SkipReason::IgnoreRule)),
             ],
         };
@@ -215,7 +222,7 @@ mod tests {
     fn test_update_exit_code_not_requested_skip_alone_is_clean() {
         let plan = UpdatePlan {
             items: vec![
-                update_item(Outcome::Applied),
+                update_item(applied()),
                 update_item(Outcome::Skipped(SkipReason::NotRequested)),
             ],
         };
@@ -254,7 +261,7 @@ mod tests {
     fn test_update_exit_code_mixed_applied_and_operator_skips_is_clean() {
         let plan = UpdatePlan {
             items: vec![
-                update_item(Outcome::Applied),
+                update_item(applied()),
                 update_item(Outcome::Skipped(SkipReason::NotRequested)),
                 update_item(Outcome::Skipped(SkipReason::IgnoreRule)),
             ],
