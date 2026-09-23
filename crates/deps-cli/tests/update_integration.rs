@@ -223,8 +223,7 @@ fn applied_plan(range: Range, new_text: &str) -> UpdatePlan {
             name: "serde".to_string(),
             current: "1.0.0".to_string(),
             target: new_text.to_string(),
-            outcome: Outcome::Applied,
-            edit: Some(ManifestEdit {
+            outcome: Outcome::Applied(ManifestEdit {
                 range,
                 new_text: new_text.to_string(),
             }),

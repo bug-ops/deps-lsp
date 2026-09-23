@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency() {
         use deps_core::ParseResult;
-        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
         };
@@ -672,8 +672,14 @@ mod tests {
             &NuGetFormatter,
         );
 
-        assert!(
-            planned.is_none(),
+        // `compile_requirement` returns `None` for an unresolved `$(...)` reference, so the
+        // #1344 `RequirementAlreadyResolves` gate is inert here — suppression instead comes
+        // from `format_version_replacing`'s own `$(` short-circuit (returns `current`
+        // unchanged), making the rewrite byte-identical to the declared literal: a genuine
+        // `VulnFixSkip::NoOpRewrite`, not a resolution-admits-the-fix case.
+        assert_eq!(
+            planned,
+            Err(VulnFixSkip::NoOpRewrite),
             "the real NuGetFormatter must suppress the fix for an unresolved property reference"
         );
     }

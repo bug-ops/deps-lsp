@@ -608,6 +608,99 @@ pub fn collect_update_candidates(
     candidates
 }
 
+/// Why [`plan_vulnerability_fix`] could not produce a [`PlannedUpdate`] for a dependency
+/// already known to be [`crate::osv::ScanOutcome::Vulnerable`].
+///
+/// Mirrors [`UnplannableReason`]'s role for the default-mode planner (spec 068's typed-skip
+/// convention) — before this type existed, every one of these five causes collapsed into a
+/// single `None`, forcing `deps-cli update --security-only`'s
+/// `classify_vulnerable_dependency` to re-run [`resolve_recommended_fix`]'s and
+/// `fix_target_is_verified`'s own chain itself just to tell `NoVerifiedFix` apart from
+/// `RequiresLockfileUpdate` (#1350).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VulnFixSkip {
+    /// No advisory on `dv` has a claimable fix — [`crate::osv::DependencyVulnerabilities::recommended_fix`]
+    /// returned `None`.
+    NoRecommendedFix,
+    /// The recommended fix's version, converted to this ecosystem's native namespace, failed
+    /// [`is_safe_version_string`].
+    UnsafeVersion,
+    /// The internal fix-target verification gate could not confirm the fix target F against
+    /// OSV — F was never live-checked, or the live check found F still vulnerable to an
+    /// advisory this recommendation claims to resolve.
+    UnverifiedTarget,
+    /// The dependency's declared requirement, left unedited, already resolves forward to the
+    /// fix target under this ecosystem's own resolution rules — nothing to rewrite (#1344).
+    RequirementAlreadyResolves,
+    /// The formatter's rewrite would be textually identical to the declared literal — no edit
+    /// to make.
+    NoOpRewrite,
+}
+
+/// Resolves and validates the OSV-recommended fix for `dv`.
+///
+/// The common prefix every vulnerability-fix caller needs before it can decide what to do
+/// next: is there a fix, and is its version string safe to act on. Shared by
+/// [`plan_vulnerability_fix`] and `deps-engine`'s phase-B fix-target verification
+/// (`classify::osv::resolve_fix_target`), which independently ran the same two steps before
+/// this was extracted (#1350).
+///
+/// # Errors
+///
+/// Returns [`VulnFixSkip::NoRecommendedFix`] when `dv.recommended_fix()` is `None`, or
+/// [`VulnFixSkip::UnsafeVersion`] when the fix's version fails [`is_safe_version_string`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities, VulnSeverity};
+/// use deps_core::{ConcreteVersion, PackageName};
+/// use std::sync::Arc;
+///
+/// struct MockFormatter;
+/// impl PackageNaming for MockFormatter {}
+/// impl PackageRendering for MockFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         format!("https://example.com/{}", name.as_str())
+///     }
+/// }
+/// impl RequirementResolution for MockFormatter {}
+/// impl DiagnosticMessages for MockFormatter {}
+/// impl DiagnosticPolicy for MockFormatter {}
+/// impl SourcePolicy for MockFormatter {}
+/// impl OsvNaming for MockFormatter {}
+///
+/// let dv = DependencyVulnerabilities::new(Capped::new(Vec::<Arc<Advisory>>::new(), 0));
+/// assert_eq!(
+///     resolve_recommended_fix(&dv, &MockFormatter),
+///     Err(VulnFixSkip::NoRecommendedFix)
+/// );
+/// ```
+pub fn resolve_recommended_fix(
+    dv: &crate::osv::DependencyVulnerabilities,
+    formatter: &dyn EcosystemFormatter,
+) -> Result<(crate::osv::FixRecommendation, String), VulnFixSkip> {
+    let fix = dv.recommended_fix().ok_or(VulnFixSkip::NoRecommendedFix)?;
+    let version_native = formatter.osv_version_to_native(&fix.version);
+    if !is_safe_version_string(&version_native) {
+        warn_rejected_value(
+            "is_safe_version_string",
+            "vulnerability fix plan",
+            &version_native,
+        );
+        return Err(VulnFixSkip::UnsafeVersion);
+    }
+    Ok((fix, version_native))
+}
+
 /// Whether `dv.fix_target_status` clears `fix`'s target version as an honest, presentable fix
 /// (#462 FR-003) — verbatim move of `lsp_helpers::code_actions`'s private helper of the same
 /// name and doc.
@@ -619,36 +712,11 @@ pub fn collect_update_candidates(
 /// dependency's own `advisories` never recorded at all. Any other state means F was never
 /// actually verified, so it is rejected too.
 ///
-/// `pub`, not `pub(crate)`: `deps-cli update --security-only` (#1329) calls this directly to
-/// distinguish "no verified fix target" from [`plan_vulnerability_fix`]'s other `None` cause
-/// (the declared requirement already admits the fix, so its no-op guard is what returned
-/// `None`) — a distinction this crate's own `code_actions.rs` adapter never needed to make.
-///
-/// # Examples
-///
-/// ```
-/// use deps_core::edit::fix_target_is_verified;
-/// use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
-/// use std::sync::Arc;
-///
-/// let advisory = Arc::new(
-///     Advisory::new(
-///         "RUSTSEC-2024-0001".to_string(),
-///         "2024-01-01T00:00:00Z".to_string(),
-///         VulnSeverity::High,
-///     )
-///     .expect("valid osv id")
-///     .with_fixed_versions(vec!["1.2.0".to_string()]),
-/// );
-/// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
-///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: "1.2.0".to_string() });
-/// let fix = dv.recommended_fix().unwrap();
-///
-/// assert!(fix_target_is_verified(&dv, &fix, "1.2.0"));
-/// assert!(!fix_target_is_verified(&dv, &fix, "9.9.9"));
-/// ```
+/// `pub(crate)`: `deps-cli update --security-only` (#1329) used to call this directly to
+/// distinguish "no verified fix target" from [`plan_vulnerability_fix`]'s other `None` cause,
+/// but now matches on [`VulnFixSkip`] directly (#1350), so this no longer needs to be `pub`.
 #[must_use]
-pub fn fix_target_is_verified(
+pub(crate) fn fix_target_is_verified(
     dv: &crate::osv::DependencyVulnerabilities,
     fix: &crate::osv::FixRecommendation,
     version_native: &str,
@@ -680,6 +748,87 @@ pub fn fix_target_is_verified(
     }
 }
 
+/// [`resolve_recommended_fix`] plus the internal `fix_target_is_verified` gate — resolves the
+/// OSV-recommended fix for `dv` AND confirms its target version's own OSV status.
+///
+/// Callers that need to know "is there a *usable* fix" (not just "is there *a* fix") call
+/// this instead of [`resolve_recommended_fix`] alone — see [`plan_vulnerability_fix`] and
+/// `deps-cli`'s `classify_vulnerable_dependency` (#1350 S1 regression fix: that caller must
+/// run this check *before* any other requirement/range/yanked-status decision, exactly as it
+/// did when it held its own copy of the `fix_target_is_verified` call, or an unverified fix
+/// target gets misreported as `RequiresLockfileUpdate`/`Unfixable(Yanked)` instead of
+/// `Unfixable(NoVerifiedFix)`).
+///
+/// `deps-engine`'s phase-B fix-target verification (`classify::osv::resolve_fix_target`) is
+/// the producer of `dv.fix_target_status` in the first place, so it calls
+/// [`resolve_recommended_fix`] directly instead of this function — gating on a status it has
+/// not computed yet would be circular.
+///
+/// # Errors
+///
+/// Returns anything [`resolve_recommended_fix`] can return, plus
+/// [`VulnFixSkip::UnverifiedTarget`] when the internal `fix_target_is_verified` gate rejects
+/// the fix target.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::{VulnFixSkip, resolve_verified_fix};
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+/// use deps_core::{ConcreteVersion, PackageName};
+/// use std::sync::Arc;
+///
+/// struct MockFormatter;
+/// impl PackageNaming for MockFormatter {}
+/// impl PackageRendering for MockFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         format!("https://example.com/{}", name.as_str())
+///     }
+/// }
+/// impl RequirementResolution for MockFormatter {}
+/// impl DiagnosticMessages for MockFormatter {}
+/// impl DiagnosticPolicy for MockFormatter {}
+/// impl SourcePolicy for MockFormatter {}
+/// impl OsvNaming for MockFormatter {}
+///
+/// let advisory = Arc::new(
+///     Advisory::new(
+///         "RUSTSEC-2024-0001".to_string(),
+///         "2024-01-01T00:00:00Z".to_string(),
+///         VulnSeverity::High,
+///     )
+///     .expect("valid osv id")
+///     .with_fixed_versions(vec!["1.2.0".to_string()]),
+/// );
+/// // `fix_target_status` left at its `NotChecked` default — never live-checked yet.
+/// let unverified = DependencyVulnerabilities::new(Capped::new(vec![advisory.clone()], 1));
+/// assert_eq!(
+///     resolve_verified_fix(&unverified, &MockFormatter),
+///     Err(VulnFixSkip::UnverifiedTarget)
+/// );
+///
+/// let verified = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: "1.2.0".to_string() });
+/// assert!(resolve_verified_fix(&verified, &MockFormatter).is_ok());
+/// ```
+pub fn resolve_verified_fix(
+    dv: &crate::osv::DependencyVulnerabilities,
+    formatter: &dyn EcosystemFormatter,
+) -> Result<(crate::osv::FixRecommendation, String), VulnFixSkip> {
+    let (fix, version_native) = resolve_recommended_fix(dv, formatter)?;
+    if !fix_target_is_verified(dv, &fix, &version_native) {
+        return Err(VulnFixSkip::UnverifiedTarget);
+    }
+    Ok((fix, version_native))
+}
+
 /// Security-mode planner: plans the vulnerability-fix edit for one dependency.
 ///
 /// The dependency must already be known to be [`crate::osv::ScanOutcome::Vulnerable`]; this
@@ -687,7 +836,7 @@ pub fn fix_target_is_verified(
 ///
 /// Originally a verbatim move of `lsp_helpers::code_actions::build_vulnerability_fix_action`'s
 /// planning core (the no-op guard, `is_safe_version_string`, `osv_version_to_native`,
-/// `format_version_replacing_for`, and the [`fix_target_is_verified`] gate) — yank/timeout
+/// `format_version_replacing_for`, and the `fix_target_is_verified` gate) — yank/timeout
 /// filtering is deliberately **not** moved: both `deps-lsp` and `deps-cli` apply their own
 /// source and policy for that (see `lsp_helpers::code_actions::generate_code_actions`'s
 /// yank-filtering block and `deps-cli`'s `update::security` module).
@@ -788,46 +937,62 @@ pub fn fix_target_is_verified(
 /// let planned = plan_vulnerability_fix(&dep, dep.version_range, "1.0.0", &dv, &MockFormatter);
 /// assert_eq!(planned.unwrap().edit.new_text, "1.2.0");
 /// ```
-#[must_use]
+///
+/// # Errors
+///
+/// Returns [`VulnFixSkip`] for any of the five causes that make an edit impossible or
+/// unnecessary — see that type's variants.
 pub fn plan_vulnerability_fix(
     dep: &dyn Dependency,
     version_range: crate::position::Range,
     current: &str,
     dv: &crate::osv::DependencyVulnerabilities,
     formatter: &dyn EcosystemFormatter,
-) -> Option<PlannedUpdate> {
-    let fix = dv.recommended_fix()?;
-    let version_native = formatter.osv_version_to_native(&fix.version);
-    if !is_safe_version_string(&version_native) {
-        warn_rejected_value(
-            "is_safe_version_string",
-            "vulnerability fix plan",
-            &version_native,
-        );
-        return None;
-    }
+) -> Result<PlannedUpdate, VulnFixSkip> {
+    let (_fix, version_native) = resolve_verified_fix(dv, formatter)?;
+    plan_verified_fix(dep, version_range, current, &version_native, formatter)
+}
 
-    if !fix_target_is_verified(dv, &fix, &version_native) {
-        return None;
-    }
-
-    let fix_concrete = ConcreteVersion::new(version_native.as_str());
+/// The remainder of [`plan_vulnerability_fix`]'s decision, for a fix target already resolved
+/// and verified via [`resolve_verified_fix`].
+///
+/// Split out for a caller that already holds `version_native` because it needed it for its
+/// own decision (e.g. a yank check) before ever reaching this point —
+/// [`plan_vulnerability_fix`] itself calls [`resolve_verified_fix`] internally, so calling
+/// that first and then [`plan_vulnerability_fix`] would run the same resolve-and-verify chain
+/// twice per dependency (code review finding, #1350). `deps-cli`'s
+/// `classify_vulnerable_dependency` is this function's only caller outside
+/// [`plan_vulnerability_fix`] itself.
+///
+/// # Errors
+///
+/// Returns [`VulnFixSkip::RequirementAlreadyResolves`] or [`VulnFixSkip::NoOpRewrite`] — the
+/// two causes that can still make an edit unnecessary once the fix is already known resolved
+/// and verified.
+pub fn plan_verified_fix(
+    dep: &dyn Dependency,
+    version_range: crate::position::Range,
+    current: &str,
+    version_native: &str,
+    formatter: &dyn EcosystemFormatter,
+) -> Result<PlannedUpdate, VulnFixSkip> {
+    let fix_concrete = ConcreteVersion::new(version_native);
     let requirement_already_resolves_to_fix =
         dep.version_requirement().is_some_and(|version_req| {
             formatter.requirement_already_resolves_to(version_req, &fix_concrete)
         });
     if requirement_already_resolves_to_fix {
-        return None;
+        return Err(VulnFixSkip::RequirementAlreadyResolves);
     }
 
     let new_text = formatter.format_version_replacing_for(dep, &fix_concrete, current);
     let literal_target = dep.version_literal().unwrap_or(current);
     if strip_whitespace(literal_target) == strip_whitespace(&new_text) {
-        return None;
+        return Err(VulnFixSkip::NoOpRewrite);
     }
 
     let normalized_name = formatter.normalize_package_name(dep.name());
-    Some(PlannedUpdate {
+    Ok(PlannedUpdate {
         name: dep.name().as_str().to_string(),
         normalized_name,
         name_range: dep.name_range(),
@@ -1304,7 +1469,7 @@ mod tests {
 
             let planned =
                 plan_vulnerability_fix(&d, d.version_range, "1", &dv, &StrictSemverFormatter);
-            assert!(planned.is_none());
+            assert_eq!(planned, Err(VulnFixSkip::RequirementAlreadyResolves));
         }
 
         /// A requirement the comparator confirms does NOT admit the fix target must still
@@ -1332,6 +1497,35 @@ mod tests {
             let planned =
                 plan_vulnerability_fix(&d, d.version_range, "1", &dv, &MockFormatter).unwrap();
             assert_eq!(planned.edit.new_text, "\"1.0.2\"");
+        }
+
+        /// A malformed `fixed_versions` entry (as if it somehow reached this dependency's
+        /// `advisories` despite OSV's own wire-boundary validation) must be rejected before
+        /// any other gate runs — `VulnFixSkip::UnsafeVersion`, not a planned edit.
+        #[test]
+        fn test_unsafe_fix_version_is_rejected() {
+            let d = dep("serde", "0.9", range(0, 8, 0, 11));
+            // A space is not in `is_safe_version_string`'s allowlist.
+            let dv = verified_dv("1.2.0 evil");
+
+            let planned = plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &MockFormatter);
+            assert_eq!(planned, Err(VulnFixSkip::UnsafeVersion));
+        }
+
+        /// A genuine textual no-op — the formatter's rewrite is byte-identical to the literal
+        /// fallback `current` text — must be `VulnFixSkip::NoOpRewrite`, distinct from
+        /// `RequirementAlreadyResolves` above (no `compile_requirement` override here, so that
+        /// gate never fires; this is the plain textual guard alone).
+        #[test]
+        fn test_true_no_op_rewrite_is_rejected() {
+            let d = dep("serde", "1", range(0, 8, 0, 9));
+            let dv = verified_dv("1.0.2");
+
+            // `MockFormatter::format_version_for_text_edit` quotes its input, so the
+            // already-quoted literal fallback below is byte-identical to the planned rewrite.
+            let planned =
+                plan_vulnerability_fix(&d, d.version_range, "\"1.0.2\"", &dv, &MockFormatter);
+            assert_eq!(planned, Err(VulnFixSkip::NoOpRewrite));
         }
 
         /// A synthetic formatter mimicking a resolver that pins a bare requirement to its

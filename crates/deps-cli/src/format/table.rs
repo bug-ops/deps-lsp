@@ -236,9 +236,15 @@ mod tests {
             current: "1.0.0".to_string(),
             target: "1.2.0".to_string(),
             outcome,
-            edit: None,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
+        }
+    }
+
+    fn applied_edit() -> deps_core::edit::ManifestEdit {
+        deps_core::edit::ManifestEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+            new_text: "1.2.0".to_string(),
         }
     }
 
@@ -247,7 +253,7 @@ mod tests {
     #[test]
     fn test_render_update_non_empty_plan_includes_item_line() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied)],
+            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
         let table = render_update(&plan, false);
         assert!(table.contains("serde"));
@@ -260,7 +266,7 @@ mod tests {
     #[test]
     fn test_render_update_dry_run_includes_leading_note() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied)],
+            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
         let table = render_update(&plan, true);
         assert!(table.starts_with("(dry run"));

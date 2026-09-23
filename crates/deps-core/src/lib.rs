@@ -231,8 +231,9 @@ pub use ecosystem::{
 pub use ecosystem_registry::EcosystemRegistry;
 pub use edit::{
     EditSpan, ManifestEdit, PlannedUpdate, UnplannableReason, UpdateCandidate, UpdateKind,
-    apply_edits, classify_update, collect_update_candidates, collect_update_edits,
-    dedup_overlapping_edits, fix_target_is_verified, plan_vulnerability_fix,
+    VulnFixSkip, apply_edits, classify_update, collect_update_candidates, collect_update_edits,
+    dedup_overlapping_edits, plan_verified_fix, plan_vulnerability_fix, resolve_recommended_fix,
+    resolve_verified_fix,
 };
 pub use error::{DepsError, FetchFailure, Result};
 pub use freshness::{
