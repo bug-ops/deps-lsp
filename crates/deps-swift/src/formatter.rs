@@ -27,6 +27,18 @@ impl RequirementMatcher for SemverMatcher {
 
 use crate::types::SwiftDependency;
 
+/// Whether `requirement` contains an unresolved Swift string-interpolation placeholder
+/// (`\(...)`), e.g. `.package(url: ..., from: "\(v)")`. `deps-swift`'s parser does not degrade
+/// this shape to `version_requirement: None`, so it reaches [`RequirementResolution`] and
+/// [`PackageRendering`] directly — issue #1354 security audit: `compile_requirement` returns
+/// `None` for it already (the interpolated text fails `semver::VersionReq::parse`), but
+/// nothing previously stopped `format_version_replacing` from planning a destructive
+/// `"9.9.9"`-literal rewrite over the interpolation. Mirrors `NuGetFormatter`'s `$(Property)`
+/// guard (#1352).
+fn requirement_contains_unresolved_interpolation(requirement: &str) -> bool {
+    requirement.contains("\\(")
+}
+
 /// Returns `true` if `name` matches the `owner/repo` GitHub identifier pattern.
 ///
 /// Delegates to [`crate::is_valid_github_identity`], shared with `registry`'s
@@ -127,10 +139,63 @@ impl PackageRendering for SwiftFormatter {
             String::new()
         }
     }
+
+    /// #1354 hardening: an unresolved Swift string interpolation (see
+    /// `requirement_contains_unresolved_interpolation`) in `current` leaves `current`
+    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
+    /// latest" edit can never hardcode a literal version over `\(...)` — mirrors
+    /// `NuGetFormatter::format_version_replacing`'s `$(Property)` guard.
+    ///
+    /// Not sufficient on its own for Swift — see [`Self::format_version_replacing_for`]'s doc
+    /// (#1354 critic S1) for why the dependency-aware override below is the one every real
+    /// caller actually reaches.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_contains_unresolved_interpolation(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
+    /// #1354 critic S1: both production callers
+    /// (`lsp_helpers::code_actions::build_vulnerability_fix_action`, `deps-cli`'s
+    /// `update::security`) pass the *declared requirement string* as `current`, never
+    /// `dep.version_literal()`. For a synthesized comparator like `from: "\(v)"`'s
+    /// `">=\(v), <1.0.0"`, [`Self::format_version_replacing`]'s guard leaves `current` itself
+    /// unchanged — but `plan_vulnerability_fix`'s no-op guard compares that result against
+    /// `dep.version_literal()` (the narrower `\(v)` span actually spliced into the manifest),
+    /// not against `current`. A `current`-echoing no-op therefore still reads as a genuine
+    /// rewrite there and gets spliced in as `">=\(v), <1.0.0"` over the bare `\(v)` literal,
+    /// corrupting the manifest. Returning the literal itself (when either `current` or the
+    /// literal is unresolved) makes the two compare equal, so the planner correctly no-ops —
+    /// and, as a side effect, makes every REFACTOR "Update to X" candidate for this dependency
+    /// dedup away against the unchanged literal too, closing S3 (a bogus REFACTOR action with
+    /// text `">=\(v), <1.0.0"`) for free.
+    fn format_version_replacing_for(
+        &self,
+        dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        let literal = dep.version_literal();
+        let unresolved = requirement_contains_unresolved_interpolation(current)
+            || literal.is_some_and(requirement_contains_unresolved_interpolation);
+        if unresolved {
+            return literal.unwrap_or(current).to_string();
+        }
+        self.format_version_replacing(version, current)
+    }
 }
 
 impl RequirementResolution for SwiftFormatter {
+    /// #1354 hardening: an unresolved requirement (see [`Self::requirement_is_unresolved`])
+    /// returns `true` (treated as satisfied) rather than falling into `semver::VersionReq`
+    /// parsing, which already fails closed for this shape but without the explicit
+    /// classification `requirement_status`/`Unresolved` needs — mirrors `NuGetFormatter`'s
+    /// identical guard.
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+            return true;
+        }
         let version = version.as_str();
         let Ok(ver) = semver::Version::parse(version) else {
             return false;
@@ -147,12 +212,26 @@ impl RequirementResolution for SwiftFormatter {
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`]) — Swift's registry client follows GitHub
     /// tags pagination to build `available`, so a `None` here is purely "this requirement
     /// string doesn't parse as semver," not a gap in what pagination could return.
+    ///
+    /// #1354: an unresolved interpolation (see [`Self::requirement_is_unresolved`]) is
+    /// checked explicitly first rather than relying on `semver::VersionReq::parse` to keep
+    /// failing on it — defense-in-depth against a future interpolation spelling that happens
+    /// to parse as valid semver syntax.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        if self.requirement_is_unresolved(requirement) {
+            return None;
+        }
         requirement
             .as_str()
             .parse::<semver::VersionReq>()
             .ok()
             .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+    }
+
+    /// #1354: an unexpanded Swift string-interpolation placeholder (`\(...)`) inside a
+    /// requirement — see `requirement_contains_unresolved_interpolation`.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_unresolved_interpolation(requirement.as_str())
     }
 }
 
@@ -531,6 +610,164 @@ mod tests {
         assert_eq!(
             matcher.matches(&ConcreteVersion::new("not-a-version")),
             None
+        );
+    }
+
+    // --- #1354: unresolved Swift interpolation (`\(...)`) must never be rewritten ---
+
+    #[test]
+    fn test_requirement_is_unresolved_swift_interpolation() {
+        let fmt = SwiftFormatter;
+        assert!(fmt.requirement_is_unresolved(&VersionReq::new(">=\\(v), <1.0.0")));
+        assert!(!fmt.requirement_is_unresolved(&VersionReq::new(">=1.5.0, <2.0.0")));
+    }
+
+    #[test]
+    fn test_compile_requirement_none_for_unresolved_interpolation() {
+        let fmt = SwiftFormatter;
+        assert!(
+            fmt.compile_requirement(&VersionReq::new(">=\\(v), <1.0.0"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_version_satisfies_requirement_unresolved_interpolation_returns_true() {
+        let fmt = SwiftFormatter;
+        assert!(
+            fmt.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), ">=\\(v), <1.0.0")
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_guards_unresolved_interpolation() {
+        let fmt = SwiftFormatter;
+        assert_eq!(
+            fmt.format_version_replacing(&ConcreteVersion::new("9.9.9"), "\\(v)"),
+            "\\(v)"
+        );
+        assert_eq!(
+            fmt.format_version_replacing(&ConcreteVersion::new("9.9.9"), "1.5.0"),
+            "9.9.9"
+        );
+    }
+
+    /// #1354 critic S1: reproduces the exact shape `from:` produces — `current` is the
+    /// synthesized comparator (`">=\(v), <1.0.0"`, what real callers pass), and
+    /// `version_literal` is the narrower raw span (`"\(v)"`) actually spliced into the
+    /// manifest. `format_version_replacing_for` must return the *literal*, not `current`
+    /// unchanged — otherwise `plan_vulnerability_fix`'s no-op guard (which compares against
+    /// `version_literal`) still sees a difference and plans a destructive rewrite.
+    #[test]
+    fn test_format_version_replacing_for_returns_literal_not_synthesized_current() {
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        let fmt = SwiftFormatter;
+        let dep = SwiftDependency {
+            name: "apple/swift-nio".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_req: Some(">=\\(v), <1.0.0".into()),
+            version_range: None,
+            version_literal: Some("\\(v)".to_string()),
+            url: "https://github.com/apple/swift-nio".to_string(),
+            source: DependencySource::Registry,
+        };
+        let current = dep.version_req.as_ref().unwrap().as_str();
+        let rewritten =
+            fmt.format_version_replacing_for(&dep, &ConcreteVersion::new("2.40.0"), current);
+        assert_eq!(
+            rewritten, "\\(v)",
+            "must reproduce the literal span, not echo the synthesized requirement back"
+        );
+    }
+
+    /// A resolved (non-interpolated) dependency is unaffected by the S1 override — it still
+    /// falls through to the ordinary `format_version_replacing` substitution.
+    #[test]
+    fn test_format_version_replacing_for_resolved_dependency_still_substitutes() {
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+
+        let fmt = SwiftFormatter;
+        let dep = SwiftDependency {
+            name: "apple/swift-nio".into(),
+            name_range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+            version_req: Some(">=1.5.0, <2.0.0".into()),
+            version_range: None,
+            version_literal: Some("1.5.0".to_string()),
+            url: "https://github.com/apple/swift-nio".to_string(),
+            source: DependencySource::Registry,
+        };
+        let rewritten =
+            fmt.format_version_replacing_for(&dep, &ConcreteVersion::new("2.40.0"), "1.5.0");
+        assert_eq!(rewritten, "2.40.0");
+    }
+
+    /// #1354 security audit: exercises `deps_core::edit::plan_vulnerability_fix` with the
+    /// *real* `SwiftFormatter` (not a hand-rolled mock) and a `SwiftDependency` obtained from
+    /// the real `crate::parser::parse_package_swift` path, on a vulnerable package whose
+    /// declared `from:` bound is an unexpanded Swift string interpolation — mirrors
+    /// `deps-nuget`'s `test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency`
+    /// (#1352) and `deps-bundler`'s equivalent (#1354).
+    ///
+    /// `compile_requirement` already returns `None` here (the interpolated text fails
+    /// `semver::VersionReq::parse`), but nothing previously stopped
+    /// `format_version_replacing` from planning a destructive rewrite once
+    /// `plan_vulnerability_fix`'s no-op guard compared the synthesized literal against it.
+    ///
+    /// #1354 critic S1/S2: `current` is `dep.version_requirement()` (the synthesized
+    /// `">=\(v), <1.0.0"` comparator `from:` produces), exactly as both production callers
+    /// (`lsp_helpers::code_actions::build_vulnerability_fix_action`, `deps-cli`'s
+    /// `update::security`) call this — passing `dep.version_literal()` (`\(v)`) instead would
+    /// mask a real bug: it differs from what real callers pass, so a formatter whose
+    /// `format_version_replacing_for` only echoes `current` back unchanged (not the narrower
+    /// literal) would pass this test despite still corrupting the manifest on the real path.
+    #[test]
+    fn test_plan_vulnerability_fix_unresolved_interpolation_returns_none() {
+        use deps_core::ParseResult;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let manifest = r#".package(url: "https://github.com/apple/swift-nio", from: "\(v)")"#;
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        let result = crate::parser::parse_package_swift(manifest, &uri).expect("valid manifest");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("from: synthesizes a version requirement")
+            .as_str();
+        assert_eq!(current, ">=\\(v), <1.0.0");
+        assert_eq!(dep.version_literal(), Some("\\(v)"));
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0003".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["2.40.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "2.40.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            deps_core::position::Range::default(),
+            current,
+            &dv,
+            &SwiftFormatter,
+        );
+
+        assert!(
+            planned.is_none(),
+            "the real SwiftFormatter must suppress the fix for an unresolved interpolation"
         );
     }
 }

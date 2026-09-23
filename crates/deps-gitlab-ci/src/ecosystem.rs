@@ -1070,6 +1070,22 @@ mod tests {
         non_registry_fixture: ".gitlab-ci.yml" => "include:\n  - project: org/proj\n    ref: v1.0.0\n";
     }
 
+    // #1354 security audit: GitLab CI's `$VAR`-in-ref placeholder syntax is real (unlike
+    // Cargo/Deno/Composer/Go/Dart), but it is unreachable through the vulnerability-fix
+    // pipeline today — `EcosystemFormatter::osv_ecosystem` returns `None` for GitLab CI, so
+    // `DependencyVulnerabilities` is never built for one of its dependencies and
+    // `plan_vulnerability_fix` is never called at all. `format_version_replacing`'s `Branch`
+    // arm does NOT independently no-op an unresolved `$VAR` ref (verified: it would rewrite
+    // it) — a latent gap, not exercised live, not fixed here since this PR's scope is the
+    // conformance macro plus the two newly-reachable ecosystems (Bundler, Swift), and a
+    // correct fix needs a new predicate distinguishing a `$VAR`-shaped ref from an ordinary
+    // branch name (both currently classify as `PinStyle::Branch`) rather than a one-line
+    // guard. Filed as #1365 (#1354 critic M1).
+    deps_core::unresolved_requirement_conformance! {
+        mod gitlab_ci_unresolved_requirement_conformance;
+        no_placeholder_syntax: "GitLab CI's $VAR ref placeholder exists but is currently unreachable via plan_vulnerability_fix (OSV coverage gap); see #1365 for the guard fix once reachable";
+    }
+
     // #1137: regression guard, not independent parser verification (see
     // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
     // own doc comment (a component/include ref has no operator syntax), so an edit to one

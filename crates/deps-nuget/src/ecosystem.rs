@@ -485,6 +485,18 @@ mod tests {
         no_non_registry_fixture: "NuGet's non-Registry classification (AlternateRegistry/CustomRegistry via NuGet.Config) only fires once a real NuGet.Config file resolves from disk (issue #523) — the shared macro's fixture has no filesystem backing to supply one. Covered instead by test_private_feed_clear_resolves_zero_requests_to_public_registry below, which builds a real NuGet.Config end-to-end and asserts the same zero-public-request property.";
     }
 
+    // #1354 security audit: `crate::parser` degrades an unresolved `$(Property)` MSBuild
+    // reference to `version_requirement: None` before either `plan_vulnerability_fix` or
+    // `format_version_replacing_for` is ever reached — this fixture pins that degradation
+    // (defense-in-depth today, but must keep holding).
+    deps_core::unresolved_requirement_conformance! {
+        mod nuget_unresolved_requirement_conformance;
+        build: NuGetEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: false;
+        fixture: "unresolved.csproj" =>
+            "<Project><ItemGroup><PackageReference Include=\"AutoMapper\" Version=\"$(AutoMapperVersion)\" /><PackageReference Include=\"known-good-control\" Version=\"1.0.0\" /></ItemGroup></Project>";
+    }
+
     // #758: the shared completion-prefix-length guard, replacing
     // test_complete_package_names_min_prefix (which only checked the empty-prefix case).
     #[cfg(feature = "lsp-responses")]

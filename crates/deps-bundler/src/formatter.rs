@@ -63,6 +63,26 @@ impl RequirementMatcher for RubygemsMatcher {
     }
 }
 
+/// Whether `requirement` contains an unresolved Ruby string-interpolation placeholder —
+/// either the general `#{...}` form or one of Ruby's shorthand forms for a bare instance
+/// (`#@ivar`), class (`#@@cvar`), or global (`#$GVAR`) variable reference, e.g. `gem 'rails',
+/// "~> #{RAILS_VERSION}"` or `gem 'rails', "~> #@rails_version"`. Bundler's parser does not
+/// degrade any of these shapes to `version_requirement: None` (unlike NuGet's `$(Property)`),
+/// so they reach [`RequirementResolution`] and [`PackageRendering`] directly — issue #1354
+/// security audit: `compile_requirement` previously returned `None` for `"~> #{V}"` only by
+/// coincidence (its operand fails `is_valid_rubygems_version`), while `">= #{V}"` compiled to
+/// `Some(true)` for every candidate (`fail_closed_operand` excludes `>=`), and neither path
+/// stopped `format_version_replacing` from planning a destructive `"9.9.9"`-literal rewrite
+/// over the interpolation. #1354 critic S4: the shorthand forms (`#@`/`#@@`/`#$`) were
+/// initially missed by a `#{`-only check, leaving `"~> #@v"` rewritable. Mirrors
+/// `NuGetFormatter`'s `$(Property)` guard (#1352).
+fn requirement_contains_unresolved_interpolation(requirement: &str) -> bool {
+    requirement
+        .as_bytes()
+        .array_windows::<2>()
+        .any(|&[c, next]| c == b'#' && matches!(next, b'{' | b'@' | b'$'))
+}
+
 /// A Bundler requirement written as `= X` or bare `X` (no operator) pins a single exact
 /// version. Returns the pinned version string, or `None` when `requirement` is a wildcard,
 /// empty, or a range/comparison operator (`~>`, `>=`, `>`, `<=`, `<`, `!=`) rather than a pin.
@@ -170,10 +190,29 @@ impl PackageRendering for BundlerFormatter {
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::gem_url(name.as_str())
     }
+
+    /// #1354 hardening: an unresolved Ruby interpolation (see
+    /// `requirement_contains_unresolved_interpolation`) in `current` leaves `current`
+    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
+    /// latest" edit can never hardcode a literal version over `#{...}` — mirrors
+    /// `NuGetFormatter::format_version_replacing`'s `$(Property)` guard.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_contains_unresolved_interpolation(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
 }
 
 impl RequirementResolution for BundlerFormatter {
+    /// #1354 hardening: an unresolved requirement (see
+    /// [`Self::requirement_is_unresolved`]) returns `true` (treated as satisfied) rather than
+    /// falling into `version_matches_requirement`, which would otherwise compare the raw
+    /// `#{...}` text against every candidate — mirrors `NuGetFormatter`'s identical guard.
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
+        if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
+            return true;
+        }
         let version = version.as_str();
         version_matches_requirement(version, requirement)
     }
@@ -194,6 +233,9 @@ impl RequirementResolution for BundlerFormatter {
     /// therefore decide it precisely instead of this method having to guess from
     /// `requirement` alone.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        if self.requirement_is_unresolved(requirement) {
+            return None;
+        }
         compile_requirement_unless(
             requirement.as_str(),
             |r| fail_closed_operand(r).is_some_and(|operand| !is_valid_rubygems_version(operand)),
@@ -208,6 +250,17 @@ impl RequirementResolution for BundlerFormatter {
         available: &[ConcreteVersion],
     ) -> bool {
         exact_pin_could_be_yanked(requirement.as_str(), available)
+    }
+
+    /// #1354: an unexpanded Ruby string-interpolation placeholder (`#{...}`) inside a
+    /// requirement — see `requirement_contains_unresolved_interpolation`. Previously, only
+    /// the fail-closed operator shapes (`~>`, `<`, `<=`, `=`, bare) happened to make
+    /// `compile_requirement` undecidable for it; a fail-open operator (`>=`, `>`, `!=`)
+    /// compiled to a matcher that accepted every candidate instead. This explicit predicate
+    /// makes every operator shape decide identically, mirroring Maven/Gradle/NuGet's
+    /// unresolved-variable precedent.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_unresolved_interpolation(requirement.as_str())
     }
 }
 
@@ -572,5 +625,140 @@ mod tests {
         let formatter = BundlerFormatter;
         let err = formatter.validate_package_name("123").unwrap_err();
         assert!(err.reason().contains("letter"));
+    }
+
+    // --- #1354: unresolved Ruby interpolation (`#{...}`) must never be rewritten ---
+
+    #[test]
+    fn test_requirement_is_unresolved_ruby_interpolation() {
+        let formatter = BundlerFormatter;
+        assert!(formatter.requirement_is_unresolved(&VersionReq::new("~> #{RAILS_VERSION}")));
+        assert!(formatter.requirement_is_unresolved(&VersionReq::new(">= #{RAILS_VERSION}")));
+        assert!(!formatter.requirement_is_unresolved(&VersionReq::new("~> 7.0")));
+    }
+
+    /// #1354 critic S4: the shorthand interpolation forms (`#@ivar`, `#@@cvar`, `#$GVAR`) must
+    /// be detected too, not just the general `#{...}` form — a `#{`-only check previously left
+    /// `"~> #@v"` classified as an ordinary (resolvable) requirement.
+    #[test]
+    fn test_requirement_is_unresolved_ruby_shorthand_interpolation() {
+        let formatter = BundlerFormatter;
+        assert!(formatter.requirement_is_unresolved(&VersionReq::new("~> #@ivar")));
+        assert!(formatter.requirement_is_unresolved(&VersionReq::new("~> #@@cvar")));
+        assert!(formatter.requirement_is_unresolved(&VersionReq::new("~> #$GVAR")));
+        assert!(formatter.requirement_is_unresolved(&VersionReq::new(">= #@ivar")));
+        // A bare '#' not followed by {, @, or $ is not interpolation syntax.
+        assert!(!formatter.requirement_is_unresolved(&VersionReq::new("~> 7.0 # comment")));
+    }
+
+    #[test]
+    fn test_compile_requirement_none_for_unresolved_interpolation_any_operator() {
+        let formatter = BundlerFormatter;
+        // Previously only the fail-closed operators (~>, <, <=, =, bare) happened to be
+        // undecidable; >= failed open and compiled to a matcher accepting every candidate.
+        for requirement in [
+            "~> #{V}", "< #{V}", "<= #{V}", "= #{V}", "#{V}", ">= #{V}", "> #{V}", "!= #{V}",
+        ] {
+            assert!(
+                formatter
+                    .compile_requirement(&VersionReq::new(requirement))
+                    .is_none(),
+                "expected {requirement:?} to be undecidable"
+            );
+        }
+    }
+
+    #[test]
+    fn test_version_satisfies_requirement_unresolved_interpolation_returns_true() {
+        let formatter = BundlerFormatter;
+        assert!(
+            formatter.version_satisfies_requirement(
+                &ConcreteVersion::new("7.0.8"),
+                "~> #{RAILS_VERSION}"
+            )
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_guards_unresolved_interpolation() {
+        let formatter = BundlerFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("9.9.9"), "~> #{V}"),
+            "~> #{V}"
+        );
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("9.9.9"), "~> 7.0"),
+            "9.9.9"
+        );
+    }
+
+    /// #1354 critic S4: the shorthand form must be guarded identically to `#{...}`.
+    #[test]
+    fn test_format_version_replacing_guards_ruby_shorthand_interpolation() {
+        let formatter = BundlerFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("9.9.9"), "~> #@v"),
+            "~> #@v"
+        );
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("0.0.1"), "~> #$GVAR"),
+            "~> #$GVAR"
+        );
+    }
+
+    /// #1354 security audit: exercises `deps_core::edit::plan_vulnerability_fix` with the
+    /// *real* `BundlerFormatter` (not a hand-rolled mock) and a `BundlerDependency` obtained
+    /// from the real `crate::parser::parse_gemfile` path, on a vulnerable gem whose declared
+    /// requirement is an unexpanded Ruby interpolation — mirrors `deps-nuget`'s
+    /// `test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency` (#1352).
+    ///
+    /// Unlike NuGet, Bundler's own parser does *not* degrade `#{...}` to
+    /// `version_requirement: None` — this scenario is reachable through the real
+    /// `generate_code_actions`/`deps-cli` call graph, not defense-in-depth only.
+    #[test]
+    fn test_plan_vulnerability_fix_unresolved_interpolation_returns_none() {
+        use deps_core::ParseResult;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let gemfile = r#"gem "rails", "~> #{RAILS_VERSION}""#;
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("parser preserves the raw interpolated requirement text")
+            .as_str();
+        assert_eq!(current, "~> #{RAILS_VERSION}");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0002".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["7.0.8".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "7.0.8".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            deps_core::position::Range::default(),
+            current,
+            &dv,
+            &BundlerFormatter,
+        );
+
+        assert!(
+            planned.is_none(),
+            "the real BundlerFormatter must suppress the fix for an unresolved interpolation"
+        );
     }
 }

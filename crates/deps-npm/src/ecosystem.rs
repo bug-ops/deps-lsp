@@ -444,6 +444,18 @@ mod tests {
         non_registry_fixture: "package.json" => r#"{"dependencies": {"acme-internal-secret": "git+ssh://git@github.com/acme/internal-secret.git"}}"#;
     }
 
+    // #1354 security audit: `"catalog:"` with no resolvable `pnpm-workspace.yaml` on disk
+    // (the fixture's synthetic URI has no real workspace file backing it) leaves the
+    // dependency's `version_requirement` unresolved (`None`) before either
+    // `plan_vulnerability_fix` or `format_version_replacing_for` is ever reached.
+    deps_core::unresolved_requirement_conformance! {
+        mod npm_unresolved_requirement_conformance;
+        build: NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: false;
+        fixture: "package.json" =>
+            r#"{"dependencies": {"acme-widgets": "catalog:", "known-good-control": "1.0.0"}}"#;
+    }
+
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
     #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {

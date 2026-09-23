@@ -160,6 +160,19 @@ mod tests {
         non_registry_fixture: "Gemfile" => "source 'https://rubygems.org'\ngem 'local_gem', path: '../local_gem'\n";
     }
 
+    // #1354 security audit: Bundler's parser does not degrade an unexpanded Ruby
+    // interpolation (`#{...}`) to `version_requirement: None` — it reaches
+    // `plan_vulnerability_fix`/`format_version_replacing_for` directly, so
+    // `BundlerFormatter`'s `#{`-guard (see `formatter::requirement_contains_unresolved_interpolation`)
+    // must actually hold.
+    deps_core::unresolved_requirement_conformance! {
+        mod bundler_unresolved_requirement_conformance;
+        build: BundlerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: "Gemfile" =>
+            "gem 'rails', \"~> #{RAILS_VERSION}\"\ngem 'sidekiq', \"~> #@sidekiq_version\"\ngem 'puma', \"~> #$PUMA_VERSION\"\n";
+    }
+
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.

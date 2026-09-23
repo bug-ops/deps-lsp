@@ -326,6 +326,13 @@ mod tests {
         non_registry_fixture: "go.mod" => "module example.com/myapp\n\nrequire github.com/acme/secretmod v1.0.0\n\nreplace github.com/acme/secretmod => ./local/secretmod\n";
     }
 
+    // #1354 security audit: `go.mod`'s `require`/`replace` directive grammar has no
+    // placeholder/environment-variable interpolation syntax for a module version.
+    deps_core::unresolved_requirement_conformance! {
+        mod go_unresolved_requirement_conformance;
+        no_placeholder_syntax: "go.mod module versions are plain tokens with no placeholder/variable interpolation grammar (#1354)";
+    }
+
     // #794: no `completion_guard_conformance!` for this crate — `complete_package_names`
     // above unconditionally returns `vec![]` (Go has no centralized module-search API, so
     // users type the full module path), never calling `registry.search` or

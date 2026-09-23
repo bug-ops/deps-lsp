@@ -1304,6 +1304,19 @@ mod tests {
         non_registry_fixture: ".github/workflows/ci.yml" => "steps:\n  - uses: ./local-action\n";
     }
 
+    // #1354 security audit: GitHub Actions preserves an unresolved `${{ }}` expression ref as
+    // `Some(version_requirement)` (unlike NuGet/PyPI/npm, which degrade to `None`) — reachable
+    // through the full `plan_vulnerability_fix`/`format_version_replacing_for` pipeline, so
+    // `PinStyle::Branch`'s no-op fallback (see `GithubActionsFormatter::format_version_replacing_for`'s
+    // doc) must actually hold, not just happen to.
+    deps_core::unresolved_requirement_conformance! {
+        mod github_actions_unresolved_requirement_conformance;
+        build: GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: ".github/workflows/unresolved.yml" =>
+            "on: push\njobs:\n  build:\n    steps:\n      - uses: \"actions/checkout@${{ env.CHECKOUT_REF }}\"\n";
+    }
+
     // #1137: regression guard, not independent parser verification (see
     // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
     // own doc comment (a `uses:` ref has no operator syntax), so an edit to one without the
