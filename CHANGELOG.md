@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: an unauthenticated GitHub 403/429 is now classified as a genuine rate limit only when the response confirms exhaustion (`X-RateLimit-Remaining: 0` or a `Retry-After` header), so `unwrap_or_skip_github_rate_limit` no longer silently skips an unrelated 403 cause as expected (resolves #1295) (#1308)
 - **deps-core**: `DepsError::fetch_failure` and its telemetry-label sibling classifier are now exhaustive matches with no wildcard arm, so a future variant cannot silently lose its diagnostic hint (resolves #1244) (#1308)
 - **deps-cargo**: `Cargo.lock` `sparse+` sources now classify as `ResolvedSource::Registry` instead of falling through to the `::Path` catch-all (latent — no current consumer branches on the variant yet) (resolves #1320) (#1324)
+- **deps-nuget**: added a regression test proving `own_auth_id` actually separates `HttpCache` entries between distinct credentials against the same feed URL, closing a coverage gap where the invariant was untested (resolves #1026)
 
 ### Breaking
 - **deps-core**: `Ecosystem::generate_hover` and `lsp_helpers::generate_hover` now return the protocol-agnostic `deps_core::hover::Hover` instead of `tower_lsp_server::ls_types::Hover` (resolves #1277) (#1309)
