@@ -55,19 +55,21 @@ impl PackageNaming for NuGetFormatter {
     /// package name" instead of falling through to a registry lookup and rendering the
     /// generic "Registry lookup failed" diagnostic (#402).
     ///
-    /// An unresolved MSBuild property reference (e.g. `<PackageReference
-    /// Include="$(MyPackageId)" />`) is checked first and always accepted — the same
-    /// unresolvable-variable treatment `requirement_is_unresolved` already gives a
-    /// `$(...)`-containing *version* string (#402 critique M2): `name` here is not a
-    /// concrete package id at all until MSBuild expands the property, so it has no shape to
-    /// validate.
+    /// An unresolved MSBuild reference (e.g. `<PackageReference Include="$(MyPackageId)" />`,
+    /// `Include="%(Identity)"`, or `Include="@(SomeItems)"`) is checked first and always
+    /// accepted — the same unresolvable-reference treatment `requirement_is_unresolved` gives
+    /// an MSBuild-reference-containing *version* string (#402 critique M2, extended to `%(`/
+    /// `@(` by #1355's code-review follow-up): `name` here is not a concrete package id at all
+    /// until MSBuild expands the reference, so it has no shape to validate — without this
+    /// guard, `%(`/`@(` fell through to `is_valid_nuget_id` and rendered an incorrect
+    /// "Invalid package name" diagnostic instead of being silently skipped.
     ///
     /// # Errors
     ///
     /// Returns [`InvalidPackageName`] if `name` is empty, exceeds 100 characters, or contains
     /// a character outside NuGet's `\w+([_.-]\w+)*` shape.
     fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
-        if name.contains("$(") {
+        if crate::parser::is_msbuild_reference(name) {
             return Ok(());
         }
         if name.is_empty() {
@@ -99,23 +101,25 @@ impl PackageRendering for NuGetFormatter {
         version.to_string()
     }
 
-    /// Issue #1347 hardening: an unexpanded MSBuild property reference (`$(SomeProperty)`) in
-    /// `current` leaves `current` unchanged instead of substituting `version`, so hardcoding a
-    /// literal version over a centrally-managed property is structurally impossible even if a
-    /// future caller reaches this method with such text. Returning `current` verbatim trips the
-    /// pre-existing textual no-op guards in `deps_core::edit::collect_update_candidates`/
-    /// `plan_vulnerability_fix`.
+    /// Issue #1347 hardening: an unexpanded MSBuild reference (`$(SomeProperty)`,
+    /// `%(MetadataName)`, or `@(ItemList)`) in `current` leaves `current` unchanged instead of
+    /// substituting `version`, so hardcoding a literal version over a centrally-managed
+    /// reference is structurally impossible even if a future caller reaches this method with
+    /// such text. Returning `current` verbatim trips the pre-existing textual no-op guards in
+    /// `deps_core::edit::collect_update_candidates`/`plan_vulnerability_fix`.
     ///
     /// Currently defense-in-depth only, not a fix for a reproducible defect: `crate::parser`
-    /// already degrades every `$(...)`-containing manifest shape to `version_requirement: None`
-    /// before either the LSP code-action path or `deps-cli` ever reaches this method (verified
-    /// across `.csproj` attribute/child-element form, `Directory.Packages.props`,
-    /// `packages.config`, and the bracketed `[$(Min),$(Max))` form — see
-    /// `parser::test_unresolved_msbuild_property_degrades_to_none`), so `current` never actually
-    /// contains `$(` in production today. This guards against that parser invariant ever
-    /// relaxing, at negligible cost.
+    /// already degrades every MSBuild-reference-containing manifest shape to
+    /// `version_requirement: None` before either the LSP code-action path or `deps-cli` ever
+    /// reaches this method (verified across `.csproj` attribute/child-element form,
+    /// `Directory.Packages.props`, `packages.config`, and the bracketed `[$(Min),$(Max))`
+    /// form — see `parser::test_unresolved_msbuild_property_degrades_to_none`), so `current`
+    /// never actually contains one of these references in production today. This guards
+    /// against that parser invariant ever relaxing, at negligible cost. Uses the same
+    /// `crate::parser::is_msbuild_reference` predicate as `requirement_is_unresolved` and the
+    /// parser's own degrade guards, for consistency (#1355).
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if current.contains("$(") {
+        if crate::parser::is_msbuild_reference(current) {
             return current.to_string();
         }
         self.format_version_for_text_edit(version)
@@ -183,17 +187,22 @@ impl RequirementResolution for NuGetFormatter {
         }
     }
 
-    /// M3: an unexpanded MSBuild property reference (`$(PropertyName)`) inside a version
-    /// string — most commonly `[$(MinVersion),$(MaxVersion))`. `crate::version::parse_range`
-    /// now rejects this bracketed form outright (#821: `$(...)`'s parentheses trip the shared
-    /// grammar's nested-bracket guard), which `compile_requirement` alone would already treat
-    /// as undecidable — but without this guard, `requirement_status` would classify it as a
-    /// generic malformed requirement instead of the more specific `Unresolved` status, losing
-    /// the "not yet expanded, skip the check" diagnostic distinction. A bare `$(X)`
-    /// (unbracketed) has no such bracket to trip a guard and needs this classification too.
+    /// M3: an unexpanded MSBuild reference (`$(PropertyName)`, `%(MetadataName)`, or
+    /// `@(ItemList)`) inside a version string — most commonly `[$(MinVersion),$(MaxVersion))`.
+    /// `crate::version::parse_range` rejects the bracketed `$(...)` form outright (#821:
+    /// its parentheses trip the shared grammar's nested-bracket guard), which
+    /// `compile_requirement` alone would already treat as undecidable — but without this
+    /// guard, `requirement_status` would classify it as a generic malformed requirement
+    /// instead of the more specific `Unresolved` status, losing the "not yet expanded, skip
+    /// the check" diagnostic distinction. A bare `$(X)`/`%(X)`/`@(X)` (unbracketed) has no
+    /// such bracket to trip a guard and needs this classification too — without it, a bare
+    /// `%(Version)`/`@(ItemList)` parses as a bogus bare-floor version and can plan an
+    /// incorrect rewrite edit, offer completions, or render a diagnostic (#1355). Uses the
+    /// same `crate::parser::is_msbuild_reference` predicate as the parser's own degrade
+    /// guards, so a reference recognized at parse time is also recognized here.
     /// Mirrors Maven's `${property}` / Gradle's `$var`/`${var}` unresolved-variable guards.
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement.as_str().contains("$(")
+        crate::parser::is_msbuild_reference(requirement.as_str())
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
@@ -318,7 +327,7 @@ mod tests {
         package_url: { "Newtonsoft.Json" => "https://www.nuget.org/packages/Newtonsoft.Json" };
         accepts: [
             "Newtonsoft.Json", "Microsoft.Extensions.Logging", "moq",
-            "_foo", "foo__bar", "_", "foo_bar", "$(MyPackageId)",
+            "_foo", "foo__bar", "_", "foo_bar", "$(MyPackageId)", "%(Identity)", "@(SomeItems)",
         ];
         rejects: [ "", ".Json", "Json.", "New..Json", "New Json", "日本語" ];
         version_roundtrip: [
@@ -609,6 +618,24 @@ mod tests {
     fn test_requirement_is_unresolved_bracketed_msbuild_property() {
         let f = NuGetFormatter;
         assert!(f.requirement_is_unresolved(&VersionReq::new("[$(MinVersion),$(MaxVersion))")));
+    }
+
+    /// #1355: `%(Version)` (MSBuild item-metadata syntax) must be classified as unresolved,
+    /// the same as `$(PropertyName)` — unlike the bracketed `$(...)` form, a bare `%(...)` has
+    /// no bracket to trip `parse_range`'s nested-bracket guard, so without this check it
+    /// parses as a bogus bare-floor version and can plan an incorrect rewrite edit.
+    #[test]
+    fn test_requirement_is_unresolved_msbuild_item_metadata() {
+        let f = NuGetFormatter;
+        assert!(f.requirement_is_unresolved(&VersionReq::new("%(Version)")));
+    }
+
+    /// #1355: `@(ItemList)` (MSBuild item-list reference) must be classified as unresolved
+    /// too, the same as `$(PropertyName)`/`%(MetadataName)`.
+    #[test]
+    fn test_requirement_is_unresolved_msbuild_item_list() {
+        let f = NuGetFormatter;
+        assert!(f.requirement_is_unresolved(&VersionReq::new("@(PollyVer)")));
     }
 
     #[test]
