@@ -61,7 +61,10 @@ fn multi_project_lockfile_name(manifest_uri: &Url) -> Option<String> {
     }
     // Matches `PackagesLockFileUtilities.GetNuGetLockFilePath`'s
     // `projectName.Replace(' ', '_')` in NuGet.Client.
-    Some(format!("packages.{}.lock.json", project_name.replace(' ', "_")))
+    Some(format!(
+        "packages.{}.lock.json",
+        project_name.replace(' ', "_")
+    ))
 }
 
 #[derive(Deserialize)]
