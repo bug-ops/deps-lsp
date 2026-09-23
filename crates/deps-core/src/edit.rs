@@ -685,12 +685,33 @@ pub fn fix_target_is_verified(
 /// The dependency must already be known to be [`crate::osv::ScanOutcome::Vulnerable`]; this
 /// targets [`crate::osv::DependencyVulnerabilities::recommended_fix`] rather than `latest`.
 ///
-/// Verbatim move of `lsp_helpers::code_actions::build_vulnerability_fix_action`'s planning
-/// core (the no-op guard, `is_safe_version_string`, `osv_version_to_native`,
+/// Originally a verbatim move of `lsp_helpers::code_actions::build_vulnerability_fix_action`'s
+/// planning core (the no-op guard, `is_safe_version_string`, `osv_version_to_native`,
 /// `format_version_replacing_for`, and the [`fix_target_is_verified`] gate) — yank/timeout
 /// filtering is deliberately **not** moved: both `deps-lsp` and `deps-cli` apply their own
 /// source and policy for that (see `lsp_helpers::code_actions::generate_code_actions`'s
 /// yank-filtering block and `deps-cli`'s `update::security` module).
+///
+/// #1344: also gated on whether `dep`'s own declared requirement, left unedited, already
+/// *resolves forward* to the fix target under this ecosystem's own resolution rules
+/// (`formatter.requirement_already_resolves_to(..)`) — not just the textual no-op guard below
+/// (which only catches the declared literal already *spelling* the fix version verbatim).
+/// `serde = "1"` with fix `1.0.2` must not be rewritten to `serde = "1.0.2"`: the declared
+/// range already accepts `1.0.2`, so re-resolving already gets there without a manifest edit
+/// (a `cargo update`/lock-file refresh, for an ecosystem that has one — not every ecosystem
+/// does: Maven and Gradle have none, and a NuGet project's is opt-in. For those, suppression
+/// is instead because the requirement already structurally expresses the fix — e.g. a Maven
+/// dynamic range/`LATEST`/`SNAPSHOT` resolves it at build time — not because of any lock
+/// file). `requirement_already_resolves_to`'s default asks only "is the fix a member of the
+/// requirement's accepted set", correct for a requirement a resolver picks its *newest*
+/// admissible member from, but wrong for one a resolver instead pins to its *lowest*
+/// admissible member (NuGet's bare `Version="1.0.0"` floor, #1344) — ecosystems with that
+/// resolution shape override the method rather than relying on the default; see
+/// `deps-nuget`'s override. Ecosystems with no `compile_requirement` override (GitHub Actions,
+/// GitLab CI — SHA/tag pins, not version ranges) fall through to the textual no-op guard as
+/// the only available signal. Originally only checked by `deps-cli update --security-only`'s
+/// `classify_vulnerable_dependency` (#1329); moved here so `deps-lsp`'s vulnerability-fix code
+/// action shares the same decision instead of reimplementing it.
 ///
 /// `dv` and `current` are supplied by the caller rather than resolved internally — the
 /// pre-extraction function rebuilt `crate::osv::vulnerability_keys` per call, tolerable for
@@ -790,11 +811,16 @@ pub fn plan_vulnerability_fix(
         return None;
     }
 
-    let new_text = formatter.format_version_replacing_for(
-        dep,
-        &ConcreteVersion::new(version_native.as_str()),
-        current,
-    );
+    let fix_concrete = ConcreteVersion::new(version_native.as_str());
+    let requirement_already_resolves_to_fix =
+        dep.version_requirement().is_some_and(|version_req| {
+            formatter.requirement_already_resolves_to(version_req, &fix_concrete)
+        });
+    if requirement_already_resolves_to_fix {
+        return None;
+    }
+
+    let new_text = formatter.format_version_replacing_for(dep, &fix_concrete, current);
     let literal_target = dep.version_literal().unwrap_or(current);
     if strip_whitespace(literal_target) == strip_whitespace(&new_text) {
         return None;
@@ -1185,6 +1211,161 @@ mod tests {
 
             let candidates = collect_update_candidates(&pr, content, versions, &MockFormatter);
             assert!(candidates.is_empty());
+        }
+    }
+
+    // --- plan_vulnerability_fix: #1344 requirement-already-admits-fix gate ---
+
+    mod plan_vulnerability_fix_tests {
+        use super::*;
+        use crate::PackageName;
+        use crate::lsp_helpers::test_support::{MockDep, MockFormatter, StrictSemverFormatter};
+        use crate::lsp_helpers::{
+            DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+            RequirementMatcher, RequirementResolution, SourcePolicy,
+        };
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        fn dep(name: &str, req: &str, version_range: crate::position::Range) -> MockDep {
+            MockDep {
+                name: PackageName::new(name),
+                version_req: crate::VersionReq::new(req),
+                version_range,
+                name_range: crate::position::Range::default(),
+            }
+        }
+
+        fn verified_dv(fixed_version: &str) -> DependencyVulnerabilities {
+            let advisory = std::sync::Arc::new(
+                Advisory::new(
+                    "RUSTSEC-2024-0001".to_string(),
+                    "2024-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::High,
+                )
+                .expect("valid osv id")
+                .with_fixed_versions(vec![fixed_version.to_string()]),
+            );
+            DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
+                UpgradeStatus::CandidateClean {
+                    version: fixed_version.to_string(),
+                },
+            )
+        }
+
+        /// A caret range ("^1" is what Cargo/npm-shaped bare "1" compiles to) that already
+        /// admits the fix target must suppress the edit — the declared requirement needs no
+        /// manifest change, only a lock-file update.
+        #[test]
+        fn test_requirement_already_admitting_fix_returns_none() {
+            let d = dep("serde", "1", range(0, 8, 0, 9));
+            let dv = verified_dv("1.0.2");
+
+            let planned =
+                plan_vulnerability_fix(&d, d.version_range, "1", &dv, &StrictSemverFormatter);
+            assert!(planned.is_none());
+        }
+
+        /// A requirement the comparator confirms does NOT admit the fix target must still
+        /// produce a rewrite — the #1344 gate must not suppress legitimate fixes.
+        #[test]
+        fn test_requirement_not_admitting_fix_returns_planned_edit() {
+            let d = dep("serde", "0.9", range(0, 8, 0, 11));
+            let dv = verified_dv("1.0.2");
+
+            let planned =
+                plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &StrictSemverFormatter)
+                    .expect("0.9 does not admit 1.0.2, so an edit must be planned");
+            assert_eq!(planned.edit.new_text, "1.0.2");
+            assert_eq!(planned.target.as_str(), "1.0.2");
+        }
+
+        /// An ecosystem with no `compile_requirement` override (e.g. GitHub Actions/GitLab CI)
+        /// has no comparator to consult, so the gate is inert and the textual no-op guard is
+        /// the only available signal — a genuinely different target must still be planned.
+        #[test]
+        fn test_no_compile_requirement_override_falls_back_to_no_op_guard() {
+            let d = dep("serde", "1", range(0, 8, 0, 9));
+            let dv = verified_dv("1.0.2");
+
+            let planned =
+                plan_vulnerability_fix(&d, d.version_range, "1", &dv, &MockFormatter).unwrap();
+            assert_eq!(planned.edit.new_text, "\"1.0.2\"");
+        }
+
+        /// A synthetic formatter mimicking a resolver that pins a bare requirement to its
+        /// *lowest* admissible member (NuGet's bare `Version="1.0.0"` floor, #1344 C1) rather
+        /// than following forward to the newest one. Its raw `compile_requirement` matcher is
+        /// deliberately permissive (matches any version at or above the floor, exactly like
+        /// NuGet's `Minimum` shape) so this test proves `plan_vulnerability_fix` consults
+        /// `requirement_already_resolves_to`'s override — which correctly refuses to
+        /// suppress — rather than the raw matcher alone.
+        struct FloorFormatter;
+
+        struct FloorMatcher(String);
+        impl RequirementMatcher for FloorMatcher {
+            fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+                Some(version.as_str() >= self.0.as_str())
+            }
+        }
+
+        impl PackageNaming for FloorFormatter {}
+        impl PackageRendering for FloorFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for FloorFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &crate::VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                Some(Box::new(FloorMatcher(requirement.as_str().to_string())))
+            }
+
+            fn requirement_already_resolves_to(
+                &self,
+                _requirement: &crate::VersionReq,
+                _target: &ConcreteVersion,
+            ) -> bool {
+                // A floor never auto-follows forward — leaving it unedited always keeps
+                // resolving to the floor itself, never to a higher target.
+                false
+            }
+        }
+        impl DiagnosticMessages for FloorFormatter {}
+        impl DiagnosticPolicy for FloorFormatter {}
+        impl SourcePolicy for FloorFormatter {}
+        impl OsvNaming for FloorFormatter {}
+
+        /// #1344 C1 regression: a floor-shaped requirement must NOT be suppressed just
+        /// because `compile_requirement`'s raw matcher admits the fix target — the resolver
+        /// keeps pinning to the floor, so an edit is still the only way to actually apply the
+        /// fix. See `deps-nuget`'s real `requirement_already_resolves_to` override for the
+        /// concrete regression this mirrors.
+        #[test]
+        fn test_floor_shaped_requirement_still_returns_planned_edit() {
+            let d = dep("nuget.pkg", "1.0.0", range(0, 8, 0, 15));
+            let dv = verified_dv("1.0.2");
+
+            // Sanity: the raw matcher alone would wrongly admit the fix, if the gate used it
+            // directly instead of `requirement_already_resolves_to`.
+            assert_eq!(
+                FloorFormatter
+                    .compile_requirement(&crate::VersionReq::new("1.0.0"))
+                    .unwrap()
+                    .matches(&ConcreteVersion::new("1.0.2")),
+                Some(true)
+            );
+
+            let planned =
+                plan_vulnerability_fix(&d, d.version_range, "1.0.0", &dv, &FloorFormatter)
+                    .expect("a floor-shaped requirement must not suppress the fix");
+            assert_eq!(planned.edit.new_text, "1.0.2");
         }
     }
 }

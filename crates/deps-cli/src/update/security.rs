@@ -8,7 +8,7 @@ use std::time::Duration;
 use deps_core::edit::{fix_target_is_verified, plan_vulnerability_fix};
 use deps_core::lsp_helpers::resolve_in_use_version;
 use deps_core::osv::{OsvClient, ScanOutcome};
-use deps_core::{ConcreteVersion, Ecosystem, is_safe_version_string};
+use deps_core::{Ecosystem, is_safe_version_string};
 
 use crate::analyze::ManifestAnalysis;
 use crate::update::ignore::IgnoreRules;
@@ -299,30 +299,6 @@ fn classify_vulnerable_dependency(
         );
     };
 
-    // S1 (critic finding, spec.md US-003/Out-of-Scope): whether the declared requirement
-    // already *admits* the fix target must be decided by the ecosystem's own comparator
-    // (`compile_requirement().matches(..)`), not by `plan_vulnerability_fix`'s textual no-op
-    // guard (which only catches the declared literal already *spelling* the fix version
-    // verbatim). Without this check, `serde = "1"` with fix `1.0.2` was rewritten to
-    // `serde = "1.0.2"` instead of being reported `RequiresLockfileUpdate` — the declared
-    // range already accepts `1.0.2`, so #1116 (a lock-file update) is what actually pulls the
-    // fix in, not a manifest edit. Ecosystems with no `compile_requirement` override (GitHub
-    // Actions, GitLab CI — SHA/tag pins, not version ranges) fall through to
-    // `plan_vulnerability_fix`'s own no-op guard below as the only available signal.
-    let fix_concrete = ConcreteVersion::new(version_native.as_str());
-    let requirement_already_admits_fix = formatter
-        .compile_requirement(version_req)
-        .is_some_and(|matcher| matcher.matches(&fix_concrete) == Some(true));
-    if requirement_already_admits_fix {
-        return requires_lockfile_update_item(
-            dep,
-            &current,
-            &version_native,
-            &fix.advisory_ids,
-            ignore_rule_overridden,
-        );
-    }
-
     // FR-012: native-form comparison — comparing OSV's wire-form version directly against
     // `PackageVersions::yanked` would silently never match for an ecosystem whose OSV and
     // native spellings diverge (PyPI, Maven, NuGet). `reports_yanked() == false` ecosystems
@@ -353,9 +329,15 @@ fn classify_vulnerable_dependency(
             advisory_ids: fix.advisory_ids,
             ignore_rule_overridden,
         },
-        // The remaining fallback: `compile_requirement` was unavailable (GitHub
-        // Actions/GitLab CI) and the declared literal already spells the fix text verbatim —
-        // `plan_vulnerability_fix`'s own no-op guard fired.
+        // #1344: `plan_vulnerability_fix` returns `None` either because the declared
+        // requirement already resolves forward to the fix target (per
+        // `requirement_already_resolves_to`, which is ecosystem-aware — see its and
+        // `NuGetFormatter`'s doc for why this is not simply "the requirement admits the fix")
+        // or, for ecosystems with no `compile_requirement` comparator (GitHub Actions/GitLab
+        // CI), because the declared literal already spells the fix text verbatim — both read
+        // as "nothing to rewrite here." Note this runs after the FR-012 yanked filter above,
+        // so a requirement that already resolves forward but whose fix target is yanked was
+        // already reported `Unfixable(Yanked)` and never reaches this match.
         None => requires_lockfile_update_item(
             dep,
             &current,
@@ -917,6 +899,45 @@ mod tests {
         let analysis = test_analysis(cached, HashSet::new());
         let formatter = TestFormatter {
             requirement_already_admits_fix: false,
+            osv_native_differs: false,
+        };
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            "serde",
+            &analysis,
+            &formatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(matches!(
+            item.outcome,
+            Outcome::Unfixable(UnfixableReason::Yanked)
+        ));
+    }
+
+    /// #1344 C3: since the requirement-already-admits-fix gate moved inside
+    /// `plan_vulnerability_fix`, it now runs AFTER the FR-012 yanked filter, not before it —
+    /// a requirement that already admits the fix AND a yanked fix target must report
+    /// `Unfixable(Yanked)`, not `RequiresLockfileUpdate`: a yanked version is never actually
+    /// selected by re-resolving regardless of what the declared requirement admits, so
+    /// `Unfixable(Yanked)` is the more truthful classification. Pins this intentional
+    /// ordering so a future refactor that reverts it is a visible test failure, not a silent
+    /// behavior change.
+    #[test]
+    fn test_classify_requirement_admits_fix_and_yanked_is_unfixable_yanked_not_lockfile() {
+        let dep = dep("serde", "1");
+        let dv = verified_dv("1.0.2");
+        let mut cached = HashMap::new();
+        cached.insert(
+            PackageName::new("serde"),
+            PackageVersions::new("1.0.2".into(), std::sync::Arc::from([])).with_yanked(
+                std::sync::Arc::from([("1.0.2".into(), RemovalStatus::from_yanked(true))]),
+            ),
+        );
+        let analysis = test_analysis(cached, HashSet::new());
+        let formatter = TestFormatter {
+            requirement_already_admits_fix: true,
             osv_native_differs: false,
         };
         let item = classify_vulnerable_dependency(

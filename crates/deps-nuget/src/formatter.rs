@@ -187,6 +187,30 @@ impl RequirementResolution for NuGetFormatter {
             )
         }
     }
+
+    /// Overridden for the same reason as [`Self::is_requirement_up_to_date`]: a bare or
+    /// explicit open-ended-minimum requirement (`1.0.0`, `[1.0.0,)`) is a floor NuGet resolves
+    /// to its *lowest* admissible member, not an auto-following range — the base default
+    /// (`compile_requirement(..).matches(target)`, true for any version at or above the
+    /// floor) would wrongly say "no edit needed" for exactly the shape that needs one, since
+    /// leaving the manifest unedited keeps restoring the vulnerable floor version (#1344 C1).
+    /// Every other shape (exact pins, bounded/maximum ranges, floating patterns like `1.1.*`)
+    /// already expresses a genuine forward-compatibility window, so those keep the base
+    /// default via `compile_requirement`.
+    fn requirement_already_resolves_to(
+        &self,
+        requirement: &VersionReq,
+        target: &ConcreteVersion,
+    ) -> bool {
+        let requirement_str = requirement.as_str();
+        let is_floor = !requirement_str.contains('*')
+            && crate::version::compare_minimum_floor(requirement_str, target.as_str()).is_some();
+        if is_floor {
+            return false;
+        }
+        self.compile_requirement(requirement)
+            .is_some_and(|matcher| matcher.matches(target) == Some(true))
+    }
 }
 
 impl DiagnosticMessages for NuGetFormatter {}
@@ -528,5 +552,123 @@ mod tests {
                 mirrors_crates_io: false,
             })
         );
+    }
+
+    // --- requirement_already_resolves_to (#1344 C1) ---
+
+    #[test]
+    fn test_requirement_already_resolves_to_bare_floor_is_false() {
+        let f = NuGetFormatter;
+        // The base default (`compile_requirement(..).matches(..)`) would say `true` here —
+        // any version at or above the floor is a matcher hit — which is exactly the bug: a
+        // bare floor never auto-follows forward, so the override must refuse it.
+        assert!(!f.requirement_already_resolves_to(
+            &VersionReq::new("1.0.0"),
+            &ConcreteVersion::new("1.0.2")
+        ));
+        assert!(!f.requirement_already_resolves_to(
+            &VersionReq::new("1.0.0"),
+            &ConcreteVersion::new("2.0.0")
+        ));
+    }
+
+    #[test]
+    fn test_requirement_already_resolves_to_open_ended_minimum_bracket_form_is_false() {
+        let f = NuGetFormatter;
+        // Same floor shape as a bare version, spelled with explicit interval brackets — must
+        // classify identically (mirrors `is_requirement_up_to_date`'s own bracket-form tests).
+        assert!(!f.requirement_already_resolves_to(
+            &VersionReq::new("[1.0.0,)"),
+            &ConcreteVersion::new("1.0.2")
+        ));
+    }
+
+    #[test]
+    fn test_requirement_already_resolves_to_exact_pin_is_false() {
+        let f = NuGetFormatter;
+        // An exact pin's `compile_requirement` matcher already rejects any other version, so
+        // this stays `false` via the base default (`compare_minimum_floor` returns `None` for
+        // an exact pin, falling through).
+        assert!(!f.requirement_already_resolves_to(
+            &VersionReq::new("[1.0.0]"),
+            &ConcreteVersion::new("1.0.2")
+        ));
+    }
+
+    #[test]
+    fn test_requirement_already_resolves_to_bounded_range_admitting_target_is_true() {
+        let f = NuGetFormatter;
+        // A bounded range genuinely expresses a forward-compatibility window — the resolver
+        // can pick the fix target from within it without any manifest edit.
+        assert!(f.requirement_already_resolves_to(
+            &VersionReq::new("[1.0.0,2.0.0)"),
+            &ConcreteVersion::new("1.0.2")
+        ));
+    }
+
+    #[test]
+    fn test_requirement_already_resolves_to_floating_pattern_admitting_target_is_true() {
+        let f = NuGetFormatter;
+        assert!(f.requirement_already_resolves_to(
+            &VersionReq::new("1.0.*"),
+            &ConcreteVersion::new("1.0.2")
+        ));
+        assert!(!f.requirement_already_resolves_to(
+            &VersionReq::new("1.0.*"),
+            &ConcreteVersion::new("1.1.0")
+        ));
+    }
+
+    /// #1344 C1 acceptance criterion: the single most common NuGet declaration form (a bare
+    /// floor) must still get its vulnerability quickfix offered end-to-end through
+    /// `deps_core::edit::plan_vulnerability_fix` — not just at the `RequirementResolution`
+    /// unit level above.
+    #[test]
+    fn test_plan_vulnerability_fix_bare_floor_still_plans_the_edit() {
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+        use deps_core::{ConcreteVersion, Dependency, PackageName};
+        use std::sync::Arc;
+
+        let version_range = Range::new(Position::new(0, 30), Position::new(0, 36));
+        let dep = crate::types::NuGetDependency {
+            name: PackageName::new("Newtonsoft.Json"),
+            name_range: Range::default(),
+            version_requirement: Some(VersionReq::new("1.0.0")),
+            version_range: Some(version_range),
+            source: DependencySource::Registry,
+        };
+
+        let advisory = Arc::new(
+            Advisory::new(
+                "GHSA-0000-0000-0000".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["1.0.2".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "1.0.2".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            &dep,
+            version_range,
+            dep.version_requirement().unwrap().as_str(),
+            &dv,
+            &NuGetFormatter,
+        )
+        .expect(
+            "a bare-floor requirement must not suppress the fix: leaving it unedited keeps \
+             restoring the vulnerable floor version",
+        );
+        assert_eq!(planned.edit.new_text, "1.0.2");
+        assert_eq!(planned.target, ConcreteVersion::new("1.0.2"));
     }
 }
