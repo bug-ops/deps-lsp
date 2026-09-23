@@ -1989,10 +1989,9 @@ pub fn is_safe_feature_name(name: &str) -> bool {
 /// content into this project's own log stream (a second-order log-injection concern),
 /// mirroring why `deps-pypi`'s `truncate_for_log` bounds a logged excerpt instead of
 /// logging a value verbatim. This is this helper's own contract, not a claim that every
-/// `tracing` call site in the workspace avoids logging a raw value — e.g. `deps-lsp`'s
-/// `deps-lsp.updateVersion` handler and an OSV malformed-`fixed`-version warning predate
-/// this helper and log their rejected value directly; they are unrelated call sites, not a
-/// place this helper is used.
+/// `tracing` call site in the workspace avoids logging a raw value — e.g. an OSV
+/// malformed-`fixed`-version warning predates this helper and logs its rejected value
+/// directly; that is an unrelated call site, not a place this helper is used.
 ///
 /// `gate` names the predicate/guard that rejected `value` (e.g.
 /// `"is_safe_maven_coordinate_segment"`); `context` is a short description of the call site
