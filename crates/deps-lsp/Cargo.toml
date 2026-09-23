@@ -78,6 +78,10 @@ tempfile = { workspace = true }
 # previously reached transitively through the now-removed `tokio-test` dev-dependency, which
 # had no other, directly-used API in this crate — made explicit here instead.
 tokio = { workspace = true, features = ["test-util"] }
+# `util` is what `ServiceExt::ready` needs, to drive a real `initialize` handshake
+# through `LspService`'s `tower::Service<Request>` impl and unblock `Client::apply_edit`
+# (gated on `State::Initialized`) — see #1335.
+tower = { workspace = true, features = ["util"] }
 
 [[bench]]
 name = "lsp_handlers"
