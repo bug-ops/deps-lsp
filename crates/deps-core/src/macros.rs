@@ -473,6 +473,50 @@ macro_rules! impl_metadata {
     };
 }
 
+/// Emits [`impl_parse_result!`]'s `workspace_root` method body — not part of the public
+/// macro API (call [`impl_parse_result!`] instead), but must be `#[macro_export]`ed like any
+/// other macro invoked from another crate's expansion.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_parse_result_workspace_root {
+    () => {
+        fn workspace_root(&self) -> Option<&::std::path::Path> {
+            None
+        }
+    };
+    ($field:ident) => {
+        fn workspace_root(&self) -> Option<&::std::path::Path> {
+            self.$field.as_deref()
+        }
+    };
+}
+
+/// Emits [`impl_parse_result!`]'s `dependency_truncation` method body, or nothing when the
+/// field is omitted (the trait default applies) — not part of the public macro API.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_parse_result_dependency_truncation {
+    () => {};
+    ($field:ident) => {
+        fn dependency_truncation(&self) -> Option<(usize, usize)> {
+            self.$field
+        }
+    };
+}
+
+/// Emits [`impl_parse_result!`]'s `blocked_registries` method body, or nothing when the
+/// field is omitted (the trait default applies) — not part of the public macro API.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_parse_result_blocked_registries {
+    () => {};
+    ($field:ident) => {
+        fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
+            self.$field.clone()
+        }
+    };
+}
+
 /// Implement `ParseResult` trait for a struct.
 ///
 /// # Arguments
@@ -486,12 +530,12 @@ macro_rules! impl_metadata {
 ///   [`ecosystem::ParseResult::dependency_truncation`](crate::ecosystem::ParseResult::dependency_truncation)
 ///   override (#796) — omit when the parser has no [`crate::DependencyBudget`] wired in yet
 ///   (the trait default `None` applies).
-/// * `blocked_registries` - Optional, matched last: field name for the `Vec<BlockedRegistryOccurrence>`
+/// * `blocked_registries` - Optional: field name for the `Vec<BlockedRegistryOccurrence>`
 ///   [`ecosystem::ParseResult::blocked_registries`](crate::ecosystem::ParseResult::blocked_registries)
 ///   override (#925, #969), read via `.clone()` — omit when the ecosystem enforces no
 ///   configurable-registry reachability policy (the trait default empty `Vec` applies).
 ///
-/// All optional fields are matched in the fixed order shown above — `workspace_root`, then
+/// All optional fields are given in the fixed order shown above — `workspace_root`, then
 /// `dependency_truncation`, then `blocked_registries` — any subset may be omitted, but a
 /// present field cannot appear out of order.
 ///
@@ -531,7 +575,11 @@ macro_rules! impl_metadata {
 macro_rules! impl_parse_result {
     ($type:ty, $dep_type:ty {
         dependencies: $dependencies:ident,
-        uri: $uri:ident $(,)?
+        uri: $uri:ident
+        $(, workspace_root: $workspace_root:ident)?
+        $(, dependency_truncation: $dependency_truncation:ident)?
+        $(, blocked_registries: $blocked_registries:ident)?
+        $(,)?
     }) => {
         impl $crate::ecosystem::ParseResult for $type {
             fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
@@ -541,235 +589,18 @@ macro_rules! impl_parse_result {
                     .collect()
             }
 
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                None
-            }
+            $crate::__impl_parse_result_workspace_root!($($workspace_root)?);
 
             fn uri(&self) -> &::url::Url {
                 &self.$uri
             }
 
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
-        }
-    };
-    ($type:ty, $dep_type:ty {
-        dependencies: $dependencies:ident,
-        uri: $uri:ident,
-        workspace_root: $workspace_root:ident $(,)?
-    }) => {
-        impl $crate::ecosystem::ParseResult for $type {
-            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
-                self.$dependencies
-                    .iter()
-                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
-                    .collect()
-            }
+            $crate::__impl_parse_result_dependency_truncation!($($dependency_truncation)?);
 
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                self.$workspace_root.as_deref()
-            }
-
-            fn uri(&self) -> &::url::Url {
-                &self.$uri
-            }
+            $crate::__impl_parse_result_blocked_registries!($($blocked_registries)?);
 
             fn as_any(&self) -> &dyn ::std::any::Any {
                 self
-            }
-        }
-    };
-    ($type:ty, $dep_type:ty {
-        dependencies: $dependencies:ident,
-        uri: $uri:ident,
-        dependency_truncation: $dependency_truncation:ident $(,)?
-    }) => {
-        impl $crate::ecosystem::ParseResult for $type {
-            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
-                self.$dependencies
-                    .iter()
-                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
-                    .collect()
-            }
-
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                None
-            }
-
-            fn uri(&self) -> &::url::Url {
-                &self.$uri
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
-
-            fn dependency_truncation(&self) -> Option<(usize, usize)> {
-                self.$dependency_truncation
-            }
-        }
-    };
-    ($type:ty, $dep_type:ty {
-        dependencies: $dependencies:ident,
-        uri: $uri:ident,
-        workspace_root: $workspace_root:ident,
-        dependency_truncation: $dependency_truncation:ident $(,)?
-    }) => {
-        impl $crate::ecosystem::ParseResult for $type {
-            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
-                self.$dependencies
-                    .iter()
-                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
-                    .collect()
-            }
-
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                self.$workspace_root.as_deref()
-            }
-
-            fn uri(&self) -> &::url::Url {
-                &self.$uri
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
-
-            fn dependency_truncation(&self) -> Option<(usize, usize)> {
-                self.$dependency_truncation
-            }
-        }
-    };
-    ($type:ty, $dep_type:ty {
-        dependencies: $dependencies:ident,
-        uri: $uri:ident,
-        blocked_registries: $blocked_registries:ident $(,)?
-    }) => {
-        impl $crate::ecosystem::ParseResult for $type {
-            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
-                self.$dependencies
-                    .iter()
-                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
-                    .collect()
-            }
-
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                None
-            }
-
-            fn uri(&self) -> &::url::Url {
-                &self.$uri
-            }
-
-            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
-                self.$blocked_registries.clone()
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
-        }
-    };
-    ($type:ty, $dep_type:ty {
-        dependencies: $dependencies:ident,
-        uri: $uri:ident,
-        workspace_root: $workspace_root:ident,
-        blocked_registries: $blocked_registries:ident $(,)?
-    }) => {
-        impl $crate::ecosystem::ParseResult for $type {
-            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
-                self.$dependencies
-                    .iter()
-                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
-                    .collect()
-            }
-
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                self.$workspace_root.as_deref()
-            }
-
-            fn uri(&self) -> &::url::Url {
-                &self.$uri
-            }
-
-            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
-                self.$blocked_registries.clone()
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
-        }
-    };
-    ($type:ty, $dep_type:ty {
-        dependencies: $dependencies:ident,
-        uri: $uri:ident,
-        dependency_truncation: $dependency_truncation:ident,
-        blocked_registries: $blocked_registries:ident $(,)?
-    }) => {
-        impl $crate::ecosystem::ParseResult for $type {
-            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
-                self.$dependencies
-                    .iter()
-                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
-                    .collect()
-            }
-
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                None
-            }
-
-            fn uri(&self) -> &::url::Url {
-                &self.$uri
-            }
-
-            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
-                self.$blocked_registries.clone()
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
-
-            fn dependency_truncation(&self) -> Option<(usize, usize)> {
-                self.$dependency_truncation
-            }
-        }
-    };
-    ($type:ty, $dep_type:ty {
-        dependencies: $dependencies:ident,
-        uri: $uri:ident,
-        workspace_root: $workspace_root:ident,
-        dependency_truncation: $dependency_truncation:ident,
-        blocked_registries: $blocked_registries:ident $(,)?
-    }) => {
-        impl $crate::ecosystem::ParseResult for $type {
-            fn dependencies(&self) -> Vec<&dyn $crate::ecosystem::Dependency> {
-                self.$dependencies
-                    .iter()
-                    .map(|d| d as &dyn $crate::ecosystem::Dependency)
-                    .collect()
-            }
-
-            fn workspace_root(&self) -> Option<&::std::path::Path> {
-                self.$workspace_root.as_deref()
-            }
-
-            fn uri(&self) -> &::url::Url {
-                &self.$uri
-            }
-
-            fn blocked_registries(&self) -> Vec<$crate::ecosystem::BlockedRegistryOccurrence> {
-                self.$blocked_registries.clone()
-            }
-
-            fn as_any(&self) -> &dyn ::std::any::Any {
-                self
-            }
-
-            fn dependency_truncation(&self) -> Option<(usize, usize)> {
-                self.$dependency_truncation
             }
         }
     };
@@ -952,6 +783,23 @@ mod tests {
         uri: url::Url,
     }
 
+    #[derive(Debug)]
+    struct TestParseResultAllOptionals {
+        dependencies: Vec<TestDependency>,
+        uri: url::Url,
+        workspace_root: Option<std::path::PathBuf>,
+        dependency_truncation: Option<(usize, usize)>,
+        blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
+    }
+
+    #[derive(Debug)]
+    struct TestParseResultTruncationAndBlockedRegistries {
+        dependencies: Vec<TestDependency>,
+        uri: url::Url,
+        dependency_truncation: Option<(usize, usize)>,
+        blocked_registries: Vec<crate::ecosystem::BlockedRegistryOccurrence>,
+    }
+
     impl_dependency!(TestDependency {
         name: name,
         name_range: name_range,
@@ -1014,6 +862,27 @@ mod tests {
         TestDependency {
             dependencies: dependencies,
             uri: uri,
+        }
+    );
+
+    impl_parse_result!(
+        TestParseResultAllOptionals,
+        TestDependency {
+            dependencies: dependencies,
+            uri: uri,
+            workspace_root: workspace_root,
+            dependency_truncation: dependency_truncation,
+            blocked_registries: blocked_registries,
+        }
+    );
+
+    impl_parse_result!(
+        TestParseResultTruncationAndBlockedRegistries,
+        TestDependency {
+            dependencies: dependencies,
+            uri: uri,
+            dependency_truncation: dependency_truncation,
+            blocked_registries: blocked_registries,
         }
     );
 
@@ -1170,5 +1039,65 @@ mod tests {
         assert_eq!(result.dependencies().len(), 1);
         assert!(result.workspace_root().is_none());
         assert!(result.as_any().is::<TestParseResult>());
+    }
+
+    #[test]
+    fn test_impl_parse_result_macro_all_optionals() {
+        use crate::ecosystem::{BlockedRegistryOccurrence, ParseResult};
+        use crate::net_policy::HostClass;
+
+        let result = TestParseResultAllOptionals {
+            dependencies: vec![TestDependency {
+                name: "dep1".into(),
+                name_range: Range::default(),
+                version_req: None,
+                version_range: None,
+            }],
+            uri: crate::test_util::test_uri("/test"),
+            workspace_root: Some(std::path::PathBuf::from("/workspace")),
+            dependency_truncation: Some((5, 10)),
+            blocked_registries: vec![BlockedRegistryOccurrence {
+                range: Range::default(),
+                class: HostClass::Loopback,
+                raw_value: "registry".into(),
+                declaration_key: "key".into(),
+            }],
+        };
+
+        assert_eq!(result.dependencies().len(), 1);
+        assert_eq!(
+            result.workspace_root(),
+            Some(std::path::Path::new("/workspace"))
+        );
+        assert_eq!(result.dependency_truncation(), Some((5, 10)));
+        assert_eq!(result.blocked_registries().len(), 1);
+        assert!(result.as_any().is::<TestParseResultAllOptionals>());
+    }
+
+    #[test]
+    fn test_impl_parse_result_macro_truncation_and_blocked_registries() {
+        use crate::ecosystem::{BlockedRegistryOccurrence, ParseResult};
+        use crate::net_policy::HostClass;
+
+        let result = TestParseResultTruncationAndBlockedRegistries {
+            dependencies: vec![],
+            uri: crate::test_util::test_uri("/test"),
+            dependency_truncation: Some((3, 7)),
+            blocked_registries: vec![BlockedRegistryOccurrence {
+                range: Range::default(),
+                class: HostClass::Loopback,
+                raw_value: "registry".into(),
+                declaration_key: "key".into(),
+            }],
+        };
+
+        assert!(result.workspace_root().is_none());
+        assert_eq!(result.dependency_truncation(), Some((3, 7)));
+        assert_eq!(result.blocked_registries().len(), 1);
+        assert!(
+            result
+                .as_any()
+                .is::<TestParseResultTruncationAndBlockedRegistries>()
+        );
     }
 }

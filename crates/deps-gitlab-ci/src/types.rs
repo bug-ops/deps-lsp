@@ -341,36 +341,15 @@ pub struct GitlabCiParseResult {
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
 }
 
-// Hand-written, not `impl_parse_result!`: the macro has no field for `blocked_registries()`
-// (mirrors `deps_cargo`/`deps_nuget`'s own hand-written impls, #925/#967).
-impl deps_core::ParseResult for GitlabCiParseResult {
-    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-        self.dependencies
-            .iter()
-            .map(|d| d as &dyn deps_core::Dependency)
-            .collect()
+deps_core::impl_parse_result!(
+    GitlabCiParseResult,
+    GitlabCiDependency {
+        dependencies: dependencies,
+        uri: uri,
+        dependency_truncation: dependency_truncation,
+        blocked_registries: blocked_registries,
     }
-
-    fn workspace_root(&self) -> Option<&std::path::Path> {
-        None
-    }
-
-    fn uri(&self) -> &Url {
-        &self.uri
-    }
-
-    fn blocked_registries(&self) -> Vec<deps_core::BlockedRegistryOccurrence> {
-        self.blocked_registries.clone()
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn dependency_truncation(&self) -> Option<(usize, usize)> {
-        self.dependency_truncation
-    }
-}
+);
 
 #[cfg(test)]
 mod tests {
