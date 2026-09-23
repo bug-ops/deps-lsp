@@ -1257,7 +1257,7 @@ where
                 // successful-registration path.
                 let key_ref = slot.key().as_ref();
                 let rendered_key = match key_shape {
-                    KeyShape::Url => crate::redact::RedactedUrl::new(key_ref).to_string(),
+                    KeyShape::Url => crate::redact::RedactedUrl::new(key_ref).into_inner(),
                     KeyShape::Opaque => key_ref.to_string(),
                 };
                 tracing::warn!(

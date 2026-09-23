@@ -4011,7 +4011,7 @@ mod tests {
 
         assert!(!message.contains("hunter2"), "message: {message}");
         assert!(
-            message.contains(&deps_core::net_policy::RedactedUrl::new(raw).to_string()),
+            message.contains(&deps_core::net_policy::RedactedUrl::new(raw).into_inner()),
             "expected the redacted form to still be present: {message}"
         );
     }

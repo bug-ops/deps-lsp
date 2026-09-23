@@ -119,7 +119,7 @@ impl PackageName {
     /// ```
     #[must_use]
     pub fn for_tracing(&self) -> String {
-        crate::redact::redact_declaration_key(&self.0)
+        crate::redact::redact_declaration_key(&self.0).into_owned()
     }
 }
 

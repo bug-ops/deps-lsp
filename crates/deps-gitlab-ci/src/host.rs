@@ -469,7 +469,8 @@ mod tests {
         let err = GitlabHost::parse(raw, &p).unwrap_err();
         assert!(!err.to_string().contains("hunter2"), "Display: {err}");
         assert!(
-            err.to_string().contains(&RedactedUrl::new(raw).to_string()),
+            err.to_string()
+                .contains(&RedactedUrl::new(raw).into_inner()),
             "expected the redacted form to still be present: {err}"
         );
     }
@@ -597,7 +598,7 @@ mod tests {
         // Critic M2: a positive assertion, not just absence — would pass vacuously if the
         // warning were dropped entirely.
         assert!(
-            log.contains(&RedactedUrl::new(raw_value).to_string()),
+            log.contains(&RedactedUrl::new(raw_value).into_inner()),
             "expected the redacted form to still be present: {log}"
         );
     }
