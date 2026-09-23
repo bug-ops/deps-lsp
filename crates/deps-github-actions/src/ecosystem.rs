@@ -1304,17 +1304,22 @@ mod tests {
         non_registry_fixture: ".github/workflows/ci.yml" => "steps:\n  - uses: ./local-action\n";
     }
 
-    // #1354 security audit: GitHub Actions preserves an unresolved `${{ }}` expression ref as
-    // `Some(version_requirement)` (unlike NuGet/PyPI/npm, which degrade to `None`) — reachable
-    // through the full `plan_vulnerability_fix`/`format_version_replacing_for` pipeline, so
-    // `PinStyle::Branch`'s no-op fallback (see `GithubActionsFormatter::format_version_replacing_for`'s
-    // doc) must actually hold, not just happen to.
+    // #1354/#1370 security audit: GitHub Actions preserves an unresolved `${{ }}` expression
+    // ref as `Some(version_requirement)` (unlike NuGet/PyPI/npm, which degrade to `None`) —
+    // reachable through the full `plan_vulnerability_fix`/`format_version_replacing_for`
+    // pipeline, so `GithubActionsFormatter::requirement_is_placeholder`'s central gate (and,
+    // for the bare-expression form, `PinStyle::Branch`'s no-op fallback — see
+    // `format_version_replacing_for`'s doc) must actually hold. The second step is a
+    // Tag-shaped ref with an embedded expression (`is_tag_shaped` only inspects the leading
+    // characters, so `v4-${{ env.X }}` classifies `PinStyle::Tag`, not `Branch` — the same
+    // embedded-placeholder shape #1370 fixed for `deps-gitlab-ci`), which
+    // `requirement_is_unresolved`'s shape-only check alone would miss.
     deps_core::unresolved_requirement_conformance! {
         mod github_actions_unresolved_requirement_conformance;
         build: GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         reachable: true;
         fixture: ".github/workflows/unresolved.yml" =>
-            "on: push\njobs:\n  build:\n    steps:\n      - uses: \"actions/checkout@${{ env.CHECKOUT_REF }}\"\n";
+            "on: push\njobs:\n  build:\n    steps:\n      - uses: \"actions/checkout@${{ env.CHECKOUT_REF }}\"\n      - uses: \"actions/setup-node@v4-${{ env.NODE_REF }}\"\n";
     }
 
     // #1137: regression guard, not independent parser verification (see

@@ -355,6 +355,14 @@ impl RequirementResolution for BundlerFormatter {
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         requirement_contains_unresolved_interpolation(requirement.as_str())
     }
+
+    /// #1370: Bundler has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// unresolved Ruby interpolation is the only unresolved shape Bundler has, so both
+    /// predicates key off the same `requirement_contains_unresolved_interpolation` detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_unresolved_interpolation(requirement.as_str())
+    }
 }
 
 impl DiagnosticMessages for BundlerFormatter {}
@@ -872,7 +880,7 @@ mod tests {
     /// `version_requirement: None` — this scenario is reachable through the real
     /// `generate_code_actions`/`deps-cli` call graph, not defense-in-depth only.
     #[test]
-    fn test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite() {
+    fn test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten() {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
@@ -912,15 +920,18 @@ mod tests {
             &BundlerFormatter,
         );
 
-        // `NoOpRewrite`, not `RequirementAlreadyResolves`: `compile_requirement` is `None`
-        // here (undecidable), so `requirement_already_resolves_to`'s default gate never
-        // short-circuits — it's `format_version_replacing`'s own `#{`-guard, echoing `current`
-        // back unchanged, that makes the planner's textual no-op check fire.
+        // #1370: `plan_verified_fix`'s central placeholder gate
+        // (`BundlerFormatter::requirement_is_placeholder`) fires first now. Before that gate
+        // existed: `compile_requirement` is `None` here (undecidable), so
+        // `requirement_already_resolves_to`'s default gate never short-circuited —
+        // `format_version_replacing`'s own `#{`-guard, echoing `current` back unchanged, made
+        // the planner's textual no-op check fire instead (`NoOpRewrite`), and still does, as
+        // defense-in-depth.
         assert_eq!(
             planned,
-            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
-            "the real BundlerFormatter must suppress the fix for an unresolved interpolation \
-             via NoOpRewrite, got {planned:?}"
+            Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
+            "the real BundlerFormatter must suppress the fix for an unresolved interpolation, \
+             got {planned:?}"
         );
     }
 
@@ -978,10 +989,10 @@ mod tests {
 
     /// #1366: a later constraint's unresolved interpolation must suppress the rewrite for the
     /// *whole* multi-constraint requirement, not just leave the first constraint alone — mirrors
-    /// `test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite` above, but
+    /// `test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten` above, but
     /// with the interpolation in the second constraint rather than the only one.
     #[test]
-    fn test_plan_vulnerability_fix_multi_constraint_later_unresolved_interpolation_skips_via_no_op_rewrite()
+    fn test_plan_vulnerability_fix_multi_constraint_later_unresolved_interpolation_is_not_rewritten()
      {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
@@ -1024,7 +1035,7 @@ mod tests {
 
         assert_eq!(
             planned,
-            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
             "an unresolved interpolation in ANY constraint must suppress the whole \
              multi-constraint rewrite, got {planned:?}"
         );

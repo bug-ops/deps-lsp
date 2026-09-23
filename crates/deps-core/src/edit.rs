@@ -14,7 +14,7 @@ use crate::lsp_helpers::{
     literal_span_matches, resolve_in_use_version, slice_for_range, strip_whitespace,
     warn_rejected_value,
 };
-use crate::{ConcreteVersion, Dependency, ParseResult};
+use crate::{ConcreteVersion, Dependency, ParseResult, VersionReq};
 
 /// Protocol-agnostic replacement for `ls_types::TextEdit` — a single manifest-text
 /// replacement.
@@ -483,7 +483,11 @@ pub enum UpdateCandidate {
 /// A dependency that never reaches `Outdated` status at all (no `version_range`, unknown to
 /// the registry, no declared requirement, an empty requirement, or genuinely up to date) is
 /// not a candidate and produces no entry here — reporting those would be noise, not signal
-/// (most manifest dependencies are exactly this case on any given run).
+/// (most manifest dependencies are exactly this case on any given run). An unexpanded
+/// placeholder ([`crate::lsp_helpers::RequirementResolution::requirement_is_placeholder`],
+/// #1370) is checked and skipped the same way, independent of whatever status an ecosystem's
+/// own classification logic reports for it — this is one of the four central edit-planning
+/// gates that predicate consults.
 #[must_use]
 pub fn collect_update_candidates(
     parse_result: &dyn ParseResult,
@@ -519,6 +523,13 @@ pub fn collect_update_candidates(
             // Defense-in-depth: an empty requirement would trivially satisfy the literal-span
             // guard below (both sides normalize to "") and could anchor an edit on a
             // non-literal span.
+            continue;
+        }
+        // #1370: central placeholder gate, checked independently of `requirement_status_for`'s
+        // own classification — a placeholder is never a rewrite candidate regardless of what
+        // status an ecosystem's own (possibly still-buggy) classification logic reports for it,
+        // the same defense-in-depth reasoning as the other three central edit-planning gates.
+        if formatter.requirement_is_placeholder(version_req) {
             continue;
         }
         if formatter.requirement_status_for(dep, version_req, latest) != RequirementStatus::Outdated
@@ -612,7 +623,7 @@ pub fn collect_update_candidates(
 /// already known to be [`crate::osv::ScanOutcome::Vulnerable`].
 ///
 /// Mirrors [`UnplannableReason`]'s role for the default-mode planner (spec 068's typed-skip
-/// convention) — before this type existed, every one of these five causes collapsed into a
+/// convention) — before this type existed, every one of these six causes collapsed into a
 /// single `None`, forcing `deps-cli update --security-only`'s
 /// `classify_vulnerable_dependency` to re-run [`resolve_recommended_fix`]'s and
 /// `fix_target_is_verified`'s own chain itself just to tell `NoVerifiedFix` apart from
@@ -635,6 +646,12 @@ pub enum VulnFixSkip {
     /// The formatter's rewrite would be textually identical to the declared literal — no edit
     /// to make.
     NoOpRewrite,
+    /// `current` is an unexpanded placeholder/interpolation
+    /// ([`crate::lsp_helpers::RequirementResolution::requirement_is_placeholder`]) — there is
+    /// no concrete version text to replace, so the requirement is never rewritten regardless
+    /// of what any other resolution predicate or the formatter's own rewrite logic would do
+    /// with it (#1370).
+    UnresolvedPlaceholder,
 }
 
 /// Resolves and validates the OSV-recommended fix for `dv`.
@@ -940,7 +957,7 @@ pub fn resolve_verified_fix(
 ///
 /// # Errors
 ///
-/// Returns [`VulnFixSkip`] for any of the five causes that make an edit impossible or
+/// Returns [`VulnFixSkip`] for any of the six causes that make an edit impossible or
 /// unnecessary — see that type's variants.
 pub fn plan_vulnerability_fix(
     dep: &dyn Dependency,
@@ -966,9 +983,9 @@ pub fn plan_vulnerability_fix(
 ///
 /// # Errors
 ///
-/// Returns [`VulnFixSkip::RequirementAlreadyResolves`] or [`VulnFixSkip::NoOpRewrite`] — the
-/// two causes that can still make an edit unnecessary once the fix is already known resolved
-/// and verified.
+/// Returns [`VulnFixSkip::UnresolvedPlaceholder`], [`VulnFixSkip::RequirementAlreadyResolves`],
+/// or [`VulnFixSkip::NoOpRewrite`] — the three causes that can still make an edit unnecessary
+/// once the fix is already known resolved and verified.
 pub fn plan_verified_fix(
     dep: &dyn Dependency,
     version_range: crate::position::Range,
@@ -976,6 +993,16 @@ pub fn plan_verified_fix(
     version_native: &str,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<PlannedUpdate, VulnFixSkip> {
+    // #1370: central placeholder gate, checked first — an unexpanded placeholder has no
+    // concrete version text to replace, independent of whether `requirement_already_resolves_to`
+    // or the formatter's own rewrite logic would coincidentally treat it as safe. Checked
+    // against `current` (the exact text a caller is about to consider rewriting), not
+    // `dep.version_requirement()`, since a caller may reach this with `current` derived from
+    // somewhere other than the dependency's own preserved requirement field.
+    if formatter.requirement_is_placeholder(&VersionReq::new(current)) {
+        return Err(VulnFixSkip::UnresolvedPlaceholder);
+    }
+
     let fix_concrete = ConcreteVersion::new(version_native);
     let requirement_already_resolves_to_fix =
         dep.version_requirement().is_some_and(|version_req| {

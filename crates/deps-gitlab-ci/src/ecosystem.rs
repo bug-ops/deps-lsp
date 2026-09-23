@@ -1070,17 +1070,16 @@ mod tests {
         non_registry_fixture: ".gitlab-ci.yml" => "include:\n  - project: org/proj\n    ref: v1.0.0\n";
     }
 
-    // #1365: GitLab CI's `$VAR`-in-ref placeholder is now guarded directly in
-    // `GitlabCiFormatter::format_version_replacing_for` (see
-    // `formatter::contains_unresolved_gitlab_variable`), with its own hand-written regression
+    // #1365/#1370: GitLab CI's `$VAR`/`${VAR}`/`%VAR%`-in-ref placeholder is guarded both by
+    // `GitlabCiFormatter::requirement_is_placeholder` (the central gate `deps-core`'s
+    // `plan_verified_fix`/`build_unsatisfiable_fix_action`/REFACTOR loop all consult) and,
+    // independently, by `format_version_replacing_for`'s own no-op guard (see
+    // `formatter::contains_unresolved_gitlab_variable`) — with its own hand-written regression
     // test exercising the real formatter + a real parsed dependency through
     // `plan_vulnerability_fix`
-    // (`formatter::tests::test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite`),
-    // mirroring what `unresolved_requirement_conformance!`'s `reachable: true`/`reachable:
-    // false` arms assert generically for other ecosystems. This macro invocation stays on
-    // `no_placeholder_syntax` (not a genuine "no such syntax" claim, but the only arm this
-    // macro's shared assertion can actually express for GitLab CI) because both other arms are
-    // structurally unusable here, independent of the guard now existing:
+    // (`formatter::tests::test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite`).
+    // This uses the `formatter_guarded` arm (not `reachable: true`/`reachable: false`, both
+    // structurally unusable here independent of the guard existing):
     // - `reachable: true` requires at least one dependency to reach the per-dependency check
     //   loop, gated on `formatter.source_is_public_registry_content(&dep.source())`; GitLab CI
     //   dependencies are always `DependencySource::AlternateRegistry`/`CustomRegistry`, never
@@ -1097,9 +1096,15 @@ mod tests {
     //   grammar — verified empirically. The parser also does not degrade `$VAR` to `None`
     //   (mirrors `reachable: true` ecosystems, not `reachable: false` ones), so this arm would
     //   be doubly wrong even setting the naming issue aside.
+    // `formatter_guarded` sidesteps both obstacles by asserting directly against the formatter,
+    // with no parser or source-policy involved.
     deps_core::unresolved_requirement_conformance! {
         mod gitlab_ci_unresolved_requirement_conformance;
-        no_placeholder_syntax: "GitLab CI's $VAR ref placeholder is guarded directly in GitlabCiFormatter::format_version_replacing_for with its own regression test (see the comment above) — neither reachable: true nor reachable: false fits this ecosystem's source-policy/naming-grammar shape";
+        formatter_guarded: GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
+        placeholders: ["$DEPLOY_VERSION", "${DEPLOY_VERSION}", "%DEPLOY_VERSION%", "v1.2-$BUILD"];
+        // #1370 critic M2: negative control — a SHA, a branch, and an ordinary tag must never
+        // be conflated with the variable-reference placeholder grammar above.
+        non_placeholders: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "main", "1.2", "v1.2.3"];
     }
 
     // #1137: regression guard, not independent parser verification (see

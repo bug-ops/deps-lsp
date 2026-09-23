@@ -194,6 +194,14 @@ impl RequirementResolution for MavenFormatter {
         is_unresolved(requirement.as_str())
     }
 
+    /// #1370: Maven has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// unresolved `${property}` is the only unresolved shape Maven has, so both predicates
+    /// key off the same `is_unresolved` detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        is_unresolved(requirement.as_str())
+    }
+
     /// Uses [`compile_requirement_unless`] (see that function and
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
     ///
@@ -581,71 +589,9 @@ mod tests {
         )
     }
 
-    /// #1353: `plan_vulnerability_fix` must never rewrite an unresolved `${property}`
-    /// placeholder to a literal fix version. `compile_requirement` classifies `${ver}` as
-    /// `AlwaysSatisfied` (matches every candidate), so the shared `requirement_already_resolves_to`
-    /// default already refuses the edit before `format_version_replacing_for` is ever
-    /// reached for this particular (non-malformed) shape — this end-to-end test is the
-    /// regression guard for that interaction.
-    #[test]
-    fn test_plan_vulnerability_fix_unresolved_property_is_not_rewritten() {
-        use crate::types::{MavenDependency, MavenScope};
-        use deps_core::edit::plan_vulnerability_fix;
-        use deps_core::parser::DependencySource;
-        use deps_core::position::{Position, Range};
-
-        let version_range = Range::new(Position::new(0, 20), Position::new(0, 27));
-        let dep = MavenDependency {
-            group_id: "com.example".into(),
-            artifact_id: "some-lib".into(),
-            name: PackageName::new("com.example:some-lib"),
-            name_range: Range::default(),
-            version_req: Some(VersionReq::new("${ver}")),
-            version_range: Some(version_range),
-            scope: MavenScope::Compile,
-            source: DependencySource::Registry,
-        };
-
-        let dv = vuln_fix_dv("1.2.0");
-        assert_eq!(
-            plan_vulnerability_fix(&dep, version_range, "${ver}", &dv, &MavenFormatter),
-            Err(deps_core::edit::VulnFixSkip::RequirementAlreadyResolves),
-            "an unresolved property placeholder must never be overwritten with a literal fix version"
-        );
-    }
-
-    /// #1353 S1 end-to-end regression: `[1.0,${hi}` is unresolved but also an undecidable
-    /// malformed range, so the default `requirement_already_resolves_to` is inert for it —
-    /// `format_version_replacing`'s no-op guard (see the unit-level test above) is what
-    /// actually stops `plan_vulnerability_fix` from rewriting it.
-    #[test]
-    fn test_plan_vulnerability_fix_unresolved_malformed_range_is_not_rewritten() {
-        use crate::types::{MavenDependency, MavenScope};
-        use deps_core::edit::plan_vulnerability_fix;
-        use deps_core::parser::DependencySource;
-        use deps_core::position::{Position, Range};
-
-        let version_range = Range::new(Position::new(0, 20), Position::new(0, 30));
-        let dep = MavenDependency {
-            group_id: "com.example".into(),
-            artifact_id: "some-lib".into(),
-            name: PackageName::new("com.example:some-lib"),
-            name_range: Range::default(),
-            version_req: Some(VersionReq::new("[1.0,${hi}")),
-            version_range: Some(version_range),
-            scope: MavenScope::Compile,
-            source: DependencySource::Registry,
-        };
-
-        let dv = vuln_fix_dv("1.2.0");
-        assert_eq!(
-            plan_vulnerability_fix(&dep, version_range, "[1.0,${hi}", &dv, &MavenFormatter),
-            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
-            "an unresolved malformed-range placeholder must never be overwritten with a literal fix version"
-        );
-    }
-
-    /// Positive control for the two `plan_vulnerability_fix` tests above: a resolved,
+    /// Positive control for the placeholder cases the `unresolved_requirement_conformance!`
+    /// macro invocation in `ecosystem.rs` covers (#1353/#1370/#1372: `${property}` and
+    /// `[1.0,${hi}` must never be rewritten by `plan_vulnerability_fix`) — a resolved,
     /// well-formed requirement on the same dependency shape must still be rewritten.
     #[test]
     fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {

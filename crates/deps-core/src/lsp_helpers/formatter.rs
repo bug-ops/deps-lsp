@@ -274,6 +274,54 @@ pub trait RequirementResolution: Send + Sync {
         false
     }
 
+    /// Whether `requirement` is an unexpanded placeholder/interpolation (Maven's
+    /// `${property}`, Gradle's `$var`, NuGet's `$(Property)`/`%(Metadata)`/`@(ItemList)`,
+    /// Bundler's `#{...}`/`#@ivar`, Swift's `\(...)`, GitLab CI's `$VAR`/`${VAR}`/`%VAR%`)
+    /// that must never be overwritten by a manifest rewrite, no matter what other requirement
+    /// resolution predicate happens to say about it.
+    ///
+    /// Distinct from [`requirement_is_unresolved`](Self::requirement_is_unresolved): that
+    /// predicate also covers a *concrete but undecidable* ref (a `deps-github-actions`/
+    /// `deps-gitlab-ci` SHA or branch pin) which is safe, and sometimes intentional, to
+    /// rewrite — a vulnerability-fix quickfix pinning a SHA forward is exactly that. This
+    /// predicate answers only "is there literally no concrete version text here to
+    /// replace", which is why the central edit-planning gates in
+    /// [`crate::edit::plan_verified_fix`], [`crate::edit::collect_update_candidates`],
+    /// `crate::lsp_helpers::code_actions`'s unsatisfiable-requirement fix builder, and the
+    /// REFACTOR "Update to X" action loop consult this method, not `requirement_is_unresolved`,
+    /// before ever calling into an ecosystem's rewrite/compile logic.
+    ///
+    /// For most ecosystems `requirement_is_placeholder` implies `requirement_is_unresolved`
+    /// (both key off the same underlying detector) — but this is not a general subset
+    /// guarantee an implementor must uphold: `deps-gitlab-ci`'s `requirement_is_unresolved`
+    /// classifies purely from `PinStyle` (`Sha`/`Branch`), so a variable embedded in an
+    /// otherwise `Tag`- or `Partial`-shaped ref (`v1.2-$BUILD`) is `requirement_is_placeholder`
+    /// `true` but `requirement_is_unresolved` `false` there. The two predicates answer
+    /// genuinely different questions — "never has concrete version text to rewrite" vs.
+    /// "concrete but undecidably outdated" — and callers needing either guarantee must consult
+    /// the specific predicate they need, not assume one implies the other.
+    ///
+    /// Default: never a placeholder. Ecosystems whose requirement syntax can contain an
+    /// unexpanded placeholder override this single predicate instead of hand-rolling the same
+    /// check separately inside [`format_version_replacing`](PackageRendering::format_version_replacing),
+    /// [`compile_requirement`](Self::compile_requirement), and
+    /// [`version_satisfies_requirement`](Self::version_satisfies_requirement).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::VersionReq;
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// assert!(!DefaultFormatter.requirement_is_placeholder(&VersionReq::new("^1.2")));
+    /// ```
+    fn requirement_is_placeholder(&self, _requirement: &VersionReq) -> bool {
+        false
+    }
+
     /// Tri-state variant of `is_requirement_up_to_date` that distinguishes "confirmed up to
     /// date" from "could not be resolved, so we don't know."
     ///

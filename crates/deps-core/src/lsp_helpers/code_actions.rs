@@ -194,6 +194,12 @@ fn build_unsatisfiable_fix_action(
     version_req: &VersionReq,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<UnsatisfiableFixAction> {
+    // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
+    // text a fix action could ever replace, independent of whether `compile_requirement`
+    // happens to also return `None` for it.
+    if formatter.requirement_is_placeholder(version_req) {
+        return None;
+    }
     if !formatter.can_resolve_source(&dep.source()) {
         return None;
     }
@@ -574,7 +580,12 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     }
 
     let mut latest_refactor_idx = None;
-    if let Some(registry_versions) = &registry_versions {
+    // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
+    // text a REFACTOR "Update to X" action could ever replace, so the whole loop is skipped
+    // rather than relying on every generated edit happening to dedup away as a no-op.
+    if !formatter.requirement_is_placeholder(version_req)
+        && let Some(registry_versions) = &registry_versions
+    {
         // Same registry-delegated pick hover's `live_latest_idx` uses (see
         // `prepare_version_display_items`'s doc comment) — not a re-derived `is_stable()` scan.
         let latest_idx =
@@ -3516,6 +3527,121 @@ mod tests {
             assert!(
                 refactor_titles(&actions).is_empty(),
                 "the duplicate REFACTOR item must be suppressed by the dedup set: {actions:?}"
+            );
+        }
+
+        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`] (so an
+        /// unsatisfiable-fix action would otherwise be offered, and the registry's versions
+        /// would otherwise produce REFACTOR "Update to X" items), but
+        /// `requirement_is_placeholder` unconditionally returns `true` — #1370 tester gap:
+        /// proves the central gate actually fires on the two call sites
+        /// (`build_unsatisfiable_fix_action`, the REFACTOR loop) that had no test coverage.
+        struct PlaceholderGatedFormatter;
+
+        impl PackageNaming for PlaceholderGatedFormatter {}
+
+        impl PackageRendering for PlaceholderGatedFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+
+            fn package_url(&self, name: &PackageName) -> String {
+                format!("https://example.com/{}", name.as_str())
+            }
+        }
+
+        impl RequirementResolution for PlaceholderGatedFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+            }
+
+            fn requirement_is_placeholder(&self, _requirement: &VersionReq) -> bool {
+                true
+            }
+        }
+
+        impl DiagnosticMessages for PlaceholderGatedFormatter {}
+
+        impl DiagnosticPolicy for PlaceholderGatedFormatter {}
+
+        impl SourcePolicy for PlaceholderGatedFormatter {}
+
+        impl OsvNaming for PlaceholderGatedFormatter {}
+
+        /// #1370: same setup as `test_unsat_fix_emitted_for_unsatisfiable_requirement` (which
+        /// asserts the action IS offered without the gate), swapping in
+        /// `PlaceholderGatedFormatter` — proves `build_unsatisfiable_fix_action`'s central
+        /// `requirement_is_placeholder` gate actually suppresses the action, not merely that
+        /// the predicate exists.
+        #[tokio::test]
+        async fn test_unsat_fix_absent_for_placeholder_requirement() {
+            let (dep, version_range, content) = vulnerable_dep("1.0.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = cached_versions("9.9.9", &["9.9.9"]);
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &MockRegistry,
+                &PlaceholderGatedFormatter,
+            )
+            .await;
+
+            assert!(
+                quickfix_titles(&actions).is_empty(),
+                "a placeholder-shaped requirement must never produce an unsatisfiable-fix \
+                 quickfix, even when compile_requirement would otherwise make it \
+                 unsatisfiable: {actions:?}"
+            );
+        }
+
+        /// #1370: mirrors the REFACTOR-loop tests above (e.g.
+        /// `test_generate_code_actions_refactor_loop_no_op_guard_ignores_whitespace`), but with
+        /// no OSV/unsat-fix action in play at all (empty `cached`) so only the REFACTOR loop's
+        /// own gate is exercised — proves it actually suppresses "Update to X" items for a
+        /// placeholder-shaped requirement, not just that a status check happens to.
+        #[tokio::test]
+        async fn test_refactor_loop_absent_for_placeholder_requirement() {
+            let (dep, version_range, content) = vulnerable_dep("1.2.0");
+            let parse_result = MockParseResult {
+                deps: vec![dep],
+                uri: crate::test_util::test_uri("/test/Cargo.toml"),
+            };
+
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+            let versions = VersionData::new(&cached, &resolved);
+            let registry = FixedVersionRegistry {
+                versions: vec![("1.2.0", false), ("1.1.0", false)],
+            };
+
+            let actions = generate_code_actions(
+                &parse_result,
+                version_range.start,
+                parse_result.uri(),
+                versions,
+                &content,
+                &registry,
+                &PlaceholderGatedFormatter,
+            )
+            .await;
+
+            assert!(
+                refactor_titles(&actions).is_empty(),
+                "a placeholder-shaped requirement must never produce a REFACTOR \"Update to X\" \
+                 action, even when the registry lists a genuinely different version: {actions:?}"
             );
         }
     }

@@ -346,10 +346,10 @@ fn classify_vulnerable_dependency(
         // requirement that already resolves forward but whose fix target is yanked was already
         // reported `Unfixable(Yanked)` and never reaches this match. `NoRecommendedFix`/
         // `UnsafeVersion`/`UnverifiedTarget` are structurally unreachable here — `plan_verified_fix`
-        // only ever constructs `RequirementAlreadyResolves`/`NoOpRewrite` — but `VulnFixSkip`
-        // has 5 variants regardless of which function returns it, so this match must still
-        // handle all of them exhaustively (a future `VulnFixSkip` variant is then a compile
-        // error here, not a silently-mishandled case).
+        // only ever constructs `RequirementAlreadyResolves`/`NoOpRewrite`/`UnresolvedPlaceholder`
+        // — but `VulnFixSkip` has 6 variants regardless of which function returns it, so this
+        // match must still handle all of them exhaustively (a future `VulnFixSkip` variant is
+        // then a compile error here, not a silently-mishandled case).
         Err(VulnFixSkip::RequirementAlreadyResolves | VulnFixSkip::NoOpRewrite) => {
             requires_lockfile_update_item(
                 dep,
@@ -359,10 +359,15 @@ fn classify_vulnerable_dependency(
                 ignore_rule_overridden,
             )
         }
+        // #1370: `UnresolvedPlaceholder` joins the `NoVerifiedFix` bucket, not the
+        // `RequirementAlreadyResolves`/`NoOpRewrite` one above — "requires lockfile update"
+        // implies the manifest requirement already admits the fix target, which is not known
+        // (and can never be, statically) for an unexpanded placeholder.
         Err(
             VulnFixSkip::UnverifiedTarget
             | VulnFixSkip::NoRecommendedFix
-            | VulnFixSkip::UnsafeVersion,
+            | VulnFixSkip::UnsafeVersion
+            | VulnFixSkip::UnresolvedPlaceholder,
         ) => unfixable_item(
             dep,
             &current,

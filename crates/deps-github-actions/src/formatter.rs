@@ -200,6 +200,17 @@ impl PackageRendering for GithubActionsFormatter {
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
+        // #1370: an unresolved `${{ }}` expression can sit inside an otherwise
+        // [`is_tag_shaped`] ref (`is_tag_shaped` only inspects the leading characters), so
+        // this is checked ahead of the `PinStyle` match below — mirrors
+        // `GitlabCiFormatter::format_version_replacing_for`'s identical
+        // `contains_unresolved_gitlab_variable` guard for the same embedded-placeholder
+        // shape. Defense-in-depth alongside the central `requirement_is_placeholder` gate in
+        // `deps-core`'s edit-planning call sites, for a caller that reaches this method some
+        // other way.
+        if self.requirement_is_placeholder(&VersionReq::new(current)) {
+            return dep.version_literal().unwrap_or(current).to_string();
+        }
         let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
             return self.format_version_for_text_edit(version);
         };
@@ -301,6 +312,20 @@ impl RequirementResolution for GithubActionsFormatter {
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         let req = requirement.as_str();
         is_full_sha(req) || !is_tag_shaped(req)
+    }
+
+    /// #1370: an unresolved GitHub Actions expression (`${{ ... }}`) embedded in a `uses:`
+    /// ref — e.g. `actions/checkout@v4-${{ env.CHECKOUT_REF }}`. Unlike a bare SHA or branch
+    /// name, this can sit inside an otherwise [`is_tag_shaped`] ref (`is_tag_shaped` only
+    /// inspects the leading characters: an optional `v`/`V` followed by a digit), so it is
+    /// not always caught by [`Self::requirement_is_unresolved`]'s `PinStyle`-free shape check
+    /// — the same embedded-placeholder gap `deps-gitlab-ci`'s
+    /// `contains_unresolved_gitlab_variable` closes for its own `$VAR`/`${VAR}`/`%VAR%`
+    /// syntax. `${{` alone is sufficient: it cannot appear in a SHA (hex-only) or a genuine
+    /// branch/tag name (GitHub's own ref-name rules reject `{`/`$`), and GitHub itself never
+    /// resolves an unexpanded expression inside a `uses:` value.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        requirement.as_str().contains("${{")
     }
 
     /// Prefers a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`, ground truth

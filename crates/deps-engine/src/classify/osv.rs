@@ -225,7 +225,7 @@ fn resolve_fix_target(
             return FixTargetResolution::Skip;
         }
         // `resolve_recommended_fix` can only ever return `NoRecommendedFix`/`UnsafeVersion` —
-        // these three variants exist only for `plan_vulnerability_fix`'s later,
+        // these four variants exist only for `plan_vulnerability_fix`'s later,
         // `resolve_verified_fix`-based decision. Handled explicitly rather than folded into a
         // wildcard (code review finding) so a future `VulnFixSkip` variant, or a change that
         // starts surfacing one of these here, is a compile error instead of silently
@@ -234,7 +234,8 @@ fn resolve_fix_target(
         Err(
             VulnFixSkip::UnverifiedTarget
             | VulnFixSkip::RequirementAlreadyResolves
-            | VulnFixSkip::NoOpRewrite,
+            | VulnFixSkip::NoOpRewrite
+            | VulnFixSkip::UnresolvedPlaceholder,
         ) => return FixTargetResolution::Skip,
     };
 

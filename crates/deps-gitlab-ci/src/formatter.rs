@@ -217,6 +217,19 @@ impl RequirementResolution for GitlabCiFormatter {
         )
     }
 
+    /// #1370: narrower than [`Self::requirement_is_unresolved`] — a SHA/branch pin is a
+    /// concrete but undecidable ref (safe, sometimes intentional, to rewrite forward by a
+    /// vulnerability fix), while an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI variable
+    /// reference (see `contains_unresolved_gitlab_variable`) has no concrete version text at
+    /// all — the same distinction [`PackageRendering::format_version_replacing_for`]'s guard
+    /// already draws. Unlike `requirement_is_unresolved` (whose `PinStyle` classification can
+    /// only ever be `Sha`/`Branch`), a variable reference can be embedded inside an otherwise
+    /// `Tag`- or `Partial`-shaped ref (`v1.2-$BUILD`), so this checks the raw text directly
+    /// rather than going through `PinStyle` at all.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        contains_unresolved_gitlab_variable(requirement.as_str())
+    }
+
     /// `~latest` is always up to date (it dynamically tracks the newest release, like an
     /// existence wildcard). A `Partial` pin (`1.2`, `1`) is up to date while `latest` falls
     /// within its GitLab tilde-range semantics. A `Tag` pin is compared by normalized
@@ -333,7 +346,19 @@ fn contains_unresolved_gitlab_variable(text: &str) -> bool {
 /// ([`crate::component::classify_component_pin_style`]) or the dependency's own
 /// authoritative parse-time field (`GitlabCiDependency::pin`) — the single place this
 /// mapping is defined, so the two call paths cannot drift apart (#466 review M-c).
+///
+/// #1370: an unresolved `$VAR`/`${VAR}`/`%VAR%` reference is checked first, ahead of the
+/// `pin`-based match — `PinStyle::Sha`/`Branch` already resolve to `Unresolved` below, but a
+/// variable reference embedded in an otherwise `Tag`- or `Partial`-shaped ref
+/// (`is_tag_shaped`/`gitlab_version_req` only inspect the requirement's own text) previously
+/// fell through to the `Tag`/`Partial` arms' literal comparison, which can never match `latest`
+/// and so reported a permanent, un-clearable `Outdated` instead of the honest "can't tell"
+/// `Unresolved` this same reference already gets
+/// [`PackageRendering::format_version_replacing_for`]'s write-path guard for.
 fn status_for_pin(pin: &PinStyle, requirement: &str, latest: &str) -> RequirementStatus {
+    if contains_unresolved_gitlab_variable(requirement) {
+        return RequirementStatus::Unresolved;
+    }
     match pin {
         PinStyle::Sha | PinStyle::Branch => RequirementStatus::Unresolved,
         PinStyle::Latest => RequirementStatus::UpToDate,
@@ -563,6 +588,44 @@ mod tests {
         assert!(!fmt.requirement_is_unresolved(&VersionReq::new("1.0.0")));
         assert!(!fmt.requirement_is_unresolved(&VersionReq::new("~latest")));
         assert!(!fmt.requirement_is_unresolved(&VersionReq::new("1.2")));
+    }
+
+    /// #1370: `requirement_is_placeholder` is narrower than `requirement_is_unresolved` — a
+    /// SHA/branch pin is not a placeholder (it's safe to rewrite forward), while a variable
+    /// reference embedded in an otherwise Tag-shaped ref, which `requirement_is_unresolved`
+    /// never sees (its `PinStyle` classification can only be `Sha`/`Branch`), is.
+    #[test]
+    fn test_requirement_is_placeholder_variable_reference() {
+        let fmt = formatter();
+        assert!(fmt.requirement_is_placeholder(&VersionReq::new("$DEPLOY_VERSION")));
+        assert!(fmt.requirement_is_placeholder(&VersionReq::new("${DEPLOY_VERSION}")));
+        assert!(fmt.requirement_is_placeholder(&VersionReq::new("%DEPLOY_VERSION%")));
+        assert!(fmt.requirement_is_placeholder(&VersionReq::new("v1.2-$BUILD")));
+        assert!(!fmt.requirement_is_placeholder(&VersionReq::new("a".repeat(40))));
+        assert!(!fmt.requirement_is_placeholder(&VersionReq::new("some-branch")));
+        assert!(!fmt.requirement_is_placeholder(&VersionReq::new("1.2")));
+    }
+
+    /// #1370 regression: a variable embedded in an otherwise `Partial`-shaped ref must also
+    /// classify `Unresolved`, not just the `Tag` case the live gap was reported for —
+    /// `status_for_pin`'s variable check runs ahead of the whole `pin` match, not just the
+    /// `Tag` arm.
+    #[test]
+    fn test_requirement_status_for_partial_pin_with_embedded_variable_is_unresolved() {
+        let fmt = formatter();
+        let d = dep(
+            Some(PinStyle::Partial),
+            "org/proj",
+            DependencySource::Registry,
+        );
+        assert_eq!(
+            fmt.requirement_status_for(
+                &d,
+                &VersionReq::new("1.$MINOR"),
+                &ConcreteVersion::new("1.2.9")
+            ),
+            RequirementStatus::Unresolved
+        );
     }
 
     #[test]
@@ -853,18 +916,18 @@ mod tests {
         );
     }
 
-    /// #1365 security audit: exercises `deps_core::edit::plan_vulnerability_fix` with the
-    /// *real* `GitlabCiFormatter` and a `GitlabCiDependency` obtained from the real
+    /// #1365 security audit / #1370: exercises `deps_core::edit::plan_vulnerability_fix` with
+    /// the *real* `GitlabCiFormatter` and a `GitlabCiDependency` obtained from the real
     /// `crate::parser::parse_gitlab_ci_yaml` path, on a `ref:` whose declared value is an
     /// unresolved `$VAR` placeholder — mirrors `deps-bundler`'s
     /// `test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite` (#1367).
     ///
     /// GitLab CI's parser does not degrade `$VAR` to `version_requirement: None` (it is
-    /// preserved verbatim, same as Bundler's `#{...}`), so this scenario reaches
-    /// `format_version_replacing_for` directly whenever `plan_vulnerability_fix` is called for
-    /// a GitLab CI dependency — the same `NoOpRewrite` gate this test asserts is the only thing
-    /// standing between an unresolved placeholder and a destructive rewrite (`plan_verified_fix`
-    /// itself never consults `requirement_is_unresolved`, see that function's own doc).
+    /// preserved verbatim, same as Bundler's `#{...}`). Since #1370, `plan_verified_fix`'s
+    /// central placeholder gate (via `GitlabCiFormatter::requirement_is_placeholder`) fires
+    /// before `format_version_replacing_for` is ever reached — the older
+    /// `format_version_replacing_for` no-op guard this test used to key off still holds too, as
+    /// defense-in-depth.
     #[test]
     fn test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite() {
         use deps_core::ParseResult;
@@ -915,24 +978,30 @@ mod tests {
         );
 
         assert!(
-            matches!(planned, Err(VulnFixSkip::NoOpRewrite)),
-            "expected NoOpRewrite (the format_version_replacing_for guard firing), got {planned:?}"
+            matches!(planned, Err(VulnFixSkip::UnresolvedPlaceholder)),
+            "expected UnresolvedPlaceholder (the central #1370 gate firing), got {planned:?}"
         );
     }
 
-    /// #1365 critic S2 (blocking): the vulnerability-fix path above is not the reachable sink
+    /// #1365 critic S2 / #1370 fix: the vulnerability-fix path above is not the reachable sink
     /// in production — `EcosystemId::GitlabCi::osv_ecosystem()` is `None`, so
     /// `plan_vulnerability_fix` is never called for a real GitLab CI dependency. The sink that
     /// *is* reachable is the bulk-update path (`deps-cli update`, the LSP "update all" code
-    /// lens) via `deps_core::edit::collect_update_candidates`. Live-reproduced by the critic:
-    /// `v16.0-$BUILD` classifies as `PinStyle::Tag`, is marked `Outdated` by
-    /// `requirement_status_for`, and without the guard would reach
-    /// `format_version_replacing_for` through this exact path and be rewritten. Exercises the
-    /// real formatter, a real parsed dependency, and the real `collect_update_candidates` entry
-    /// point — not `plan_vulnerability_fix` — asserting `Unplannable { reason: NoOpRewrite, .. }`.
+    /// lens) via `deps_core::edit::collect_update_candidates`, gated on
+    /// `requirement_status_for(..) == Outdated`.
+    ///
+    /// Before #1370, `v16.0-$BUILD` classified as `PinStyle::Tag` and `status_for_pin`'s `Tag`
+    /// arm compared the raw (still variable-containing) text against `latest`, which could
+    /// never match — reporting a permanent, un-clearable `Outdated` and reaching
+    /// `format_version_replacing_for` through this exact path (caught only by that method's
+    /// own no-op guard, `Unplannable { reason: NoOpRewrite, .. }`). #1370's `status_for_pin`
+    /// fix checks [`contains_unresolved_gitlab_variable`] first, so this now classifies
+    /// `Unresolved` instead — `collect_update_candidates` never even builds a candidate for it.
+    /// Exercises the real formatter, a real parsed dependency, and the real
+    /// `collect_update_candidates` entry point.
     #[test]
-    fn test_collect_update_candidates_var_placeholder_in_tag_shaped_ref_is_unplannable() {
-        use deps_core::edit::{UnplannableReason, UpdateCandidate, collect_update_candidates};
+    fn test_collect_update_candidates_var_placeholder_in_tag_shaped_ref_produces_no_candidate() {
+        use deps_core::edit::collect_update_candidates;
         use deps_core::net_policy::RegistryAccessPolicy;
         use deps_core::{PackageVersions, ParseResult, VersionData};
         use std::collections::HashMap;
@@ -954,6 +1023,16 @@ mod tests {
             Some("v16.0-$BUILD"),
             "parser preserves the raw $VAR-embedded tag-shaped ref text"
         );
+        assert_eq!(
+            formatter().requirement_status_for(
+                *dep,
+                dep.version_requirement().expect("checked above"),
+                &ConcreteVersion::new("16.0.1")
+            ),
+            RequirementStatus::Unresolved,
+            "a variable embedded in an otherwise Tag-shaped ref must classify Unresolved, not \
+             a permanent Outdated"
+        );
 
         let fmt = formatter();
         let mut cached = HashMap::new();
@@ -963,23 +1042,10 @@ mod tests {
 
         let candidates = collect_update_candidates(&result, content, versions, &fmt);
 
-        assert_eq!(
-            candidates.len(),
-            1,
-            "expected exactly one Outdated candidate"
-        );
         assert!(
-            matches!(
-                &candidates[0],
-                UpdateCandidate::Unplannable {
-                    reason: UnplannableReason::NoOpRewrite,
-                    ..
-                }
-            ),
-            "expected Unplannable{{ reason: NoOpRewrite, .. }} (the \
-             format_version_replacing_for guard firing via the real bulk-update path), got \
-             {:?}",
-            candidates[0]
+            candidates.is_empty(),
+            "an Unresolved requirement must never reach collect_update_candidates' Outdated \
+             gate, got {candidates:?}"
         );
     }
 }
