@@ -533,8 +533,11 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
             let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            // #1344: "0.9.0" (not "1.0.0"), so the fix action's own gate — the declared
+            // requirement must not already admit the fix target ("1.0.5", which "^1.0.0"
+            // would admit) — doesn't suppress the quickfix this test is exercising.
             let content = r#"[dependencies]
-serde = "1.0.0"
+serde = "0.9.0"
 "#
             .to_string();
 
@@ -608,6 +611,89 @@ serde = "1.0.0"
                 .as_ref()
                 .expect("expected the matching client-supplied diagnostic to be bound");
             assert_eq!(diagnostics.len(), 1);
+        }
+
+        /// #1344 C4: the deps-lsp-level sibling of
+        /// `test_handle_code_actions_end_to_end_composition` — same wiring, but with the
+        /// declared requirement ("1.0.0", whose "^1.0.0" range already admits the fix target
+        /// "1.0.5") so the vulnerability-fix quickfix must be withheld end-to-end, not just at
+        /// the `deps-core` unit level. Without this test, deleting the #1344 gate entirely
+        /// would leave every deps-lsp test green.
+        #[tokio::test]
+        async fn test_handle_code_actions_withholds_quickfix_when_requirement_already_admits_fix() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use deps_core::osv::{
+                Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
+                VulnSeverity, VulnerabilityMap,
+            };
+            use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
+
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let content = r#"[dependencies]
+serde = "1.0.0"
+"#
+            .to_string();
+
+            let parse_result = ecosystem
+                .parse_manifest(&content, &url)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                "serde".to_string(),
+                ScanOutcome::Vulnerable(
+                    DependencyVulnerabilities::new(Capped::new(
+                        vec![Arc::new(
+                            Advisory::new(
+                                "RUSTSEC-2020-0071".to_string(),
+                                "2023-01-01T00:00:00Z".to_string(),
+                                VulnSeverity::High,
+                            )
+                            .expect("valid osv id")
+                            .with_fixed_versions(vec!["1.0.5".to_string()]),
+                        )],
+                        1,
+                    ))
+                    .with_fix_target_status(UpgradeStatus::CandidateClean {
+                        version: "1.0.5".to_string(),
+                    }),
+                ),
+            );
+            doc_state.vulnerabilities = vulnerabilities;
+            state.update_document(uri.clone(), doc_state);
+
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range::new(Position::new(1, 9), Position::new(1, 16)),
+                context: CodeActionContext {
+                    diagnostics: vec![Diagnostic {
+                        source: Some("deps-lsp".to_string()),
+                        code: Some(NumberOrString::String("RUSTSEC-2020-0071".to_string())),
+                        ..Default::default()
+                    }],
+                    only: Some(vec![CodeActionKind::QUICKFIX]),
+                    ..Default::default()
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+
+            let (client, config) = create_test_client_and_config();
+            let result = handle_code_actions(state, params, client, config).await;
+
+            assert!(
+                result.is_empty(),
+                "the requirement (\"1.0.0\" -> \"^1.0.0\") already admits the fix target \
+                 (\"1.0.5\"), so no quickfix should be offered: {result:?}"
+            );
         }
 
         #[tokio::test]

@@ -391,6 +391,50 @@ pub trait RequirementResolution: Send + Sync {
         None
     }
 
+    /// Whether `requirement`, left unedited, already resolves forward to a version at or
+    /// above `target` under this ecosystem's own resolution rules — the gate
+    /// [`crate::edit::plan_vulnerability_fix`] (#1344) consults before deciding a
+    /// vulnerability-fix manifest rewrite is unnecessary.
+    ///
+    /// Distinct from `compile_requirement(requirement).matches(target)` alone, which only
+    /// answers "is `target` a member of `requirement`'s accepted set" — true both for an
+    /// auto-following range (Cargo's `^1`, a Maven bracket range), where membership genuinely
+    /// means "no edit needed, re-resolving already gets there", *and* for a floor a resolver
+    /// instead pins to its lowest admissible member (NuGet's bare `Version="1.0.0"`, mirroring
+    /// [`Self::is_requirement_up_to_date`]'s own floor carve-out), where it does not: leaving
+    /// the manifest unedited keeps resolving to the floor itself, never to `target`.
+    ///
+    /// Default: delegates straight to `compile_requirement(requirement).matches(target)`,
+    /// collapsing `None` (uncompilable requirement) and `Some(false)` to `false` — correct for
+    /// every ecosystem whose resolution prefers the newest admissible member of a requirement's
+    /// accepted set. Override only when some requirement shape in this ecosystem instead
+    /// resolves to something other than that newest member.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::{ConcreteVersion, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// // No `compile_requirement` override, so this is always `false` — matches that
+    /// // method's own default.
+    /// assert!(!DefaultFormatter.requirement_already_resolves_to(
+    ///     &VersionReq::new("^1.2"),
+    ///     &ConcreteVersion::new("1.5.0")
+    /// ));
+    /// ```
+    fn requirement_already_resolves_to(
+        &self,
+        requirement: &VersionReq,
+        target: &ConcreteVersion,
+    ) -> bool {
+        self.compile_requirement(requirement)
+            .is_some_and(|matcher| matcher.matches(target) == Some(true))
+    }
+
     /// Whether this ecosystem's registry can silently omit a *published* version from
     /// `available` in a way indistinguishable from "never published" — and, if so, whether
     /// `requirement` names a version-space region that specific omission could explain, given
