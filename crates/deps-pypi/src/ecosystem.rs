@@ -686,6 +686,18 @@ mod tests {
         non_registry_fixture: "requirements.txt" => "mylib @ https://example.com/mylib.tar.gz\n";
     }
 
+    // #1354 security audit: PyPI has no `${VAR}`-expansion syntax of its own — an unresolved
+    // shell-style placeholder inside a version specifier fails PEP 440 parsing, so
+    // `parse_requirements`'s per-line "log and skip" behavior drops the whole line rather than
+    // producing a dependency with `version_requirement: None`. This is an even stronger form
+    // of "never reaches the gate" than the other `reachable: false` ecosystems.
+    deps_core::unresolved_requirement_conformance! {
+        mod pypi_unresolved_requirement_conformance;
+        build: PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: false;
+        fixture: "requirements.txt" => "known-good-control==1.0.0\nmylib==${VERSION}\n";
+    }
+
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.

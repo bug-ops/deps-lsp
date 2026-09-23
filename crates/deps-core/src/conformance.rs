@@ -716,6 +716,327 @@ pub async fn assert_non_registry_source_yields_no_fetch(
 // ecosystem now gets this coverage (or a recorded, reviewable opt-out) automatically.
 
 // ---------------------------------------------------------------------------------------
+// Macro 4b: `unresolved_requirement_conformance!` — issue #1354: an unexpanded
+// placeholder/interpolation in a version requirement must never be rewritten, whether or not
+// `RequirementResolution::compile_requirement`/`requirement_already_resolves_to` happen to
+// short-circuit it first.
+// ---------------------------------------------------------------------------------------
+
+/// Dependency name a `reachable: false` fixture must include, with an ordinary, resolvable
+/// version, alongside its placeholder-bearing dependency/dependencies.
+///
+/// Lets [`assert_unresolved_requirements_never_rewritten`] tell "the parser correctly
+/// degraded the placeholder" apart from "the parser is broken and returns nothing for
+/// everything" — #1354 critic M3: without this canary, a parser regressing to always-empty
+/// output would still satisfy "no dependency has `Some(version_requirement)`" vacuously (as
+/// PyPI's already-empty-by-design `requirements.txt` fixture demonstrates it can).
+pub const UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME: &str = "known-good-control";
+
+/// Asserts that every placeholder-bearing dependency in `content` is immune to
+/// [`crate::edit::plan_vulnerability_fix`] rewriting it.
+///
+/// Checked for two out-of-range fix targets (`0.0.1`, one below any real release, and
+/// `999.0.0`, one above) — and, independently of that gate, that
+/// [`crate::lsp_helpers::PackageRendering::format_version_replacing_for`] itself reproduces
+/// the dependency's literal target unchanged (up to whitespace) when called directly with
+/// either target, called with the declared requirement string as `current` — exactly as both
+/// production callers do (`lsp_helpers::code_actions::build_vulnerability_fix_action`,
+/// `deps-cli`'s `update::security`), never `dep.version_literal()`.
+///
+/// The second, independent check is the one that actually matters (#1354 security audit): a
+/// formatter can pass the first check by coincidence — e.g. because
+/// `RequirementResolution::requirement_already_resolves_to` or `compile_requirement` happens
+/// to answer `Some(true)`/decisively for the placeholder — while its own
+/// `format_version_replacing`/`format_version_replacing_for` would still destructively
+/// rewrite the placeholder if ever reached some other way (a future refactor of the gate, or a
+/// caller that skips it). Asserting the formatter's own no-op behavior directly closes that
+/// gap.
+///
+/// `reachable` records whether this ecosystem's manifest parser preserves the placeholder as
+/// `Some(version_requirement)` (`true`, e.g. GitHub Actions' `${{ env.V }}`) or degrades it to
+/// `None` before it can ever reach the gate (`false`, e.g. NuGet's `$(Property)`, PyPI's
+/// `${VAR}`, npm's `catalog:`) — asserted up front so a parser change that starts/stops
+/// preserving the placeholder is caught here rather than silently making the fixture vacuous.
+///
+/// # Panics
+///
+/// Panics (via `assert!`/`assert_eq!`) on any dependency in `content` whose declared
+/// requirement is rewritten by either path, or if `reachable` does not match what the parser
+/// actually produced.
+///
+/// A `reachable: false` fixture must also include a dependency named
+/// [`UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME`] with an ordinary, resolvable version —
+/// see that constant's doc for why (#1354 critic M3).
+pub async fn assert_unresolved_requirements_never_rewritten(
+    eco: &dyn Ecosystem,
+    manifest_name: &str,
+    content: &str,
+    reachable: bool,
+) {
+    use crate::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+
+    let uri = crate::test_util::test_uri(&format!("/test/{manifest_name}"));
+    let parse_result = eco
+        .parse_manifest(content, &uri)
+        .await
+        .expect("fixture manifest must parse");
+    let deps = parse_result.dependencies();
+    let formatter = eco.formatter();
+    if reachable {
+        let has_requirement = deps.iter().any(|dep| dep.version_requirement().is_some());
+        assert!(
+            !deps.is_empty(),
+            "fixture manifest must produce at least one dependency"
+        );
+        assert!(
+            has_requirement,
+            "reachable: true fixture must have at least one dependency with \
+             Some(version_requirement) — otherwise this fixture never exercises the gate at all"
+        );
+    } else {
+        let control_resolved = deps.iter().any(|dep| {
+            dep.name().as_str() == UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME
+                && dep.version_requirement().is_some()
+        });
+        assert!(
+            control_resolved,
+            "reachable: false fixture must include a dependency named {:?} with an ordinary, \
+             resolvable version requirement — without this canary, a parser that silently \
+             returns zero dependencies for everything (not just the placeholder) would still \
+             pass this test vacuously",
+            UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME
+        );
+        let unexpected_requirement = deps.iter().any(|dep| {
+            dep.name().as_str() != UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME
+                && dep.version_requirement().is_some()
+        });
+        assert!(
+            !unexpected_requirement,
+            "reachable: false fixture must have every non-control dependency's \
+             version_requirement degrade to None before reaching the gate — if the parser now \
+             preserves it, switch this fixture to reachable: true"
+        );
+    }
+
+    // Review finding (code-review, high effort): counts how many dependencies actually reach
+    // the checks below (rather than being skipped by one of the three `continue`s above), so
+    // the `reachable: true` assertion after the loop can catch a future fixture whose
+    // placeholder-bearing dependency has `Some(version_requirement)` but a `None`
+    // `version_range` or a non-public-registry source — both of which would silently skip
+    // every dependency and make this test pass vacuously without ever calling
+    // `plan_vulnerability_fix`/`format_version_replacing_for` at all.
+    let mut exercised_count = 0usize;
+
+    for dep in &deps {
+        if dep.name().as_str() == UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME {
+            continue;
+        }
+        let Some(req) = dep.version_requirement() else {
+            continue;
+        };
+        if dep.version_range().is_none() {
+            continue;
+        }
+        if !formatter.source_is_public_registry_content(&dep.source()) {
+            continue;
+        }
+        exercised_count += 1;
+        // `req.as_str()`, not `dep.version_literal()` — both production callers
+        // (`lsp_helpers::code_actions::build_vulnerability_fix_action` and
+        // `deps-cli`'s `update::security`) pass the declared requirement string as `current`,
+        // never the literal span. Using the literal here would hide exactly the bug class this
+        // macro exists to catch: a formatter whose `format_version_replacing_for` echoes
+        // `current` unchanged, when `current` (a synthesized comparator, e.g. Swift's
+        // `">=\(v), <1.0.0"` for `from: "\(v)"`) differs from `version_literal` (the raw `\(v)`
+        // span the edit is actually spliced into) — the planner's own no-op guard compares
+        // against the literal, not `current`, so that mismatch alone would still produce a
+        // destructive rewrite even though `format_version_replacing_for` looks like a no-op.
+        let current = req.as_str();
+
+        for target in ["0.0.1", "999.0.0"] {
+            let native = formatter.osv_version_to_native(target);
+            let advisory = std::sync::Arc::new(
+                Advisory::new(
+                    "GHSA-1354-conformance".to_string(),
+                    "2024-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::High,
+                )
+                .expect("valid osv id")
+                .with_fixed_versions(vec![target.to_string()]),
+            );
+            let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+                .with_fix_target_status(UpgradeStatus::CandidateClean {
+                    version: native.clone(),
+                });
+
+            let planned = crate::edit::plan_vulnerability_fix(
+                *dep,
+                dep.version_range().expect("checked above"),
+                current,
+                &dv,
+                formatter,
+            );
+            // Only these two `VulnFixSkip` variants prove the unresolved-placeholder guard
+            // itself did its job — `RequirementAlreadyResolves` is the gate short-circuiting
+            // (the "coincidentally safe" case), `NoOpRewrite` is the formatter's own
+            // `format_version_replacing`/`format_version_replacing_for` guard firing (the
+            // "independently safe" case this macro primarily exists to catch). The other three
+            // variants (`NoRecommendedFix`, `UnsafeVersion`, `UnverifiedTarget`) would mean
+            // this fixture's synthetic `dv`/target setup is broken, not that the placeholder
+            // guard fired — accepting any `Err(_)` here would let a malformed fixture pass
+            // vacuously for the wrong reason.
+            assert!(
+                matches!(
+                    planned,
+                    Err(crate::edit::VulnFixSkip::RequirementAlreadyResolves
+                        | crate::edit::VulnFixSkip::NoOpRewrite)
+                ),
+                "plan_vulnerability_fix must skip an unresolved requirement {current:?} \
+                 (dependency {:?}) targeting {target} via RequirementAlreadyResolves or \
+                 NoOpRewrite, got {planned:?}",
+                dep.name().as_str()
+            );
+
+            let native_concrete = ConcreteVersion::new(native);
+            let rewritten = formatter.format_version_replacing_for(*dep, &native_concrete, current);
+            // Matches `plan_vulnerability_fix`'s own `literal_target` (edit.rs), not `current`
+            // directly — an ecosystem whose declared requirement is synthesized from a
+            // narrower literal span (Swift's `version_literal`) is only genuinely a no-op when
+            // it reproduces that literal, not merely `current` itself.
+            let literal_target = dep.version_literal().unwrap_or(current);
+            assert_eq!(
+                crate::lsp_helpers::strip_whitespace(&rewritten),
+                crate::lsp_helpers::strip_whitespace(literal_target),
+                "format_version_replacing_for must leave an unresolved requirement {current:?} \
+                 (dependency {:?}) as a no-op against its literal target {literal_target:?} even \
+                 when called directly, independent of the plan_vulnerability_fix gate (target \
+                 {target})",
+                dep.name().as_str()
+            );
+        }
+    }
+
+    if reachable {
+        assert!(
+            exercised_count > 0,
+            "reachable: true fixture must have at least one dependency that reaches the \
+             per-dependency check loop (Some(version_requirement) AND Some(version_range) AND \
+             a public-registry source) — otherwise plan_vulnerability_fix/\
+             format_version_replacing_for are never actually invoked and this test passes \
+             vacuously"
+        );
+    }
+}
+
+/// Generates conformance tests asserting an ecosystem never rewrites an unexpanded
+/// placeholder/interpolation in a version requirement (issue #1354).
+///
+/// Three mutually exclusive forms:
+/// - `reachable: true; fixture: "name" => "content";` — the parser preserves the placeholder
+///   as `Some(version_requirement)`, so it reaches [`crate::edit::plan_vulnerability_fix`] and
+///   [`crate::lsp_helpers::PackageRendering::format_version_replacing_for`] directly (e.g. GitHub Actions'
+///   `${{ env.V }}`, Bundler's `"~> #{V}"`, Swift's `.package(url:, from: "\(v)")`).
+/// - `reachable: false; fixture: "name" => "content";` — the parser degrades the placeholder
+///   to `None` before either method is ever reached (e.g. NuGet's `$(Property)`, PyPI's
+///   `${VAR}`, npm's `catalog:`); the fixture still exercises
+///   [`assert_unresolved_requirements_never_rewritten`]'s degradation check. Must also declare
+///   a dependency named
+///   [`UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME`] with an ordinary, resolvable version —
+///   see that constant's doc for why (#1354 critic M3).
+/// - `no_placeholder_syntax: "<reason>";` — an exhaustiveness marker (no tests emitted) for an
+///   ecosystem whose version-requirement grammar has no placeholder/variable syntax at all.
+///
+/// See [`assert_unresolved_requirements_never_rewritten`] for what each generated test
+/// actually asserts.
+///
+/// # Examples
+///
+/// ```
+/// deps_core::unresolved_requirement_conformance! {
+///     mod example_no_placeholder_syntax;
+///     no_placeholder_syntax: "doctest fixture — this ecosystem's grammar has no placeholder \
+///                             syntax to demonstrate";
+/// }
+/// ```
+#[macro_export]
+macro_rules! unresolved_requirement_conformance {
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        reachable: true;
+        fixture: $file:literal => $content:literal;
+    ) => {
+        mod $mod_name {
+            use super::*;
+
+            async fn unresolved_requirement_never_rewritten_impl() {
+                $crate::conformance::assert_unresolved_requirements_never_rewritten(
+                    &($build),
+                    $file,
+                    $content,
+                    true,
+                )
+                .await;
+            }
+
+            #[::tokio::test]
+            async fn unresolved_requirement_never_rewritten() {
+                unresolved_requirement_never_rewritten_impl().await;
+            }
+        }
+    };
+    (
+        mod $mod_name:ident;
+        build: $build:expr;
+        reachable: false;
+        fixture: $file:literal => $content:literal;
+    ) => {
+        mod $mod_name {
+            use super::*;
+
+            async fn unresolved_requirement_never_rewritten_impl() {
+                $crate::conformance::assert_unresolved_requirements_never_rewritten(
+                    &($build),
+                    $file,
+                    $content,
+                    false,
+                )
+                .await;
+            }
+
+            #[::tokio::test]
+            async fn unresolved_requirement_never_rewritten() {
+                unresolved_requirement_never_rewritten_impl().await;
+            }
+        }
+    };
+    (
+        mod $mod_name:ident;
+        no_placeholder_syntax: $reason:literal;
+    ) => {
+        #[allow(dead_code)]
+        mod $mod_name {
+            const _: &str = $reason;
+        }
+    };
+    // A friendly compile-time error for any invocation matching none of the three arms above
+    // (missing/misspelled field, wrong order, wrong literal type) — mirrors
+    // `ecosystem_conformance!`'s own fallback arm just below, rather than leaving the caller
+    // with `macro_rules!`'s generic "no rules expected this token" message.
+    (
+        mod $mod_name:ident;
+        $($rest:tt)*
+    ) => {
+        compile_error!(
+            "unresolved_requirement_conformance!: expected one of `build: <expr>; reachable: \
+             true; fixture: \"name\" => \"content\";`, `build: <expr>; reachable: false; \
+             fixture: \"name\" => \"content\";`, or `no_placeholder_syntax: \"<reason>\";` \
+             after `mod <name>;`"
+        );
+    };
+}
+
+// ---------------------------------------------------------------------------------------
 // Macro 5: `json_depth_conformance!` — the shared JSON-nesting depth cap
 // (`crate::MAX_JSON_NESTING_DEPTH` / `crate::check_json_nesting_depth`).
 // ---------------------------------------------------------------------------------------

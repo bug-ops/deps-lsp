@@ -321,6 +321,13 @@ mod tests {
         no_non_registry_fixture: "Deno's non-Registry classification (parser::classify_npm_imports) only fires once a real .npmrc file resolves from disk for an npm: import's scope — the shared macro's fixture has no filesystem backing to supply one. Covered instead by parser::tests::test_npm_scoped_import_resolves_via_npmrc, which builds a real tempfile::tempdir() with a .npmrc and asserts the same gate properties end-to-end.";
     }
 
+    // #1354 security audit: `deno.json`/`deno.jsonc`'s JSR/npm import-specifier grammar has no
+    // placeholder/environment-variable interpolation syntax for a version requirement string.
+    deps_core::unresolved_requirement_conformance! {
+        mod deno_unresolved_requirement_conformance;
+        no_placeholder_syntax: "Deno's JSR/npm import specifiers are plain JSON strings with no placeholder/variable interpolation grammar (#1354)";
+    }
+
     // #758: the shared completion-prefix-length guard, replacing
     // test_complete_package_names_minimum_prefix (which only checked a 1-character prefix).
     #[cfg(feature = "lsp-responses")]

@@ -382,6 +382,14 @@ mod tests {
         non_registry_fixture: "Cargo.toml" => "[dependencies]\nlocal-crate = { path = \"../local-crate\" }\n";
     }
 
+    // #1354 security audit: Cargo.toml's TOML grammar has no placeholder/environment-variable
+    // interpolation syntax for a version requirement string — a `${V}`-shaped literal is just
+    // plain text, not a possible unresolved reference.
+    deps_core::unresolved_requirement_conformance! {
+        mod cargo_unresolved_requirement_conformance;
+        no_placeholder_syntax: "Cargo.toml version requirements are plain TOML strings with no placeholder/variable interpolation grammar (#1354)";
+    }
+
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
     // The mock registry stands in for `self.registry`, calling the same shared guard with
     // the same `limit: 20` — without it, an always-offline real registry couldn't

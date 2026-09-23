@@ -456,6 +456,19 @@ mod tests {
         non_registry_fixture: "Package.swift" => r#".package(url: "https://github.com/dev/tool", .branch("main"))"#;
     }
 
+    // #1354 security audit: `deps-swift`'s parser does not degrade an unexpanded Swift string
+    // interpolation (`\(...)`) to `version_requirement: None` — it reaches
+    // `plan_vulnerability_fix`/`format_version_replacing_for` directly, so
+    // `SwiftFormatter`'s `\(`-guard (see `formatter::requirement_contains_unresolved_interpolation`)
+    // must actually hold.
+    deps_core::unresolved_requirement_conformance! {
+        mod swift_unresolved_requirement_conformance;
+        build: SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: "Package.swift" =>
+            r#".package(url: "https://github.com/apple/swift-nio", from: "\(v)")"#;
+    }
+
     // #794: `complete_package_urls` guards on the exact same `is_valid_completion_prefix_len`
     // predicate `complete_package_names_generic` uses before calling `registry.search` — this
     // proves that shared guard predicate behaves correctly, mirroring every other ecosystem's

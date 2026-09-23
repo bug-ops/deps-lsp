@@ -230,6 +230,13 @@ mod tests {
         non_registry_fixture: "pubspec.yaml" => "name: my_app\ndependencies:\n  local_pkg:\n    path: ../local_pkg\n";
     }
 
+    // #1354 security audit: `pubspec.yaml`'s version-constraint grammar has no
+    // placeholder/environment-variable interpolation syntax for a version requirement string.
+    deps_core::unresolved_requirement_conformance! {
+        mod dart_unresolved_requirement_conformance;
+        no_placeholder_syntax: "pubspec.yaml version constraints are plain YAML strings with no placeholder/variable interpolation grammar (#1354)";
+    }
+
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_min_prefix/test_complete_package_names_max_length.
