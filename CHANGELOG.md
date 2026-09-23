@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `completion::build_completion_sort_text`/`starts_with_ascii_case_insensitive` helpers computing exact-prefix-tiered `sort_text`, shared by deps-maven and deps-swift's field/url completion overrides (resolves #1282) (#1293)
 - **deps-core**: new `is_safe_feature_name` allowlist predicate, gating Cargo feature-completion names (resolves #1296)
 - **deps-core**: new `lsp_helpers::HoverMarkdown` typed builder replaces `generate_hover`'s bare `&mut String` accumulator, structurally enforcing per-field-kind length caps and escaping instead of relying on call-site discipline (resolves #1310) (#1322)
+- **deps-lsp** (test infrastructure): new test drives a real `initialize`/`applyEdit` handshake through `LspService`'s loopback socket, closing `commands::UPDATE_VERSION`'s `canonicalize_uri` coverage gap (resolves #1335)
 
 ### Security
 - **deps-core, deps-nuget, deps-pypi**: `ResolvedPackage`/`ResolvedSource`, `ScanTarget`, `ResolvedShaPin`, `PackageSourceEntry`, and `RequirementRef` now redact credential-shaped fields in `Debug` output (resolves #1237) (#1318)
