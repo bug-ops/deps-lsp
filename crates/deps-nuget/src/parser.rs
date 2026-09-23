@@ -144,6 +144,21 @@ pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseR
     })
 }
 
+/// True when `s` contains an unexpanded MSBuild reference: a property (`$(Name)`), an
+/// item-metadata (`%(Name)`), or an item-list (`@(Name)`) reference. None of these are a
+/// concrete value until MSBuild expands them, so wherever this is true a `version`/`Version`
+/// string must degrade to "no requirement" rather than be treated as a real, checkable one —
+/// used by both this module's parse-time degrade guards and
+/// [`crate::formatter::NuGetFormatter::requirement_is_unresolved`], so the same reference is
+/// never partially recognized at one layer and not the other (#1355).
+///
+/// A false positive is not realistically possible: a literal `%` in an MSBuild string must be
+/// escaped as `%25`, and none of `$`, `%`, `@` followed by `(` can appear in a real NuGet
+/// version string.
+pub(crate) fn is_msbuild_reference(s: &str) -> bool {
+    s.contains("$(") || s.contains("%(") || s.contains("@(")
+}
+
 fn parse_package_element(
     content: &str,
     line_table: &LineOffsetTable,
@@ -170,13 +185,13 @@ fn parse_package_element(
 
     let name = name?;
     let name_range = span_to_range(content, line_table, name_span);
-    // An empty `version=""` attribute must degrade to "no requirement" like a `$(...)`
-    // MSBuild property reference does — left unguarded, it gets wrapped into `"[]"`, which
+    // An empty `version=""` attribute must degrade to "no requirement" like an unresolved
+    // MSBuild reference does — left unguarded, it gets wrapped into `"[]"`, which
     // `crate::version::parse_range` now rejects as malformed (#821) rather than treating it
     // as an exact pin — but wrapping it at all would still turn "no version" into a
     // requirement string instead of being skipped by the empty-`VersionReq` guards downstream.
     let (version_requirement, version_range) = match version {
-        Some(v) if !v.trim().is_empty() && !v.contains("$(") => (
+        Some(v) if !v.trim().is_empty() && !is_msbuild_reference(&v) => (
             Some(format!("[{}]", v.trim())),
             Some(span_to_range(content, line_table, version_span)),
         ),
@@ -308,11 +323,12 @@ fn finalize_dep(
     })
 }
 
-/// Unresolvable MSBuild property expressions (`Version="$(SerilogVersion)"`), central
-/// package management entries (no `Version` at all), and an empty/whitespace-only
-/// `Version=""` attribute all degrade to `version_requirement: None` rather than a bogus
-/// or unresolved-looking requirement (spec §3, deferred scope) — matching the
-/// `packages.config` path's `version=""` guard in `parse_package_element` above.
+/// Unresolvable MSBuild reference expressions (`Version="$(SerilogVersion)"`,
+/// `Version="%(Version)"`, `Version="@(PollyVer)"`), central package management entries (no
+/// `Version` at all), and an empty/whitespace-only `Version=""` attribute all degrade to
+/// `version_requirement: None` rather than a bogus or unresolved-looking requirement (spec
+/// §3, deferred scope) — matching the `packages.config` path's `version=""` guard in
+/// `parse_package_element` above.
 fn resolve_version_field(
     content: &str,
     line_table: &LineOffsetTable,
@@ -320,7 +336,7 @@ fn resolve_version_field(
     span: (usize, usize),
 ) -> (Option<String>, Option<Range>) {
     match version {
-        Some(ref v) if !v.trim().is_empty() && !v.contains("$(") => (
+        Some(ref v) if !v.trim().is_empty() && !is_msbuild_reference(v) => (
             Some(v.trim().to_string()),
             Some(span_to_range(content, line_table, span)),
         ),
@@ -369,6 +385,17 @@ mod tests {
 
     fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/App.csproj")
+    }
+
+    #[test]
+    fn test_is_msbuild_reference_recognizes_all_three_forms() {
+        assert!(is_msbuild_reference("$(SerilogVersion)"));
+        assert!(is_msbuild_reference("%(Version)"));
+        assert!(is_msbuild_reference("@(PollyVer)"));
+        assert!(is_msbuild_reference("[$(MinVersion),$(MaxVersion))"));
+        assert!(!is_msbuild_reference("13.0.3"));
+        assert!(!is_msbuild_reference("[1.0,2.0)"));
+        assert!(!is_msbuild_reference(""));
     }
 
     #[test]
@@ -684,6 +711,48 @@ mod tests {
         let result = parse_project_file(xml, &test_uri()).unwrap();
         assert_eq!(result.dependencies.len(), 1);
         assert_eq!(result.dependencies[0].name, "Serilog");
+        assert!(result.dependencies[0].version_requirement.is_none());
+        assert!(result.dependencies[0].version_range.is_none());
+    }
+
+    /// #1355: `%(Version)` (MSBuild item-metadata syntax) must degrade to `None` the same as
+    /// `$(PropertyName)` — before this fix it survived parsing as a real requirement string
+    /// and could plan an incorrect version-rewrite edit, offer completions, and render a
+    /// diagnostic (live-verified by impl-critic).
+    #[test]
+    fn test_unresolved_msbuild_item_metadata_degrades_to_none() {
+        let xml = r#"<Project><ItemGroup><PackageReference Include="Polly" Version="%(Version)" /></ItemGroup></Project>"#;
+        let result = parse_project_file(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "Polly");
+        assert!(result.dependencies[0].version_requirement.is_none());
+        assert!(result.dependencies[0].version_range.is_none());
+    }
+
+    /// #1355: `@(ItemList)` (MSBuild item-list reference) must degrade to `None` too — it has
+    /// no bracket for `crate::version::parse_range`'s nested-bracket guard to trip on, so
+    /// unguarded it parsed as a bogus bare-floor version (live-verified by impl-critic).
+    #[test]
+    fn test_unresolved_msbuild_item_list_degrades_to_none() {
+        let xml = r#"<Project><ItemGroup><PackageReference Include="Polly" Version="@(PollyVer)" /></ItemGroup></Project>"#;
+        let result = parse_project_file(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "Polly");
+        assert!(result.dependencies[0].version_requirement.is_none());
+        assert!(result.dependencies[0].version_range.is_none());
+    }
+
+    /// #1355: same degrade behavior via the `packages.config` parse path
+    /// (`parse_package_element`'s inline guard, not `resolve_version_field`).
+    #[test]
+    fn test_packages_config_msbuild_item_metadata_degrades_to_none() {
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<packages>
+  <package id="Polly" version="%(Version)" targetFramework="net48" />
+</packages>"#;
+        let uri = deps_core::test_util::test_uri("/test/packages.config");
+        let result = parse_packages_config(xml, &uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
         assert!(result.dependencies[0].version_requirement.is_none());
         assert!(result.dependencies[0].version_range.is_none());
     }

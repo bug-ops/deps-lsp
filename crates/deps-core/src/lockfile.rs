@@ -269,6 +269,53 @@ pub fn locate_lockfile_for_manifest(
     manifest_uri: &Url,
     lockfile_names: &[&str],
 ) -> Option<PathBuf> {
+    locate_lockfile_for_manifest_with_max_depth(manifest_uri, lockfile_names, MAX_WORKSPACE_DEPTH)
+}
+
+/// Same as [`locate_lockfile_for_manifest`], but with an explicit cap on how many ancestor
+/// directories are searched after the manifest's own directory.
+///
+/// Most ecosystems share a lock file across a workspace, so they should keep using
+/// [`locate_lockfile_for_manifest`] (which searches up to `MAX_WORKSPACE_DEPTH` ancestors).
+/// An ecosystem whose lock file is genuinely per-project (e.g. NuGet's
+/// `packages.lock.json`, one per `.csproj`) should pass `max_ancestor_depth: 0` here instead,
+/// so an unrelated ancestor's lock file is never misattributed to a manifest that has none of
+/// its own (#1357).
+///
+/// # Arguments
+///
+/// * `manifest_uri` - URI of the manifest file
+/// * `lockfile_names` - List of possible lock file names to search for, checked in the given
+///   order within each directory before moving up to its parent.
+/// * `max_ancestor_depth` - How many parent directories to search after the manifest's own
+///   directory. `0` restricts the search to the manifest's own directory only.
+///
+/// # Returns
+///
+/// Path to the first found lock file, or None if not found.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::lockfile::locate_lockfile_for_manifest_with_max_depth;
+/// use url::Url;
+///
+/// let manifest_uri = Url::from_file_path("/path/to/project/project.csproj").unwrap();
+/// let lockfile_names = &["packages.lock.json"];
+///
+/// // NuGet lock files are per-project, so restrict the search to the manifest's own
+/// // directory — an unrelated ancestor project's lock file must never be picked up.
+/// if let Some(path) =
+///     locate_lockfile_for_manifest_with_max_depth(&manifest_uri, lockfile_names, 0)
+/// {
+///     println!("Found lock file at: {}", path.display());
+/// }
+/// ```
+pub fn locate_lockfile_for_manifest_with_max_depth(
+    manifest_uri: &Url,
+    lockfile_names: &[&str],
+    max_ancestor_depth: usize,
+) -> Option<PathBuf> {
     let manifest_path = resolve_manifest_file_path(manifest_uri)?;
     let manifest_dir = manifest_path.parent()?;
 
@@ -289,7 +336,7 @@ pub fn locate_lockfile_for_manifest(
         return None;
     };
 
-    for depth in 0..MAX_WORKSPACE_DEPTH {
+    for depth in 0..max_ancestor_depth {
         lock_path.clear();
         lock_path.push(current_dir);
 
@@ -1442,6 +1489,46 @@ mod tests {
 
         assert!(located.is_some());
         assert_eq!(located.unwrap(), workspace_lock);
+    }
+
+    /// #1357 regression guard: `max_ancestor_depth: 0` must find a same-directory lock file
+    /// but never walk up to a parent's, while the existing `locate_lockfile_for_manifest`
+    /// wrapper must keep finding ancestor lock files for the other ecosystem crates that rely
+    /// on it (Cargo, npm, Bundler, etc.).
+    #[test]
+    fn test_locate_lockfile_for_manifest_with_max_depth_zero_ignores_ancestors() {
+        // See the comment in `test_locate_lockfile_for_manifest_same_directory` on why this
+        // guard is needed here.
+        let _guard = fs_probe::snapshot_guard();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_lock = temp_dir.path().join("Cargo.lock");
+        let member_dir = temp_dir.path().join("crates").join("member");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        let member_lock = member_dir.join("Cargo.lock");
+
+        std::fs::write(&workspace_lock, "version = 4").unwrap();
+        std::fs::write(&member_manifest, "[package]\nname = \"member\"").unwrap();
+
+        let manifest_uri = Url::from_file_path(&member_manifest).unwrap();
+
+        assert_eq!(
+            locate_lockfile_for_manifest_with_max_depth(&manifest_uri, &["Cargo.lock"], 0),
+            None,
+            "depth 0 must not walk up to the workspace root's lock file"
+        );
+        assert_eq!(
+            locate_lockfile_for_manifest(&manifest_uri, &["Cargo.lock"]),
+            Some(workspace_lock),
+            "the default wrapper must keep the ancestor-walk behavior for existing callers"
+        );
+
+        std::fs::write(&member_lock, "version = 4").unwrap();
+        assert_eq!(
+            locate_lockfile_for_manifest_with_max_depth(&manifest_uri, &["Cargo.lock"], 0),
+            Some(member_lock),
+            "depth 0 must still find a lock file in the manifest's own directory"
+        );
     }
 
     /// A directory named `Cargo.lock` (portable stand-in for a FIFO, which

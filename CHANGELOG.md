@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-nuget**: harden `compile_requirement`/`format_version_replacing` against an unexpanded MSBuild property reference (`Version="$(SomeProperty)"`) being treated as a satisfiable requirement (see #1347) (#1352)
 
 ### Fixed
+- **deps-nuget**: a project with no `packages.lock.json`/`packages.<Project>.lock.json` of its own no longer falls back to an unrelated ancestor project's lock file, since NuGet lock files are per-project, not workspace-shared (resolves #1357) (#1362)
+- **deps-nuget**: `%(MetadataName)` item-metadata and `@(ItemList)` item-list MSBuild reference syntax are now recognized as unresolved everywhere `$(PropertyName)` already was — parse-time version degrade guards, `requirement_is_unresolved`, and `validate_package_name` — closing gaps where they still offered version-rewrite code actions, completions, and diagnostics, or rendered an incorrect "Invalid package name" diagnostic for an unresolved `Include` reference (resolves #1355) (#1362)
 - **deps-nuget**: an ancestor directory's `packages.lock.json` no longer shadows a nested project's own `packages.<Project>.lock.json` one directory closer (resolves #1351) (#1356)
 - **deps-core, deps-engine, deps-cli**: `plan_vulnerability_fix` now returns a typed reason instead of collapsing every failure into `None` (resolves #1350) (#1361)
 - **deps-cli**: `Outcome::Applied` now carries its edit directly, preventing a state where success is reported without writing (resolves #1349) (#1361)
