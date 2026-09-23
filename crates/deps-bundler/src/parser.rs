@@ -1166,10 +1166,20 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
     })
 }
 
-/// Scans each `(line, base_offset)` segment in order and returns the version constraint from
-/// the first eligible one, with a range computed against that specific line's offset — so a
-/// version on a continuation line of a multi-line `gem` call (#991) still gets a correct LSP
-/// range instead of one derived from the wrong physical line.
+/// Scans each `(line, base_offset)` segment in order and returns *every* positional version
+/// constraint found, starting from the first eligible one — a `gem` call may declare more than
+/// one comma-separated constraint (`gem "rails", ">= 5.0", "< 6.0"`, #1366) — joined back into a
+/// single `", "`-separated requirement string, with a range spanning from the first constraint's
+/// content to the last's (so a rewrite replacing that whole range with a single new version
+/// literal collapses a multi-constraint declaration back to one, rather than leaving a stray
+/// unrewritten second literal behind). Before #1366 this returned only the first constraint,
+/// which could make a vulnerability-fix rewrite decide "already resolves"/"safe to rewrite" from
+/// half the declared requirement, or silently drop a real second constraint from diagnostics.
+/// Consecutive constraints must be separated only by the pattern's own comma/whitespace
+/// terminator — anything else (an option key, a nested call, unrelated content) stops
+/// accumulation, whether on the same line or before moving on to the next. A version on a
+/// continuation line of a multi-line `gem` call (#991) still gets a range computed against that
+/// specific line's offset instead of one derived from the wrong physical line.
 ///
 /// A version constraint can only be a *positional* argument, and Ruby requires positional
 /// arguments before keyword arguments in a method call — so each segment is searched only up
@@ -1179,8 +1189,8 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
 /// once a segment contains one, scanning stops there entirely (every later segment is
 /// necessarily inside keyword-argument territory too). Without this, `VERSION_PATTERN` — which
 /// matches any quoted string starting with a version-ish character — could match an unrelated
-/// option's value on a later line (e.g. `require: "5.x_bridge"`) and misreport it as the
-/// version constraint, while the real one further down was never reached (code-review finding).
+/// option's value on a later line (e.g. `require: "5.x_bridge"`) and misreport it as a version
+/// constraint, while the real one further down was never reached (code-review finding).
 ///
 /// Each segment's search area is also truncated at a trailing `if`/`unless` statement-modifier
 /// keyword ([`STATEMENT_MODIFIER_KEYWORD`], critic finding S3 for #1021): a quoted,
@@ -1248,6 +1258,10 @@ fn extract_version(
         &VERSION_PATTERN
     };
 
+    let mut constraints: Vec<String> = Vec::new();
+    let mut range_start = 0usize;
+    let mut range_end = 0usize;
+
     for (line, base_offset) in lines {
         let line: &str = line;
         let key_match = first_code_match(line, &ANY_OPTION_KEY);
@@ -1262,24 +1276,63 @@ fn extract_version(
             .unwrap_or(line.len());
         let search_area = &line[..boundary];
 
-        if let Some(caps) = version_pattern.captures(search_area) {
-            let version = caps[1].to_string();
-            let version_match = caps.get(1).unwrap();
-            let version_start = base_offset + version_match.start();
-            let version_end = base_offset + version_match.end();
+        // Repeatedly matches another constraint immediately following the previous one (only
+        // whitespace, already consumed as part of the previous match's own comma terminator, in
+        // between) — this is what lets `"~> 1.0", "< 2.0"` accumulate as two constraints instead
+        // of stopping at the first.
+        let mut cursor = 0usize;
+        while let Some(caps) = version_pattern.captures(&search_area[cursor..]) {
+            let whole = caps.get(0).unwrap();
+            let group = caps.get(1).unwrap();
+            // The very first constraint may sit anywhere in `search_area` (e.g. after the
+            // `gem "name", ` prefix, same as the pre-#1366 unanchored search) — only a
+            // *second or later* constraint must be immediately adjacent (nothing but the
+            // previous match's own whitespace/comma terminator in between).
+            if !constraints.is_empty()
+                && !search_area[cursor..cursor + whole.start()]
+                    .trim()
+                    .is_empty()
+            {
+                // Not an immediately-adjacent constraint — whatever this is belongs to a later,
+                // unrelated match (or nothing at all); stop accumulating on this line.
+                break;
+            }
+            if constraints.is_empty() {
+                range_start = base_offset + cursor + group.start();
+            }
+            range_end = base_offset + cursor + group.end();
+            constraints.push(caps[1].to_string());
+            cursor += whole.end();
+        }
 
-            let version_range = byte_span_to_range(content, line_table, version_start, version_end);
+        let leftover_is_empty = search_area[cursor..].trim().is_empty();
 
-            return (Some(version), Some(version_range));
+        if !constraints.is_empty() {
+            if key_match.is_some() || !leftover_is_empty {
+                // Either keyword-argument territory starts right after (nothing later can be
+                // positional), or this line has unrecognized trailing content — either way, the
+                // constraint list ends here.
+                break;
+            }
+            // This line's positional-argument list wasn't closed off by anything but
+            // whitespace — a later physical line may still continue it (#991).
+            continue;
         }
 
         if key_match.is_some() {
-            // This segment already entered keyword-argument territory — no positional version
-            // can appear on this or any later segment.
+            // No constraint found on this segment, and it already entered keyword-argument
+            // territory — no positional version can appear on this or any later segment.
             break;
         }
     }
-    (None, None)
+
+    if constraints.is_empty() {
+        return (None, None);
+    }
+
+    let version = constraints.join(", ");
+    let version_range = byte_span_to_range(content, line_table, range_start, range_end);
+    (Some(version), Some(version_range))
 }
 
 /// Joins every accumulated physical line of a (possibly multi-line) `gem` call into one search
@@ -2381,6 +2434,90 @@ gem 'rails', '~> 7.0'";
         assert_eq!(dep.name_range.start.line, 1);
         assert!(dep.version_range.is_some());
         assert_eq!(dep.version_range.unwrap().start.line, 1);
+    }
+
+    // --- #1366: multi-constraint version requirements (`gem "x", ">= 1.0", "< 2.0"`) ---
+
+    #[test]
+    fn test_parse_multi_constraint_version() {
+        let gemfile = "source 'https://rubygems.org'\ngem 'rails', '>= 5.0', '< 6.0'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].version_req,
+            Some(">= 5.0, < 6.0".into())
+        );
+    }
+
+    #[test]
+    fn test_parse_multi_constraint_version_three_constraints() {
+        let gemfile = "source 'https://rubygems.org'\ngem 'rails', '>= 5.0', '< 6.0', '!= 5.5.0'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].version_req,
+            Some(">= 5.0, < 6.0, != 5.5.0".into())
+        );
+    }
+
+    /// A constraint on its own continuation line (Ruby's implicit trailing-comma continuation,
+    /// #991) must still be accumulated, not just a same-line multi-constraint list.
+    #[test]
+    fn test_parse_multi_constraint_version_multiline_continuation() {
+        let gemfile = "source 'https://rubygems.org'\ngem 'rails',\n  '>= 5.0',\n  '< 6.0'";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].version_req,
+            Some(">= 5.0, < 6.0".into())
+        );
+    }
+
+    /// A keyword option after a multi-constraint list must still be reached — the accumulation
+    /// loop must stop at the option key, not swallow it as a third constraint.
+    #[test]
+    fn test_parse_multi_constraint_version_followed_by_option() {
+        let gemfile =
+            "source 'https://rubygems.org'\ngem 'rails', '>= 5.0', '< 6.0', require: false";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].version_req,
+            Some(">= 5.0, < 6.0".into())
+        );
+        assert_eq!(result.dependencies[0].require, Some("false".into()));
+    }
+
+    /// The parser itself just preserves the raw text of every constraint, unresolved
+    /// interpolation included — `BundlerFormatter` is what refuses to rewrite it (#1354/#1366).
+    #[test]
+    fn test_parse_multi_constraint_version_with_unresolved_interpolation() {
+        let gemfile = "source 'https://rubygems.org'\ngem \"rails\", \"~> 1.0\", \"< #{V}\"";
+        let result = parse_gemfile(gemfile, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].version_req,
+            Some("~> 1.0, < #{V}".into())
+        );
+    }
+
+    /// The version range must span from the first constraint's content to the last's —
+    /// including the intervening closing/opening quotes and comma — so a rewrite that replaces
+    /// that whole span with one new literal collapses two positional args into one instead of
+    /// leaving a stray second literal behind (see `deps_core::edit::plan_verified_fix`, which
+    /// replaces exactly this range verbatim).
+    #[test]
+    fn test_parse_multi_constraint_version_range_collapses_to_single_pin() {
+        let line = "gem 'rails', '>= 5.0', '< 6.0'";
+        let gemfile = format!("source 'https://rubygems.org'\n{line}");
+        let result = parse_gemfile(&gemfile, &test_uri()).unwrap();
+        let range = result.dependencies[0]
+            .version_range
+            .expect("multi-constraint version has a range");
+
+        let line_start = gemfile.find(line).unwrap();
+        let content_start = line_start + line.find(">= 5.0").unwrap();
+        let content_end = line_start + line.rfind("< 6.0").unwrap() + "< 6.0".len();
+        let line_table = LineOffsetTable::new(&gemfile);
+        let expected = byte_span_to_range(&gemfile, &line_table, content_start, content_end);
+
+        assert_eq!(range, expected);
     }
 
     #[test]

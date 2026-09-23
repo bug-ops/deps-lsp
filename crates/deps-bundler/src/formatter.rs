@@ -51,6 +51,16 @@ fn fail_closed_operand(requirement: &str) -> Option<&str> {
     Some(req)
 }
 
+/// True when any comma-separated constraint of a (possibly multi-constraint, #1366) requirement
+/// has a [`fail_closed_operand`] whose operand is not a valid RubyGems version — applied
+/// per-constraint since `fail_closed_operand` itself only looks at a single leading operator, and
+/// a multi-constraint requirement like `">= 1.0, < 2.0"` composes several independently.
+fn any_constraint_fails_closed_and_invalid(requirement: &str) -> bool {
+    requirement.split(',').any(|constraint| {
+        fail_closed_operand(constraint).is_some_and(|operand| !is_valid_rubygems_version(operand))
+    })
+}
+
 /// Rubygems requirement matcher, compiled once per dependency by
 /// [`BundlerFormatter::compile_requirement`]. `version_matches_requirement` is a hand-rolled
 /// comparator with no external parser to fail on, so this always decides (`Some`).
@@ -88,7 +98,12 @@ fn requirement_contains_unresolved_interpolation(requirement: &str) -> bool {
 /// empty, or a range/comparison operator (`~>`, `>=`, `>`, `<=`, `<`, `!=`) rather than a pin.
 fn exact_pin_version(requirement: &str) -> Option<&str> {
     let req = requirement.trim();
-    if req.is_empty() || req == "*" {
+    // A multi-constraint requirement (#1366, e.g. `"1.0.0, < 2.0"`) is never a single exact
+    // pin, even when its first constraint looks like one — without this guard, a bare-pin
+    // first constraint followed by another fell through to the `is_range_op` check below,
+    // which only inspects the leading operator, and returned the whole comma-joined string as
+    // if it were one version.
+    if req.is_empty() || req == "*" || req.contains(',') {
         return None;
     }
     if let Some(rest) = req.strip_prefix('=') {
@@ -221,13 +236,14 @@ impl RequirementResolution for BundlerFormatter {
     /// `version_matches_requirement` comparator as `version_satisfies_requirement` — Bundler
     /// requirements have no separate "loose" vs. "precise" form to distinguish, and
     /// `version_matches_requirement` never fails to parse, so this always decides (`Some`),
-    /// except when `fail_closed_operand` identifies `requirement` as one of the operator
-    /// shapes (`~>`, `<`, `<=`, `=`, bare) whose malformed-operand behavior fails closed
-    /// (matches no candidate) rather than open: with no up-front validation, that would
-    /// produce a misleading "no version satisfies requirement" diagnostic instead of
-    /// flagging the requirement itself as invalid, so this returns `None` for it instead,
-    /// matching the `is_valid_range`/`is_valid_requirement` precedent in Maven/Gradle/NuGet's
-    /// `compile_requirement` (#332). The "could this requirement be satisfied by a version
+    /// except when `any_constraint_fails_closed_and_invalid` identifies one of `requirement`'s
+    /// comma-separated constraints (#1366) as one of the operator shapes (`~>`, `<`, `<=`, `=`,
+    /// bare) whose malformed-operand behavior fails closed (matches no candidate) rather than
+    /// open: with no up-front validation, that would produce a misleading "no version satisfies
+    /// requirement" diagnostic instead of flagging the requirement itself as invalid, so this
+    /// returns `None` for it instead, matching the `is_valid_range`/`is_valid_requirement`
+    /// precedent in Maven/Gradle/NuGet's `compile_requirement` (#332). The "could this
+    /// requirement be satisfied by a version
     /// RubyGems hid" ambiguity is handled separately in
     /// [`Self::requirement_is_undecidable_given_available`], which sees `available` and can
     /// therefore decide it precisely instead of this method having to guess from
@@ -238,7 +254,7 @@ impl RequirementResolution for BundlerFormatter {
         }
         compile_requirement_unless(
             requirement.as_str(),
-            |r| fail_closed_operand(r).is_some_and(|operand| !is_valid_rubygems_version(operand)),
+            any_constraint_fails_closed_and_invalid,
             RubygemsMatcher,
         )
     }
@@ -499,6 +515,15 @@ mod tests {
         assert_eq!(exact_pin_version("~> 7.0"), None);
         assert_eq!(exact_pin_version(">= 1.1"), None);
         assert_eq!(exact_pin_version("!= 1.0.0"), None);
+    }
+
+    /// #1366: a multi-constraint requirement is never a single exact pin, even when its first
+    /// constraint has no operator prefix and would otherwise look like one.
+    #[test]
+    fn test_exact_pin_version_multi_constraint_not_a_pin() {
+        assert_eq!(exact_pin_version("1.0.0, < 2.0"), None);
+        assert_eq!(exact_pin_version("= 1.0.0, < 2.0"), None);
+        assert_eq!(exact_pin_version(">= 1.0, < 2.0"), None);
     }
 
     /// #252 regression: rest-client's yanked `1.6.10`-`1.6.13` sit between the published
@@ -765,6 +790,129 @@ mod tests {
             Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
             "the real BundlerFormatter must suppress the fix for an unresolved interpolation \
              via NoOpRewrite, got {planned:?}"
+        );
+    }
+
+    // --- #1366: multi-constraint requirements must round-trip or safely no-op ---
+
+    /// A multi-constraint requirement with no unresolved interpolation is a normal
+    /// vulnerability-fix target — the whole comma-joined requirement collapses to a single new
+    /// version literal, and applying the resulting edit to the original text must leave a
+    /// syntactically valid, single-argument `gem` call behind (not a stray second literal).
+    #[test]
+    fn test_plan_vulnerability_fix_multi_constraint_collapses_to_single_pin() {
+        use deps_core::ParseResult;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let gemfile = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("multi-constraint requirement preserved")
+            .as_str();
+        assert_eq!(current, ">= 5.0, < 6.0");
+        let version_range = dep.version_range().expect("multi-constraint has a range");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0003".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["6.1.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "6.1.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, &BundlerFormatter)
+            .expect("a non-interpolated multi-constraint requirement must be rewritable");
+
+        assert_eq!(planned.edit.new_text, "6.1.0");
+
+        let start = usize::try_from(planned.edit.range.start.character).unwrap();
+        let end = usize::try_from(planned.edit.range.end.character).unwrap();
+        let mut rewritten = gemfile.to_string();
+        rewritten.replace_range(start..end, &planned.edit.new_text);
+        assert_eq!(rewritten, "gem \"rails\", \"6.1.0\"");
+    }
+
+    /// #1366: a later constraint's unresolved interpolation must suppress the rewrite for the
+    /// *whole* multi-constraint requirement, not just leave the first constraint alone — mirrors
+    /// `test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite` above, but
+    /// with the interpolation in the second constraint rather than the only one.
+    #[test]
+    fn test_plan_vulnerability_fix_multi_constraint_later_unresolved_interpolation_skips_via_no_op_rewrite()
+     {
+        use deps_core::ParseResult;
+        use deps_core::edit::plan_vulnerability_fix;
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let gemfile = "gem \"rails\", \"~> 1.0\", \"< #{RAILS_MAX}\"";
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("multi-constraint requirement preserved, interpolation included")
+            .as_str();
+        assert_eq!(current, "~> 1.0, < #{RAILS_MAX}");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0004".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["7.0.8".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "7.0.8".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            deps_core::position::Range::default(),
+            current,
+            &dv,
+            &BundlerFormatter,
+        );
+
+        assert_eq!(
+            planned,
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            "an unresolved interpolation in ANY constraint must suppress the whole \
+             multi-constraint rewrite, got {planned:?}"
+        );
+    }
+
+    /// #1366: `compile_requirement` must reject a multi-constraint requirement when *any* of its
+    /// constraints has an invalid operand for a fail-closed operator, not just the first.
+    #[test]
+    fn test_compile_requirement_multi_constraint_invalid_later_constraint_suppressed() {
+        let formatter = BundlerFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new(">= 1.0, < abc"))
+                .is_none()
+        );
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new(">= 1.0, < 2.0"))
+                .is_some()
         );
     }
 }
