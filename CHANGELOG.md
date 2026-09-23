@@ -72,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-dart, deps-npm**: new `deps_core::check_yaml_bounds` helper centralizes duplicated YAML nesting-depth/expansion-guard wiring across 5 call sites (resolves #1245) (#1314)
 - **deps-core**: URL/declaration-key/parse-error redaction and the in-memory secret wrapper moved from `net_policy`/`secret` into a new `redact` module; old paths are kept as re-exports, so no call site needs updating (resolves #1247, #1216) (#1316)
 - **deps-core**: `redact` module dedupes the double URL-parse on the declaration-key redaction hot path and avoids a second allocation on its opaque-key no-op path (resolves #1317) (#1327)
+- **deps-core, ci**: `redacting_debug_compile_fail` trybuild test is now `#[ignore]`d (slow cold-cache sandbox rebuild); still run explicitly via dedicated steps in `ci.yml`'s `test`, `cross-check` (i686), and `coverage` jobs, and excluded from `live-registry-tests.yml`'s network-gated sweep (#1345)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)

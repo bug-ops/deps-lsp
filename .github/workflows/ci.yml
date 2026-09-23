@@ -850,6 +850,25 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace --all-features --no-fail-fast --profile ci
 
+      - name: Run redacting_debug_compile_fail (ignored for local speed, explicit in CI)
+        # #[ignore]d in-crate for local speed (see the test's own module docs) — run explicitly
+        # here so it still gates every PR. `--workspace --all-features` matches the "Run tests"
+        # step above exactly (not `-p deps-core`) so this reuses that step's build instead of
+        # compiling a third, distinct feature-set rlib. `if: '!cancelled()'` so a failure in
+        # "Run tests" above (`--no-fail-fast`, so it can fail without stopping the job) doesn't
+        # skip this step and hide its result. Do NOT fold this into "Run tests" via
+        # `--run-ignored all` — this workspace also has ~40 network-gated `#[ignore]`d tests
+        # (see live-registry-tests.yml) that must stay out of this blocking job. `--retries 0`
+        # overrides `--profile ci`'s `retries = 2`: a real regression here is a deterministic
+        # `.stderr` mismatch, not a flake, so retrying would only pay this test's cold-cache
+        # sandbox-rebuild cost twice more on every genuine failure. `shell: bash` is explicit
+        # because this is the first `-E '...'` filter expression in this file and the `windows-
+        # latest` leg's default shell is `pwsh`, which quotes arguments differently; bash is
+        # available on all 3 GitHub-hosted runner OSes.
+        if: '!cancelled()'
+        shell: bash
+        run: cargo nextest run --workspace --all-features -E 'test(redacting_debug_compile_fail)' --run-ignored ignored-only --profile ci --retries 0
+
       - name: Run doctests
         run: cargo test --workspace --doc --all-features
 
@@ -980,12 +999,25 @@ jobs:
         if: matrix.run_tests && matrix.native_multilib
         run: cargo nextest run --workspace --all-features --no-fail-fast --target ${{ matrix.target }}
 
+      - name: Run redacting_debug_compile_fail for cross-compile target (ignored above, explicit here)
+        # Mirrors ci.yml's `test` job step of the same name: `#[ignore]`d in-crate for local
+        # speed, so it needs a dedicated `--run-ignored` invocation to still run here too — this
+        # is the exact leg `.config/nextest.toml`'s per-test slow-timeout override calls out
+        # ("cross-compilation (i686-unknown-linux-gnu)"), so dropping it here would silently
+        # stop testing the 32-bit pointer-width path this test exercises.
+        if: matrix.run_tests && matrix.native_multilib && !cancelled()
+        run: cargo nextest run --workspace --all-features -E 'test(redacting_debug_compile_fail)' --run-ignored ignored-only --target ${{ matrix.target }}
+
   coverage:
     name: Code Coverage
     needs: changes
     if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Was 10: the job now does a second instrumented nextest pass (redacting_debug_compile_fail's
+    # trybuild sandbox rebuild, slower under coverage instrumentation than natively) plus a
+    # separate `report` step on top of the original coverage run — bumped with margin for a
+    # cold-cache worst case.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -998,7 +1030,21 @@ jobs:
           tool: cargo-nextest, cargo-llvm-cov
 
       - name: Generate coverage
-        run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info nextest --profile coverage
+        run: cargo llvm-cov --no-report --all-features --workspace nextest --profile coverage
+
+      - name: Generate coverage for redacting_debug_compile_fail (ignored above, explicit here)
+        # Mirrors ci.yml's `test` job step of the same name: `#[ignore]`d in-crate for local
+        # speed, so it needs its own `--run-ignored` invocation to still contribute to this
+        # job's coverage report too — this is the exact leg `.config/nextest.toml`'s per-test
+        # slow-timeout override calls out ("coverage instrumentation (llvm-cov)"). `--no-report`
+        # on both nextest invocations accumulates instrumentation data instead of overwriting
+        # it; the following `report` step combines them into one lcov file (verified locally:
+        # `cargo llvm-cov report` after two `--no-report` runs covers both tests' files).
+        if: '!cancelled()'
+        run: cargo llvm-cov --no-report --all-features --workspace nextest --profile coverage -E 'test(redacting_debug_compile_fail)' --run-ignored ignored-only
+
+      - name: Generate coverage report
+        run: cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload coverage
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1

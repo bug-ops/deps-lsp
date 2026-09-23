@@ -50,9 +50,15 @@ jobs:
         # by itself file a P1 "registry drifted" issue below. Kept at 1, not higher: a
         # misconfigured (e.g. empty) GITHUB_TOKEN secret fails every retry identically, so
         # more retries would only amplify live-API load without improving flake protection.
+        # `redacting_debug_compile_fail` (crates/deps-core/tests/) is `#[ignore]`d for local
+        # speed, not for network access — it's a `trybuild` compile-fail test with no registry
+        # calls, so it's excluded here rather than swept in: a `.stderr` toolchain-drift failure
+        # here would otherwise get misdiagnosed by the "File or update tracking issue on
+        # failure" step below as a live registry API drift. It's already run explicitly in
+        # ci.yml's `test`, `cross-check`, and `coverage` jobs on every PR.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: cargo nextest run --workspace --all-features --run-ignored ignored-only --no-fail-fast --retries 1
+        run: cargo nextest run --workspace --all-features --run-ignored ignored-only --no-fail-fast --retries 1 -E 'not test(redacting_debug_compile_fail)'
 
       - name: File or update tracking issue on failure
         # Mirrors ci.yml's `semver` job's identically named step: a scheduled failure here
