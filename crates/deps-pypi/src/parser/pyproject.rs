@@ -1141,6 +1141,35 @@ flask = "^3.0"
         assert_eq!(poetry_deps.len(), 1);
     }
 
+    /// #1374 regression: a PEP 621 `dependencies = [...]` entry carrying an unresolved
+    /// `$VAR`/`${VAR}`-style external-templating placeholder (`envsubst`, CI templating) in
+    /// its version slot already fails `pep508_rs`'s PEP 440 dependency-specifier parsing —
+    /// `${REQ}` is not a valid version — so `parse_pep621_dependencies` logs and skips the
+    /// whole entry (see that method's `Err` arm) rather than producing a dependency with
+    /// `version_requirement: Some("${REQ}")`. Locks this already-correct behavior in place:
+    /// `PypiFormatter`'s new `requirement_contains_dollar_placeholder` guard
+    /// (`formatter::format_version_replacing`/`requirement_is_unresolved`) exists for the
+    /// `[tool.poetry.dependencies]` table form, which has no such upstream validation — this
+    /// PEP 621 array form must stay unaffected by that guard's addition.
+    #[test]
+    fn test_parse_pep621_dollar_placeholder_requirement_is_skipped() {
+        let content = r#"
+[project]
+dependencies = ["requests==${REQ}", "flask>=3.0"]
+"#;
+
+        let parser = PypiParser::new();
+        let result = parser.parse_content(content, &test_uri()).unwrap();
+        let deps = &result.dependencies;
+
+        assert_eq!(
+            deps.len(),
+            1,
+            "the ${{REQ}} entry must be skipped, not parsed"
+        );
+        assert_eq!(deps[0].name, "flask");
+    }
+
     #[test]
     fn test_parse_invalid_toml() {
         let content = "invalid toml {{{";

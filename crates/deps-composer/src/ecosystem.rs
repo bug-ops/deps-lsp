@@ -244,11 +244,19 @@ mod tests {
         non_registry_fixture: "composer.json" => r#"{"repositories": [{"type": "vcs", "url": "ssh://git@git.acme.internal/private.git", "only": ["acme/secretpkg"]}], "require": {"acme/secretpkg": "^1.0"}}"#;
     }
 
-    // #1354 security audit: `composer.json`'s version-constraint grammar has no
-    // placeholder/environment-variable interpolation syntax for a version requirement string.
+    // #1373/#1374: `composer.json`'s version-constraint grammar has no placeholder/
+    // environment-variable interpolation syntax of its own, but a manifest can still carry
+    // three non-rewritable forms deps-lsp must never overwrite with a literal registry
+    // version — two Composer-native (`self.version`, an inline alias
+    // `<branch-or-constraint> as <alias-version>`) and one from external templating
+    // (`${VAR}`/`$VAR` left unexpanded, #1374 impl-critic M2) — see `ComposerFormatter`'s
+    // `requirement_is_composer_unresolved` guard.
     deps_core::unresolved_requirement_conformance! {
         mod composer_unresolved_requirement_conformance;
-        no_placeholder_syntax: "composer.json version constraints are plain JSON strings with no placeholder/variable interpolation grammar (#1354)";
+        build: ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: "composer.json" =>
+            r#"{"require":{"monolog/monolog":"self.version","symfony/console":"dev-main as 1.0.0","psr/log":"${PSR_LOG}"}}"#;
     }
 
     // #758: the shared completion-prefix-length guard

@@ -1533,6 +1533,68 @@ pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
     }
 }
 
+/// The length of the maximal `[a-zA-Z_][a-zA-Z0-9_]*`-shaped identifier starting at `start` in
+/// `bytes`, or `None` if `bytes[start]` does not start one — the identifier grammar shared by
+/// shell/envsubst-style variable expansion (`$VAR`, `${VAR}`). Mirrors
+/// `deps_gitlab_ci::formatter::identifier_end`, minus that crate's `%VAR%` form.
+fn dollar_placeholder_identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start)?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// Whether `requirement` contains an unresolved `$VAR`/`${VAR}`-style external-templating
+/// placeholder.
+///
+/// Detected anywhere in the text, not just as the whole value: `"${REACT_VERSION}"`, `"$VUE"`,
+/// and an embedded form like `"1.0.0-$BUILD"` are all detected.
+///
+/// Issue #1374: manifests pre-processed by external templating (`envsubst`, CI templating,
+/// cookiecutter-style generators) commonly carry this shape in a version-requirement slot.
+/// npm, Cargo, Dart and Poetry (`[tool.poetry.dependencies]`) have no expansion syntax of
+/// their own for it — unlike Maven's `${property}` or Gradle's `$var`/`${var}`, which their
+/// own build tools resolve — so this crate can never expand it either, and a requirement
+/// containing it must never be classified as outdated/unsatisfiable or rewritten to a literal
+/// version. Deliberately narrower than
+/// `deps_gitlab_ci::formatter::contains_unresolved_gitlab_variable`: it omits that function's
+/// `%VAR%` form, which is GitLab's own Windows-`cmd`-style variable syntax, not a templating
+/// convention any of this predicate's callers' ecosystems use.
+///
+/// The braced form does not require a closing `}` (failing safe on an unclosed `${VAR` — still
+/// treating it as a placeholder — mirrors the GitLab precedent this predicate was extracted
+/// alongside).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::requirement_contains_dollar_placeholder;
+///
+/// assert!(requirement_contains_dollar_placeholder("${REACT_VERSION}"));
+/// assert!(requirement_contains_dollar_placeholder("$VUE"));
+/// assert!(requirement_contains_dollar_placeholder("1.0.0-$BUILD"));
+/// assert!(!requirement_contains_dollar_placeholder("1.2.3"));
+/// assert!(!requirement_contains_dollar_placeholder("price-is-$5"));
+/// ```
+pub fn requirement_contains_dollar_placeholder(requirement: &str) -> bool {
+    let bytes = requirement.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == b'$'
+            && match bytes.get(i + 1) {
+                Some(b'{') => dollar_placeholder_identifier_end(bytes, i + 2).is_some(),
+                _ => dollar_placeholder_identifier_end(bytes, i + 1).is_some(),
+            }
+    })
+}
+
 /// Result of checking whether a dependency's declared requirement is already satisfied by
 /// the latest known version.
 ///
@@ -3298,6 +3360,40 @@ mod tests {
         assert!(!is_same_major_minor("", ""));
         assert!(!is_same_major_minor("1.2.3", ""));
         assert!(!is_same_major_minor("", "1.2.3"));
+    }
+
+    #[test]
+    fn test_requirement_contains_dollar_placeholder_bare_and_braced() {
+        assert!(requirement_contains_dollar_placeholder("$REACT_VERSION"));
+        assert!(requirement_contains_dollar_placeholder("${REACT_VERSION}"));
+        assert!(requirement_contains_dollar_placeholder("1.0.0-$BUILD"));
+        assert!(requirement_contains_dollar_placeholder(
+            "v${MAJOR}.${MINOR}"
+        ));
+    }
+
+    #[test]
+    fn test_requirement_contains_dollar_placeholder_lowercase_and_mixed_case() {
+        assert!(requirement_contains_dollar_placeholder("$react_version"));
+        assert!(requirement_contains_dollar_placeholder("${React_Version}"));
+    }
+
+    #[test]
+    fn test_requirement_contains_dollar_placeholder_ordinary_requirements_not_flagged() {
+        assert!(!requirement_contains_dollar_placeholder("1.2.3"));
+        assert!(!requirement_contains_dollar_placeholder("^1.2.3"));
+        assert!(!requirement_contains_dollar_placeholder("~1.2.3"));
+        assert!(!requirement_contains_dollar_placeholder(">=1.0.0 <2.0.0"));
+        assert!(!requirement_contains_dollar_placeholder(""));
+        assert!(!requirement_contains_dollar_placeholder("price-is-$5"));
+        assert!(!requirement_contains_dollar_placeholder("trailing-$"));
+        assert!(!requirement_contains_dollar_placeholder("empty-${}"));
+        assert!(!requirement_contains_dollar_placeholder("${123}"));
+    }
+
+    #[test]
+    fn test_requirement_contains_dollar_placeholder_unclosed_brace_fails_safe() {
+        assert!(requirement_contains_dollar_placeholder("${VAR"));
     }
 
     #[test]

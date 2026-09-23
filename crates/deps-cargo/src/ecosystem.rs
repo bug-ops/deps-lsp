@@ -382,12 +382,19 @@ mod tests {
         non_registry_fixture: "Cargo.toml" => "[dependencies]\nlocal-crate = { path = \"../local-crate\" }\n";
     }
 
-    // #1354 security audit: Cargo.toml's TOML grammar has no placeholder/environment-variable
-    // interpolation syntax for a version requirement string — a `${V}`-shaped literal is just
-    // plain text, not a possible unresolved reference.
+    // #1374: Cargo.toml's TOML grammar has no placeholder/environment-variable interpolation
+    // syntax of its own, but a manifest pre-processed by external templating (`envsubst`, CI
+    // templating) commonly leaves a `$VAR`/`${VAR}`-shaped literal in the version slot; the
+    // TOML parser has no way to distinguish that from an ordinary string, so it stays a
+    // normal `Some(version_requirement)` and reaches `plan_vulnerability_fix`/
+    // `format_version_replacing_for` directly — depends on `CargoFormatter`'s own
+    // `requirement_contains_dollar_placeholder` guard.
     deps_core::unresolved_requirement_conformance! {
         mod cargo_unresolved_requirement_conformance;
-        no_placeholder_syntax: "Cargo.toml version requirements are plain TOML strings with no placeholder/variable interpolation grammar (#1354)";
+        build: CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: "Cargo.toml" =>
+            "[dependencies]\nserde = \"${SERDE}\"\n";
     }
 
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.

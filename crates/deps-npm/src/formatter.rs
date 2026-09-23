@@ -1,6 +1,7 @@
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy,
+    requirement_contains_dollar_placeholder,
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
@@ -131,6 +132,21 @@ impl PackageRendering for NpmFormatter {
         version.to_string()
     }
 
+    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
+    /// (see `requirement_contains_dollar_placeholder`) in `current` leaves `current`
+    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
+    /// latest" edit can never hardcode a literal version over it — mirrors
+    /// `MavenFormatter`/`GradleFormatter`/`NuGetFormatter`'s identical-shaped
+    /// `${property}`/`$(Property)` guards, all on this same non-`dep`-aware hook (npm has no
+    /// dependency-identity-dependent rewrite logic, unlike `GitlabCiFormatter`/
+    /// `BundlerFormatter`, which override `format_version_replacing_for` instead).
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_contains_dollar_placeholder(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -141,10 +157,24 @@ impl RequirementResolution for NpmFormatter {
     /// registry uses for matching — precise npm semver range semantics, unlike the
     /// default `version_satisfies_requirement` heuristic this method deliberately does
     /// not reuse (see that method's docs).
+    ///
+    /// #1374 hardening: an unresolved placeholder (see
+    /// [`Self::requirement_is_unresolved`]) never reaches `node_semver::Range::parse` —
+    /// returning `None` up front keeps this consistent with `requirement_is_unresolved`
+    /// even for the rare case `node_semver` might otherwise parse loosely.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        if self.requirement_is_unresolved(requirement) {
+            return None;
+        }
         node_semver::Range::parse(requirement.as_str())
             .ok()
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+    }
+
+    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
+    /// — see `requirement_contains_dollar_placeholder`.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_dollar_placeholder(requirement.as_str())
     }
 }
 

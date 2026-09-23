@@ -8,6 +8,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy,
+    requirement_contains_dollar_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -68,6 +69,22 @@ impl PackageRendering for DartFormatter {
         format!("^{version}")
     }
 
+    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
+    /// (see `requirement_contains_dollar_placeholder`) in `current` leaves `current`
+    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
+    /// latest" edit can never hardcode a literal version over a `pubspec.yaml` version
+    /// constraint pre-processed by `envsubst`/CI templating — mirrors
+    /// `MavenFormatter`/`GradleFormatter`/`NuGetFormatter`'s identical-shaped
+    /// `${property}`/`$(Property)` guards, all on this same non-`dep`-aware hook (Dart has no
+    /// dependency-identity-dependent rewrite logic, unlike `GitlabCiFormatter`/
+    /// `BundlerFormatter`, which override `format_version_replacing_for` instead).
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if requirement_contains_dollar_placeholder(current) {
+            return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -83,9 +100,28 @@ impl RequirementResolution for DartFormatter {
     /// `version_satisfies_requirement` — Dart constraints have no separate "loose" vs.
     /// "precise" form to distinguish. Spaced-operator normalization runs once here, not
     /// per candidate version.
+    ///
+    /// #1374 hardening: an unresolved placeholder (see
+    /// [`Self::requirement_is_unresolved`]) returns `None` up front — `PubDevMatcher`'s
+    /// hand-rolled comparator otherwise always decides (`Some`), which would read a
+    /// `${VAR}`-shaped constraint as satisfied by no candidate and misreport it
+    /// unsatisfiable (`requirement_is_unresolved` already short-circuits that diagnostic
+    /// ahead of this, but keeping `compile_requirement` consistent avoids a second,
+    /// independent path — e.g. completion candidate filtering — disagreeing with it).
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        if self.requirement_is_unresolved(requirement) {
+            return None;
+        }
         let normalized = normalize_operator_spacing(requirement.as_str().trim()).into_owned();
         Some(Box::new(PubDevMatcher(normalized)))
+    }
+
+    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
+    /// — see `requirement_contains_dollar_placeholder`. `pubspec.yaml`'s own version-
+    /// constraint grammar has no such syntax; this only fires for a value pre-processed
+    /// (and left unexpanded) by tooling outside Dart, e.g. `envsubst`.
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_dollar_placeholder(requirement.as_str())
     }
 }
 

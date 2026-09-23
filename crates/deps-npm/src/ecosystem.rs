@@ -456,6 +456,20 @@ mod tests {
             r#"{"dependencies": {"acme-widgets": "catalog:", "known-good-control": "1.0.0"}}"#;
     }
 
+    // #1374: a `$VAR`/`${VAR}`-style external-templating placeholder (`envsubst`, CI
+    // templating) in a plain string version value is not special-cased by
+    // `string_valued_entries`/`classify_non_registry_specifier`, so it stays a normal
+    // registry-sourced `Some(version_requirement)` — unlike `catalog:` above, this reaches
+    // `plan_vulnerability_fix`/`format_version_replacing_for` directly and depends on
+    // `NpmFormatter`'s own `requirement_contains_dollar_placeholder` guard.
+    deps_core::unresolved_requirement_conformance! {
+        mod npm_dollar_placeholder_conformance;
+        build: NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: "package.json" =>
+            r#"{"dependencies": {"react": "${REACT_VERSION}", "vue": "$VUE"}}"#;
+    }
+
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
     #[cfg(feature = "lsp-responses")]
     deps_core::completion_guard_conformance! {

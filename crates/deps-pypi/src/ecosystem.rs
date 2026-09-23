@@ -698,6 +698,21 @@ mod tests {
         fixture: "requirements.txt" => "known-good-control==1.0.0\nmylib==${VERSION}\n";
     }
 
+    // #1374: unlike the PEP 440 `mylib==${VERSION}` requirements.txt/PEP 621 form above,
+    // `[tool.poetry.dependencies]`'s string-form entries have no upstream PEP 440/508
+    // validation (`PypiParser::parse_poetry_dependency` takes the raw TOML string value
+    // directly) — a `$VAR`/`${VAR}`-style external-templating placeholder there stays a
+    // normal `Some(version_requirement)` and reaches `plan_vulnerability_fix`/
+    // `format_version_replacing_for` directly, depending entirely on `PypiFormatter`'s own
+    // `requirement_contains_dollar_placeholder` guard.
+    deps_core::unresolved_requirement_conformance! {
+        mod pypi_poetry_dollar_placeholder_conformance;
+        build: PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        reachable: true;
+        fixture: "pyproject.toml" =>
+            "[tool.poetry.dependencies]\nnumpy = \"${NUMPY}\"\n";
+    }
+
     // #758: the shared completion-prefix-length guard
     // (`deps_core::completion::complete_package_names_generic`), replacing
     // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
