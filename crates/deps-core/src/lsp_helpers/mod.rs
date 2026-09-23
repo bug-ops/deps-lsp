@@ -1342,46 +1342,39 @@ pub fn escape_markdown(s: &str) -> String {
     escaped
 }
 
-/// Narrow, explicit predicate for a character that must not survive [`escape_markdown`]
-/// or [`markdown_code_span`] unescaped (#1248): ASCII/C1 control characters plus a
-/// fixed set of invisible/bidi-override Unicode characters with a demonstrated Trojan
-/// Source (CVE-2021-42574) or text-smuggling use, and no legitimate mid-string use in
-/// registry-supplied free text.
+/// Predicate for a character that must not survive [`escape_markdown`]/
+/// [`markdown_code_span`] unescaped (#1248, widened #1323): every Unicode `Cc`/`Cf`/`Zl`/`Zp`
+/// character except a small, named exempt set with genuine mid-string use in real-world free
+/// text — RTL/ZWNJ/ZWJ marks and Arabic/Syriac/Kaithi prefixed-format signs (see individual
+/// `matches!` arms below, and `EXEMPT_CHARS` in
+/// `test_is_markdown_unsafe_exempt_set_matches_sanitize_invisible_drift_guard` for the exact
+/// list). Deliberately narrower than [`crate::redact::sanitize_invisible`]'s full sweep for
+/// that reason; a name/version-shaped caller with no such legitimate-mark concern should
+/// layer `sanitize_invisible` on top for full parity, as
+/// `deps_npm::catalog::CatalogOrigin::hover_detail` does (#1266) — this crate's own
+/// `deprecation.replacement` hover field does not yet (#1311).
 ///
-/// Deliberately narrower than [`crate::redact::sanitize_invisible`]'s whole-category
-/// (`Cf`/`Zl`/`Zp`) sweep: both `escape_markdown` and `markdown_code_span` also process
-/// free text (registry descriptions) that can legitimately carry `Cf` marks such as
-/// U+200F RIGHT-TO-LEFT MARK, U+061C ARABIC LETTER MARK, U+200E LEFT-TO-RIGHT MARK, or
-/// U+200C/U+200D (ZWNJ/ZWJ, load-bearing in Persian/Arabic/Indic text and emoji
-/// sequences) — a category-wide check would mangle genuine RTL text or emoji. This list
-/// covers only the bidi-override/invisible characters with no such legitimate use:
-/// explicit bidi overrides/isolates (U+202A-U+202E, U+2066-U+2069), the zero-width
-/// space (U+200B) and word joiner (U+2060, functionally identical to — and Unicode's
-/// recommended replacement for — U+FEFF used as a ZWNBSP rather than a byte-order mark),
-/// the line/paragraph separators (U+2028/U+2029, `Zl`/`Zp` — not `Cf`, so a `Cf`-only
-/// check would miss them), the byte-order mark (U+FEFF), interlinear annotation
-/// characters (U+FFF9-U+FFFB), and the Unicode tag characters (U+E0000-U+E007F, the
-/// canonical invisible "ASCII smuggling" vector).
-///
-/// This narrower list is a deliberate strength trade-off, not drift from
-/// [`crate::net_policy::sanitize_invisible`] — a caller whose Markdown fragments are
-/// name-shaped (an identifier, a version string, a specifier) rather than free text has no
-/// such legitimate-`Cf`-mark concern and should layer `sanitize_invisible` on top of
-/// [`escape_markdown`]/[`markdown_code_span`] for full parity with a sibling plain-text
-/// sink, the way `deps_npm::catalog::CatalogOrigin::hover_detail` does (#1266). This
-/// crate's own hover path does not yet do so for its name-shaped fragments (e.g.
-/// `deprecation.replacement`) — tracked separately as #1311, not fixed here.
+/// The drift-guard test above scans the full Unicode code space and enforces that the
+/// exempt set is exact. Do not widen or narrow this function without updating that test's
+/// `EXEMPT_CHARS`, and do not fold in `sanitize_invisible`'s RTL/ZWNJ/ZWJ exemption without
+/// also revisiting #1248.
 fn is_markdown_unsafe(c: char) -> bool {
     c.is_control()
         || matches!(c,
-            '\u{202A}'..='\u{202E}'   // LRE RLE PDF LRO RLO
-          | '\u{2066}'..='\u{2069}'   // LRI RLI FSI PDI
-          | '\u{200B}'               // ZWSP
-          | '\u{2060}'               // WORD JOINER
-          | '\u{2028}' | '\u{2029}'  // LS, PS
-          | '\u{FEFF}'               // ZWNBSP / BOM
-          | '\u{FFF9}'..='\u{FFFB}'  // interlinear annotation anchor/separator/terminator
+            '\u{202A}'..='\u{202E}'    // LRE RLE PDF LRO RLO
+          | '\u{2060}'..='\u{206F}'    // WORD JOINER, invisible math ops, bidi isolates,
+                                       // deprecated format-control block (U+2065 unassigned,
+                                       // deliberately included)
+          | '\u{200B}'                // ZWSP
+          | '\u{2028}' | '\u{2029}'   // LS, PS
+          | '\u{FEFF}'                // ZWNBSP / BOM
+          | '\u{FFF9}'..='\u{FFFB}'   // interlinear annotation anchor/separator/terminator
           | '\u{E0000}'..='\u{E007F}' // Unicode tag characters
+          | '\u{00AD}'                // SOFT HYPHEN
+          | '\u{180E}'                // MONGOLIAN VOWEL SEPARATOR
+          | '\u{13430}'..='\u{1343F}' // Egyptian Hieroglyph format controls
+          | '\u{1BCA0}'..='\u{1BCA3}' // Shorthand format controls
+          | '\u{1D173}'..='\u{1D17A}' // Musical symbol format controls
         )
 }
 
@@ -3042,6 +3035,147 @@ mod tests {
         ] {
             let escaped = escape_markdown(&format!("a{c}b"));
             assert_eq!(escaped, "a b", "{c:?} must be replaced with a space");
+        }
+    }
+
+    /// #1323: `sanitize_invisible` already stripped these `Cf` characters while
+    /// `is_markdown_unsafe`'s hand-picked list let them through.
+    #[test]
+    fn test_escape_markdown_replaces_1323_gap_characters() {
+        for c in [
+            '\u{00AD}',  // SOFT HYPHEN
+            '\u{180E}',  // MONGOLIAN VOWEL SEPARATOR
+            '\u{2061}',  // FUNCTION APPLICATION
+            '\u{2062}',  // INVISIBLE TIMES
+            '\u{2063}',  // INVISIBLE SEPARATOR
+            '\u{2064}',  // INVISIBLE PLUS
+            '\u{206A}',  // INHIBIT SYMMETRIC SWAPPING
+            '\u{206B}',  // ACTIVATE SYMMETRIC SWAPPING
+            '\u{206C}',  // INHIBIT ARABIC FORM SHAPING
+            '\u{206D}',  // ACTIVATE ARABIC FORM SHAPING
+            '\u{206E}',  // NATIONAL DIGIT SHAPES
+            '\u{206F}',  // NOMINAL DIGIT SHAPES
+            '\u{13430}', // Egyptian Hieroglyph format control (first)
+            '\u{1343F}', // Egyptian Hieroglyph format control (last)
+            '\u{1BCA0}', // Shorthand format control (first)
+            '\u{1BCA3}', // Shorthand format control (last)
+            '\u{1D173}', // Musical symbol format control (first)
+            '\u{1D17A}', // Musical symbol format control (last)
+        ] {
+            let escaped = escape_markdown(&format!("a{c}b"));
+            assert_eq!(escaped, "a b", "{c:?} must be replaced with a space");
+        }
+    }
+
+    /// #1323 M1: U+2065 (unassigned, sitting inside the consolidated U+2060-U+206F range)
+    /// is now deliberately swept in by the range rather than carved out, so a future
+    /// Unicode assignment of it can't silently open a hole.
+    #[test]
+    fn test_escape_markdown_now_blocks_unassigned_u2065() {
+        assert_eq!(escape_markdown("a\u{2065}b"), "a b");
+    }
+
+    /// #1323 must not regress #1248: legitimate directional marks and ZWNJ/ZWJ survive.
+    #[test]
+    fn test_escape_markdown_still_preserves_legitimate_bidi_marks_after_1323() {
+        for c in ['\u{200F}', '\u{061C}', '\u{200E}', '\u{200C}', '\u{200D}'] {
+            let escaped = escape_markdown(&format!("a{c}b"));
+            assert_eq!(
+                escaped,
+                format!("a{c}b"),
+                "{c:?} must survive verbatim (legitimate RTL/emoji use, #1248)"
+            );
+        }
+    }
+
+    /// #1323 M2/critic S2: prefixed-format signs with genuine Arabic/Syriac/Kaithi
+    /// mid-string use must also survive — they were exempt before #1323 and remain so.
+    #[test]
+    fn test_escape_markdown_preserves_prefixed_format_signs() {
+        for c in [
+            '\u{0600}',
+            '\u{0601}',
+            '\u{0602}',
+            '\u{0603}',
+            '\u{0604}',
+            '\u{0605}',
+            '\u{06DD}',
+            '\u{070F}',
+            '\u{0890}',
+            '\u{0891}',
+            '\u{08E2}',
+            '\u{110BD}',
+            '\u{110CD}',
+        ] {
+            let escaped = escape_markdown(&format!("a{c}b"));
+            assert_eq!(
+                escaped,
+                format!("a{c}b"),
+                "{c:?} must survive verbatim (legitimate Arabic/Syriac/Kaithi use, #1248)"
+            );
+        }
+    }
+
+    /// #1323 critic S3: exhaustive drift guard. Scans the full Unicode code space and
+    /// asserts that every character `sanitize_invisible` strips but `is_markdown_unsafe`
+    /// does not is exactly the documented, named exempt set (#1248's RTL/ZWNJ/ZWJ marks
+    /// plus the prefixed-format signs) — not a superset (an undocumented, silently
+    /// widened exemption) and not a subset (a stale exempt-set constant hiding a real
+    /// gap). Fails CI if `unicode-general-category` changes classification for any code
+    /// point, or if either function's character list is hand-edited without updating the
+    /// other.
+    #[test]
+    fn test_is_markdown_unsafe_exempt_set_matches_sanitize_invisible_drift_guard() {
+        const EXEMPT_CHARS: &[char] = &[
+            // #1248: RTL/ZWNJ/ZWJ marks, load-bearing in Persian/Arabic/Indic text shaping
+            // and emoji ZWJ sequences.
+            '\u{200E}',
+            '\u{200F}',
+            '\u{061C}',
+            '\u{200C}',
+            '\u{200D}',
+            // #1248/critic S2: prefixed-format signs with genuine Arabic/Syriac/Kaithi
+            // mid-string annotation use.
+            '\u{0600}',
+            '\u{0601}',
+            '\u{0602}',
+            '\u{0603}',
+            '\u{0604}',
+            '\u{0605}',
+            '\u{06DD}',
+            '\u{070F}',
+            '\u{0890}',
+            '\u{0891}',
+            '\u{08E2}',
+            '\u{110BD}',
+            '\u{110CD}',
+        ];
+
+        let mut undocumented_exemptions = Vec::new();
+        for cp in 0..=0x0010_FFFFu32 {
+            let Some(c) = char::from_u32(cp) else {
+                continue;
+            };
+            if crate::redact::is_invisible(c)
+                && !is_markdown_unsafe(c)
+                && !EXEMPT_CHARS.contains(&c)
+            {
+                undocumented_exemptions.push(c);
+            }
+        }
+        assert!(
+            undocumented_exemptions.is_empty(),
+            "is_markdown_unsafe silently exempts characters sanitize_invisible strips, \
+             outside the documented #1248/#1323 exempt set: {undocumented_exemptions:?}"
+        );
+
+        for &c in EXEMPT_CHARS {
+            assert!(
+                crate::redact::is_invisible(c) && !is_markdown_unsafe(c),
+                "{c:?} is listed in the exempt set but is either not stripped by \
+                 sanitize_invisible or is already blocked by is_markdown_unsafe — the \
+                 exempt-set constant is stale"
+            );
         }
     }
 

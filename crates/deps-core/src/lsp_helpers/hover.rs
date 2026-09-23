@@ -1334,11 +1334,12 @@ mod tests {
     }
 
     /// #1311/#1313: `resolved`/`version_requirement` are `FieldKind::Version`, so they
-    /// must strip a `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe`
-    /// alone does not catch.
+    /// must strip a `sanitize_invisible`-only codepoint (U+0600 ARABIC NUMBER SIGN)
+    /// that `is_markdown_unsafe` alone does not catch — deliberately exempt per
+    /// #1248/#1323.
     #[test]
-    fn push_current_or_requirement_hover_section_strips_u206a() {
-        let value = format!("1.0{}0", '\u{206a}');
+    fn push_current_or_requirement_hover_section_strips_u0600() {
+        let value = format!("1.0{}0", '\u{0600}');
         let dep = MockDep {
             name: "pkg".into(),
             version_req: value.as_str().into(),
@@ -1348,11 +1349,11 @@ mod tests {
 
         let mut markdown = HoverMarkdown::new();
         push_current_or_requirement_hover_section(&mut markdown, &dep, Some(&value));
-        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+        assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
 
         let mut markdown = HoverMarkdown::new();
         push_current_or_requirement_hover_section(&mut markdown, &dep, None);
-        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+        assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
     }
 
     #[test]
@@ -1447,11 +1448,11 @@ mod tests {
     }
 
     /// #1311/#1313: `latest_ver` is `FieldKind::Version`, so it must strip a
-    /// `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe` alone
-    /// does not catch.
+    /// `sanitize_invisible`-only codepoint (U+0600 ARABIC NUMBER SIGN) that
+    /// `is_markdown_unsafe` alone does not catch — deliberately exempt per #1248/#1323.
     #[test]
-    fn push_latest_hover_section_strips_u206a() {
-        let value = format!("1.0{}0", '\u{206a}');
+    fn push_latest_hover_section_strips_u0600() {
+        let value = format!("1.0{}0", '\u{0600}');
         let mut markdown = HoverMarkdown::new();
         push_latest_hover_section(
             &mut markdown,
@@ -1459,7 +1460,7 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         );
-        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+        assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
     }
 
     #[test]
@@ -1527,11 +1528,11 @@ mod tests {
     }
 
     /// #1311/#1313: `version_string()` is `FieldKind::Version`, so it must strip a
-    /// `sanitize_invisible`-only codepoint (U+206A) that `is_markdown_unsafe` alone
-    /// does not catch.
+    /// `sanitize_invisible`-only codepoint (U+0600 ARABIC NUMBER SIGN) that
+    /// `is_markdown_unsafe` alone does not catch — deliberately exempt per #1248/#1323.
     #[test]
-    fn push_recent_versions_hover_section_strips_u206a() {
-        let value = format!("1.0{}0", '\u{206a}');
+    fn push_recent_versions_hover_section_strips_u0600() {
+        let value = format!("1.0{}0", '\u{0600}');
         let versions: Vec<Box<dyn crate::Version>> = vec![Box::new(TestVersion {
             version: value.as_str().into(),
             yanked: false,
@@ -1545,7 +1546,7 @@ mod tests {
             PublishTime::now(),
             &MockFormatter,
         );
-        assert!(!markdown.as_str().contains('\u{206a}'), "got: {markdown}");
+        assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
     }
 
     #[test]
@@ -1657,11 +1658,12 @@ mod tests {
 
     /// #1313 reclassification: `deprecation.replacement` moved off `FieldKind::Prose`
     /// onto `FieldKind::Name`, so it must now strip a `sanitize_invisible`-only
-    /// codepoint (U+206A) that `is_markdown_unsafe` alone does not catch — the exact
-    /// gap #1313's own doc names as #1311's still-open example.
+    /// codepoint (U+0600 ARABIC NUMBER SIGN, deliberately exempt from
+    /// `is_markdown_unsafe` per #1248/#1323) that `is_markdown_unsafe` alone does not
+    /// catch — the exact gap #1313's own doc names as #1311's still-open example.
     #[test]
-    fn push_deprecation_hover_section_replacement_strips_u206a() {
-        let replacement = format!("left{}pad", '\u{206a}');
+    fn push_deprecation_hover_section_replacement_strips_u0600() {
+        let replacement = format!("left{}pad", '\u{0600}');
         let deprecation = Deprecation {
             reason: None,
             replacement: Some(replacement),
@@ -1669,17 +1671,20 @@ mod tests {
         let mut markdown = HoverMarkdown::new();
         push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
         assert!(
-            !markdown.as_str().contains('\u{206a}'),
-            "U+206A must be stripped from the name-shaped replacement field; got: {markdown:?}"
+            !markdown.as_str().contains('\u{0600}'),
+            "U+0600 must be stripped from the name-shaped replacement field; got: {markdown:?}"
         );
     }
 
     /// `deprecation.reason` is genuine prose and stays on `FieldKind::Prose` — it must
-    /// still carry U+206A and legitimate RTL/ZWJ content unchanged (by design), so this
-    /// reclassification doesn't accidentally sweep the one field that must stay untouched.
+    /// still carry U+0600 and legitimate RTL marks unchanged (by design), so this
+    /// reclassification doesn't accidentally sweep the one field that must stay
+    /// untouched. Uses U+0600 rather than U+206A (the pre-#1323 exemplar): #1323
+    /// widened `is_markdown_unsafe` to block U+206A even in Prose, via `Hover::new`'s
+    /// whole-document sweep, while U+0600 remains deliberately exempt (#1248/#1323).
     #[test]
-    fn push_deprecation_hover_section_reason_does_not_strip_u206a_or_rtl_marks() {
-        let reason = format!("note{} with RTL{}mark", '\u{206a}', '\u{200f}');
+    fn push_deprecation_hover_section_reason_does_not_strip_u0600_or_rtl_marks() {
+        let reason = format!("note{} with RTL{}mark", '\u{0600}', '\u{200f}');
         let deprecation = Deprecation {
             reason: Some(reason),
             replacement: None,
@@ -1687,25 +1692,25 @@ mod tests {
         let mut markdown = HoverMarkdown::new();
         push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
         assert!(
-            markdown.as_str().contains('\u{206a}') && markdown.as_str().contains('\u{200f}'),
-            "reason (Prose) must preserve U+206A and RTL marks unchanged; got: {markdown:?}"
+            markdown.as_str().contains('\u{0600}') && markdown.as_str().contains('\u{200f}'),
+            "reason (Prose) must preserve U+0600 and RTL marks unchanged; got: {markdown:?}"
         );
     }
 
     /// #1313 reclassification: `marker_expr` moved off `FieldKind::Prose` onto
-    /// `FieldKind::Name`, so it must now strip U+206A too.
+    /// `FieldKind::Name`, so it must now strip U+0600 too.
     #[test]
-    fn push_markers_hover_section_strips_u206a() {
+    fn push_markers_hover_section_strips_u0600() {
         let dep = MockMarkedDep {
             name: "pkg".into(),
             name_range: Range::default(),
-            markers: Some(format!("python_version{}>= '3.8'", '\u{206a}')),
+            markers: Some(format!("python_version{}>= '3.8'", '\u{0600}')),
         };
         let mut markdown = HoverMarkdown::new();
         push_markers_hover_section(&mut markdown, &dep);
         assert!(
-            !markdown.as_str().contains('\u{206a}'),
-            "U+206A must be stripped from the name-shaped marker expression; got: {markdown:?}"
+            !markdown.as_str().contains('\u{0600}'),
+            "U+0600 must be stripped from the name-shaped marker expression; got: {markdown:?}"
         );
     }
 

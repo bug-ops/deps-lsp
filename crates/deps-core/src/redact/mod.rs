@@ -21,6 +21,8 @@ mod wrapper;
 
 pub mod secret;
 
+#[cfg(test)]
+pub(crate) use key::is_invisible;
 pub use key::{
     MAX_PARSE_ERROR_LOG_BYTES, is_credential_or_query_bearing, parse_error_source,
     redact_declaration_key, redact_parse_error_for_log, sanitize_invisible,
