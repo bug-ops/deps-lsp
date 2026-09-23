@@ -53,6 +53,7 @@ test-util = ["dep:tracing-subscriber", "dep:tempfile"]
 [dependencies]
 bytes = { workspace = true }
 dashmap = { workspace = true }
+deps-core-macros = { workspace = true }
 futures = { workspace = true }
 jsonc-parser = { workspace = true }
 reqwest = { workspace = true, features = ["json", "gzip"] }
@@ -80,6 +81,7 @@ proptest = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 tokio-test = { workspace = true }
+trybuild = { workspace = true }
 
 [[bench]]
 name = "core_benchmarks"

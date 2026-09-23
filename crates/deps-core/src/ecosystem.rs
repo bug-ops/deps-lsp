@@ -105,10 +105,7 @@ pub async fn parse_manifest_blocking(
         handle.block_on(ecosystem.parse_manifest(&owned_content, &owned_uri))
     })
     .await
-    .map_err(|e| crate::error::DepsError::ParseError {
-        file_type: format!("manifest at {uri:?}"),
-        source: Box::new(std::io::Error::other(e)),
-    })??;
+    .map_err(|e| crate::error::DepsError::parse_error(format!("manifest at {uri:?}"), &e))??;
 
     // Single chokepoint for #796: every ecosystem's parse result is capped here, once,
     // rather than each ecosystem crate's own parser bounding its dependency count

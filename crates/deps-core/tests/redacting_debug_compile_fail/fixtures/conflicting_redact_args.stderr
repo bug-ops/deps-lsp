@@ -1,0 +1,5 @@
+error: `#[redact(...)]` accepts exactly one of `url`/`key`, not both
+ --> tests/redacting_debug_compile_fail/fixtures/conflicting_redact_args.rs:5:19
+  |
+5 |     #[redact(url, key)]
+  |                   ^^^

@@ -1,0 +1,5 @@
+error: field `token` must carry exactly one of `#[redact(url)]`, `#[redact(key)]`, or `#[raw]` (RedactingDebug, #1238)
+ --> tests/redacting_debug_compile_fail/fixtures/missing_attribute.rs:5:5
+  |
+5 |     token: String,
+  |     ^^^^^^^^^^^^^

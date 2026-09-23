@@ -48,10 +48,8 @@ pub fn parse_pubspec_lock(content: &str) -> Result<ResolvedPackages> {
 
     let mut packages = ResolvedPackages::new();
 
-    let docs = YamlLoader::load_from_str(content).map_err(|e| DepsError::ParseError {
-        file_type: "pubspec.lock".into(),
-        source: deps_core::net_policy::parse_error_source(&e),
-    })?;
+    let docs = YamlLoader::load_from_str(content)
+        .map_err(|e| DepsError::parse_error("pubspec.lock", &e))?;
 
     let doc = match docs.first() {
         Some(d) => d,

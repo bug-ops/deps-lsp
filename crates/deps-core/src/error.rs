@@ -143,13 +143,10 @@ impl std::error::Error for SanitizedRegistryError {
 /// fn parse_file(content: &str, file_type: &str) -> Result<()> {
 ///     // Parsing errors are automatically wrapped
 ///     if content.is_empty() {
-///         return Err(DepsError::ParseError {
-///             file_type: file_type.into(),
-///             source: Box::new(std::io::Error::new(
-///                 std::io::ErrorKind::InvalidData,
-///                 "empty content"
-///             )),
-///         });
+///         return Err(DepsError::parse_error(
+///             file_type,
+///             &std::io::Error::new(std::io::ErrorKind::InvalidData, "empty content"),
+///         ));
 ///     }
 ///     Ok(())
 /// }
@@ -158,7 +155,27 @@ impl std::error::Error for SanitizedRegistryError {
 #[derive(Error)]
 pub enum DepsError {
     /// A manifest or lockfile failed to parse.
+    ///
+    /// `#[non_exhaustive]` on the variant itself (#1250, mirrors [`Self::RateLimited`]'s
+    /// precedent): the only way to construct this from outside `deps-core` is
+    /// [`Self::parse_error`], which always routes `source` through
+    /// [`crate::redact::parse_error_source`] — closing the recurring gap (#1240, #1243,
+    /// #1249) where a new call site hand-built this variant with an unredacted source.
+    ///
+    /// An external crate cannot build this variant as a struct literal — this fails to
+    /// compile with E0639 (`#[non_exhaustive]` variant constructed outside its defining
+    /// crate), not for some unrelated reason:
+    ///
+    /// ```compile_fail
+    /// use deps_core::DepsError;
+    ///
+    /// let _ = DepsError::ParseError {
+    ///     file_type: "Cargo.toml".into(),
+    ///     source: Box::new(std::io::Error::other("bad")),
+    /// };
+    /// ```
     #[error("failed to parse {file_type}: {source}")]
+    #[non_exhaustive]
     ParseError {
         /// Ecosystem/file kind being parsed (e.g. `"Cargo.toml"`), for the error message.
         file_type: String,
@@ -425,6 +442,29 @@ impl DepsError {
             // `crate::cache`'s own confirmed-evidence classification knows a real status
             // (#1295 critic N1).
             source_status: None,
+        }
+    }
+
+    /// Constructs a [`Self::ParseError`], routing `source` through
+    /// [`crate::redact::parse_error_source`] so a credential-shaped parser error can never
+    /// reach `Debug`/`Display` unredacted (#1250).
+    ///
+    /// The only way to build this `#[non_exhaustive]` variant from outside this crate —
+    /// mirrors [`Self::rate_limited`]'s precedent exactly.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::DepsError;
+    ///
+    /// let err = DepsError::parse_error("Cargo.toml", &"duplicate key: `serde`");
+    /// assert!(matches!(err, DepsError::ParseError { .. }));
+    /// ```
+    #[must_use]
+    pub fn parse_error(file_type: impl Into<String>, source: &dyn std::fmt::Display) -> Self {
+        Self::ParseError {
+            file_type: file_type.into(),
+            source: crate::redact::parse_error_source(source),
         }
     }
 

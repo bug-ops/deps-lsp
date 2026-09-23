@@ -96,6 +96,13 @@
     clippy::cast_precision_loss,
     clippy::cast_sign_loss
 )]
+
+// #1238: lets `redact_debug::RedactingDebug`'s generated code say `deps_core::redact_debug::…`
+// unconditionally, whether the derive is used by an external consumer or by a type defined
+// inside this crate itself (e.g. a future `lsp_helpers::git_ref::ResolvedShaPin` migration) —
+// a crate has no external name for itself without this alias.
+extern crate self as deps_core;
+
 /// HTTP response cache with `ETag`/`Last-Modified` conditional-request validation.
 pub mod cache;
 /// Bounded-`DashMap` capacity policies shared by [`cache`], [`github`], [`deps_dev`], and
@@ -188,6 +195,9 @@ pub mod rate_limit;
 ///
 /// Extracted from [`net_policy`], which kept the old paths as re-exports.
 pub mod redact;
+/// Compile-time-enforced `Debug` redaction: the [`redact_debug::RedactingDebug`] derive
+/// (issue #1238).
+pub mod redact_debug;
 /// The [`registry::Registry`] trait: version lookup and search that every
 /// ecosystem's registry client implements.
 pub mod registry;

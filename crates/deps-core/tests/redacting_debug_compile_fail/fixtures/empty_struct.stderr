@@ -1,0 +1,5 @@
+error: RedactingDebug requires at least one named field — a zero-field struct has nothing to redact; use a hand-written `impl Debug` instead
+ --> tests/redacting_debug_compile_fail/fixtures/empty_struct.rs:4:14
+  |
+4 | struct Empty {}
+  |              ^^

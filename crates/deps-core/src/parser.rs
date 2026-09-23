@@ -790,20 +790,18 @@ pub fn check_yaml_expansion(content: &str, max_bytes: usize) -> std::result::Res
 /// ```
 pub fn check_yaml_bounds(content: &str, file_type: &str) -> Result<()> {
     if let Err(depth) = check_yaml_nesting_depth(content, MAX_YAML_NESTING_DEPTH) {
-        return Err(DepsError::ParseError {
-            file_type: file_type.into(),
-            source: Box::new(std::io::Error::other(format!(
-                "YAML nesting depth {depth} exceeds maximum of {MAX_YAML_NESTING_DEPTH}"
-            ))),
-        });
+        return Err(DepsError::parse_error(
+            file_type,
+            &format!("YAML nesting depth {depth} exceeds maximum of {MAX_YAML_NESTING_DEPTH}"),
+        ));
     }
     if let Err(bytes) = check_yaml_expansion(content, MAX_YAML_EXPANDED_BYTES) {
-        return Err(DepsError::ParseError {
-            file_type: file_type.into(),
-            source: Box::new(std::io::Error::other(format!(
+        return Err(DepsError::parse_error(
+            file_type,
+            &format!(
                 "YAML expansion {bytes} bytes exceeds maximum of {MAX_YAML_EXPANDED_BYTES} bytes"
-            ))),
-        });
+            ),
+        ));
     }
     Ok(())
 }

@@ -88,11 +88,8 @@ impl LockFileProvider for ComposerLockParser {
 /// The CPU-bound half of [`ComposerLockParser::parse_lockfile`], run inside
 /// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_composer_lock(content: String) -> Result<ResolvedPackages> {
-    let lock_data: ComposerLock =
-        deps_core::parse_json_checked(content.as_bytes()).map_err(|e| DepsError::ParseError {
-            file_type: "composer.lock".into(),
-            source: Box::new(e),
-        })?;
+    let lock_data: ComposerLock = deps_core::parse_json_checked(content.as_bytes())
+        .map_err(|e| DepsError::parse_error("composer.lock", &e))?;
 
     let mut packages = ResolvedPackages::new();
 

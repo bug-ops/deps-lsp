@@ -66,9 +66,8 @@ pub const MAX_LOCKFILE_BYTES: u64 = 32 * 1024 * 1024;
 /// ```
 #[tracing::instrument(skip_all, fields(path = %path.display(), file_type = %file_type), level = "debug")]
 pub async fn read_lockfile_content(path: &Path, file_type: &str) -> Result<String> {
-    let to_parse_error = |e: std::io::Error| DepsError::ParseError {
-        file_type: format!("{file_type} at {}", path.display()),
-        source: Box::new(e),
+    let to_parse_error = |e: std::io::Error| {
+        DepsError::parse_error(format!("{file_type} at {}", path.display()), &e)
     };
     let oversized_error = || {
         to_parse_error(std::io::Error::new(
@@ -172,10 +171,7 @@ where
 
     tokio::task::spawn_blocking(move || parse(content))
         .await
-        .map_err(|e| DepsError::ParseError {
-            file_type: format!("{file_type} at {}", path.display()),
-            source: Box::new(std::io::Error::other(e)),
-        })?
+        .map_err(|e| DepsError::parse_error(format!("{file_type} at {}", path.display()), &e))?
 }
 
 /// Resolves a manifest URI to an absolute local filesystem path, rejecting a non-`file:`

@@ -1071,10 +1071,7 @@ pub fn parse_pubspec_yaml(content: &str, doc_uri: &Url) -> Result<DartParseResul
     let mut parser = Parser::new_from_str(content);
     parser
         .load(&mut receiver, false)
-        .map_err(|e| DepsError::ParseError {
-            file_type: "pubspec.yaml".into(),
-            source: Box::new(std::io::Error::other(e.to_string())),
-        })?;
+        .map_err(|e| DepsError::parse_error("pubspec.yaml", &e))?;
 
     let line_table = LineOffsetTable::new(content);
     let dependency_truncation = receiver.budget.truncation();

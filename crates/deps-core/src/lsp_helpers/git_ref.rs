@@ -673,32 +673,19 @@ impl MarkedScalar {
 /// M3, #1138): `display_name` and `replacement` are both `String`, and a tuple return lets a
 /// future [`ShaPinning`] implementor transpose them silently.
 #[cfg(feature = "lsp-responses")]
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, deps_core::redact_debug::RedactingDebug)]
 pub struct ResolvedShaPin {
     /// The dependency's human-readable name, for the quickfix title ("Pin `{display_name}`
     /// to commit SHA").
+    #[redact(key)]
     pub display_name: String,
     /// The span of the dependency's current ref — what the edit replaces.
+    #[raw]
     pub version_range: Range,
     /// The commit-SHA text (plus any ecosystem-specific trailing comment, e.g. GitHub
     /// Actions' `{sha} # {tag}`) to splice into `version_range`.
+    #[raw]
     pub replacement: String,
-}
-
-#[cfg(feature = "lsp-responses")]
-impl std::fmt::Debug for ResolvedShaPin {
-    /// Manual, not derived: `display_name` is a raw dependency name — the weaker #1217
-    /// name-shape sibling of the #1222 sweep (#1237).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ResolvedShaPin")
-            .field(
-                "display_name",
-                &crate::net_policy::redact_declaration_key(&self.display_name),
-            )
-            .field("version_range", &self.version_range)
-            .field("replacement", &self.replacement)
-            .finish()
-    }
 }
 
 /// Resolves the *static* — warm-`TagIndex`-only, no live fetch — "pin a mutable ref to an

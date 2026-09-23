@@ -211,18 +211,15 @@ pub fn parse_deno_json_with_context(
         &CollectOptions::default(),
         &ParseOptions::default(),
     )
-    .map_err(|e| DepsError::ParseError {
-        file_type: "deno.json".into(),
-        source: e.to_string().into(),
-    })?;
+    .map_err(|e| DepsError::parse_error("deno.json", &e))?;
 
     if let Some(value) = &ast.value
         && let Err(depth) = check_ast_nesting_depth(value, MAX_JSON_NESTING_DEPTH)
     {
-        return Err(DepsError::ParseError {
-            file_type: "deno.json".into(),
-            source: json_depth_error_message(depth).into(),
-        });
+        return Err(DepsError::parse_error(
+            "deno.json",
+            &json_depth_error_message(depth),
+        ));
     }
 
     let line_table = LineOffsetTable::new(content);

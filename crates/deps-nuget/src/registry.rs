@@ -241,12 +241,10 @@ impl ServiceIndex {
     ) -> Result<Self> {
         let package_base_address =
             pick_resource(&response.resources, &["PackageBaseAddress/3.0.0"]).ok_or_else(|| {
-                deps_core::DepsError::ParseError {
-                    file_type: "NuGet service index".into(),
-                    source: Box::new(std::io::Error::other(
-                        "missing PackageBaseAddress/3.0.0 resource",
-                    )),
-                }
+                deps_core::DepsError::parse_error(
+                    "NuGet service index",
+                    &"missing PackageBaseAddress/3.0.0 resource",
+                )
             })?;
         let search_query_service = pick_resource(
             &response.resources,
@@ -276,11 +274,11 @@ impl ServiceIndex {
             "nuget",
             gate,
         )
-        .map_err(|e| deps_core::DepsError::ParseError {
-            file_type: "NuGet service index".into(),
-            source: Box::new(std::io::Error::other(format!(
-                "PackageBaseAddress blocked by workspace registry policy: {e}"
-            ))),
+        .map_err(|e| {
+            deps_core::DepsError::parse_error(
+                "NuGet service index",
+                &format!("PackageBaseAddress blocked by workspace registry policy: {e}"),
+            )
         })?;
         let search_query_service = search_query_service
             .filter(|u| deps_core::net_policy::validate_index_url(u, u, "nuget", gate).is_ok());
