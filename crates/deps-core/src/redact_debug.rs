@@ -64,10 +64,13 @@ pub fn __redact_url_field(value: &(impl AsRef<str> + ?Sized)) -> String {
 /// `#[doc(hidden)]`: called only from the derive's macro-generated `impl Debug`, never meant
 /// to be called directly. Delegates to [`crate::redact::redact_declaration_key`] — the
 /// same redactor every hand-written `Debug` impl this derive replaces already called.
+/// `redact_declaration_key` returns `Cow<'_, str>` (#1317, to skip allocating when the value
+/// needs no redaction); this helper always owns its output, matching [`__redact_url_field`]'s
+/// signature and the derive's `.field(name, &__redact_*_field(...))` call shape.
 #[doc(hidden)]
 #[must_use]
 pub fn __redact_key_field(value: &(impl AsRef<str> + ?Sized)) -> String {
-    crate::redact::redact_declaration_key(value.as_ref())
+    crate::redact::redact_declaration_key(value.as_ref()).into_owned()
 }
 
 #[cfg(test)]
