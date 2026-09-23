@@ -201,14 +201,12 @@ impl RequirementResolution for NuGetFormatter {
     /// same `crate::parser::is_msbuild_reference` predicate as the parser's own degrade
     /// guards, so a reference recognized at parse time is also recognized here.
     /// Mirrors Maven's `${property}` / Gradle's `$var`/`${var}` unresolved-variable guards.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        crate::parser::is_msbuild_reference(requirement.as_str())
-    }
-
-    /// #1370: NuGet has no separate "concrete but undecidable ref" case
+    ///
+    /// #1370/#1380: NuGet has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
     /// unexpanded MSBuild reference is the only unresolved shape NuGet has, so both
-    /// predicates key off the same `crate::parser::is_msbuild_reference` detector.
+    /// predicates key off the same `crate::parser::is_msbuild_reference` detector, and
+    /// `requirement_is_unresolved`'s default delegates here rather than duplicating it.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         crate::parser::is_msbuild_reference(requirement.as_str())
     }

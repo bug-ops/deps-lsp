@@ -603,8 +603,9 @@ mod tests {
 
     /// #821: `$(...)`'s parentheses trip the shared grammar's nested-bracket guard, so this
     /// bracketed MSBuild property reference is now rejected outright rather than parsing to a
-    /// `Bounded` 0.0.0-0.0.0 interval as it used to — see `NuGetFormatter::requirement_is_unresolved`'s
-    /// doc for why the `Unresolved` classification still matters independently of this.
+    /// `Bounded` 0.0.0-0.0.0 interval as it used to — see `NuGetFormatter::requirement_is_placeholder`'s
+    /// doc (source of the `Unresolved` classification since #1380) for why that classification
+    /// still matters independently of this.
     #[test]
     fn test_parse_range_rejects_bracketed_msbuild_property_reference() {
         assert!(parse_range("[$(MinVersion),$(MaxVersion))").is_none());

@@ -116,18 +116,15 @@ impl RequirementResolution for DartFormatter {
         Some(Box::new(PubDevMatcher(normalized)))
     }
 
-    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
-    /// — see `requirement_contains_dollar_placeholder`. `pubspec.yaml`'s own version-
-    /// constraint grammar has no such syntax; this only fires for a value pre-processed
-    /// (and left unexpanded) by tooling outside Dart, e.g. `envsubst`.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_dollar_placeholder(requirement.as_str())
-    }
-
     /// #1370: Dart has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — a
-    /// `$VAR`/`${VAR}`-style placeholder is the only unresolved shape Dart has, so both
-    /// predicates key off the same `requirement_contains_dollar_placeholder` detector.
+    /// `$VAR`/`${VAR}`-style placeholder is the only unresolved shape Dart has, so its
+    /// default delegates here rather than duplicating the
+    /// `requirement_contains_dollar_placeholder` detector (#1380).
+    ///
+    /// #1374 hardening: `pubspec.yaml`'s own version-constraint grammar has no such syntax;
+    /// this only fires for a value pre-processed (and left unexpanded) by tooling outside
+    /// Dart, e.g. `envsubst`.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         requirement_contains_dollar_placeholder(requirement.as_str())
     }

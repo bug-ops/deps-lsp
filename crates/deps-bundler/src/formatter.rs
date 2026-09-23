@@ -352,14 +352,12 @@ impl RequirementResolution for BundlerFormatter {
     /// compiled to a matcher that accepted every candidate instead. This explicit predicate
     /// makes every operator shape decide identically, mirroring Maven/Gradle/NuGet's
     /// unresolved-variable precedent.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_unresolved_interpolation(requirement.as_str())
-    }
-
-    /// #1370: Bundler has no separate "concrete but undecidable ref" case
+    ///
+    /// #1370/#1380: Bundler has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// unresolved Ruby interpolation is the only unresolved shape Bundler has, so both
-    /// predicates key off the same `requirement_contains_unresolved_interpolation` detector.
+    /// unresolved Ruby interpolation is the only unresolved shape Bundler has, so its
+    /// default delegates here rather than duplicating the
+    /// `requirement_contains_unresolved_interpolation` detector.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         requirement_contains_unresolved_interpolation(requirement.as_str())
     }

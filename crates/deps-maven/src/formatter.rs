@@ -190,10 +190,6 @@ impl RequirementResolution for MavenFormatter {
         version == requirement
     }
 
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        is_unresolved(requirement.as_str())
-    }
-
     /// #1370: Maven has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
     /// unresolved `${property}` is the only unresolved shape Maven has, so both predicates

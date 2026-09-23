@@ -225,10 +225,6 @@ impl RequirementResolution for GradleFormatter {
         gradle_version_matches(version, requirement)
     }
 
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        is_unresolved(requirement.as_str())
-    }
-
     /// #1370: Gradle has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
     /// unresolved `$var`/`${var}` reference is the only unresolved shape Gradle has, so both

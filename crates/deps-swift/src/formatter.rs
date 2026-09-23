@@ -230,14 +230,11 @@ impl RequirementResolution for SwiftFormatter {
 
     /// #1354: an unexpanded Swift string-interpolation placeholder (`\(...)`) inside a
     /// requirement — see `requirement_contains_unresolved_interpolation`.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_unresolved_interpolation(requirement.as_str())
-    }
-
+    ///
     /// #1370: Swift has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// unresolved Swift string interpolation is the only unresolved shape Swift has, so both
-    /// predicates key off the same `requirement_contains_unresolved_interpolation` detector.
+    /// unresolved Swift string interpolation is the only unresolved shape Swift has, so its
+    /// default delegates here rather than duplicating the detector (#1380).
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         requirement_contains_unresolved_interpolation(requirement.as_str())
     }

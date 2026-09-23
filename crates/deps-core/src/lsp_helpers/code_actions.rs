@@ -3558,6 +3558,17 @@ mod tests {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }
 
+            /// Pinned to `false`, diverging from [`Self::requirement_is_placeholder`] below
+            /// (`true`) rather than relying on the trait's default delegation (#1380) —
+            /// mutation-testing control: if `build_unsatisfiable_fix_action`'s central gate
+            /// were ever swapped to consult `requirement_is_unresolved` instead of
+            /// `requirement_is_placeholder`, this divergence makes
+            /// `test_unsat_fix_absent_for_placeholder_requirement` fail instead of passing
+            /// vacuously (both predicates would otherwise agree via the shared default).
+            fn requirement_is_unresolved(&self, _requirement: &VersionReq) -> bool {
+                false
+            }
+
             fn requirement_is_placeholder(&self, _requirement: &VersionReq) -> bool {
                 true
             }

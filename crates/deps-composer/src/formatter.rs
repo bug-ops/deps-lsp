@@ -347,15 +347,12 @@ impl RequirementResolution for ComposerFormatter {
     /// `deps_core::lsp_helpers::requirement_is_unsatisfiable` (which checks this before
     /// calling `compile_requirement`) must treat them as unresolved instead of "no
     /// published version satisfies this".
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_is_composer_unresolved(requirement.as_str())
-    }
-
-    /// #1370: all three forms `requirement_is_composer_unresolved` covers (`self.version`,
-    /// an inline alias, and a `$VAR`/`${VAR}` placeholder) are equally non-rewritable —
-    /// Composer has no "concrete but undecidable, safe-to-rewrite" ref concept (unlike a
-    /// SHA/branch pin) for `requirement_is_unresolved` to stay broader than this for, so both
-    /// predicates key off the same detector.
+    ///
+    /// #1370/#1380: all three forms `requirement_is_composer_unresolved` covers
+    /// (`self.version`, an inline alias, and a `$VAR`/`${VAR}` placeholder) are equally
+    /// non-rewritable — Composer has no "concrete but undecidable, safe-to-rewrite" ref
+    /// concept (unlike a SHA/branch pin) for `requirement_is_unresolved` to stay broader
+    /// than this for, so its default delegates here rather than duplicating the detector.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         requirement_is_composer_unresolved(requirement.as_str())
     }

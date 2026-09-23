@@ -171,12 +171,6 @@ impl RequirementResolution for NpmFormatter {
             .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 
-    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
-    /// — see `requirement_contains_dollar_placeholder`.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_dollar_placeholder(requirement.as_str())
-    }
-
     /// #1370: npm has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — a
     /// `$VAR`/`${VAR}`-style placeholder is the only unresolved shape npm has, so both
