@@ -817,9 +817,9 @@ mod tests {
                 version: "1.2.0".to_string(),
             });
 
-        assert!(
-            plan_vulnerability_fix(&dep, version_range, "$unknownVar", &dv, &GradleFormatter)
-                .is_none(),
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "$unknownVar", &dv, &GradleFormatter),
+            Err(deps_core::edit::VulnFixSkip::RequirementAlreadyResolves),
             "an unresolved variable reference must never be overwritten with a literal fix version"
         );
     }
@@ -882,15 +882,15 @@ mod tests {
             );
 
             let dv = vuln_fix_dv("1.2.0");
-            assert!(
+            assert_eq!(
                 plan_vulnerability_fix(
                     &dep,
                     version_range,
                     malformed_unresolved,
                     &dv,
                     &GradleFormatter
-                )
-                .is_none(),
+                ),
+                Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
                 "{malformed_unresolved:?}: an unresolved malformed-range placeholder must never be overwritten with a literal fix version"
             );
         }

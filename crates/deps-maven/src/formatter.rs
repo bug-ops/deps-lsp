@@ -607,8 +607,9 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("1.2.0");
-        assert!(
-            plan_vulnerability_fix(&dep, version_range, "${ver}", &dv, &MavenFormatter).is_none(),
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "${ver}", &dv, &MavenFormatter),
+            Err(deps_core::edit::VulnFixSkip::RequirementAlreadyResolves),
             "an unresolved property placeholder must never be overwritten with a literal fix version"
         );
     }
@@ -637,9 +638,9 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("1.2.0");
-        assert!(
-            plan_vulnerability_fix(&dep, version_range, "[1.0,${hi}", &dv, &MavenFormatter)
-                .is_none(),
+        assert_eq!(
+            plan_vulnerability_fix(&dep, version_range, "[1.0,${hi}", &dv, &MavenFormatter),
+            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
             "an unresolved malformed-range placeholder must never be overwritten with a literal fix version"
         );
     }
