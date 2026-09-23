@@ -14,6 +14,13 @@ pub struct BundlerDependency {
     pub version_req: Option<deps_core::VersionReq>,
     /// Document range of the version requirement string.
     pub version_range: Option<Range>,
+    /// Raw source text spanned by `version_range`, when it differs from `version_req` — set
+    /// only for a multi-constraint declaration (`gem "x", ">= 1.0", "< 2.0"`, #1366), where
+    /// `version_req` is the `", "`-joined comparator (`">= 1.0, < 2.0"`) but `version_range`
+    /// spans the raw multi-literal text including the quotes/comma between constraints. See
+    /// [`deps_core::Dependency::version_literal`]'s doc for why the two can diverge and what
+    /// this feeds (the literal-span guard shared by code actions/completion).
+    pub version_literal: Option<String>,
     /// Which `Gemfile` group this gem was declared under.
     pub group: DependencyGroup,
     /// Where this gem resolves from (rubygems, git, path, etc.).
@@ -184,6 +191,7 @@ deps_core::impl_dependency!(BundlerDependency {
     version: version_req,
     version_range: version_range,
     source: source,
+    version_literal: version_literal,
 });
 
 #[cfg(test)]
@@ -198,6 +206,7 @@ mod tests {
             name_range: Range::new(Position::new(1, 5), Position::new(1, 13)),
             version_req: Some("~> 1.0".into()),
             version_range: Some(Range::new(Position::new(1, 17), Position::new(1, 23))),
+            version_literal: None,
             group: DependencyGroup::Default,
             source,
             platforms: vec![],
@@ -298,6 +307,7 @@ mod tests {
             name_range: Range::new(Position::new(1, 5), Position::new(1, 10)),
             version_req: Some("~> 7.0".into()),
             version_range: Some(Range::new(Position::new(1, 14), Position::new(1, 20))),
+            version_literal: None,
             group: DependencyGroup::Default,
             source: DependencySource::Registry,
             platforms: vec![],
@@ -415,6 +425,7 @@ mod tests {
             name_range: Range::default(),
             version_req: None,
             version_range: None,
+            version_literal: None,
             group: DependencyGroup::Default,
             source: DependencySource::Registry,
             platforms: vec![],

@@ -2,6 +2,7 @@
 
 use crate::version::{compare_versions, is_valid_rubygems_version, version_matches_requirement};
 use deps_core::ConcreteVersion;
+use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
@@ -93,6 +94,31 @@ fn requirement_contains_unresolved_interpolation(requirement: &str) -> bool {
         .any(|&[c, next]| c == b'#' && matches!(next, b'{' | b'@' | b'$'))
 }
 
+/// True when `literal` — a raw multi-constraint span (see
+/// [`crate::types::BundlerDependency::version_literal`], #1366) spanning from the first
+/// constraint's content through the last's — was written with inconsistent quote characters
+/// across its constraints, e.g. `gem "x", '>= 5.0', "< 6.0"`.
+///
+/// [`VERSION_PATTERN`](crate::parser)'s capture group excludes quote characters from a
+/// constraint's own text (`[^'"]*`), so the *only* quote characters that can appear inside this
+/// span are the boundary quotes between constraints (a closing quote immediately followed by an
+/// opening one) — a same-quote-style multi-constraint call therefore has exactly one quote
+/// character repeated throughout the span, while a mixed-style one has both.
+///
+/// Why this matters: `version_range` spans from just after the first constraint's opening quote
+/// to just before the last constraint's closing quote (#1366 impl-critic S1's `version_literal`
+/// fix) — those two *outer* quote characters are never part of the replaced range, only
+/// preserved verbatim on either side of it. Splicing a bare replacement version into that range
+/// unconditionally is safe when every constraint used the same quote character (the two
+/// preserved outer quotes match), but produces invalid Ruby when they differ — e.g. replacing
+/// the whole span in `'>= 5.0', "< 6.0"` with `6.1.0` leaves `'6.1.0"` (mismatched open/close
+/// quotes). Impl-critic S2: `deps-cli`'s `plan_verified_fix` has no separate guard against the
+/// live document text (unlike the LSP's `literal_span_matches`), so this must be caught before a
+/// replacement is ever produced, not after.
+fn literal_span_has_mixed_quote_styles(literal: &str) -> bool {
+    literal.contains('\'') && literal.contains('"')
+}
+
 /// A Bundler requirement written as `= X` or bare `X` (no operator) pins a single exact
 /// version. Returns the pinned version string, or `None` when `requirement` is a wildcard,
 /// empty, or a range/comparison operator (`~>`, `>=`, `>`, `<=`, `<`, `!=`) rather than a pin.
@@ -149,17 +175,38 @@ fn exact_pin_version(requirement: &str) -> Option<&str> {
 /// two no longer can.) A prerelease-tagged pin like `"2.0.0.rc1"` against a published
 /// `"2.0.0"` does not reach this path either: `compare_versions` correctly orders it below
 /// the stable release instead of tying, since #323's fix.
+///
+/// #1366 impl-critic M2: applied per comma-separated constraint, not just to `requirement` as a
+/// whole — `exact_pin_version` itself rejects a whole multi-constraint string outright (it is
+/// never itself a single pin), so without this a requirement like `'1.6.13', '< 2'` lost the
+/// yanked-pin suppression entirely for its exact-pin half, reintroducing #252's false positive
+/// for the specific case of an exact pin now written alongside a second, unrelated bound.
+///
+/// #1366 team-lead review: a candidate constraint's pin must also satisfy every *other*
+/// constraint in `requirement` (checked via [`version_matches_requirement`] against the whole
+/// original string, which already ANDs every comma-separated part) before this suppresses the
+/// unsatisfiable diagnostic — otherwise a requirement that is genuinely, unconditionally
+/// impossible for a reason unrelated to yanking (e.g. `"5.0.0", ">= 6.0"`, a bad merge/typo
+/// with no version that could ever satisfy both) gets silently waved through just because its
+/// exact-pin half happens to sit below the observed maximum: `5.0.0` not exceeding a `6.5.0`
+/// max says nothing about whether `5.0.0` was ever a candidate for this requirement's *other*
+/// half. Without this check, `exact_pin_could_be_yanked` only asked "could this one constraint's
+/// pin be a yanked, unlisted version" — the right question for a single-constraint requirement,
+/// but not sufficient once `requirement_is_undecidable_given_available` suppresses the diagnostic
+/// for the *whole* multi-constraint requirement on this constraint's say-so alone.
 fn exact_pin_could_be_yanked(requirement: &str, available: &[ConcreteVersion]) -> bool {
-    let Some(pin) = exact_pin_version(requirement) else {
-        return false;
-    };
     let Some(max) = available
         .iter()
         .max_by(|a, b| compare_versions(a.as_str(), b.as_str()))
     else {
         return false;
     };
-    !compare_versions(pin, max.as_str()).is_gt()
+    requirement.split(',').any(|constraint| {
+        exact_pin_version(constraint).is_some_and(|pin| {
+            !compare_versions(pin, max.as_str()).is_gt()
+                && version_matches_requirement(pin, requirement)
+        })
+    })
 }
 
 /// Formatter for Bundler/Ruby gem versions.
@@ -214,6 +261,36 @@ impl PackageRendering for BundlerFormatter {
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
         if requirement_contains_unresolved_interpolation(current) {
             return current.to_string();
+        }
+        self.format_version_for_text_edit(version)
+    }
+
+    /// #1366 impl-critic S2: a multi-constraint requirement whose constraints were written
+    /// with inconsistent quote characters (see `literal_span_has_mixed_quote_styles`) echoes
+    /// [`Dependency::version_literal`] back unchanged instead of collapsing to a bare
+    /// replacement version, mirroring [`Self::format_version_replacing`]'s `#{...}` guard.
+    ///
+    /// **Must** echo `literal_target` (`dep.version_literal()`, falling back to `current`) —
+    /// not `current` — on every no-op path here, unlike [`Self::format_version_replacing`]
+    /// itself (which has no `dep` and echoes `current`, its only option): both
+    /// `deps_core::edit::plan_verified_fix`'s and `generate_code_actions`'s no-op check compare
+    /// the text this returns against that exact `literal_target`, not `current`. For a
+    /// multi-constraint dependency the two differ (`current` is the `", "`-joined comparator,
+    /// e.g. `">= 5.0, < 6.0"`, with no quote characters at all regardless of how the source
+    /// `Gemfile` quoted each constraint; `literal_target` is the raw source span, quotes and
+    /// comma included) — echoing `current` there would fail the no-op comparison and still
+    /// produce a corrupting replacement despite the interpolation/mixed-quote guard firing.
+    fn format_version_replacing_for(
+        &self,
+        dep: &dyn Dependency,
+        version: &ConcreteVersion,
+        current: &str,
+    ) -> String {
+        let literal_target = dep.version_literal().unwrap_or(current);
+        if requirement_contains_unresolved_interpolation(current)
+            || literal_span_has_mixed_quote_styles(literal_target)
+        {
+            return literal_target.to_string();
         }
         self.format_version_for_text_edit(version)
     }
@@ -574,6 +651,60 @@ mod tests {
     #[test]
     fn test_exact_pin_could_be_yanked_empty_available_not_suppressed() {
         assert!(!exact_pin_could_be_yanked("1.6.13", &[]));
+    }
+
+    /// #1366 impl-critic M2: a multi-constraint requirement combining a yanked-range exact
+    /// pin with an unrelated second constraint (`gem "rest-client", "1.6.13", "< 2"`) must
+    /// still suppress the yanked-pin false positive for its exact-pin half — before this fix,
+    /// `exact_pin_version` rejected the whole comma-joined string outright (never a single
+    /// pin), so the suppression this test pins never applied to a multi-constraint requirement
+    /// at all, reintroducing #252's false positive whenever an exact pin was combined with a
+    /// second bound.
+    #[test]
+    fn test_exact_pin_could_be_yanked_multi_constraint_exact_pin_suppressed() {
+        let available = ["1.6.14".into(), "1.6.9".into()];
+        assert!(exact_pin_could_be_yanked("1.6.13, < 2", &available));
+        assert!(exact_pin_could_be_yanked("< 2, 1.6.13", &available));
+    }
+
+    /// A multi-constraint requirement whose exact-pin half is genuinely mistyped (above the
+    /// observed maximum) must still be flagged — the per-constraint suppression must not
+    /// blanket-suppress every multi-constraint requirement regardless of the pin's value.
+    #[test]
+    fn test_exact_pin_could_be_yanked_multi_constraint_mistyped_pin_not_suppressed() {
+        let available = ["1.6.14".into(), "1.6.9".into()];
+        assert!(!exact_pin_could_be_yanked("99.0.0, < 100", &available));
+    }
+
+    /// #1366 team-lead review: a multi-constraint requirement that is genuinely,
+    /// unconditionally impossible (no version can ever satisfy both halves — e.g. a bad
+    /// merge/typo) must not be suppressed just because its exact-pin half happens to sit below
+    /// the observed maximum. `5.0.0` not exceeding a `6.5.0` max says nothing about whether
+    /// `5.0.0` could ever satisfy the requirement's other half, `>= 6.0`.
+    #[test]
+    fn test_exact_pin_could_be_yanked_multi_constraint_contradictory_not_suppressed() {
+        let available = ["6.5.0".into(), "6.0.0".into()];
+        assert!(!exact_pin_could_be_yanked("5.0.0, >= 6.0", &available));
+        assert!(!exact_pin_could_be_yanked(">= 6.0, 5.0.0", &available));
+    }
+
+    /// End-to-end companion to the unit test above, through the same
+    /// `deps_core::lsp_helpers::requirement_is_unsatisfiable` entry point
+    /// `test_requirement_is_unsatisfiable_mistyped_exact_pin_still_flagged` already exercises
+    /// for the single-constraint case — pins that the diagnostic actually fires for the
+    /// contradictory multi-constraint shape, not just that the internal heuristic returns the
+    /// right boolean in isolation.
+    #[test]
+    fn test_requirement_is_unsatisfiable_multi_constraint_contradictory_still_flagged() {
+        use deps_core::lsp_helpers::requirement_is_unsatisfiable;
+
+        let formatter = BundlerFormatter;
+        let available = vec!["6.5.0".into(), "6.0.0".into()];
+        assert!(requirement_is_unsatisfiable(
+            &formatter,
+            &VersionReq::new("5.0.0, >= 6.0"),
+            &available,
+        ));
     }
 
     /// Boundary case the doc comment above [`exact_pin_could_be_yanked`] guarantees: a

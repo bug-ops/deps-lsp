@@ -849,7 +849,7 @@ fn finalize_pending_gem(
         .iter()
         .map(|(text, offset)| (strip_trailing_comment(text), *offset))
         .collect();
-    let (version_req, version_range) = extract_version(
+    let (version_req, version_range, version_literal) = extract_version(
         &stripped_segments,
         content,
         line_table,
@@ -869,6 +869,7 @@ fn finalize_pending_gem(
         name_range: pending.name_range,
         version_req: version_req.map(Into::into),
         version_range,
+        version_literal,
         group,
         source,
         platforms,
@@ -1111,7 +1112,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
                 continue;
             }
 
-            let (version_req, version_range) = extract_version(
+            let (version_req, version_range, version_literal) = extract_version(
                 &[(stripped_rest, rest_offset)],
                 content,
                 &line_table,
@@ -1136,6 +1137,7 @@ pub fn parse_gemfile(content: &str, doc_uri: &Url) -> Result<BundlerParseResult>
                 name_range,
                 version_req: version_req.map(Into::into),
                 version_range,
+                version_literal,
                 group,
                 source,
                 platforms,
@@ -1251,7 +1253,7 @@ fn extract_version(
     content: &str,
     line_table: &LineOffsetTable,
     allow_paren_terminator: bool,
-) -> (Option<String>, Option<Range>) {
+) -> (Option<String>, Option<Range>, Option<String>) {
     let version_pattern: &Regex = if allow_paren_terminator {
         &VERSION_PATTERN_PAREN_TERMINATED
     } else {
@@ -1327,12 +1329,29 @@ fn extract_version(
     }
 
     if constraints.is_empty() {
-        return (None, None);
+        return (None, None, None);
     }
 
     let version = constraints.join(", ");
     let version_range = byte_span_to_range(content, line_table, range_start, range_end);
-    (Some(version), Some(version_range))
+    // #1366 impl-critic S1: only set for a genuine multi-constraint call (2+ positional
+    // literals) — a single constraint's `version_range` already spans exactly `version`'s own
+    // text (up to whitespace), so `Dependency::version_literal`'s documented default (`None`,
+    // falling back to `version_requirement`) is already correct there; overriding it
+    // unconditionally would be redundant, not wrong, but the raw multi-literal span (this
+    // constraint's content through the last one's, including the quotes/comma between them) is
+    // the whole point here — see `Dependency::version_literal`'s doc for why the *comparator*
+    // string (`version`, `", "`-joined with no quotes at all) can never itself be what
+    // `version_range`'s slice holds, so without this the literal-span guard shared by
+    // `generate_code_actions`/`collect_update_all_edits`/completion rejects every
+    // multi-constraint dependency outright — no code action, no completion, ever offered again
+    // (impl-critic S1, verified: `dependency_version_range_is_literal` false for every
+    // multi-constraint shape).
+    let version_literal = (constraints.len() > 1)
+        .then(|| content.get(range_start..range_end))
+        .flatten()
+        .map(str::to_string);
+    (Some(version), Some(version_range), version_literal)
 }
 
 /// Joins every accumulated physical line of a (possibly multi-line) `gem` call into one search
