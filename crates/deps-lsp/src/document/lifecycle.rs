@@ -2850,9 +2850,16 @@ tokio = "1.0"
             }
 
             // If the pre-existing task had instead been aborted, it would never reach the
-            // `store(true, ...)` line above; give it well past its 50ms sleep to prove it ran
-            // to completion undisturbed.
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            // `store(true, ...)` line above. Poll rather than a single fixed sleep: a flat
+            // 200ms margin over the task's own 50ms sleep flaked under CI-runner scheduling
+            // load (#1337) — polling exits as soon as the flag is set while still tolerating
+            // a slow scheduler up to a generous ceiling.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ran_to_completion.load(Ordering::SeqCst)
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             assert!(
                 ran_to_completion.load(Ordering::SeqCst),
                 "the pre-existing background task must not be aborted by a skipped guarded reparse"
