@@ -4,10 +4,7 @@ use crate::ParseResult;
 #[cfg(test)]
 use crate::PublishTime;
 
-use super::{
-    EcosystemFormatter, LineOffsetTable, RequirementStatus, VersionData, is_safe_version_string,
-    literal_span_matches, slice_for_range, strip_whitespace, warn_rejected_value,
-};
+use super::{EcosystemFormatter, VersionData};
 
 /// `workspace/executeCommand` id for the bulk "Pin N {noun} to commit SHA" code lens.
 ///
@@ -146,115 +143,29 @@ pub fn collect_update_all_edits(
     versions: VersionData<'_>,
     formatter: &dyn EcosystemFormatter,
 ) -> Vec<TextEdit> {
-    let deps = parse_result.dependencies();
-    let mut edits: Vec<TextEdit> = Vec::with_capacity(deps.len());
-    // Built once and reused for every dependency below — content is fixed for the
-    // whole call, so re-scanning it per dependency would be O(n²) in dependency count.
-    let line_offsets = LineOffsetTable::new(content);
-
-    for dep in deps {
-        let Some(version_range) = dep.version_range() else {
-            continue;
-        };
-        let version_range: Range = version_range.into();
-
-        let normalized_name = formatter.normalize_package_name(dep.name());
-        let Some(latest) = versions
-            .cached
-            .get(normalized_name.as_str())
-            .or_else(|| versions.cached.get(dep.name()))
-            .map(|v| &v.latest)
-        else {
-            continue;
-        };
-        if !is_safe_version_string(latest.as_str()) {
-            warn_rejected_value(
-                "is_safe_version_string",
-                "update-all code lens edit",
-                latest.as_str(),
-            );
-            continue;
-        }
-
-        let Some(version_req) = dep.version_requirement() else {
-            continue;
-        };
-        if version_req.as_str().is_empty() {
-            // Defense-in-depth: an empty requirement would trivially satisfy the guard below
-            // (both sides normalize to "") and could anchor an edit on a non-literal span.
-            continue;
-        }
-        // `requirement_status_for`, matching `apply_outdated_rule`/`inlay_hints.rs` (#907):
-        // lets e.g. `GithubActionsFormatter` prefer a SHA pin's registry-confirmed tag over
-        // its own comment text, so this lens agrees with what diagnostics/hints show.
-        if formatter.requirement_status_for(dep, version_req, latest) != RequirementStatus::Outdated
-        {
-            continue;
-        }
-
-        // TODO(critic): intentionally not calling `dependency_version_range_is_literal`
-        // (#919) — empty-requirement semantics differ (edit: nothing to update; completion:
-        // everything to offer).
-        let slice = slice_for_range(content, &line_offsets, version_range.into());
-        let literal_target = dep
-            .version_literal()
-            .unwrap_or_else(|| version_req.as_str());
-        if !literal_span_matches(slice, literal_target) {
-            continue;
-        }
-
-        let new_text = formatter.format_version_replacing_for(dep, latest, version_req.as_str());
-        // No-op guard, mirroring `code_actions`'s N1 guard: a formatter can return a
-        // requirement unchanged when it has no single unambiguous rewrite (e.g.
-        // `deps-gradle`'s `{strictly}!!{preferred}` shorthand) — without it such a dependency
-        // would still count toward the lens while its click applies nothing.
-        if strip_whitespace(&new_text) == strip_whitespace(literal_target) {
-            continue;
-        }
-
-        edits.push(TextEdit {
-            range: version_range,
-            new_text,
-        });
-    }
-
-    dedup_overlapping_edits(edits, "collect_update_all_edits")
+    crate::edit::collect_update_edits(parse_result, content, versions, formatter)
+        .into_iter()
+        .map(|planned| planned.edit.into())
+        .collect()
 }
 
-/// Sorts `edits` by start position and drops any edit whose start falls before the
-/// previous (surviving) edit's end — a `WorkspaceEdit` protocol violation no LSP client
-/// can apply.
-///
-/// `caller` names the collector in the `tracing::warn!` emitted for each dropped edit, so
-/// a log line is traceable back to which bulk command produced it.
-///
-/// Shared by every "collect edits for a bulk `WorkspaceEdit`" aggregator in the
-/// workspace (issue #633 critic M3: a sibling collector omitting this pass — while every
-/// current parser happens not to produce overlapping spans — is exactly the kind of
-/// divergence the project's cross-ecosystem-consistency rule exists to catch) —
-/// currently [`collect_update_all_edits`] and
-/// `deps_github_actions::ecosystem::collect_pin_all_to_sha_edits`.
-pub fn dedup_overlapping_edits(mut edits: Vec<TextEdit>, caller: &str) -> Vec<TextEdit> {
-    edits.sort_by_key(|edit| (edit.range.start.line, edit.range.start.character));
-
-    let mut non_overlapping: Vec<TextEdit> = Vec::with_capacity(edits.len());
-    for edit in edits {
-        let overlaps_prev = non_overlapping.last().is_some_and(|prev: &TextEdit| {
-            (edit.range.start.line, edit.range.start.character)
-                < (prev.range.end.line, prev.range.end.character)
-        });
-        if overlaps_prev {
-            tracing::warn!(
-                range = ?edit.range,
-                caller,
-                "dropping overlapping TextEdit"
-            );
-            continue;
+impl From<crate::edit::ManifestEdit> for TextEdit {
+    fn from(edit: crate::edit::ManifestEdit) -> Self {
+        Self {
+            range: edit.range.into(),
+            new_text: edit.new_text,
         }
-        non_overlapping.push(edit);
+    }
+}
+
+impl crate::edit::EditSpan for TextEdit {
+    fn start(&self) -> (u32, u32) {
+        (self.range.start.line, self.range.start.character)
     }
 
-    non_overlapping
+    fn end(&self) -> (u32, u32) {
+        (self.range.end.line, self.range.end.character)
+    }
 }
 
 /// Zero or one lens for the document, bound to `command_id`.

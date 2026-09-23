@@ -3,23 +3,27 @@
 //! Wires the `check` subcommand end to end: loads config, walks the target path(s),
 //! classifies every discovered manifest through the same pipeline `deps-lsp` uses, applies
 //! the `--fail-on` policy, prints the selected format, and exits with the mapped code.
+//!
+//! Also wires `update` (spec 068, #1329): plans and writes back version-requirement edits
+//! for one manifest's outdated or vulnerable dependencies.
 
 use clap::Parser;
-use deps_cli::cli::{Cli, Command, OutputFormat};
+use deps_cli::MAX_MANIFEST_FILE_SIZE;
+use deps_cli::analyze::analyze_manifest;
+use deps_cli::cli::{Cli, Command, OutputFormat, UpdateArgs, UpdateOutputFormat};
 use deps_cli::config::{self, CliConfig};
 use deps_cli::exit::exit_code;
 use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
+use deps_cli::update::ignore::IgnoreRules;
+use deps_cli::update::{self, UpdatePlan};
 use deps_cli::{format, walk};
 use deps_core::osv::OsvClient;
+use deps_core::policy_config::PolicyConfig;
 use deps_core::{EcosystemRegistry, HttpCache};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-
-/// Manifest file size cap — mirrors `deps-lsp`'s `document::loader::MAX_FILE_SIZE`
-/// (`fs_probe::read_to_string_capped`'s own TOCTOU-safe cap, not reachable from this crate).
-const MAX_MANIFEST_FILE_SIZE: u64 = 10_000_000;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -28,7 +32,6 @@ fn main() -> ExitCode {
         .init();
 
     let cli = Cli::parse();
-    let Command::Check(args) = cli.command;
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -41,6 +44,51 @@ fn main() -> ExitCode {
         }
     };
 
+    match cli.command {
+        Command::Check(args) => run_check_command(&runtime, &args),
+        Command::Update(args) => run_update_command(&runtime, &args),
+    }
+}
+
+/// Shared per-run handles: HTTP cache, OSV client, lock-file cache, and the ecosystem
+/// registry — built identically for `check` and `update`.
+struct RuntimeHandles {
+    osv: Arc<OsvClient>,
+    lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
+    cache: Arc<HttpCache>,
+    ecosystem_registry: EcosystemRegistry,
+}
+
+fn build_runtime_handles(policy: &PolicyConfig) -> RuntimeHandles {
+    // Shared with `ecosystem_runtime` below (impl-critic #4 follow-up to #1212's S3 fix) so
+    // Composer's classification-time `composer.lock` read and this run's own in-use-version
+    // resolution hit the same mtime-keyed cache instance, instead of each parsing the lock
+    // file independently — the same double-parse `deps-lsp`'s `ServerState` avoids.
+    let lockfile_cache = Arc::new(deps_core::lockfile::LockFileCache::new());
+    let ecosystem_runtime =
+        EcosystemRuntime::from_policy(policy).with_lockfile_cache(Arc::clone(&lockfile_cache));
+    let cache = Arc::new(HttpCache::with_policy(Arc::clone(
+        &ecosystem_runtime.policy,
+    )));
+    // FR-013/SC-004: offline gate lives at the shared cache, so callers degrade to
+    // cached-only data without their own per-call short-circuit.
+    cache.set_offline(policy.network.offline);
+    let ecosystem_registry = EcosystemRegistry::new();
+    let _workspace_registry_ecosystems =
+        register_ecosystems(&ecosystem_registry, Arc::clone(&cache), &ecosystem_runtime);
+
+    RuntimeHandles {
+        osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+        lockfile_cache,
+        cache,
+        ecosystem_registry,
+    }
+}
+
+fn run_check_command(
+    runtime: &tokio::runtime::Runtime,
+    args: &deps_cli::cli::CheckArgs,
+) -> ExitCode {
     let walk_paths = args.walk_paths();
     let default_config_dir = config_default_dir(&walk_paths);
     let cli_config = match config::load(args.config.as_deref(), &default_config_dir) {
@@ -97,33 +145,17 @@ async fn run_check(
     symlink_policy: walk::SymlinkPolicy,
 ) -> (CheckReport, bool) {
     let policy = cli_config.policy;
-    // Shared with `ecosystem_runtime` below (impl-critic #4 follow-up to #1212's S3 fix) so
-    // Composer's classification-time `composer.lock` read and this run's own in-use-version
-    // resolution hit the same mtime-keyed cache instance, instead of each parsing the lock
-    // file independently — the same double-parse `deps-lsp`'s `ServerState` avoids.
-    let lockfile_cache = Arc::new(deps_core::lockfile::LockFileCache::new());
-    let ecosystem_runtime =
-        EcosystemRuntime::from_policy(&policy).with_lockfile_cache(Arc::clone(&lockfile_cache));
-    let cache = Arc::new(HttpCache::with_policy(Arc::clone(
-        &ecosystem_runtime.policy,
-    )));
-    // FR-013/SC-004: offline gate lives at the shared cache, so callers degrade to
-    // cached-only data without their own per-call short-circuit.
-    cache.set_offline(policy.network.offline);
-    let ecosystem_registry = EcosystemRegistry::new();
-    let _workspace_registry_ecosystems =
-        register_ecosystems(&ecosystem_registry, Arc::clone(&cache), &ecosystem_runtime);
-
+    let handles = build_runtime_handles(&policy);
     let ctx = CheckContext {
-        cache: Arc::clone(&cache),
-        osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
-        lockfile_cache,
+        cache: Arc::clone(&handles.cache),
+        osv: handles.osv,
+        lockfile_cache: handles.lockfile_cache,
         policy,
     };
 
     let walk_outcome = walk::walk(
         &paths,
-        &ecosystem_registry,
+        &handles.ecosystem_registry,
         gitignore_policy,
         symlink_policy,
     );
@@ -257,4 +289,227 @@ fn config_default_dir(paths: &[PathBuf]) -> PathBuf {
             .map_or_else(|| PathBuf::from("."), Path::to_path_buf),
         _ => PathBuf::from("."),
     }
+}
+
+/// Loads [`CliConfig`] for `update` (FR-007): only from an explicit `--config <path>`, never
+/// auto-discovered — `update` never even looks for a default-location `deps.toml`, unlike
+/// `check`'s [`config::load`] with `explicit_path: None`.
+fn load_update_config(explicit_path: Option<&Path>) -> Result<CliConfig, config::ConfigError> {
+    match explicit_path {
+        Some(path) => config::load(Some(path), Path::new(".")),
+        None => Ok(CliConfig::default()),
+    }
+}
+
+fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> ExitCode {
+    let cli_config = match load_update_config(args.config.as_deref()) {
+        Ok(config) => config::apply_overrides(config, args.offline, args.cooldown),
+        Err(error) => {
+            eprintln!("deps-cli: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let policy = cli_config.policy;
+
+    // FR-014 (M6: covers both clauses in one check, not just `--cooldown`): a non-default
+    // `freshness.cooldown_secs` — whether it came from `--cooldown` or from a `[freshness]`
+    // section in an explicit `--config` file — has no effect under `--security-only`, since
+    // the fix target comes from the advisory's `recommended_fix()`, never the
+    // freshness-filtered registry pick. Warn, don't reject; comparing the final resolved
+    // `policy` value (after `apply_overrides`) against the default catches both sources
+    // uniformly instead of checking `args.cooldown` alone.
+    if args.security_only
+        && policy.freshness.cooldown_secs != PolicyConfig::default().freshness.cooldown_secs
+    {
+        eprintln!(
+            "deps-cli: warning: a non-default freshness cooldown has no effect under --security-only (the fix target comes from the advisory, not the freshness-filtered registry pick)"
+        );
+    }
+
+    // FR-015: hard-error rather than silently scanning zero dependencies and exiting 0.
+    if args.security_only && (policy.network.offline || !policy.diagnostics.vulnerabilities_enabled)
+    {
+        eprintln!(
+            "deps-cli: error: --security-only requires network access and vulnerability scanning to be enabled (network.offline and diagnostics.vulnerabilities_enabled)"
+        );
+        return ExitCode::from(2);
+    }
+
+    // FR-007: `[update].ignore` rules are honored only when loaded from an explicit
+    // `--config <path>` — `cli_config.update.ignore` is already empty when `args.config` is
+    // `None` (`load_update_config` never auto-discovers), but this stays explicit rather than
+    // relying on that being true by construction.
+    let ignore_config = args
+        .config
+        .is_some()
+        .then(|| cli_config.update.ignore.clone());
+
+    match runtime.block_on(run_update(args, policy, ignore_config)) {
+        Ok(plan) => {
+            let rendered = match args.format {
+                UpdateOutputFormat::Table => format::table::render_update(&plan, args.dry_run),
+                UpdateOutputFormat::Json => {
+                    match format::json::render_update(&plan, args.dry_run) {
+                        Ok(json) => json,
+                        Err(error) => {
+                            eprintln!("deps-cli: failed to render JSON report: {error}");
+                            return ExitCode::from(2);
+                        }
+                    }
+                }
+            };
+            print!("{rendered}");
+            ExitCode::from(u8::try_from(deps_cli::exit::update_exit_code(&plan)).unwrap_or(2))
+        }
+        Err(message) => {
+            eprintln!("deps-cli: error: {message}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// Walks (single-path routing, FR-002), analyzes, plans, and applies one `update` run.
+///
+/// `ignore_config` is `Some(rules)` only when an explicit `--config` supplied `[update].ignore`
+/// rules (FR-007) — `None` means no rules were loaded at all, resolving to
+/// [`IgnoreRules::empty`] once the manifest's ecosystem (and therefore its
+/// `normalize_package_name`) is known.
+async fn run_update(
+    args: &UpdateArgs,
+    policy: PolicyConfig,
+    ignore_config: Option<Vec<deps_cli::config::IgnoreRule>>,
+) -> Result<UpdatePlan, String> {
+    let handles = build_runtime_handles(&policy);
+
+    let walk_outcome = walk::walk(
+        std::slice::from_ref(&args.manifest),
+        &handles.ecosystem_registry,
+        walk::GitignorePolicy::Ignore,
+        walk::SymlinkPolicy::Skip,
+    );
+    if walk_outcome.manifests().len() != 1
+        || !walk_outcome.unrecognized_explicit_paths().is_empty()
+        || !walk_outcome.broken_manifest_symlinks().is_empty()
+        || !walk_outcome.ignored_manifests().is_empty()
+        || !walk_outcome.walk_errors().is_empty()
+    {
+        return Err(format!(
+            "{} is not a single recognized manifest",
+            args.manifest.display()
+        ));
+    }
+    let Some(manifest) = walk_outcome.manifests().first() else {
+        return Err(format!(
+            "{} is not a single recognized manifest",
+            args.manifest.display()
+        ));
+    };
+
+    // N1 (critic re-review): spec §8's Never clause forbids reading manifest content before
+    // FR-017's symlink refusal passes — `write_atomic`'s own refusal only fires at write time,
+    // which left a symlinked manifest argument fully read, parsed, and its dependency names
+    // sent to the registry/OSV before the existing write-time check ever ran (US-006's
+    // *observable* contract — nothing gets written — still held, but the spec's stricter
+    // read-time boundary did not). `manifest.path` is the encountered, unresolved argument
+    // path for an explicit single-file root (`walk_with_limit`'s `root.is_file()` branch calls
+    // `route_file(&absolute_root, &absolute_root, ...)` — `std::path::absolute` never resolves
+    // symlinks), so this read and `write_atomic`'s later write both operate on the same path.
+    //
+    // Code review finding 2: a separate `symlink_metadata` check followed by a plain,
+    // symlink-following read left a check-then-open TOCTOU gap of its own. Closed by
+    // `read_to_string_capped_no_follow`, which passes `O_NOFOLLOW` to the single `open(2)`
+    // call itself on Linux/macOS — see that function's doc for the narrower (documented, not
+    // fully closed) fallback on other platforms.
+    let content = match deps_core::fs_probe::read_to_string_capped_no_follow(
+        &manifest.path,
+        MAX_MANIFEST_FILE_SIZE,
+    ) {
+        Ok(Some(content)) => content,
+        Ok(None) => {
+            return Err(format!(
+                "{} exceeds the manifest size cap",
+                manifest.display_path.display()
+            ));
+        }
+        // `read_to_string_capped_no_follow`'s own error message already names the symlink
+        // refusal specifically (mirroring how `ApplyError::Write`'s `{source}` Display already
+        // carries `write_atomic`'s equivalent message) — no need to re-detect it by `ErrorKind`
+        // here, just propagate `error`'s own `Display`.
+        Err(error) => {
+            return Err(format!(
+                "could not read {}: {error}",
+                manifest.display_path.display()
+            ));
+        }
+    };
+
+    let ctx = CheckContext {
+        cache: Arc::clone(&handles.cache),
+        osv: Arc::clone(&handles.osv),
+        lockfile_cache: handles.lockfile_cache,
+        policy,
+    };
+
+    // Code review finding 6: `update` never reads `ManifestAnalysis::licenses` in either mode,
+    // and its default mode never reads `vulnerabilities` either — declaring the narrower scope
+    // here (vs. `check`'s `AnalysisScope::all()`) skips a wasted network round trip per
+    // dependency (license prefetch) and, for the common default-mode case, the OSV scan too.
+    let scope = if args.security_only {
+        deps_cli::analyze::AnalysisScope::vulnerabilities_only()
+    } else {
+        deps_cli::analyze::AnalysisScope::none()
+    };
+    let analysis = analyze_manifest(
+        &manifest.ecosystem,
+        &manifest.uri_path,
+        &content,
+        &ctx,
+        scope,
+    )
+    .await
+    .map_err(|error| error.to_string())?;
+    // S2 (critic finding): a total registry outage must not silently yield an empty plan and
+    // exit 0 — spec §5's exit table lists "registry unreachable" under exit 2, and `check`
+    // already honors this same signal (see `run_check`). Aborts before planning/writing
+    // rather than proceeding on partial registry data, since an "up to date" verdict built
+    // from an incomplete fetch is actively misleading, not merely incomplete. Deliberately
+    // does not also gate on `analysis.license_fetch_incomplete`: unlike `check`, `update`'s
+    // planners never read license data at all, so that signal has no bearing on plan
+    // correctness here.
+    if analysis.registry_unreachable {
+        return Err(format!(
+            "a registry required to classify {} was unreachable; the plan would be based on \
+             incomplete data",
+            manifest.display_path.display()
+        ));
+    }
+    let formatter = manifest.ecosystem.formatter();
+    let ignore_rules = match ignore_config {
+        Some(rules) => IgnoreRules::new(rules, formatter),
+        None => IgnoreRules::empty(),
+    };
+
+    let mut plan = if args.security_only {
+        update::security::plan_security_updates(
+            &analysis,
+            manifest.ecosystem.as_ref(),
+            &ctx.osv,
+            &args.package,
+            &ignore_rules,
+            ctx.policy.cache.fetch_timeout_secs,
+        )
+        .await
+    } else {
+        update::plan_updates(&analysis, &content, formatter, &args.package, &ignore_rules)
+    };
+    // M2: must run before the plan is reported/rendered — `plan_security_updates` does not
+    // dedup its own `Applied` items, so this demotes any edit that would be dropped by
+    // `apply_plan`'s own dedup pass to `Skipped(OverlapsAnotherEdit)` first, so a reported
+    // `applied` outcome always matches what actually gets written.
+    update::dedup_applied_items(&mut plan.items);
+
+    update::apply_plan(&plan, &manifest.path, &content, args.dry_run)
+        .map_err(|error| error.to_string())?;
+
+    Ok(plan)
 }

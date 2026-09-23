@@ -78,6 +78,62 @@ fn severity_rank(severity: Severity) -> u8 {
     }
 }
 
+/// Renders an `update` run's plan: one line per item (name, current, target, outcome,
+/// reason), following `render`'s table style.
+///
+/// `dry_run` prints a leading note so an `applied` line is never confused with an edit that
+/// was actually written (critic finding M1/US-005 — mirrors
+/// `format::json::render_update`'s `dry_run` field, which is likewise emitted unconditionally
+/// regardless of item count — code review finding 3: this note used to be skipped for an
+/// empty plan, so `--dry-run --format table` on an empty plan was indistinguishable from a
+/// real run, unlike the json format's always-present `dry_run` field).
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::format::table::render_update;
+/// use deps_cli::update::UpdatePlan;
+///
+/// assert_eq!(render_update(&UpdatePlan::default(), false), "No eligible updates.\n");
+/// assert_eq!(
+///     render_update(&UpdatePlan::default(), true),
+///     "(dry run — no changes written)\nNo eligible updates.\n"
+/// );
+/// ```
+#[must_use]
+pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: bool) -> String {
+    let mut out = String::new();
+    if dry_run {
+        let _ = writeln!(out, "(dry run — no changes written)");
+    }
+    if plan.items.is_empty() {
+        out.push_str("No eligible updates.\n");
+        return out;
+    }
+
+    for item in &plan.items {
+        let target = if item.target.is_empty() {
+            "-"
+        } else {
+            item.target.as_str()
+        };
+        // Security-S3: `name`/`current` can embed manifest-controlled text (a package name,
+        // or — in `--security-only` mode — the declared requirement/resolved version
+        // verbatim); routed through the same sanitizer every other untrusted-text sink in
+        // this crate uses, closing a consistency gap even though no live exploit reached it.
+        let _ = writeln!(
+            out,
+            "[{}] {} {} -> {} — {}",
+            item.outcome.wire_token(),
+            crate::sanitize::sanitize_message_for_display(&item.name),
+            crate::sanitize::sanitize_message_for_display(&item.current),
+            target,
+            item.reason(),
+        );
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +228,52 @@ mod tests {
             ],
         };
         insta::assert_snapshot!(render(&report));
+    }
+
+    fn update_item(outcome: crate::update::Outcome) -> crate::update::PlannedUpdateItem {
+        crate::update::PlannedUpdateItem {
+            name: "serde".to_string(),
+            current: "1.0.0".to_string(),
+            target: "1.2.0".to_string(),
+            outcome,
+            edit: None,
+            advisory_ids: Vec::new(),
+            ignore_rule_overridden: false,
+        }
+    }
+
+    /// S5: `render_update` on a non-empty plan — the empty-plan doctest alone never exercised
+    /// the per-item line format or the `dry_run` leading note.
+    #[test]
+    fn test_render_update_non_empty_plan_includes_item_line() {
+        let plan = crate::update::UpdatePlan {
+            items: vec![update_item(crate::update::Outcome::Applied)],
+        };
+        let table = render_update(&plan, false);
+        assert!(table.contains("serde"));
+        assert!(table.contains("1.0.0"));
+        assert!(table.contains("1.2.0"));
+        assert!(table.contains("applied"));
+        assert!(!table.contains("dry run"));
+    }
+
+    #[test]
+    fn test_render_update_dry_run_includes_leading_note() {
+        let plan = crate::update::UpdatePlan {
+            items: vec![update_item(crate::update::Outcome::Applied)],
+        };
+        let table = render_update(&plan, true);
+        assert!(table.starts_with("(dry run"));
+    }
+
+    /// Code review finding 3: an empty plan must still carry the `dry_run` leading note —
+    /// otherwise `--dry-run --format table` on an empty plan was indistinguishable from a
+    /// real run (`format::json::render_update`'s `dry_run` field never had this gap, since it
+    /// is emitted unconditionally regardless of item count).
+    #[test]
+    fn test_render_update_empty_plan_still_includes_dry_run_note() {
+        let table = render_update(&crate::update::UpdatePlan::default(), true);
+        assert!(table.starts_with("(dry run"));
+        assert!(table.contains("No eligible updates."));
     }
 }

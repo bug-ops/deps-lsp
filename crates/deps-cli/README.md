@@ -181,6 +181,30 @@ Defaults to `vulnerable,yanked,unsatisfiable` when the flag is omitted. A findin
 none of these seven categories (for example, an unresolved or unknown package) is always
 reported in the output but can never fail a run through this flag.
 
+### `update` subcommand
+
+`deps-cli update <MANIFEST>` reads exactly one manifest, plans version-requirement edits for
+its outdated (default mode) or OSV-vulnerable (`--security-only`) dependencies, and writes
+them back atomically — the non-interactive counterpart to `deps-lsp`'s "update all outdated"
+code lens and vulnerability-fix quick action:
+
+```bash
+# Update every outdated dependency
+deps-cli update Cargo.toml
+
+# Only OSV-vulnerable dependencies, targeting each advisory's own recommended fix
+deps-cli update --security-only Cargo.toml
+
+# Plan without writing, inspecting the machine-readable result
+deps-cli update --dry-run --format json Cargo.toml
+```
+
+`[update].ignore` rules (skip specific dependencies, optionally scoped by update kind) are
+honored only from an explicit `--config <path>` — `update` never auto-discovers a `deps.toml`.
+See the [`update` usage](https://bug-ops.github.io/deps-lsp/cli.html#update-usage) mdBook
+section for the full flag reference, the three-outcome `--security-only` classification, and
+the exit-code contract.
+
 ## Pre-commit hook
 
 This repository ships a [`.pre-commit-hooks.yaml`](../../.pre-commit-hooks.yaml) at its root

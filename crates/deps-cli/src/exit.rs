@@ -1,6 +1,7 @@
 //! Exit-code mapping (FR-011, FR-012): 0 clean, 1 policy violation, 2 execution error.
 
 use crate::report::{CheckReport, FailOnPolicy};
+use crate::update::{Outcome, SkipReason, UpdatePlan};
 
 /// The process exited cleanly: no finding matched the `--fail-on` policy.
 pub const EXIT_CLEAN: i32 = 0;
@@ -42,6 +43,52 @@ pub fn exit_code(report: &CheckReport, policy: &FailOnPolicy, had_execution_erro
         return EXIT_EXECUTION_ERROR;
     }
     EXIT_CLEAN
+}
+
+/// Computes the process exit code for a completed `update` run (spec §5's exit-code table,
+/// as amended by S3 — see below).
+///
+/// `0` if every item is [`Outcome::Applied`], the plan was empty (nothing eligible), or every
+/// non-`Applied` item is a deliberate operator exclusion
+/// (<code>[Outcome::Skipped]([SkipReason::NotRequested])</code> — a `--package` narrowing —
+/// or <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code> — a `[update].ignore` match).
+/// `1` if at least one item is
+/// <code>[Outcome::Skipped]([SkipReason::NotSafelyEditable])</code>,
+/// [`Outcome::RequiresLockfileUpdate`], or [`Outcome::Unfixable`] — these represent something
+/// the run *wanted* to fix but could not, unlike an operator-requested exclusion. `2`
+/// (execution error — parse/write/TOCTOU/symlink/offline-gate failures) is set by the caller
+/// before this function is ever reached, never by this function itself (FR-022 — a non-zero
+/// exit here never implies the working tree is unmodified: a mixed run can exit `1` with real
+/// edits already on disk).
+///
+/// **S3 amendment**: spec.md's own exit-code table (§5) originally listed *any* skip,
+/// including `NotRequested`/`IgnoreRule`, under exit `1` — directly contradicting US-004's
+/// stated acceptance criterion ("`tokio` is skipped, reported `skipped (ignore-rule)`, and
+/// the run still exits `0` if every other selected dependency was applied"). This function
+/// implements US-004's reading: an operator explicitly asking to skip something is not a
+/// failure. spec.md §5 and `book/src/cli.md` are updated to match.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::exit::{EXIT_CLEAN, EXIT_POLICY_VIOLATION, update_exit_code};
+/// use deps_cli::update::UpdatePlan;
+///
+/// assert_eq!(update_exit_code(&UpdatePlan::default()), EXIT_CLEAN);
+/// ```
+#[must_use]
+pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
+    let has_unresolved_item = plan.items.iter().any(|item| {
+        !matches!(
+            item.outcome,
+            Outcome::Applied | Outcome::Skipped(SkipReason::NotRequested | SkipReason::IgnoreRule)
+        )
+    });
+    if has_unresolved_item {
+        EXIT_POLICY_VIOLATION
+    } else {
+        EXIT_CLEAN
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +166,99 @@ mod tests {
         };
         let policy = FailOnPolicy::default_categories();
         assert_eq!(exit_code(&report, &policy, true), EXIT_POLICY_VIOLATION);
+    }
+
+    // --- update_exit_code (spec 068, S3) ---
+
+    use crate::update::{PlannedUpdateItem, UnfixableReason};
+    use deps_core::edit::UnplannableReason;
+
+    fn update_item(outcome: Outcome) -> PlannedUpdateItem {
+        PlannedUpdateItem {
+            name: "serde".to_string(),
+            current: "1.0.0".to_string(),
+            target: "1.2.0".to_string(),
+            outcome,
+            edit: None,
+            advisory_ids: Vec::new(),
+            ignore_rule_overridden: false,
+        }
+    }
+
+    #[test]
+    fn test_update_exit_code_empty_plan_is_clean() {
+        assert_eq!(update_exit_code(&UpdatePlan::default()), EXIT_CLEAN);
+    }
+
+    #[test]
+    fn test_update_exit_code_all_applied_is_clean() {
+        let plan = UpdatePlan {
+            items: vec![update_item(Outcome::Applied), update_item(Outcome::Applied)],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+    }
+
+    /// US-004: an ignore-rule skip alone must not fail the run.
+    #[test]
+    fn test_update_exit_code_ignore_rule_skip_alone_is_clean() {
+        let plan = UpdatePlan {
+            items: vec![
+                update_item(Outcome::Applied),
+                update_item(Outcome::Skipped(SkipReason::IgnoreRule)),
+            ],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+    }
+
+    /// US-002: a `--package` exclusion alone must not fail the run.
+    #[test]
+    fn test_update_exit_code_not_requested_skip_alone_is_clean() {
+        let plan = UpdatePlan {
+            items: vec![
+                update_item(Outcome::Applied),
+                update_item(Outcome::Skipped(SkipReason::NotRequested)),
+            ],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+    }
+
+    #[test]
+    fn test_update_exit_code_not_safely_editable_skip_is_policy_violation() {
+        let plan = UpdatePlan {
+            items: vec![update_item(Outcome::Skipped(
+                SkipReason::NotSafelyEditable(UnplannableReason::NonLiteralSpan),
+            ))],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn test_update_exit_code_requires_lockfile_update_is_policy_violation() {
+        let plan = UpdatePlan {
+            items: vec![update_item(Outcome::RequiresLockfileUpdate)],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn test_update_exit_code_unfixable_is_policy_violation() {
+        let plan = UpdatePlan {
+            items: vec![update_item(Outcome::Unfixable(
+                UnfixableReason::FetchFailedOrAbsent,
+            ))],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
+    }
+
+    #[test]
+    fn test_update_exit_code_mixed_applied_and_operator_skips_is_clean() {
+        let plan = UpdatePlan {
+            items: vec![
+                update_item(Outcome::Applied),
+                update_item(Outcome::Skipped(SkipReason::NotRequested)),
+                update_item(Outcome::Skipped(SkipReason::IgnoreRule)),
+            ],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
     }
 }

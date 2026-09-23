@@ -148,6 +148,9 @@ docker run --rm -v "$PWD:/workspace" -w /workspace \
 
 - **Output formats**: human-readable table (default), versioned JSON, or SARIF 2.1.0 for
   `github/codeql-action/upload-sarif`
+- **`deps-cli update <MANIFEST>`**: plans and writes back version-requirement edits for
+  outdated (default) or OSV-vulnerable (`--security-only`) dependencies — see
+  [`crates/deps-cli/README.md`](crates/deps-cli/README.md#update-subcommand)
 - **[Pre-commit hook](.pre-commit-hooks.yaml)**: `deps-lsp-check`, runs `deps-cli check`
   against staged files
 - **[GitHub Action](crates/github-action/README.md)**: a Docker-based action wrapping

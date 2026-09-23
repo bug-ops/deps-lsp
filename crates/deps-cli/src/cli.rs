@@ -19,7 +19,9 @@ const MAX_COOLDOWN_SECS: u64 = 30 * 24 * 60 * 60;
 /// use deps_cli::cli::{Cli, Command};
 ///
 /// let cli = Cli::parse_from(["deps-cli", "check", "Cargo.toml"]);
-/// let Command::Check(args) = cli.command;
+/// let Command::Check(args) = cli.command else {
+///     unreachable!()
+/// };
 /// assert_eq!(args.paths, vec![std::path::PathBuf::from("Cargo.toml")]);
 /// ```
 #[derive(Debug, Parser)]
@@ -34,12 +36,15 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Top-level `deps-cli` subcommands. Only `check` exists in this release.
+/// Top-level `deps-cli` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Walk PATH(s), classify every discovered manifest's dependencies through the same
     /// pipeline `deps-lsp` uses, and report findings.
     Check(CheckArgs),
+    /// Plan and write back version-requirement edits for one manifest's outdated or
+    /// vulnerable dependencies (spec 068, #1329).
+    Update(UpdateArgs),
 }
 
 /// Output format for a `check` run.
@@ -116,7 +121,9 @@ impl CheckArgs {
     /// use deps_cli::cli::{Cli, Command};
     ///
     /// let cli = Cli::parse_from(["deps-cli", "check"]);
-    /// let Command::Check(args) = cli.command;
+    /// let Command::Check(args) = cli.command else {
+    ///     unreachable!()
+    /// };
     /// assert_eq!(args.walk_paths(), vec![std::path::PathBuf::from(".")]);
     /// ```
     #[must_use]
@@ -149,6 +156,70 @@ impl CheckArgs {
             SymlinkPolicy::Skip
         }
     }
+}
+
+/// Output format for an `update` run.
+///
+/// A separate enum from [`OutputFormat`] (not `sarif`-capable, per NFR-005's "duplicate,
+/// don't share" precedent): `update` has no diagnostic-finding concept for SARIF to
+/// describe, so accepting `--format sarif` only to reject it at runtime would be a worse UX
+/// than never accepting it syntactically at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum UpdateOutputFormat {
+    /// Human-readable table, one line per item (the default).
+    Table,
+    /// Versioned JSON document (see `crate::format::json::render_update`).
+    Json,
+}
+
+/// Arguments for `deps-cli update` (spec 068, #1329).
+///
+/// `--config`/`--offline`/`--cooldown` clap attributes are **duplicated** from
+/// [`CheckArgs`]'s equivalents rather than shared via a `CommonArgs` flatten (NFR-005) — this
+/// keeps `CheckArgs`' existing public field layout and clap surface untouched. No
+/// `--respect-gitignore`/`--follow-symlinks` (Out of Scope: an explicitly named manifest path
+/// is already an explicit choice).
+#[derive(Debug, Parser)]
+pub struct UpdateArgs {
+    /// The single manifest to update (FR-002 — a directory, a glob expanding to more than
+    /// one path, or a path no ecosystem recognizes is an execution error).
+    pub manifest: PathBuf,
+
+    /// Narrows the update set to only the named dependencies (repeatable), matched after
+    /// `formatter.normalize_package_name` on both sides (FR-005).
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub package: Vec<String>,
+
+    /// Targets only OSV-`Vulnerable` dependencies, via `recommended_fix()` rather than
+    /// `latest`; overrides every `[update].ignore` rule (FR-008 through FR-015). For a
+    /// registry that does not report yank status at all, the yank check is inert for that
+    /// ecosystem — a documented limitation (FR-013), not a bug: such a dependency can still
+    /// be classified `applied` even though its yanked status was never actually checked.
+    #[arg(long)]
+    pub security_only: bool,
+
+    /// Plans and reports without writing the manifest.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = UpdateOutputFormat::Table)]
+    pub format: UpdateOutputFormat,
+
+    /// Path to a `deps.toml` config file — the only way `[update].ignore` rules are loaded
+    /// (FR-007: `update` never auto-discovers a `deps.toml`).
+    #[arg(long)]
+    pub config: Option<PathBuf>,
+
+    /// Serve only already-cached registry data; never make a new outbound request.
+    #[arg(long)]
+    pub offline: bool,
+
+    /// Overrides `freshness.cooldown_secs` for this run. Accepts a bare number of seconds
+    /// or a suffixed duration (`30m`, `12h`, `3d`). No effect under `--security-only`
+    /// (FR-014).
+    #[arg(long, value_parser = parse_cooldown)]
+    pub cooldown: Option<u64>,
 }
 
 /// Parses a `--cooldown` value into a clamped second count.
@@ -212,14 +283,18 @@ mod tests {
     #[test]
     fn test_walk_paths_defaults_to_current_directory() {
         let cli = Cli::parse_from(["deps-cli", "check"]);
-        let Command::Check(args) = cli.command;
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
         assert_eq!(args.walk_paths(), vec![PathBuf::from(".")]);
     }
 
     #[test]
     fn test_walk_paths_keeps_explicit_paths() {
         let cli = Cli::parse_from(["deps-cli", "check", "a/Cargo.toml", "b/package.json"]);
-        let Command::Check(args) = cli.command;
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
         assert_eq!(
             args.walk_paths(),
             vec![
@@ -232,14 +307,18 @@ mod tests {
     #[test]
     fn test_fail_on_parses_valid_category_list() {
         let cli = Cli::parse_from(["deps-cli", "check", "--fail-on", "vulnerable,license"]);
-        let Command::Check(args) = cli.command;
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
         assert_eq!(args.fail_on, vec![Category::Vulnerable, Category::License]);
     }
 
     #[test]
     fn test_fail_on_mutable_ref_token_matches_fr009() {
         let cli = Cli::parse_from(["deps-cli", "check", "--fail-on", "mutable-ref"]);
-        let Command::Check(args) = cli.command;
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
         assert_eq!(args.fail_on, vec![Category::MutableRefPin]);
     }
 
@@ -252,21 +331,27 @@ mod tests {
     #[test]
     fn test_format_defaults_to_table() {
         let cli = Cli::parse_from(["deps-cli", "check"]);
-        let Command::Check(args) = cli.command;
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
         assert_eq!(args.format, OutputFormat::Table);
     }
 
     #[test]
     fn test_format_json_parses() {
         let cli = Cli::parse_from(["deps-cli", "check", "--format", "json"]);
-        let Command::Check(args) = cli.command;
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
         assert_eq!(args.format, OutputFormat::Json);
     }
 
     #[test]
     fn test_format_sarif_parses() {
         let cli = Cli::parse_from(["deps-cli", "check", "--format", "sarif"]);
-        let Command::Check(args) = cli.command;
+        let Command::Check(args) = cli.command else {
+            unreachable!()
+        };
         assert_eq!(args.format, OutputFormat::Sarif);
     }
 
@@ -300,5 +385,99 @@ mod tests {
     #[test]
     fn test_parse_cooldown_rejects_non_numeric() {
         assert!(parse_cooldown("abc").is_err());
+    }
+
+    // --- Command::Update (spec 068, T008) ---
+
+    #[test]
+    fn test_update_no_flags_parses_and_reaches_command_update() {
+        let cli = Cli::parse_from(["deps-cli", "update", "Cargo.toml"]);
+        let Command::Update(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.manifest, PathBuf::from("Cargo.toml"));
+        assert!(args.package.is_empty());
+        assert!(!args.security_only);
+        assert!(!args.dry_run);
+        assert_eq!(args.format, UpdateOutputFormat::Table);
+        assert!(args.config.is_none());
+        assert!(!args.offline);
+        assert!(args.cooldown.is_none());
+    }
+
+    #[test]
+    fn test_update_repeatable_package_flag() {
+        let cli = Cli::parse_from([
+            "deps-cli",
+            "update",
+            "--package",
+            "serde",
+            "--package",
+            "tokio",
+            "Cargo.toml",
+        ]);
+        let Command::Update(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.package, vec!["serde".to_string(), "tokio".to_string()]);
+    }
+
+    #[test]
+    fn test_update_security_only_and_dry_run_flags() {
+        let cli = Cli::parse_from([
+            "deps-cli",
+            "update",
+            "--security-only",
+            "--dry-run",
+            "Cargo.toml",
+        ]);
+        let Command::Update(args) = cli.command else {
+            unreachable!()
+        };
+        assert!(args.security_only);
+        assert!(args.dry_run);
+    }
+
+    #[test]
+    fn test_update_config_offline_cooldown_flags() {
+        let cli = Cli::parse_from([
+            "deps-cli",
+            "update",
+            "--config",
+            "deps.toml",
+            "--offline",
+            "--cooldown",
+            "1h",
+            "Cargo.toml",
+        ]);
+        let Command::Update(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.config, Some(PathBuf::from("deps.toml")));
+        assert!(args.offline);
+        assert_eq!(args.cooldown, Some(3_600));
+    }
+
+    #[test]
+    fn test_update_requires_a_manifest_argument() {
+        let result = Cli::try_parse_from(["deps-cli", "update"]);
+        assert!(result.is_err());
+    }
+
+    /// `update` has no SARIF concept — `--format sarif` must be rejected at parse time, not
+    /// accepted and rejected later at runtime.
+    #[test]
+    fn test_update_format_sarif_is_rejected_at_parse_time() {
+        let result = Cli::try_parse_from(["deps-cli", "update", "--format", "sarif", "Cargo.toml"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_update_format_json_parses() {
+        let cli = Cli::parse_from(["deps-cli", "update", "--format", "json", "Cargo.toml"]);
+        let Command::Update(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.format, UpdateOutputFormat::Json);
     }
 }

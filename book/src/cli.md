@@ -81,8 +81,8 @@ deps-cli check --cooldown 3d
 deps-cli check --config ./ci/deps-strict.toml
 ```
 
-`check` is currently the only subcommand. Paths default to the current directory when
-none are given.
+`check` and `update` (see [`update` usage](#update-usage) below) are the two `deps-cli`
+subcommands. Paths default to the current directory when none are given to `check`.
 
 ### Output formats
 
@@ -212,6 +212,119 @@ only.
 > ignored this way is named in a warning on stderr. Only a config path given explicitly via
 > `--config` — the operator's own choice, not the scanned repository's — is trusted in
 > full.
+
+## `update` usage
+
+`deps-cli update <MANIFEST>` reads exactly one manifest, plans a set of version-requirement
+edits, and writes them back atomically — the non-interactive counterpart to `deps-lsp`'s
+"update all outdated" code lens and per-dependency vulnerability-fix quick action.
+
+```bash
+# Update every outdated dependency in Cargo.toml
+deps-cli update Cargo.toml
+
+# Only serde, even if other dependencies are also outdated
+deps-cli update --package serde Cargo.toml
+
+# Plan without writing, and inspect the machine-readable plan
+deps-cli update --dry-run --format json Cargo.toml
+
+# Only OSV-Vulnerable dependencies, via their recommended fix (never plain "latest")
+deps-cli update --security-only Cargo.toml
+
+# Ignore rules only take effect from an explicit --config — see below
+deps-cli update --config deps.toml Cargo.toml
+```
+
+`<MANIFEST>` must resolve to exactly one manifest a registered ecosystem recognizes — a
+directory, a shell-glob expansion to more than one path, or an unrecognized file is an
+execution error (exit `2`). `update` never walks a tree the way `check` does, so it has no
+`--respect-gitignore`/`--follow-symlinks` flags: an explicitly named path is already an
+explicit choice.
+
+### Default mode vs. `--security-only`
+
+- **Default mode** targets every dependency `check` would report `outdated`, rewriting its
+  declared requirement to the latest matching version.
+- **`--security-only`** targets only dependencies OSV reports vulnerable, rewriting to the
+  advisory's own recommended fix (never a plain "latest" pick), and independently
+  re-verifies that fix against OSV before writing it. Every vulnerable dependency is
+  classified into exactly one of three outcomes:
+  - `applied` — the fix was written.
+  - `requires-lockfile-update` — the declared requirement already admits the fix, so there
+    is nothing to rewrite at the manifest level; a lock-file regeneration step (tracked by
+    [#1116](https://github.com/bug-ops/deps-lsp/issues/1116), not yet implemented) is
+    needed to actually pull the fixed version in. `update` does not regenerate lock files
+    itself.
+  - `unfixable` — no independently-verified fix target exists, the registry fetch for that
+    dependency failed, or the fix target is itself yanked.
+
+  For a registry that does not report yank status at all, the yank check is inert for that
+  ecosystem (a documented limitation, not a bug) — such a dependency can still be classified
+  `applied` even though its yanked status was never actually checked.
+
+  `--cooldown` (and a `[freshness]` cooldown sourced from `--config`) has no effect under
+  `--security-only`: the fix target comes from the advisory, never the freshness-filtered
+  registry pick.
+
+### `[update].ignore` (only via `--config`)
+
+```toml
+[update]
+ignore = [
+  { name = "tokio", update_types = ["major"] },  # skip only major bumps
+  { name = "legacy-thing" },                     # skip every update, including unclassifiable ones
+]
+```
+
+`update_types` is one or more of `major`/`minor`/`patch`; omitting it skips every kind for
+that dependency, including one `update` cannot classify at all (a GitHub Actions SHA pin, a
+Go pseudo-version, a Maven/NuGet range, `*`/`latest`/`workspace:*`, ...) — an unclassifiable
+update is always treated as if it met a scoped rule's threshold too, never silently let
+through. Names are matched exactly (after normalization), not by wildcard.
+
+**`[update].ignore` is honored only when loaded from an explicit `--config <path>`** —
+`update` never auto-discovers a default-location `deps.toml` at all (unlike `check`), so
+without `--config` no ignore rule is ever loaded. `--security-only` overrides every ignore
+rule outright (never silently applies one) — a security fix is never held back by a routine
+maintenance preference, and the plan reports when a rule was overridden rather than applying
+it quietly.
+
+Unlike Dependabot's `ignore` (which can retarget a blocked update to the highest version its
+own rule still allows), a matching `[update].ignore` rule here skips the dependency entirely
+for this run — it is reported `skipped (ignore-rule)` with no edit written at all, never
+rewritten to some lesser version.
+
+### Write safety and exit codes
+
+Writes are atomic: a temp file is created in the manifest's own directory
+(`O_CREAT|O_EXCL`), permissions are copied from the original before any content is written
+(Unix only), the content is fsynced, then renamed over the original. A manifest path whose
+final component is itself a symlink is refused before any temp file is created. The manifest
+is re-read and byte-compared against the content the plan was computed against immediately
+before writing; a mismatch (something else modified the file in the meantime) aborts without
+writing.
+
+| Exit code | Meaning |
+|---|---|
+| `0` | Every selected update was applied, or nothing was eligible, or every non-applied item was a deliberate operator exclusion — an `[update].ignore` match or a `--package` exclusion |
+| `1` | At least one item the run *wanted* to fix but could not — an unsafe/unrecognized span, `requires-lockfile-update`, or `unfixable` |
+| `2` | Execution error — not a single recognized manifest, a registry required to classify the manifest was unreachable, a write/read failure, a symlinked manifest path (refused before any read, not just before the write), stale content detected before write, or `--security-only` combined with `network.offline`/vulnerability scanning disabled |
+
+An ignore rule or a `--package` exclusion is something the operator asked for, not a failure —
+it never turns an otherwise-clean run non-zero on its own.
+
+**A single unreachable dependency aborts the whole run.** Unlike `check`, which still reports
+its other findings alongside exit `2`, `update` treats any one dependency's registry fetch
+failure as reason to abort the entire plan before writing anything — a deliberate, stricter
+fail-closed choice, not a bug, since a plan built from partial registry data could otherwise
+recommend a version that isn't actually the latest.
+
+**A non-zero exit never implies the working tree is unmodified.** A mixed run (some items
+applied, others not) exits `1` with the applied edits already written to disk. A wrapper
+script deciding what to do with the result (e.g. whether to commit a diff) must inspect each
+item's `outcome` field in `--format json` output, never branch on the process exit code
+alone.
 
 ## Pre-commit hook
 

@@ -24,7 +24,7 @@
 //! `scripts/check-fs-probe-race.sh` after adding a new fs_probe-touching test in one of those
 //! six crates to catch a missing guard before it reaches CI's i686 cross-test leg (issue #806).
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 /// Shared upper bound on how many ancestor directories a config-file discovery walk
@@ -82,23 +82,10 @@ pub fn metadata(path: &Path) -> std::io::Result<std::fs::Metadata> {
     std::fs::metadata(path)
 }
 
-/// Counted, size-bounded wrapper around [`std::fs::File::open`] + [`Read::take`].
-///
-/// Reads at most `max_bytes + 1` bytes and returns `Ok(None)` if that read produced more than
-/// `max_bytes` — the one extra byte is what distinguishes "exactly `max_bytes` long" from
-/// "longer than `max_bytes`" without reading the whole (potentially huge) file. Unlike a
-/// `stat`-then-`read_to_string` sequence, this bound is enforced by the read call itself, so
-/// it holds even if the file grows, or is swapped via a symlink, between a caller's earlier
-/// `stat` and this call.
-///
-/// # Errors
-///
-/// Returns an error under the same conditions as [`std::fs::read_to_string`] — most commonly,
-/// `path` does not exist, is not accessible, or the bounded content is not valid UTF-8.
-pub fn read_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<Option<String>> {
-    #[cfg(any(test, feature = "test-util"))]
-    READ_COUNT.fetch_add(1, Ordering::Relaxed);
-    let file = std::fs::File::open(path)?;
+/// Reads at most `max_bytes + 1` bytes from an already-open `file` and returns `Ok(None)` if
+/// that read produced more than `max_bytes` — shared body for [`read_to_string_capped`] and
+/// [`read_to_string_capped_no_follow`], which differ only in how they obtain `file`.
+fn read_capped(file: std::fs::File, max_bytes: u64) -> std::io::Result<Option<String>> {
     let mut buf = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut buf)?;
@@ -108,6 +95,234 @@ pub fn read_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<Opt
     String::from_utf8(buf)
         .map(Some)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()))
+}
+
+/// Counted, size-bounded wrapper around [`std::fs::File::open`] + [`Read::take`].
+///
+/// Reads at most `max_bytes + 1` bytes and returns `Ok(None)` if that read produced more than
+/// `max_bytes` — the one extra byte is what distinguishes "exactly `max_bytes` long" from
+/// "longer than `max_bytes`" without reading the whole (potentially huge) file. Unlike a
+/// `stat`-then-`read_to_string` sequence, this bound is enforced by the read call itself, so
+/// it holds even if the file grows, or is swapped via a symlink, between a caller's earlier
+/// `stat` and this call.
+///
+/// This follows symlinks, matching [`std::fs::File::open`]'s own default — the right choice
+/// for every existing caller (ecosystem config-file discovery, `deps-lsp`'s
+/// `--follow-symlinks` mode), which read *through* an encountered symlink deliberately. A
+/// caller that must instead refuse a symlinked path outright wants
+/// [`read_to_string_capped_no_follow`].
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`std::fs::read_to_string`] — most commonly,
+/// `path` does not exist, is not accessible, or the bounded content is not valid UTF-8.
+pub fn read_to_string_capped(path: &Path, max_bytes: u64) -> std::io::Result<Option<String>> {
+    #[cfg(any(test, feature = "test-util"))]
+    READ_COUNT.fetch_add(1, Ordering::Relaxed);
+    let file = std::fs::File::open(path)?;
+    read_capped(file, max_bytes)
+}
+
+/// Like [`read_to_string_capped`], but refuses to read through a symlinked `path`.
+///
+/// The single call that opens `path` is itself given the `O_NOFOLLOW` flag, so there is no
+/// gap between checking for a symlink and reading through it (code review finding 2, #1329: a
+/// separate `symlink_metadata` check followed by a plain, symlink-following open left a
+/// check-then-open TOCTOU race — an attacker with write access to the manifest's directory
+/// could swap in a symlink between the two calls).
+///
+/// On Linux and macOS (the two Unix platforms this project's CI actually builds and tests
+/// against), the kernel enforces this atomically via `O_NOFOLLOW` on the `open(2)` call — a
+/// symlinked `path` fails the open outright, with no content ever read either way; this
+/// function then classifies that failure into the distinct, well-worded error described
+/// below rather than a generic read failure. On every other platform (Windows, and any
+/// untested Unix flavor), std exposes no portable `O_NOFOLLOW` equivalent, so this falls back
+/// to a `symlink_metadata` check immediately before the open — not atomic, but narrows the
+/// window to the two syscalls happening back to back with no attacker-controlled work between
+/// them, rather than leaving it open across this function's entire caller-side read path.
+///
+/// # Errors
+///
+/// Returns an error under the same conditions as [`read_to_string_capped`], plus
+/// [`std::io::ErrorKind::InvalidInput`] (matching [`write_atomic`]'s own symlink-refusal
+/// error kind) when `path`'s final component is a symlink.
+pub fn read_to_string_capped_no_follow(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<Option<String>> {
+    #[cfg(any(test, feature = "test-util"))]
+    READ_COUNT.fetch_add(1, Ordering::Relaxed);
+    let file = open_no_follow(path)?;
+    read_capped(file, max_bytes)
+}
+
+/// `std::io::ErrorKind::FilesystemLoop` (the semantically exact kind for this) is still an
+/// unstable library feature (`io_error_more`, rust-lang/rust#86442) — `InvalidInput` is the
+/// stable kind [`write_atomic`]'s own symlink refusal already uses, so this matches that
+/// existing convention instead of introducing a second, inconsistent error shape.
+fn symlink_refused_error(path: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "refusing to read through a symlinked path: {}",
+            path.display()
+        ),
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    // Kernel ABI constants for `O_NOFOLLOW`, not exposed by `std` — stable across every libc
+    // on each OS (glibc, musl, and macOS's libSystem alike), so one constant per `target_os`
+    // covers every CI target that OS builds (including the musl cross-compile legs).
+    #[cfg(target_os = "linux")]
+    const O_NOFOLLOW: i32 = 0o400_000;
+    #[cfg(target_os = "macos")]
+    const O_NOFOLLOW: i32 = 0x0100;
+
+    // The `O_NOFOLLOW` open itself is the atomic, race-free enforcement — it fails (ELOOP) if
+    // `path`'s final component is a symlink, with no window between checking and opening. The
+    // `symlink_metadata` call below runs only *after* that open already failed, purely to
+    // classify the error into a specific, well-worded message; it is not security-load-bearing
+    // (by this point nothing has been read either way) and cannot reintroduce the race this
+    // function exists to close.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| {
+            if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+                symlink_refused_error(path)
+            } else {
+                error
+            }
+        })
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(symlink_refused_error(path));
+    }
+    std::fs::File::open(path)
+}
+
+/// Atomically writes `content` to `path` (issue #1329, `deps-cli update`'s write path).
+///
+/// Refuses to write when `path`'s final path component is itself a symlink — checked via
+/// [`std::fs::symlink_metadata`] before any temp file is created, so neither the symlink nor
+/// its target is ever touched. Otherwise creates a temp file in `path`'s own directory via
+/// `OpenOptions::create_new(true)` (`O_CREAT|O_EXCL`, closing the classic
+/// symlink-pre-creation race by open-mode rather than by name unpredictability — anything,
+/// including a dangling symlink, already at the temp path makes this call fail with
+/// `AlreadyExists`). On Unix, the temp file is created directly at mode `0600` (via
+/// `OpenOptionsExt::mode`), **not** the default `0644`-under-typical-umask a bare
+/// `create_new` would produce — the temp path is a predictable, guessable name
+/// (`{name}.deps-cli-{pid}-{nanos}.tmp`), and a window where it is world-readable under any
+/// default mode would let another local user on the same host read the content before this
+/// function ever gets to widen the permissions back. `path`'s original permissions are then
+/// copied onto the **open temp handle** before writing any content, widening `0600` back to
+/// the original's actual mode (e.g. `0644`) if that was ever narrower than the default. The
+/// content is written and `sync_all`ed, then [`std::fs::rename`]d over `path`. On non-Unix
+/// platforms the permission-copy step is skipped entirely (no Unix mode bits exist to copy)
+/// — the destination directory's inherited ACL governs the renamed file instead. The temp
+/// file is removed on every error path before returning.
+///
+/// **Accepted limitations**: `sync_all` covers only the temp file's own content durability,
+/// not the `rename`'s directory-entry durability — that would additionally need the parent
+/// directory itself fsynced, which this function does not do. This function alone does not
+/// close the write-time TOCTOU window either: callers that need to detect a concurrent
+/// modification between planning and writing must re-read and byte-compare the original
+/// content themselves before calling this function (`rename(2)` has no compare-and-swap
+/// primitive). `fs::rename`'s positive property — a target-side symlink is *replaced*, not
+/// followed — is relied on deliberately here; do not "simplify" this to `fs::write`. A
+/// pre-created file already sitting at the generated temp path makes `create_new` fail
+/// outright (never silently overwritten) — this also means an attacker who can predict a
+/// future invocation's `pid`/timestamp and pre-creates that exact path can wedge that one
+/// `update` run; accepted, since the attacker already needs write access to the manifest's
+/// own directory to do so, at which point tampering with the manifest directly is simpler.
+///
+/// # Errors
+///
+/// Returns an error if `path`'s final path component is a symlink, if the temp file cannot
+/// be created (including because something already exists at the generated temp path) or
+/// written, or if the rename fails.
+pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to write through a symlinked manifest path: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "manifest path has no file name",
+        )
+    })?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let tmp_path = dir.join(format!(
+        "{}.deps-cli-{}-{nanos}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+    ));
+
+    let mut open_options = std::fs::OpenOptions::new();
+    open_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Created narrow (0600), then widened to the original file's actual mode below —
+        // never briefly world-readable at the default `0644`-under-typical-umask a bare
+        // `create_new` would produce.
+        open_options.mode(0o600);
+    }
+    let mut file = open_options.open(&tmp_path)?;
+
+    let write_result = write_atomic_content(&mut file, path, content);
+    drop(file);
+
+    match write_result {
+        Ok(()) => {
+            if let Err(error) = std::fs::rename(&tmp_path, path) {
+                let _ = std::fs::remove_file(&tmp_path);
+                Err(error)
+            } else {
+                Ok(())
+            }
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            Err(error)
+        }
+    }
+}
+
+/// [`write_atomic`]'s permission-copy-then-write step, split out so the temp-handle
+/// permission set always happens before any content byte is written.
+fn write_atomic_content(
+    file: &mut std::fs::File,
+    original_path: &Path,
+    content: &str,
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Ok(original_meta) = std::fs::metadata(original_path) {
+        file.set_permissions(original_meta.permissions())?;
+    }
+    #[cfg(not(unix))]
+    let _ = original_path;
+
+    file.write_all(content.as_bytes())?;
+    file.sync_all()
 }
 
 /// Whether `path` exists and is a regular file — `false` on any error, including a missing
@@ -301,5 +516,211 @@ mod tests {
         // guard is needed here.
         let _guard = snapshot_guard();
         assert!(read_to_string_capped(Path::new("/nonexistent/path/file.txt"), 1024).is_err());
+    }
+
+    #[test]
+    fn write_atomic_replaces_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, "old content").unwrap();
+
+        write_atomic(&path, "new content").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new content");
+        // No stray temp file left behind after a successful write.
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name() != "Cargo.toml")
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "temp file must be renamed away, not left behind"
+        );
+    }
+
+    #[test]
+    fn write_atomic_creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+
+        write_atomic(&path, "content").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "content");
+    }
+
+    #[test]
+    fn read_to_string_capped_no_follow_reads_a_plain_file() {
+        // See the comment in `read_to_string_capped_returns_content_under_cap` on why this
+        // guard is needed here — this function increments the same `READ_COUNT`.
+        let _guard = snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, "content").unwrap();
+
+        assert_eq!(
+            read_to_string_capped_no_follow(&path, 1000).unwrap(),
+            Some("content".to_string())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_to_string_capped_no_follow_refuses_a_symlinked_path() {
+        use std::os::unix::fs::symlink;
+
+        let _guard = snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "real content").unwrap();
+        let link = dir.path().join("Cargo.toml");
+        symlink(&target, &link).unwrap();
+
+        let result = read_to_string_capped_no_follow(&link, 1000);
+
+        assert!(result.is_err(), "a symlinked path must be refused");
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_refuses_symlinked_manifest_path() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.toml");
+        std::fs::write(&target, "real content").unwrap();
+        let link = dir.path().join("Cargo.toml");
+        symlink(&target, &link).unwrap();
+
+        let result = write_atomic(&link, "attacker content");
+
+        assert!(result.is_err(), "a symlinked manifest path must be refused");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "real content");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be left untouched"
+        );
+        // No temp file created before the refusal.
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let name = entry.file_name();
+                name != "real.toml" && name != "Cargo.toml"
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no temp file must be created before refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_unix_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, "old content").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        write_atomic(&path, "new content").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the original file's mode must survive the atomic rewrite"
+        );
+    }
+
+    /// Security-S1 regression: the temp file must never be created at a mode wider than the
+    /// original's — this test uses an original mode *wider* than the temp file's initial
+    /// `0600` (`0644`) to prove the permission-copy step still widens back out correctly
+    /// (not permanently stuck at `0600`), while the create-time mode itself (verified by
+    /// inspection, not by this test — see the doc comment) is never `0644`-by-default.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_widens_permissions_when_original_is_wider_than_temp_default() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, "old content").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_atomic(&path, "new content").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "the original file's wider mode must be restored, not left at the temp file's \
+             narrower creation-time mode"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_original_content_untouched_on_temp_create_failure() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(&path, "original content").unwrap();
+        // Make the directory read-only so `OpenOptions::create_new` cannot create the temp
+        // file at all — a portable failure injection for "the temp file could not be
+        // created", proving the original manifest is never touched in that case.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let result = write_atomic(&path, "new content");
+
+        // Restore permissions so the tempdir can be cleaned up.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "original content");
+    }
+
+    /// FR-018: the positive property `write_atomic`'s write-time TOCTOU window relies on —
+    /// `fs::rename`'s target-side symlink is *replaced*, not followed. Exercised directly
+    /// against `std::fs::rename` (not through `write_atomic`, which refuses upfront whenever
+    /// `path` is already a symlink at call time — see
+    /// `write_atomic_refuses_symlinked_manifest_path`) since this is an OS-level guarantee
+    /// the accepted TOCTOU window relies on, not a check this crate performs itself. A future
+    /// "simplification" to `fs::write` would silently lose this property.
+    #[cfg(unix)]
+    #[test]
+    fn fs_rename_replaces_a_target_side_symlink_rather_than_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_target = dir.path().join("real_target.txt");
+        std::fs::write(&real_target, "target content").unwrap();
+        let symlink_path = dir.path().join("symlink.txt");
+        std::os::unix::fs::symlink(&real_target, &symlink_path).unwrap();
+
+        let new_path = dir.path().join("new_content.txt");
+        std::fs::write(&new_path, "new content").unwrap();
+
+        std::fs::rename(&new_path, &symlink_path).unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&symlink_path)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the symlink itself must be replaced by a regular file"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&symlink_path).unwrap(),
+            "new content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&real_target).unwrap(),
+            "target content",
+            "the symlink's original target must never be written through"
+        );
     }
 }

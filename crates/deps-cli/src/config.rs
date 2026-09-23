@@ -31,6 +31,98 @@ pub struct CliConfig {
     /// network, license_policy).
     #[serde(flatten)]
     pub policy: PolicyConfig,
+    /// The `[update]` section (#1119) — `deps-cli update`'s ignore rules. Honored only when
+    /// loaded from an explicit `--config <path>`; never auto-discovered (FR-007) —
+    /// [`safe_auto_discovered_config`] drops it by omission for the `check` auto-discovery
+    /// path.
+    #[serde(default)]
+    pub update: UpdateConfig,
+}
+
+/// The `[update]` config section (#1119): `deps-cli update`'s ignore rules.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::config::UpdateConfig;
+///
+/// assert!(UpdateConfig::default().ignore.is_empty());
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Deserialize, Default, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    /// Dependencies (optionally scoped by update kind) `deps-cli update`'s default mode
+    /// should skip.
+    #[serde(default)]
+    pub ignore: Vec<IgnoreRule>,
+}
+
+/// One `[update].ignore` entry: a dependency name, optionally scoped to specific update
+/// kinds.
+///
+/// `#[non_exhaustive]`: constructed only via deserialization (a future field addition should
+/// not force every construction site to update).
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::config::IgnoreRule;
+///
+/// let rule: IgnoreRule = serde_json::from_str(r#"{"name": "tokio"}"#).unwrap();
+/// assert_eq!(rule.name, "tokio");
+/// assert_eq!(rule.update_types, None);
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct IgnoreRule {
+    /// The dependency name this rule matches, after
+    /// [`deps_core::lsp_helpers::PackageNaming::normalize_package_name`] is applied to both
+    /// sides (FR-006).
+    pub name: String,
+    /// The update kinds this rule matches. `None` matches every kind, including
+    /// [`deps_core::edit::UpdateKind::Unknown`]; `Some(kinds)` matches the listed kinds
+    /// **and** `Unknown` (fail-closed — FR-006: a rule that cannot confirm an update is
+    /// below its stated threshold treats it as if it met the threshold).
+    #[serde(default)]
+    pub update_types: Option<Vec<UpdateTypeToken>>,
+}
+
+/// One `update_types` token in an `[update].ignore` entry.
+#[non_exhaustive]
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateTypeToken {
+    /// Matches [`deps_core::edit::UpdateKind::Major`].
+    Major,
+    /// Matches [`deps_core::edit::UpdateKind::Minor`].
+    Minor,
+    /// Matches [`deps_core::edit::UpdateKind::Patch`].
+    Patch,
+}
+
+impl UpdateTypeToken {
+    /// Whether this token matches `kind`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cli::config::UpdateTypeToken;
+    /// use deps_core::edit::UpdateKind;
+    ///
+    /// assert!(UpdateTypeToken::Major.matches(UpdateKind::Major));
+    /// assert!(!UpdateTypeToken::Major.matches(UpdateKind::Minor));
+    /// ```
+    #[must_use]
+    pub fn matches(self, kind: deps_core::edit::UpdateKind) -> bool {
+        matches!(
+            (self, kind),
+            (Self::Major, deps_core::edit::UpdateKind::Major)
+                | (Self::Minor, deps_core::edit::UpdateKind::Minor)
+                | (Self::Patch, deps_core::edit::UpdateKind::Patch)
+        )
+    }
 }
 
 /// Error loading or parsing a `deps.toml` file.
@@ -113,7 +205,7 @@ pub enum ConfigError {
 ///   touching a secret. A PR from a fork can introduce a vulnerable dependency *and* edit
 ///   `deps.toml` in the same PR to turn off the check that would have caught it.
 ///
-/// [`safe_auto_discovered_policy`] applies to an auto-discovered file only; an explicitly-given
+/// [`safe_auto_discovered_config`] applies to an auto-discovered file only; an explicitly-given
 /// `--config` *is* the operator's own choice and is trusted as written.
 ///
 /// # Errors
@@ -135,59 +227,71 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
         Err(source) => return Err(ConfigError::Io { path, source }),
     };
 
-    let mut config = parse(&content, &path)?;
+    let config = parse(&content, &path)?;
     if !required {
         for section in ignored_sections(&config.policy) {
             eprintln!(
-                "deps-cli: warning: {path}'s [{section}] section was auto-discovered, not given via --config, and is ignored — see `deps_cli::config::safe_auto_discovered_policy`'s doc for why",
+                "deps-cli: warning: {path}'s [{section}] section was auto-discovered, not given via --config, and is ignored — see `deps_cli::config::safe_auto_discovered_config`'s doc for why",
                 path = crate::sanitize::sanitize_path_for_display(&path).display(),
             );
         }
-        config.policy = safe_auto_discovered_policy(config.policy);
+        return Ok(safe_auto_discovered_config(config));
     }
     Ok(config)
 }
 
-/// Reduces a policy loaded from an *auto-discovered* `deps.toml` to only the fields that
-/// cannot weaken what `--fail-on` observes (spec 062 review, F1 follow-up).
+/// Reduces a [`CliConfig`] loaded from an *auto-discovered* `deps.toml` to only the fields
+/// that cannot weaken what `--fail-on` observes (spec 062 review, F1 follow-up).
+///
+/// Widened one level from a `PolicyConfig`-only allowlist (#1329) so a `CliConfig` field
+/// added later (like [`CliConfig::update`]) is safe-by-default under auto-discovery rather
+/// than attacker-controlled by default, without needing its own explicit reset.
 ///
 /// Built as an **allowlist** (what to *keep* from `parsed`) rather than a blocklist (what to
 /// reset), deliberately: F1's first fix reset only `registries` and was proven, in the very
 /// next review round, to have missed `diagnostics.*_enabled` and `network.offline` — an
 /// enumerate-the-dangerous-fields approach already failed once on this exact code path. An
-/// allowlist fails closed instead: a `PolicyConfig` field added later defaults to
-/// `PolicyConfig::default()`'s (safe) value here automatically, rather than silently staying
-/// attacker-controlled until someone notices and adds it to a reset list.
+/// allowlist fails closed instead: a field added later defaults to `CliConfig::default`'s
+/// (safe) value here automatically, rather than silently staying attacker-controlled until
+/// someone notices and adds it to a reset list.
 ///
-/// The only fields kept from `parsed`: `diagnostics`'s six `*_severity` values. These are
-/// purely cosmetic (`table`/`json` severity display) — [`crate::report::FailOnPolicy::matches`]
-/// checks a finding's `Category`, never its severity, so no severity value can suppress or
-/// weaken a `--fail-on` match. Everything else reverts to [`PolicyConfig::default`]:
-/// `diagnostics.{mutable_ref_pin,vulnerabilities}_enabled` (the two direct "disable the
-/// check" levers), `cache.*` (a low `fetch_timeout_secs` can induce spurious fetch failures
-/// that mask a real finding as an unresolved lookup instead), `freshness.*` and
-/// `license_policy.{allow,deny}` (both change what counts as a violation),
-/// `supply_chain.enabled` (moot for `deps-cli` today — `VersionData.trust` is hover-only and
-/// never set here — reset anyway for uniformity), `network.offline` (F1-follow-up: silently
-/// suppresses every registry/OSV-derived finding), and `registries.*` (F1).
+/// The only fields kept from `parsed`: `policy.diagnostics`'s six `*_severity` values. These
+/// are purely cosmetic (`table`/`json` severity display) —
+/// [`crate::report::FailOnPolicy::matches`] checks a finding's `Category`, never its
+/// severity, so no severity value can suppress or weaken a `--fail-on` match. Everything else
+/// reverts to its default: `policy.diagnostics.{mutable_ref_pin,vulnerabilities}_enabled`
+/// (the two direct "disable the check" levers), `policy.cache.*` (a low `fetch_timeout_secs`
+/// can induce spurious fetch failures that mask a real finding as an unresolved lookup
+/// instead), `policy.freshness.*` and `policy.license_policy.{allow,deny}` (both change what
+/// counts as a violation), `policy.supply_chain.enabled` (moot for `deps-cli` today —
+/// `VersionData.trust` is hover-only and never set here — reset anyway for uniformity),
+/// `policy.network.offline` (F1-follow-up: silently suppresses every registry/OSV-derived
+/// finding), `policy.registries.*` (F1), and `update.ignore` (FR-007 — provably a no-op
+/// regardless: `update` never auto-discovers a config at all, so `check`'s own auto-discovery
+/// path — the only caller of this function — never renders `[update].ignore` in the first
+/// place; dropped here anyway so the allowlist stays the single source of truth for what an
+/// auto-discovered file can influence).
 #[must_use]
-pub fn safe_auto_discovered_policy(parsed: PolicyConfig) -> PolicyConfig {
-    PolicyConfig {
-        diagnostics: DiagnosticsConfig::new()
-            .with_outdated_severity(parsed.diagnostics.outdated_severity)
-            .with_unknown_severity(parsed.diagnostics.unknown_severity)
-            .with_yanked_severity(parsed.diagnostics.yanked_severity)
-            .with_unsatisfiable_severity(parsed.diagnostics.unsatisfiable_severity)
-            .with_deprecated_severity(parsed.diagnostics.deprecated_severity)
-            .with_mutable_ref_pin_severity(parsed.diagnostics.mutable_ref_pin_severity),
-        ..PolicyConfig::default()
+pub fn safe_auto_discovered_config(parsed: CliConfig) -> CliConfig {
+    CliConfig {
+        policy: PolicyConfig {
+            diagnostics: DiagnosticsConfig::new()
+                .with_outdated_severity(parsed.policy.diagnostics.outdated_severity)
+                .with_unknown_severity(parsed.policy.diagnostics.unknown_severity)
+                .with_yanked_severity(parsed.policy.diagnostics.yanked_severity)
+                .with_unsatisfiable_severity(parsed.policy.diagnostics.unsatisfiable_severity)
+                .with_deprecated_severity(parsed.policy.diagnostics.deprecated_severity)
+                .with_mutable_ref_pin_severity(parsed.policy.diagnostics.mutable_ref_pin_severity),
+            ..PolicyConfig::default()
+        },
+        ..CliConfig::default()
     }
 }
 
 /// Names every section of `policy` that differs from [`PolicyConfig::default`] outside the
 /// always-kept severity fields — used only to print a specific, per-section warning when
 /// [`load`] ignores an auto-discovered file's non-cosmetic settings, so this is visible in CI
-/// logs even if a future `PolicyConfig` field is missed by [`safe_auto_discovered_policy`]'s
+/// logs even if a future `PolicyConfig` field is missed by [`safe_auto_discovered_config`]'s
 /// allowlist (same "defense in depth" spirit as `report.rs`'s diagnostic-code-list doc).
 fn ignored_sections(policy: &PolicyConfig) -> Vec<&'static str> {
     let default = PolicyConfig::default();
@@ -443,7 +547,7 @@ b = 2
     /// given `default_dir` (the walked root), not the process's own CWD.
     ///
     /// Uses a severity field as the signal (not `network.offline` — that's one of the
-    /// fields `safe_auto_discovered_policy` now resets, see the F1-follow-up tests below;
+    /// fields `safe_auto_discovered_config` now resets, see the F1-follow-up tests below;
     /// a severity value is always kept, so it stays a valid probe for *which file* was
     /// actually read).
     #[test]
@@ -631,5 +735,81 @@ b = 2
         base.policy.freshness.cooldown_secs = 999;
         let config = apply_overrides(base, false, None);
         assert_eq!(config.policy.freshness.cooldown_secs, 999);
+    }
+
+    // --- [update] section (#1119, T006) ---
+
+    #[test]
+    fn test_load_auto_discovered_update_ignore_is_dropped() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(
+            dir.path().join(DEFAULT_CONFIG_FILENAME),
+            r#"
+            [diagnostics]
+            yanked_severity = 4
+
+            [[update.ignore]]
+            name = "tokio"
+            update_types = ["major"]
+            "#,
+        )
+        .expect("write deps.toml");
+        let config = load(None, dir.path()).expect("auto-discovered file must still load");
+        assert!(
+            config.update.ignore.is_empty(),
+            "an auto-discovered [update].ignore must never take effect"
+        );
+        // The allowlisted severity field must still survive, proving the whole file wasn't
+        // silently dropped.
+        assert_eq!(
+            config.policy.diagnostics.yanked_severity,
+            deps_core::diagnostic::Severity::Hint
+        );
+    }
+
+    #[test]
+    fn test_load_explicit_config_update_ignore_is_trusted_verbatim() {
+        let file = write_temp_toml(
+            r#"
+            [[update.ignore]]
+            name = "tokio"
+            update_types = ["major"]
+
+            [[update.ignore]]
+            name = "legacy-thing"
+            "#,
+        );
+        let config = load(Some(file.path()), Path::new("."))
+            .expect("explicit --config must load [update].ignore verbatim");
+        assert_eq!(config.update.ignore.len(), 2);
+        assert_eq!(config.update.ignore[0].name, "tokio");
+        assert_eq!(
+            config.update.ignore[0].update_types,
+            Some(vec![UpdateTypeToken::Major])
+        );
+        assert_eq!(config.update.ignore[1].name, "legacy-thing");
+        assert_eq!(config.update.ignore[1].update_types, None);
+    }
+
+    #[test]
+    fn test_load_update_ignore_unrecognized_update_types_token_is_a_hard_error() {
+        let file = write_temp_toml(
+            r#"
+            [[update.ignore]]
+            name = "tokio"
+            update_types = ["unknown"]
+            "#,
+        );
+        let result = load(Some(file.path()), Path::new("."));
+        assert!(matches!(result, Err(ConfigError::Deserialize { .. })));
+    }
+
+    #[test]
+    fn test_update_type_token_matches_only_its_own_kind() {
+        assert!(UpdateTypeToken::Major.matches(deps_core::edit::UpdateKind::Major));
+        assert!(!UpdateTypeToken::Major.matches(deps_core::edit::UpdateKind::Minor));
+        assert!(!UpdateTypeToken::Major.matches(deps_core::edit::UpdateKind::Unknown));
+        assert!(UpdateTypeToken::Minor.matches(deps_core::edit::UpdateKind::Minor));
+        assert!(UpdateTypeToken::Patch.matches(deps_core::edit::UpdateKind::Patch));
     }
 }

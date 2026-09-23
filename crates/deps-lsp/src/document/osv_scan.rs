@@ -113,10 +113,8 @@ pub(crate) async fn run_osv_scan_phase_a(
         return None;
     }
 
-    let osv_name_by_key: HashMap<String, String> = targets
-        .iter()
-        .map(|t| (t.key.clone(), t.osv_name.clone()))
-        .collect();
+    let osv_name_by_key: HashMap<String, String> =
+        deps_engine::classify::osv::osv_name_by_key(&targets);
 
     if !targets.is_empty() {
         let timeout_duration =

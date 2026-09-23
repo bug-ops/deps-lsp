@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
-use crate::osv::{ScanOutcome, UpgradeStatus};
-use crate::{ConcreteVersion, Dependency, ParseResult, Registry, VersionReq};
+use crate::osv::ScanOutcome;
+use crate::{Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE,
@@ -28,61 +28,10 @@ struct VulnerabilityFixAction {
     action: CodeAction,
 }
 
-/// Whether `dv.fix_target_status` clears `fix` (F) as an honest, presentable fix (#462
-/// FR-003).
-///
-/// `CandidateClean { version: F }` always clears it. A `CandidateVulnerable { version: F,
-/// advisory_ids }` result can *also* clear it — F may legitimately still be affected by
-/// advisories `recommended_fix()` never claimed to resolve in the first place (excluded via
-/// `upgrade_status`'s `still_applying` subtraction, or never had a known fix at all): that is
-/// #216's original honest "partial fix" contract, not a gap this verification introduces. It is
-/// suppressed the moment `advisory_ids` names either a *claimed* advisory (`fix`'s own
-/// `advisory_ids` — the fix doesn't do what its title says) or an advisory this dependency's
-/// `advisories` never recorded at all: a brand-new advisory only visible by live-checking F
-/// itself, since phase A only ever queries the dependency's *declared* version, not F (the #462
-/// repro: an advisory affecting some version strictly between declared and F, invisible until F
-/// is checked directly). Any other state ([`UpgradeStatus::NotChecked`] or a `version`
-/// mismatch) means F was never actually verified, so it is rejected too.
-///
-/// `advisory_ids` is itself capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] the same way
-/// [`crate::osv::DependencyVulnerabilities::advisories`] is (#462 critic M1) — a truncated
-/// list can never be read as exhaustive, since the ids it dropped could just as easily be the
-/// claimed or unknown one that should have suppressed this fix. `!advisory_ids.is_complete()`
-/// is rejected unconditionally before the known/unclaimed check even runs, so a dependency with
-/// more affecting advisories than the cap never gets a false "verified clean" reading from a
-/// partial list.
-fn fix_target_is_verified(
-    dv: &crate::osv::DependencyVulnerabilities,
-    fix: &crate::osv::FixRecommendation,
-    version_native: &str,
-) -> bool {
-    match &dv.fix_target_status {
-        UpgradeStatus::CandidateClean { version } => version == version_native,
-        UpgradeStatus::CandidateVulnerable {
-            version,
-            advisory_ids,
-        } => {
-            if version != version_native || !advisory_ids.is_complete() {
-                return false;
-            }
-            let known_ids: HashSet<&str> = dv
-                .advisories
-                .items()
-                .iter()
-                .map(|a| a.id.as_str())
-                .collect();
-            advisory_ids
-                .items()
-                .iter()
-                .all(|id| known_ids.contains(id.as_str()) && !fix.advisory_ids.contains(id))
-        }
-        UpgradeStatus::NotChecked => false,
-    }
-}
-
 /// Builds the "fix vulnerability" quickfix for `dep`, if OSV data recommends
 /// one AND that recommendation's target version F has itself been verified
-/// against OSV (#462) — see [`fix_target_is_verified`].
+/// against OSV (#462) — see `deps_core::edit::plan_vulnerability_fix`'s internal
+/// `fix_target_is_verified` gate, which this action's edit now goes through.
 ///
 /// Registry-independent by construction (FR-007, mirroring the rule already
 /// enforced in [`crate::lsp_helpers::generate_diagnostics_from_cache`]): computed entirely from
@@ -128,43 +77,21 @@ fn build_vulnerability_fix_action(
     let ScanOutcome::Vulnerable(dv) = outcome else {
         return None;
     };
+
+    // Planning core (the no-op guard, `is_safe_version_string`, `osv_version_to_native`,
+    // `format_version_replacing_for`, and the #462 fix-target-verification gate) lives in
+    // `deps_core::edit::plan_vulnerability_fix` — moved there so `deps-cli update
+    // --security-only` (#1329) reuses the identical decision logic instead of
+    // reimplementing it.
+    let planned =
+        crate::edit::plan_vulnerability_fix(dep, version_range.into(), version_req, dv, formatter)?;
+    let version_native = planned.target.as_str().to_string();
+    let new_text = planned.edit.new_text;
+
+    // Recomputed for the title/data payload below only — `plan_vulnerability_fix` already
+    // confirmed a fix exists and F is verified; `recommended_fix` is a pure, deterministic
+    // function of `dv` alone, so calling it again here is not a second decision.
     let fix = dv.recommended_fix()?;
-    let version_native = formatter.osv_version_to_native(&fix.version);
-    if !is_safe_version_string(&version_native) {
-        warn_rejected_value(
-            "is_safe_version_string",
-            "vulnerability fix code action",
-            &version_native,
-        );
-        return None;
-    }
-
-    // #462: F must itself have been independently verified against OSV before it is
-    // offered as a fix — see `fix_target_is_verified`'s doc for the exact contract and why
-    // a `CandidateVulnerable` result doesn't always disqualify F.
-    if !fix_target_is_verified(dv, &fix, &version_native) {
-        return None;
-    }
-
-    // Uses the same formatting the plain "update version" action uses, not the bare version:
-    // several ecosystems wrap or expand it (`deps-dart`'s `^`-prefix, `deps-pypi`'s in-place
-    // pin-style rewrite) — the N1 guard below must compare the text that would actually be
-    // written.
-    let new_text = formatter.format_version_replacing_for(
-        dep,
-        &ConcreteVersion::new(version_native.as_str()),
-        version_req,
-    );
-
-    // N1: skip a no-op edit. Whitespace-insensitive, mirroring `literal_span_matches`:
-    // `version_req` can be a normalized requirement string with spacing that disagrees with
-    // the freshly-formatted text (e.g. pep508's `>=1.7, <2.0` vs. `>=1.7,<2.0`). Compares
-    // against `dep.version_literal()` when available, since for `deps-swift` `version_req` is
-    // a synthesized comparator (`"=2.61.0"`) that never equals the bare literal (`"2.61.0"`).
-    let literal_target = dep.version_literal().unwrap_or(version_req);
-    if strip_whitespace(literal_target) == strip_whitespace(&new_text) {
-        return None;
-    }
 
     // S3: the scan target may have been the lockfile-resolved version, not
     // the declared requirement — rewriting the manifest alone would then not

@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core**: new ungated `edit` module (`ManifestEdit`, `PlannedUpdate`, `EditSpan`, `UpdateKind`/`classify_update`, `collect_update_edits`, `plan_vulnerability_fix`) shared by `deps-lsp`'s code-lens/code-action edit planning and the new `deps-cli update` subcommand (resolves #1329) (#1343)
+- **deps-core**: new `fs_probe::write_atomic` — symlink-refusing, permission-preserving atomic file write (resolves #1329) (#1343)
+- **deps-cli**: new `update` subcommand plans and writes back version-requirement edits for one manifest's outdated (default mode) or OSV-vulnerable (`--security-only`) dependencies, with `--package` selection, `[update].ignore` rules (honored only via explicit `--config`), `--dry-run`, and `table`/`json` output (resolves #1115, #1119, #1120) (#1343)
 - **ci**: new weekly/manual `live-registry-tests` workflow runs the workspace's `#[ignore]`d, network-gated tests with a real `GITHUB_TOKEN`, non-blocking for PRs (#1297)
 - **deps-core**: new `completion::build_completion_sort_text`/`starts_with_ascii_case_insensitive` helpers computing exact-prefix-tiered `sort_text`, shared by deps-maven and deps-swift's field/url completion overrides (resolves #1282) (#1293)
 - **deps-core**: new `is_safe_feature_name` allowlist predicate, gating Cargo feature-completion names (resolves #1296)
@@ -59,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `quote_scan::ScanSyntax` is now `#[non_exhaustive]`, so a future scanner dialect variant (like `Groovy`, added in #1186) won't repeat that break silently (resolves #1226) (#1321)
 - **deps-core**: `registry::CapResult` is now `#[non_exhaustive]` (part of #1226) (#1321)
 - **deps-core**: `DepsError::ParseError` is now `#[non_exhaustive]`; a downstream crate matching or constructing it without `..` needs updating — use the new `DepsError::parse_error(file_type, source)` constructor instead of a struct literal (resolves #1250)
+- **deps-core**: `lsp_helpers::dedup_overlapping_edits` moved to `edit::dedup_overlapping_edits` and is now generic over a new `edit::EditSpan` trait instead of taking/returning `Vec<tower_lsp_server::ls_types::TextEdit>` only; re-exported at `lsp_helpers::dedup_overlapping_edits` unchanged for existing `Vec<TextEdit>` call sites (part of #1329) (#1343)
 
 ### Changed
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)
