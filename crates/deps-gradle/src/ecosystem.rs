@@ -751,6 +751,23 @@ dependencies {
 "#;
     }
 
+    // #1370/#1372: Gradle's parser preserves an unresolved `$var`/`${var}` reference (and a
+    // malformed bracket range with one embedded, e.g. `[1.0,$hi`) as `Some(version_requirement)`
+    // — it reaches `plan_vulnerability_fix`/`format_version_replacing_for` directly, so
+    // `GradleFormatter::requirement_is_placeholder`'s central gate (and its own
+    // `format_version_replacing` no-op guard) must actually hold.
+    deps_core::unresolved_requirement_conformance! {
+        mod gradle_unresolved_requirement_conformance;
+        build: GradleEcosystem::new(make_cache());
+        reachable: true;
+        // #1370 critic M3: `${v}` (braced form) and `[$lo,` (variable in the lower-bound
+        // position, distinct from `[1.0,$hi`'s upper-bound position) alongside the original
+        // bare `$someVersion` and `[1.0,$hi` — the deleted hand-written tests covered both
+        // range positions, so this fixture restores that coverage.
+        fixture: "build.gradle.kts" =>
+            "dependencies {\n    implementation(\"com.example:some-lib:$someVersion\")\n    implementation(\"com.example:braced-var:${v}\")\n    implementation(\"com.example:malformed-range:[1.0,$hi\")\n    implementation(\"com.example:malformed-range-lower:[$lo,2.0]\")\n}\n";
+    }
+
     // #784: `build_arc:` against the real `Ecosystem::registry()` wiring, not a `build:` fixture
     // constructing `MavenCentralRegistry` directly — that would only duplicate deps-maven's own
     // test and prove nothing gradle-specific. `req: "*"` exercises the wildcard branch the real

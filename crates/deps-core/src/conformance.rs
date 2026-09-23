@@ -841,6 +841,18 @@ pub async fn assert_unresolved_requirements_never_rewritten(
             continue;
         }
         exercised_count += 1;
+        // #1370 critic S2: the central `requirement_is_placeholder` gate itself must classify
+        // this fixture's requirement as a placeholder — without this, a formatter whose
+        // override was accidentally dropped (or never added) would still pass every check
+        // below via the legacy per-formatter guards alone, leaving the central gate
+        // unenforced by this macro.
+        assert!(
+            formatter.requirement_is_placeholder(req),
+            "reachable: true fixture dependency {:?} (requirement {:?}) must be classified a \
+             placeholder by requirement_is_placeholder — the central #1370 gate",
+            dep.name().as_str(),
+            req.as_str()
+        );
         // `req.as_str()`, not `dep.version_literal()` — both production callers
         // (`lsp_helpers::code_actions::build_vulnerability_fix_action` and
         // `deps-cli`'s `update::security`) pass the declared requirement string as `current`,
@@ -876,24 +888,28 @@ pub async fn assert_unresolved_requirements_never_rewritten(
                 &dv,
                 formatter,
             );
-            // Only these two `VulnFixSkip` variants prove the unresolved-placeholder guard
-            // itself did its job — `RequirementAlreadyResolves` is the gate short-circuiting
-            // (the "coincidentally safe" case), `NoOpRewrite` is the formatter's own
-            // `format_version_replacing`/`format_version_replacing_for` guard firing (the
-            // "independently safe" case this macro primarily exists to catch). The other three
-            // variants (`NoRecommendedFix`, `UnsafeVersion`, `UnverifiedTarget`) would mean
-            // this fixture's synthetic `dv`/target setup is broken, not that the placeholder
-            // guard fired — accepting any `Err(_)` here would let a malformed fixture pass
-            // vacuously for the wrong reason.
+            // Only these three `VulnFixSkip` variants prove the unresolved-placeholder guard
+            // itself did its job — `UnresolvedPlaceholder` is `plan_verified_fix`'s own
+            // central gate (#1370) firing, `RequirementAlreadyResolves` is the
+            // `requirement_already_resolves_to` short-circuit (the "coincidentally safe"
+            // case, for an ecosystem that has not [yet] wired `requirement_is_placeholder`),
+            // `NoOpRewrite` is the formatter's own `format_version_replacing`/
+            // `format_version_replacing_for` guard firing (the "independently safe" case this
+            // macro primarily exists to catch). The other three variants (`NoRecommendedFix`,
+            // `UnsafeVersion`, `UnverifiedTarget`) would mean this fixture's synthetic
+            // `dv`/target setup is broken, not that the placeholder guard fired — accepting
+            // any `Err(_)` here would let a malformed fixture pass vacuously for the wrong
+            // reason.
             assert!(
                 matches!(
                     planned,
-                    Err(crate::edit::VulnFixSkip::RequirementAlreadyResolves
+                    Err(crate::edit::VulnFixSkip::UnresolvedPlaceholder
+                        | crate::edit::VulnFixSkip::RequirementAlreadyResolves
                         | crate::edit::VulnFixSkip::NoOpRewrite)
                 ),
                 "plan_vulnerability_fix must skip an unresolved requirement {current:?} \
-                 (dependency {:?}) targeting {target} via RequirementAlreadyResolves or \
-                 NoOpRewrite, got {planned:?}",
+                 (dependency {:?}) targeting {target} via UnresolvedPlaceholder, \
+                 RequirementAlreadyResolves, or NoOpRewrite, got {planned:?}",
                 dep.name().as_str()
             );
 
@@ -928,10 +944,116 @@ pub async fn assert_unresolved_requirements_never_rewritten(
     }
 }
 
+/// A minimal, generic [`crate::Dependency`] used only to probe
+/// [`crate::lsp_helpers::PackageRendering::format_version_replacing_for`] in
+/// [`assert_formatter_guarded_placeholders_never_rewritten`] — every ecosystem's placeholder
+/// guard in that method checks its `current` argument before ever consulting `dep` (downcast
+/// or otherwise), so a dependency carrying no real identity is sufficient to exercise it.
+struct PlaceholderProbeDependency {
+    name: PackageName,
+}
+
+impl crate::Dependency for PlaceholderProbeDependency {
+    fn name(&self) -> &PackageName {
+        &self.name
+    }
+
+    fn name_range(&self) -> crate::position::Range {
+        crate::position::Range::default()
+    }
+
+    fn version_requirement(&self) -> Option<&crate::VersionReq> {
+        None
+    }
+
+    fn version_range(&self) -> Option<crate::position::Range> {
+        None
+    }
+
+    fn source(&self) -> crate::parser::DependencySource {
+        crate::parser::DependencySource::Registry
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Asserts that each of `placeholders` is recognized as an unresolved placeholder directly
+/// against `formatter` — no parser or source-policy gating involved.
+///
+/// The `formatter_guarded` counterpart to [`assert_unresolved_requirements_never_rewritten`],
+/// for an ecosystem whose parser/source-policy shape makes neither the `reachable: true` nor
+/// `reachable: false` fixture form of that function constructible (#1372, `deps-gitlab-ci`:
+/// every dependency is a non-`Registry` source, so `source_is_public_registry_content` is
+/// always `false`, and its coordinate-naming grammar rejects
+/// [`UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME`] outright). Checked directly against the
+/// [`crate::lsp_helpers::RequirementResolution`] methods instead of routing through a parsed
+/// manifest and [`crate::edit::plan_vulnerability_fix`].
+///
+/// Rewrite-safety is checked via
+/// [`format_version_replacing_for`](crate::lsp_helpers::PackageRendering::format_version_replacing_for),
+/// not the bare `format_version_replacing`, mirroring
+/// [`assert_unresolved_requirements_never_rewritten`] — every real central edit-planning call
+/// site (`plan_verified_fix`, `build_unsatisfiable_fix_action`, the REFACTOR loop) calls the
+/// `_for` method, and an ecosystem may guard only that one (`deps-gitlab-ci` does).
+///
+/// `non_placeholders` is the negative control (#1370 critic M2): requirement strings that
+/// look superficially similar to `placeholders` but must NOT be classified as one — e.g. a
+/// SHA or an ordinary branch/tag name for an ecosystem whose placeholder grammar could
+/// otherwise be conflated with its concrete-but-undecidable-ref grammar. Pass an empty slice
+/// if the ecosystem has no such adjacent shape worth pinning.
+///
+/// # Panics
+///
+/// Panics (via `assert!`) if any `placeholders` entry is not classified
+/// [`crate::lsp_helpers::RequirementResolution::requirement_is_placeholder`], compiles to
+/// `Some` via [`crate::lsp_helpers::RequirementResolution::compile_requirement`], or is
+/// rewritten by [`format_version_replacing_for`](crate::lsp_helpers::PackageRendering::format_version_replacing_for);
+/// or if any `non_placeholders` entry IS classified a placeholder.
+pub fn assert_formatter_guarded_placeholders_never_rewritten(
+    formatter: &dyn EcosystemFormatter,
+    placeholders: &[&str],
+    non_placeholders: &[&str],
+) {
+    let probe = PlaceholderProbeDependency {
+        name: PackageName::new("placeholder-probe"),
+    };
+    for &placeholder in placeholders {
+        let req = crate::VersionReq::new(placeholder);
+        assert!(
+            formatter.requirement_is_placeholder(&req),
+            "{placeholder:?} must be classified as a placeholder by requirement_is_placeholder"
+        );
+        assert!(
+            formatter.compile_requirement(&req).is_none(),
+            "{placeholder:?} must not compile into a requirement matcher"
+        );
+        let rewritten = formatter.format_version_replacing_for(
+            &probe,
+            &ConcreteVersion::new("9.9.9"),
+            placeholder,
+        );
+        assert_eq!(
+            crate::lsp_helpers::strip_whitespace(&rewritten),
+            crate::lsp_helpers::strip_whitespace(placeholder),
+            "format_version_replacing_for must leave placeholder {placeholder:?} unchanged, \
+             got {rewritten:?}"
+        );
+    }
+    for &non_placeholder in non_placeholders {
+        assert!(
+            !formatter.requirement_is_placeholder(&crate::VersionReq::new(non_placeholder)),
+            "{non_placeholder:?} must NOT be classified as a placeholder by \
+             requirement_is_placeholder — negative control"
+        );
+    }
+}
+
 /// Generates conformance tests asserting an ecosystem never rewrites an unexpanded
 /// placeholder/interpolation in a version requirement (issue #1354).
 ///
-/// Three mutually exclusive forms:
+/// Four mutually exclusive forms:
 /// - `reachable: true; fixture: "name" => "content";` — the parser preserves the placeholder
 ///   as `Some(version_requirement)`, so it reaches [`crate::edit::plan_vulnerability_fix`] and
 ///   [`crate::lsp_helpers::PackageRendering::format_version_replacing_for`] directly (e.g. GitHub Actions'
@@ -943,11 +1065,16 @@ pub async fn assert_unresolved_requirements_never_rewritten(
 ///   a dependency named
 ///   [`UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME`] with an ordinary, resolvable version —
 ///   see that constant's doc for why (#1354 critic M3).
+/// - `formatter_guarded: <expr>; placeholders: ["p1", "p2", ...]; non_placeholders: [...];` —
+///   asserts directly against the formatter (see
+///   [`assert_formatter_guarded_placeholders_never_rewritten`]), for an ecosystem whose
+///   parser/source-policy shape makes neither `reachable` form constructible (#1372).
+///   `non_placeholders` (may be empty, `[]`) is the negative control.
 /// - `no_placeholder_syntax: "<reason>";` — an exhaustiveness marker (no tests emitted) for an
 ///   ecosystem whose version-requirement grammar has no placeholder/variable syntax at all.
 ///
-/// See [`assert_unresolved_requirements_never_rewritten`] for what each generated test
-/// actually asserts.
+/// See [`assert_unresolved_requirements_never_rewritten`] for what each `reachable` generated
+/// test actually asserts.
 ///
 /// # Examples
 ///
@@ -1012,6 +1139,25 @@ macro_rules! unresolved_requirement_conformance {
     };
     (
         mod $mod_name:ident;
+        formatter_guarded: $build:expr;
+        placeholders: [$($placeholder:literal),+ $(,)?];
+        non_placeholders: [$($non_placeholder:literal),* $(,)?];
+    ) => {
+        mod $mod_name {
+            use super::*;
+
+            #[test]
+            fn unresolved_requirement_never_rewritten() {
+                $crate::conformance::assert_formatter_guarded_placeholders_never_rewritten(
+                    &($build),
+                    &[$($placeholder),+],
+                    &[$($non_placeholder),*],
+                );
+            }
+        }
+    };
+    (
+        mod $mod_name:ident;
         no_placeholder_syntax: $reason:literal;
     ) => {
         #[allow(dead_code)]
@@ -1019,7 +1165,7 @@ macro_rules! unresolved_requirement_conformance {
             const _: &str = $reason;
         }
     };
-    // A friendly compile-time error for any invocation matching none of the three arms above
+    // A friendly compile-time error for any invocation matching none of the four arms above
     // (missing/misspelled field, wrong order, wrong literal type) — mirrors
     // `ecosystem_conformance!`'s own fallback arm just below, rather than leaving the caller
     // with `macro_rules!`'s generic "no rules expected this token" message.
@@ -1030,8 +1176,9 @@ macro_rules! unresolved_requirement_conformance {
         compile_error!(
             "unresolved_requirement_conformance!: expected one of `build: <expr>; reachable: \
              true; fixture: \"name\" => \"content\";`, `build: <expr>; reachable: false; \
-             fixture: \"name\" => \"content\";`, or `no_placeholder_syntax: \"<reason>\";` \
-             after `mod <name>;`"
+             fixture: \"name\" => \"content\";`, `formatter_guarded: <expr>; placeholders: \
+             [\"p1\", \"p2\", ...]; non_placeholders: [...];`, or `no_placeholder_syntax: \
+             \"<reason>\";` after `mod <name>;`"
         );
     };
 }

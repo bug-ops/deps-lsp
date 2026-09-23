@@ -350,6 +350,15 @@ impl RequirementResolution for ComposerFormatter {
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         requirement_is_composer_unresolved(requirement.as_str())
     }
+
+    /// #1370: all three forms `requirement_is_composer_unresolved` covers (`self.version`,
+    /// an inline alias, and a `$VAR`/`${VAR}` placeholder) are equally non-rewritable —
+    /// Composer has no "concrete but undecidable, safe-to-rewrite" ref concept (unlike a
+    /// SHA/branch pin) for `requirement_is_unresolved` to stay broader than this for, so both
+    /// predicates key off the same detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        requirement_is_composer_unresolved(requirement.as_str())
+    }
 }
 
 impl DiagnosticMessages for ComposerFormatter {
@@ -1336,11 +1345,13 @@ mod tests {
         )
     }
 
-    /// #1373 end-to-end regression: `plan_vulnerability_fix` must never rewrite
-    /// `self.version` to a literal fix version. `compile_requirement` now returns `None`
-    /// for it (undecidable), so the `RequirementAlreadyResolves` gate is inert here —
-    /// `format_version_replacing`'s own no-op guard is what actually stops the rewrite,
-    /// hence `NoOpRewrite`.
+    /// #1373/#1370 end-to-end regression: `plan_vulnerability_fix` must never rewrite
+    /// `self.version` to a literal fix version. Since #1370,
+    /// `ComposerFormatter::requirement_is_placeholder`'s central gate fires first; before
+    /// that gate existed, `compile_requirement` returned `None` for it (undecidable), so the
+    /// `RequirementAlreadyResolves` gate was inert and `format_version_replacing`'s own
+    /// no-op guard stopped the rewrite instead (`NoOpRewrite`), which still holds as
+    /// defense-in-depth.
     #[test]
     fn test_plan_vulnerability_fix_self_version_is_not_rewritten() {
         use deps_core::edit::plan_vulnerability_fix;
@@ -1359,7 +1370,7 @@ mod tests {
         let dv = vuln_fix_dv("3.12.0");
         assert_eq!(
             plan_vulnerability_fix(&dep, version_range, "self.version", &dv, &ComposerFormatter),
-            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
             "self.version must never be overwritten with a literal fix version"
         );
     }
@@ -1390,7 +1401,7 @@ mod tests {
                 &dv,
                 &ComposerFormatter
             ),
-            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
             "an inline alias must never be overwritten with a literal fix version"
         );
     }
@@ -1417,7 +1428,7 @@ mod tests {
         let dv = vuln_fix_dv("3.0.2");
         assert_eq!(
             plan_vulnerability_fix(&dep, version_range, "${PSR_LOG}", &dv, &ComposerFormatter),
-            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
+            Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
             "an unexpanded ${{VAR}} placeholder must never be overwritten with a literal fix \
              version"
         );

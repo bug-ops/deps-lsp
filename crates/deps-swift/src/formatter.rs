@@ -233,6 +233,14 @@ impl RequirementResolution for SwiftFormatter {
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         requirement_contains_unresolved_interpolation(requirement.as_str())
     }
+
+    /// #1370: Swift has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// unresolved Swift string interpolation is the only unresolved shape Swift has, so both
+    /// predicates key off the same `requirement_contains_unresolved_interpolation` detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        requirement_contains_unresolved_interpolation(requirement.as_str())
+    }
 }
 
 impl DiagnosticMessages for SwiftFormatter {
@@ -724,7 +732,7 @@ mod tests {
     /// `format_version_replacing_for` only echoes `current` back unchanged (not the narrower
     /// literal) would pass this test despite still corrupting the manifest on the real path.
     #[test]
-    fn test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite() {
+    fn test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten() {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
@@ -765,16 +773,19 @@ mod tests {
             &SwiftFormatter,
         );
 
-        // `NoOpRewrite`, not `RequirementAlreadyResolves`: `compile_requirement` is `None`
-        // here (undecidable, guarded by `requirement_is_unresolved`), so
-        // `requirement_already_resolves_to`'s default gate never short-circuits — it's
-        // `format_version_replacing_for`'s S1 override, reproducing `version_literal`
-        // unchanged, that makes the planner's textual no-op check fire.
+        // #1370: `plan_verified_fix`'s central placeholder gate
+        // (`SwiftFormatter::requirement_is_placeholder`) fires first now, on `current` (which
+        // itself contains `\(`, same as the narrower `version_literal`). Before that gate
+        // existed: `compile_requirement` was `None` here (undecidable, guarded by
+        // `requirement_is_unresolved`), so `requirement_already_resolves_to`'s default gate
+        // never short-circuited — `format_version_replacing_for`'s S1 override, reproducing
+        // `version_literal` unchanged, made the planner's textual no-op check fire instead
+        // (`NoOpRewrite`), and still does, as defense-in-depth.
         assert_eq!(
             planned,
-            Err(deps_core::edit::VulnFixSkip::NoOpRewrite),
-            "the real SwiftFormatter must suppress the fix for an unresolved interpolation via \
-             NoOpRewrite, got {planned:?}"
+            Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
+            "the real SwiftFormatter must suppress the fix for an unresolved interpolation, \
+             got {planned:?}"
         );
     }
 }

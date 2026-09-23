@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp** (test infrastructure): new test drives a real `initialize`/`applyEdit` handshake through `LspService`'s loopback socket, closing `commands::UPDATE_VERSION`'s `canonicalize_uri` coverage gap (resolves #1335) (#1342)
 - **ci**: new native `ubuntu-24.04-arm` test leg runs `deps-core`'s test suite on real aarch64 Linux, catching Linux-arch-dependent ABI bugs that the build-only `cross-check` job never exercised (resolves #1359) (#1360)
 - **deps-core**: new `unresolved_requirement_conformance!` test macro asserts an ecosystem never rewrites an unexpanded version-requirement placeholder, independent of whether `plan_vulnerability_fix`'s gate happens to short-circuit it first (resolves #1354) (#1367)
+- **deps-core**: `unresolved_requirement_conformance!` gains a `formatter_guarded` arm for ecosystems whose placeholder syntax can't be expressed by the existing `reachable`/`no_placeholder_syntax` arms; **deps-gitlab-ci** switches onto it and **deps-maven**/**deps-gradle** gain their first invocations of the macro, replacing hand-written `MockDep`-based tests (resolves #1372) (#1376)
 
 ### Security
 - **deps-bundler**: `format_version_replacing`/`compile_requirement`/`version_satisfies_requirement`/`requirement_is_unresolved` now no-op an unresolved Ruby string-interpolation placeholder (`"~> #{V}"`, plus shorthand `#@ivar`/`#@@cvar`/`#$GVAR` forms) instead of planning a destructive vulnerability-fix rewrite (resolves #1354) (#1367)
@@ -41,6 +42,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-maven, deps-gradle**: `format_version_replacing` no longer rewrites an unresolved `${property}`/`$var` placeholder to a literal version, including malformed-range shapes (resolves #1353) (#1363)
 - **deps-composer**: `format_version_replacing`/`requirement_is_unresolved`/`compile_requirement` now no-op a native `self.version` root-package pin and an inline-alias constraint (`"dev-main as 1.0.0"`) instead of planning a destructive rewrite (resolves #1373) (#1375)
 - **deps-core, deps-composer, deps-npm, deps-cargo, deps-dart, deps-pypi, deps-gitlab-ci**: new shared `lsp_helpers::requirement_contains_dollar_placeholder` predicate stops an externally-templated `$VAR`/`${VAR}` version placeholder from being rewritten in npm, Cargo, Dart, Poetry (`[tool.poetry.dependencies]`), and Composer manifests; `deps-gitlab-ci` now delegates its own `$VAR`/`${VAR}` detection to the shared predicate instead of a local duplicate (resolves #1374) (#1375)
+- **deps-core**: new `RequirementResolution::requirement_is_placeholder` predicate centralizes the "never rewrite an unresolved placeholder" guard across all four edit paths (`plan_verified_fix`, `collect_update_candidates`, `build_unsatisfiable_fix_action`, the REFACTOR "Update to X" code action), replacing 6 independent per-ecosystem detectors with one trait override each across deps-maven, deps-gradle, deps-nuget, deps-bundler, deps-swift, deps-github-actions, deps-gitlab-ci, deps-npm, deps-cargo, deps-dart, deps-pypi, and deps-composer (resolves #1370) (#1376)
 
 ### Fixed
 - **deps-bundler**: multi-constraint `gem` requirements now capture and rewrite every positional constraint instead of only the first, fixing contradictory version-fix rewrites and restoring code actions/completion for such dependencies (resolves #1366) (#1369)
@@ -71,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `DepsError::fetch_failure` and its telemetry-label sibling classifier are now exhaustive matches with no wildcard arm, so a future variant cannot silently lose its diagnostic hint (resolves #1244) (#1308)
 - **deps-cargo**: `Cargo.lock` `sparse+` sources now classify as `ResolvedSource::Registry` instead of falling through to the `::Path` catch-all (latent — no current consumer branches on the variant yet) (resolves #1320) (#1324)
 - **deps-nuget**: added a regression test proving `own_auth_id` actually separates `HttpCache` entries between distinct credentials against the same feed URL, closing a coverage gap where the invariant was untested (resolves #1026) (#1331)
+- **deps-gitlab-ci**: a Tag-shaped ref with an embedded, non-leading variable reference (e.g. `v16.0-$BUILD`) no longer reports permanently `Outdated`; it's now correctly classified `Unresolved` (part of #1370) (#1376)
 
 ### Breaking
 - **deps-core**: `edit::plan_vulnerability_fix` returns `Result<PlannedUpdate, VulnFixSkip>` instead of `Option<PlannedUpdate>`; `edit::fix_target_is_verified` is `pub(crate)` again (part of #1350) (#1361)

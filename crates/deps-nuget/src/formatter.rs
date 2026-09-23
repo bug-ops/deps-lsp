@@ -205,6 +205,14 @@ impl RequirementResolution for NuGetFormatter {
         crate::parser::is_msbuild_reference(requirement.as_str())
     }
 
+    /// #1370: NuGet has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// unexpanded MSBuild reference is the only unresolved shape NuGet has, so both
+    /// predicates key off the same `crate::parser::is_msbuild_reference` detector.
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        crate::parser::is_msbuild_reference(requirement.as_str())
+    }
+
     /// Uses [`compile_requirement_unless`] (see that function and
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
     ///
@@ -699,14 +707,15 @@ mod tests {
             &NuGetFormatter,
         );
 
-        // `compile_requirement` returns `None` for an unresolved `$(...)` reference, so the
-        // #1344 `RequirementAlreadyResolves` gate is inert here — suppression instead comes
-        // from `format_version_replacing`'s own `$(` short-circuit (returns `current`
-        // unchanged), making the rewrite byte-identical to the declared literal: a genuine
-        // `VulnFixSkip::NoOpRewrite`, not a resolution-admits-the-fix case.
+        // #1370: `plan_verified_fix`'s central placeholder gate checks `current` directly
+        // (independent of `dep.version_requirement()`, which is `None` here) and fires first,
+        // via `NuGetFormatter::requirement_is_placeholder`. Before that gate existed,
+        // suppression came from `format_version_replacing`'s own `$(` short-circuit instead
+        // (`VulnFixSkip::NoOpRewrite`) — still true as defense-in-depth, but no longer the
+        // first guard reached.
         assert_eq!(
             planned,
-            Err(VulnFixSkip::NoOpRewrite),
+            Err(VulnFixSkip::UnresolvedPlaceholder),
             "the real NuGetFormatter must suppress the fix for an unresolved property reference"
         );
     }
