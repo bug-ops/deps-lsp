@@ -290,36 +290,32 @@ impl Backend {
             affected_uris.len()
         );
 
-        // Reload lock file (cache was invalidated, so this re-parses). `lockfile_reload_ok`
-        // gates the OSV rescan below (issue #1395 critic M1): on a reload error the maps
-        // fall back to empty, which would otherwise make every previously-resolved
-        // dependency look "changed" and rescan the whole document down to `Skipped` —
-        // replacing a real `Clean`/`Vulnerable` result with a false one — on what may be a
-        // transient read of a lock file mid-write. `resolved_versions`/`resolved_version_candidates`
-        // themselves still fall back to empty on error, unchanged pre-existing behavior
-        // this fix does not touch.
-        let (resolved_versions, resolved_version_candidates, lockfile_reload_ok) = match self
-            .state
-            .lockfile_cache
-            .get_or_parse(lock_provider.as_ref(), lockfile_path)
-            .await
-        {
-            Ok(packages) => {
-                let (versions, candidates) =
-                    deps_engine::classify::resolved::split_resolved_packages(&packages);
-                (versions, candidates, true)
-            }
-            Err(e) => {
-                tracing::error!("Failed to reload lock file: {}", e);
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Failed to reload lock file: {e}"),
-                    )
-                    .await;
-                (HashMap::new(), HashMap::new(), false)
-            }
-        };
+        // Reload lock file (cache was invalidated, so this re-parses) via the same
+        // get-or-parse-then-split sequence `load_resolved_versions` uses (issue #1424, was
+        // duplicated inline here). `lockfile_reload_ok` gates the OSV rescan below (issue
+        // #1395 critic M1): on a reload error the maps fall back to empty, which would
+        // otherwise make every previously-resolved dependency look "changed" and rescan the
+        // whole document down to `Skipped` — replacing a real `Clean`/`Vulnerable` result
+        // with a false one — on what may be a transient read of a lock file mid-write. These
+        // local `resolved_versions`/`resolved_version_candidates` variables are always empty
+        // on a reload error (`LockfileLoad::into_maps`'s `Failed` fallback) — but, per the
+        // `lockfile_reload_ok` gate on `reload_resolved_versions` below (issue #1424
+        // impl-critic M1), that empty pair is never actually written into the document on
+        // error, so `doc.resolved_versions` itself survives a transient reload failure
+        // untouched.
+        let load = deps_engine::classify::resolved::parse_known_lockfile(
+            &self.state.lockfile_cache,
+            lock_provider.as_ref(),
+            lockfile_path,
+        )
+        .await;
+        let lockfile_reload_ok = load.reload_ok();
+        if !lockfile_reload_ok {
+            let message = format!("Failed to reload lock file: {}", lockfile_path.display());
+            tracing::error!("{}", message);
+            self.client.log_message(MessageType::ERROR, message).await;
+        }
+        let (resolved_versions, resolved_version_candidates) = load.into_maps();
 
         // Snapshot before the loop and drop the guard: re-reading `self.config` per URI
         // inside the loop would hold this guard across a nested read of the same
@@ -343,20 +339,28 @@ impl Backend {
             //
             // `reload_resolved_versions` (issue #1398/#1399 code review) shares the
             // diff-and-write sequence with `document::lifecycle::run_document_change_task`'s
-            // own debounced-edit lock-drift check. Gated on `lockfile_reload_ok` alone
-            // (issue #1407 code-review should-fix), not
+            // own debounced-edit lock-drift check, including that call's own
+            // `if lockfile_reload_ok { ... } else { false }` gating (issue #1424
+            // impl-critic M1): `reload_resolved_versions` always unconditionally
+            // overwrites `resolved_versions`/`resolved_version_candidates` with whatever it
+            // is given, so calling it on a `Failed` reload — whose maps are always empty —
+            // would silently wipe known-good, previously-resolved data instead of leaving
+            // it untouched until a subsequent reload actually succeeds. Not
             // `vulnerabilities_enabled && lockfile_reload_ok`: a tier-3 ecosystem's license
             // can go stale on a resolved-version change whether or not vulnerability
             // scanning is turned on, so the drift signal must be available for the license
             // trigger below too, not just the OSV one.
-            let resolved_changed = reload_resolved_versions(
-                &uri,
-                &self.state,
-                ecosystem_impl.as_ref(),
-                &resolved_versions,
-                &resolved_version_candidates,
-                lockfile_reload_ok,
-            );
+            let resolved_changed = if lockfile_reload_ok {
+                reload_resolved_versions(
+                    &uri,
+                    &self.state,
+                    ecosystem_impl.as_ref(),
+                    &resolved_versions,
+                    &resolved_version_candidates,
+                )
+            } else {
+                false
+            };
 
             // Shared with `run_document_change_task`'s identical formula (issue #1407
             // code-review should-fix: the two call sites used to hand-roll this by hand) —
@@ -2838,10 +2842,12 @@ mod tests {
             .await;
 
         let doc = backend.state.get_document(&uri).unwrap();
-        assert!(
-            doc.resolved_versions.is_empty(),
-            "resolved_versions still falls back to empty on a reload error — pre-existing, \
-             unchanged behavior this fix deliberately does not touch"
+        assert_eq!(
+            doc.resolved_versions.get("alpha-dep"),
+            Some(&ConcreteVersion::from("0.1.0")),
+            "a lock-file reload error must leave previously-resolved versions untouched \
+             (issue #1424 impl-critic M1), not wipe them with the reload's empty fallback \
+             maps"
         );
         assert_matches!(
             doc.vulnerabilities
