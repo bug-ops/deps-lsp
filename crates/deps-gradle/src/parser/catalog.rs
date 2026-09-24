@@ -17,19 +17,8 @@ use url::Url;
 /// Returns [`DepsError::ParseError`] if the TOML nesting depth exceeds the
 /// configured limit or the content is not valid TOML.
 pub fn parse_version_catalog(content: &str, uri: &Url) -> Result<GradleParseResult> {
-    if let Err(depth) =
-        deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
-    {
-        return Err(DepsError::parse_error(
-            "Gradle",
-            &format!(
-                "array/table nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_TOML_NESTING_DEPTH
-            ),
-        ));
-    }
-
-    let doc = toml_span::parse(content).map_err(|e| DepsError::parse_error("Gradle", &e))?;
+    let doc =
+        deps_core::parse_toml_checked(content).map_err(|e| DepsError::parse_error("Gradle", &e))?;
 
     let line_table = LineOffsetTable::new(content);
     let mut version_refs: HashMap<String, String> = HashMap::new();

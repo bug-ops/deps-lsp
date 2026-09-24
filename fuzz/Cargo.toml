@@ -99,6 +99,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "parse_toml_checked"
+path = "fuzz_targets/parse_toml_checked.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "json_ast"
 path = "fuzz_targets/json_ast.rs"
 test = false

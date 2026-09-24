@@ -98,19 +98,8 @@ impl LockFileProvider for CargoLockParser {
 /// The CPU-bound half of [`CargoLockParser::parse_lockfile`], run inside
 /// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
-    if let Err(depth) =
-        deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
-    {
-        return Err(DepsError::parse_error(
-            "Cargo.lock",
-            &format!(
-                "array/table nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_TOML_NESTING_DEPTH
-            ),
-        ));
-    }
-
-    let doc = toml_span::parse(&content).map_err(|e| DepsError::parse_error("Cargo.lock", &e))?;
+    let doc = deps_core::parse_toml_checked(&content)
+        .map_err(|e| DepsError::parse_error("Cargo.lock", &e))?;
 
     let mut packages = ResolvedPackages::new();
 

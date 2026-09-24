@@ -664,6 +664,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-test",
+ "toml-span",
  "tower-lsp-server",
  "tracing",
  "tracing-subscriber",
