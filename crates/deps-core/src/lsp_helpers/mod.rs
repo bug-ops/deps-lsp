@@ -288,8 +288,8 @@ impl DependencyOutcome {
 /// A newtype rather than a bare `HashMap` so the empty-entry pruning invariant (an entry is
 /// removed once all three of its channels are cleared) lives in one place, and so test
 /// fixtures get chainable `with_*` constructors instead of building three ad-hoc `HashMap`s.
-/// Mirrors the existing [`crate::osv::VulnerabilityMap`] convention of a `String`-keyed map by
-/// normalized name.
+/// Keyed by plain normalized name — unlike [`crate::osv::VulnerabilityMap`], which is keyed by
+/// [`crate::osv::VulnKey`] to disambiguate multiple occurrences of one name.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DependencyOutcomes(HashMap<String, DependencyOutcome>);
 
@@ -1109,7 +1109,7 @@ pub(crate) fn version_range_is_synthetic_empty(dep: &dyn Dependency) -> bool {
 /// };
 ///
 /// let mut vulnerabilities = VulnerabilityMap::new();
-/// vulnerabilities.insert("time".to_string(), ScanOutcome::Clean);
+/// vulnerabilities.insert(deps_core::test_util::vuln_key("time"), ScanOutcome::Clean);
 ///
 /// // No `VulnKeys` map: falls back straight to the normalized name.
 /// let outcome = resolve_scan_outcome(&vulnerabilities, &dep, None, "time");
@@ -1122,9 +1122,15 @@ pub fn resolve_scan_outcome<'a>(
     normalized_name: &str,
 ) -> Option<&'a ScanOutcome> {
     keys.and_then(|k| k.get(&dep.name_range()))
-        .and_then(|key| vulnerabilities.get(key.as_str()))
-        .or_else(|| vulnerabilities.get(normalized_name))
-        .or_else(|| vulnerabilities.get(dep.name().as_str()))
+        .and_then(|key| vulnerabilities.get(key))
+        .or_else(|| {
+            vulnerabilities.get(&crate::osv::VulnKey::from_name(normalized_name.to_string()))
+        })
+        .or_else(|| {
+            vulnerabilities.get(&crate::osv::VulnKey::from_name(
+                dep.name().as_str().to_string(),
+            ))
+        })
 }
 
 /// Converts byte offsets in source text to LSP `Position` values.

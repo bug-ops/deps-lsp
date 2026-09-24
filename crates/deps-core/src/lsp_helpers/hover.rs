@@ -4610,7 +4610,7 @@ mod tests {
         let resolved_versions = HashMap::new();
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
-        vulns.insert("clean-pkg".to_string(), ScanOutcome::Clean);
+        vulns.insert(crate::test_util::vuln_key("clean-pkg"), ScanOutcome::Clean);
 
         let hover = generate_hover(
             &parse_result,
@@ -4641,7 +4641,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "path-pkg".to_string(),
+            crate::test_util::vuln_key("path-pkg"),
             ScanOutcome::Skipped(SkipReason::NonRegistrySource),
         );
 
@@ -4678,7 +4678,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "bad-pkg".to_string(),
+            crate::test_util::vuln_key("bad-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
@@ -4811,7 +4811,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "bad-pkg".to_string(),
+            crate::test_util::vuln_key("bad-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("MAL-2025-47141", VulnSeverity::Malicious)],
@@ -4870,7 +4870,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "yaml-rust".to_string(),
+            crate::test_util::vuln_key("yaml-rust"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -4925,7 +4925,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "yaml-rust".to_string(),
+            crate::test_util::vuln_key("yaml-rust"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![advisory], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -4981,7 +4981,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "mixed-pkg".to_string(),
+            crate::test_util::vuln_key("mixed-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![informational_advisory, graded_advisory], 2),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -5062,7 +5062,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            vulnerable_key.into_string(),
+            vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
@@ -5072,7 +5072,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(patched_key.into_string(), ScanOutcome::Clean);
+        vulns.insert(patched_key, ScanOutcome::Clean);
 
         let versions = VersionData::new(&cached_versions, &resolved_versions)
             .with_vulnerabilities(&vulns)
@@ -5169,7 +5169,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            current_key.into_string(),
+            current_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
@@ -5179,7 +5179,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(renamed_key.into_string(), ScanOutcome::Clean);
+        vulns.insert(renamed_key, ScanOutcome::Clean);
 
         let versions = VersionData::new(&cached_versions, &resolved_versions)
             .with_resolved_version_candidates(&resolved_version_candidates)
@@ -5420,7 +5420,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "serde".to_string(),
+            crate::test_util::vuln_key("serde"),
             ScanOutcome::Skipped(SkipReason::QueryFailed),
         );
 
@@ -5582,7 +5582,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "serde".to_string(),
+            crate::test_util::vuln_key("serde"),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
 
@@ -5617,7 +5617,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "serde".to_string(),
+            crate::test_util::vuln_key("serde"),
             ScanOutcome::Skipped(SkipReason::QueryFailed),
         );
 
@@ -5658,7 +5658,7 @@ mod tests {
         let parse_result = freshness_test_parse_result("serde");
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "serde".to_string(),
+            crate::test_util::vuln_key("serde"),
             ScanOutcome::Skipped(SkipReason::QueryFailed),
         );
 
@@ -5707,7 +5707,10 @@ mod tests {
         for (reason, expected_fragment) in cases {
             let parse_result = freshness_test_parse_result("serde");
             let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
-            vulns.insert("serde".to_string(), ScanOutcome::Skipped(reason));
+            vulns.insert(
+                crate::test_util::vuln_key("serde"),
+                ScanOutcome::Skipped(reason),
+            );
 
             let hover = generate_hover(
                 &parse_result,
@@ -5742,7 +5745,7 @@ mod tests {
         };
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "path-pkg".to_string(),
+            crate::test_util::vuln_key("path-pkg"),
             ScanOutcome::Skipped(SkipReason::NonRegistrySource),
         );
 

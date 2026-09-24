@@ -97,7 +97,7 @@ pub async fn plan_security_updates(
         return UpdatePlan::default();
     };
 
-    let vulnerable_keys: Vec<String> = vulnerabilities
+    let vulnerable_keys: Vec<deps_core::osv::VulnKey> = vulnerabilities
         .iter()
         .filter(|(_, outcome)| matches!(outcome, ScanOutcome::Vulnerable(_)))
         .map(|(key, _)| key.clone())
@@ -120,7 +120,7 @@ pub async fn plan_security_updates(
     // fix target resolve to `NotChecked` and silently suppress every fix — see
     // `collect_fix_target_resolutions`'s doc for the two-case resolution order this
     // depends on. Do not "fix" this by populating it.
-    let latest_native_by_key: HashMap<String, String> = HashMap::new();
+    let latest_native_by_key: HashMap<deps_core::osv::VulnKey, String> = HashMap::new();
     let (resolved, live_check_candidates) =
         deps_engine::classify::osv::collect_fix_target_resolutions(
             vulnerabilities,

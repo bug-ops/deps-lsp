@@ -52,12 +52,12 @@ pub(crate) struct OsvScanResult {
     resolved_generation: ResolvedGeneration,
     vulnerabilities: deps_core::osv::VulnerabilityMap,
     /// `key -> osv_name`, needed to build phase B candidates.
-    osv_name_by_key: HashMap<String, String>,
+    osv_name_by_key: HashMap<deps_core::osv::VulnKey, String>,
     /// `key -> dep.name()` (raw, pre-normalization), the fallback
     /// `cached_versions` lookup needs since that map is keyed by the raw
     /// name while `key` is normalized (critique S2) — they differ for
     /// Composer/Swift/NuGet-style ecosystems.
-    raw_name_by_key: HashMap<String, String>,
+    raw_name_by_key: HashMap<deps_core::osv::VulnKey, String>,
 }
 
 /// Phase A: builds scan targets, runs [`deps_core::osv::OsvClient::scan`], and
@@ -100,12 +100,11 @@ pub(crate) async fn run_osv_scan_phase_a(
             ecosystem.formatter(),
             ecosystem_id,
         );
-        let raw_name_by_key: HashMap<String, String> = parse_result
+        let raw_name_by_key: HashMap<deps_core::osv::VulnKey, String> = parse_result
             .dependencies()
             .into_iter()
             .map(|d| {
-                let key = deps_core::osv::vuln_key_for(d, Some(&vuln_keys), ecosystem.formatter())
-                    .into_string();
+                let key = deps_core::osv::vuln_key_for(d, Some(&vuln_keys), ecosystem.formatter());
                 (key, d.name().as_str().to_string())
             })
             .collect();
@@ -122,7 +121,7 @@ pub(crate) async fn run_osv_scan_phase_a(
         return None;
     }
 
-    let osv_name_by_key: HashMap<String, String> =
+    let osv_name_by_key: HashMap<deps_core::osv::VulnKey, String> =
         deps_engine::classify::osv::osv_name_by_key(&targets);
 
     if !targets.is_empty() {
@@ -359,7 +358,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
     fetch_timeout_secs: u64,
     mut result: OsvScanResult,
 ) {
-    let vulnerable_keys: Vec<String> = result
+    let vulnerable_keys: Vec<deps_core::osv::VulnKey> = result
         .vulnerabilities
         .iter()
         .filter(|(_, outcome)| matches!(outcome, deps_core::osv::ScanOutcome::Vulnerable(_)))
@@ -374,7 +373,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         // `latest_native_by_key` is kept for B.2 below, which needs the same native
         // "latest" string to detect a fix target F that coincides with latest (FR-002)
         // without re-deriving it from `doc.cached_versions` a second time.
-        let latest_native_by_key: HashMap<String, String> = {
+        let latest_native_by_key: HashMap<deps_core::osv::VulnKey, String> = {
             let Some(doc) = state.get_document(uri) else {
                 return;
             };
@@ -485,9 +484,9 @@ pub(crate) async fn run_osv_phase_b_and_commit(
 #[allow(clippy::too_many_arguments)]
 async fn run_osv_fix_target_verification(
     vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
-    vulnerable_keys: &[String],
-    osv_name_by_key: &HashMap<String, String>,
-    latest_native_by_key: &HashMap<String, String>,
+    vulnerable_keys: &[deps_core::osv::VulnKey],
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    latest_native_by_key: &HashMap<deps_core::osv::VulnKey, String>,
     ecosystem_id: EcosystemId,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     osv: &deps_core::osv::OsvClient,
@@ -505,7 +504,7 @@ async fn run_osv_fix_target_verification(
         );
 
     for (key, status) in resolved {
-        if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(key.as_str()) {
+        if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(&key) {
             dv.fix_target_status = status;
         }
     }
@@ -1210,7 +1209,8 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
-                doc.vulnerabilities.get("alpha-dep"),
+                doc.vulnerabilities
+                    .get(&deps_core::test_util::vuln_key("alpha-dep")),
                 Some(deps_core::osv::ScanOutcome::Skipped(
                     deps_core::osv::SkipReason::NonRegistrySource
                 )),
@@ -1311,7 +1311,7 @@ mod tests {
             }
             let mut s2_result = VulnerabilityMap::new();
             s2_result.insert(
-                "alpha-dep".to_string(),
+                deps_core::test_util::vuln_key("alpha-dep"),
                 ScanOutcome::Skipped(SkipReason::UnmappableName),
             );
             state
@@ -1334,7 +1334,8 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
-                doc.vulnerabilities.get("alpha-dep"),
+                doc.vulnerabilities
+                    .get(&deps_core::test_util::vuln_key("alpha-dep")),
                 Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
                 "R1's stale commit (snapshotted against the closed document instance) must \
                  not overwrite the freshly-reopened instance's own result — got: {:?}",

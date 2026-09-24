@@ -557,7 +557,7 @@ serde = "0.9.0"
 
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
-                "serde".to_string(),
+                deps_core::test_util::vuln_key("serde"),
                 ScanOutcome::Vulnerable(
                     DependencyVulnerabilities::new(Capped::new(
                         vec![Arc::new(
@@ -657,7 +657,7 @@ serde = "1.0.0"
 
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
-                "serde".to_string(),
+                deps_core::test_util::vuln_key("serde"),
                 ScanOutcome::Vulnerable(
                     DependencyVulnerabilities::new(Capped::new(
                         vec![Arc::new(
@@ -902,7 +902,7 @@ serde = "1.0.0"
             // `build_vulnerability_fix_action` uses, not `osv_package_name`'s wire-request format.
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
-                "vapor/vapor".to_string(),
+                deps_core::test_util::vuln_key("vapor/vapor"),
                 ScanOutcome::Vulnerable(
                     DependencyVulnerabilities::new(Capped::new(
                         vec![Arc::new(

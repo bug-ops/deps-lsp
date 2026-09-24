@@ -510,7 +510,7 @@ impl<'a> DependencyIndex<'a> {
 /// `CheckFinding::advisory_severity: None`.
 fn advisory_severity_index(
     vulnerabilities: Option<&VulnerabilityMap>,
-) -> HashMap<(String, String), VulnSeverity> {
+) -> HashMap<(deps_core::osv::VulnKey, String), VulnSeverity> {
     let mut index = HashMap::new();
     let Some(vulnerabilities) = vulnerabilities else {
         return index;
@@ -539,7 +539,7 @@ fn to_finding(
     dep_index: &DependencyIndex<'_>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
-    advisory_severities: &HashMap<(String, String), VulnSeverity>,
+    advisory_severities: &HashMap<(deps_core::osv::VulnKey, String), VulnSeverity>,
     vuln_keys: &VulnKeys,
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
@@ -556,7 +556,7 @@ fn to_finding(
         }
         let dependency_key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
         advisory_severities
-            .get(&(dependency_key.into_string(), code.to_string()))
+            .get(&(dependency_key, code.to_string()))
             .copied()
     });
     CheckFinding {
@@ -1207,7 +1207,10 @@ mod tests {
         );
         let mut severities = HashMap::new();
         severities.insert(
-            ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
+            (
+                deps_core::test_util::vuln_key("dep-0"),
+                "RUSTSEC-2024-0001".to_string(),
+            ),
             VulnSeverity::Critical,
         );
 
@@ -1258,7 +1261,10 @@ mod tests {
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
         let mut severities = HashMap::new();
         severities.insert(
-            ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
+            (
+                deps_core::test_util::vuln_key("dep-0"),
+                "RUSTSEC-2024-0001".to_string(),
+            ),
             VulnSeverity::Critical,
         );
 
@@ -1287,11 +1293,17 @@ mod tests {
         .expect("valid osv id");
         let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
         let mut map: VulnerabilityMap = HashMap::new();
-        map.insert("serde".to_string(), ScanOutcome::Vulnerable(dv));
+        map.insert(
+            deps_core::test_util::vuln_key("serde"),
+            ScanOutcome::Vulnerable(dv),
+        );
 
         let index = advisory_severity_index(Some(&map));
         assert_eq!(
-            index.get(&("serde".to_string(), "RUSTSEC-2024-0001".to_string())),
+            index.get(&(
+                deps_core::test_util::vuln_key("serde"),
+                "RUSTSEC-2024-0001".to_string()
+            )),
             Some(&VulnSeverity::High)
         );
     }
@@ -1316,14 +1328,14 @@ mod tests {
         };
         let mut map: VulnerabilityMap = HashMap::new();
         map.insert(
-            "package-a".to_string(),
+            deps_core::test_util::vuln_key("package-a"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
                 vec![advisory_for(VulnSeverity::Critical)],
                 1,
             ))),
         );
         map.insert(
-            "package-b".to_string(),
+            deps_core::test_util::vuln_key("package-b"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
                 vec![advisory_for(VulnSeverity::Low)],
                 1,
@@ -1332,11 +1344,17 @@ mod tests {
 
         let index = advisory_severity_index(Some(&map));
         assert_eq!(
-            index.get(&("package-a".to_string(), "GHSA-shared-id".to_string())),
+            index.get(&(
+                deps_core::test_util::vuln_key("package-a"),
+                "GHSA-shared-id".to_string()
+            )),
             Some(&VulnSeverity::Critical)
         );
         assert_eq!(
-            index.get(&("package-b".to_string(), "GHSA-shared-id".to_string())),
+            index.get(&(
+                deps_core::test_util::vuln_key("package-b"),
+                "GHSA-shared-id".to_string()
+            )),
             Some(&VulnSeverity::Low)
         );
     }

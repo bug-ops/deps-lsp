@@ -196,16 +196,16 @@ impl OsvClient {
         ecosystem: crate::EcosystemId,
         candidates: &[ScanTarget],
         timeout: Duration,
-    ) -> HashMap<String, UpgradeStatus> {
+    ) -> HashMap<VulnKey, UpgradeStatus> {
         if candidates.is_empty() {
             return HashMap::new();
         }
 
         // `display_version`, not `version`: the latter is OSV's wire spelling (e.g. Go's
         // `v`-prefix stripped), but `UpgradeStatus` must surface the ecosystem-native one.
-        let versions: HashMap<&str, &str> = candidates
+        let versions: HashMap<&VulnKey, &str> = candidates
             .iter()
-            .map(|c| (c.key.as_str(), c.display_version.as_str()))
+            .map(|c| (&c.key, c.display_version.as_str()))
             .collect();
 
         let outcomes = self.resolve(ecosystem, candidates, timeout).await;
@@ -213,7 +213,7 @@ impl OsvClient {
         outcomes
             .into_iter()
             .filter_map(|(key, outcome)| {
-                let version = (*versions.get(key.as_str())?).to_string();
+                let version = (*versions.get(&key)?).to_string();
                 let status = match outcome {
                     ScanOutcome::Clean => UpgradeStatus::CandidateClean { version },
                     ScanOutcome::Vulnerable(dv) => UpgradeStatus::CandidateVulnerable {
@@ -244,7 +244,7 @@ impl OsvClient {
         ecosystem: crate::EcosystemId,
         targets: &[ScanTarget],
         timeout: Duration,
-    ) -> HashMap<String, ScanOutcome> {
+    ) -> VulnerabilityMap {
         let deadline = Instant::now() + timeout;
         let mut outcomes = HashMap::with_capacity(targets.len());
 
@@ -332,7 +332,7 @@ impl OsvClient {
         &self,
         osv_eco: &'static str,
         chunk: &[ScanTarget],
-        outcomes: &mut HashMap<String, ScanOutcome>,
+        outcomes: &mut VulnerabilityMap,
         truncated: &mut Vec<ScanTarget>,
     ) {
         let url = self.batch_url();
@@ -413,7 +413,7 @@ impl OsvClient {
         &self,
         osv_eco: &'static str,
         truncated: &[ScanTarget],
-        outcomes: &mut HashMap<String, ScanOutcome>,
+        outcomes: &mut VulnerabilityMap,
     ) {
         use futures::stream::{self, StreamExt};
 
@@ -423,7 +423,7 @@ impl OsvClient {
         // Cloned, not borrowed: a closure borrowing both `self` and a `truncated` slice
         // element triggers a higher-ranked-lifetime inference failure once nested inside an
         // outer `tokio::spawn` — `fetch_records` hit the same issue and fixed it with `.cloned()`.
-        let recovered: Vec<(String, ScanOutcome)> = stream::iter(to_recover.iter().cloned())
+        let recovered: Vec<(VulnKey, ScanOutcome)> = stream::iter(to_recover.iter().cloned())
             .map(|target| async move {
                 let outcome = match self.query_single(osv_eco, &target).await {
                     // `/v1/query` can itself paginate — never trust its
@@ -678,14 +678,14 @@ impl OsvClient {
 }
 
 /// Marks every dependency in a failed chunk as [`SkipReason::QueryFailed`].
-fn mark_chunk_failed(chunk: &[ScanTarget], outcomes: &mut HashMap<String, ScanOutcome>) {
+fn mark_chunk_failed(chunk: &[ScanTarget], outcomes: &mut VulnerabilityMap) {
     for t in chunk {
         outcomes.insert(t.key.clone(), ScanOutcome::Skipped(SkipReason::QueryFailed));
     }
 }
 
 /// Logs the `info`-level scan summary mandated by §8 invariant 0.
-fn log_scan_summary(outcomes: &HashMap<String, ScanOutcome>) {
+fn log_scan_summary(outcomes: &VulnerabilityMap) {
     let mut clean = 0usize;
     let mut vulnerable = 0usize;
     let mut skip_counts: HashMap<&'static str, usize> = HashMap::new();
@@ -738,7 +738,7 @@ mod tests {
 
     fn target(name: &str, version: &str) -> ScanTarget {
         ScanTarget {
-            key: name.to_string(),
+            key: crate::test_util::vuln_key(name),
             osv_name: name.to_string(),
             version: version.to_string(),
             display_version: version.to_string(),
@@ -787,7 +787,10 @@ mod tests {
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
         assert_eq!(outcomes.len(), 1);
-        assert_matches!(outcomes.get("left-pad"), Some(ScanOutcome::Clean));
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("left-pad")),
+            Some(ScanOutcome::Clean)
+        );
     }
 
     #[tokio::test]
@@ -806,7 +809,7 @@ mod tests {
         assert_eq!(outcomes.len(), 2);
         for key in ["a", "b"] {
             assert_matches!(
-                outcomes.get(key),
+                outcomes.get(&crate::test_util::vuln_key(key)),
                 Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
             );
         }
@@ -826,7 +829,7 @@ mod tests {
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
         assert_matches!(
-            outcomes.get("a"),
+            outcomes.get(&crate::test_util::vuln_key("a")),
             Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
         );
     }
@@ -854,7 +857,7 @@ mod tests {
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
         assert_matches!(
-            outcomes.get("pkg"),
+            outcomes.get(&crate::test_util::vuln_key("pkg")),
             Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
         );
     }
@@ -875,7 +878,7 @@ mod tests {
 
         for key in ["a", "b"] {
             assert_matches!(
-                outcomes.get(key),
+                outcomes.get(&crate::test_util::vuln_key(key)),
                 Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
             );
         }
@@ -937,7 +940,7 @@ mod tests {
 
         for key in ["a", "b"] {
             assert_matches!(
-                outcomes.get(key),
+                outcomes.get(&crate::test_util::vuln_key(key)),
                 Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
             );
         }
@@ -980,7 +983,9 @@ mod tests {
             .scan(EcosystemId::Maven, &targets, TEST_TIMEOUT)
             .await;
 
-        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("log4j-core") else {
+        let Some(ScanOutcome::Vulnerable(dv)) =
+            outcomes.get(&crate::test_util::vuln_key("log4j-core"))
+        else {
             panic!("expected Vulnerable outcome");
         };
         // Must pick up log4j-core's own severity/fix, not log4j-api's.
@@ -1011,8 +1016,12 @@ mod tests {
 
         // total() still counts the batch stub; the malformed-id record
         // is dropped rather than rendered with an unsafe id.
-        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("pkg") else {
-            panic!("expected Vulnerable outcome, got {:?}", outcomes.get("pkg"));
+        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get(&crate::test_util::vuln_key("pkg"))
+        else {
+            panic!(
+                "expected Vulnerable outcome, got {:?}",
+                outcomes.get(&crate::test_util::vuln_key("pkg"))
+            );
         };
         assert_eq!(dv.advisories.total(), 1);
         assert!(dv.advisories.items().is_empty());
@@ -1042,7 +1051,7 @@ mod tests {
         let outcomes = client.scan(EcosystemId::Go, &targets, TEST_TIMEOUT).await;
 
         assert_matches!(
-            outcomes.get("linux"),
+            outcomes.get(&crate::test_util::vuln_key("linux")),
             Some(ScanOutcome::Skipped(SkipReason::Truncated))
         );
     }
@@ -1083,10 +1092,11 @@ mod tests {
             .scan(EcosystemId::Cargo, &targets, TEST_TIMEOUT)
             .await;
 
-        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("time") else {
+        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get(&crate::test_util::vuln_key("time"))
+        else {
             panic!(
                 "expected Vulnerable outcome, got {:?}",
-                outcomes.get("time")
+                outcomes.get(&crate::test_util::vuln_key("time"))
             );
         };
         assert_eq!(dv.advisories.total(), 1);
@@ -1128,8 +1138,12 @@ mod tests {
 
         // total() still reflects the batch stub count; the failed fetch
         // is dropped rather than rendered half-populated.
-        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("pkg") else {
-            panic!("expected Vulnerable outcome, got {:?}", outcomes.get("pkg"));
+        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get(&crate::test_util::vuln_key("pkg"))
+        else {
+            panic!(
+                "expected Vulnerable outcome, got {:?}",
+                outcomes.get(&crate::test_util::vuln_key("pkg"))
+            );
         };
         assert_eq!(dv.advisories.total(), 1);
         assert!(dv.advisories.items().is_empty());
@@ -1158,7 +1172,7 @@ mod tests {
         let targets = vec![target("linux", "5.10.1")];
         let outcomes = client.scan(EcosystemId::Go, &targets, TEST_TIMEOUT).await;
 
-        let Some(outcome) = outcomes.get("linux") else {
+        let Some(outcome) = outcomes.get(&crate::test_util::vuln_key("linux")) else {
             panic!("dependency missing from outcome map");
         };
         assert!(
@@ -1200,7 +1214,8 @@ mod tests {
             .scan(EcosystemId::Bundler, &targets, TEST_TIMEOUT)
             .await;
 
-        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("rack") else {
+        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get(&crate::test_util::vuln_key("rack"))
+        else {
             panic!("expected Vulnerable outcome");
         };
         assert_eq!(dv.advisories.total(), 40);
@@ -1250,11 +1265,11 @@ mod tests {
             .await;
 
         assert_matches!(
-            statuses.get("clean-pkg"),
+            statuses.get(&crate::test_util::vuln_key("clean-pkg")),
             Some(UpgradeStatus::CandidateClean { version }) if version == "2.0.0"
         );
         assert_matches!(
-            statuses.get("bad-pkg"),
+            statuses.get(&crate::test_util::vuln_key("bad-pkg")),
             Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids })
                 if version == "2.0.0"
                     && advisory_ids.items() == ["ADV-1".to_string()]
@@ -1275,7 +1290,7 @@ mod tests {
             .await;
 
         let candidate = ScanTarget {
-            key: "golang.org/x/text".to_string(),
+            key: crate::test_util::vuln_key("golang.org/x/text"),
             osv_name: "golang.org/x/text".to_string(),
             version: "0.4.0".to_string(),
             display_version: "v0.4.0".to_string(),
@@ -1285,7 +1300,7 @@ mod tests {
             .await;
 
         assert_matches!(
-            statuses.get("golang.org/x/text"),
+            statuses.get(&crate::test_util::vuln_key("golang.org/x/text")),
             Some(UpgradeStatus::CandidateClean { version }) if version == "v0.4.0"
         );
     }
@@ -1411,7 +1426,8 @@ mod tests {
         let targets = vec![target("pkg", "1.0.0")];
         let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
 
-        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get("pkg") else {
+        let Some(ScanOutcome::Vulnerable(dv)) = outcomes.get(&crate::test_util::vuln_key("pkg"))
+        else {
             panic!("expected Vulnerable outcome");
         };
         assert_eq!(

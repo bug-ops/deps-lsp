@@ -75,6 +75,27 @@ pub fn test_uri(unix_path: &str) -> url::Url {
     url::Url::from_file_path(path).expect("test_uri: fixture path must be a valid file URL")
 }
 
+/// Builds a [`crate::osv::VulnKey`] from a plain name, for [`crate::osv::VulnerabilityMap`]
+/// test fixtures.
+///
+/// Fixture-only: production code must derive a key via [`crate::osv::vuln_key_for`] or
+/// [`crate::osv::vulnerability_keys`], never construct one directly. Unlike [`crate::osv::vuln_key_for`],
+/// this does **not** normalize `name` — it yields the same key `vuln_key_for` would for a
+/// unique, non-synthetic-range dependency whose already-normalized name is `name`.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::vuln_key;
+///
+/// let key = vuln_key("time");
+/// assert_eq!(key.as_str(), "time");
+/// ```
+#[must_use]
+pub fn vuln_key(name: &str) -> crate::osv::VulnKey {
+    crate::osv::VulnKey::from_name(name.to_string())
+}
+
 /// Minimal [`crate::Metadata`] fixture for tests that only care about a package's name and
 /// latest version — e.g. exercising [`crate::Ecosystem::completion_insert_text`].
 ///

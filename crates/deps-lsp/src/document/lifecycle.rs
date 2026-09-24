@@ -631,9 +631,10 @@ fn commit_parsed_document(
         // removed while staying open accumulated an ever-growing set of orphaned license
         // entries never reclaimed until the document closed.
         doc_state.licenses.remove(removed_dep);
+        let removed_normalized_name = formatter.normalize_package_name(removed_dep);
         doc_state
             .vulnerabilities
-            .remove(&formatter.normalize_package_name(removed_dep));
+            .retain(|key, _| key.as_str() != removed_normalized_name);
         doc_state
             .outcomes
             .remove(&formatter.normalize_package_name(removed_dep));
