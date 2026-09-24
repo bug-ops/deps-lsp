@@ -1070,14 +1070,13 @@ mod tests {
         non_registry_fixture: ".gitlab-ci.yml" => "include:\n  - project: org/proj\n    ref: v1.0.0\n";
     }
 
-    // #1365/#1370: GitLab CI's `$VAR`/`${VAR}`/`%VAR%`/`{{ }}`/`{% %}`/`@VAR@`/`<%= %>`/
-    // `$[[ inputs.x ]]`-in-ref placeholder is guarded both by
+    // #1365/#1370/#1391: GitLab CI's `$VAR`/`${VAR}`/`%VAR%`/`{{ }}`/`{% %}`/`@VAR@`/`<%= %>`/
+    // `$[[ inputs.x ]]`-in-ref placeholder is guarded by
     // `GitlabCiFormatter::requirement_is_placeholder` (the central gate `deps-core`'s
-    // `plan_verified_fix`/`build_unsatisfiable_fix_action`/REFACTOR loop all consult) and,
-    // independently, by `format_version_replacing_for`'s own no-op guard (see
-    // `formatter::contains_unresolved_gitlab_variable`) — with its own hand-written regression
-    // test exercising the real formatter + a real parsed dependency through
-    // `plan_vulnerability_fix`
+    // `plan_verified_fix`/`build_unsatisfiable_fix_action`/REFACTOR loop all consult via
+    // `edit::requirement_is_placeholder_for` — see `formatter::contains_unresolved_gitlab_variable`)
+    // — with its own hand-written regression test exercising the real formatter + a real
+    // parsed dependency through `plan_vulnerability_fix`
     // (`formatter::tests::test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite`).
     // This uses the `formatter_guarded` arm (not `reachable: true`/`reachable: false`, both
     // structurally unusable here independent of the guard existing):

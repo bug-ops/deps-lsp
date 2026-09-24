@@ -326,18 +326,18 @@ mod tests {
         non_registry_fixture: "go.mod" => "module example.com/myapp\n\nrequire github.com/acme/secretmod v1.0.0\n\nreplace github.com/acme/secretmod => ./local/secretmod\n";
     }
 
-    // #1377/#1379: `go.mod`'s `require` directive grammar has no placeholder/interpolation
-    // syntax of its own — a version field is always a single, space-free token — but a
-    // manifest pre-processed by external templating (`envsubst`, a Go `text/template` pass,
-    // CI templating) commonly leaves one of these shapes there anyway; `parse_require_line`'s
-    // #1379 widening (see that function's doc) keeps the full placeholder text as `version`
-    // instead of truncating it to the first whitespace-delimited fragment, so it stays a
-    // normal registry-sourced `Some(version_requirement)` and reaches
-    // `plan_vulnerability_fix`/`format_version_replacing_for` directly — depends on
-    // `GoFormatter`'s own `requirement_contains_template_placeholder` guard. Supersedes the
-    // pre-#1377 `no_placeholder_syntax:` marker here, which predated the discovery that
-    // external templating can still leave one of these shapes in a `require` line's version
-    // field even though `go.mod`'s own grammar has no such syntax.
+    // #1377/#1379/#1391: `go.mod`'s `require` directive grammar has no placeholder/
+    // interpolation syntax of its own — a version field is always a single, space-free
+    // token — but a manifest pre-processed by external templating (`envsubst`, a Go
+    // `text/template` pass, CI templating) commonly leaves one of these shapes there anyway;
+    // `parse_require_line`'s #1379 widening (see that function's doc) keeps the full
+    // placeholder text as `version` instead of truncating it to the first whitespace-delimited
+    // fragment, so it stays a normal registry-sourced `Some(version_requirement)` and reaches
+    // `deps_core::edit::plan_vulnerability_fix` directly — depends on
+    // `RequirementResolution::requirement_is_placeholder`'s shared default (`GoFormatter` has
+    // no override). Supersedes the pre-#1377 `no_placeholder_syntax:` marker here, which
+    // predated the discovery that external templating can still leave one of these shapes in
+    // a `require` line's version field even though `go.mod`'s own grammar has no such syntax.
     deps_core::unresolved_requirement_conformance! {
         mod go_unresolved_requirement_conformance;
         build: GoEcosystem::new(Arc::new(deps_core::HttpCache::new()));

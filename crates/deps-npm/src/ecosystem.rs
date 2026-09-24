@@ -456,13 +456,14 @@ mod tests {
             r#"{"dependencies": {"acme-widgets": "catalog:", "known-good-control": "1.0.0"}}"#;
     }
 
-    // #1374/#1379: an unresolved external-templating placeholder (`$VAR`/`${VAR}`, `{{ }}`,
-    // `@VAR@`, `%VAR%`, `<%= %>` — `envsubst`, CI templating, Yeoman-style generators) in a
-    // plain string version value is not special-cased by
+    // #1374/#1379/#1391: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
+    // `{{ }}`, `@VAR@`, `%VAR%`, `<%= %>` — `envsubst`, CI templating, Yeoman-style
+    // generators) in a plain string version value is not special-cased by
     // `string_valued_entries`/`classify_non_registry_specifier`, so it stays a normal
     // registry-sourced `Some(version_requirement)` — unlike `catalog:` above, this reaches
-    // `plan_vulnerability_fix`/`format_version_replacing_for` directly and depends on
-    // `NpmFormatter`'s own `requirement_contains_template_placeholder` guard.
+    // `deps_core::edit::plan_vulnerability_fix` directly and depends on
+    // `RequirementResolution::requirement_is_placeholder`'s shared default (`NpmFormatter`
+    // has no override), consulted via `deps_core::edit::requirement_is_placeholder_for`.
     deps_core::unresolved_requirement_conformance! {
         mod npm_dollar_placeholder_conformance;
         build: NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));

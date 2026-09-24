@@ -698,13 +698,14 @@ mod tests {
         fixture: "requirements.txt" => "known-good-control==1.0.0\nmylib==${VERSION}\n";
     }
 
-    // #1374/#1379: unlike the PEP 440 `mylib==${VERSION}` requirements.txt/PEP 621 form above,
-    // `[tool.poetry.dependencies]`'s string-form entries have no upstream PEP 440/508
+    // #1374/#1379/#1391: unlike the PEP 440 `mylib==${VERSION}` requirements.txt/PEP 621 form
+    // above, `[tool.poetry.dependencies]`'s string-form entries have no upstream PEP 440/508
     // validation (`PypiParser::parse_poetry_dependency` takes the raw TOML string value
     // directly) — an unresolved external-templating placeholder there (`$VAR`/`${VAR}`,
     // `{{ }}`, `@VAR@`, `%VAR%`, `<%= %>`) stays a normal `Some(version_requirement)` and
-    // reaches `plan_vulnerability_fix`/`format_version_replacing_for` directly, depending
-    // entirely on `PypiFormatter`'s own `requirement_contains_template_placeholder` guard.
+    // reaches `deps_core::edit::plan_vulnerability_fix` directly, depending entirely on
+    // `RequirementResolution::requirement_is_placeholder`'s shared default (`PypiFormatter`
+    // has no override).
     deps_core::unresolved_requirement_conformance! {
         mod pypi_poetry_dollar_placeholder_conformance;
         build: PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));

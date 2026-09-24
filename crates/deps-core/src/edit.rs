@@ -16,6 +16,172 @@ use crate::lsp_helpers::{
 };
 use crate::{ConcreteVersion, Dependency, ParseResult, VersionReq};
 
+/// Whether `current` — or `dep`'s own literal version span — is an unexpanded placeholder.
+///
+/// Checks both `current` (the requirement text a caller is about to consider rewriting) and
+/// [`Dependency::version_literal`] (when present) rather than `current` alone, folding
+/// `deps-swift`'s literal-vs-synthesized-comparator distinction (a `from: "\(v)"` declaration's
+/// `current` is a synthesized `">=\(v), <1.0.0"` comparator, while `version_literal` is the raw
+/// `\(v)` interpolation actually embedded in the manifest) into one shared check instead of a
+/// per-ecosystem `format_version_replacing_for` override having to re-derive it.
+///
+/// This is the gate every central edit-planning call site
+/// ([`collect_update_candidates`], [`plan_verified_fix`],
+/// `crate::lsp_helpers::code_actions`'s unsatisfiable-requirement fix builder and REFACTOR
+/// "Update to X" loop) checks before ever calling [`replacement_text`] — see that function's
+/// doc for why the two are split into a boolean gate and a text-producing step rather than one
+/// combined call.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::requirement_is_placeholder_for;
+/// use deps_core::lsp_helpers::{DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering, RequirementResolution, SourcePolicy};
+/// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
+///
+/// struct PlainFormatter;
+/// impl PackageNaming for PlainFormatter {}
+/// impl PackageRendering for PlainFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for PlainFormatter {}
+/// impl DiagnosticMessages for PlainFormatter {}
+/// impl DiagnosticPolicy for PlainFormatter {}
+/// impl SourcePolicy for PlainFormatter {}
+/// impl OsvNaming for PlainFormatter {}
+///
+/// struct PlainDependency(PackageName);
+/// impl Dependency for PlainDependency {
+///     fn name(&self) -> &PackageName {
+///         &self.0
+///     }
+///     fn name_range(&self) -> deps_core::position::Range {
+///         deps_core::position::Range::default()
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<deps_core::position::Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn std::any::Any {
+///         self
+///     }
+/// }
+///
+/// let dep = PlainDependency(PackageName::new("example"));
+/// assert!(!requirement_is_placeholder_for(&PlainFormatter, &dep, "^1.2"));
+/// assert!(requirement_is_placeholder_for(&PlainFormatter, &dep, "{{ version }}"));
+/// ```
+#[must_use]
+pub fn requirement_is_placeholder_for(
+    formatter: &dyn EcosystemFormatter,
+    dep: &dyn Dependency,
+    current: &str,
+) -> bool {
+    formatter.requirement_is_placeholder(&VersionReq::new(current))
+        || dep
+            .version_literal()
+            .is_some_and(|literal| formatter.requirement_is_placeholder(&VersionReq::new(literal)))
+}
+
+/// The only production path that rewrites a manifest's version-requirement text.
+///
+/// `None` when [`requirement_is_placeholder_for`] says `current`/`dep`'s literal is an
+/// unexpanded placeholder, else `Some(formatter.format_version_replacing_for(dep, version,
+/// current))`.
+///
+/// Centralizing the placeholder gate here — rather than leaving it to each ecosystem's
+/// [`PackageRendering::format_version_replacing`](crate::lsp_helpers::PackageRendering::format_version_replacing)/
+/// [`format_version_replacing_for`](crate::lsp_helpers::PackageRendering::format_version_replacing_for)
+/// override to re-check — means a formatter implementation can never destructively rewrite a
+/// placeholder no matter how it is reached: the 14 previously hand-rolled per-crate guards
+/// inside those methods are gone (#1391), and this free function is the sole call site that
+/// still invokes them in production. Every central edit-planning call site
+/// ([`collect_update_candidates`], [`plan_verified_fix`],
+/// `crate::lsp_helpers::code_actions`'s unsatisfiable-requirement fix builder and REFACTOR
+/// "Update to X" loop) already checks [`requirement_is_placeholder_for`] as an early gate for
+/// its own control-flow reasons (skip vs. `Err`/`None`/`continue` differ per caller) before
+/// ever reaching this call — that earlier check makes this function's own `None` branch
+/// unreachable in practice, and is kept anyway as a fail-closed defense-in-depth backstop
+/// rather than relied upon as the only gate.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::replacement_text;
+/// use deps_core::lsp_helpers::{DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering, RequirementResolution, SourcePolicy};
+/// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
+///
+/// struct PlainFormatter;
+/// impl PackageNaming for PlainFormatter {}
+/// impl PackageRendering for PlainFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for PlainFormatter {}
+/// impl DiagnosticMessages for PlainFormatter {}
+/// impl DiagnosticPolicy for PlainFormatter {}
+/// impl SourcePolicy for PlainFormatter {}
+/// impl OsvNaming for PlainFormatter {}
+///
+/// struct PlainDependency(PackageName);
+/// impl Dependency for PlainDependency {
+///     fn name(&self) -> &PackageName {
+///         &self.0
+///     }
+///     fn name_range(&self) -> deps_core::position::Range {
+///         deps_core::position::Range::default()
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<deps_core::position::Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn std::any::Any {
+///         self
+///     }
+/// }
+///
+/// let dep = PlainDependency(PackageName::new("example"));
+/// assert_eq!(
+///     replacement_text(&PlainFormatter, &dep, &ConcreteVersion::new("1.2.3"), "^1.0"),
+///     Some("1.2.3".to_string())
+/// );
+/// assert_eq!(
+///     replacement_text(&PlainFormatter, &dep, &ConcreteVersion::new("1.2.3"), "{{ version }}"),
+///     None
+/// );
+/// ```
+#[must_use]
+pub fn replacement_text(
+    formatter: &dyn EcosystemFormatter,
+    dep: &dyn Dependency,
+    version: &ConcreteVersion,
+    current: &str,
+) -> Option<String> {
+    if requirement_is_placeholder_for(formatter, dep, current) {
+        return None;
+    }
+    Some(formatter.format_version_replacing_for(dep, version, current))
+}
+
 /// Protocol-agnostic replacement for `ls_types::TextEdit` — a single manifest-text
 /// replacement.
 ///
@@ -529,7 +695,7 @@ pub fn collect_update_candidates(
         // own classification — a placeholder is never a rewrite candidate regardless of what
         // status an ecosystem's own (possibly still-buggy) classification logic reports for it,
         // the same defense-in-depth reasoning as the other three central edit-planning gates.
-        if formatter.requirement_is_placeholder(version_req) {
+        if requirement_is_placeholder_for(formatter, dep, version_req.as_str()) {
             continue;
         }
         if formatter.requirement_status_for(dep, version_req, latest) != RequirementStatus::Outdated
@@ -574,7 +740,10 @@ pub fn collect_update_candidates(
             continue;
         }
 
-        let new_text = formatter.format_version_replacing_for(dep, latest, version_req.as_str());
+        // Unreachable after the gate above; fails closed rather than unwrapping.
+        let Some(new_text) = replacement_text(formatter, dep, latest, version_req.as_str()) else {
+            continue;
+        };
         if strip_whitespace(&new_text) == strip_whitespace(literal_target) {
             candidates.push(UpdateCandidate::Unplannable {
                 name,
@@ -999,7 +1168,7 @@ pub fn plan_verified_fix(
     // against `current` (the exact text a caller is about to consider rewriting), not
     // `dep.version_requirement()`, since a caller may reach this with `current` derived from
     // somewhere other than the dependency's own preserved requirement field.
-    if formatter.requirement_is_placeholder(&VersionReq::new(current)) {
+    if requirement_is_placeholder_for(formatter, dep, current) {
         return Err(VulnFixSkip::UnresolvedPlaceholder);
     }
 
@@ -1012,7 +1181,10 @@ pub fn plan_verified_fix(
         return Err(VulnFixSkip::RequirementAlreadyResolves);
     }
 
-    let new_text = formatter.format_version_replacing_for(dep, &fix_concrete, current);
+    // Unreachable after the gate above; fails closed rather than unwrapping.
+    let Some(new_text) = replacement_text(formatter, dep, &fix_concrete, current) else {
+        return Err(VulnFixSkip::UnresolvedPlaceholder);
+    };
     let literal_target = dep.version_literal().unwrap_or(current);
     if strip_whitespace(literal_target) == strip_whitespace(&new_text) {
         return Err(VulnFixSkip::NoOpRewrite);

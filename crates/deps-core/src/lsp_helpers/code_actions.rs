@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, Range, WorkspaceEdit};
 
+use crate::edit::{replacement_text, requirement_is_placeholder_for};
 use crate::osv::ScanOutcome;
 use crate::{Dependency, ParseResult, Registry, VersionReq};
 
@@ -197,7 +198,7 @@ fn build_unsatisfiable_fix_action(
     // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
     // text a fix action could ever replace, independent of whether `compile_requirement`
     // happens to also return `None` for it.
-    if formatter.requirement_is_placeholder(version_req) {
+    if requirement_is_placeholder_for(formatter, dep, version_req.as_str()) {
         return None;
     }
     if !formatter.can_resolve_source(&dep.source()) {
@@ -223,7 +224,8 @@ fn build_unsatisfiable_fix_action(
         );
         return None;
     }
-    let new_text = formatter.format_version_replacing_for(dep, &latest, version_req.as_str());
+    // Unreachable after the gate above; fails closed rather than unwrapping.
+    let new_text = replacement_text(formatter, dep, &latest, version_req.as_str())?;
 
     // Mirrors `build_vulnerability_fix_action`'s N1 guard: compares against
     // `dep.version_literal()` rather than `version_req` when the ecosystem provides one,
@@ -583,7 +585,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
     // text a REFACTOR "Update to X" action could ever replace, so the whole loop is skipped
     // rather than relying on every generated edit happening to dedup away as a no-op.
-    if !formatter.requirement_is_placeholder(version_req)
+    if !requirement_is_placeholder_for(formatter, dep, version_req.as_str())
         && let Some(registry_versions) = &registry_versions
     {
         // Same registry-delegated pick hover's `live_latest_idx` uses (see
@@ -601,8 +603,12 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 );
                 continue;
             }
-            let new_text =
-                formatter.format_version_replacing_for(dep, &item.version, version_req.as_str());
+            // Unreachable after the gate above; fails closed rather than unwrapping.
+            let Some(new_text) =
+                replacement_text(formatter, dep, &item.version, version_req.as_str())
+            else {
+                continue;
+            };
 
             if !emitted_texts.insert(strip_whitespace(&new_text)) {
                 continue;
