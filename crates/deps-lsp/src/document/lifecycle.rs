@@ -2754,7 +2754,14 @@ tokio = "1.0"
                  #abcdef1234567890abcdef1234567890abcdef12\"\n",
             )
             .unwrap();
-            let lock_file = std::fs::File::open(&lock_path).unwrap();
+            // `write(true)`, not a read-only `File::open`: on Windows, `set_modified` calls
+            // `SetFileTime`, which needs `FILE_WRITE_ATTRIBUTES` access — a plain
+            // `GENERIC_READ` handle is denied that with `ERROR_ACCESS_DENIED` (Unix's
+            // `futimens` has no such requirement, so this only surfaces on Windows CI).
+            let lock_file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
             let new_mtime =
                 lock_file.metadata().unwrap().modified().unwrap() + Duration::from_secs(2);
             lock_file.set_modified(new_mtime).unwrap();
