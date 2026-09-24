@@ -3586,6 +3586,155 @@ mod tests {
                  ServerState::documents lookup"
             );
         }
+
+        /// Regression coverage for issue #1382: `apply_batch_edit`'s
+        /// `CLIENT_REFRESH_TIMEOUT`-bounded `workspace/applyEdit` wait had no test
+        /// exercising a real, unanswered client — every other `execute_command` test in
+        /// this module (per `next_client_message`'s doc comment above) uses an
+        /// uninitialized `Backend`, where `Client::apply_edit` is gated on
+        /// `State::Initialized` and fails fast, never reaching the timeout branch.
+        ///
+        /// This test drives a real `initialize` request through the composed
+        /// `tower::Service` so the shared `ServerState` actually reaches `Initialized`,
+        /// then drains the resulting `workspace/applyEdit` request off the loopback
+        /// socket without ever feeding a `Response` back — reproducing the exact client
+        /// behavior issue #496 was filed against, now against
+        /// `deps-lsp.updateAllOutdated`'s bulk edit path (`Backend::apply_batch_edit`)
+        /// instead of the removed `deps-lsp.updateVersion` command's own inline
+        /// `apply_edit` call (#1378).
+        #[tokio::test]
+        async fn test_execute_command_update_all_outdated_times_out_on_unanswered_apply_edit() {
+            // See the comment in `test_handle_lockfile_change_computes_ceiling_per_uri` on why this
+            // guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use futures::StreamExt as _;
+            use tower::Service as _;
+
+            let (mut service, mut socket) =
+                tower_lsp_server::LspService::build(Backend::new).finish();
+
+            let init_request = tower_lsp_server::jsonrpc::Request::build("initialize")
+                .id(1_i64)
+                .params(serde_json::to_value(InitializeParams::default()).unwrap())
+                .finish();
+            let init_response = service.call(init_request).await.unwrap();
+            assert!(
+                init_response.is_some_and(|response| response.is_ok()),
+                "initialize must succeed for the shared ServerState to reach `Initialized` \
+                 — without it, `Client::apply_edit` fails fast instead of ever waiting"
+            );
+
+            let backend = service.inner();
+            let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
+                "/test/Cargo.toml",
+            ));
+            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let parse_result = ecosystem
+                .parse_manifest(
+                    &content,
+                    &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+                )
+                .await
+                .unwrap();
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.set_version(Some(1));
+            doc_state.set_loaded();
+            let mut cached = HashMap::new();
+            cached.insert(
+                "serde".into(),
+                deps_core::PackageVersions::latest_only("1.2.0"),
+            );
+            doc_state.update_cached_versions(cached);
+            assert!(doc_state.is_ready_for_batch_update());
+            backend.state.update_document(uri.clone(), doc_state);
+
+            // Drains outgoing server-to-client messages without ever feeding a `Response`
+            // back into the socket — simulating issue #496's exact reproduction (a client
+            // that never answers `workspace/applyEdit`), this time reaching it through
+            // `apply_batch_edit` rather than the removed `updateVersion` command's own
+            // inline `apply_edit` call. Run concurrently with `execute_command` via
+            // `tokio::join!`: draining the first (`applyEdit`) message frees the loopback
+            // channel's single buffer slot, which the later `showMessage` warning needs
+            // room for.
+            let drain_two_messages = async {
+                let mut messages = Vec::new();
+                while messages.len() < 2 {
+                    match socket.next().await {
+                        Some(message) => messages.push(message),
+                        None => break,
+                    }
+                }
+                messages
+            };
+
+            // Bounded from the outside too, so a regressed-away internal timeout fails
+            // with the `.expect()` message below instead of hanging.
+            let start = std::time::Instant::now();
+            let (result, messages) = tokio::time::timeout(
+                CLIENT_REFRESH_TIMEOUT + std::time::Duration::from_secs(4),
+                async {
+                    tokio::join!(
+                        backend.execute_command(command_params(&uri)),
+                        drain_two_messages
+                    )
+                },
+            )
+            .await
+            .expect(
+                "execute_command did not return within CLIENT_REFRESH_TIMEOUT + 4s — \
+                 apply_batch_edit's internal timeout appears to be broken or removed",
+            );
+            let elapsed = start.elapsed();
+
+            assert_eq!(
+                result,
+                Ok(None),
+                "execute_command must still succeed even after apply_edit times out"
+            );
+            assert_eq!(
+                messages.len(),
+                2,
+                "expected exactly the timed-out workspace/applyEdit request and the \
+                 follow-up window/showMessage warning, got {messages:?}"
+            );
+            assert_eq!(
+                messages[0].method(),
+                "workspace/applyEdit",
+                "server must have actually attempted the batch edit (proving the timeout, \
+                 not some other short-circuit, is why execute_command returned) even though \
+                 this harness never answers it"
+            );
+            assert_eq!(messages[1].method(), "window/showMessage");
+            let warning: tower_lsp_server::ls_types::ShowMessageParams = serde_json::from_value(
+                messages[1]
+                    .params()
+                    .expect("window/showMessage must carry params")
+                    .clone(),
+            )
+            .unwrap();
+            assert_eq!(
+                warning.message,
+                format!(
+                    "deps-lsp: the editor did not respond to the dependency updates within \
+                     {CLIENT_REFRESH_TIMEOUT:?}"
+                ),
+                "expected apply_batch_edit's own timeout warning, not some other refusal"
+            );
+
+            assert!(
+                elapsed >= CLIENT_REFRESH_TIMEOUT,
+                "expected apply_batch_edit to wait out the full {CLIENT_REFRESH_TIMEOUT:?} \
+                 before giving up, took only {elapsed:?} instead"
+            );
+            assert!(
+                elapsed < CLIENT_REFRESH_TIMEOUT + std::time::Duration::from_secs(4),
+                "expected apply_batch_edit's timeout branch to return promptly after \
+                 {CLIENT_REFRESH_TIMEOUT:?}, took {elapsed:?} instead (possible regression: \
+                 an unbounded await here would hang until the test harness itself times out)"
+            );
+        }
     }
 
     #[cfg(feature = "github-actions")]
