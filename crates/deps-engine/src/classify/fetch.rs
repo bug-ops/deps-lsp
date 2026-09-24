@@ -1018,45 +1018,16 @@ mod tests {
     mod dedup_by_source_collision_tests {
         use super::*;
         use deps_core::Dependency;
-        use deps_core::lsp_helpers::{
-            DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-            RequirementResolution, SourcePolicy,
-        };
         use deps_core::position::{Position, Range};
+        use deps_core::test_util::StubFormatter;
         use std::any::Any;
 
-        /// Unlike the real `CargoFormatter`, treats *both* `Registry` and
-        /// `AlternateRegistry` as resolvable — needed so two distinct source values can
-        /// both pass gate 1 (resolvability) and reach gate 2 (collision) in the same test.
-        struct AlternateAwareFormatter;
-        impl PackageNaming for AlternateAwareFormatter {}
-
-        impl PackageRendering for AlternateAwareFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for AlternateAwareFormatter {}
-
-        impl DiagnosticMessages for AlternateAwareFormatter {}
-
-        impl DiagnosticPolicy for AlternateAwareFormatter {}
-
-        impl SourcePolicy for AlternateAwareFormatter {
-            fn can_resolve_source(&self, source: &DependencySource) -> bool {
-                matches!(
-                    source,
-                    DependencySource::Registry | DependencySource::AlternateRegistry { .. }
-                )
-            }
-        }
-
-        impl OsvNaming for AlternateAwareFormatter {}
+        /// Treats both `Registry` and `AlternateRegistry` as resolvable, mirroring the real
+        /// `CargoFormatter`'s own `resolves_alternate_registry` override — needed so two
+        /// distinct source values can both pass gate 1 (resolvability) and reach gate 2
+        /// (collision) in the same test.
+        const ALTERNATE_AWARE_FORMATTER: StubFormatter =
+            StubFormatter::new().with_alternate_registry_resolution();
 
         struct MockDep {
             name: PackageName,
@@ -1129,7 +1100,7 @@ mod tests {
             };
 
             let (sources, collided) =
-                dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+                dedup_dependencies_by_source(&parse_result, &ALTERNATE_AWARE_FORMATTER);
 
             assert!(
                 !sources.contains_key(&PackageName::new("shared-name")),
@@ -1159,7 +1130,7 @@ mod tests {
             };
 
             let (sources, collided) =
-                dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+                dedup_dependencies_by_source(&parse_result, &ALTERNATE_AWARE_FORMATTER);
 
             assert!(collided.is_empty());
             assert_eq!(
@@ -1185,7 +1156,7 @@ mod tests {
             };
 
             let (sources, collided) =
-                dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+                dedup_dependencies_by_source(&parse_result, &ALTERNATE_AWARE_FORMATTER);
 
             assert!(sources.is_empty());
             assert!(collided.is_empty());
@@ -1223,7 +1194,7 @@ mod tests {
 
             let log = deps_core::test_util::capture_tracing_output(|| {
                 let (sources, collided) =
-                    dedup_dependencies_by_source(&parse_result, &AlternateAwareFormatter);
+                    dedup_dependencies_by_source(&parse_result, &ALTERNATE_AWARE_FORMATTER);
                 assert!(!sources.contains_key(&PackageName::new("shared-name")));
                 assert!(collided.contains(&PackageName::new("shared-name")));
             });

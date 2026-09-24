@@ -551,21 +551,8 @@ mod tests {
 
     /// A formatter with no `compile_requirement` override (like GitHub Actions/GitLab CI) —
     /// `plan_vulnerability_fix`'s own textual no-op guard is the only available signal.
-    struct NoCompileRequirementFormatter;
-    impl PackageNaming for NoCompileRequirementFormatter {}
-    impl PackageRendering for NoCompileRequirementFormatter {
-        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
-            v.to_string()
-        }
-        fn package_url(&self, name: &PackageName) -> String {
-            name.as_str().to_string()
-        }
-    }
-    impl RequirementResolution for NoCompileRequirementFormatter {}
-    impl DiagnosticMessages for NoCompileRequirementFormatter {}
-    impl DiagnosticPolicy for NoCompileRequirementFormatter {}
-    impl SourcePolicy for NoCompileRequirementFormatter {}
-    impl OsvNaming for NoCompileRequirementFormatter {}
+    const NO_COMPILE_REQUIREMENT_FORMATTER: deps_core::test_util::StubFormatter =
+        deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
     fn advisory(id: &str, fixed_version: &str) -> std::sync::Arc<Advisory> {
         std::sync::Arc::new(
@@ -729,7 +716,7 @@ mod tests {
             &dv,
             "serde",
             &analysis,
-            &NoCompileRequirementFormatter,
+            &NO_COMPILE_REQUIREMENT_FORMATTER,
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );

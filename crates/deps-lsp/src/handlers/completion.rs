@@ -377,25 +377,6 @@ mod tests {
         CompletionItemKind, Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
 
-    struct MockFormatter;
-    impl deps_core::PackageNaming for MockFormatter {}
-
-    impl deps_core::PackageRendering for MockFormatter {
-        fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-            version.to_string()
-        }
-
-        fn package_url(&self, name: &deps_core::PackageName) -> String {
-            format!("https://example.com/{}", name.as_str())
-        }
-    }
-
-    impl deps_core::RequirementResolution for MockFormatter {}
-    impl deps_core::DiagnosticMessages for MockFormatter {}
-    impl deps_core::DiagnosticPolicy for MockFormatter {}
-    impl deps_core::SourcePolicy for MockFormatter {}
-    impl deps_core::OsvNaming for MockFormatter {}
-
     /// Generic test double for [`deps_core::Ecosystem`], configurable per test so
     /// `fallback_completion`/`search_packages` tests can observe (or forbid) a
     /// registry search, and control the resulting completion item's insert text,
@@ -437,7 +418,7 @@ mod tests {
             Arc::clone(&self.registry)
         }
         fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
-            &MockFormatter
+            &deps_core::test_util::StubFormatter::DEFAULT
         }
         fn generate_completions<'a>(
             &'a self,
@@ -561,11 +542,7 @@ mod tests {
     async fn test_completion_missing_document_reports_incomplete_for_flagged_ecosystem() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{
-            DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter, Metadata,
-            OsvNaming, PackageNaming, PackageRendering, ParseResult, Registry,
-            RequirementResolution, SourcePolicy, Version,
-        };
+        use deps_core::{Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version};
         use std::any::Any;
 
         struct NoopRegistry;
@@ -598,29 +575,6 @@ mod tests {
             }
         }
 
-        struct NoopFormatter;
-        impl PackageNaming for NoopFormatter {}
-
-        impl PackageRendering for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for NoopFormatter {}
-
-        impl DiagnosticMessages for NoopFormatter {}
-
-        impl DiagnosticPolicy for NoopFormatter {}
-
-        impl SourcePolicy for NoopFormatter {}
-
-        impl OsvNaming for NoopFormatter {}
-
         /// Stands in for `PypiEcosystem`: overrides `package_search_is_incomplete`
         /// the same way, and `generate_completions` is deliberately `unimplemented!()`
         /// since this test never lets it run.
@@ -648,7 +602,7 @@ mod tests {
                 Arc::new(NoopRegistry)
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &NoopFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn package_search_is_incomplete(&self) -> bool {
                 true
@@ -844,9 +798,7 @@ mod tests {
     async fn test_completion_freshness_enabled_live_reload_changes_label_details_on_next_request() {
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
-            Dependency, DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter,
-            Metadata, OsvNaming, PackageNaming, PackageRendering, ParseResult, Registry,
-            RequirementResolution, SourcePolicy, Version,
+            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
         };
         use std::any::Any;
         use std::path::Path;
@@ -882,29 +834,6 @@ mod tests {
             }
         }
 
-        struct NoopFormatter;
-        impl PackageNaming for NoopFormatter {}
-
-        impl PackageRendering for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for NoopFormatter {}
-
-        impl DiagnosticMessages for NoopFormatter {}
-
-        impl DiagnosticPolicy for NoopFormatter {}
-
-        impl SourcePolicy for NoopFormatter {}
-
-        impl OsvNaming for NoopFormatter {}
-
         /// Stands in for a real ecosystem's `generate_completions`, echoing whatever
         /// `freshness.enabled` it was called with into `label_details` — exactly the
         /// signal real ecosystems derive from `build_version_completion`, without
@@ -933,7 +862,7 @@ mod tests {
                 Arc::new(NoopRegistry)
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &NoopFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn generate_completions<'a>(
                 &'a self,
@@ -2180,37 +2109,10 @@ ser"
 
     #[tokio::test(start_paused = true)]
     async fn test_handle_completion_primary_path_times_out_and_skips_fallback() {
-        use deps_core::{
-            Dependency, DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter,
-            OsvNaming, PackageNaming, PackageRendering, ParseResult, RequirementResolution,
-            SourcePolicy,
-        };
+        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult};
         use std::any::Any;
         use std::path::Path;
         use std::time::Duration;
-
-        struct MockFormatter;
-        impl PackageNaming for MockFormatter {}
-
-        impl PackageRendering for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for MockFormatter {}
-
-        impl DiagnosticMessages for MockFormatter {}
-
-        impl DiagnosticPolicy for MockFormatter {}
-
-        impl SourcePolicy for MockFormatter {}
-
-        impl OsvNaming for MockFormatter {}
 
         // Deliberately `unimplemented!()`: if a primary-path timeout ever falls through
         // to `fallback_completion` again (the N1 double-timeout bug), that path calls
@@ -2239,7 +2141,7 @@ ser"
                 unimplemented!()
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &MockFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn generate_completions<'a>(
                 &'a self,
@@ -2340,9 +2242,7 @@ ser"
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
-            Dependency, DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter,
-            Metadata, OsvNaming, PackageNaming, PackageRendering, ParseResult, Registry,
-            RequirementResolution, SourcePolicy, Version,
+            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
         };
         use std::any::Any;
 
@@ -2376,29 +2276,6 @@ ser"
             }
         }
 
-        struct NoopFormatter;
-        impl PackageNaming for NoopFormatter {}
-
-        impl PackageRendering for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for NoopFormatter {}
-
-        impl DiagnosticMessages for NoopFormatter {}
-
-        impl DiagnosticPolicy for NoopFormatter {}
-
-        impl SourcePolicy for NoopFormatter {}
-
-        impl OsvNaming for NoopFormatter {}
-
         /// Stands in for `PypiEcosystem`: always reports incomplete results, and
         /// returns either zero or one completion item depending on `has_item`.
         struct IncompleteEcosystem {
@@ -2427,7 +2304,7 @@ ser"
                 Arc::new(NoopRegistry)
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &NoopFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn generate_completions<'a>(
                 &'a self,
@@ -2543,32 +2420,9 @@ ser"
     async fn test_origin_version_skips_fallback_search() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{
-            Dependency, DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter,
-            OsvNaming, PackageNaming, PackageRendering, ParseResult, RequirementResolution,
-            SourcePolicy,
-        };
+        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult};
         use std::any::Any;
         use std::path::Path;
-
-        struct MockFormatter;
-        impl PackageNaming for MockFormatter {}
-
-        impl PackageRendering for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for MockFormatter {}
-        impl DiagnosticMessages for MockFormatter {}
-        impl DiagnosticPolicy for MockFormatter {}
-        impl SourcePolicy for MockFormatter {}
-        impl OsvNaming for MockFormatter {}
 
         struct SuppressFallbackEcosystem;
         impl Sealed for SuppressFallbackEcosystem {}
@@ -2596,7 +2450,7 @@ ser"
                 )
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &MockFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn generate_completions<'a>(
                 &'a self,
@@ -2699,31 +2553,10 @@ ser"
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
-            Dependency, DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter,
-            Metadata, OsvNaming, PackageNaming, PackageRendering, ParseResult, Registry,
-            RequirementResolution, SourcePolicy, Version,
+            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
         };
         use std::any::Any;
         use std::path::Path;
-
-        struct MockFormatter;
-        impl PackageNaming for MockFormatter {}
-
-        impl PackageRendering for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for MockFormatter {}
-        impl DiagnosticMessages for MockFormatter {}
-        impl DiagnosticPolicy for MockFormatter {}
-        impl SourcePolicy for MockFormatter {}
-        impl OsvNaming for MockFormatter {}
 
         struct OneResultRegistry;
         impl Registry for OneResultRegistry {
@@ -2809,7 +2642,7 @@ ser"
                 Arc::new(OneResultRegistry)
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &MockFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn generate_completions<'a>(
                 &'a self,
@@ -2908,28 +2741,10 @@ ser"
         use deps_core::completion::{CompletionOrigin, Completions};
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
-            Dependency, DiagnosticMessages, DiagnosticPolicy, Ecosystem, EcosystemFormatter,
-            Metadata, OsvNaming, PackageNaming, PackageRendering, ParseResult, Registry,
-            RequirementResolution, SourcePolicy, Version,
+            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
         };
         use std::any::Any;
         use std::path::Path;
-
-        struct MockFormatter;
-        impl PackageNaming for MockFormatter {}
-        impl PackageRendering for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &deps_core::PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-        impl RequirementResolution for MockFormatter {}
-        impl DiagnosticMessages for MockFormatter {}
-        impl DiagnosticPolicy for MockFormatter {}
-        impl SourcePolicy for MockFormatter {}
-        impl OsvNaming for MockFormatter {}
 
         struct OneResultRegistry;
         impl Registry for OneResultRegistry {
@@ -3017,7 +2832,7 @@ ser"
                 Arc::new(OneResultRegistry)
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &MockFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn generate_completions<'a>(
                 &'a self,

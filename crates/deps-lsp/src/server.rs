@@ -3042,7 +3042,7 @@ mod tests {
             let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
                 parse_result.as_ref(),
                 deps_core::VersionData::new(&cached_versions, &resolved_versions),
-                &crate::test_utils::blocking_ecosystem::NoopFormatter,
+                &deps_core::test_util::StubFormatter::DEFAULT,
                 parse_result.uri(),
                 deps_core::FreshnessSettings::default(),
                 config.policy.diagnostics.to_severities(),

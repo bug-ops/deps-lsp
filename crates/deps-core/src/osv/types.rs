@@ -1798,7 +1798,7 @@ mod informational_record_tests {
 #[cfg(test)]
 mod vulnerability_keys_candidates_tests {
     use super::*;
-    use crate::lsp_helpers::test_support::{MockDep, MockFormatter};
+    use crate::lsp_helpers::test_support::{MOCK_FORMATTER, MockDep};
     use crate::position::{Position, Range};
     use crate::{ConcreteVersion, EcosystemId, PackageName, ParseResult, VersionReq};
 
@@ -1862,7 +1862,7 @@ mod vulnerability_keys_candidates_tests {
             &parse_result,
             &resolved,
             Some(&candidates),
-            &MockFormatter,
+            &MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
         let deps = parse_result.dependencies();
@@ -1914,7 +1914,7 @@ mod vulnerability_keys_candidates_tests {
             &parse_result,
             &resolved,
             None,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
 

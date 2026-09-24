@@ -237,7 +237,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -289,7 +289,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -342,7 +342,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -385,7 +385,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -433,7 +433,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -485,7 +485,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockGoFormatter;
+        let formatter = MOCK_GO_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -545,7 +545,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -598,7 +598,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -649,7 +649,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -689,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_caret_version_0x_edge_cases() {
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         // ^0.2 should only allow 0.2.x
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.2.0"), "^0.2"));
@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn test_caret_version_non_zero_major() {
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         // ^1.2 allows any 1.x.x
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^1.2"));
@@ -730,7 +730,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -783,7 +783,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -835,7 +835,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -939,7 +939,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -985,7 +985,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -1033,7 +1033,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -1084,7 +1084,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -1137,7 +1137,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -1191,7 +1191,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -1248,7 +1248,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),
@@ -1305,7 +1305,7 @@ mod tests {
         use std::collections::HashMap;
         use tower_lsp_server::ls_types::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let config = EcosystemConfig {
             show_up_to_date_hints: true,
             up_to_date_text: "✅".to_string(),

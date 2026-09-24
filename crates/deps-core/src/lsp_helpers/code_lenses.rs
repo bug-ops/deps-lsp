@@ -435,14 +435,14 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits = collect_update_all_edits(&pr, content, versions, &MockFormatter);
+            let edits = collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER);
             assert!(edits.is_empty());
 
             let lenses = generate_code_lenses(
                 &pr,
                 content,
                 versions,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
             );
@@ -462,24 +462,24 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits = collect_update_all_edits(&pr, content, versions, &MockFormatter);
+            let edits = collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER);
             assert_eq!(edits.len(), 2);
             assert_eq!(edits[0].range, range(0, 9, 0, 14));
             assert_eq!(
                 edits[0].new_text,
-                MockFormatter.format_version_for_text_edit(&ConcreteVersion::new("1.2.0"))
+                MOCK_FORMATTER.format_version_for_text_edit(&ConcreteVersion::new("1.2.0"))
             );
             assert_eq!(edits[1].range, range(1, 9, 1, 14));
             assert_eq!(
                 edits[1].new_text,
-                MockFormatter.format_version_for_text_edit(&ConcreteVersion::new("1.3.0"))
+                MOCK_FORMATTER.format_version_for_text_edit(&ConcreteVersion::new("1.3.0"))
             );
 
             let lenses = generate_code_lenses(
                 &pr,
                 content,
                 versions,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
             );
@@ -502,7 +502,7 @@ mod tests {
                 &pr,
                 content,
                 versions,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 pr.uri(),
                 "deps-lsp.updateAllOutdated",
             );
@@ -525,7 +525,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(edits.is_empty());
         }
@@ -545,7 +545,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(
                 edits.is_empty(),
@@ -568,7 +568,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(edits.is_empty());
         }
@@ -587,7 +587,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(
                 edits.is_empty(),
@@ -607,7 +607,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(edits.is_empty());
         }
@@ -629,7 +629,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(edits.is_empty());
         }
@@ -648,7 +648,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(edits.is_empty());
         }
@@ -751,7 +751,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(
                 edits.is_empty(),
@@ -777,7 +777,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert_eq!(edits.len(), 1, "whitespace-only divergence must not skip");
         }
@@ -803,7 +803,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert_eq!(
                 edits.len(),
@@ -834,7 +834,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert_eq!(
                 edits.len(),
@@ -864,7 +864,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert_eq!(
                 edits.len(),
@@ -894,7 +894,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert_eq!(
                 edits.len(),
@@ -921,7 +921,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert!(
                 edits.is_empty(),
@@ -945,11 +945,11 @@ mod tests {
             let resolved = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let edits = collect_update_all_edits(&pr, content, versions, &MockFormatter);
+            let edits = collect_update_all_edits(&pr, content, versions, &MOCK_FORMATTER);
             let diagnostics = generate_diagnostics_from_cache(
                 &pr,
                 versions,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 pr.uri(),
                 crate::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -982,7 +982,7 @@ mod tests {
                 &pr,
                 content,
                 VersionData::new(&cached, &resolved),
-                &MockFormatter,
+                &MOCK_FORMATTER,
             );
             assert_eq!(edits.len(), 1, "the overlapping later edit must be dropped");
         }

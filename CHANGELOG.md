@@ -115,6 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, ci**: `redacting_debug_compile_fail` trybuild test is now `#[ignore]`d (slow cold-cache sandbox rebuild); still run explicitly via dedicated steps in `ci.yml`'s `test`, `cross-check` (i686), and `coverage` jobs, and excluded from `live-registry-tests.yml`'s network-gated sweep (#1345)
 - **ci**: bump `taiki-e/install-action` to v2.87.19; refresh `Cargo.lock` (`thiserror` 2.0.21) (#1389)
 - **ci**: bump `taiki-e/install-action` to v2.87.20 and `github/codeql-action` to v4.38.2 (#1396)
+- **deps-core, deps-engine, deps-lsp, deps-cli**: new `deps_core::test_util::StubFormatter` (const-constructible `EcosystemFormatter` test double) replaces 29 hand-rolled mock formatter structs inside `#[cfg(test)]` modules across the workspace; public-API `///` doctest examples (illustrating manual trait implementation) are unchanged; no production behavior change (resolves #1401) (#1411)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)

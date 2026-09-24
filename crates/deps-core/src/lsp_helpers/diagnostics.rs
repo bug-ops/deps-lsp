@@ -2311,7 +2311,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -2385,7 +2385,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: CREDENTIAL_SHAPED_NAME.into(),
@@ -2424,7 +2424,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: CREDENTIAL_SHAPED_NAME.into(),
@@ -2461,7 +2461,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let injected_name =
             "ok\n  [error] 1:1 totally-real-pkg (vulnerable) — CRITICAL RCE, upgrade now";
         let parse_result = MockParseResult {
@@ -2499,7 +2499,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let injected_name = "bidi\u{202E}gnp.exe\u{200B}";
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -2537,7 +2537,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let injected_name = "evil\u{2028}pkg\u{2029}name";
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -2575,7 +2575,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let oversized_name = "a".repeat(400_000);
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -2616,7 +2616,7 @@ mod tests {
     fn test_generate_diagnostics_from_cache_skips_synthetic_range_dependency() {
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockMixedParseResult {
             deps: vec![
@@ -2662,7 +2662,7 @@ mod tests {
     /// evaluates the retained (capped) subset.
     #[test]
     fn test_generate_diagnostics_from_cache_reports_dependency_ceiling_truncation() {
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let inner = crate::test_util::stub_parse_result_with_dependencies(12);
         let parse_result = crate::dependency_cap::cap_dependencies(inner, 10);
 
@@ -2705,7 +2705,7 @@ mod tests {
     /// A document under the ceiling must never get a ceiling notice.
     #[test]
     fn test_generate_diagnostics_from_cache_no_ceiling_notice_under_the_limit() {
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let inner = crate::test_util::stub_parse_result_with_dependencies(3);
         let parse_result = crate::dependency_cap::cap_dependencies(inner, 10);
 
@@ -2741,7 +2741,7 @@ mod tests {
     fn test_generate_diagnostics_from_cache_no_comparable_versions_is_not_unknown_package() {
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -2807,7 +2807,7 @@ mod tests {
         }
 
         let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = BlockedRegistryParseResult {
             deps: vec![MockDep {
                 name: "internal-crate".into(),
@@ -3095,7 +3095,7 @@ mod tests {
         let first_range = Range::new(Position::new(0, 0), Position::new(0, 14));
         let second_range = Range::new(Position::new(1, 0), Position::new(1, 14));
         let third_range = Range::new(Position::new(2, 0), Position::new(2, 14));
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = BlockedRegistryParseResult {
             deps: vec![
                 MockDep {
@@ -3249,7 +3249,7 @@ mod tests {
         let first_range = Range::new(Position::new(0, 0), Position::new(0, 14));
         let second_range = Range::new(Position::new(1, 0), Position::new(1, 14));
         let credential_name = "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p";
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = BlockedRegistryParseResult {
             deps: vec![
                 MockDep {
@@ -3369,7 +3369,7 @@ mod tests {
             })
             .collect();
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = BlockedRegistryParseResult {
             deps,
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -3483,7 +3483,7 @@ mod tests {
         }
 
         let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let long_alias = "x".repeat(10_000);
         let parse_result = BlockedRegistryParseResult {
             deps: vec![MockDep {
@@ -3619,7 +3619,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "serde".into(),
@@ -3660,7 +3660,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -3702,7 +3702,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -3750,7 +3750,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "left-pad".into(),
@@ -3803,7 +3803,7 @@ mod tests {
 
         // A package missing from `cached` due to a fetch error/timeout (#267) must not be
         // reported as "Unknown package" — it was never successfully asked about.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -3845,7 +3845,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![
@@ -3911,7 +3911,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -3956,7 +3956,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "serde".into(),
@@ -4004,7 +4004,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: CREDENTIAL_SHAPED_NAME.into(),
@@ -4060,7 +4060,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "serde".into(),
@@ -4106,7 +4106,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "path-pkg".into(),
@@ -4150,7 +4150,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![
                 MockDep {
@@ -4207,7 +4207,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![
                 MockDep {
@@ -4274,7 +4274,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![
                 MockDep {
@@ -4342,7 +4342,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "current-pkg".into(),
@@ -4390,7 +4390,7 @@ mod tests {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let mut deps = Vec::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         for i in 0..10u32 {
@@ -4453,7 +4453,7 @@ mod tests {
 
         // #478: an `Actionable` fetch failure must surface its pre-vetted hint
         // text in the diagnostic, not the generic fallback.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -4500,7 +4500,7 @@ mod tests {
         // #479: a registry-wide condition can fail every remaining dependency identically;
         // asserts the 2+ case collapses onto the first failing dependency's range, with the
         // count in the message.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
         let name_range_2 = Range::new(Position::new(1, 0), Position::new(1, 8));
@@ -4590,7 +4590,7 @@ mod tests {
         // n==2 is the lowest n that collapses at all (n==1 stays per-dependency, see
         // `test_generate_diagnostics_from_cache_fetch_failed_not_reported_as_unknown`);
         // confirms `related_information` is populated right at that threshold.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
         let name_range_2 = Range::new(Position::new(1, 0), Position::new(1, 8));
@@ -4660,7 +4660,7 @@ mod tests {
 
         // #478/#485 + #479: a rate-limit gate fails every remaining dependency with the SAME
         // `Actionable` hint — the #479 collapse must not silently drop it.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let name_range_1 = Range::new(Position::new(0, 0), Position::new(0, 8));
         let name_range_2 = Range::new(Position::new(1, 0), Position::new(1, 8));
@@ -4743,7 +4743,7 @@ mod tests {
         // A `Transient` fetch failure has no safe detail to show, so it must
         // fall back to the generic "package status could not be determined"
         // message rather than leak anything failure-specific.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -4786,7 +4786,7 @@ mod tests {
 
         // #478 fix (impl-critic S1): `NotAttempted` (deliberately never queried, e.g.
         // source-collided) must render the SAME generic message as `Transient`, never "Unknown package".
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -4905,7 +4905,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -4945,7 +4945,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5000,7 +5000,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5048,7 +5048,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5105,7 +5105,7 @@ mod tests {
         let published_at_at_boundary =
             PublishTime::from_unix_secs(10_000 - COOLDOWN_SECS.cast_signed());
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "serde".into(),
@@ -5160,7 +5160,7 @@ mod tests {
         let published_at_just_inside =
             PublishTime::from_unix_secs(10_000 - (COOLDOWN_SECS.cast_signed() - 1));
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "serde".into(),
@@ -5209,7 +5209,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5247,7 +5247,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![
@@ -5346,7 +5346,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5391,7 +5391,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5433,7 +5433,7 @@ mod tests {
         // Regression guard for the four handlers (hover, completion, code_lens,
         // inlay_hints) that keep calling `VersionData::new` without
         // `.with_outcomes(..)` — `outcomes: None` must never produce a diagnostic.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5475,7 +5475,7 @@ mod tests {
         // Proves the yanked push sits before the early-`continue`s, so a dep
         // that is both yanked (in-use version) and outdated (vs. latest)
         // gets both diagnostics.
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5531,7 +5531,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "left-pad".into(),
@@ -5590,7 +5590,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "pkg".into(),
@@ -5654,7 +5654,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![MockDep {
                 name: "left-pad".into(),
@@ -5753,7 +5753,7 @@ mod tests {
             let diagnostics = generate_diagnostics_from_cache(
                 &parse_result,
                 VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 parse_result.uri(),
                 crate::freshness::FreshnessSettings::default(),
                 DiagnosticSeverities::default(),
@@ -5762,7 +5762,7 @@ mod tests {
             assert!(
                 diagnostics
                     .iter()
-                    .all(|d| !d.message().starts_with(MockFormatter.deprecated_message())),
+                    .all(|d| !d.message().starts_with(MOCK_FORMATTER.deprecated_message())),
                 "source {source:?} must never surface the deprecation diagnostic for a \
                  coincidentally-named registry package: {diagnostics:?}"
             );
@@ -5777,7 +5777,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &registry_parse_result,
             VersionData::new(&cached_versions, &resolved_versions).with_outcomes(&outcomes),
-            &MockFormatter,
+            &MOCK_FORMATTER,
             registry_parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -5786,7 +5786,7 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message().starts_with(MockFormatter.deprecated_message())),
+                .any(|d| d.message().starts_with(MOCK_FORMATTER.deprecated_message())),
             "control case: a Registry-source dependency must still produce the diagnostic"
         );
     }
@@ -5796,7 +5796,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let name_range = Range::new(Position::new(0, 0), Position::new(0, 5));
 
         let parse_result = MockMarkedParseResult {
@@ -5835,36 +5835,9 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        /// Mirrors a Composer/NuGet/Swift-shaped formatter whose normalized
-        /// name differs from the manifest-declared raw name.
-        struct MockLowercaseFormatter;
-        impl PackageNaming for MockLowercaseFormatter {
-            fn normalize_package_name(&self, name: &PackageName) -> String {
-                name.as_str().to_lowercase()
-            }
-        }
-
-        impl PackageRendering for MockLowercaseFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for MockLowercaseFormatter {}
-
-        impl DiagnosticMessages for MockLowercaseFormatter {}
-
-        impl DiagnosticPolicy for MockLowercaseFormatter {}
-
-        impl SourcePolicy for MockLowercaseFormatter {}
-
-        impl OsvNaming for MockLowercaseFormatter {}
-
-        let formatter = MockLowercaseFormatter;
+        // Mirrors a Composer/NuGet/Swift-shaped formatter whose normalized
+        // name differs from the manifest-declared raw name.
+        let formatter = crate::test_util::StubFormatter::new().with_lowercase_names();
 
         let parse_result = MockParseResult {
             deps: vec![MockDep {
@@ -5908,7 +5881,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![
@@ -5969,7 +5942,7 @@ mod tests {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let parse_result = MockParseResult {
             deps: vec![
@@ -6260,7 +6233,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &MockFormatter,
+            &MOCK_FORMATTER,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -6282,7 +6255,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &registry_parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &MockFormatter,
+            &MOCK_FORMATTER,
             registry_parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -6356,7 +6329,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &MockFormatter,
+            &MOCK_FORMATTER,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -6378,7 +6351,7 @@ mod tests {
         let diagnostics = generate_diagnostics_from_cache(
             &registry_parse_result,
             VersionData::new(&cached_versions, &resolved_versions),
-            &MockFormatter,
+            &MOCK_FORMATTER,
             registry_parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
             DiagnosticSeverities::default(),
@@ -6400,7 +6373,7 @@ mod tests {
             VulnerabilityMap,
         };
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![dep_at("vulnerable-pkg")],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -6451,7 +6424,7 @@ mod tests {
             VulnerabilityMap,
         };
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![dep_at("vulnerable-pkg")],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -6520,7 +6493,7 @@ mod tests {
             VulnerabilityMap,
         };
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![dep_at("vulnerable-pkg")],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -6582,7 +6555,7 @@ mod tests {
             VulnerabilityMap,
         };
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![dep_at("vulnerable-pkg")],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -6644,7 +6617,7 @@ mod tests {
         };
         use std::sync::Arc;
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![dep_at("bad-pkg")],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -6707,7 +6680,7 @@ mod tests {
             VulnSeverity, VulnerabilityMap,
         };
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![dep_at("noisy-pkg")],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -6761,7 +6734,7 @@ mod tests {
         };
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let vulnerable_dep = MockDep {
             name: "pkg".into(),
@@ -6856,7 +6829,7 @@ mod tests {
         };
         use crate::position::{Position, Range};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         let current_major = MockDep {
             name: "serde".into(),
@@ -6949,7 +6922,7 @@ mod tests {
     fn test_generate_diagnostics_skipped_outcome_emits_no_vulnerability_diagnostic() {
         use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
 
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let parse_result = MockParseResult {
             deps: vec![dep_at("git-pkg")],
             uri: crate::test_util::test_uri("/test/Cargo.toml"),
@@ -8298,7 +8271,7 @@ mod tests {
 
         #[test]
         fn no_policy_configured_produces_no_diagnostic() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8328,7 +8301,7 @@ mod tests {
 
         #[test]
         fn policy_configured_but_no_prefetch_data_produces_no_diagnostic() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8357,7 +8330,7 @@ mod tests {
 
         #[test]
         fn denied_license_emits_error_diagnostic() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8400,7 +8373,7 @@ mod tests {
         /// `Diagnostic.message()`, same CWE-532/CWE-117 exposure as R5a/R5c/R5d.
         #[test]
         fn denied_license_diagnostic_redacts_credential_shaped_name() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let credential_name = "https://svcacct:glpat-AAAABBBBCCCCDDDD@gitlab.corp/g/p";
             let parse_result = MockParseResult {
                 deps: vec![MockDep {
@@ -8443,7 +8416,7 @@ mod tests {
 
         #[test]
         fn not_allowed_license_emits_warning_diagnostic() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8482,7 +8455,7 @@ mod tests {
         /// for the dependency name on this same message.
         #[test]
         fn not_allowed_license_diagnostic_sanitizes_bidi_override_in_license_text() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8516,7 +8489,7 @@ mod tests {
 
         #[test]
         fn compliant_license_produces_no_diagnostic() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8548,7 +8521,7 @@ mod tests {
         /// diagnostic *and* the license-policy diagnostic, not one instead of the other.
         #[test]
         fn fires_alongside_unknown_package_diagnostic() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let cached_versions = HashMap::new();
             let resolved_versions = HashMap::new();
@@ -8592,7 +8565,7 @@ mod tests {
         /// C2's original gate).
         #[test]
         fn gradle_dependency_with_recognized_license_is_evaluated_and_compliant() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8633,7 +8606,7 @@ mod tests {
         /// enforcement for Gradle, not just a no-op pass-through.
         #[test]
         fn gradle_dependency_with_recognized_license_is_denied() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8676,7 +8649,7 @@ mod tests {
         /// data at all (NFR-003 graceful degradation), not guessed at.
         #[test]
         fn gradle_dependency_with_unrecognized_license_fails_closed() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8720,7 +8693,7 @@ mod tests {
         /// a still-unrecognized second entry to keep exercising the suppression path).
         #[test]
         fn gradle_partial_normalization_never_manufactures_false_not_allowed() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8769,7 +8742,7 @@ mod tests {
         /// fabricate one).
         #[test]
         fn gradle_partial_normalization_still_allows_denied_to_fire() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8817,7 +8790,7 @@ mod tests {
         /// single-entry POM.
         #[test]
         fn gradle_dual_licensed_pom_is_compliant_if_any_normalized_entry_matches_allow() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8861,7 +8834,7 @@ mod tests {
         /// side would otherwise be compliant.
         #[test]
         fn gradle_dual_licensed_pom_denied_wins_over_allow() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8912,7 +8885,7 @@ mod tests {
         /// `license_prefetch` side is unbounded.
         #[test]
         fn overlong_not_allowed_license_is_truncated_in_message() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(
@@ -8951,7 +8924,7 @@ mod tests {
         /// joined into the message, not render an unbounded list.
         #[test]
         fn many_license_entries_are_capped_in_not_allowed_message() {
-            let formatter = MockFormatter;
+            let formatter = MOCK_FORMATTER;
             let parse_result = single_dep_parse_result();
             let mut cached_versions = HashMap::new();
             cached_versions.insert(

@@ -30,10 +30,7 @@ use deps_core::Registry;
 use deps_core::VersionReq;
 use deps_core::ecosystem::BoxFuture;
 use deps_core::ecosystem::private::Sealed;
-use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
-    PackageRendering, RequirementResolution, SourcePolicy,
-};
+use deps_core::lsp_helpers::EcosystemFormatter;
 use std::any::Any;
 use std::sync::Arc;
 
@@ -69,31 +66,6 @@ impl Registry for StubRegistry {
         self
     }
 }
-
-/// Identity [`EcosystemFormatter`].
-///
-/// Every sub-trait keeps its default, which is enough for
-/// [`crate::classify::license`]'s target-selection logic (a `Registry`-sourced dependency
-/// with an explicit `=`-pinned requirement already resolves without any formatter override).
-pub struct StubFormatter;
-
-impl PackageNaming for StubFormatter {}
-
-impl PackageRendering for StubFormatter {
-    fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name.as_str())
-    }
-}
-
-impl RequirementResolution for StubFormatter {}
-impl DiagnosticMessages for StubFormatter {}
-impl DiagnosticPolicy for StubFormatter {}
-impl SourcePolicy for StubFormatter {}
-impl OsvNaming for StubFormatter {}
 
 /// The single dependency [`TestTier3Ecosystem::parse_manifest`] parses into: named
 /// `"dep-0"`, an explicit `=`-pinned requirement (concrete under every ecosystem's
@@ -249,7 +221,7 @@ impl Ecosystem for TestTier3Ecosystem {
     }
 
     fn formatter(&self) -> &dyn EcosystemFormatter {
-        &StubFormatter
+        &deps_core::test_util::StubFormatter::DEFAULT
     }
 
     fn completion_insert_text(&self, _metadata: &dyn Metadata) -> Option<String> {

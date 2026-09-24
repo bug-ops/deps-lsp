@@ -21,29 +21,8 @@ pub(crate) fn pkg(s: &str) -> PackageName {
     PackageName::new(s)
 }
 
-pub(crate) struct MockFormatter;
-
-impl PackageNaming for MockFormatter {}
-
-impl PackageRendering for MockFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        format!("\"{}\"", version)
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name.as_str())
-    }
-}
-
-impl RequirementResolution for MockFormatter {}
-
-impl DiagnosticMessages for MockFormatter {}
-
-impl DiagnosticPolicy for MockFormatter {}
-
-impl SourcePolicy for MockFormatter {}
-
-impl OsvNaming for MockFormatter {}
+pub(crate) const MOCK_FORMATTER: crate::test_util::StubFormatter =
+    crate::test_util::StubFormatter::new().with_quoted_text_edit();
 
 /// Formatter stub that always reports `Unresolved`, mirroring `MavenFormatter` /
 /// `GradleFormatter`'s override for `${property}` / `$var` requirements.
@@ -83,40 +62,10 @@ impl OsvNaming for MockUnresolvedFormatter {}
 /// version-requirement line (go.mod's `require`) as itself the resolved
 /// version, since it is already the exact MVS-selected version (#235).
 #[cfg(feature = "lsp-responses")]
-pub(crate) struct MockGoFormatter;
-
-#[cfg(feature = "lsp-responses")]
-impl PackageNaming for MockGoFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl PackageRendering for MockGoFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        format!("https://pkg.go.dev/{}", name.as_str())
-    }
-}
-
-#[cfg(feature = "lsp-responses")]
-impl RequirementResolution for MockGoFormatter {
-    fn manifest_requirement_is_resolved_version(&self, _dep: &dyn Dependency) -> bool {
-        true
-    }
-}
-
-#[cfg(feature = "lsp-responses")]
-impl DiagnosticMessages for MockGoFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl DiagnosticPolicy for MockGoFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl SourcePolicy for MockGoFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl OsvNaming for MockGoFormatter {}
+pub(crate) const MOCK_GO_FORMATTER: crate::test_util::StubFormatter =
+    crate::test_util::StubFormatter::new()
+        .with_package_url_prefix("https://pkg.go.dev/")
+        .with_manifest_requirement_as_resolved_version();
 
 /// Formatter stub mirroring `deps-cargo`'s `CargoFormatter`: widens
 /// `can_resolve_source` to accept `AlternateRegistry` (any private/internal
@@ -127,44 +76,8 @@ impl OsvNaming for MockGoFormatter {}
 /// registry's (e.g. for the deps.dev trust-signal gate, which must use the
 /// latter, never the former).
 #[cfg(feature = "lsp-responses")]
-pub(crate) struct MockWidenedResolveFormatter;
-
-#[cfg(feature = "lsp-responses")]
-impl PackageNaming for MockWidenedResolveFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl PackageRendering for MockWidenedResolveFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name.as_str())
-    }
-}
-
-#[cfg(feature = "lsp-responses")]
-impl RequirementResolution for MockWidenedResolveFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl DiagnosticMessages for MockWidenedResolveFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl DiagnosticPolicy for MockWidenedResolveFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl SourcePolicy for MockWidenedResolveFormatter {
-    fn can_resolve_source(&self, source: &crate::parser::DependencySource) -> bool {
-        matches!(
-            source,
-            crate::parser::DependencySource::Registry
-                | crate::parser::DependencySource::AlternateRegistry { .. }
-        )
-    }
-}
-
-#[cfg(feature = "lsp-responses")]
-impl OsvNaming for MockWidenedResolveFormatter {}
+pub(crate) const MOCK_WIDENED_RESOLVE_FORMATTER: crate::test_util::StubFormatter =
+    crate::test_util::StubFormatter::new().with_alternate_registry_resolution();
 
 /// A formatter whose `validate_package_name` always rejects, for exercising
 /// the "Invalid package name" diagnostic path independently of "Unknown package".
@@ -1004,39 +917,11 @@ pub(crate) fn freshness_test_parse_result(name: &str) -> MockParseResult {
 }
 
 /// A formatter whose `format_version_for_text_edit` is the identity —
-/// unlike [`MockFormatter`], which wraps the version in quotes and would
+/// unlike [`MOCK_FORMATTER`], which wraps the version in quotes and would
 /// otherwise confound the N1 no-op-edit guard's own test.
 #[cfg(feature = "lsp-responses")]
-pub(crate) struct IdentityFormatter;
-
-#[cfg(feature = "lsp-responses")]
-impl PackageNaming for IdentityFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl PackageRendering for IdentityFormatter {
-    fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-        version.to_string()
-    }
-
-    fn package_url(&self, name: &PackageName) -> String {
-        format!("https://example.com/{}", name.as_str())
-    }
-}
-
-#[cfg(feature = "lsp-responses")]
-impl RequirementResolution for IdentityFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl DiagnosticMessages for IdentityFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl DiagnosticPolicy for IdentityFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl SourcePolicy for IdentityFormatter {}
-
-#[cfg(feature = "lsp-responses")]
-impl OsvNaming for IdentityFormatter {}
+pub(crate) const IDENTITY_FORMATTER: crate::test_util::StubFormatter =
+    crate::test_util::StubFormatter::DEFAULT;
 
 /// A formatter mimicking `deps-dart`'s non-identity
 /// `format_version_for_text_edit` (wraps the version in a caret
@@ -1316,7 +1201,7 @@ impl<D: Dependency + 'static> ParseResult for SingleDepParseResult<D> {
 
 /// Formatter whose `compile_requirement` does exact-string matching, so
 /// `requirement_is_unsatisfiable` can actually return `true` in a test
-/// (unlike the default `MockFormatter`, whose `compile_requirement`
+/// (unlike the default `MOCK_FORMATTER`, whose `compile_requirement`
 /// default always returns `None`).
 pub(crate) struct ExactMatchFormatter;
 

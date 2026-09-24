@@ -540,25 +540,12 @@ mod tests {
     use deps_core::licenses::LicensePolicy;
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
-    use deps_core::{ConcreteVersion, Dependency, EcosystemId, PackageVersions, ParseResult};
+    use deps_core::{Dependency, EcosystemId, PackageVersions, ParseResult};
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
 
-    struct StubFormatter;
-    impl deps_core::lsp_helpers::PackageNaming for StubFormatter {}
-    impl deps_core::lsp_helpers::PackageRendering for StubFormatter {
-        fn format_version_for_text_edit(&self, v: &ConcreteVersion) -> String {
-            v.to_string()
-        }
-        fn package_url(&self, name: &PackageName) -> String {
-            name.as_str().to_string()
-        }
-    }
-    impl deps_core::lsp_helpers::RequirementResolution for StubFormatter {}
-    impl deps_core::lsp_helpers::DiagnosticMessages for StubFormatter {}
-    impl deps_core::lsp_helpers::DiagnosticPolicy for StubFormatter {}
-    impl deps_core::lsp_helpers::SourcePolicy for StubFormatter {}
-    impl deps_core::lsp_helpers::OsvNaming for StubFormatter {}
+    const STUB_FORMATTER: deps_core::test_util::StubFormatter =
+        deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
     struct TestDep {
         name: PackageName,
@@ -682,7 +669,7 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &StubFormatter,
+            &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
         );
@@ -733,7 +720,7 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &StubFormatter,
+            &STUB_FORMATTER,
             &["serde".to_string()],
             &IgnoreRules::empty(),
         );
@@ -765,10 +752,10 @@ mod tests {
                 name: "tokio".to_string(),
                 update_types: Some(vec![crate::config::UpdateTypeToken::Major]),
             }],
-            &StubFormatter,
+            &STUB_FORMATTER,
         );
 
-        let plan = plan_updates(&analysis, content, &StubFormatter, &[], &ignore_rules);
+        let plan = plan_updates(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
         assert!(matches!(
@@ -800,10 +787,10 @@ mod tests {
                 name: "tokio".to_string(),
                 update_types: None,
             }],
-            &StubFormatter,
+            &STUB_FORMATTER,
         );
 
-        let plan = plan_updates(&analysis, content, &StubFormatter, &[], &ignore_rules);
+        let plan = plan_updates(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
         assert!(
@@ -835,7 +822,7 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &StubFormatter,
+            &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
         );
@@ -868,7 +855,7 @@ mod tests {
         let plan = plan_updates(
             &analysis,
             content,
-            &StubFormatter,
+            &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
         );
@@ -879,16 +866,16 @@ mod tests {
 
     #[test]
     fn test_is_requested_empty_filter_matches_everything() {
-        assert!(is_requested(&[], "serde", &StubFormatter));
+        assert!(is_requested(&[], "serde", &STUB_FORMATTER));
         assert!(is_requested(
             &["serde".to_string()],
             "serde",
-            &StubFormatter
+            &STUB_FORMATTER
         ));
         assert!(!is_requested(
             &["tokio".to_string()],
             "serde",
-            &StubFormatter
+            &STUB_FORMATTER
         ));
     }
 
