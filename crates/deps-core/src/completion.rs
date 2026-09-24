@@ -1912,7 +1912,7 @@ pub async fn complete_versions_at_position(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lsp_helpers::test_support::MockFormatter;
+    use crate::lsp_helpers::test_support::MOCK_FORMATTER;
     use std::any::Any;
     use std::assert_matches;
 
@@ -4930,7 +4930,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "^1.0",
@@ -4945,7 +4945,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "~1.1",
@@ -4959,7 +4959,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "=2.0",
@@ -4973,7 +4973,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "1.0",
@@ -5017,7 +5017,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "!=2.0",
@@ -5062,7 +5062,7 @@ mod tests {
 
         let items = complete_versions_generic_replacing(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "",
@@ -5106,7 +5106,7 @@ mod tests {
 
         let items = complete_versions_generic_replacing(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "",
@@ -5169,7 +5169,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &PanicsIfQueriedRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("private-pkg"),
             &git_source,
             "1.0",
@@ -5263,7 +5263,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_versions_generic_from_routes_source_to_get_versions_from() {
-        use crate::lsp_helpers::test_support::MockWidenedResolveFormatter;
+        use crate::lsp_helpers::test_support::MOCK_WIDENED_RESOLVE_FORMATTER;
 
         let registry = RoutingMockRegistry;
         let alternate = crate::parser::DependencySource::AlternateRegistry {
@@ -5276,7 +5276,7 @@ mod tests {
         // #1136 gate would return an empty vec before ever reaching `get_versions_from`.
         let items = complete_versions_generic_from(
             &registry,
-            &MockWidenedResolveFormatter,
+            &MOCK_WIDENED_RESOLVE_FORMATTER,
             &pkg("test-pkg"),
             &alternate,
             "",
@@ -5320,7 +5320,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "3.0",
@@ -5337,7 +5337,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "",
@@ -5376,7 +5376,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "1.0",
@@ -5412,7 +5412,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "1.0",
@@ -5445,7 +5445,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "1.0",
@@ -5484,7 +5484,7 @@ mod tests {
         // Go has no operators, so empty array
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("github.com/gin-gonic/gin"),
             &crate::parser::DependencySource::Registry,
             "v1.9",
@@ -5525,7 +5525,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("Newtonsoft.Json"),
             &crate::parser::DependencySource::Registry,
             "",
@@ -5572,7 +5572,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "",
@@ -5611,7 +5611,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "",
@@ -5685,7 +5685,7 @@ mod tests {
 
         let items = complete_versions_generic_from(
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             &pkg("test-pkg"),
             &crate::parser::DependencySource::Registry,
             "2.",

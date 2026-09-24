@@ -1538,7 +1538,7 @@ mod tests {
             None,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            &MockFormatter,
+            &MOCK_FORMATTER,
         );
         assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
         assert!(markdown.as_str().contains('…'));
@@ -1561,7 +1561,7 @@ mod tests {
             None,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            &MockFormatter,
+            &MOCK_FORMATTER,
         );
         assert_eq!(
             markdown.as_str(),
@@ -1580,7 +1580,7 @@ mod tests {
             None,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            &MockFormatter,
+            &MOCK_FORMATTER,
         );
         assert_eq!(
             markdown.as_str(),
@@ -1605,7 +1605,7 @@ mod tests {
             None,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            &MockFormatter,
+            &MOCK_FORMATTER,
         );
         assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
     }
@@ -1619,7 +1619,7 @@ mod tests {
             replacement: Some(long_replacement.clone()),
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             markdown.as_str().len() < long_reason.len() + long_replacement.len(),
             "got: {markdown}"
@@ -1639,7 +1639,7 @@ mod tests {
             replacement: None,
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             markdown.as_str().contains(&format!("{at_cap}\n\n")),
             "got: {markdown}"
@@ -1652,7 +1652,7 @@ mod tests {
             replacement: None,
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             markdown
                 .as_str()
@@ -1674,7 +1674,7 @@ mod tests {
             replacement: Some(at_cap.clone()),
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             markdown
                 .as_str()
@@ -1688,7 +1688,7 @@ mod tests {
             replacement: Some(over_cap),
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             markdown.as_str().contains(&format!(
                 "Suggested replacement: `{}…`\n\n",
@@ -1710,7 +1710,7 @@ mod tests {
             replacement: None,
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             !markdown.as_str().contains('\u{202e}'),
             "RLO override must still be blocked; got: {markdown:?}"
@@ -1730,7 +1730,7 @@ mod tests {
             replacement: Some(replacement),
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             !markdown.as_str().contains('\u{0600}'),
             "U+0600 must be stripped from the name-shaped replacement field; got: {markdown:?}"
@@ -1751,7 +1751,7 @@ mod tests {
             replacement: None,
         };
         let mut markdown = HoverMarkdown::new();
-        push_deprecation_hover_section(&mut markdown, &MockFormatter, Some(&deprecation));
+        push_deprecation_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&deprecation));
         assert!(
             markdown.as_str().contains('\u{0600}') && markdown.as_str().contains('\u{200f}'),
             "reason (Prose) must preserve U+0600 and RTL marks unchanged; got: {markdown:?}"
@@ -1895,7 +1895,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -1940,7 +1940,7 @@ mod tests {
             Position::new(0, 0).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -1978,7 +1978,7 @@ mod tests {
             version_range.start.into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2016,7 +2016,7 @@ mod tests {
             version_range.start.into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2051,7 +2051,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2106,7 +2106,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new())
                 .with_ecosystem(crate::EcosystemId::Composer),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2152,7 +2152,7 @@ mod tests {
                 .with_license_source(crate::LicenseSource::DetectedSpdx)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2194,7 +2194,7 @@ mod tests {
                 .with_license_source(crate::LicenseSource::DetectedSpdx)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2233,7 +2233,7 @@ mod tests {
                 .with_license_source(crate::LicenseSource::PomFreeText)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2278,7 +2278,7 @@ mod tests {
                 .with_license_source(crate::LicenseSource::PomFreeText)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2323,7 +2323,7 @@ mod tests {
                 .with_license_source(crate::LicenseSource::PomFreeText)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2365,7 +2365,7 @@ mod tests {
                 .with_license_source(crate::LicenseSource::PomFreeText)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2411,7 +2411,7 @@ mod tests {
                 .with_license_source(crate::LicenseSource::PomFreeText)
                 .with_license_prefetch(&licenses),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2477,7 +2477,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2610,7 +2610,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2643,7 +2643,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2684,7 +2684,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2732,7 +2732,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2793,7 +2793,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2843,7 +2843,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2897,7 +2897,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2949,7 +2949,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -2998,7 +2998,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3050,7 +3050,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3096,7 +3096,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3132,7 +3132,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &ErrorRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3170,7 +3170,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3213,7 +3213,7 @@ mod tests {
                 Position::new(0, 2).into(),
                 VersionData::new(&HashMap::new(), &HashMap::new()),
                 &registry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 crate::freshness::FreshnessSettings::default(),
                 PublishTime::now(),
             )
@@ -3299,7 +3299,7 @@ mod tests {
                 Position::new(0, 2).into(),
                 VersionData::new(&HashMap::new(), &HashMap::new()),
                 &registry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 crate::freshness::FreshnessSettings::default(),
                 PublishTime::now(),
             )
@@ -3349,7 +3349,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockGoFormatter,
+            &MOCK_GO_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3392,7 +3392,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3439,7 +3439,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3474,7 +3474,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings {
                 enabled: false,
                 cooldown_secs: crate::freshness::DEFAULT_COOLDOWN_SECS,
@@ -3516,7 +3516,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3565,7 +3565,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3597,7 +3597,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -3636,7 +3636,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings {
                 enabled: false,
                 cooldown_secs: crate::freshness::DEFAULT_COOLDOWN_SECS,
@@ -3683,7 +3683,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings {
                 enabled: true,
                 cooldown_secs: COOLDOWN_SECS,
@@ -3729,7 +3729,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings {
                 enabled: true,
                 cooldown_secs: COOLDOWN_SECS,
@@ -3799,7 +3799,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             now,
         )
@@ -3862,7 +3862,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             now,
         )
@@ -3916,7 +3916,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             now,
         )
@@ -3969,7 +3969,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             now,
         )
@@ -4105,7 +4105,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4135,7 +4135,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4171,7 +4171,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4226,7 +4226,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4281,7 +4281,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4339,7 +4339,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4406,7 +4406,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4471,7 +4471,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4525,7 +4525,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4570,7 +4570,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4593,7 +4593,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4623,7 +4623,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4656,7 +4656,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4703,7 +4703,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4833,7 +4833,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4889,7 +4889,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -4947,7 +4947,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5009,7 +5009,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5058,7 +5058,7 @@ mod tests {
             &parse_result,
             &resolved_versions,
             None,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::EcosystemId::Cargo,
         );
         let deps = parse_result.dependencies();
@@ -5089,7 +5089,7 @@ mod tests {
             Position::new(3, 2).into(),
             versions,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5108,7 +5108,7 @@ mod tests {
             Position::new(0, 2).into(),
             versions,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5165,7 +5165,7 @@ mod tests {
             &parse_result,
             &resolved_versions,
             Some(&resolved_version_candidates),
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::EcosystemId::Cargo,
         );
         let deps = parse_result.dependencies();
@@ -5197,7 +5197,7 @@ mod tests {
             Position::new(1, 2).into(),
             versions,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5221,7 +5221,7 @@ mod tests {
             Position::new(0, 2).into(),
             versions,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5258,7 +5258,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &NotFoundRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5297,7 +5297,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5341,7 +5341,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5388,7 +5388,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5437,7 +5437,7 @@ mod tests {
                 .with_offline(true)
                 .with_vulnerabilities(&vulns),
             &ErrorRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5478,7 +5478,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()).with_offline(true),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5514,7 +5514,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached, &resolved).with_offline(true),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5560,7 +5560,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&cached_versions, &resolved_versions).with_offline(true),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5597,7 +5597,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5634,7 +5634,7 @@ mod tests {
                 .with_vulnerabilities(&vulns)
                 .with_offline(true),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5673,7 +5673,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5720,7 +5720,7 @@ mod tests {
                 Position::new(0, 2).into(),
                 VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
                 &MockRegistry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 crate::freshness::FreshnessSettings::default(),
                 PublishTime::now(),
             )
@@ -5757,7 +5757,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5829,7 +5829,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5871,7 +5871,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5918,7 +5918,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -5964,7 +5964,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6012,7 +6012,7 @@ mod tests {
                     .with_ecosystem(ecosystem)
                     .with_trust(&deps_dev),
                 &registry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 crate::freshness::FreshnessSettings::default(),
                 PublishTime::now(),
             )
@@ -6033,7 +6033,7 @@ mod tests {
     /// `AlternateRegistry` source must never reach deps.dev, even though it
     /// resolves against this ecosystem's own registry (`resolvable` alone
     /// is the wrong, too-permissive gate — see
-    /// `MockWidenedResolveFormatter`'s docs).
+    /// `MOCK_WIDENED_RESOLVE_FORMATTER`'s docs).
     #[tokio::test]
     async fn test_generate_hover_trust_signal_skips_private_registry_source() {
         let (mut server, deps_dev) = deps_dev_mock_client().await;
@@ -6067,7 +6067,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Cargo)
                 .with_trust(&deps_dev),
             &registry,
-            &MockWidenedResolveFormatter,
+            &MOCK_WIDENED_RESOLVE_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6107,7 +6107,7 @@ mod tests {
                 .with_trust(&deps_dev)
                 .with_offline(true),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6147,7 +6147,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6160,7 +6160,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6237,7 +6237,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
@@ -6301,7 +6301,7 @@ mod tests {
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )

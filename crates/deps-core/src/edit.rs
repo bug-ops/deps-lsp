@@ -1409,7 +1409,7 @@ mod tests {
     mod collect_update_tests {
         use super::*;
         use crate::lsp_helpers::PackageVersions;
-        use crate::lsp_helpers::test_support::{MockDep, MockFormatter, MockParseResult, pkg};
+        use crate::lsp_helpers::test_support::{MOCK_FORMATTER, MockDep, MockParseResult, pkg};
         use crate::{EcosystemId, PackageName};
         use std::collections::HashMap;
 
@@ -1454,7 +1454,7 @@ mod tests {
                 .with_resolved_version_candidates(&candidates)
                 .with_ecosystem(EcosystemId::Cargo);
 
-            let mut planned = collect_update_edits(&pr, content, versions, &MockFormatter);
+            let mut planned = collect_update_edits(&pr, content, versions, &MOCK_FORMATTER);
             planned.sort_by_key(|p| p.edit.range.start.line);
 
             assert_eq!(planned.len(), 2);
@@ -1473,7 +1473,7 @@ mod tests {
             let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MockFormatter);
+            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert_eq!(candidates.len(), 1);
             assert!(matches!(
                 candidates[0],
@@ -1483,7 +1483,7 @@ mod tests {
                 }
             ));
             assert!(
-                collect_update_edits(&pr, content, versions, &MockFormatter).is_empty(),
+                collect_update_edits(&pr, content, versions, &MOCK_FORMATTER).is_empty(),
                 "an unplannable candidate must never reach collect_update_edits's writable subset"
             );
         }
@@ -1551,7 +1551,7 @@ mod tests {
             let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MockFormatter);
+            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert_eq!(candidates.len(), 1);
             assert!(matches!(
                 candidates[0],
@@ -1573,7 +1573,7 @@ mod tests {
             let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
             let versions = VersionData::new(&cached, &resolved);
 
-            let candidates = collect_update_candidates(&pr, content, versions, &MockFormatter);
+            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert!(candidates.is_empty());
         }
     }
@@ -1586,7 +1586,7 @@ mod tests {
         use crate::PackageName;
         use crate::VersionReq;
         use crate::lsp_helpers::test_support::{
-            MockDep, MockFormatter, StrictSemverFormatter, pkg,
+            MOCK_FORMATTER, MockDep, StrictSemverFormatter, pkg,
         };
         use crate::lsp_helpers::{
             DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
@@ -1694,7 +1694,7 @@ mod tests {
             let dv = verified_dv("1.0.2");
 
             let planned =
-                plan_vulnerability_fix(&d, d.version_range, "1", &dv, &MockFormatter).unwrap();
+                plan_vulnerability_fix(&d, d.version_range, "1", &dv, &MOCK_FORMATTER).unwrap();
             assert_eq!(planned.edit.new_text, "\"1.0.2\"");
         }
 
@@ -1707,7 +1707,7 @@ mod tests {
             // A space is not in `is_safe_version_string`'s allowlist.
             let dv = verified_dv("1.2.0 evil");
 
-            let planned = plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &MockFormatter);
+            let planned = plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &MOCK_FORMATTER);
             assert_eq!(planned, Err(VulnFixSkip::UnsafeVersion));
         }
 
@@ -1720,10 +1720,10 @@ mod tests {
             let d = dep("serde", "1", range(0, 8, 0, 9));
             let dv = verified_dv("1.0.2");
 
-            // `MockFormatter::format_version_for_text_edit` quotes its input, so the
+            // `MOCK_FORMATTER.format_version_for_text_edit` quotes its input, so the
             // already-quoted literal fallback below is byte-identical to the planned rewrite.
             let planned =
-                plan_vulnerability_fix(&d, d.version_range, "\"1.0.2\"", &dv, &MockFormatter);
+                plan_vulnerability_fix(&d, d.version_range, "\"1.0.2\"", &dv, &MOCK_FORMATTER);
             assert_eq!(planned, Err(VulnFixSkip::NoOpRewrite));
         }
 

@@ -622,36 +622,8 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     use crate::completion::Completions;
-    use crate::{
-        ConcreteVersion, PackageName, ParseResult, Registry,
-        lsp_helpers::{
-            DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
-            PackageRendering, RequirementResolution, SourcePolicy,
-        },
-    };
-
-    struct MockFormatter;
-    impl PackageNaming for MockFormatter {}
-
-    impl PackageRendering for MockFormatter {
-        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-            version.to_string()
-        }
-
-        fn package_url(&self, name: &PackageName) -> String {
-            format!("https://example.com/{}", name.as_str())
-        }
-    }
-
-    impl RequirementResolution for MockFormatter {}
-
-    impl DiagnosticMessages for MockFormatter {}
-
-    impl DiagnosticPolicy for MockFormatter {}
-
-    impl SourcePolicy for MockFormatter {}
-
-    impl OsvNaming for MockFormatter {}
+    use crate::test_util::StubFormatter;
+    use crate::{ParseResult, Registry, lsp_helpers::EcosystemFormatter};
 
     struct MockEcosystem {
         id: &'static str,
@@ -704,7 +676,7 @@ mod tests {
         }
 
         fn formatter(&self) -> &dyn EcosystemFormatter {
-            &MockFormatter
+            &StubFormatter::DEFAULT
         }
 
         #[cfg(feature = "lsp-responses")]
@@ -780,7 +752,7 @@ mod tests {
         }
 
         fn formatter(&self) -> &dyn EcosystemFormatter {
-            &MockFormatter
+            &StubFormatter::DEFAULT
         }
 
         #[cfg(feature = "lsp-responses")]
@@ -863,7 +835,7 @@ mod tests {
         }
 
         fn formatter(&self) -> &dyn EcosystemFormatter {
-            &MockFormatter
+            &StubFormatter::DEFAULT
         }
 
         #[cfg(feature = "lsp-responses")]

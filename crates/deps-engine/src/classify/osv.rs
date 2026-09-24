@@ -476,30 +476,8 @@ mod tests {
         };
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position, Range};
+        use deps_core::test_util::StubFormatter;
         use std::any::Any;
-
-        struct MockFormatter;
-        impl PackageNaming for MockFormatter {}
-
-        impl PackageRendering for MockFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for MockFormatter {}
-
-        impl DiagnosticMessages for MockFormatter {}
-
-        impl DiagnosticPolicy for MockFormatter {}
-
-        impl SourcePolicy for MockFormatter {}
-
-        impl OsvNaming for MockFormatter {}
 
         struct MockDep {
             name: PackageName,
@@ -580,7 +558,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
@@ -606,7 +584,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
@@ -617,32 +595,9 @@ mod tests {
         /// Formatter stub mirroring `GoFormatter`'s override: every
         /// dependency's manifest requirement is itself the resolved version
         /// (#235's `manifest_requirement_is_resolved_version` unification).
-        struct MockGoFormatter;
-        impl PackageNaming for MockGoFormatter {}
-
-        impl PackageRendering for MockGoFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://pkg.go.dev/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for MockGoFormatter {
-            fn manifest_requirement_is_resolved_version(&self, _dep: &dyn Dependency) -> bool {
-                true
-            }
-        }
-
-        impl DiagnosticMessages for MockGoFormatter {}
-
-        impl DiagnosticPolicy for MockGoFormatter {}
-
-        impl SourcePolicy for MockGoFormatter {}
-
-        impl OsvNaming for MockGoFormatter {}
+        const MOCK_GO_FORMATTER: StubFormatter = StubFormatter::new()
+            .with_package_url_prefix("https://pkg.go.dev/")
+            .with_manifest_requirement_as_resolved_version();
 
         struct MockVPrefixFormatter;
         impl PackageNaming for MockVPrefixFormatter {}
@@ -722,7 +677,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
@@ -755,12 +710,12 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockGoFormatter,
+                &MOCK_GO_FORMATTER,
                 EcosystemId::Go,
             );
             assert_eq!(targets.len(), 1);
             // `.version` (the wire-format value) goes through `formatter.osv_version`,
-            // whose shared default (`deps-core`) strips a leading `v`/`V` — `MockGoFormatter`
+            // whose shared default (`deps-core`) strips a leading `v`/`V` — `MOCK_GO_FORMATTER`
             // doesn't override it, unlike the real `GoFormatter`. `.display_version` is the
             // raw, untransformed value this test is actually about (manifest vs. lockfile
             // authority), so it keeps the native "v" spelling.
@@ -822,7 +777,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Maven,
             );
             assert_eq!(targets.len(), 1);
@@ -845,7 +800,7 @@ mod tests {
                 &cargo_result,
                 &HashMap::new(),
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(targets.len(), 1);
@@ -863,7 +818,7 @@ mod tests {
                 &nuget_result,
                 &HashMap::new(),
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::NuGet,
             );
             assert_eq!(targets.len(), 1);
@@ -886,7 +841,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
@@ -911,7 +866,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(targets.is_empty());
@@ -954,7 +909,7 @@ mod tests {
                     &parse_result,
                     &resolved,
                     &HashMap::new(),
-                    &MockFormatter,
+                    &StubFormatter::DEFAULT,
                     EcosystemId::Cargo,
                 );
                 assert!(targets.is_empty(), "{source:?} must be skipped (step 0)");
@@ -997,7 +952,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Maven,
             );
 
@@ -1034,7 +989,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(
@@ -1060,7 +1015,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Maven,
             );
             assert_eq!(
@@ -1088,7 +1043,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Pypi,
             );
             assert_eq!(
@@ -1113,7 +1068,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(in_use.is_empty());
@@ -1140,7 +1095,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert!(in_use.is_empty());
@@ -1171,7 +1126,7 @@ mod tests {
                 &parse_result,
                 &resolved,
                 &HashMap::new(),
-                &MockFormatter,
+                &StubFormatter::DEFAULT,
                 EcosystemId::Cargo,
             );
             assert_eq!(
@@ -1186,38 +1141,12 @@ mod tests {
     /// a live-check result map that may be missing keys (timeout/outage).
     mod fix_target_verification_tests {
         use super::*;
-        use deps_core::lsp_helpers::{
-            DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-            RequirementResolution, SourcePolicy,
-        };
         use deps_core::osv::{
             Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
             VulnerabilityMap,
         };
+        use deps_core::test_util::StubFormatter;
         use std::sync::Arc;
-
-        struct IdentityFormatter;
-        impl PackageNaming for IdentityFormatter {}
-
-        impl PackageRendering for IdentityFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-
-        impl RequirementResolution for IdentityFormatter {}
-
-        impl DiagnosticMessages for IdentityFormatter {}
-
-        impl DiagnosticPolicy for IdentityFormatter {}
-
-        impl SourcePolicy for IdentityFormatter {}
-
-        impl OsvNaming for IdentityFormatter {}
 
         fn advisory(id: &str, fixed_versions: &[&str]) -> Arc<Advisory> {
             Arc::new(
@@ -1249,7 +1178,7 @@ mod tests {
                 "pkg",
                 &HashMap::new(),
                 &HashMap::new(),
-                &IdentityFormatter,
+                &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
         }
@@ -1270,7 +1199,7 @@ mod tests {
                 "pkg",
                 &latest_native_by_key,
                 &HashMap::new(),
-                &IdentityFormatter,
+                &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Resolved(latest_status));
         }
@@ -1297,7 +1226,7 @@ mod tests {
                 "pkg",
                 &latest_native_by_key,
                 &osv_name_by_key,
-                &IdentityFormatter,
+                &StubFormatter::DEFAULT,
             );
             assert_eq!(
                 resolution,
@@ -1321,7 +1250,7 @@ mod tests {
                 "pkg",
                 &HashMap::new(),
                 &HashMap::new(),
-                &IdentityFormatter,
+                &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
         }
@@ -1341,7 +1270,7 @@ mod tests {
                 "pkg",
                 &HashMap::new(),
                 &HashMap::new(),
-                &IdentityFormatter,
+                &StubFormatter::DEFAULT,
             );
             assert_eq!(resolution, FixTargetResolution::Skip);
         }
@@ -1398,7 +1327,7 @@ mod tests {
                 &vulnerable_keys,
                 &osv_name_by_key,
                 &latest_native_by_key,
-                &IdentityFormatter,
+                &StubFormatter::DEFAULT,
             );
 
             assert_eq!(resolved.len(), 1, "{resolved:?}");

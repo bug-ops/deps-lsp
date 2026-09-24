@@ -38,6 +38,10 @@
 //! for a test whose production call swallows the underlying error to an empty/missing
 //! result rather than surfacing a `Result` directly.
 
+mod stub_formatter;
+#[cfg_attr(docsrs, doc(cfg(feature = "test-util")))]
+pub use stub_formatter::StubFormatter;
+
 /// Builds a [`url::Url`] from a Unix-style absolute test path.
 ///
 /// On Windows, a synthetic `C:` drive is prefixed so the path is

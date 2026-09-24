@@ -722,7 +722,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -811,7 +811,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -882,7 +882,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -945,7 +945,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -1012,7 +1012,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -1090,7 +1090,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -1148,7 +1148,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -1208,7 +1208,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -1266,7 +1266,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &IdentityFormatter,
+            &IDENTITY_FORMATTER,
         )
         .await;
 
@@ -1357,7 +1357,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &IdentityFormatter,
+            &IDENTITY_FORMATTER,
         )
         .await;
 
@@ -1433,7 +1433,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &IdentityFormatter,
+            &IDENTITY_FORMATTER,
         )
         .await;
 
@@ -1496,7 +1496,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &IdentityFormatter,
+            &IDENTITY_FORMATTER,
         )
         .await;
 
@@ -1558,7 +1558,7 @@ mod tests {
             &parse_result,
             &resolved,
             None,
-            &IdentityFormatter,
+            &IDENTITY_FORMATTER,
             crate::EcosystemId::Cargo,
         );
         let deps = parse_result.dependencies();
@@ -1601,7 +1601,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &IdentityFormatter,
+            &IDENTITY_FORMATTER,
         )
         .await;
         assert!(
@@ -1616,7 +1616,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &IdentityFormatter,
+            &IDENTITY_FORMATTER,
         )
         .await;
         assert!(
@@ -1808,7 +1808,7 @@ mod tests {
             versions,
             &content,
             &MockRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -1870,7 +1870,7 @@ mod tests {
             versions,
             &content,
             &ErrorRegistry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -1939,7 +1939,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -2009,7 +2009,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -2062,7 +2062,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -2122,7 +2122,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -2183,7 +2183,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -2236,7 +2236,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -2291,7 +2291,7 @@ mod tests {
             versions,
             &content,
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
         )
         .await;
 
@@ -2586,7 +2586,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
             )
             .await;
 
@@ -2648,7 +2648,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
             )
             .await;
 
@@ -2680,7 +2680,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
             )
             .await;
 
@@ -2711,7 +2711,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
             )
             .await;
 
@@ -2748,7 +2748,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
             )
             .await;
 
@@ -2785,7 +2785,7 @@ mod tests {
                 versions,
                 content,
                 &CaRegistry,
-                &MockFormatter,
+                &MOCK_FORMATTER,
             )
             .await;
 

@@ -1771,43 +1771,15 @@ tokio = "1.0"
             }
         }
 
-        struct IdentityFormatter;
-        impl deps_core::lsp_helpers::PackageNaming for IdentityFormatter {}
-        impl deps_core::lsp_helpers::PackageRendering for IdentityFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &PackageName) -> String {
-                name.as_str().to_string()
-            }
-        }
-        impl deps_core::lsp_helpers::RequirementResolution for IdentityFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticMessages for IdentityFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticPolicy for IdentityFormatter {}
-        impl deps_core::lsp_helpers::SourcePolicy for IdentityFormatter {}
-        impl deps_core::lsp_helpers::OsvNaming for IdentityFormatter {}
+        const IDENTITY_FORMATTER: deps_core::test_util::StubFormatter =
+            deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
         /// Mimics a PEP 503-normalizing ecosystem (PyPI/Poetry, Composer): lowercases the
         /// manifest-declared name the way the real lock-file key is produced.
-        struct LowercaseFormatter;
-        impl deps_core::lsp_helpers::PackageNaming for LowercaseFormatter {
-            fn normalize_package_name(&self, name: &PackageName) -> String {
-                name.as_str().to_lowercase()
-            }
-        }
-        impl deps_core::lsp_helpers::PackageRendering for LowercaseFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &PackageName) -> String {
-                name.as_str().to_string()
-            }
-        }
-        impl deps_core::lsp_helpers::RequirementResolution for LowercaseFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticMessages for LowercaseFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticPolicy for LowercaseFormatter {}
-        impl deps_core::lsp_helpers::SourcePolicy for LowercaseFormatter {}
-        impl deps_core::lsp_helpers::OsvNaming for LowercaseFormatter {}
+        const LOWERCASE_FORMATTER: deps_core::test_util::StubFormatter =
+            deps_core::test_util::StubFormatter::new()
+                .with_package_url_prefix("")
+                .with_lowercase_names();
 
         /// Regression guard for issue #1395: `handle_lockfile_change` has no
         /// `DependencyDiff` to consult (the manifest text is untouched), so it must detect
@@ -1823,7 +1795,7 @@ tokio = "1.0"
                 version_req: None,
             };
             let deps: Vec<&dyn Dependency> = vec![&time, &serde];
-            let formatter = IdentityFormatter;
+            let formatter = IDENTITY_FORMATTER;
             let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
 
             // `time` newly resolved (no lock file entry before `cargo generate-lockfile`).
@@ -1930,7 +1902,7 @@ tokio = "1.0"
                 version_req: None,
             };
             let deps: Vec<&dyn Dependency> = vec![&time];
-            let formatter = IdentityFormatter;
+            let formatter = IDENTITY_FORMATTER;
             let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
 
             let old: HashMap<PackageName, ConcreteVersion> =
@@ -1965,7 +1937,7 @@ tokio = "1.0"
                 version_req: None,
             };
             let deps: Vec<&dyn Dependency> = vec![&django];
-            let formatter = LowercaseFormatter;
+            let formatter = LOWERCASE_FORMATTER;
             let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
 
             // The lock file resolves under the normalized key, never the raw manifest
@@ -2005,7 +1977,7 @@ tokio = "1.0"
                 version_req: Some(VersionReq::new("0.1")),
             };
             let deps: Vec<&dyn Dependency> = vec![&time];
-            let formatter = IdentityFormatter;
+            let formatter = IDENTITY_FORMATTER;
 
             // The collapsed value is always the highest retained entry (0.3.36, a
             // transitive dependency's pin) and never changes across the update below.

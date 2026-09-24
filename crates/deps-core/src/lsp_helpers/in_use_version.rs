@@ -519,7 +519,7 @@ mod tests {
 
     /// Minimal formatter with a real `compile_requirement` (Cargo-style `semver::VersionReq`
     /// semantics), for tests that must distinguish `best_candidate_for_requirement`'s
-    /// precise `compile_requirement` path from `MockFormatter`'s heuristic-only fallback
+    /// precise `compile_requirement` path from `MOCK_FORMATTER`'s heuristic-only fallback
     /// (issue #649 critic finding C1).
     struct CaretFormatter;
 
@@ -918,7 +918,7 @@ mod tests {
             "serde",
             &resolved_versions,
             Some(&candidates),
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
         let plain_result = resolve_in_use_version(
@@ -926,7 +926,7 @@ mod tests {
             "serde",
             &resolved_versions,
             Some(&candidates),
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
 
@@ -964,7 +964,7 @@ mod tests {
             "serde",
             &resolved_versions,
             Some(&candidates),
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
 
@@ -1000,7 +1000,7 @@ mod tests {
             "serde",
             &resolved_versions,
             Some(&candidates),
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
 
@@ -1035,7 +1035,7 @@ mod tests {
             "serde",
             &resolved_versions,
             Some(&candidates),
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
         let without_candidates = resolve_in_use_version(
@@ -1043,7 +1043,7 @@ mod tests {
             "serde",
             &resolved_versions,
             None,
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
 
@@ -1069,7 +1069,7 @@ mod tests {
         let result = best_candidate_for_requirement(
             &candidates,
             &crate::VersionReq::new("1"),
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
         );
 
         assert_eq!(result, Some(&ConcreteVersion::from("1-rc2")));
@@ -1180,7 +1180,7 @@ mod tests {
             "express",
             &HashMap::new(),
             None,
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Npm,
         );
 
@@ -1206,7 +1206,7 @@ mod tests {
             "monolog/monolog",
             &HashMap::new(),
             None,
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Composer,
         );
 
@@ -1233,7 +1233,7 @@ mod tests {
             "serde",
             &HashMap::new(),
             None,
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Cargo,
         );
 
@@ -1262,7 +1262,7 @@ mod tests {
             "express",
             &HashMap::new(),
             None,
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::Deno,
         );
 
@@ -1298,7 +1298,7 @@ mod tests {
             "newtonsoft.json",
             &HashMap::new(),
             None,
-            &crate::lsp_helpers::test_support::MockFormatter,
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
             EcosystemId::NuGet,
         );
 

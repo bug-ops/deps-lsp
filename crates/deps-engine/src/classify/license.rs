@@ -397,30 +397,11 @@ mod tests {
     use crate::test_util::TestTier3Ecosystem;
     use deps_core::Dependency;
     use deps_core::VersionReq;
-    use deps_core::lsp_helpers::{
-        DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-        RequirementResolution, SourcePolicy,
-    };
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
+    use deps_core::test_util::StubFormatter;
     use std::any::Any;
     use std::sync::Arc;
-
-    struct MockFormatter;
-    impl PackageNaming for MockFormatter {}
-    impl PackageRendering for MockFormatter {
-        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-            version.to_string()
-        }
-        fn package_url(&self, name: &PackageName) -> String {
-            format!("https://example.com/{}", name.as_str())
-        }
-    }
-    impl RequirementResolution for MockFormatter {}
-    impl DiagnosticMessages for MockFormatter {}
-    impl DiagnosticPolicy for MockFormatter {}
-    impl SourcePolicy for MockFormatter {}
-    impl OsvNaming for MockFormatter {}
 
     struct MockDep {
         name: PackageName,
@@ -492,7 +473,7 @@ mod tests {
             &parse_result,
             &resolved,
             &HashMap::new(),
-            &MockFormatter,
+            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -522,7 +503,7 @@ mod tests {
             &parse_result,
             &resolved,
             &HashMap::new(),
-            &MockFormatter,
+            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -539,7 +520,7 @@ mod tests {
             &parse_result,
             &HashMap::new(),
             &HashMap::new(),
-            &MockFormatter,
+            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -562,7 +543,7 @@ mod tests {
             &parse_result,
             &resolved,
             &HashMap::new(),
-            &MockFormatter,
+            &StubFormatter::DEFAULT,
             EcosystemId::Dart,
         );
 
@@ -587,7 +568,7 @@ mod tests {
             &parse_result,
             &resolved,
             &HashMap::new(),
-            &MockFormatter,
+            &StubFormatter::DEFAULT,
             EcosystemId::Gradle,
         );
 
@@ -613,7 +594,7 @@ mod tests {
             &parse_result,
             &HashMap::new(),
             &HashMap::new(),
-            &MockFormatter,
+            &StubFormatter::DEFAULT,
             EcosystemId::Gradle,
         );
 
@@ -847,7 +828,7 @@ mod tests {
                 Arc::new(crate::test_util::StubRegistry)
             }
             fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
-                &crate::test_util::StubFormatter
+                &StubFormatter::DEFAULT
             }
             fn completion_insert_text(
                 &self,

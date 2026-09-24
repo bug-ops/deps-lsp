@@ -3889,7 +3889,7 @@ mod tests {
 
     #[test]
     fn test_ecosystem_formatter_defaults() {
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         assert_eq!(
             formatter.normalize_package_name(&pkg("test-pkg")),
             "test-pkg"
@@ -3900,7 +3900,7 @@ mod tests {
 
     #[test]
     fn test_format_version_replacing_for_default_delegates_to_format_version_replacing() {
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
         let dep = MockDep {
             name: pkg("test-pkg"),
             version_req: VersionReq::new("1.0.0"),
@@ -3915,7 +3915,7 @@ mod tests {
 
     #[test]
     fn test_ecosystem_formatter_version_satisfies() {
-        let formatter = MockFormatter;
+        let formatter = MOCK_FORMATTER;
 
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "1.2.3"));
 
