@@ -237,29 +237,35 @@ pub(crate) fn resolved_versions_changed(
 }
 
 /// Writes a freshly-reloaded `resolved_versions`/`resolved_version_candidates` pair into
-/// `uri`'s document and bumps `resolved_versions_generation` when a rescan is warranted —
-/// shared by `server::handle_lockfile_change` and
-/// `document::lifecycle::run_document_change_task` (issue #1398/#1399 code review: keeps
-/// their drift-detection-and-write sequence from silently diverging, exactly the bug class
-/// #1398/#1399 themselves exist to close).
+/// `uri`'s document and reports whether a resolved-version move was detected — shared by
+/// `server::handle_lockfile_change` and `document::lifecycle::run_document_change_task`
+/// (issue #1398/#1399 code review: keeps their drift-detection-and-write sequence from
+/// silently diverging, exactly the bug class #1398/#1399 themselves exist to close).
 ///
-/// `detect_drift` gates whether [`resolved_versions_changed`] runs at all (each caller passes
-/// its own precondition — `vulnerabilities_enabled` plus, for the lock-file-watcher path,
-/// `lockfile_reload_ok`). `own_trigger` is a caller-specific rescan signal independent of the
-/// lock-file drift check (the debounced-edit path's diff-level `needs_osv_rescan`; the
-/// lock-file-watcher path has none, so it always passes `false`). Returns whether drift was
-/// detected (`false` whenever `detect_drift` is `false`, without running the comparison).
+/// `detect_drift` gates whether [`resolved_versions_changed`] runs at all — each caller
+/// passes its own precondition (`lockfile_reload_ok` on the lock-file-watcher path; the
+/// debounced-edit path only ever calls this function once it already knows the reload
+/// succeeded, so it always passes `true`). Returns whether drift was detected (`false`
+/// whenever `detect_drift` is `false`, without running the comparison).
+///
+/// Deliberately does **not** bump `resolved_versions_generation` itself (issue #1407
+/// code-review reconciliation with #1410): the bump decision needs the caller's own
+/// manifest-diff-level trigger too (`document::lifecycle::change_task_triggers`'
+/// `diff_needs_rescan`), not just this function's own drift verdict, and — since #1407 —
+/// also needs an ecosystem/license-policy gate this generic diff-and-write primitive has
+/// no business knowing about. Every caller must compute its own bump-worthiness from this
+/// return value (typically via `change_task_triggers`) and call
+/// `DocumentState::bump_resolved_generation` itself.
 ///
 /// The drift comparison runs under a *shared* read lock on the document (via
 /// [`ServerState::with_document`]), not the exclusive lock the write below needs — issue
 /// #1399 code-review finding: [`resolved_versions_changed`] allocates and compares once per
 /// dependency, which would otherwise hold an exclusive DashMap shard lock (blocking every
 /// other document sharing that shard, including concurrent hover/completion reads) for the
-/// duration. The write itself (unconditional map replace, conditional generation bump) still
-/// happens under one exclusive lock acquisition, so `resolved_versions` and
-/// `resolved_versions_generation` can never desync relative to *this* call's own write — a
-/// concurrent writer for the same URI landing between the read and the write can only make
-/// this call's drift verdict imprecise, a narrow, already-tolerated window (see
+/// duration. The write itself (unconditional map replace) still happens under one exclusive
+/// lock acquisition, so `resolved_versions` can never desync relative to *this* call's own
+/// write — a concurrent writer for the same URI landing between the read and the write can
+/// only make this call's drift verdict imprecise, a narrow, already-tolerated window (see
 /// `server::handle_lockfile_change`'s critic M4 "Known limitation" comment for the same class
 /// of tolerated staleness), never violate that invariant.
 pub(crate) fn reload_resolved_versions(
@@ -269,7 +275,6 @@ pub(crate) fn reload_resolved_versions(
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     detect_drift: bool,
-    own_trigger: bool,
 ) -> bool {
     let lock_changed = detect_drift
         && state
@@ -294,9 +299,6 @@ pub(crate) fn reload_resolved_versions(
             resolved_versions.clone(),
             resolved_version_candidates.clone(),
         );
-        if own_trigger || lock_changed {
-            doc.bump_resolved_generation(state.next_resolved_versions_generation());
-        }
     }
 
     lock_changed

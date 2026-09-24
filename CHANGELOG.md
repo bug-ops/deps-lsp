@@ -53,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-lsp**: the tier-3 license pre-fetch (Dart/Swift/Gradle/Deno) now re-runs alongside the OSV rescan on a lock-file-only resolved-version change, in both the lock-file-watcher and debounced-edit paths, instead of leaving `DocumentState::licenses` stale until the next manifest edit or document reopen (resolves #1407) (#TBD)
 - **deps-core**: hover's "Press `Cmd+.` to update version" footer is no longer shown for a dependency whose requirement is an unexpanded template placeholder, since `codeAction` returns zero actions for it under the write-path guard from #1393 (resolves #1402) (#1408)
 - **deps-go**: `parse_require_line` no longer truncates a `require` line's version to its first whitespace-delimited token when there is more than one token on the version side of the line, fixing manifest corruption from a partial edit range on a multi-token external-templating placeholder — including one embedded inside an otherwise version-shaped leading token (e.g. `v0.{{ .Minor }}.0`, not just a placeholder starting the field like `{{ .NetVersion }}`) (resolves #1379) (#1383)
 - **deps-bundler**: multi-constraint `gem` requirements now capture and rewrite every positional constraint instead of only the first, fixing contradictory version-fix rewrites and restoring code actions/completion for such dependencies (resolves #1366) (#1369)
@@ -91,6 +92,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 - **deps-lsp**: `DocumentState::update_resolved_versions` is no longer public (resolves #1398) (#1410)
+- **deps-engine**: `classify::resolved::load_resolved_versions` now returns a 3-tuple, adding a `bool` distinguishing a successful reload (including a genuinely absent/empty lock file) from a parse failure, so callers that treat an empty-to-non-empty transition as a staleness signal can avoid mistaking one for the other (resolves #1407) (#TBD)
 - **deps-core**: `edit::plan_vulnerability_fix` returns `Result<PlannedUpdate, VulnFixSkip>` instead of `Option<PlannedUpdate>`; `edit::fix_target_is_verified` is `pub(crate)` again (part of #1350) (#1361)
 - **deps-cli**: `update::Outcome::Applied` is now a tuple variant carrying `ManifestEdit`; `update::PlannedUpdateItem` no longer has a separate `edit` field (part of #1349) (#1361)
 - **deps-core**: `Ecosystem::generate_hover` and `lsp_helpers::generate_hover` now return the protocol-agnostic `deps_core::hover::Hover` instead of `tower_lsp_server::ls_types::Hover` (resolves #1277) (#1309)

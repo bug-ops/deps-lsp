@@ -171,10 +171,6 @@ pub(crate) async fn rescan_after_resolved_version_change(
     // shared `INITIAL` value before this runs — phase A snapshots whatever the document holds
     // when it starts, so a commit against a freshly reopened, still-`INITIAL` document is
     // self-consistent, not a bug.
-    //
-    // License prefetch is not refreshed on lockfile-only changes: see issue #1407 for why
-    // this isn't a trivial trigger-wiring fix (the commit needs a generation-style
-    // staleness guard first, not just a new call site here).
     let Some(phase_a_result) = run_osv_scan_phase_a(
         uri.clone(),
         Arc::clone(state),
@@ -219,11 +215,15 @@ pub(crate) async fn rescan_after_resolved_version_change(
 /// dispatch below ever awaits. This function keeps only what is genuinely `deps-lsp`'s own:
 /// the document snapshot/staleness guard and the additive `DocumentState::licenses` commit.
 ///
-/// The commit at the end is staleness-guarded (`doc.content == content_snapshot`,
-/// mirroring [`run_osv_phase_b_and_commit`]'s identical guard) and merges rather than
-/// replaces (round 3 finding #1/#2): two overlapping edits can spawn two overlapping
-/// pre-fetches, and without the guard the older one finishing last could silently
-/// overwrite the newer one's results with stale data; without a merge, a transient
+/// The commit at the end is staleness-guarded on both `doc.content == content_snapshot`
+/// and `doc.resolved_versions_generation == resolved_generation` (issue #1407, mirroring
+/// [`run_osv_phase_b_and_commit`]'s identical pair of checks) and merges rather than
+/// replaces (round 3 finding #1/#2). The content check alone is not enough: a
+/// lock-file-only change never touches `content`, so two overlapping lock-file-triggered
+/// pre-fetches (each snapshotting a different `resolved_versions`) would both pass a
+/// content-only guard, and the older one finishing last could silently overwrite the
+/// newer one's results — the same race issue #1395 fixed for OSV scan commits via the
+/// generation guard, reproduced here for licenses. Without the merge, a transient
 /// per-dependency fetch failure this round (already filtered out by the shared function,
 /// before this point) would drop that dependency's previously-cached, still-valid
 /// license instead of just failing to refresh it. `DocumentState::merge_licenses`'s own
@@ -238,18 +238,35 @@ pub(crate) async fn rescan_after_resolved_version_change(
 ///
 /// No-op (returns immediately) for every ecosystem whose
 /// <code>ecosystem.[license_source](deps_core::Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
-/// is `false` (issue #697) — every ecosystem except the four above.
+/// is `false` (issue #697) — every ecosystem except the four above — or whenever
+/// `state`'s current [`ServerState::license_policy`] is empty (issue #1407 code-review
+/// should-fix). This check is *load-bearing*, not defense-in-depth: as noted above, this
+/// function calls [`deps_engine::classify::license::fetch_tier3_licenses`] directly, not
+/// its convenience-wrapper counterpart
+/// [`deps_engine::classify::license::prefetch_tier3_licenses`] (used by `deps-cli`) —
+/// `prefetch_tier3_licenses` takes a `LicensePolicy` and no-ops on an empty one itself,
+/// but `fetch_tier3_licenses` takes no `LicensePolicy` parameter at all and never checks
+/// one. Without this early return, a document with no license policy configured would
+/// still issue a real tier-3 network fetch (Dart/Swift/Gradle/Deno) on every trigger, for
+/// a result nothing ever reads. Centralizing the check here (issue #1407 code-review
+/// should-fix) also replaced the now-removed duplicate checks
+/// `server::handle_lockfile_change` and `document::lifecycle::change_task_triggers`'s
+/// callers used to run externally before deciding whether to trigger a refresh at all.
 pub(crate) async fn run_license_prefetch(
     uri: Uri,
     state: Arc<ServerState>,
     ecosystem: Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) {
-    if !ecosystem.license_source().requires_dedicated_fetch() {
+    if !ecosystem.license_source().requires_dedicated_fetch() || state.license_policy().is_empty() {
         return;
     }
 
-    let (content_snapshot, targets): (String, Vec<(PackageName, String)>) = {
+    let (content_snapshot, resolved_generation, targets): (
+        String,
+        ResolvedGeneration,
+        Vec<(PackageName, String)>,
+    ) = {
         let Some(doc) = state.get_document(&uri) else {
             return;
         };
@@ -263,7 +280,11 @@ pub(crate) async fn run_license_prefetch(
             ecosystem.formatter(),
             ecosystem.ecosystem_id(),
         );
-        (doc.content.clone(), targets)
+        (
+            doc.content.clone(),
+            doc.resolved_versions_generation,
+            targets,
+        )
     };
 
     if targets.is_empty() {
@@ -279,12 +300,20 @@ pub(crate) async fn run_license_prefetch(
     .await;
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
-        if doc.content == content_snapshot {
-            doc.merge_licenses(result.licenses);
-        } else {
+        if doc.content != content_snapshot {
             tracing::debug!(
                 "dropping stale tier-3 license pre-fetch result: document content changed mid-fetch"
             );
+        } else if doc.resolved_versions_generation != resolved_generation {
+            // Issue #1407, mirroring #1395 critic S3: `content` alone can't order two
+            // racing pre-fetches whose resolved-version snapshots differ (e.g. two
+            // overlapping lock-file-only reloads) — a newer resolved-versions update
+            // landed on this document after this pre-fetch's snapshot was taken.
+            tracing::debug!(
+                "dropping stale tier-3 license pre-fetch result: resolved versions changed mid-fetch"
+            );
+        } else {
+            doc.merge_licenses(result.licenses);
         }
     }
 }
@@ -507,6 +536,14 @@ mod tests {
     use super::super::state::DocumentState;
     use super::*;
 
+    /// A non-empty license policy, for every `run_license_prefetch` test below that
+    /// needs to get past its new empty-policy early return (issue #1407 code-review
+    /// should-fix) to reach the ecosystem-specific fetch under test. The actual
+    /// allow/deny content is irrelevant here — only emptiness matters to that gate.
+    fn non_empty_license_policy() -> deps_core::LicensePolicy {
+        deps_core::LicensePolicy::new(vec!["MIT".to_string()], vec![])
+    }
+
     /// Issue #660: `run_license_prefetch`'s ecosystem gate — only the four tier-3
     /// ecosystems (no `deps_dev_system` coverage, no license in the hot-path
     /// version-list response) should ever reach a network call.
@@ -592,6 +629,7 @@ mod tests {
         #[ignore = "hits the real pub.dev API"]
         async fn run_license_prefetch_live_dart_populates_document_licenses() {
             let state = Arc::new(ServerState::new());
+            state.set_license_policy(non_empty_license_policy());
             let url = deps_core::test_util::test_uri("/test/pubspec.yaml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "dependencies:\n  http: ^1.0.0\n";
@@ -633,6 +671,7 @@ mod tests {
         #[ignore = "hits the real GitHub API"]
         async fn run_license_prefetch_live_swift_populates_document_licenses() {
             let state = Arc::new(ServerState::new());
+            state.set_license_policy(non_empty_license_policy());
             let url = deps_core::test_util::test_uri("/test/Package.swift");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#".package(url: "https://github.com/apple/swift-nio.git", .upToNextMajor(from: "2.0.0"))"#;
@@ -695,6 +734,7 @@ mod tests {
             // `document/loader.rs`'s diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
+            state.set_license_policy(non_empty_license_policy());
             let url = deps_core::test_util::test_uri("/test/build.gradle.kts");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content =
@@ -744,6 +784,7 @@ mod tests {
             // on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let state = Arc::new(ServerState::new());
+            state.set_license_policy(non_empty_license_policy());
             let url = deps_core::test_util::test_uri("/test/build.gradle.kts");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content =
@@ -791,6 +832,7 @@ mod tests {
         #[ignore = "hits the real JSR API"]
         async fn run_license_prefetch_live_deno_populates_document_licenses() {
             let state = Arc::new(ServerState::new());
+            state.set_license_policy(non_empty_license_policy());
             let url = deps_core::test_util::test_uri("/test/deno.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0"}}"#;
@@ -818,6 +860,279 @@ mod tests {
             assert!(
                 doc.licenses.contains_key(&PackageName::new("jsr:@std/fs")),
                 "expected a pre-fetched license for 'jsr:@std/fs', got: {:?}",
+                doc.licenses
+            );
+        }
+    }
+
+    /// Regression coverage for issue #1407: `run_license_prefetch`'s own
+    /// `resolved_versions_generation` guard (mirroring #1395's OSV guard, see
+    /// `generation_race_tests` below) must drop a commit that raced against an intervening
+    /// resolved-versions bump. Unlike `run_osv_phase_b_and_commit`, `run_license_prefetch`
+    /// has no separate phase-A/phase-B split to snapshot against ahead of time, so the race
+    /// is reproduced with real concurrency instead: a fake tier-3 `Ecosystem` whose
+    /// `fetch_license` signals a barrier once entered (proving the snapshot has already been
+    /// taken) and then blocks on a second barrier until the test releases it, giving the test
+    /// a deterministic window to mutate the document's generation in between. Network-free —
+    /// no real tier-3 registry call is ever made.
+    mod license_prefetch_generation_race_tests {
+        use super::super::super::state::DocumentState;
+        use super::*;
+        use deps_core::Dependency;
+        use deps_core::LicenseSource;
+        use deps_core::Metadata;
+        use deps_core::ParseResult;
+        use deps_core::Registry;
+        use deps_core::VersionReq;
+        use deps_core::ecosystem::BoxFuture;
+        use deps_core::ecosystem::private::Sealed;
+        use deps_core::lsp_helpers::EcosystemFormatter;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+        use std::any::Any;
+        use tokio::sync::Barrier;
+
+        struct FakeTier3Dep {
+            name: PackageName,
+            version_req: VersionReq,
+        }
+
+        impl Dependency for FakeTier3Dep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::new(Position::new(0, 0), Position::new(0, 1))
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> DependencySource {
+                DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct FakeTier3ParseResult {
+            dep: FakeTier3Dep,
+            uri: url::Url,
+        }
+
+        impl deps_core::ParseResult for FakeTier3ParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![&self.dep]
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// A single `=`-pinned, registry-sourced dependency (`dep-0`) whose `fetch_license`
+        /// is fully controlled by the barriers below — mirrors
+        /// `deps_engine::test_util::TestTier3Ecosystem`'s shape, but kept local to this crate
+        /// (rather than pulled in as a `deps-engine/test-util` dev-dependency) since only
+        /// `deps-lsp`'s own commit-guard needs exercising here, not `fetch_tier3_licenses`
+        /// itself.
+        struct SignalingLicenseEcosystem {
+            started: Arc<Barrier>,
+            release: Arc<Barrier>,
+            license: Vec<String>,
+        }
+
+        impl Sealed for SignalingLicenseEcosystem {}
+        impl Ecosystem for SignalingLicenseEcosystem {
+            fn ecosystem_id(&self) -> EcosystemId {
+                EcosystemId::Dart
+            }
+            fn display_name(&self) -> &'static str {
+                "test-tier3-license"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &[]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                uri: &'a url::Url,
+            ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
+                let uri = uri.clone();
+                Box::pin(async move {
+                    Ok(Box::new(FakeTier3ParseResult {
+                        dep: FakeTier3Dep {
+                            name: PackageName::new("dep-0"),
+                            version_req: VersionReq::new("=1.0.0"),
+                        },
+                        uri,
+                    }) as Box<dyn ParseResult>)
+                })
+            }
+            fn registry(&self) -> Arc<dyn Registry> {
+                Arc::new(crate::test_utils::blocking_ecosystem::NoopRegistry)
+            }
+            fn formatter(&self) -> &dyn EcosystemFormatter {
+                &deps_core::test_util::StubFormatter::DEFAULT
+            }
+            fn completion_insert_text(&self, _metadata: &dyn Metadata) -> Option<String> {
+                None
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: deps_core::completion::CompletionRequest<'a>,
+                _package_name: PackageName,
+                _prefix: String,
+            ) -> BoxFuture<'a, deps_core::completion::Completions> {
+                unimplemented!()
+            }
+            fn fetch_license<'a>(
+                &'a self,
+                _name: &'a str,
+                _version: &'a str,
+            ) -> BoxFuture<'a, Vec<String>> {
+                Box::pin(async move {
+                    self.started.wait().await;
+                    self.release.wait().await;
+                    self.license.clone()
+                })
+            }
+            fn license_source(&self) -> LicenseSource {
+                LicenseSource::DetectedSpdx
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Sets up a document (generation 0, empty content) parsed via `ecosystem` and
+        /// registered in `state`, ready for `run_license_prefetch` to be spawned against it.
+        async fn setup_document(
+            state: &Arc<ServerState>,
+            uri: &Uri,
+            ecosystem: &Arc<dyn Ecosystem>,
+            url: &url::Url,
+        ) {
+            let parse_result = ecosystem.parse_manifest("", url).await.unwrap();
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Dart,
+                String::new(),
+                parse_result,
+            );
+            state.update_document(uri.clone(), doc_state);
+        }
+
+        #[tokio::test]
+        async fn run_license_prefetch_drops_stale_commit_on_concurrent_generation_bump() {
+            let state = Arc::new(ServerState::new());
+            state.set_license_policy(non_empty_license_policy());
+            let url = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let started = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(SignalingLicenseEcosystem {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                license: vec!["MIT".to_string()],
+            });
+            setup_document(&state, &uri, &ecosystem, &url).await;
+
+            let task = {
+                let uri = uri.clone();
+                let state = Arc::clone(&state);
+                let ecosystem = Arc::clone(&ecosystem);
+                tokio::spawn(async move {
+                    run_license_prefetch(uri, state, ecosystem, 5).await;
+                })
+            };
+
+            // `fetch_license` has been entered, so `run_license_prefetch`'s content/generation
+            // snapshot has necessarily already been taken. Timeout-wrapped (critic minor,
+            // issue #1407): a future regression that made `run_license_prefetch` skip the
+            // fetch entirely (e.g. an over-eager early return) would otherwise hang this
+            // test forever instead of failing it.
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.wait())
+                .await
+                .expect("run_license_prefetch must reach fetch_license within 5s");
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.bump_resolved_generation(state.next_resolved_versions_generation());
+            }
+
+            // Let `fetch_license` return its (otherwise real) license result.
+            tokio::time::timeout(std::time::Duration::from_secs(5), release.wait())
+                .await
+                .expect("test must release fetch_license's second barrier within 5s");
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("run_license_prefetch task must complete within 5s")
+                .unwrap();
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.licenses.is_empty(),
+                "an intervening generation bump between snapshot and commit must drop this \
+                 pre-fetch's result, even though the fetch itself succeeded: {:?}",
+                doc.licenses
+            );
+        }
+
+        /// Negative control, proving the guard above is not vacuously passing: with no
+        /// intervening bump, the same fetch must still commit successfully.
+        #[tokio::test]
+        async fn run_license_prefetch_commits_when_no_concurrent_bump() {
+            let state = Arc::new(ServerState::new());
+            state.set_license_policy(non_empty_license_policy());
+            let url = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let started = Arc::new(Barrier::new(2));
+            let release = Arc::new(Barrier::new(2));
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(SignalingLicenseEcosystem {
+                started: Arc::clone(&started),
+                release: Arc::clone(&release),
+                license: vec!["MIT".to_string()],
+            });
+            setup_document(&state, &uri, &ecosystem, &url).await;
+
+            let task = {
+                let uri = uri.clone();
+                let state = Arc::clone(&state);
+                let ecosystem = Arc::clone(&ecosystem);
+                tokio::spawn(async move {
+                    run_license_prefetch(uri, state, ecosystem, 5).await;
+                })
+            };
+
+            // Timeout-wrapped for the same reason as the positive test above (critic
+            // minor, issue #1407): a future regression must fail this test cleanly,
+            // not hang it.
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.wait())
+                .await
+                .expect("run_license_prefetch must reach fetch_license within 5s");
+            tokio::time::timeout(std::time::Duration::from_secs(5), release.wait())
+                .await
+                .expect("test must release fetch_license's second barrier within 5s");
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .expect("run_license_prefetch task must complete within 5s")
+                .unwrap();
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.licenses.get(&PackageName::new("dep-0")),
+                Some(&vec!["MIT".to_string()]),
+                "no intervening bump occurred, so the fetch's result must commit: {:?}",
                 doc.licenses
             );
         }
