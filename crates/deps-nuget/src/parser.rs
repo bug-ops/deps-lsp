@@ -716,6 +716,31 @@ mod tests {
         assert!(result.dependencies[0].version_range.is_none());
     }
 
+    /// #1417 regression: `deps_core::lsp_helpers::requirement_contains_template_placeholder`
+    /// gained its own, independent `$(VAR)` recognition. `NuGetFormatter::requirement_is_placeholder`
+    /// ORs that shared predicate with NuGet's own `is_msbuild_reference` guard, so both are
+    /// reachable and both independently agree `$(VAR)` is unresolved here — but NuGet's parser
+    /// degrades the requirement to `None` before either predicate is ever consulted (see
+    /// `test_unresolved_msbuild_property_degrades_to_none` above), and `is_msbuild_reference`
+    /// already natively recognized `$(VAR)` before this shared predicate did, so this asserts
+    /// no regression, not a new dependency between the two guards.
+    #[test]
+    fn test_msbuild_property_unaffected_by_shared_dollar_paren_placeholder_extension() {
+        assert!(is_msbuild_reference("$(NewtonsoftJsonVersion)"));
+        assert!(
+            deps_core::lsp_helpers::requirement_contains_template_placeholder(
+                "$(NewtonsoftJsonVersion)"
+            )
+        );
+
+        let xml = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="$(NewtonsoftJsonVersion)" /></ItemGroup></Project>"#;
+        let result = parse_project_file(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(result.dependencies[0].name, "Newtonsoft.Json");
+        assert!(result.dependencies[0].version_requirement.is_none());
+        assert!(result.dependencies[0].version_range.is_none());
+    }
+
     /// #1355: `%(Version)` (MSBuild item-metadata syntax) must degrade to `None` the same as
     /// `$(PropertyName)` — before this fix it survived parsing as a real requirement string
     /// and could plan an incorrect version-rewrite edit, offer completions, and render a

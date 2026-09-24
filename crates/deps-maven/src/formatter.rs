@@ -18,8 +18,8 @@ pub struct MavenFormatter;
 /// cross-ecosystem external-templating shape — delegates fully to
 /// [`requirement_contains_template_placeholder`] (#1384), the same shared predicate
 /// npm/Cargo/PyPI/Dart/Deno/Go/Composer/GitLab CI's equivalent guards use (#1383's
-/// generalization), which already covers `${...}` (its own `$`-prefixed check) alongside
-/// `@VAR@`, `%VAR%`, `{{ }}`, `{% %}`, and `<%= %>`.
+/// generalization), which already covers `${...}`/`$(...)` (its own `$`-prefixed check)
+/// alongside `@VAR@`, `%VAR%`, `{{ }}`, `{% %}`, and `<%= %>`.
 fn is_unresolved(requirement: &str) -> bool {
     requirement_contains_template_placeholder(requirement)
 }

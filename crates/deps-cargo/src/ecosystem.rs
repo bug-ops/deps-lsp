@@ -401,7 +401,8 @@ mod tests {
              tokio = \"{{ TOKIO_VERSION }}\"\n\
              regex = \"@REGEX_VERSION@\"\n\
              rand = \"%RAND_VERSION%\"\n\
-             clap = \"<%= CLAP_VERSION %>\"\n";
+             clap = \"<%= CLAP_VERSION %>\"\n\
+             anyhow = \"$(ANYHOW_VERSION)\"\n";
     }
 
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.

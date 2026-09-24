@@ -475,7 +475,8 @@ mod tests {
                 "svelte": "{{ SVELTE_VERSION }}",
                 "solid": "@SOLID_VERSION@",
                 "preact": "%PREACT_VERSION%",
-                "lit": "<%= LIT_VERSION %>"
+                "lit": "<%= LIT_VERSION %>",
+                "lodash": "$(LODASH_VERSION)"
             }}"#;
     }
 
