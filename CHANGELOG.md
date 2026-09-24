@@ -106,7 +106,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: URL/declaration-key/parse-error redaction and the in-memory secret wrapper moved from `net_policy`/`secret` into a new `redact` module; old paths are kept as re-exports, so no call site needs updating (resolves #1247, #1216) (#1316)
 - **deps-core**: `redact` module dedupes the double URL-parse on the declaration-key redaction hot path and avoids a second allocation on its opaque-key no-op path (resolves #1317) (#1327)
 - **deps-core, ci**: `redacting_debug_compile_fail` trybuild test is now `#[ignore]`d (slow cold-cache sandbox rebuild); still run explicitly via dedicated steps in `ci.yml`'s `test`, `cross-check` (i686), and `coverage` jobs, and excluded from `live-registry-tests.yml`'s network-gated sweep (#1345)
-- **ci**: bump `taiki-e/install-action` to v2.87.19; refresh `Cargo.lock` (`thiserror` 2.0.21)
+- **ci**: bump `taiki-e/install-action` to v2.87.19; refresh `Cargo.lock` (`thiserror` 2.0.21) (#1389)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
