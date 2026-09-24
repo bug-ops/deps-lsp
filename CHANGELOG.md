@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gitlab-ci**: a Tag-shaped ref with an embedded, non-leading variable reference (e.g. `v16.0-$BUILD`) no longer reports permanently `Outdated`; it's now correctly classified `Unresolved` (part of #1370) (#1376)
 - **deps-core**: hover and diagnostics now surface a "vulnerability data not checked" signal when the OSV scan skipped a dependency for a non-offline reason (most commonly no resolved/exact version to query), instead of rendering nothing and looking identical to a scanned, clean dependency (resolves #1392) (#1394)
 - **deps-lsp**: `handle_lockfile_change` now re-runs the OSV vulnerability scan for a document whose resolved version newly appeared or changed, instead of leaving `Skipped`/`Clean`/`Vulnerable` results stale after a lock-file-only change (resolves #1395) (#1397)
-- **deps-cli**: an auto-discovered `deps.toml` with excessive array/table nesting now returns a `ConfigError` instead of overflowing the stack (resolves #1403)
+- **deps-cli**: an auto-discovered `deps.toml` with excessive array/table nesting now returns a `ConfigError` instead of overflowing the stack (resolves #1403) (#1405)
 
 ### Breaking
 - **deps-core**: `edit::plan_vulnerability_fix` returns `Result<PlannedUpdate, VulnFixSkip>` instead of `Option<PlannedUpdate>`; `edit::fix_target_is_verified` is `pub(crate)` again (part of #1350) (#1361)
