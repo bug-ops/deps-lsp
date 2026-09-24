@@ -1,0 +1,4 @@
+# Fuzz corpus seed files are synthetic parser-input fixtures, not real project
+# dependencies (see fuzz/fuzz_targets and #1409). Exclude them from GitHub's
+# dependency graph so Dependabot doesn't open security alerts against them.
+fuzz/seeds/** linguist-vendored
