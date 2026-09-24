@@ -8,8 +8,8 @@ use crate::{Dependency, ParseResult, Registry, VersionReq};
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE,
     VersionData, await_versions_fetch, is_safe_version_string, literal_span_matches,
-    requirement_is_unsatisfiable, single_file_edit, slice_for_range, strip_whitespace,
-    warn_rejected_value,
+    requirement_is_unsatisfiable, resolve_scan_outcome, single_file_edit, slice_for_range,
+    strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -58,7 +58,7 @@ fn build_vulnerability_fix_action(
     // #394 S2: prefer the version-qualified key so a fix action for one
     // occurrence of a duplicated name is never built from another
     // occurrence's OSV result. See `crate::osv::vulnerability_keys`.
-    let vuln_key = versions.ecosystem.and_then(|ecosystem| {
+    let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
             versions.resolved,
@@ -66,15 +66,10 @@ fn build_vulnerability_fix_action(
             formatter,
             ecosystem,
         )
-        .remove(&dep.name_range())
     });
-    let outcome = versions.vulnerabilities.and_then(|m| {
-        vuln_key
-            .as_deref()
-            .and_then(|key| m.get(key))
-            .or_else(|| m.get(&normalized_name))
-            .or_else(|| m.get(dep.name().as_str()))
-    })?;
+    let outcome = versions
+        .vulnerabilities
+        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &normalized_name))?;
     let ScanOutcome::Vulnerable(dv) = outcome else {
         return None;
     };
@@ -1568,7 +1563,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            vulnerable_key,
+            vulnerable_key.into_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1588,7 +1583,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulnerabilities.insert(patched_key, ScanOutcome::Clean);
+        vulnerabilities.insert(patched_key.into_string(), ScanOutcome::Clean);
 
         let versions = VersionData::new(&cached, &resolved)
             .with_vulnerabilities(&vulnerabilities)

@@ -248,11 +248,8 @@ pub(crate) async fn generate_diagnostics_internal(
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
     let Some(extracted) = state.with_document(uri, |doc| {
-        let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem_id()) else {
-            tracing::warn!(
-                "Ecosystem not found for diagnostics: {}",
-                doc.ecosystem_id()
-            );
+        let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem) else {
+            tracing::warn!("Ecosystem not found for diagnostics: {}", doc.ecosystem);
             return None;
         };
 
@@ -490,7 +487,10 @@ mod tests {
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::new().with_unknown_severity(Severity::Error);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -520,7 +520,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -550,7 +553,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::new().with_outdated_severity(Severity::Error);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -592,7 +598,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -633,7 +642,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::new().with_unsatisfiable_severity(Severity::Error);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -677,7 +689,10 @@ serde = "1.0.0"
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content =
                 "[dependencies]\nserde = \"1.0\"\ntokio = \"1.0\"\nanyhow = \"1.0\"\n".to_string();
             let parse_result = ecosystem
@@ -720,7 +735,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -767,7 +785,10 @@ serde = "1.0.0"
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -829,7 +850,10 @@ serde = "1.0.0"
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             // No cached_versions/resolved_versions seeded for "serde" at all — the exact
             // "never actually fetched" shape S2 covers.
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
@@ -887,7 +911,10 @@ serde = "1.0.0"
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -929,7 +956,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -979,7 +1009,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"99\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -1017,7 +1050,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"99\"\ntokio = \"1.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -1077,7 +1113,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"=1.0.213\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -1131,7 +1170,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Npm)
+                .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem
@@ -1169,7 +1211,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Npm)
+                .unwrap();
             let content = r#"{"dependencies": {"left-pad": "^1.0.0"}}"#.to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -1239,7 +1284,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Npm)
+                .unwrap();
             // Bare exact pin (npm's ordinary package.json style, no `=` marker) — the
             // shape `yanked_diagnostic_applies_to` still allowed through pre-#436.
             let content = r#"{"dependencies": {"old-pkg": "1.0.1"}}"#.to_string();
@@ -1302,7 +1350,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("deno").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Deno)
+                .unwrap();
             let content = r#"{"imports": {"lodash": "npm:lodash@4.17.20"}}"#.to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -1353,7 +1404,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("deno").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Deno)
+                .unwrap();
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@1.0.0"}}"#.to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -1410,7 +1464,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("deno").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Deno)
+                .unwrap();
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0.0"}}"#.to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &url)
@@ -1470,7 +1527,10 @@ serde = "1.0.0"
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let config = DiagnosticsConfig::default();
 
-            let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Pypi)
+                .unwrap();
             let content = r#"[project]
 dependencies = ["requests>=2.0.0"]
 "#
@@ -1509,7 +1569,7 @@ dependencies = ["requests>=2.0.0"]
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             state
                 .ecosystem_registry
-                .get("cargo")
+                .get(deps_core::EcosystemId::Cargo)
                 .unwrap()
                 .parse_manifest(content, uri)
                 .await

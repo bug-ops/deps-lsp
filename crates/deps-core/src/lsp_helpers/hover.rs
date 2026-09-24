@@ -254,7 +254,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 
     // #394 S2: version-qualified key so a hover on one occurrence of a duplicated name never
     // shows another occurrence's OSV result.
-    let vuln_key = versions.ecosystem.and_then(|ecosystem| {
+    let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
             versions.resolved,
@@ -262,16 +262,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             formatter,
             ecosystem,
         )
-        .remove(&dep.name_range())
     });
-    let vuln_outcome = versions.vulnerabilities.and_then(|m| {
-        resolve_scan_outcome(
-            m,
-            vuln_key.as_deref(),
-            &normalized_name,
-            dep.name().as_str(),
-        )
-    });
+    let vuln_outcome = versions
+        .vulnerabilities
+        .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &normalized_name));
     let deprecation = versions
         .outcomes
         .and_then(|o| o.deprecation(&normalized_name));
@@ -5068,7 +5062,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            vulnerable_key,
+            vulnerable_key.into_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
@@ -5078,7 +5072,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(patched_key, ScanOutcome::Clean);
+        vulns.insert(patched_key.into_string(), ScanOutcome::Clean);
 
         let versions = VersionData::new(&cached_versions, &resolved_versions)
             .with_vulnerabilities(&vulns)
@@ -5175,7 +5169,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            current_key,
+            current_key.into_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::Critical)],
@@ -5185,7 +5179,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(renamed_key, ScanOutcome::Clean);
+        vulns.insert(renamed_key.into_string(), ScanOutcome::Clean);
 
         let versions = VersionData::new(&cached_versions, &resolved_versions)
             .with_resolved_version_candidates(&resolved_version_candidates)

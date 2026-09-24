@@ -841,7 +841,148 @@ pub enum ScanOutcome {
 /// [`crate::lsp_helpers::generate_hover`] already use to look up
 /// `cached`/`resolved` versions), but see [`vulnerability_keys`] for the
 /// version-qualified form a duplicated dependency name's occurrences use.
+// TODO(#1413): key VulnerabilityMap by VulnKey instead of String.
 pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
+
+/// A single occurrence's [`VulnerabilityMap`] lookup key, as computed by [`vulnerability_keys`]
+/// or [`vuln_key_for`].
+///
+/// A newtype rather than a bare `String` so a key value is never silently interchangeable
+/// with a plain declared or normalized package name at a call site — see [`VulnKeys`] for why
+/// that distinction is the point of this whole type pair. Deliberately has no `Borrow<str>`
+/// impl: that is only useful once a type is used as a map key itself, which
+/// [`VulnerabilityMap`] does not yet do (`#1413`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct VulnKey(String);
+
+impl VulnKey {
+    /// Borrows the key as a string slice, e.g. to look it up in a [`VulnerabilityMap`].
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes this key, returning the owned `String` a [`VulnerabilityMap`] producer
+    /// inserts under (`#1413`: the map itself is not yet keyed by `VulnKey`).
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl std::fmt::Display for VulnKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Per-occurrence [`VulnKey`]s for one document, keyed by
+/// [`Dependency::name_range`](crate::Dependency::name_range) — returned by
+/// [`vulnerability_keys`].
+///
+/// Deliberately exposes no public lookup by [`Range`](crate::position::Range): only
+/// [`vuln_key_for`] and [`crate::lsp_helpers::resolve_scan_outcome`] may read an entry, which
+/// makes a forgotten normalized-name/declared-name fallback impossible for any caller outside
+/// `deps-core` — the exact bug class (four independently hand-written copies of the same
+/// 3-step chain) issue #1400 closes on the read-by-range side. This guarantees the
+/// range-to-key *rule* only, not full [`VulnerabilityMap`] key typing: the map itself stays a
+/// plain `HashMap<String, ScanOutcome>` in this PR (`#1413`), so a producer or consumer that
+/// bypasses [`vuln_key_for`]/[`crate::lsp_helpers::resolve_scan_outcome`] entirely (e.g. a raw
+/// `vulnerabilities.insert(some_other_string, ..)`) is not prevented by this type.
+#[derive(Debug, Clone, Default)]
+pub struct VulnKeys(HashMap<crate::position::Range, VulnKey>);
+
+impl VulnKeys {
+    /// Looks up the [`VulnKey`] for one occurrence's name range — `pub(crate)` only: the
+    /// public entry points are [`vuln_key_for`] (produces a key, falling back to the
+    /// normalized name) and [`crate::lsp_helpers::resolve_scan_outcome`] (looks an outcome
+    /// up, falling back further to the declared name).
+    pub(crate) fn get(&self, range: &crate::position::Range) -> Option<&VulnKey> {
+        self.0.get(range)
+    }
+}
+
+/// Returns the [`VulnKey`] `dep`'s occurrence should be scanned/looked-up under.
+///
+/// Prefers `keys`' version-qualified entry for `dep`'s
+/// [`name_range`](crate::Dependency::name_range) (see [`vulnerability_keys`]); falls back to
+/// `formatter`'s ecosystem-normalized name when `keys` is `None` (a caller with no
+/// [`EcosystemId`](crate::EcosystemId) to give `vulnerability_keys`, e.g. most test fixtures)
+/// or has no entry for this occurrence (e.g. a synthetic name range, which
+/// [`vulnerability_keys`] deliberately excludes).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::osv::vuln_key_for;
+/// use deps_core::position::{Position, Range};
+/// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
+/// use std::any::Any;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     name_range: Range,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         self.name_range
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// struct SimpleFormatter;
+/// impl PackageNaming for SimpleFormatter {}
+/// impl PackageRendering for SimpleFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for SimpleFormatter {}
+/// impl DiagnosticMessages for SimpleFormatter {}
+/// impl DiagnosticPolicy for SimpleFormatter {}
+/// impl SourcePolicy for SimpleFormatter {}
+/// impl OsvNaming for SimpleFormatter {}
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("time"),
+///     name_range: Range::new(Position::new(0, 0), Position::new(0, 4)).into(),
+/// };
+///
+/// // No `VulnKeys` map (e.g. no `EcosystemId` available) falls back to the normalized name.
+/// let key = vuln_key_for(&dep, None, &SimpleFormatter);
+/// assert_eq!(key.as_str(), "time");
+/// ```
+#[must_use]
+pub fn vuln_key_for(
+    dep: &dyn crate::Dependency,
+    keys: Option<&VulnKeys>,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+) -> VulnKey {
+    keys.and_then(|k| k.get(&dep.name_range()).cloned())
+        .unwrap_or_else(|| VulnKey(formatter.normalize_package_name(dep.name())))
+}
 
 /// Computes the [`VulnerabilityMap`] key each occurrence in `parse_result`
 /// should be scanned/looked-up under.
@@ -970,8 +1111,8 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 ///
 /// let keys = vulnerability_keys(&parse_result, &resolved, None, &SimpleFormatter, EcosystemId::Cargo);
 /// let deps = parse_result.dependencies();
-/// let key0 = keys.get(&deps[0].name_range()).unwrap();
-/// let key1 = keys.get(&deps[1].name_range()).unwrap();
+/// let key0 = deps_core::osv::vuln_key_for(deps[0], Some(&keys), &SimpleFormatter);
+/// let key1 = deps_core::osv::vuln_key_for(deps[1], Some(&keys), &SimpleFormatter);
 /// assert_ne!(key0, key1, "differently-pinned occurrences of one name get distinct keys");
 /// ```
 pub fn vulnerability_keys(
@@ -980,7 +1121,7 @@ pub fn vulnerability_keys(
     resolved_candidates: Option<&HashMap<crate::PackageName, Vec<crate::ConcreteVersion>>>,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     ecosystem: crate::EcosystemId,
-) -> HashMap<crate::position::Range, String> {
+) -> VulnKeys {
     use crate::lsp_helpers::resolve_in_use_version;
 
     let deps = parse_result.dependencies();
@@ -1024,7 +1165,8 @@ pub fn vulnerability_keys(
             .insert(signature.as_str());
     }
 
-    deps.iter()
+    let map = deps
+        .iter()
         .zip(&signatures)
         // A synthetic `name_range()` is not a stable per-dependency position — every such
         // dependency would share the same key, each insertion evicting the last. Excluding
@@ -1039,9 +1181,10 @@ pub fn vulnerability_keys(
             } else {
                 name.clone()
             };
-            (dep.name_range(), key)
+            (dep.name_range(), VulnKey(key))
         })
-        .collect()
+        .collect();
+    VulnKeys(map)
 }
 
 // ---- OSV wire types (private) -------------------------------------------
@@ -1874,11 +2017,11 @@ mod vulnerability_keys_candidates_tests {
             "the current-major and renamed-old-major occurrences must not share an OSV key"
         );
         assert!(
-            current_key.ends_with("v:1.0.219"),
+            current_key.as_str().ends_with("v:1.0.219"),
             "current-major occurrence's key must carry its own resolved version: {current_key}"
         );
         assert!(
-            renamed_key.ends_with("v:0.9.15"),
+            renamed_key.as_str().ends_with("v:0.9.15"),
             "renamed occurrence's key must carry its own resolved version, not the collapsed \
              1.0.219: {renamed_key}"
         );
@@ -1918,14 +2061,13 @@ mod vulnerability_keys_candidates_tests {
             EcosystemId::Cargo,
         );
 
-        assert_eq!(
-            keys.len(),
-            1,
-            "only the real dependency's real name_range should be keyed"
-        );
         let deps = parse_result.dependencies();
         assert!(
-            keys.contains_key(&deps[1].name_range()),
+            keys.get(&deps[0].name_range()).is_none(),
+            "the synthetic-range dependency must not be keyed"
+        );
+        assert!(
+            keys.get(&deps[1].name_range()).is_some(),
             "the real dependency's own range must still be present"
         );
     }

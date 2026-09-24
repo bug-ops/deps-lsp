@@ -1047,26 +1047,84 @@ pub(crate) fn version_range_is_synthetic_empty(dep: &dyn Dependency) -> bool {
     dep.version_requirement().is_none() && dep.version_range().is_some_and(|r| r.start == r.end)
 }
 
-/// Resolves the [`ScanOutcome`] for one dependency occurrence, trying `vuln_key` first
-/// (the version-qualified lookup key from `crate::osv::vulnerability_keys`, #394 S2 —
-/// distinguishes two occurrences of one name pinned to different versions), then the
-/// ecosystem-normalized name, then the declared name.
+/// Resolves the [`ScanOutcome`] for one dependency occurrence.
+///
+/// Tries `keys`' version-qualified lookup key for `dep` first (from
+/// `crate::osv::vulnerability_keys`, #394 S2 — distinguishes two occurrences of one name
+/// pinned to different versions), then the ecosystem-normalized name, then `dep`'s declared
+/// name.
 ///
 /// The single shared fallback chain for every OSV-outcome consumer
 /// (`diagnostics::apply_vulnerability_rule`, `diagnostics::skip_reason_notice`,
-/// `hover::generate_hover`'s vulnerability section) — previously written out three times
-/// independently, risking a future change to the fallback priority landing in only some
-/// of them (issue #1392 code-review finding).
-pub(crate) fn resolve_scan_outcome<'a>(
+/// `hover::generate_hover`'s vulnerability section) — previously written out four times
+/// independently (issue #1400), risking a future change to the fallback priority landing in
+/// only some of them. `keys` is `Option` because a caller with no [`EcosystemId`] to give
+/// `crate::osv::vulnerability_keys` (most test
+/// fixtures) has none to pass. `normalized_name` stays a caller-supplied parameter rather than
+/// being derived here: `diagnostics` precomputes it once per name range and shares it across
+/// both this lookup and its own per-dependency loop, so `normalize_package_name` (an
+/// allocating call) never runs twice for the same dependency.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy, resolve_scan_outcome,
+/// };
+/// use deps_core::osv::{ScanOutcome, VulnerabilityMap};
+/// use deps_core::position::{Position, Range};
+/// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
+/// use std::any::Any;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     name_range: Range,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         self.name_range
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("time"),
+///     name_range: Range::new(Position::new(0, 0), Position::new(0, 4)).into(),
+/// };
+///
+/// let mut vulnerabilities = VulnerabilityMap::new();
+/// vulnerabilities.insert("time".to_string(), ScanOutcome::Clean);
+///
+/// // No `VulnKeys` map: falls back straight to the normalized name.
+/// let outcome = resolve_scan_outcome(&vulnerabilities, &dep, None, "time");
+/// assert!(matches!(outcome, Some(ScanOutcome::Clean)));
+/// ```
+pub fn resolve_scan_outcome<'a>(
     vulnerabilities: &'a VulnerabilityMap,
-    vuln_key: Option<&str>,
+    dep: &dyn Dependency,
+    keys: Option<&crate::osv::VulnKeys>,
     normalized_name: &str,
-    declared_name: &str,
 ) -> Option<&'a ScanOutcome> {
-    vuln_key
-        .and_then(|key| vulnerabilities.get(key))
+    keys.and_then(|k| k.get(&dep.name_range()))
+        .and_then(|key| vulnerabilities.get(key.as_str()))
         .or_else(|| vulnerabilities.get(normalized_name))
-        .or_else(|| vulnerabilities.get(declared_name))
+        .or_else(|| vulnerabilities.get(dep.name().as_str()))
 }
 
 /// Converts byte offsets in source text to LSP `Position` values.

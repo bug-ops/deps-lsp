@@ -60,7 +60,7 @@ pub async fn handle_code_lens(
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
     let Some((ecosystem, parse_result, content, cached_versions, resolved_versions)) = state
         .with_document(uri, |doc| {
-            let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
+            let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
 
             // Refuse the same conditions `execute_update_all_outdated` requires, so the lens
             // never renders a click target the command would then refuse (see
@@ -263,7 +263,10 @@ mod tests {
             // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
             // this test shares a binary with document/loader.rs's diffing test.
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result = ecosystem
                 .parse_manifest(
                     content,
@@ -585,7 +588,10 @@ mod tests {
         #[tokio::test]
         async fn test_cargo_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
             let content = "[dependencies]\nserde = \"1.0.0\"\n";
             let mut cached = HashMap::new();
@@ -605,7 +611,10 @@ mod tests {
         #[tokio::test]
         async fn test_npm_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Npm)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/package.json");
             let content = r#"{"dependencies": {"express": "^4.0.0"}}"#;
             let mut cached = HashMap::new();
@@ -625,7 +634,10 @@ mod tests {
         #[tokio::test]
         async fn test_pypi_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Pypi)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
             // An exact pin, not a lower bound: "==2.0.0" doesn't accept "2.5.0" like ">=2.0.0"
             // would. `format_version_replacing` preserves the `==` style (§6.1), not a range.
@@ -647,7 +659,10 @@ mod tests {
         #[tokio::test]
         async fn test_go_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("go").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Go)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/go.mod");
             let content =
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
@@ -671,7 +686,10 @@ mod tests {
         #[tokio::test]
         async fn test_dart_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("dart").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Dart)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
             // A major-version bump: "^1.0.0" does not accept "2.0.0".
             let content = "dependencies:\n  http: ^1.0.0\n";
@@ -692,7 +710,10 @@ mod tests {
         #[tokio::test]
         async fn test_nuget_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("nuget").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::NuGet)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/project.csproj");
             let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="12.0.3" /></ItemGroup></Project>"#;
             let mut cached = HashMap::new();
@@ -715,7 +736,10 @@ mod tests {
         #[tokio::test]
         async fn test_composer_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("composer").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Composer)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/composer.json");
             let content = "{\n  \"require\": {\n    \"symfony/console\": \"^6.0\"\n  }\n}";
             let mut cached = HashMap::new();
@@ -738,7 +762,10 @@ mod tests {
         #[tokio::test]
         async fn test_bundler_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("bundler").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Bundler)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/Gemfile");
             let content = "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'";
             let mut cached = HashMap::new();
@@ -758,7 +785,10 @@ mod tests {
         #[tokio::test]
         async fn test_maven_literal_version_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("maven").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Maven)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
             let content = r"<project>
   <dependencies>
@@ -790,7 +820,10 @@ mod tests {
         #[tokio::test]
         async fn test_maven_property_version_is_skipped() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("maven").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Maven)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/pom.xml");
             let content = r"<project>
   <properties>
@@ -831,7 +864,10 @@ mod tests {
 
             let uri = url::Url::from_file_path(&build_gradle_path).unwrap();
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("gradle").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Gradle)
+                .unwrap();
 
             let mut cached = HashMap::new();
             cached.insert(
@@ -846,7 +882,10 @@ mod tests {
         #[tokio::test]
         async fn test_gradle_version_catalog_alias_is_skipped() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("gradle").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Gradle)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/gradle/libs.versions.toml");
             let content = "[versions]\nspring = \"3.2.0\"\n\n[libraries]\nspring-boot = { module = \"org.springframework.boot:spring-boot-starter\", version.ref = \"spring\" }\n";
             let mut cached = HashMap::new();
@@ -865,7 +904,10 @@ mod tests {
             // comparator requirement against the bare `version_range` span, so this
             // previously-always-skipped case now produces an edit.
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("swift").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Swift)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
             let content = r#"
 let package = Package(
@@ -899,7 +941,10 @@ let package = Package(
             // `lowerBound > upperBound`). Must keep producing zero edits, as for other
             // unsupported-literal cases (Maven `${property}`, Gradle DSL var).
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("swift").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Swift)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/test/Package.swift");
 
             for content in [
@@ -945,7 +990,10 @@ let package = Package(
         #[tokio::test]
         async fn test_github_actions_tag_pin_is_edited() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::GithubActions)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let content = "steps:\n  - uses: actions/checkout@v4.2.0\n";
             let mut cached = HashMap::new();
@@ -968,7 +1016,10 @@ let package = Package(
         #[tokio::test]
         async fn test_github_actions_sha_with_comment_pin_is_edited_to_new_sha_and_tag() {
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::GithubActions)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let old_sha = "a".repeat(40);
             let new_sha = "b".repeat(40);
@@ -998,7 +1049,10 @@ let package = Package(
             // after the full `owner/repo/sub@` prefix, not the truncated `owner/repo@` —
             // otherwise the edit corrupts the `/init@` segment and silently drops the pin.
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::GithubActions)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let old_sha = "a".repeat(40);
             let new_sha = "b".repeat(40);
@@ -1034,7 +1088,10 @@ let package = Package(
             // equal the raw span byte-for-byte, so the no-op guard suppresses the edit
             // instead of silently downgrading the SHA pin to a bare tag.
             let state = ServerState::new();
-            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::GithubActions)
+                .unwrap();
             let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
             let old_sha = "a".repeat(40);
             // No seed_gha_tag_index call: the index has no entry for "v4.3.0", so the lookup misses.
@@ -1063,7 +1120,10 @@ let package = Package(
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
 
-            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::GithubActions)
+                .unwrap();
             seed_gha_tag_index(
                 ecosystem.as_ref(),
                 "actions/checkout",
@@ -1107,7 +1167,10 @@ let package = Package(
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "steps:\n  - uses: actions/checkout@v3\n".to_string();
 
-            let ecosystem = state.ecosystem_registry.get("github-actions").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::GithubActions)
+                .unwrap();
             seed_gha_tag_index(
                 ecosystem.as_ref(),
                 "actions/checkout",

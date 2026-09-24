@@ -478,14 +478,14 @@ ecosystem!(
 ///
 /// // Every id this call reports as policy-consuming is actually registered.
 /// for id in &workspace_registry_ecosystems {
-///     assert!(registry.get(id).is_some());
+///     assert!(registry.get(*id).is_some());
 /// }
 /// ```
 pub fn register_ecosystems(
     registry: &EcosystemRegistry,
     cache: Arc<HttpCache>,
     runtime: &EcosystemRuntime,
-) -> Vec<&'static str> {
+) -> Vec<deps_core::EcosystemId> {
     let policy = Arc::clone(&runtime.policy);
     // Keeps `policy` used even when none of its consumers (cargo, npm, pypi, go, nuget,
     // gitlab-ci) are compiled in.
@@ -507,7 +507,7 @@ pub fn register_ecosystems(
             Arc::clone(&cache),
             context,
         )));
-        workspace_registry_ecosystems.push("cargo");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Cargo);
     }
 
     #[cfg(all(feature = "npm", feature = "deno"))]
@@ -528,7 +528,7 @@ pub fn register_ecosystems(
             Arc::clone(&npm_registry),
             npm_context,
         )));
-        workspace_registry_ecosystems.push("npm");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Npm);
         // `DenoEcosystem::with_context` shares the registry, policy, and `.npmrc` cache above.
         // "deno" joins `workspace_registry_ecosystems` too (#1212 S4 impl-critic fix): since
         // `DenoParseContext.policy` now flows into real classification (`npm:`-scope
@@ -541,7 +541,7 @@ pub fn register_ecosystems(
             npm_registry.as_ref().clone(),
             deno_context,
         )));
-        workspace_registry_ecosystems.push("deno");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Deno);
     }
     // npm is explicit, not via `register!` (spec 032, S3): the macro's default
     // `NpmParseContext` would never see a live `initialize`/`didChangeConfiguration` update.
@@ -556,7 +556,7 @@ pub fn register_ecosystems(
             Arc::new(NpmRegistry::new(Arc::clone(&cache))),
             npm_context,
         )));
-        workspace_registry_ecosystems.push("npm");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Npm);
     }
     // deno-without-npm is explicit too, not via `register!` (#1212 S5 impl-critic fix): the
     // macro's default `DenoParseContext` would never see a live
@@ -575,7 +575,7 @@ pub fn register_ecosystems(
             Arc::clone(&cache),
             deno_context,
         )));
-        workspace_registry_ecosystems.push("deno");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Deno);
     }
 
     // pypi is explicit, not via `register!` (spec 033, mirrors npm's spec 032 S3): the
@@ -586,7 +586,7 @@ pub fn register_ecosystems(
             Arc::new(PypiRegistry::new(Arc::clone(&cache))),
             Arc::clone(&policy),
         )));
-        workspace_registry_ecosystems.push("pypi");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Pypi);
     }
 
     // go is explicit, not via `register!` (spec 034, mirrors npm's spec 032 S3): the macro's
@@ -602,7 +602,7 @@ pub fn register_ecosystems(
             Arc::new(GoRegistry::new(Arc::clone(&cache))),
             go_context,
         )));
-        workspace_registry_ecosystems.push("go");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::Go);
     }
     register!("bundler", BundlerEcosystem, registry, &cache);
     register!("dart", DartEcosystem, registry, &cache);
@@ -632,7 +632,7 @@ pub fn register_ecosystems(
             Arc::new(NuGetRegistry::new(Arc::clone(&cache))),
             nuget_context,
         )));
-        workspace_registry_ecosystems.push("nuget");
+        workspace_registry_ecosystems.push(deps_core::EcosystemId::NuGet);
     }
 
     register!("github-actions", GithubActionsEcosystem, registry, &cache);
@@ -755,7 +755,7 @@ mod tests {
 
         for id in &workspace_registry_ecosystems {
             assert!(
-                registry.get(id).is_some(),
+                registry.get(*id).is_some(),
                 "{id:?} was returned as policy-consuming but is not a registered ecosystem"
             );
         }
@@ -774,7 +774,10 @@ mod tests {
         #[cfg(feature = "nuget")]
         expected.push("nuget");
         expected.sort_unstable();
-        let mut actual = workspace_registry_ecosystems.clone();
+        let mut actual: Vec<&str> = workspace_registry_ecosystems
+            .iter()
+            .map(|id| id.id())
+            .collect();
         actual.sort_unstable();
         assert_eq!(
             actual, expected,
@@ -819,7 +822,7 @@ mod tests {
 
         for id in deps_core::EcosystemId::ALL {
             assert!(
-                registry.get(id.id()).is_some(),
+                registry.get(*id).is_some(),
                 "{id:?} is in EcosystemId::ALL but was not registered by register_ecosystems"
             );
         }
@@ -853,15 +856,15 @@ mod tests {
                 .get(id)
                 .unwrap_or_else(|| panic!("{id:?} came from registry.ecosystem_ids() itself"));
 
-            let parsed_id: deps_core::EcosystemId = id.parse().unwrap_or_else(|_| {
-                panic!("{id:?} has no matching EcosystemId variant (see issue #118)")
-            });
+            // The only remaining guarantee that `Ecosystem::id()` (still used by tracing
+            // spans/logs) agrees with routing, now that routing itself keys on
+            // `Ecosystem::ecosystem_id()` instead (see `EcosystemRegistry::register`).
             assert_eq!(
-                parsed_id.id(),
+                ecosystem.ecosystem_id(),
                 id,
-                "{id:?}: EcosystemId round-trip mismatch"
+                "{id:?}: Ecosystem::ecosystem_id() disagrees with the registry key"
             );
-            assert_eq!(ecosystem.id(), id, "{id:?}: Ecosystem::id() mismatch");
+            assert_eq!(ecosystem.id(), id.id(), "{id:?}: Ecosystem::id() mismatch");
 
             let display_name = ecosystem.display_name();
             assert!(!display_name.is_empty(), "{id:?} has an empty display_name");
@@ -1130,13 +1133,10 @@ mod tests {
         const BARE_FULL_VERSION: &str = "1.2.3";
         const BARE_PARTIAL_VERSION: &str = "1.2";
 
-        for str_id in registry.ecosystem_ids() {
-            let id: deps_core::EcosystemId = str_id.parse().unwrap_or_else(|_| {
-                panic!("registered ecosystem id {str_id:?} has no matching EcosystemId variant")
-            });
+        for id in registry.ecosystem_ids() {
             let ecosystem = registry
-                .get(str_id)
-                .unwrap_or_else(|| panic!("{str_id:?} just parsed from the registry's own ids"));
+                .get(id)
+                .unwrap_or_else(|| panic!("{id:?} came from the registry's own ids"));
             let formatter = ecosystem.formatter();
 
             match bare_version_agreement_expectation(id) {
@@ -1333,7 +1333,7 @@ mod tests {
             // NuGet used to be excluded too, but #423 added a fallback rung to
             // `select_latest_matching` so a prerelease-only package now resolves under a bare
             // wildcard too — no exception needed anymore.
-            if matches!(id, "go") {
+            if matches!(id, deps_core::EcosystemId::Go) {
                 continue;
             }
 

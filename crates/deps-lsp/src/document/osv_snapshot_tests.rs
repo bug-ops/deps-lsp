@@ -47,7 +47,7 @@ fn sample_advisory() -> Arc<Advisory> {
 /// single dependency named `dep_key` (after normalization) as vulnerable,
 /// generate diagnostics, and return a snapshot-stable rendering.
 async fn diagnostics_snapshot_for(
-    ecosystem_id: &str,
+    ecosystem_id: deps_core::EcosystemId,
     manifest_filename: &str,
     content: &str,
 ) -> String {
@@ -119,8 +119,9 @@ macro_rules! ecosystem_snapshot_test {
         #[cfg(feature = $feature)]
         #[tokio::test]
         async fn $test_name() {
+            let ecosystem_id: deps_core::EcosystemId = $ecosystem_id.parse().unwrap();
             let rendered =
-                diagnostics_snapshot_for($ecosystem_id, $manifest_filename, $content).await;
+                diagnostics_snapshot_for(ecosystem_id, $manifest_filename, $content).await;
             insta::assert_snapshot!(rendered);
         }
     };

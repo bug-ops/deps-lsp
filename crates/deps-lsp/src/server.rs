@@ -230,14 +230,18 @@ impl Backend {
         }
     }
 
-    async fn handle_lockfile_change(&self, lockfile_path: &std::path::Path, ecosystem_id: &str) {
-        let Some(ecosystem) = self.state.ecosystem_registry.get(ecosystem_id) else {
-            tracing::error!("Unknown ecosystem: {}", ecosystem_id);
+    async fn handle_lockfile_change(
+        &self,
+        lockfile_path: &std::path::Path,
+        ecosystem: deps_core::EcosystemId,
+    ) {
+        let Some(ecosystem_impl) = self.state.ecosystem_registry.get(ecosystem) else {
+            tracing::error!("Unknown ecosystem: {}", ecosystem);
             return;
         };
 
-        let Some(lock_provider) = ecosystem.lockfile_provider() else {
-            tracing::warn!("Ecosystem {} has no lock file provider", ecosystem_id);
+        let Some(lock_provider) = ecosystem_impl.lockfile_provider() else {
+            tracing::warn!("Ecosystem {} has no lock file provider", ecosystem);
             return;
         };
 
@@ -246,7 +250,6 @@ impl Backend {
         // document. Run the whole scan in `spawn_blocking` instead.
         let state = Arc::clone(&self.state);
         let lock_provider_for_scan = Arc::clone(&lock_provider);
-        let ecosystem_id_owned = ecosystem_id.to_string();
         let lockfile_path_owned = lockfile_path.to_path_buf();
         let affected_uris: Vec<Uri> = tokio::task::spawn_blocking(move || {
             state
@@ -255,7 +258,7 @@ impl Backend {
                 .filter_map(|entry| {
                     let uri = entry.key();
                     let doc = entry.value();
-                    if doc.ecosystem_id() != ecosystem_id_owned {
+                    if doc.ecosystem != ecosystem {
                         return None;
                     }
                     let domain_uri = crate::lsp_types_interop::from_lsp_uri(uri)?;
@@ -349,7 +352,7 @@ impl Backend {
             let resolved_changed = reload_resolved_versions(
                 &uri,
                 &self.state,
-                ecosystem.as_ref(),
+                ecosystem_impl.as_ref(),
                 &resolved_versions,
                 &resolved_version_candidates,
                 lockfile_reload_ok,
@@ -370,7 +373,9 @@ impl Backend {
                 },
                 ChangeTaskTriggerGates {
                     vulnerabilities_enabled,
-                    requires_dedicated_fetch: ecosystem.license_source().requires_dedicated_fetch(),
+                    requires_dedicated_fetch: ecosystem_impl
+                        .license_source()
+                        .requires_dedicated_fetch(),
                 },
             );
 
@@ -416,7 +421,7 @@ impl Backend {
                 // close.
                 let state = Arc::clone(&self.state);
                 let client = self.client.clone();
-                let ecosystem = Arc::clone(&ecosystem);
+                let ecosystem_impl = Arc::clone(&ecosystem_impl);
                 let rescan_uri = uri.clone();
                 let log_uri = uri.clone();
                 // Supervised the same way as the `did_change_configuration` reparse worker
@@ -432,14 +437,14 @@ impl Backend {
                         // OSV phase A and license pre-fetch concurrently.
                         let license_uri = rescan_uri.clone();
                         let license_state = Arc::clone(&state);
-                        let license_ecosystem = Arc::clone(&ecosystem);
+                        let license_ecosystem = Arc::clone(&ecosystem_impl);
                         tokio::join!(
                             async {
                                 if needs_osv_rescan {
                                     rescan_after_resolved_version_change(
                                         &rescan_uri,
                                         &state,
-                                        &ecosystem,
+                                        &ecosystem_impl,
                                         snapshot.fetch_timeout_secs,
                                     )
                                     .await;
@@ -502,7 +507,7 @@ impl Backend {
     /// (e.g. `.npmrc`), since a plain diff would treat it as a no-op.
     async fn handle_watched_config_change(
         &self,
-        ecosystem_ids: Vec<&'static str>,
+        ecosystem_ids: Vec<deps_core::EcosystemId>,
         refetch: crate::document::RefetchPolicy,
     ) {
         crate::document::reparse::reparse_open_documents(
@@ -1057,13 +1062,15 @@ impl LanguageServer for Backend {
                 );
 
                 self.state.lockfile_cache.invalidate(&path);
-                self.handle_lockfile_change(&path, ecosystem.id()).await;
+                self.handle_lockfile_change(&path, ecosystem.ecosystem_id())
+                    .await;
                 continue;
             }
 
             let ecosystems = self.state.ecosystem_registry.for_watched_config(filename);
             if !ecosystems.is_empty() {
-                let ecosystem_ids: Vec<&'static str> = ecosystems.iter().map(|e| e.id()).collect();
+                let ecosystem_ids: Vec<deps_core::EcosystemId> =
+                    ecosystems.iter().map(|e| e.ecosystem_id()).collect();
                 // A routing-only change (e.g. `.npmrc`) needs a full refetch, not a diff (issue #1232 S1).
                 let refetch = if ecosystems
                     .iter()
@@ -1325,7 +1332,7 @@ impl Backend {
             return;
         }
 
-        let Some(ecosystem) = self.state.ecosystem_registry.get(doc.ecosystem_id()) else {
+        let Some(ecosystem) = self.state.ecosystem_registry.get(doc.ecosystem) else {
             tracing::warn!("Unknown ecosystem for {:?}", uri);
             drop(doc);
             self.warn_update_all_outdated_not_ready().await;
@@ -1449,7 +1456,7 @@ impl Backend {
             return;
         }
 
-        let Some(ecosystem) = self.state.ecosystem_registry.get(doc.ecosystem_id()) else {
+        let Some(ecosystem) = self.state.ecosystem_registry.get(doc.ecosystem) else {
             tracing::warn!("Unknown ecosystem for {:?}", uri);
             drop(doc);
             self.warn_update_all_outdated_not_ready().await;
@@ -1753,7 +1760,11 @@ mod tests {
 
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let backend = service.inner();
-        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let provider = ecosystem.lockfile_provider().unwrap();
 
         backend
@@ -2108,7 +2119,11 @@ mod tests {
 
         let deno_url = deps_core::test_util::test_uri("/test/deno.json");
         let deno_uri = crate::lsp_types_interop::to_lsp_uri(&deno_url);
-        let deno_ecosystem = backend.state.ecosystem_registry.get("deno").unwrap();
+        let deno_ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Deno)
+            .unwrap();
         let deno_content =
             r#"{"imports": {"secret": "npm:@acme-corp/secretpkg@^1.0.0"}}"#.to_string();
         let deno_parse = deno_ecosystem
@@ -2504,7 +2519,11 @@ mod tests {
             config.policy.cache.max_concurrent_fetches = 1;
         }
 
-        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         for (uri, content) in [(&small_uri, &small_content), (&large_uri, &large_content)] {
             let parse_result = ecosystem
                 .parse_manifest(
@@ -2530,7 +2549,7 @@ mod tests {
         }
 
         backend
-            .handle_lockfile_change(&lockfile_path, "cargo")
+            .handle_lockfile_change(&lockfile_path, deps_core::EcosystemId::Cargo)
             .await;
 
         assert_eq!(
@@ -2602,7 +2621,11 @@ mod tests {
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let backend = service.inner();
 
-        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         for (uri, content) in [(&alpha_uri, &alpha_content), (&beta_uri, &beta_content)] {
             let parse_result = ecosystem
                 .parse_manifest(
@@ -2629,7 +2652,7 @@ mod tests {
         .unwrap();
 
         backend
-            .handle_lockfile_change(&lockfile_path, "cargo")
+            .handle_lockfile_change(&lockfile_path, deps_core::EcosystemId::Cargo)
             .await;
 
         // The rescan now runs in a detached background task (issue #1395 critic S2), off
@@ -2702,7 +2725,11 @@ mod tests {
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let backend = service.inner();
 
-        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let parse_result = ecosystem
             .parse_manifest(
                 &content,
@@ -2728,7 +2755,7 @@ mod tests {
         backend.state.update_document(uri.clone(), doc_state);
 
         backend
-            .handle_lockfile_change(&lockfile_path, "cargo")
+            .handle_lockfile_change(&lockfile_path, deps_core::EcosystemId::Cargo)
             .await;
 
         let doc = backend.state.get_document(&uri).unwrap();
@@ -2776,7 +2803,11 @@ mod tests {
         let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
         let backend = service.inner();
 
-        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let parse_result = ecosystem
             .parse_manifest(
                 &content,
@@ -2801,7 +2832,7 @@ mod tests {
         backend.state.update_document(uri.clone(), doc_state);
 
         backend
-            .handle_lockfile_change(&lockfile_path, "cargo")
+            .handle_lockfile_change(&lockfile_path, deps_core::EcosystemId::Cargo)
             .await;
 
         let doc = backend.state.get_document(&uri).unwrap();
@@ -2857,7 +2888,11 @@ mod tests {
             config.policy.diagnostics.vulnerabilities_enabled = false;
         }
 
-        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let parse_result = ecosystem
             .parse_manifest(
                 &content,
@@ -2886,7 +2921,7 @@ mod tests {
         .unwrap();
 
         backend
-            .handle_lockfile_change(&lockfile_path, "cargo")
+            .handle_lockfile_change(&lockfile_path, deps_core::EcosystemId::Cargo)
             .await;
 
         let doc = backend.state.get_document(&uri).unwrap();
@@ -3655,7 +3690,11 @@ mod tests {
 
             // Seed the document so `ensure_document_loaded`'s fast path (already loaded)
             // returns immediately, letting both handlers reach their own config reads.
-            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let doc_state =
@@ -3774,7 +3813,11 @@ mod tests {
             // (unrelated) scope.
             let cargo_url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let cargo_uri = crate::lsp_types_interop::to_lsp_uri(&cargo_url);
-            let cargo_ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let cargo_ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let cargo_content = "[dependencies]\nserde = \"1.0\"\n".to_string();
             let cargo_parse = cargo_ecosystem
                 .parse_manifest(&cargo_content, &cargo_url)
@@ -3794,7 +3837,11 @@ mod tests {
 
             let nuget_url = deps_core::test_util::test_uri("/test/project.csproj");
             let nuget_uri = crate::lsp_types_interop::to_lsp_uri(&nuget_url);
-            let nuget_ecosystem = backend.state.ecosystem_registry.get("nuget").unwrap();
+            let nuget_ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::NuGet)
+                .unwrap();
             let nuget_content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="12.0.3" /></ItemGroup></Project>"#.to_string();
             let nuget_parse = nuget_ecosystem
                 .parse_manifest(&nuget_content, &nuget_url)
@@ -3900,7 +3947,11 @@ mod tests {
                 "/test/Cargo.toml",
             ));
 
-            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(
@@ -3944,7 +3995,11 @@ mod tests {
                 "/test/Cargo.toml",
             ));
 
-            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(
@@ -3977,7 +4032,11 @@ mod tests {
                 "/test/Cargo.toml",
             ));
 
-            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(
@@ -4044,7 +4103,11 @@ mod tests {
             let (service, mut socket) = tower_lsp_server::LspService::build(Backend::new).finish();
             let backend = service.inner();
 
-            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(&content, &canonical_url)
@@ -4146,7 +4209,11 @@ mod tests {
             let uri = crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
                 "/test/Cargo.toml",
             ));
-            let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = backend
+                .state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
             let parse_result = ecosystem
                 .parse_manifest(
@@ -4346,7 +4413,7 @@ mod tests {
             let ecosystem = backend
                 .state
                 .ecosystem_registry
-                .get("github-actions")
+                .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
             let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
             let parse_result = ecosystem
@@ -4393,7 +4460,7 @@ mod tests {
             let ecosystem = backend
                 .state
                 .ecosystem_registry
-                .get("github-actions")
+                .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
             let content = "steps:\n  - uses: actions/checkout@v4\n";
             let parse_result = ecosystem
@@ -4432,7 +4499,7 @@ mod tests {
             let ecosystem = backend
                 .state
                 .ecosystem_registry
-                .get("github-actions")
+                .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
             let parse_result = ecosystem
                 .parse_manifest(
@@ -4475,7 +4542,7 @@ mod tests {
             let ecosystem = backend
                 .state
                 .ecosystem_registry
-                .get("github-actions")
+                .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
             seed_gha_tag_index(
                 ecosystem.as_ref(),
@@ -4556,7 +4623,7 @@ mod tests {
             let ecosystem = backend
                 .state
                 .ecosystem_registry
-                .get("github-actions")
+                .get(deps_core::EcosystemId::GithubActions)
                 .unwrap();
             seed_gha_tag_index(
                 ecosystem.as_ref(),
@@ -4634,7 +4701,11 @@ mod tests {
             "/test/Cargo.toml",
         ));
 
-        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
         let parse_result = ecosystem
             .parse_manifest(
@@ -4694,7 +4765,11 @@ mod tests {
         ));
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
 
-        let ecosystem = backend.state.ecosystem_registry.get("gitlab-ci").unwrap();
+        let ecosystem = backend
+            .state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::GitlabCi)
+            .unwrap();
         let registry = ecosystem.registry();
         let gitlab_registry = registry
             .as_any()

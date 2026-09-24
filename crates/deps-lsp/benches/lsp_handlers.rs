@@ -68,7 +68,7 @@ fn create_test_config() -> Arc<RwLock<DepsConfig>> {
 async fn setup_document(state: &ServerState, uri: &Uri, content: &str) {
     let ecosystem = state
         .ecosystem_registry
-        .get("cargo")
+        .get(EcosystemId::Cargo)
         .expect("Cargo ecosystem not found");
 
     let parse_result = ecosystem
@@ -383,7 +383,7 @@ fn bench_cold_start_loading(c: &mut Criterion) {
 
                     let ecosystem = state
                         .ecosystem_registry
-                        .get("cargo")
+                        .get(EcosystemId::Cargo)
                         .expect("Cargo ecosystem not found");
 
                     let parse_result = ecosystem

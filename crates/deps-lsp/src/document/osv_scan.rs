@@ -104,10 +104,8 @@ pub(crate) async fn run_osv_scan_phase_a(
             .dependencies()
             .into_iter()
             .map(|d| {
-                let key = vuln_keys
-                    .get(&d.name_range())
-                    .cloned()
-                    .unwrap_or_else(|| ecosystem.formatter().normalize_package_name(d.name()));
+                let key = deps_core::osv::vuln_key_for(d, Some(&vuln_keys), ecosystem.formatter())
+                    .into_string();
                 (key, d.name().as_str().to_string())
             })
             .collect();
@@ -580,17 +578,16 @@ mod tests {
         fn license_source_is_pinned_per_ecosystem() {
             let state = ServerState::new();
 
-            for id_str in state.ecosystem_registry.ecosystem_ids() {
-                let id: EcosystemId = id_str.parse().expect("valid ecosystem id");
+            for id in state.ecosystem_registry.ecosystem_ids() {
                 let eco = state
                     .ecosystem_registry
-                    .get(id_str)
-                    .unwrap_or_else(|| panic!("{id_str} ecosystem not found"));
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{id} ecosystem not found"));
 
                 assert_eq!(
                     eco.license_source(),
                     expected_license_source(id),
-                    "{id_str}: license_source() mismatch"
+                    "{id}: license_source() mismatch"
                 );
             }
         }

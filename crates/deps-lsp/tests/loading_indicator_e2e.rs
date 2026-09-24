@@ -23,7 +23,7 @@ serde = "1.0.0"
 tokio = { version = "1.0", features = ["full"] }
 "#;
 
-    let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+    let ecosystem = state.ecosystem_registry.get(EcosystemId::Cargo).unwrap();
     let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
 
     let doc =
@@ -135,7 +135,7 @@ async fn test_concurrent_loading_multiple_documents() {
 serde = "1.0.0"
 "#;
 
-    let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+    let ecosystem = state.ecosystem_registry.get(EcosystemId::Cargo).unwrap();
 
     let parse1 = ecosystem.parse_manifest(content, &url1).await.unwrap();
     let parse2 = ecosystem.parse_manifest(content, &url2).await.unwrap();

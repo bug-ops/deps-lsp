@@ -94,21 +94,14 @@ pub async fn handle_completion(
     // a concurrent `didChange` between them could pair a `parse_result` with `content` from
     // a different revision, and `generate_completions` correlates the two (#319 review).
     // `with_document` makes releasing the guard structural, not a convention (#333).
-    let Some((ecosystem_id, ecosystem_kind, content, parse_result)) =
-        state.with_document(uri, |doc| {
-            (
-                doc.ecosystem_id(),
-                doc.ecosystem,
-                doc.content.clone(),
-                doc.parse_result_arc(),
-            )
-        })
-    else {
+    let Some((ecosystem_id, content, parse_result)) = state.with_document(uri, |doc| {
+        (doc.ecosystem, doc.content.clone(), doc.parse_result_arc())
+    }) else {
         tracing::warn!("completion: document not found: {:?}", uri);
         return context_less_response();
     };
 
-    tracing::Span::current().record("ecosystem", ecosystem_kind.id());
+    tracing::Span::current().record("ecosystem", ecosystem_id.id());
 
     tracing::info!(
         "completion: ecosystem={}, has_parse_result={}",
@@ -149,7 +142,7 @@ pub async fn handle_completion(
                     {
                         tracing::info!("completion: ecosystem returned empty, trying fallback");
                         let fallback_items =
-                            fallback_completion(&state, ecosystem_kind, position, &content).await;
+                            fallback_completion(&state, ecosystem_id, position, &content).await;
                         (
                             fallback_items,
                             completions.is_incomplete || ecosystem.package_search_is_incomplete(),
@@ -178,7 +171,7 @@ pub async fn handle_completion(
         // `package_search_is_incomplete` (resolved above) is the only signal available —
         // matches the mid-typing, parse-failed state (`new_without_parse_result`).
         (
-            fallback_completion(&state, ecosystem_kind, position, &content).await,
+            fallback_completion(&state, ecosystem_id, position, &content).await,
             package_search_is_incomplete,
         )
     };
@@ -221,7 +214,7 @@ async fn fallback_completion(
         ecosystem_kind
     );
 
-    let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_kind.id()) else {
+    let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_kind) else {
         tracing::warn!(
             "fallback_completion: ecosystem not found for id: {}",
             ecosystem_kind
@@ -678,7 +671,10 @@ mod tests {
 
         let content = "[dependencies]\nserde = \"1.0\"".to_string();
 
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
 
         let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);

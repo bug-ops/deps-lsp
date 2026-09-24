@@ -339,7 +339,10 @@ serde = "1.0"
 tokio = "1.0"
 "#;
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -427,7 +430,10 @@ serde = "1.0"
 serde_old = { package = "serde", version = "0.9" }
 "#;
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -489,7 +495,10 @@ serde_old = { package = "serde", version = "0.9" }
             let content1 = r#"[dependencies]
 serde = "1.0"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -548,7 +557,10 @@ serde = "1.0"
             let content1 = r#"[dependencies]
 time = "0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -598,7 +610,10 @@ time = "0.1.43"
             let content1 = r#"[dependencies]
 time = "0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -652,7 +667,10 @@ time = "0.1.43"
             let content1 = r#"[dependencies]
 time = "0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -713,7 +731,10 @@ time = "0.1.43"
 serde = "1.0"
 time = "0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -789,7 +810,10 @@ serde = "1.0"
 serde = "1.0"
 serde_old = { package = "serde", version = "0.9" }
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -852,7 +876,10 @@ serde_old = { package = "serde", version = "0.9" }
             let content1 = r#"[dependencies]
 time = "0.1.44"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -928,7 +955,10 @@ time = "0.1.43"
             let content1 = r#"[dependencies]
 time = "0.1.44"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -1024,7 +1054,10 @@ time = "0.1.43"
 serde = "1.0"
 time = "0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -1099,7 +1132,10 @@ serde = "1.0"
             let content1 = r#"[dependencies]
 time = "=0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -1182,7 +1218,10 @@ time = "=0.1.44"
 serde = "1.0"
 time = "0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -1294,7 +1333,10 @@ serde = "1.0"
             let content = r#"[dependencies]
 time = "0.1.43"
 "#;
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -1350,7 +1392,10 @@ time = "0.1.43"
 serde = "1.0"
 "#;
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
             let doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -1379,7 +1424,10 @@ serde = "1.0"
 serde = "1.0"
 "#;
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -1531,7 +1579,10 @@ serde = "1.0"
             // keep one requirement per occurrence.
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
 
             let content = r#"[dependencies]
 time = "0.1.43"
@@ -1573,7 +1624,10 @@ time = "0.1.44"
             // `DependencyDiff` — the registry fetch and OSV rescan never ran.
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
 
             let content1 = r#"[dependencies]
 time = "0.1.43"
@@ -1625,7 +1679,10 @@ time = "0.1.44"
             // — confirming the fix is not merely order-dependent.
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
 
             let content1 = r#"[dependencies]
 time = "0.1.43"
@@ -1682,7 +1739,10 @@ time = "0.1.60"
             // appearing in source order to detect the edit correctly.
             let state = Arc::new(ServerState::new());
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
 
             let content1 = r#"[target.'cfg(windows)'.dependencies]
 time = "0.1.44"
@@ -1747,7 +1807,10 @@ tokio = "1.0"
 anyhow = "1.0"
 "#;
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
             let doc_state1 = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
