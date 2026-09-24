@@ -345,7 +345,8 @@ mod tests {
                 "mustache": "jsr:@std/fmt@{{ STD_VERSION }}",
                 "autoconf": "npm:lodash@@PACKAGE_VERSION@",
                 "batch": "npm:left-pad@%LEFT_PAD_VERSION%",
-                "erb": "npm:react@<%= REACT_VERSION %>"
+                "erb": "npm:react@<%= REACT_VERSION %>",
+                "makefile": "npm:lodash@$(LODASH_VERSION)"
             }}"#;
     }
 

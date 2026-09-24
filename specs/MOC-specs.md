@@ -94,6 +94,7 @@ status: moc
 | 061 | [[061-feature-matrix-test-sharding/spec\|Shard feature-matrix-test CI job across parallel runners]] | specify | shipped — testing-infra/enhancement, P2, `feature-matrix-test` split into a 4-leg parallel matrix (`fail-fast: false`) with the redundant `default` slice dropped, coverage parity preserved (PR #1031, issue #1030) |
 | 066 | [[066-canonical-document-identity/spec\|Canonical document identity: canonicalize URIs once at server entry instead of per-handler URI rekeying]] | tasks | shipped — single `canonicalize_uri()` chokepoint at every document-reading LSP entry point, replacing the three per-handler #1071 rekey fixups (PR #1198, issue #1086) |
 | 068 | [[068-cli-update-subcommand/spec\|deps-cli update subcommand: non-interactive dependency update automation]] | tasks | draft — enhancement, P4, part of epic #1114; design settled via 3 rounds of architect/critic review (verdict: minor), 0 open `[NEEDS CLARIFICATION]` items (issues #1115, #1119, #1120) |
+| 069 | [[069-template-placeholder-dollar-paren-guard/spec\|Extend requirement_contains_template_placeholder to recognize $(VAR) (Makefile/MSBuild-style) placeholders]] | specify | bug, P3, 0 open `[NEEDS CLARIFICATION]` items; scoped by research on issue #1385 (`%{VAR}`/`#{VAR}` explicitly out of scope); tracked by issue #1417, ready for `/rust-team` |
 
 ## Project Foundation
 

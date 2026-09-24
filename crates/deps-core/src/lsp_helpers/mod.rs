@@ -1701,28 +1701,41 @@ fn contains_bracketed_placeholder(text: &str, open: &str, close_or_skip: &[u8]) 
 
 /// Whether `requirement` contains an unresolved external-templating placeholder.
 ///
-/// Recognizes several common generator syntaxes: `$VAR`/`${VAR}` (shell/envsubst), `{{ VAR }}`
-/// (Liquid/Jinja2/Mustache/Go `text/template` expression tags), `{% ... %}` (Jinja2/Liquid
-/// statement tags), `@VAR@`/`@project.version@` (autoconf/CMake `configure_file`), `%VAR%`
-/// (Windows batch/NSIS), or `<%= VAR %>` (ERB/lodash/Yeoman templates).
+/// Recognizes several common generator syntaxes: `$VAR`/`${VAR}` (shell/envsubst), `$(VAR)`
+/// (Makefile/MSBuild variable reference), `{{ VAR }}` (Liquid/Jinja2/Mustache/Go `text/template`
+/// expression tags), `{% ... %}` (Jinja2/Liquid statement tags), `@VAR@`/`@project.version@`
+/// (autoconf/CMake `configure_file`), `%VAR%` (Windows batch/NSIS), or `<%= VAR %>`
+/// (ERB/lodash/Yeoman templates).
 ///
 /// Detected anywhere in the text, not just as the whole value: `"${REACT_VERSION}"`, `"$VUE"`,
-/// `"{{ .NetVersion }}"`, `"{% if x %}"`, `"@PACKAGE_VERSION@"`, `"%VERSION%"`,
-/// `"<%= version %>"`, and an embedded form like `"1.0.0-$BUILD"` are all detected.
+/// `"$(LODASH_VERSION)"`, `"{{ .NetVersion }}"`, `"{% if x %}"`, `"@PACKAGE_VERSION@"`,
+/// `"%VERSION%"`, `"<%= version %>"`, and an embedded form like `"1.0.0-$BUILD"` are all
+/// detected.
 ///
-/// Issues #1374/#1379: manifests pre-processed by external templating (`envsubst`, CI
-/// templating, cookiecutter/Yeoman-style generators, `configure_file`) commonly carry one of
-/// these shapes in a version-requirement slot. npm, Cargo, Dart, Poetry
-/// (`[tool.poetry.dependencies]`), Deno and Go have no expansion syntax of their own for any of
-/// them — unlike Maven's `${property}` or Gradle's `$var`/`${var}`, which their own build tools
-/// resolve — so this crate can never expand one either, and a requirement containing it must
-/// never be classified as outdated/unsatisfiable or rewritten to a literal version.
+/// Issues #1374/#1379/#1417: manifests pre-processed by external templating (`envsubst`, CI
+/// templating, cookiecutter/Yeoman-style generators, `configure_file`, `Makefile`-orchestrated
+/// codegen) commonly carry one of these shapes in a version-requirement slot. npm, Cargo, Dart,
+/// Poetry (`[tool.poetry.dependencies]`), Deno and Go have no expansion syntax of their own for
+/// any of them — unlike Maven's `${property}` or Gradle's `$var`/`${var}`, which their own build
+/// tools resolve — so this crate can never expand one either, and a requirement containing it
+/// must never be classified as outdated/unsatisfiable or rewritten to a literal version.
 ///
 /// The `$`/`{{`/`{%`/`<%` forms do not require a closing delimiter (failing safe on an unclosed
 /// `${VAR`/`{{VAR`/`{%VAR`/`<%VAR` — still treating it as a placeholder — mirrors the GitLab
 /// precedent this predicate was originally extracted alongside); `@VAR@`/`%VAR%` require both
 /// delimiters, since a bare `@`/`%` is too common in ordinary text to treat as an opening
-/// delimiter alone.
+/// delimiter alone. `$(VAR)` also requires both delimiters (unlike `${VAR`'s fail-open
+/// precedent): an unclosed `$(` is far more likely to be a real, unrelated `$` immediately
+/// followed by literal `(text...` (parenthetical prose, a pasted shell command-substitution
+/// snippet) than an unterminated Makefile reference (#1417).
+///
+/// NuGet's `.csproj`/`.fsproj`/`.vbproj`/`Directory.Packages.props` MSBuild Central Package
+/// Management references (also `$(VAR)`-shaped, plus `%(VAR)`/`@(VAR)`) are natively recognized
+/// by that crate's own, independent `is_msbuild_reference` guard — `NuGetFormatter`'s
+/// `requirement_is_placeholder` ORs this function with that guard (`shared || native`), so this
+/// function is still reachable and consulted for NuGet, but its own `$(VAR)` extension is not
+/// load-bearing there: `is_msbuild_reference` already covered NuGet's `$(VAR)` case before this
+/// function did.
 ///
 /// # Examples
 ///
@@ -1732,6 +1745,8 @@ fn contains_bracketed_placeholder(text: &str, open: &str, close_or_skip: &[u8]) 
 /// assert!(requirement_contains_template_placeholder("${REACT_VERSION}"));
 /// assert!(requirement_contains_template_placeholder("$VUE"));
 /// assert!(requirement_contains_template_placeholder("1.0.0-$BUILD"));
+/// assert!(requirement_contains_template_placeholder("$(LODASH_VERSION)"));
+/// assert!(requirement_contains_template_placeholder("1.0.0-$(BUILD_SUFFIX)"));
 /// assert!(requirement_contains_template_placeholder("{{ .NetVersion }}"));
 /// assert!(requirement_contains_template_placeholder("{% if x %}"));
 /// assert!(requirement_contains_template_placeholder("@PACKAGE_VERSION@"));
@@ -1740,6 +1755,7 @@ fn contains_bracketed_placeholder(text: &str, open: &str, close_or_skip: &[u8]) 
 /// assert!(requirement_contains_template_placeholder("<%= version %>"));
 /// assert!(!requirement_contains_template_placeholder("1.2.3"));
 /// assert!(!requirement_contains_template_placeholder("price-is-$5"));
+/// assert!(!requirement_contains_template_placeholder("price-is-$(five"));
 /// assert!(!requirement_contains_template_placeholder("me@example.com"));
 /// assert!(!requirement_contains_template_placeholder("100%"));
 /// ```
@@ -1749,6 +1765,11 @@ pub fn requirement_contains_template_placeholder(requirement: &str) -> bool {
         b == b'$'
             && match bytes.get(i + 1) {
                 Some(b'{') => template_placeholder_identifier_end(bytes, i + 2).is_some(),
+                // #1417 scope boundary: strict `[a-zA-Z_][a-zA-Z0-9_]*` grammar per spec
+                // FR-001 — a hyphen/dot identifier (`$(MOD-VERSION)`, `$(A.VERSION)`) is not
+                // matched; tracked as a deliberate follow-up, not fixed here.
+                Some(b'(') => template_placeholder_identifier_end(bytes, i + 2)
+                    .is_some_and(|end| bytes.get(end) == Some(&b')')),
                 _ => template_placeholder_identifier_end(bytes, i + 1).is_some(),
             }
     });
@@ -3566,6 +3587,35 @@ mod tests {
     #[test]
     fn test_requirement_contains_template_placeholder_unclosed_brace_fails_safe() {
         assert!(requirement_contains_template_placeholder("${VAR"));
+    }
+
+    #[test]
+    fn test_requirement_contains_template_placeholder_dollar_paren_form() {
+        assert!(requirement_contains_template_placeholder(
+            "$(LODASH_VERSION)"
+        ));
+        assert!(requirement_contains_template_placeholder(
+            "require golang.org/x/net $(NET_VERSION)"
+        ));
+    }
+
+    /// #1417: unlike `${VAR`'s fail-open precedent, `$(` requires the closing `)` — an
+    /// unclosed `$(VAR` must NOT be classified as a placeholder on that basis alone.
+    #[test]
+    fn test_requirement_contains_template_placeholder_dollar_paren_unclosed_not_matched() {
+        assert!(!requirement_contains_template_placeholder("$(VAR"));
+        assert!(!requirement_contains_template_placeholder(
+            "price-is-$(five"
+        ));
+    }
+
+    #[test]
+    fn test_requirement_contains_template_placeholder_dollar_paren_no_identifier_not_matched() {
+        assert!(!requirement_contains_template_placeholder("$()"));
+        assert!(!requirement_contains_template_placeholder("$(123)"));
+        assert!(!requirement_contains_template_placeholder(
+            "$(SERDE VERSION)"
+        ));
     }
 
     /// #1391 fixture/detector drift guard: every entry in

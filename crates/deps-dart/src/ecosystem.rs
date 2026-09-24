@@ -251,6 +251,7 @@ dependencies:
   yaml: \"@YAML_VERSION@\"
   args: \"%ARGS_VERSION%\"
   intl: <%= INTL_VERSION %>
+  meta: $(META_VERSION)
 ";
     }
 
