@@ -1,7 +1,7 @@
 use crate::config::DepsConfig;
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ServerState, handle_document_change, handle_document_open,
-    rescan_after_resolved_version_change, resolved_versions_changed,
+    reload_resolved_versions, rescan_after_resolved_version_change,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -38,6 +38,25 @@ mod commands {
     /// returns no edits, so the command is simply always a no-op for an ecosystem with
     /// no mutable-ref pin concept, rather than needing its own feature gate.
     pub(super) const PIN_ALL_TO_SHA: &str = deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID;
+}
+
+/// Spawns `fut` as a detached background task, then spawns a second task that awaits it and
+/// calls `on_panic` if it panicked — the shared shape behind every "detached background work
+/// whose panic must not vanish silently" spawn in this file (issue #1399 code review:
+/// previously duplicated between `handle_lockfile_change`'s rescan and
+/// `did_change_configuration`'s reparse worker). `fut`'s success path is unaffected: this
+/// only ever observes a [`tokio::task::JoinError`] from a genuine panic, never cancellation
+/// (`fut` is never aborted by anything here) or `fut`'s own return value.
+fn spawn_supervised<F>(fut: F, on_panic: impl FnOnce(tokio::task::JoinError) + Send + 'static)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let worker = tokio::spawn(fut);
+    tokio::spawn(async move {
+        if let Err(e) = worker.await {
+            on_panic(e);
+        }
+    });
 }
 
 /// Parses a [`DepsConfig`] from a raw JSON settings payload (client
@@ -301,21 +320,10 @@ impl Backend {
         // Snapshot before the loop and drop the guard: re-reading `self.config` per URI
         // inside the loop would hold this guard across a nested read of the same
         // write-preferring `RwLock`, and a writer queued in between would block it forever.
-        let (
-            freshness,
-            severities,
-            offline,
-            fetch_timeout_secs,
-            max_concurrent_fetches,
-            vulnerabilities_enabled,
-        ) = {
+        let (snapshot, vulnerabilities_enabled) = {
             let config = self.config.read().await;
             (
-                config.policy.freshness.to_settings(),
-                config.policy.diagnostics.to_severities(),
-                config.policy.network.offline,
-                config.policy.cache.fetch_timeout_secs,
-                config.policy.cache.max_concurrent_fetches,
+                diagnostics::DiagnosticsSnapshot::from_config(&config),
                 config.policy.diagnostics.vulnerabilities_enabled,
             )
         };
@@ -328,39 +336,27 @@ impl Backend {
             // consults (critic S1) — not a raw-name lookup against the collapsed
             // `resolved_versions` map, which misses a normalized-name mismatch or a
             // multi-candidate name whose per-occurrence selection moved.
-            let mut needs_osv_rescan = false;
-            if let Some(mut doc) = self.state.documents.get_mut(&uri) {
-                if vulnerabilities_enabled
-                    && lockfile_reload_ok
-                    && let Some(parse_result) = doc.parse_result()
-                {
-                    let deps = parse_result.dependencies();
-                    needs_osv_rescan = resolved_versions_changed(
-                        &deps,
-                        &doc.resolved_versions,
-                        &doc.resolved_version_candidates,
-                        &resolved_versions,
-                        &resolved_version_candidates,
-                        ecosystem.formatter(),
-                        ecosystem.ecosystem_id(),
-                    );
-                }
-                // The maps update unconditionally, but the generation only bumps when
-                // paired with a rescan that will produce a fresh commit under the new
-                // generation (issue #1395 critic N2): bumping on every lock-file reload
-                // regardless would silently invalidate a concurrently in-flight
-                // manifest-edit-triggered OSV scan's staleness guard (S3) with no rescan
-                // ever re-triggered to replace the now-discarded result — e.g. adding an
-                // already-locked transitive dependency races a `cargo metadata` lock-file
-                // rewrite that changes nothing about that dependency's own resolution.
-                doc.set_resolved_versions_without_bump(
-                    resolved_versions.clone(),
-                    resolved_version_candidates.clone(),
-                );
-                if needs_osv_rescan {
-                    doc.bump_resolved_generation(self.state.next_resolved_versions_generation());
-                }
-            }
+            //
+            // The maps update unconditionally, but the generation only bumps when paired
+            // with a rescan that will produce a fresh commit under the new generation (issue
+            // #1395 critic N2): bumping on every lock-file reload regardless would silently
+            // invalidate a concurrently in-flight manifest-edit-triggered OSV scan's
+            // staleness guard (S3) with no rescan ever re-triggered to replace the
+            // now-discarded result — e.g. adding an already-locked transitive dependency
+            // races a `cargo metadata` lock-file rewrite that changes nothing about that
+            // dependency's own resolution. `reload_resolved_versions` (issue #1398/#1399
+            // code review) shares this compute-and-write sequence with
+            // `document::lifecycle::run_document_change_task`'s own debounced-edit
+            // lock-drift check.
+            let needs_osv_rescan = reload_resolved_versions(
+                &uri,
+                &self.state,
+                ecosystem.as_ref(),
+                &resolved_versions,
+                &resolved_version_candidates,
+                vulnerabilities_enabled && lockfile_reload_ok,
+                false,
+            );
 
             if needs_osv_rescan {
                 // A detached `tokio::spawn`, deliberately NOT `spawn_background_task`
@@ -378,61 +374,68 @@ impl Backend {
                 // no-op (`run_osv_phase_b_and_commit` returns early when `get_document`
                 // finds nothing).
                 //
-                // Known limitation (critic M4): a manifest edit arriving mid-rescan still
-                // aborts this task via its own `spawn_background_task` install racing with
-                // nothing here to prevent it, or the content guard drops this rescan's
-                // stale-by-then result — the lock-file-driven refresh is then lost until
-                // the next lock-file/manifest event. Narrow window, not worth extra
-                // machinery to close.
+                // Known limitation (critic M4): the content guard (`run_osv_phase_b_and_commit`)
+                // and the `resolved_versions_generation` guard are this rescan's only ordering
+                // protection — there is no `spawn_background_task` slot installed for it, so a
+                // manifest edit racing in mid-rescan does NOT abort this task the way it would
+                // an open/change-path fetch. Instead, either guard can independently drop this
+                // rescan's now-stale result once it finishes: the lock-file-driven refresh is
+                // then lost until the next lock-file/manifest event. Narrow window, not worth
+                // extra machinery to close.
                 //
-                // TODO(critic): license prefetch is not refreshed on lockfile-only changes
+                // License prefetch is not refreshed on lockfile-only changes: see issue #1407
+                // for why this isn't a trivial trigger-wiring fix.
                 let state = Arc::clone(&self.state);
                 let client = self.client.clone();
                 let ecosystem = Arc::clone(&ecosystem);
                 let rescan_uri = uri.clone();
-                tokio::spawn(async move {
-                    rescan_after_resolved_version_change(
-                        &rescan_uri,
-                        &state,
-                        &ecosystem,
-                        fetch_timeout_secs,
-                    )
-                    .await;
+                let log_uri = uri.clone();
+                // Supervised the same way as the `did_change_configuration` reparse worker
+                // below (issue #1399): a panic here would otherwise be silently swallowed by
+                // the detached `tokio::spawn` above, leaving this document's OSV diagnostics
+                // stale with no log trail to explain why.
+                spawn_supervised(
+                    async move {
+                        rescan_after_resolved_version_change(
+                            &rescan_uri,
+                            &state,
+                            &ecosystem,
+                            snapshot.fetch_timeout_secs,
+                        )
+                        .await;
 
-                    let dep_count = diagnostics::document_dependency_count(&state, &rescan_uri);
-                    let items = diagnostics::generate_diagnostics_internal(
-                        Arc::clone(&state),
-                        &rescan_uri,
-                        freshness,
-                        severities,
-                        offline,
-                        diagnostics::loading_ceiling(
-                            fetch_timeout_secs,
+                        let dep_count = diagnostics::document_dependency_count(&state, &rescan_uri);
+                        diagnostics::publish_document_diagnostics(
+                            &state,
+                            &client,
+                            &rescan_uri,
+                            &snapshot,
                             dep_count,
-                            max_concurrent_fetches,
-                        ),
-                    )
-                    .await;
-
-                    client.publish_diagnostics(rescan_uri, items, None).await;
-                });
+                        )
+                        .await;
+                    },
+                    move |e| {
+                        tracing::error!(
+                            "lockfile-change rescan for {:?} panicked ({e}); its OSV \
+                             diagnostics may be stale",
+                            log_uri
+                        );
+                    },
+                );
                 continue;
             }
 
             // Computed per URI (#636): each affected document can produce a different
             // ceiling, so it can't be hoisted out of the loop.
             let dep_count = diagnostics::document_dependency_count(&self.state, &uri);
-            let items = diagnostics::generate_diagnostics_internal(
-                Arc::clone(&self.state),
+            diagnostics::publish_document_diagnostics(
+                &self.state,
+                &self.client,
                 &uri,
-                freshness,
-                severities,
-                offline,
-                diagnostics::loading_ceiling(fetch_timeout_secs, dep_count, max_concurrent_fetches),
+                &snapshot,
+                dep_count,
             )
             .await;
-
-            self.client.publish_diagnostics(uri, items, None).await;
         }
 
         // Detached, capability-gated, timeout-bounded (#493): see
@@ -840,40 +843,42 @@ impl LanguageServer for Backend {
                 let state = Arc::clone(&self.state);
                 let client = self.client.clone();
                 let config = Arc::clone(&self.config);
-                let worker = tokio::spawn(async move {
-                    tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE).await;
-                    let superseded = state.config_generation() != generation;
-                    // Security M3: a superseded worker normally defers to the newer one, but
-                    // under a continuous burst every worker would see itself superseded
-                    // forever, starving the reparse indefinitely. Once the pending scope has
-                    // waited at least `MAX_DEBOUNCE_WAIT`, drain it regardless of staleness.
-                    if superseded
-                        && !state
-                            .pending_reparse_overdue(crate::document::reparse::MAX_DEBOUNCE_WAIT)
-                    {
-                        return;
-                    }
-                    let Some(scope) = state.take_pending_reparse() else {
-                        return;
-                    };
-                    crate::document::reparse::reparse_open_documents(
-                        scope,
-                        crate::document::RefetchPolicy::AllDependencies,
-                        "workspace/didChangeConfiguration",
-                        state,
-                        client,
-                        config,
-                    )
-                    .await;
-                });
-                tokio::spawn(async move {
-                    if let Err(e) = worker.await {
+                spawn_supervised(
+                    async move {
+                        tokio::time::sleep(crate::document::reparse::RECONFIGURE_DEBOUNCE).await;
+                        let superseded = state.config_generation() != generation;
+                        // Security M3: a superseded worker normally defers to the newer one,
+                        // but under a continuous burst every worker would see itself
+                        // superseded forever, starving the reparse indefinitely. Once the
+                        // pending scope has waited at least `MAX_DEBOUNCE_WAIT`, drain it
+                        // regardless of staleness.
+                        if superseded
+                            && !state.pending_reparse_overdue(
+                                crate::document::reparse::MAX_DEBOUNCE_WAIT,
+                            )
+                        {
+                            return;
+                        }
+                        let Some(scope) = state.take_pending_reparse() else {
+                            return;
+                        };
+                        crate::document::reparse::reparse_open_documents(
+                            scope,
+                            crate::document::RefetchPolicy::AllDependencies,
+                            "workspace/didChangeConfiguration",
+                            state,
+                            client,
+                            config,
+                        )
+                        .await;
+                    },
+                    |e| {
                         tracing::error!(
                             "workspace/didChangeConfiguration reparse worker panicked ({e}); \
                              open documents were not reparsed"
                         );
-                    }
-                });
+                    },
+                );
             }
             None => {
                 // Nothing parse-affecting changed. Hover/completion/code actions pick up
