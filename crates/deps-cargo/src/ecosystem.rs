@@ -382,19 +382,25 @@ mod tests {
         non_registry_fixture: "Cargo.toml" => "[dependencies]\nlocal-crate = { path = \"../local-crate\" }\n";
     }
 
-    // #1374: Cargo.toml's TOML grammar has no placeholder/environment-variable interpolation
-    // syntax of its own, but a manifest pre-processed by external templating (`envsubst`, CI
-    // templating) commonly leaves a `$VAR`/`${VAR}`-shaped literal in the version slot; the
-    // TOML parser has no way to distinguish that from an ordinary string, so it stays a
-    // normal `Some(version_requirement)` and reaches `plan_vulnerability_fix`/
+    // #1374/#1379: Cargo.toml's TOML grammar has no placeholder/interpolation syntax of its
+    // own, but a manifest pre-processed by external templating (`envsubst`, CI templating,
+    // cookiecutter-style generators) commonly leaves an unresolved `$VAR`/`${VAR}`/`{{ }}`/
+    // `@VAR@`/`%VAR%`/`<%= %>`-shaped literal in the version slot; the TOML parser has no way
+    // to distinguish that from an ordinary string, so it stays a normal
+    // `Some(version_requirement)` and reaches `plan_vulnerability_fix`/
     // `format_version_replacing_for` directly — depends on `CargoFormatter`'s own
-    // `requirement_contains_dollar_placeholder` guard.
+    // `requirement_contains_template_placeholder` guard.
     deps_core::unresolved_requirement_conformance! {
         mod cargo_unresolved_requirement_conformance;
         build: CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         reachable: true;
         fixture: "Cargo.toml" =>
-            "[dependencies]\nserde = \"${SERDE}\"\n";
+            "[dependencies]\n\
+             serde = \"${SERDE}\"\n\
+             tokio = \"{{ TOKIO_VERSION }}\"\n\
+             regex = \"@REGEX_VERSION@\"\n\
+             rand = \"%RAND_VERSION%\"\n\
+             clap = \"<%= CLAP_VERSION %>\"\n";
     }
 
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.

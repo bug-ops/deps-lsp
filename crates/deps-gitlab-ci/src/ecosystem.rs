@@ -1098,10 +1098,17 @@ mod tests {
     //   be doubly wrong even setting the naming issue aside.
     // `formatter_guarded` sidesteps both obstacles by asserting directly against the formatter,
     // with no parser or source-policy involved.
+    // impl-critic M3 (#1379 follow-up): `placeholders` now also covers the four template forms
+    // `contains_unresolved_gitlab_variable`'s full delegation to
+    // `requirement_contains_template_placeholder` inherited for free — no fixture previously
+    // pinned that (the doc comment describing this behavior was also stale, fixed alongside).
     deps_core::unresolved_requirement_conformance! {
         mod gitlab_ci_unresolved_requirement_conformance;
         formatter_guarded: GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
-        placeholders: ["$DEPLOY_VERSION", "${DEPLOY_VERSION}", "%DEPLOY_VERSION%", "v1.2-$BUILD"];
+        placeholders: [
+            "$DEPLOY_VERSION", "${DEPLOY_VERSION}", "%DEPLOY_VERSION%", "v1.2-$BUILD",
+            "{{ DEPLOY_VERSION }}", "@DEPLOY_VERSION@", "<%= DEPLOY_VERSION %>"
+        ];
         // #1370 critic M2: negative control — a SHA, a branch, and an ordinary tag must never
         // be conflated with the variable-reference placeholder grammar above.
         non_placeholders: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "main", "1.2", "v1.2.3"];

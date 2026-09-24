@@ -1147,7 +1147,7 @@ flask = "^3.0"
     /// `${REQ}` is not a valid version — so `parse_pep621_dependencies` logs and skips the
     /// whole entry (see that method's `Err` arm) rather than producing a dependency with
     /// `version_requirement: Some("${REQ}")`. Locks this already-correct behavior in place:
-    /// `PypiFormatter`'s new `requirement_contains_dollar_placeholder` guard
+    /// `PypiFormatter`'s new `requirement_contains_template_placeholder` guard
     /// (`formatter::format_version_replacing`/`requirement_is_unresolved`) exists for the
     /// `[tool.poetry.dependencies]` table form, which has no such upstream validation — this
     /// PEP 621 array form must stay unaffected by that guard's addition.

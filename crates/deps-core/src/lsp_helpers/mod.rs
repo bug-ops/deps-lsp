@@ -1535,9 +1535,9 @@ pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
 
 /// The length of the maximal `[a-zA-Z_][a-zA-Z0-9_]*`-shaped identifier starting at `start` in
 /// `bytes`, or `None` if `bytes[start]` does not start one — the identifier grammar shared by
-/// shell/envsubst-style variable expansion (`$VAR`, `${VAR}`). Mirrors
-/// `deps_gitlab_ci::formatter::identifier_end`, minus that crate's `%VAR%` form.
-fn dollar_placeholder_identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
+/// shell/envsubst-style variable expansion (`$VAR`, `${VAR}`) and the `@VAR@`/`%VAR%` forms
+/// below. Mirrors `deps_gitlab_ci::formatter::identifier_end`.
+fn template_placeholder_identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
     let first = *bytes.get(start)?;
     if !(first.is_ascii_alphabetic() || first == b'_') {
         return None;
@@ -1552,47 +1552,130 @@ fn dollar_placeholder_identifier_end(bytes: &[u8], start: usize) -> Option<usize
     Some(end)
 }
 
-/// Whether `requirement` contains an unresolved `$VAR`/`${VAR}`-style external-templating
-/// placeholder.
+/// Like [`template_placeholder_identifier_end`], but also allows `.`/`-` in the identifier's
+/// tail (never as the leading character) — the shape a CMake/Autotools `configure_file`
+/// placeholder needs (`@project.version@`, `@some-flag@`), which is the actual common
+/// real-world `@..@` form (impl-critic M1, #1379 follow-up): the stricter
+/// `[a-zA-Z_][a-zA-Z0-9_]*` grammar the `$VAR`/`%VAR%` forms use never matches it, since those
+/// forms' own real-world identifiers (shell/environment variable names, Windows env vars)
+/// never contain `.`/`-` to begin with.
+fn dotted_identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start)?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
+    {
+        end += 1;
+    }
+    Some(end)
+}
+
+/// Whether `text` contains a `delim IDENT delim`-shaped placeholder (`@VAR@`/`@project.version@`
+/// autoconf/CMake `configure_file`, `%VAR%` Windows batch/NSIS), anywhere in `text`. Unlike the
+/// `$`-prefixed forms, both delimiters are required — `@`/`%` are common enough in ordinary text
+/// (email addresses, percentages) that a bare opening delimiter alone would be too permissive.
+fn contains_delimited_identifier_placeholder(
+    text: &str,
+    delim: u8,
+    identifier_end: impl Fn(&[u8], usize) -> Option<usize>,
+) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(i, &b)| {
+        b == delim && identifier_end(bytes, i + 1).is_some_and(|end| bytes.get(end) == Some(&delim))
+    })
+}
+
+/// Whether `text` contains an `open ... close`-shaped placeholder with non-blank content
+/// between the delimiters (`{{ VAR }}` Liquid/Jinja2/Mustache/Go `text/template`, `<%= VAR %>`
+/// ERB/lodash/Yeoman) — content is not restricted to a single identifier, since these grammars
+/// commonly carry dotted field access (`{{ .NetVersion }}`), filters, or an `=`/`-` modifier
+/// right after `open`.
+///
+/// The closing delimiter is not required (failing safe on an unclosed `{{VAR` — still treating
+/// it as a placeholder — mirrors the `${VAR` precedent below): only `open` followed by
+/// whitespace-then-non-blank content is checked, so a stray, immediately-closed `open` (`{{}}`,
+/// `{{ }}`) is deliberately NOT flagged, matching `${}`'s empty-placeholder carve-out.
+fn contains_bracketed_placeholder(text: &str, open: &str, close_or_skip: &[u8]) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices(open).any(|(pos, _)| {
+        let mut i = pos + open.len();
+        if close_or_skip.contains(bytes.get(i).unwrap_or(&0)) {
+            i += 1;
+        }
+        while bytes.get(i).is_some_and(|b| b.is_ascii_whitespace()) {
+            i += 1;
+        }
+        bytes.get(i).is_some_and(|&b| b != b'}' && b != b'%')
+    })
+}
+
+/// Whether `requirement` contains an unresolved external-templating placeholder.
+///
+/// Recognizes several common generator syntaxes: `$VAR`/`${VAR}` (shell/envsubst), `{{ VAR }}`
+/// (Liquid/Jinja2/Mustache/Go `text/template` expression tags), `{% ... %}` (Jinja2/Liquid
+/// statement tags), `@VAR@`/`@project.version@` (autoconf/CMake `configure_file`), `%VAR%`
+/// (Windows batch/NSIS), or `<%= VAR %>` (ERB/lodash/Yeoman templates).
 ///
 /// Detected anywhere in the text, not just as the whole value: `"${REACT_VERSION}"`, `"$VUE"`,
-/// and an embedded form like `"1.0.0-$BUILD"` are all detected.
+/// `"{{ .NetVersion }}"`, `"{% if x %}"`, `"@PACKAGE_VERSION@"`, `"%VERSION%"`,
+/// `"<%= version %>"`, and an embedded form like `"1.0.0-$BUILD"` are all detected.
 ///
-/// Issue #1374: manifests pre-processed by external templating (`envsubst`, CI templating,
-/// cookiecutter-style generators) commonly carry this shape in a version-requirement slot.
-/// npm, Cargo, Dart and Poetry (`[tool.poetry.dependencies]`) have no expansion syntax of
-/// their own for it — unlike Maven's `${property}` or Gradle's `$var`/`${var}`, which their
-/// own build tools resolve — so this crate can never expand it either, and a requirement
-/// containing it must never be classified as outdated/unsatisfiable or rewritten to a literal
-/// version. Deliberately narrower than
-/// `deps_gitlab_ci::formatter::contains_unresolved_gitlab_variable`: it omits that function's
-/// `%VAR%` form, which is GitLab's own Windows-`cmd`-style variable syntax, not a templating
-/// convention any of this predicate's callers' ecosystems use.
+/// Issues #1374/#1379: manifests pre-processed by external templating (`envsubst`, CI
+/// templating, cookiecutter/Yeoman-style generators, `configure_file`) commonly carry one of
+/// these shapes in a version-requirement slot. npm, Cargo, Dart, Poetry
+/// (`[tool.poetry.dependencies]`), Deno and Go have no expansion syntax of their own for any of
+/// them — unlike Maven's `${property}` or Gradle's `$var`/`${var}`, which their own build tools
+/// resolve — so this crate can never expand one either, and a requirement containing it must
+/// never be classified as outdated/unsatisfiable or rewritten to a literal version.
 ///
-/// The braced form does not require a closing `}` (failing safe on an unclosed `${VAR` — still
-/// treating it as a placeholder — mirrors the GitLab precedent this predicate was extracted
-/// alongside).
+/// The `$`/`{{`/`{%`/`<%` forms do not require a closing delimiter (failing safe on an unclosed
+/// `${VAR`/`{{VAR`/`{%VAR`/`<%VAR` — still treating it as a placeholder — mirrors the GitLab
+/// precedent this predicate was originally extracted alongside); `@VAR@`/`%VAR%` require both
+/// delimiters, since a bare `@`/`%` is too common in ordinary text to treat as an opening
+/// delimiter alone.
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::lsp_helpers::requirement_contains_dollar_placeholder;
+/// use deps_core::lsp_helpers::requirement_contains_template_placeholder;
 ///
-/// assert!(requirement_contains_dollar_placeholder("${REACT_VERSION}"));
-/// assert!(requirement_contains_dollar_placeholder("$VUE"));
-/// assert!(requirement_contains_dollar_placeholder("1.0.0-$BUILD"));
-/// assert!(!requirement_contains_dollar_placeholder("1.2.3"));
-/// assert!(!requirement_contains_dollar_placeholder("price-is-$5"));
+/// assert!(requirement_contains_template_placeholder("${REACT_VERSION}"));
+/// assert!(requirement_contains_template_placeholder("$VUE"));
+/// assert!(requirement_contains_template_placeholder("1.0.0-$BUILD"));
+/// assert!(requirement_contains_template_placeholder("{{ .NetVersion }}"));
+/// assert!(requirement_contains_template_placeholder("{% if x %}"));
+/// assert!(requirement_contains_template_placeholder("@PACKAGE_VERSION@"));
+/// assert!(requirement_contains_template_placeholder("@project.version@"));
+/// assert!(requirement_contains_template_placeholder("%VERSION%"));
+/// assert!(requirement_contains_template_placeholder("<%= version %>"));
+/// assert!(!requirement_contains_template_placeholder("1.2.3"));
+/// assert!(!requirement_contains_template_placeholder("price-is-$5"));
+/// assert!(!requirement_contains_template_placeholder("me@example.com"));
+/// assert!(!requirement_contains_template_placeholder("100%"));
 /// ```
-pub fn requirement_contains_dollar_placeholder(requirement: &str) -> bool {
+pub fn requirement_contains_template_placeholder(requirement: &str) -> bool {
     let bytes = requirement.as_bytes();
-    bytes.iter().enumerate().any(|(i, &b)| {
+    let has_dollar_form = bytes.iter().enumerate().any(|(i, &b)| {
         b == b'$'
             && match bytes.get(i + 1) {
-                Some(b'{') => dollar_placeholder_identifier_end(bytes, i + 2).is_some(),
-                _ => dollar_placeholder_identifier_end(bytes, i + 1).is_some(),
+                Some(b'{') => template_placeholder_identifier_end(bytes, i + 2).is_some(),
+                _ => template_placeholder_identifier_end(bytes, i + 1).is_some(),
             }
-    })
+    });
+    has_dollar_form
+        || contains_delimited_identifier_placeholder(requirement, b'@', dotted_identifier_end)
+        || contains_delimited_identifier_placeholder(
+            requirement,
+            b'%',
+            template_placeholder_identifier_end,
+        )
+        || contains_bracketed_placeholder(requirement, "{{", b"")
+        || contains_bracketed_placeholder(requirement, "{%", b"-")
+        || contains_bracketed_placeholder(requirement, "<%", b"=-")
 }
 
 /// Result of checking whether a dependency's declared requirement is already satisfied by
@@ -3362,37 +3445,128 @@ mod tests {
     }
 
     #[test]
-    fn test_requirement_contains_dollar_placeholder_bare_and_braced() {
-        assert!(requirement_contains_dollar_placeholder("$REACT_VERSION"));
-        assert!(requirement_contains_dollar_placeholder("${REACT_VERSION}"));
-        assert!(requirement_contains_dollar_placeholder("1.0.0-$BUILD"));
-        assert!(requirement_contains_dollar_placeholder(
+    fn test_requirement_contains_template_placeholder_bare_and_braced() {
+        assert!(requirement_contains_template_placeholder("$REACT_VERSION"));
+        assert!(requirement_contains_template_placeholder(
+            "${REACT_VERSION}"
+        ));
+        assert!(requirement_contains_template_placeholder("1.0.0-$BUILD"));
+        assert!(requirement_contains_template_placeholder(
             "v${MAJOR}.${MINOR}"
         ));
     }
 
     #[test]
-    fn test_requirement_contains_dollar_placeholder_lowercase_and_mixed_case() {
-        assert!(requirement_contains_dollar_placeholder("$react_version"));
-        assert!(requirement_contains_dollar_placeholder("${React_Version}"));
+    fn test_requirement_contains_template_placeholder_lowercase_and_mixed_case() {
+        assert!(requirement_contains_template_placeholder("$react_version"));
+        assert!(requirement_contains_template_placeholder(
+            "${React_Version}"
+        ));
     }
 
     #[test]
-    fn test_requirement_contains_dollar_placeholder_ordinary_requirements_not_flagged() {
-        assert!(!requirement_contains_dollar_placeholder("1.2.3"));
-        assert!(!requirement_contains_dollar_placeholder("^1.2.3"));
-        assert!(!requirement_contains_dollar_placeholder("~1.2.3"));
-        assert!(!requirement_contains_dollar_placeholder(">=1.0.0 <2.0.0"));
-        assert!(!requirement_contains_dollar_placeholder(""));
-        assert!(!requirement_contains_dollar_placeholder("price-is-$5"));
-        assert!(!requirement_contains_dollar_placeholder("trailing-$"));
-        assert!(!requirement_contains_dollar_placeholder("empty-${}"));
-        assert!(!requirement_contains_dollar_placeholder("${123}"));
+    fn test_requirement_contains_template_placeholder_ordinary_requirements_not_flagged() {
+        assert!(!requirement_contains_template_placeholder("1.2.3"));
+        assert!(!requirement_contains_template_placeholder("^1.2.3"));
+        assert!(!requirement_contains_template_placeholder("~1.2.3"));
+        assert!(!requirement_contains_template_placeholder(">=1.0.0 <2.0.0"));
+        assert!(!requirement_contains_template_placeholder(""));
+        assert!(!requirement_contains_template_placeholder("price-is-$5"));
+        assert!(!requirement_contains_template_placeholder("trailing-$"));
+        assert!(!requirement_contains_template_placeholder("empty-${}"));
+        assert!(!requirement_contains_template_placeholder("${123}"));
     }
 
     #[test]
-    fn test_requirement_contains_dollar_placeholder_unclosed_brace_fails_safe() {
-        assert!(requirement_contains_dollar_placeholder("${VAR"));
+    fn test_requirement_contains_template_placeholder_unclosed_brace_fails_safe() {
+        assert!(requirement_contains_template_placeholder("${VAR"));
+    }
+
+    #[test]
+    fn test_requirement_contains_template_placeholder_mustache_form() {
+        assert!(requirement_contains_template_placeholder(
+            "{{ STD_VERSION }}"
+        ));
+        assert!(requirement_contains_template_placeholder("{{STD_VERSION}}"));
+        assert!(requirement_contains_template_placeholder(
+            "{{ .NetVersion }}"
+        ));
+        assert!(requirement_contains_template_placeholder(
+            "v1.2-{{ BUILD | default }}"
+        ));
+        // Unclosed still fails safe, mirroring the `${VAR` precedent.
+        assert!(requirement_contains_template_placeholder("{{ VAR"));
+    }
+
+    #[test]
+    fn test_requirement_contains_template_placeholder_mustache_empty_not_flagged() {
+        assert!(!requirement_contains_template_placeholder("{{}}"));
+        assert!(!requirement_contains_template_placeholder("{{ }}"));
+    }
+
+    /// Security M1 follow-up (impl-critic M1): `{% ... %}` Jinja2/Liquid statement tags
+    /// alongside `{{ ... }}` expression tags.
+    #[test]
+    fn test_requirement_contains_template_placeholder_jinja_statement_tag() {
+        assert!(requirement_contains_template_placeholder("{% if x %}"));
+        assert!(requirement_contains_template_placeholder("{%if x%}"));
+        assert!(requirement_contains_template_placeholder("{%- if x -%}"));
+        assert!(requirement_contains_template_placeholder(
+            "v1.2-{% BUILD %}"
+        ));
+        assert!(requirement_contains_template_placeholder("{% VAR"));
+        assert!(!requirement_contains_template_placeholder("{%}"));
+        assert!(!requirement_contains_template_placeholder("{% %}"));
+    }
+
+    #[test]
+    fn test_requirement_contains_template_placeholder_autoconf_form() {
+        assert!(requirement_contains_template_placeholder(
+            "@PACKAGE_VERSION@"
+        ));
+        assert!(requirement_contains_template_placeholder("v1.2-@BUILD@"));
+        // No closing '@' — not flagged (unlike the '$'/'{{' forms, both delimiters required).
+        assert!(!requirement_contains_template_placeholder(
+            "@PACKAGE_VERSION"
+        ));
+        assert!(!requirement_contains_template_placeholder("me@example.com"));
+    }
+
+    /// impl-critic M1: the dotted/hyphenated CMake/Autotools `configure_file` form — the
+    /// actual common real-world `@..@` shape, unlike the bare-identifier form above.
+    #[test]
+    fn test_requirement_contains_template_placeholder_autoconf_dotted_form() {
+        assert!(requirement_contains_template_placeholder(
+            "@project.version@"
+        ));
+        assert!(requirement_contains_template_placeholder(
+            "@PACKAGE_VERSION_MAJOR@"
+        ));
+        assert!(requirement_contains_template_placeholder("@some-flag@"));
+        assert!(requirement_contains_template_placeholder(
+            "v@project.version@"
+        ));
+        // No closing '@' — still not flagged, even with dots in the tail.
+        assert!(!requirement_contains_template_placeholder(
+            "@project.version"
+        ));
+    }
+
+    #[test]
+    fn test_requirement_contains_template_placeholder_percent_form() {
+        assert!(requirement_contains_template_placeholder("%VERSION%"));
+        assert!(requirement_contains_template_placeholder("v1.2-%BUILD%"));
+        assert!(!requirement_contains_template_placeholder("%VERSION"));
+        assert!(!requirement_contains_template_placeholder("100%"));
+    }
+
+    #[test]
+    fn test_requirement_contains_template_placeholder_erb_form() {
+        assert!(requirement_contains_template_placeholder("<%= version %>"));
+        assert!(requirement_contains_template_placeholder("<%version%>"));
+        assert!(requirement_contains_template_placeholder("<%- version %>"));
+        assert!(!requirement_contains_template_placeholder("<%%>"));
+        assert!(!requirement_contains_template_placeholder("<% %>"));
     }
 
     #[test]

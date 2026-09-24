@@ -304,6 +304,22 @@ fn strip_line_comment(line: &str) -> &str {
 /// setting `version` to the comment token itself (#1179). `indirect` is derived from the raw
 /// (unstripped) line by the caller, since the `// indirect` marker lives in the comment this
 /// function no longer sees.
+///
+/// #1379: a `require` line's version field is grammatically always exactly one
+/// whitespace-delimited token — Go module paths and versions can never themselves contain
+/// whitespace, and `line` has already had any trailing comment stripped — so any token(s)
+/// remaining *after* the naive first-token split is proof the line's version slot was
+/// overwritten by something `go.mod`-foreign, almost always an external-templating
+/// placeholder left unexpanded (`{{ .NetVersion }}`, `<%= version %>`, ...). Security M1
+/// (live-reproduced, same bug class as the original #1379 report): keying this decision on
+/// "does the *first* token look like a real Go version" is unsound — a placeholder can itself
+/// start with a `v`+digit-shaped fragment (`golang.org/x/net v0.{{ .Minor }}.0` naively
+/// splits to first-token `"v0.{{"`, which passes a shape check untruncated-looking but is
+/// still only a fragment). Whenever there is more than one token on the version side, this
+/// unconditionally widens `version`/`version_range` to the entire rest of the line instead of
+/// trusting the first token at all, so the full placeholder text is always captured — correctly
+/// classified as unresolved by `GoFormatter`'s `RequirementResolution` overrides — and never
+/// partially overwritten regardless of what the leading fragment happens to look like.
 fn parse_require_line(
     line: &str,
     indirect: bool,
@@ -312,10 +328,10 @@ fn parse_require_line(
     line_table: &LineOffsetTable,
 ) -> Option<GoDependency> {
     let parts: Vec<&str> = line.split_whitespace().collect();
-    let (module_path, version) = match parts.as_slice() {
-        ["require", module, version, ..] => (*module, *version),
+    let (module_path, first_version_token, version_has_extra_tokens) = match parts.as_slice() {
+        ["require", module, version, rest @ ..] => (*module, *version, !rest.is_empty()),
         ["require", ..] => return None,
-        [module, version, ..] => (*module, *version),
+        [module, version, rest @ ..] => (*module, *version, !rest.is_empty()),
         _ => return None,
     };
 
@@ -328,7 +344,19 @@ fn parse_require_line(
         module_offset + module_path.len(),
     );
 
-    let version_start = line.find(version)?;
+    let (version, version_start) = if version_has_extra_tokens {
+        let after_module = module_start + module_path.len();
+        let rest = line.get(after_module..)?;
+        let trimmed_end = rest.trim_end();
+        let version = trimmed_end.trim_start();
+        if version.is_empty() {
+            return None;
+        }
+        (version, after_module + (trimmed_end.len() - version.len()))
+    } else {
+        (first_version_token, line.find(first_version_token)?)
+    };
+
     let version_offset = line_start_offset + version_start;
     let version_range = byte_span_to_range(
         content,
@@ -493,6 +521,107 @@ require github.com/gin-gonic/gin v1.9.1
             Some("v1.9.1")
         );
         assert!(!result.dependencies[0].indirect);
+    }
+
+    /// #1379 regression: a `text/template`-style `{{ .Var }}` placeholder in a `require`
+    /// line's version field must be captured whole, not truncated to its first
+    /// whitespace-delimited fragment (`"{{"`) — the pre-fix behavior, which produced a
+    /// 2-byte `version_range` landing mid-placeholder and corrupted the file on any rewrite
+    /// (`golang.org/x/net v0.59.0 .NetVersion }}`).
+    #[test]
+    fn test_parse_require_mustache_placeholder_captures_full_text_not_first_token() {
+        let content = "require golang.org/x/net {{ .NetVersion }}\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.module_path, "golang.org/x/net");
+        assert_eq!(
+            dep.version.as_ref().map(deps_core::VersionReq::as_str),
+            Some("{{ .NetVersion }}")
+        );
+        let range = dep.version_range.expect("version_range must be set");
+        assert_eq!(range.start.character, 25);
+        assert_eq!(range.end.character, 42);
+    }
+
+    /// #1379: the same widening must apply inside a `require ( ... )` block, not just the
+    /// single-line form.
+    #[test]
+    fn test_parse_require_block_mustache_placeholder_captures_full_text() {
+        let content = "require (\n\tgolang.org/x/net {{ .NetVersion }}\n)\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0]
+                .version
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some("{{ .NetVersion }}")
+        );
+    }
+
+    /// A version field with no extra tokens after it (the ordinary, well-formed case) must
+    /// still take the fast, unwidened path — the widening only fires when there is more than
+    /// one whitespace-delimited token on the version side of the line.
+    #[test]
+    fn test_parse_require_ordinary_pseudo_version_unaffected_by_widening() {
+        let content = "require golang.org/x/crypto v0.0.0-20191109021931-daa7c04131f5\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0]
+                .version
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some("v0.0.0-20191109021931-daa7c04131f5")
+        );
+    }
+
+    /// Security M1 regression (live-reproduced): a placeholder embedded *inside* a token that
+    /// itself starts with a `v`+digit shape must still be widened to the full text, not just
+    /// its leading fragment — `golang.org/x/net v0.{{ .Minor }}.0` naively splits its first
+    /// version-side token as `"v0.{{"`, which looks superficially version-shaped but is only
+    /// a fragment; the fix keys the widen decision on "are there extra tokens on the version
+    /// side" instead of "does the first token look like a version", so this must never
+    /// truncate to `"v0.{{"` and a real (non-dry-run) rewrite must never corrupt the file.
+    #[test]
+    fn test_parse_require_placeholder_embedded_in_version_shaped_token_widens_fully() {
+        let content = "require golang.org/x/net v0.{{ .Minor }}.0\n";
+        let result = parse_go_mod(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.module_path, "golang.org/x/net");
+        assert_eq!(
+            dep.version.as_ref().map(deps_core::VersionReq::as_str),
+            Some("v0.{{ .Minor }}.0")
+        );
+    }
+
+    /// `%VAR%`/`@VAR@` never contain internal whitespace, so a `v`-digit-prefixed token
+    /// embedding one (`v0.%Minor%.0`) is captured whole even on the fast, unwidened path —
+    /// this pins that the fix doesn't regress the (already-correct) no-whitespace forms.
+    /// `<%= %>` does typically carry internal whitespace, so `v0.<%= Minor %>.0` DOES exercise
+    /// the same widening path as the `{{ }}` case above — proving the fix isn't specific to
+    /// Mustache/Go-template syntax.
+    #[test]
+    fn test_parse_require_placeholder_embedded_in_version_shaped_token_other_forms() {
+        for (content, expected) in [
+            ("require golang.org/x/net v0.%Minor%.0\n", "v0.%Minor%.0"),
+            ("require golang.org/x/net v0.@Minor@.0\n", "v0.@Minor@.0"),
+            (
+                "require golang.org/x/net v0.<%= Minor %>.0\n",
+                "v0.<%= Minor %>.0",
+            ),
+        ] {
+            let result = parse_go_mod(content, &test_uri()).unwrap();
+            assert_eq!(
+                result.dependencies[0]
+                    .version
+                    .as_ref()
+                    .map(deps_core::VersionReq::as_str),
+                Some(expected),
+                "content: {content:?}"
+            );
+        }
     }
 
     #[test]
