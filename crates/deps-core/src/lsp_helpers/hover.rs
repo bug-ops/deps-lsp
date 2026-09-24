@@ -5341,7 +5341,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
         )
