@@ -78,7 +78,11 @@ impl ResolvedGeneration {
     /// Test-only: whether `self` is the shared starting value every fresh/reopened
     /// [`DocumentState`] begins at (issue #1398 impl-critic S1) — lets a test assert on the
     /// invariant without gaining a way to construct `Self::INITIAL` itself.
-    #[cfg(test)]
+    ///
+    /// Gated on `feature = "cargo"` in addition to `test`: every current call site is a
+    /// `cargo`-fixture test, so a `--no-default-features` test build (the CI feature-matrix
+    /// `baseline` job) would otherwise see this as dead code under `-D warnings`.
+    #[cfg(all(test, feature = "cargo"))]
     pub(crate) fn is_initial(self) -> bool {
         self == Self::INITIAL
     }
