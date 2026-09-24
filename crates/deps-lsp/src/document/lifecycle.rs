@@ -200,7 +200,9 @@ async fn run_document_open_background_task(
     };
 
     // Lock file read is instant and network-free, so it runs before the registry fetch below.
-    let (resolved_versions, resolved_version_candidates) =
+    // The reload-ok signal (issue #1407) isn't needed on this cold-open path: there is no
+    // prior in-memory `resolved_versions` yet for a transient parse failure to clobber.
+    let (resolved_versions, resolved_version_candidates, _lockfile_reload_ok) =
         load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
     if !resolved_versions.is_empty()
@@ -855,6 +857,64 @@ struct ChangeTaskConfig {
 /// parked in this sleep, so a keystroke burst costs one fetch round instead of one per edit.
 pub(crate) const DID_CHANGE_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Whether this debounced edit observed a resolved-version move, from either signal
+/// (`clippy::struct_excessive_bools` splits [`change_task_triggers`]'s bools into this
+/// plus [`ChangeTaskTriggerGates`]).
+///
+/// `pub(crate)`: shared with `server::handle_lockfile_change`, which computes the same
+/// triggers for its own lock-file-only path (issue #1407 code-review should-fix — the
+/// two call sites were duplicating this formula by hand, with no shared test coverage
+/// for the duplicate).
+pub(crate) struct ResolvedVersionMove {
+    /// The manifest-diff-derived flag (this function's own `needs_osv_rescan`
+    /// parameter) — fires from the manifest text alone, independent of whether a
+    /// lock file was resolved at all. `server::handle_lockfile_change` has no manifest
+    /// diff of its own, so it always passes `false` here.
+    pub(crate) diff_needs_rescan: bool,
+    /// Whether the lock-file reload changed a resolved version, only ever computed
+    /// when one was actually resolved (see the caller).
+    pub(crate) resolved_changed: bool,
+}
+
+/// The independent config/ecosystem gates [`change_task_triggers`] applies on top of a
+/// [`ResolvedVersionMove`] (split out from it too, for the same
+/// `clippy::struct_excessive_bools` reason). `pub(crate)`: see [`ResolvedVersionMove`]'s
+/// doc.
+///
+/// Deliberately does *not* carry a license-policy-non-empty gate (issue #1407
+/// code-review should-fix): that precondition now lives as a second early-return inside
+/// [`super::osv_scan::run_license_prefetch`] itself, rather than being duplicated at
+/// every call site that used to check it before deciding whether to trigger a refresh.
+pub(crate) struct ChangeTaskTriggerGates {
+    pub(crate) vulnerabilities_enabled: bool,
+    pub(crate) requires_dedicated_fetch: bool,
+}
+
+/// Computes [`run_document_change_task`]'s OSV-rescan and license-refresh triggers
+/// (and, by extension, whether `resolved_versions_generation` should bump) from the
+/// raw manifest-diff flag and whether the lock-file reload itself changed anything —
+/// pulled out as a pure function (issue #1407 R1) so every combination of inputs is
+/// covered by a truth-table unit test instead of only whichever paths a live edit
+/// happens to exercise. Shared with `server::handle_lockfile_change` (issue #1407
+/// code-review should-fix), which is algebraically this function with
+/// `diff_needs_rescan` fixed to `false` (it has no manifest diff of its own).
+///
+/// `diff_needs_rescan` and `resolved_changed` are deliberately independent: either one
+/// alone must be able to trigger a rescan/refresh, since `resolved_changed` is only
+/// ever computed when a lock file resolved something, while `diff_needs_rescan` is the
+/// *only* signal available for the ecosystems that have no lock file to reload at all.
+///
+/// Returns `(needs_osv_rescan, needs_license_refresh)`.
+pub(crate) fn change_task_triggers(
+    mv: ResolvedVersionMove,
+    gates: ChangeTaskTriggerGates,
+) -> (bool, bool) {
+    let any_resolved_move = mv.diff_needs_rescan || mv.resolved_changed;
+    let needs_osv_rescan = gates.vulnerabilities_enabled && any_resolved_move;
+    let needs_license_refresh = any_resolved_move && gates.requires_dedicated_fetch;
+    (needs_osv_rescan, needs_license_refresh)
+}
+
 /// Background task spawned by [`handle_document_change`] once the new document state has
 /// been committed: reloads lock-file-resolved versions, then runs the OSV rescan
 /// concurrently with any registry fetch the diff calls for, and finally publishes the
@@ -883,45 +943,85 @@ async fn run_document_change_task(
     };
 
     // Lock file read is instant and network-free, so it runs before the registry fetch below.
-    let (resolved_versions, resolved_version_candidates) =
+    // `lockfile_reload_ok` (issue #1407 E1) distinguishes a lock file that genuinely
+    // resolved to nothing (or doesn't apply to this ecosystem) from one that was found
+    // but failed to parse — e.g. caught mid-rewrite by the package manager while this
+    // edit's own change event was in flight. See its use below.
+    let (resolved_versions, resolved_version_candidates, lockfile_reload_ok) =
         load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
     // Must not touch cached_versions here — it holds the latest registry versions.
     //
-    // Issue #1399: a lock-file rewrite observed here (e.g. a `cargo build` racing this
-    // debounced edit) must trigger an OSV rescan even when the edit itself touches no
-    // dependency (`needs_osv_rescan == false`) — mirrors `server::handle_lockfile_change`'s
-    // own drift check, which is exactly this gap for the lock-file-watcher path instead of
-    // this debounced-edit path. `reload_resolved_versions` (issue #1398/#1399 code review)
-    // shares the compute-and-write sequence with that other call site, so bump only when
-    // `osv_task` below is actually about to spawn (issue #1395 critic bidirectional-race
-    // finding): this function runs on *every* debounced edit with a non-empty lock file,
-    // including ones that touch no dependency at all and have no lock-file drift either —
-    // an unconditional bump here would silently invalidate any *other* in-flight OSV scan
-    // for this same document (e.g. a concurrent lock-file-triggered rescan,
-    // `server::handle_lockfile_change`) via `run_osv_phase_b_and_commit`'s shared staleness
-    // guard, with no rescan of this call's own to pair with it and produce a fresh
-    // replacement. Also covers the reparse path (`reparse.rs`), which reuses this same
-    // function: a reparse's `DependencyDiff` is always empty (the manifest text itself is
-    // untouched), so it now correctly never bumps unless the lock file itself drifted.
-    let mut osv_rescan = config.vulnerabilities_enabled && needs_osv_rescan;
-    if !resolved_versions.is_empty() {
-        let lock_changed = reload_resolved_versions(
+    // Issue #1399/#1407 S1: a lock-file rewrite observed here (e.g. a `cargo build`
+    // racing this debounced edit) must trigger an OSV rescan/license refresh even when
+    // the edit itself touches no dependency (`diff_needs_rescan == false`) — mirrors
+    // `server::handle_lockfile_change`'s own drift check for the lock-file-watcher path.
+    // `reload_resolved_versions` (issue #1398/#1399 code review) shares the diff-and-write
+    // sequence with that other call site.
+    //
+    // Gated on `lockfile_reload_ok` alone (issue #1407 R1/E1), not
+    // `!resolved_versions.is_empty()`: `load_resolved_versions` only ever returns `false`
+    // alongside empty maps (a parse failure — e.g. a lock file caught mid-rewrite by the
+    // package manager racing this same debounced edit), so `lockfile_reload_ok` is `true`
+    // whenever the reload was a genuine success — including to zero packages, which
+    // covers Gradle/Deno's permanent no-`LockFileProvider` state and Dart/Swift before
+    // their first resolve (R1: a manifest edit on those ecosystems must still reach
+    // `change_task_triggers` below via `diff_needs_rescan`, not be skipped because there
+    // was never any lock data to diff) — or `resolved_versions` is non-empty (which
+    // itself implies success). Gating on `lockfile_reload_ok` alone therefore both fires
+    // the diff/write on a genuine populated-to-empty transition (a lock file deleted,
+    // `cargo clean`, a VCS checkout mid-edit — `reload_resolved_versions`'s internal
+    // comparison already falls back to each dependency's manifest-declared pin and
+    // detects this correctly) and skips it entirely on an actual parse failure, so a
+    // transient error never wipes known-good `doc.resolved_versions` or bumps the
+    // generation off untrustworthy data (E1 — the exact #1395 M1 failure mode the
+    // watcher path's own `lockfile_reload_ok` already guards against).
+    let diff_needs_rescan = needs_osv_rescan;
+    let resolved_changed = if lockfile_reload_ok {
+        reload_resolved_versions(
             &uri,
             &state,
             ecosystem.as_ref(),
             &resolved_versions,
             &resolved_version_candidates,
-            config.vulnerabilities_enabled,
-            osv_rescan,
-        );
-        osv_rescan = osv_rescan || lock_changed;
+            true,
+        )
+    } else {
+        false
+    };
+
+    let (needs_osv_rescan, needs_license_refresh) = change_task_triggers(
+        ResolvedVersionMove {
+            diff_needs_rescan,
+            resolved_changed,
+        },
+        ChangeTaskTriggerGates {
+            vulnerabilities_enabled: config.vulnerabilities_enabled,
+            requires_dedicated_fetch: ecosystem.license_source().requires_dedicated_fetch(),
+        },
+    );
+
+    // Bump only when a rescan/refresh below is actually about to spawn (issue #1395
+    // critic bidirectional-race finding, N2 invariant): this function runs on *every*
+    // debounced edit, including ones that touch no dependency at all and have no
+    // lock-file drift either — an unconditional bump here would silently invalidate any
+    // *other* in-flight OSV scan or license pre-fetch for this same document (e.g. a
+    // concurrent lock-file-triggered rescan, `server::handle_lockfile_change`) via their
+    // shared staleness guards, with no rescan of this call's own to pair with it and
+    // produce a fresh replacement. Also covers the reparse path (`reparse.rs`), which
+    // reuses this same function: a reparse's `DependencyDiff` is always empty (the
+    // manifest text itself is untouched), so it now correctly never bumps unless the
+    // lock file itself drifted.
+    if (needs_osv_rescan || needs_license_refresh)
+        && let Some(mut doc) = state.documents.get_mut(&uri)
+    {
+        doc.bump_resolved_generation(state.next_resolved_versions_generation());
     }
 
     // Phase A OSV scan (only when a dependency was added or an existing one's version
     // changed, or the lock file moved a resolved version underneath this edit — critique
     // S1, issue #1399), spawned so it runs concurrently with the registry fetch below.
-    let osv_task = osv_rescan.then(|| {
+    let osv_task = needs_osv_rescan.then(|| {
         tokio::spawn(
             run_osv_scan_phase_a(
                 uri.clone(),
@@ -933,15 +1033,14 @@ async fn run_document_change_task(
         )
     });
 
-    // Tier-3 license pre-fetch (issue #660), gated on `needs_osv_rescan` — the diff-level
-    // "a dependency was added or an existing one's version changed" trigger only, deliberately
-    // narrower than `osv_task` above since #1399: a lock-only drift with no manifest change
-    // (`lock_changed`) still has no *new* dependency to fetch a license for, so re-running here
-    // would just repeat the previous pre-fetch's result. A lock-driven license refresh is
-    // issue #1407's scope, not this one. Joined (round 3 finding #3) via
-    // `await_license_prefetch` below, same shape as `osv_task`, so its commit lands before
-    // either of this function's diagnostics publishes below, not after.
-    let license_task = needs_osv_rescan.then(|| {
+    // Tier-3 license pre-fetch (issue #660/#1407), gated on `needs_license_refresh` —
+    // fires from either a manifest-diff-level dependency add/version-change or a
+    // lock-only drift (`change_task_triggers`'s `any_resolved_move`), same trigger shape
+    // as `osv_task` above but independently gated on ecosystem/policy instead of
+    // `vulnerabilities_enabled`. Joined (round 3 finding #3) via `await_license_prefetch`
+    // below, same shape as `osv_task`, so its commit lands before either of this
+    // function's diagnostics publishes below, not after.
+    let license_task = needs_license_refresh.then(|| {
         tokio::spawn(
             run_license_prefetch(
                 uri.clone(),
@@ -1259,6 +1358,180 @@ mod tests {
     // (go_tests imports its own `tokio::time::Duration` locally instead).
     #[cfg(feature = "cargo")]
     use std::time::Duration;
+
+    /// Issue #1407 R1: exhaustive truth table over `change_task_triggers`'s four
+    /// boolean inputs, so a future edit can't silently reintroduce the regression
+    /// this fix closed (a trigger nested inside the "lock file resolved something"
+    /// guard, which is always false for Gradle/Deno and for Dart/Swift before their
+    /// first resolve). No feature gate needed — pure function, no ecosystem I/O.
+    ///
+    /// No `license_policy_non_empty` input any more (code-review should-fix): that
+    /// precondition moved inside `run_license_prefetch` itself, so it is no longer
+    /// part of this function's own formula.
+    #[test]
+    fn change_task_triggers_truth_table() {
+        for diff_needs_rescan in [false, true] {
+            for resolved_changed in [false, true] {
+                for vulnerabilities_enabled in [false, true] {
+                    for requires_dedicated_fetch in [false, true] {
+                        let (osv, license) = change_task_triggers(
+                            ResolvedVersionMove {
+                                diff_needs_rescan,
+                                resolved_changed,
+                            },
+                            ChangeTaskTriggerGates {
+                                vulnerabilities_enabled,
+                                requires_dedicated_fetch,
+                            },
+                        );
+                        let any_resolved_move = diff_needs_rescan || resolved_changed;
+                        assert_eq!(
+                            osv,
+                            vulnerabilities_enabled && any_resolved_move,
+                            "osv mismatch for diff={diff_needs_rescan} resolved={resolved_changed} \
+                             vulns={vulnerabilities_enabled} tier3={requires_dedicated_fetch}"
+                        );
+                        assert_eq!(
+                            license,
+                            any_resolved_move && requires_dedicated_fetch,
+                            "license mismatch for diff={diff_needs_rescan} resolved={resolved_changed} \
+                             vulns={vulnerabilities_enabled} tier3={requires_dedicated_fetch}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Issue #1407 R1 regression case (a)/(c): a pure manifest edit
+    /// (`diff_needs_rescan == true`) with no lock file resolved at all (Gradle/Deno's
+    /// permanent state, or Dart/Swift before their first resolve) must still trigger
+    /// the license refresh — before this fix, the trigger was computed only inside
+    /// the `!resolved_versions.is_empty()` guard, so it silently stayed `false`
+    /// forever for these ecosystems.
+    #[test]
+    fn change_task_triggers_manifest_edit_alone_triggers_license_with_no_lock_file() {
+        let (osv, license) = change_task_triggers(
+            ResolvedVersionMove {
+                diff_needs_rescan: true, // manifest edit added/changed a dependency
+                resolved_changed: false, // no lock file was resolved at all
+            },
+            ChangeTaskTriggerGates {
+                vulnerabilities_enabled: false, // off (R1 case (c))
+                requires_dedicated_fetch: true, // a tier-3 ecosystem
+            },
+        );
+        assert!(
+            !osv,
+            "vulnerabilities disabled must suppress the OSV rescan"
+        );
+        assert!(
+            license,
+            "a manifest-only edit must still trigger the license refresh even with no \
+             lock file resolved and vulnerabilities disabled"
+        );
+    }
+
+    /// Issue #1407 R1, critic M1: call-site regression guard, exercised through the real
+    /// `handle_document_open`/`handle_document_change` pipeline rather than
+    /// `change_task_triggers` in isolation — protects the *placement* of the trigger
+    /// computation inside `run_document_change_task`, not just its formula. Gradle has
+    /// no `LockFileProvider` (`load_resolved_versions` always returns empty maps for
+    /// it), so before this fix the trigger — nested inside the
+    /// `!resolved_versions.is_empty()` guard — could never fire for a Gradle manifest
+    /// edit; a future refactor that reintroduced that nesting would keep
+    /// `change_task_triggers`'s own unit tests green while silently regressing this.
+    ///
+    /// Network-free: the added dependency uses Gradle's `4.+` dynamic-version syntax,
+    /// which `resolve_in_use_version`'s `concrete_pin_version` fallback rejects (it
+    /// contains `+`, see `deps_core::lsp_helpers::in_use_version::looks_like_a_single_version`),
+    /// so `tier3_license_targets` produces zero targets and `run_license_prefetch`
+    /// returns before any network call — this test only needs the generation bump that
+    /// precedes that call, not the fetch itself.
+    #[cfg(feature = "gradle")]
+    #[tokio::test]
+    async fn test_gradle_manifest_edit_bumps_generation_with_vulnerabilities_disabled() {
+        // See the comment in `test_document_parsing` on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::test_utils::test_helpers::create_test_client_and_config;
+        use std::time::Duration;
+
+        let state = Arc::new(ServerState::new());
+        state.set_license_policy(deps_core::LicensePolicy::new(
+            vec!["MIT".to_string()],
+            vec![],
+        ));
+
+        let url = deps_core::test_util::test_uri("/test/build.gradle.kts");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let original_content = "dependencies {\n}\n".to_string();
+
+        let (client, config) = create_test_client_and_config();
+        config
+            .write()
+            .await
+            .policy
+            .diagnostics
+            .vulnerabilities_enabled = false;
+        handle_document_open(
+            uri.clone(),
+            original_content,
+            Some(1),
+            state.clone(),
+            client,
+            config,
+        )
+        .await
+        .expect("initial open should succeed")
+        .await
+        .expect("initial open's background task must not panic");
+
+        let generation_before = state
+            .get_document(&uri)
+            .unwrap()
+            .resolved_versions_generation;
+
+        let edited_content =
+            "dependencies {\n    implementation(\"com.squareup.okhttp3:okhttp:4.+\")\n}\n"
+                .to_string();
+        let (client, config) = create_test_client_and_config();
+        config
+            .write()
+            .await
+            .policy
+            .diagnostics
+            .vulnerabilities_enabled = false;
+        let task = handle_document_change(
+            uri.clone(),
+            edited_content,
+            Some(2),
+            state.clone(),
+            client,
+            config,
+        )
+        .await
+        .expect("manifest edit adding a dependency should be accepted");
+
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect(
+                "background task must complete promptly (network-free: the dynamic \
+                 version resolves no license target)",
+            )
+            .expect("background task must not panic");
+
+        let generation_after = state
+            .get_document(&uri)
+            .unwrap()
+            .resolved_versions_generation;
+        assert_ne!(
+            generation_before, generation_after,
+            "a manifest edit adding a dependency to a lockless Gradle document, with \
+             vulnerabilities disabled, must still bump resolved_versions_generation for \
+             its license refresh (issue #1407 R1) — even though the OSV rescan itself \
+             stays off and Gradle has no lock file to resolve from"
+        );
+    }
 
     /// #796: the dependency-count ceiling applies through the full `deps-lsp`
     /// document-open pipeline for a real ecosystem parser (Cargo), not just the
@@ -2800,6 +3073,253 @@ tokio = "1.0"
                 "a debounced edit that changes no dependency itself must still bump \
                  resolved_versions_generation when the lock file moved a resolved version \
                  underneath it (issue #1399)"
+            );
+        }
+
+        /// Issue #1407 code-review must-fix: the opposite transition from the test
+        /// above — a lock file that goes from resolved to empty (deleted, `cargo
+        /// clean`, a VCS checkout mid-edit, a build tool regenerating it) must still be
+        /// detected as a resolved-version move, even for a comment-only edit that adds
+        /// or changes no dependency in the manifest text itself
+        /// (`diff_needs_rescan == false`). Before this fix, the trigger computation
+        /// (and the map overwrite it sits alongside) were skipped whenever the
+        /// *reloaded* map was empty, so `doc.resolved_versions` stayed stuck on the
+        /// stale, now-invalid data forever and `resolved_versions_generation` never
+        /// bumped.
+        #[tokio::test]
+        async fn test_lockfile_becoming_empty_bumps_resolved_generation() {
+            // See the comment in `test_document_parsing` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+            use tempfile::TempDir;
+
+            let temp_dir = TempDir::new().unwrap();
+            let lockfile_path = temp_dir.path().join("Cargo.lock");
+            std::fs::write(
+                &lockfile_path,
+                "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+                 [[package]]\nname = \"alpha-dep\"\nversion = \"0.1.0\"\n\
+                 source = \"git+https://github.com/example/alpha-dep\
+                 #abcdef1234567890abcdef1234567890abcdef12\"\n",
+            )
+            .unwrap();
+            let manifest_dir = temp_dir.path().join("crate");
+            std::fs::create_dir(&manifest_dir).unwrap();
+            let manifest_path = manifest_dir.join("Cargo.toml");
+            let original_content =
+                "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+                    .to_string();
+            std::fs::write(&manifest_path, &original_content).unwrap();
+            let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+            let state = Arc::new(ServerState::new());
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content.clone(),
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed")
+            .await
+            .expect("initial open's background task must not panic");
+
+            // `with_document` (not `get_document`) so the `DashMap` shard-lock guard is
+            // released immediately, before the `.await`s below (`clippy::await_holding_invalid_type`).
+            let (generation_before, resolved_non_empty_after_open) = state
+                .with_document(&uri, |doc| {
+                    (
+                        doc.resolved_versions_generation,
+                        !doc.resolved_versions.is_empty(),
+                    )
+                })
+                .unwrap();
+            assert!(
+                resolved_non_empty_after_open,
+                "the open path is expected to have resolved from the real lock file on disk"
+            );
+
+            // The lock file loses its only entry — same shape of change a `cargo clean`
+            // or a VCS checkout mid-edit produces.
+            std::fs::write(
+                &lockfile_path,
+                "# This file is automatically @generated by Cargo.\nversion = 3\n",
+            )
+            .unwrap();
+            // Ensure a distinguishable mtime on filesystems with coarse timestamp
+            // resolution (issue #1407 M3, matches `server.rs`'s
+            // `test_watched_config_change_reparses_open_document_with_catalog_dependency`
+            // and `mtime_cache::tests::forward_mtime_bump_invalidates`) — without this,
+            // the lock-file cache can serve the stale, pre-rewrite entry on a coarse
+            // filesystem, making this test flake instead of reliably re-reading.
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lockfile_path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+                .unwrap();
+
+            // Comment-only edit — touches no dependency, so `diff_needs_rescan` is
+            // false; only the lock-file-emptying transition itself can trigger a bump.
+            let edited_content = format!("{original_content}# a comment\n");
+            let (client, config) = create_test_client_and_config();
+            let task = handle_document_change(
+                uri.clone(),
+                edited_content,
+                Some(2),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("comment-only edit should be accepted");
+
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("background task must complete promptly")
+                .expect("background task must not panic");
+
+            let (resolved_empty_after_edit, generation_after_edit) = state
+                .with_document(&uri, |doc| {
+                    (
+                        doc.resolved_versions.is_empty(),
+                        doc.resolved_versions_generation,
+                    )
+                })
+                .unwrap();
+            assert!(
+                resolved_empty_after_edit,
+                "resolved_versions must reflect the now-empty lock file, not stay stuck \
+                 on the stale pre-deletion data"
+            );
+            assert_ne!(
+                generation_after_edit, generation_before,
+                "a lock file transitioning from resolved to empty must bump \
+                 resolved_versions_generation, even for a comment-only edit with no \
+                 manifest-text diff of its own (issue #1407 code-review must-fix)"
+            );
+        }
+
+        /// Issue #1407 E1 (regression caught in critic's fourth pass): the must-fix
+        /// test above (`test_lockfile_becoming_empty_bumps_resolved_generation`) must
+        /// NOT fire when the lock file's empty read-back is a *parse failure* rather
+        /// than a genuine absence — a lock file caught mid-rewrite by the package
+        /// manager while this same debounced edit is in flight is a very real race, not
+        /// an edge case. Mirrors `server::handle_lockfile_change`'s own
+        /// `test_handle_lockfile_change_skips_osv_rescan_on_lockfile_reload_error`
+        /// (issue #1395 M1) for the edit path.
+        #[tokio::test]
+        async fn test_lockfile_parse_error_does_not_bump_resolved_generation() {
+            // See the comment in `test_document_parsing` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+            use tempfile::TempDir;
+
+            let temp_dir = TempDir::new().unwrap();
+            let lockfile_path = temp_dir.path().join("Cargo.lock");
+            std::fs::write(
+                &lockfile_path,
+                "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+                 [[package]]\nname = \"alpha-dep\"\nversion = \"0.1.0\"\n\
+                 source = \"git+https://github.com/example/alpha-dep\
+                 #abcdef1234567890abcdef1234567890abcdef12\"\n",
+            )
+            .unwrap();
+            let manifest_dir = temp_dir.path().join("crate");
+            std::fs::create_dir(&manifest_dir).unwrap();
+            let manifest_path = manifest_dir.join("Cargo.toml");
+            let original_content =
+                "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+                    .to_string();
+            std::fs::write(&manifest_path, &original_content).unwrap();
+            let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+            let state = Arc::new(ServerState::new());
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content.clone(),
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed")
+            .await
+            .expect("initial open's background task must not panic");
+
+            let (generation_before, resolved_versions_before) = state
+                .with_document(&uri, |doc| {
+                    (
+                        doc.resolved_versions_generation,
+                        doc.resolved_versions.clone(),
+                    )
+                })
+                .unwrap();
+            assert!(
+                !resolved_versions_before.is_empty(),
+                "the open path is expected to have resolved from the real lock file on disk"
+            );
+
+            // Present (so the reload finds it) but malformed, so the reload fails to
+            // parse — not the same as the lock file being genuinely absent/empty.
+            std::fs::write(&lockfile_path, "not valid toml [[[\n").unwrap();
+            // Ensure a distinguishable mtime on filesystems with coarse timestamp
+            // resolution (issue #1407 M3) — without this, the lock-file cache can
+            // serve the stale, pre-rewrite entry on a coarse filesystem, making this
+            // parse-error assertion pass vacuously (the reload never actually re-reads
+            // the malformed content).
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lockfile_path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
+                .unwrap();
+
+            // Comment-only edit — touches no dependency, so `diff_needs_rescan` is
+            // false; only the (incorrectly-treated-as-a-transition) parse failure could
+            // trigger a bump if this guard were missing.
+            let edited_content = format!("{original_content}# a comment\n");
+            let (client, config) = create_test_client_and_config();
+            let task = handle_document_change(
+                uri.clone(),
+                edited_content,
+                Some(2),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("comment-only edit should be accepted");
+
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("background task must complete promptly")
+                .expect("background task must not panic");
+
+            let (resolved_versions_after, generation_after) = state
+                .with_document(&uri, |doc| {
+                    (
+                        doc.resolved_versions.clone(),
+                        doc.resolved_versions_generation,
+                    )
+                })
+                .unwrap();
+            assert_eq!(
+                resolved_versions_after, resolved_versions_before,
+                "a lock-file parse error must not clobber the known-good resolved \
+                 versions already in memory (issue #1407 E1)"
+            );
+            assert_eq!(
+                generation_after, generation_before,
+                "a lock-file parse error must not bump resolved_versions_generation — \
+                 a bump here, paired with no rescan of this call's own, would invalidate \
+                 an unrelated in-flight scan's staleness guard with nothing to \
+                 re-trigger a fresh commit (issue #1407 E1, mirroring #1395 M1)"
             );
         }
     }

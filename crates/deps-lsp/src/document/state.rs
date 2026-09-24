@@ -534,6 +534,8 @@ impl DocumentState {
     /// removed dependency's stale entry is reclaimed by
     /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop, not
     /// by this merge.
+    // TODO(critic): name-keyed merge keeps previous version's license on failed re-fetch
+    // after a version change
     pub fn merge_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
         self.licenses.extend(licenses);
     }

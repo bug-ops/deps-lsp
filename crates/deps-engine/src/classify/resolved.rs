@@ -245,6 +245,21 @@ pub fn split_resolved_packages(
 /// [`split_resolved_packages`]. Both returned maps are empty if no lock file is found or
 /// parsing fails.
 ///
+/// The trailing `bool` (issue #1407 code-review E1) distinguishes *why* the maps came
+/// back empty when they did: `true` means either a lock file was found and parsed
+/// successfully (possibly to zero packages) or it is genuinely absent (no
+/// `LockFileProvider`, or none found on disk); `false` means either a lock file *was*
+/// found but failed to parse — e.g. caught mid-rewrite by the package manager while an
+/// editor's change event raced it — or its discovery task itself panicked (treated the
+/// same, conservatively, since a panic is not a definitive "absent" answer the way
+/// `Ok(None)` is). Callers that treat an
+/// empty-vs-non-empty transition as a real signal (a resolved-version move worth
+/// re-scanning/diffing against) must gate on this the same way
+/// `server::handle_lockfile_change`'s `lockfile_reload_ok` already does — otherwise a
+/// transient parse failure looks identical to every dependency genuinely losing its
+/// resolution, silently discarding known-good data and replacing correct OSV/license
+/// results with `Skipped`/stale ones (the exact #1395 M1 class this mirrors).
+///
 /// # Examples
 ///
 /// ```
@@ -263,10 +278,12 @@ pub fn split_resolved_packages(
 ///     // the same fast path a manifest with no lock file takes in production.
 ///     let uri = test_uri("/nonexistent-for-doctest/Cargo.toml");
 ///
-///     let (versions, candidates) =
+///     let (versions, candidates, reload_ok) =
 ///         load_resolved_versions(&uri, &lockfile_cache, &ecosystem).await;
 ///     assert!(versions.is_empty());
 ///     assert!(candidates.is_empty());
+///     // Genuinely absent, not a parse failure.
+///     assert!(reload_ok);
 /// }
 /// ```
 pub async fn load_resolved_versions(
@@ -276,12 +293,13 @@ pub async fn load_resolved_versions(
 ) -> (
     HashMap<PackageName, ConcreteVersion>,
     HashMap<PackageName, Vec<ConcreteVersion>>,
+    bool,
 ) {
     let lock_provider = match ecosystem.lockfile_provider() {
         Some(p) => p,
         None => {
             tracing::debug!("No lock file provider for ecosystem {}", ecosystem.id());
-            return (HashMap::new(), HashMap::new());
+            return (HashMap::new(), HashMap::new(), true);
         }
     };
 
@@ -298,11 +316,14 @@ pub async fn load_resolved_versions(
         Ok(Some(path)) => path,
         Ok(None) => {
             tracing::debug!("No lock file found for {:?}", uri);
-            return (HashMap::new(), HashMap::new());
+            return (HashMap::new(), HashMap::new(), true);
         }
         Err(e) => {
             tracing::warn!("Lock file discovery task panicked for {:?}: {}", uri, e);
-            return (HashMap::new(), HashMap::new());
+            // Conservative (issue #1407 E1): a panic is not a definitive "no lock
+            // file" answer the way `Ok(None)` above is, so this is treated the same
+            // as a parse failure rather than as a genuine absence.
+            return (HashMap::new(), HashMap::new(), false);
         }
     };
 
@@ -316,11 +337,12 @@ pub async fn load_resolved_versions(
                 resolved.len(),
                 lockfile_path.display()
             );
-            split_resolved_packages(&resolved)
+            let (versions, candidates) = split_resolved_packages(&resolved);
+            (versions, candidates, true)
         }
         Err(e) => {
             tracing::warn!("Failed to parse lock file: {}", e);
-            (HashMap::new(), HashMap::new())
+            (HashMap::new(), HashMap::new(), false)
         }
     }
 }
