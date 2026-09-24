@@ -45,6 +45,11 @@ pub(crate) struct OsvScanResult {
     /// Document content at the moment the scan started, to guard the
     /// eventual write against a cross-generation stale commit (critique M4).
     content_snapshot: String,
+    /// `DocumentState::resolved_versions_generation` at the moment the scan started (issue
+    /// #1395 critic S3) — `content_snapshot` alone cannot order two phase-A/B pairs whose
+    /// resolved-version snapshots differ but whose `content` doesn't (a lock-file-only
+    /// reload never touches `content`).
+    resolved_generation: u64,
     vulnerabilities: deps_core::osv::VulnerabilityMap,
     /// `key -> osv_name`, needed to build phase B candidates.
     osv_name_by_key: HashMap<String, String>,
@@ -74,7 +79,7 @@ pub(crate) async fn run_osv_scan_phase_a(
 ) -> Option<OsvScanResult> {
     let ecosystem_id = ecosystem.ecosystem_id();
 
-    let (content_snapshot, targets, mut vulnerabilities, raw_name_by_key) = {
+    let (content_snapshot, resolved_generation, targets, mut vulnerabilities, raw_name_by_key) = {
         let doc = state.get_document(&uri)?;
         let parse_result = doc.parse_result()?;
         let (targets, skipped) = deps_engine::classify::osv::build_scan_targets(
@@ -106,7 +111,13 @@ pub(crate) async fn run_osv_scan_phase_a(
                 (key, d.name().as_str().to_string())
             })
             .collect();
-        (doc.content.clone(), targets, skipped, raw_name_by_key)
+        (
+            doc.content.clone(),
+            doc.resolved_versions_generation,
+            targets,
+            skipped,
+            raw_name_by_key,
+        )
     };
 
     if targets.is_empty() && vulnerabilities.is_empty() {
@@ -130,10 +141,49 @@ pub(crate) async fn run_osv_scan_phase_a(
 
     Some(OsvScanResult {
         content_snapshot,
+        resolved_generation,
         vulnerabilities,
         osv_name_by_key,
         raw_name_by_key,
     })
+}
+
+/// Runs phase A followed by phase B and commits the result for a single document —
+/// the lock-file-change counterpart of the manifest-change path's spawn-phase-A/
+/// await-then-phase-B sequence in `document::lifecycle::run_document_change_task`
+/// (issue #1395). Unlike that path, `handle_lockfile_change` never starts a registry
+/// fetch of its own for phase A to run concurrently against, so this awaits phase A
+/// directly rather than spawning it as a separate task.
+///
+/// No-op if phase A finds nothing to report (see [`run_osv_scan_phase_a`]'s return
+/// contract).
+pub(crate) async fn rescan_after_resolved_version_change(
+    uri: &Uri,
+    state: &Arc<ServerState>,
+    ecosystem: &Arc<dyn Ecosystem>,
+    fetch_timeout_secs: u64,
+) {
+    // TODO(critic): license prefetch is not refreshed on lockfile-only changes
+    let Some(phase_a_result) = run_osv_scan_phase_a(
+        uri.clone(),
+        Arc::clone(state),
+        Arc::clone(ecosystem),
+        fetch_timeout_secs,
+    )
+    .await
+    else {
+        return;
+    };
+
+    run_osv_phase_b_and_commit(
+        uri,
+        state,
+        ecosystem.ecosystem_id(),
+        ecosystem.formatter(),
+        fetch_timeout_secs,
+        phase_a_result,
+    )
+    .await;
 }
 
 /// Background pre-fetch of each dependency's license, for whichever ecosystems
@@ -350,10 +400,16 @@ pub(crate) async fn run_osv_phase_b_and_commit(
     }
 
     if let Some(mut doc) = state.documents.get_mut(uri) {
-        if doc.content == result.content_snapshot {
-            doc.update_vulnerabilities(result.vulnerabilities);
-        } else {
+        if doc.content != result.content_snapshot {
             tracing::debug!("dropping stale OSV scan result: document content changed mid-scan");
+        } else if doc.resolved_versions_generation != result.resolved_generation {
+            // Issue #1395 critic S3: `content` alone can't order two racing phase-A/B
+            // pairs whose resolved-version snapshots differ (e.g. a lock-file-only
+            // reload racing a slower manifest-edit scan) — a newer `update_resolved_versions`
+            // call landed on this document after this scan's snapshot was taken.
+            tracing::debug!("dropping stale OSV scan result: resolved versions changed mid-scan");
+        } else {
+            doc.update_vulnerabilities(result.vulnerabilities);
         }
     }
 }
@@ -542,6 +598,7 @@ mod tests {
             doc_state.update_resolved_versions(
                 HashMap::from([(PackageName::new("http"), "1.2.0".into())]),
                 HashMap::new(),
+                state.next_resolved_versions_generation(),
             );
             state.update_document(uri.clone(), doc_state);
 
@@ -582,6 +639,7 @@ mod tests {
             doc_state.update_resolved_versions(
                 HashMap::from([(PackageName::new("apple/swift-nio"), "2.65.0".into())]),
                 HashMap::new(),
+                state.next_resolved_versions_generation(),
             );
             state.update_document(uri.clone(), doc_state);
 
@@ -647,6 +705,7 @@ mod tests {
                     "4.12.0".into(),
                 )]),
                 HashMap::new(),
+                state.next_resolved_versions_generation(),
             );
             state.update_document(uri.clone(), doc_state);
 
@@ -695,6 +754,7 @@ mod tests {
                     "32.0.1-jre".into(),
                 )]),
                 HashMap::new(),
+                state.next_resolved_versions_generation(),
             );
             state.update_document(uri.clone(), doc_state);
 
@@ -737,6 +797,7 @@ mod tests {
             doc_state.update_resolved_versions(
                 HashMap::from([(PackageName::new("jsr:@std/fs"), "1.0.24".into())]),
                 HashMap::new(),
+                state.next_resolved_versions_generation(),
             );
             state.update_document(uri.clone(), doc_state);
 
@@ -747,6 +808,214 @@ mod tests {
                 doc.licenses.contains_key(&PackageName::new("jsr:@std/fs")),
                 "expected a pre-fetched license for 'jsr:@std/fs', got: {:?}",
                 doc.licenses
+            );
+        }
+    }
+
+    /// Regression coverage for issue #1395's bidirectional-generation-race finding
+    /// (surfaced by code-review after N1/N2): `run_osv_phase_b_and_commit`'s staleness
+    /// guard (`resolved_versions_generation` match) is shared by every commit site, so a
+    /// bump from *any* source without a corresponding fresh scan of its own can silently
+    /// drop a different, still-correct in-flight commit.
+    #[cfg(feature = "cargo")]
+    mod generation_race_tests {
+        use super::super::super::state::DocumentState;
+        use super::*;
+        use std::assert_matches;
+
+        fn git_dep_content() -> &'static str {
+            "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+        }
+
+        async fn setup(state: &Arc<ServerState>, uri: &Uri, url: &url::Url) -> Arc<dyn Ecosystem> {
+            let ecosystem = state.ecosystem_registry.for_uri(url).unwrap();
+            let parse_result = ecosystem
+                .parse_manifest(git_dep_content(), url)
+                .await
+                .unwrap();
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                git_dep_content().to_string(),
+                parse_result,
+            );
+            state.update_document(uri.clone(), doc_state);
+            ecosystem
+        }
+
+        /// The fix: an intervening caller that follows the conditional-bump contract
+        /// (`set_resolved_versions_without_bump` with no paired `bump_resolved_generation`,
+        /// exactly what `document::lifecycle::run_document_change_task` now does for an
+        /// edit with `needs_osv_rescan == false`, and `server::handle_lockfile_change` does
+        /// for a document whose own dependencies are unaffected) must NOT cause a
+        /// concurrently in-flight, still-correct phase-A/B pair to be dropped.
+        #[tokio::test]
+        async fn test_unrelated_no_bump_update_does_not_drop_concurrent_scan_commit() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem = setup(&state, &uri, &url).await;
+
+            // Phase A of some concurrent scan (e.g. a lock-file-triggered rescan) snapshots
+            // the document here, capturing the current generation.
+            let phase_a_result =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect(
+                        "git-sourced dependency must still produce a NonRegistrySource skip result",
+                    );
+
+            // An unrelated event (e.g. a debounced edit that touches no dependency, or a
+            // lock-file reload for a document whose own dependencies are unaffected) races
+            // in between phase A and phase B. It updates the maps (even to the same values)
+            // but — per the fix — must not bump the generation, since it schedules no scan
+            // of its own to produce a fresh replacement commit.
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.set_resolved_versions_without_bump(HashMap::new(), HashMap::new());
+            }
+
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                phase_a_result,
+            )
+            .await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_matches!(
+                doc.vulnerabilities.get("alpha-dep"),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::NonRegistrySource
+                )),
+                "an intervening update that correctly does not bump the generation must not \
+                 cause this scan's own, still-correct commit to be dropped"
+            );
+        }
+
+        /// Negative control, proving the guard above is not vacuously passing: a genuine
+        /// bump between phase A and phase B (the case the guard exists to catch) must still
+        /// drop the now-stale commit.
+        #[tokio::test]
+        async fn test_concurrent_bump_still_drops_stale_scan_commit() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem = setup(&state, &uri, &url).await;
+
+            let phase_a_result =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect(
+                        "git-sourced dependency must still produce a NonRegistrySource skip result",
+                    );
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.set_resolved_versions_without_bump(HashMap::new(), HashMap::new());
+                doc.bump_resolved_generation(state.next_resolved_versions_generation());
+            }
+
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                phase_a_result,
+            )
+            .await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.vulnerabilities.is_empty(),
+                "a genuine concurrent generation bump must still cause the now-stale scan's \
+                 commit to be dropped, proving the guard itself still functions: {:?}",
+                doc.vulnerabilities
+            );
+        }
+
+        /// Regression guard for issue #1395 critic M10: a close/reopen ABA on the
+        /// generation counter. A per-document-instance counter restarting at 0 on every
+        /// `DocumentState` rebuild can collide with a stale, `did_close`-surviving rescan's
+        /// earlier snapshot from a *previous* instance of the same document — the one scan
+        /// kind that deliberately isn't cancelled on close (issue #1395 critic N1).
+        /// `ServerState::next_resolved_versions_generation`'s server-global, ever-increasing
+        /// source closes this by construction: two different `DocumentState` instances can
+        /// never draw the same value.
+        #[tokio::test]
+        async fn test_close_reopen_does_not_let_a_stale_rescan_commit_over_a_fresh_instance() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use deps_core::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            // First document instance, resolved at v1 — a rescan (R1) snapshots it here.
+            let ecosystem = setup(&state, &uri, &url).await;
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_resolved_versions(
+                    HashMap::from([(PackageName::new("alpha-dep"), "0.1.0".into())]),
+                    HashMap::new(),
+                    state.next_resolved_versions_generation(),
+                );
+            }
+            let r1_phase_a =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect(
+                        "git-sourced dependency must still produce a NonRegistrySource skip result",
+                    );
+
+            // Document closed, then reopened — a brand new `DocumentState` instance for the
+            // same URI, resolved at a different version (v2) by a rescan (S2) that already
+            // committed its own, correct result before R1's phase B below returns.
+            state.remove_document(&uri);
+            let ecosystem = setup(&state, &uri, &url).await;
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_resolved_versions(
+                    HashMap::from([(PackageName::new("alpha-dep"), "0.2.0".into())]),
+                    HashMap::new(),
+                    state.next_resolved_versions_generation(),
+                );
+            }
+            let mut s2_result = VulnerabilityMap::new();
+            s2_result.insert(
+                "alpha-dep".to_string(),
+                ScanOutcome::Skipped(SkipReason::UnmappableName),
+            );
+            state
+                .documents
+                .get_mut(&uri)
+                .unwrap()
+                .update_vulnerabilities(s2_result);
+
+            // R1's phase B, snapshotted against the FIRST (now-closed) document instance,
+            // finally returns.
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                r1_phase_a,
+            )
+            .await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_matches!(
+                doc.vulnerabilities.get("alpha-dep"),
+                Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
+                "R1's stale commit (snapshotted against the closed document instance) must \
+                 not overwrite the freshly-reopened instance's own result — got: {:?}",
+                doc.vulnerabilities
             );
         }
     }

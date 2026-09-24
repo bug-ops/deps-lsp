@@ -1116,7 +1116,7 @@ serde = "1.0.0"
             // in-use-version check (#263), not the manifest-requirement check (#247).
             let mut resolved = std::collections::HashMap::new();
             resolved.insert("left-pad".into(), "1.0.1".into());
-            doc_state.update_resolved_versions(resolved, std::collections::HashMap::new());
+            doc_state.update_resolved_versions(resolved, std::collections::HashMap::new(), 1);
 
             doc_state.replace_outcomes(deps_core::DependencyOutcomes::new().with_yanked(
                 "left-pad",
