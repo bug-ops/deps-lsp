@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::error::DepsError;
 use crate::licenses::LicensePolicy;
-use crate::osv::VulnerabilityMap;
+use crate::osv::{ScanOutcome, VulnerabilityMap};
 use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
@@ -1045,6 +1045,28 @@ pub fn position_in_range(pos: Position, range: Range) -> bool {
 /// `version_requirement().is_none()` alone is not, since both shapes share it.
 pub(crate) fn version_range_is_synthetic_empty(dep: &dyn Dependency) -> bool {
     dep.version_requirement().is_none() && dep.version_range().is_some_and(|r| r.start == r.end)
+}
+
+/// Resolves the [`ScanOutcome`] for one dependency occurrence, trying `vuln_key` first
+/// (the version-qualified lookup key from `crate::osv::vulnerability_keys`, #394 S2 —
+/// distinguishes two occurrences of one name pinned to different versions), then the
+/// ecosystem-normalized name, then the declared name.
+///
+/// The single shared fallback chain for every OSV-outcome consumer
+/// (`diagnostics::apply_vulnerability_rule`, `diagnostics::skip_reason_notice`,
+/// `hover::generate_hover`'s vulnerability section) — previously written out three times
+/// independently, risking a future change to the fallback priority landing in only some
+/// of them (issue #1392 code-review finding).
+pub(crate) fn resolve_scan_outcome<'a>(
+    vulnerabilities: &'a VulnerabilityMap,
+    vuln_key: Option<&str>,
+    normalized_name: &str,
+    declared_name: &str,
+) -> Option<&'a ScanOutcome> {
+    vuln_key
+        .and_then(|key| vulnerabilities.get(key))
+        .or_else(|| vulnerabilities.get(normalized_name))
+        .or_else(|| vulnerabilities.get(declared_name))
 }
 
 /// Converts byte offsets in source text to LSP `Position` values.

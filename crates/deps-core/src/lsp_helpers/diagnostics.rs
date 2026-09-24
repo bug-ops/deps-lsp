@@ -4,7 +4,7 @@ use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severit
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
-use crate::osv::{ScanOutcome, diagnostic_severity_for};
+use crate::osv::{ScanOutcome, SkipReason, diagnostic_severity_for};
 use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
@@ -14,7 +14,7 @@ use crate::{
 
 use super::{
     EcosystemFormatter, PackageVersions, RequirementMatcher, RequirementStatus, VersionData,
-    version_range_is_synthetic_empty,
+    resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -850,10 +850,6 @@ pub fn generate_diagnostics_from_cache(
     // diagnostic while still naming every dependency and keeping any `Actionable` hint (#478/#485).
     let mut fetch_failed: Vec<FetchFailureEntry> = Vec::new();
 
-    dependency_ceiling_notice(&mut diagnostics, parse_result);
-    offline_notice(&mut diagnostics, versions, &deps);
-    blocked_registry_diagnostics(&mut diagnostics, parse_result, &deps);
-
     // #394 S2: version-qualified OSV lookup keys, so two occurrences of one name pinned to
     // different versions never share a `Vulnerable`/`Clean` result; `None` falls back to plain-name lookup.
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
@@ -866,6 +862,33 @@ pub fn generate_diagnostics_from_cache(
         )
     });
 
+    // Computed once and shared by `skip_reason_notice` below and the main per-dependency
+    // loop's `RuleContext`, so `normalize_package_name` (an allocating call) never runs
+    // twice for the same dependency (#1392 code-review finding 4). Keyed by name range
+    // like `vuln_keys`, since two occurrences of one name have distinct positions.
+    let normalized_names: HashMap<Range, String> = deps
+        .iter()
+        .filter(|dep| !dep.name_range_is_synthetic())
+        .map(|dep| {
+            (
+                dep.name_range(),
+                formatter.normalize_package_name(dep.name()),
+            )
+        })
+        .collect();
+
+    dependency_ceiling_notice(&mut diagnostics, parse_result);
+    offline_notice(&mut diagnostics, versions, &deps);
+    skip_reason_notice(
+        &mut diagnostics,
+        &deps,
+        versions,
+        &normalized_names,
+        uri,
+        vuln_keys.as_ref(),
+    );
+    blocked_registry_diagnostics(&mut diagnostics, parse_result, &deps);
+
     for dep in deps {
         // Critic S1 (#905): a synthetic `name_range()` has no real document position, and every
         // rule below anchors on it — skip diagnostics entirely rather than stack on a sentinel range.
@@ -873,10 +896,12 @@ pub fn generate_diagnostics_from_cache(
             continue;
         }
 
-        let normalized_name = formatter.normalize_package_name(dep.name());
+        let normalized_name = normalized_names
+            .get(&dep.name_range())
+            .map_or("", String::as_str);
         let ctx = RuleContext {
             dep,
-            normalized_name: &normalized_name,
+            normalized_name,
             versions,
             formatter,
             severities,
@@ -1090,6 +1115,175 @@ fn offline_notice(
     }
 }
 
+/// Whether `reason` is transient/environment-dependent enough to warrant the persistent,
+/// document-level [`skip_reason_notice`] (issue #1392 M1) — as opposed to
+/// `NonRegistrySource`/`UnmappableName`/`UnmappableEcosystem`, which are structurally
+/// permanent for as long as the dependency is declared the way it is (every `deno.json`
+/// `jsr:` dependency is `UnmappableName` forever, for example) and would otherwise leave a
+/// standing, unresolvable Problems-panel entry. [`push_skip_reason_footer_hover_section`]
+/// has no such restriction: it renders per-dependency, on demand, not as a standing
+/// diagnostic, so it uses [`SkipReason::unchecked_reason`] directly for every
+/// non-`NonRegistrySource` variant.
+const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
+    match reason {
+        SkipReason::NoConcreteVersion | SkipReason::QueryFailed | SkipReason::Truncated => true,
+        SkipReason::NonRegistrySource
+        | SkipReason::UnmappableName
+        | SkipReason::UnmappableEcosystem => false,
+    }
+}
+
+/// R0b — file-level "vulnerability data not checked" notice for non-offline
+/// `SkipReason`s (issue #1392), extending [`offline_notice`]'s #483 mechanism to the far
+/// more common case where the OSV scan itself skipped a dependency — most often
+/// `NoConcreteVersion`: a semver-range requirement with no committed lock file, which is
+/// how most real `Cargo.toml`/`package.json` dependencies are declared. Without this,
+/// such a dependency's vulnerability section renders nothing and is visually
+/// indistinguishable from one that was scanned and found clean.
+///
+/// Wording deliberately states only the fact ("no resolved or exact version was
+/// available"), not a remedy: adding/updating a lock file does not itself re-run the OSV
+/// scan for an already-open document (a separate, pre-existing staleness gap tracked
+/// outside #1392), so a phrase like "add a lock file to fix this" would overclaim.
+///
+/// One file-level diagnostic, not per-dependency, for the same noise reason
+/// [`offline_notice`] documents just above: `NoConcreteVersion` alone would otherwise put
+/// an "Information" squiggle on nearly every dependency in a lockfile-less manifest. Every
+/// individual skipped dependency still survives via `related_information` (name + its own
+/// reason), capped at [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] like
+/// [`push_collapsed_blocked_registries`]'s sibling cap, so the notice never grows
+/// unbounded with document size.
+///
+/// Suppressed while `versions.offline`: [`offline_notice`] already covers that case with
+/// broader wording (version *and* vulnerability data unchecked); showing both would be
+/// redundant. Only counts reasons [`should_notify_in_diagnostics`] accepts — unlike the
+/// hover footer, `UnmappableName`/`UnmappableEcosystem` are excluded here (M1), alongside
+/// `NonRegistrySource` (`unchecked_reason` returns `None` for it).
+///
+/// Reads: `versions.offline`, `versions.vulnerabilities`, looked up per dependency via the
+/// shared [`resolve_scan_outcome`] (name-range key, then normalized name, then declared
+/// name — the same chain [`apply_vulnerability_rule`] and `hover::generate_hover` use) —
+/// not by iterating the vulnerability map's values directly, which would double-count
+/// nothing but also silently drop or misattribute duplicate-name occurrences pinned to
+/// different versions (#394 S2's same concern), or surface a stale entry for a dependency
+/// no longer in `deps` at all. `normalized_names` is precomputed once by the caller and
+/// shared with the main per-dependency loop, so `EcosystemFormatter::normalize_package_name`
+/// (an allocating call) never runs twice for the same dependency.
+/// Emits: at most one [`Severity::Information`] at `Position(0,0)`, appended right after
+/// [`offline_notice`] so both file-level R0 notices stay adjacent.
+fn skip_reason_notice(
+    diagnostics: &mut Vec<Diagnostic>,
+    deps: &[&dyn Dependency],
+    versions: VersionData<'_>,
+    normalized_names: &HashMap<Range, String>,
+    uri: &url::Url,
+    vuln_keys: Option<&HashMap<Range, String>>,
+) {
+    if versions.offline {
+        return;
+    }
+    let Some(vulnerabilities) = versions.vulnerabilities else {
+        return;
+    };
+
+    struct SkippedEntry {
+        // Redacted via `redact_name_for_diagnostic` before storage (#1392 code-review
+        // finding 1) — `PackageName` is unbounded/unvalidated registry-adjacent input,
+        // the same sink `push_vulnerability_diagnostics`/`push_deprecation_diagnostic`
+        // already guard.
+        name: String,
+        range: Range,
+        reason_text: &'static str,
+    }
+
+    let mut entries: Vec<SkippedEntry> = Vec::new();
+    for dep in deps {
+        if dep.name_range_is_synthetic() {
+            continue;
+        }
+        let normalized_name = normalized_names
+            .get(&dep.name_range())
+            .map_or("", String::as_str);
+        let vuln_key = vuln_keys
+            .and_then(|keys| keys.get(&dep.name_range()))
+            .map(String::as_str);
+        let outcome = resolve_scan_outcome(
+            vulnerabilities,
+            vuln_key,
+            normalized_name,
+            dep.name().as_str(),
+        );
+
+        if let Some(ScanOutcome::Skipped(reason)) = outcome
+            && should_notify_in_diagnostics(*reason)
+            && let Some(reason_text) = reason.unchecked_reason()
+        {
+            entries.push(SkippedEntry {
+                name: redact_name_for_diagnostic(dep.name()),
+                range: version_anchor_range(*dep),
+                reason_text,
+            });
+        }
+    }
+    if entries.is_empty() {
+        return;
+    }
+
+    let count = entries.len();
+    let dependency_word = if count == 1 {
+        "dependency"
+    } else {
+        "dependencies"
+    };
+    let mut distinct_reasons: Vec<&'static str> =
+        entries.iter().map(|entry| entry.reason_text).collect();
+    distinct_reasons.sort_unstable();
+    distinct_reasons.dedup();
+    let joined_reasons = distinct_reasons.join("; ");
+
+    let shown = entries.len().min(MAX_BLOCKED_REGISTRY_RELATED_INFO);
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "shown is entries.len().min(...), so entries[..shown] is always in bounds"
+    )]
+    let mut related_information: Vec<RelatedInformation> = entries[..shown]
+        .iter()
+        .map(|entry| {
+            RelatedInformation::new(
+                uri.clone(),
+                entry.range,
+                format!("'{}': {}", entry.name, entry.reason_text),
+            )
+        })
+        .collect();
+    let remaining = entries.len() - shown;
+    if remaining > 0 {
+        related_information.push(RelatedInformation::new(
+            uri.clone(),
+            Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, 0),
+            },
+            format!("and {remaining} more dependencies not checked for vulnerabilities"),
+        ));
+    }
+
+    diagnostics.push(
+        Diagnostic::new(
+            Range {
+                start: Position::new(0, 0),
+                end: Position::new(0, 0),
+            },
+            format!(
+                "vulnerability data was not checked for {count} {dependency_word}: \
+                 {joined_reasons}"
+            ),
+        )
+        .with_severity(Severity::Information)
+        .with_related_information(related_information),
+    );
+}
+
 /// R1 — blocked-registry notices (#443/plan-1b §1.7).
 ///
 /// A registry index blocked by `registries.workspace_registries` must not degrade silently.
@@ -1268,14 +1462,18 @@ fn apply_vulnerability_rule(
     ctx: &RuleContext<'_>,
     vuln_keys: Option<&HashMap<Range, String>>,
 ) {
-    if let Some(vulnerabilities) = ctx.versions.vulnerabilities
-        && let Some(ScanOutcome::Vulnerable(dv)) = vuln_keys
+    if let Some(vulnerabilities) = ctx.versions.vulnerabilities {
+        let vuln_key = vuln_keys
             .and_then(|keys| keys.get(&ctx.dep.name_range()))
-            .and_then(|key| vulnerabilities.get(key))
-            .or_else(|| vulnerabilities.get(ctx.normalized_name))
-            .or_else(|| vulnerabilities.get(ctx.dep.name().as_str()))
-    {
-        push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
+            .map(String::as_str);
+        if let Some(ScanOutcome::Vulnerable(dv)) = resolve_scan_outcome(
+            vulnerabilities,
+            vuln_key,
+            ctx.normalized_name,
+            ctx.dep.name().as_str(),
+        ) {
+            push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
+        }
     }
 }
 
@@ -3746,6 +3944,505 @@ mod tests {
                     && d.message().to_lowercase().contains("offline")),
             "expected a file-level offline diagnostic even with zero fetch failures; \
              got: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #1392: a non-offline `Skipped(NoConcreteVersion)` outcome — the common case
+    /// of a semver-range requirement with no committed lock file — must surface a
+    /// file-level notice explaining vulnerability data was not checked, mirroring
+    /// #483's offline notice but scoped to just the reasons actually seen.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_present_for_no_concrete_version() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "^1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.0"));
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "serde".to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(Severity::Information)
+                    && d.message()
+                        .contains("vulnerability data was not checked for 1 dependency")),
+            "expected a file-level not-checked diagnostic; got: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #1392 (code-review finding 1): a credential-shaped dependency name must never
+    /// reach the notice's `related_information` verbatim — `skip_reason_notice` must route
+    /// it through `redact_name_for_diagnostic` the same as every other name sink in this
+    /// file (`apply_unknown_package_rule`, `push_vulnerability_diagnostics`, etc.).
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_redacts_credential_in_name() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: CREDENTIAL_SHAPED_NAME.into(),
+                version_req: "^1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            CREDENTIAL_SHAPED_NAME.to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notice = diagnostics
+            .iter()
+            .find(|d| {
+                d.message()
+                    .contains("vulnerability data was not checked for")
+            })
+            .unwrap_or_else(|| panic!("expected the notice; got: {diagnostics:?}"));
+        let related = notice.related_information.as_deref().unwrap_or_default();
+        assert!(
+            related.iter().any(|r| r.message().contains("***@")),
+            "the redacted form must survive via related_information; got: {related:?}"
+        );
+        assert!(
+            related
+                .iter()
+                .all(|r| !r.message().contains("glpat-AAAABBBBCCCCDDDD")),
+            "the raw credential must never reach related_information; got: {related:?}"
+        );
+    }
+
+    /// Issue #1392: the file-level notice must stay suppressed while offline — that case
+    /// is already covered by `offline_notice`'s broader wording, and showing both would
+    /// be redundant noise.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_omitted_while_offline() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "^1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "serde".to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulns)
+                .with_offline(true),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d
+                .message()
+                .contains("vulnerability data was not checked for")),
+            "the reason-specific notice must not also render while offline; got: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #1392: `NonRegistrySource` entries must not be counted toward the notice —
+    /// a source that was never going to be checked regardless is not a "not checked"
+    /// surprise, mirroring hover's `resolvable` gate.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_ignores_non_registry_source() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "path-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "path-pkg".to_string(),
+            ScanOutcome::Skipped(SkipReason::NonRegistrySource),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d
+                .message()
+                .contains("vulnerability data was not checked for")),
+            "a NonRegistrySource skip must never contribute to the notice; got: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #1392 M1: `UnmappableName`/`UnmappableEcosystem` are structurally permanent
+    /// (e.g. every `jsr:`-pinned dependency), so — unlike the hover footer — they must
+    /// never contribute to the file-level diagnostics notice, matching `NonRegistrySource`.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_ignores_unmappable_reasons() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "jsr-pkg".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 7)),
+                },
+                MockDep {
+                    name: "unmapped-eco-pkg".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 17)),
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "jsr-pkg".to_string(),
+            ScanOutcome::Skipped(SkipReason::UnmappableName),
+        );
+        vulns.insert(
+            "unmapped-eco-pkg".to_string(),
+            ScanOutcome::Skipped(SkipReason::UnmappableEcosystem),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d
+                .message()
+                .contains("vulnerability data was not checked for")),
+            "UnmappableName/UnmappableEcosystem must never contribute to the notice; \
+             got: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #1392 (critic S2, M4): two dependencies skipped for the *same* reason must
+    /// be counted individually (not collapsed via the vulnerability map's own dedup) and
+    /// both named in `related_information`.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_counts_two_same_reason() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "pkg-a".into(),
+                    version_req: "^1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                },
+                MockDep {
+                    name: "pkg-b".into(),
+                    version_req: "^1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 5)),
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "pkg-a".to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+        vulns.insert(
+            "pkg-b".to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notice = diagnostics
+            .iter()
+            .find(|d| {
+                d.message()
+                    .contains("vulnerability data was not checked for")
+            })
+            .unwrap_or_else(|| panic!("expected the notice; got: {diagnostics:?}"));
+        assert!(
+            notice.message().contains("2 dependencies"),
+            "two distinct dependencies with the same reason must both count; got: {}",
+            notice.message()
+        );
+        let related = notice.related_information.as_deref().unwrap_or_default();
+        assert!(
+            related.iter().any(|r| r.message().contains("pkg-a"))
+                && related.iter().any(|r| r.message().contains("pkg-b")),
+            "both dependency names must survive via related_information; got: {related:?}"
+        );
+    }
+
+    /// Issue #1392 (critic M4): two dependencies skipped for *different* reasons must
+    /// both appear in the message, sorted and semicolon-joined, not just the first one.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_joins_distinct_reasons() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![
+                MockDep {
+                    name: "pkg-a".into(),
+                    version_req: "^1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                },
+                MockDep {
+                    name: "pkg-b".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(1, 10), Position::new(1, 20)),
+                    name_range: Range::new(Position::new(1, 0), Position::new(1, 5)),
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "pkg-a".to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+        vulns.insert(
+            "pkg-b".to_string(),
+            ScanOutcome::Skipped(SkipReason::QueryFailed),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notice = diagnostics
+            .iter()
+            .find(|d| {
+                d.message()
+                    .contains("vulnerability data was not checked for")
+            })
+            .unwrap_or_else(|| panic!("expected the notice; got: {diagnostics:?}"));
+        assert!(
+            notice.message().contains("2 dependencies")
+                && notice
+                    .message()
+                    .contains("no resolved or exact version was available to query")
+                && notice.message().contains("the OSV.dev query failed"),
+            "both distinct reasons must be present in the message; got: {}",
+            notice.message()
+        );
+    }
+
+    /// Issue #1392 (critic S2/M5): a `vulnerabilities` map entry for a dependency that no
+    /// longer appears in `deps` (e.g. removed from the manifest since the last OSV scan,
+    /// but the cached scan result map wasn't pruned) must not be counted — the notice is
+    /// driven by `deps` + `vuln_keys`, not by iterating the map's values directly, which
+    /// would have surfaced this stale entry under the pre-fix implementation.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_ignores_stale_map_entry() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "current-pkg".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        // `current-pkg` has no entry at all (never skipped); `removed-pkg` is a stale
+        // leftover from a dependency no longer declared in `parse_result`.
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "removed-pkg".to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            !diagnostics.iter().any(|d| d
+                .message()
+                .contains("vulnerability data was not checked for")),
+            "a stale map entry for a removed dependency must never surface the notice; \
+             got: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #1392 (critic M5): 10+ skipped dependencies must collapse into one notice
+    /// with `related_information` capped at `MAX_BLOCKED_REGISTRY_RELATED_INFO` (9) named
+    /// entries plus a trailing "+N more" entry, mirroring
+    /// `push_collapsed_blocked_registries`'s own cap.
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_caps_related_information() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MockFormatter;
+        let mut deps = Vec::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        for i in 0..10u32 {
+            let name = format!("pkg-{i}");
+            deps.push(MockDep {
+                name: name.as_str().into(),
+                version_req: "^1.0.0".into(),
+                version_range: Range::new(Position::new(i, 10), Position::new(i, 20)),
+                name_range: Range::new(Position::new(i, 0), Position::new(i, 5)),
+            });
+            vulns.insert(name, ScanOutcome::Skipped(SkipReason::NoConcreteVersion));
+        }
+        let parse_result = MockParseResult {
+            deps,
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notice = diagnostics
+            .iter()
+            .find(|d| {
+                d.message()
+                    .contains("vulnerability data was not checked for")
+            })
+            .unwrap_or_else(|| panic!("expected the notice; got: {diagnostics:?}"));
+        assert!(
+            notice.message().contains("10 dependencies"),
+            "all 10 skipped dependencies must be counted; got: {}",
+            notice.message()
+        );
+        let related = notice.related_information.as_deref().unwrap_or_default();
+        assert_eq!(
+            related.len(),
+            10,
+            "expected 9 named entries plus one trailing '+N more'; got: {related:?}"
+        );
+        assert!(
+            related
+                .last()
+                .is_some_and(|r| r.message().contains("1 more")),
+            "the trailing entry must report the 1 remaining dependency; got: {related:?}"
         );
     }
 

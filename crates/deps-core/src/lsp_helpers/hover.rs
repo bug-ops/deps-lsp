@@ -23,6 +23,7 @@ use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
     EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, await_versions_fetch, escape_markdown,
     in_use_version, markdown_code_span, position_in_range, resolve_in_use_version,
+    resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -263,11 +264,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         .remove(&dep.name_range())
     });
     let vuln_outcome = versions.vulnerabilities.and_then(|m| {
-        vuln_key
-            .as_deref()
-            .and_then(|key| m.get(key))
-            .or_else(|| m.get(&normalized_name))
-            .or_else(|| m.get(dep.name().as_str()))
+        resolve_scan_outcome(
+            m,
+            vuln_key.as_deref(),
+            &normalized_name,
+            dep.name().as_str(),
+        )
     });
     let deprecation = versions
         .outcomes
@@ -411,6 +413,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     );
 
     push_offline_footer_hover_section(&mut markdown, resolvable, versions.offline);
+    push_skip_reason_footer_hover_section(
+        &mut markdown,
+        resolvable,
+        versions.offline,
+        vuln_outcome,
+    );
 
     Some(markdown.finish(Some(dep.name_range())))
 }
@@ -741,6 +749,37 @@ fn push_offline_footer_hover_section(
 ) {
     if offline && resolvable {
         markdown.push_static("\n---\n📴 *Offline: version and vulnerability data not checked*");
+    }
+}
+
+/// Appends a "vulnerability data not checked" footer for a non-offline
+/// [`SkipReason`] (issue #1392) — extends #483's offline-only footer to the far more
+/// common case where the OSV scan itself skipped this dependency (most often
+/// `NoConcreteVersion`: a semver-range requirement with no committed lock file),
+/// which otherwise renders nothing and is visually indistinguishable from a
+/// scanned, vulnerability-free dependency (`push_vulnerability_hover_section`'s
+/// `Some(ScanOutcome::Skipped(_)) | None => {}` arm).
+///
+/// Suppressed while `offline`: [`push_offline_footer_hover_section`] already covers
+/// that case with its own, broader wording (version *and* vulnerability data), and
+/// showing both footers together would be redundant. Gated on `resolvable` for the
+/// same reason as that function; `SkipReason::unchecked_reason` returning `None` for
+/// `NonRegistrySource` is belt-and-suspenders for the same case.
+fn push_skip_reason_footer_hover_section(
+    markdown: &mut HoverMarkdown,
+    resolvable: bool,
+    offline: bool,
+    vuln_outcome: Option<&ScanOutcome>,
+) {
+    if offline || !resolvable {
+        return;
+    }
+    if let Some(ScanOutcome::Skipped(reason)) = vuln_outcome
+        && let Some(text) = reason.unchecked_reason()
+    {
+        markdown.push_static("\n---\n🔍 *Vulnerability data not checked: ");
+        markdown.push_static(text);
+        markdown.push_static("*");
     }
 }
 
@@ -5466,6 +5505,202 @@ mod tests {
             !content.contains("Offline:"),
             "a non-resolvable source must not show the offline footer, even with \
              versions.offline set; got: {}",
+            content
+        );
+    }
+
+    /// Issue #1392: a non-offline `Skipped(NoConcreteVersion)` outcome — the common case
+    /// of a semver-range requirement with no committed lock file — must surface a footer
+    /// explaining vulnerability data was not checked, instead of rendering nothing (the
+    /// pre-fix behavior [`test_generate_hover_skipped_outcome_says_nothing_about_vulnerabilities`]
+    /// documents for `NonRegistrySource`).
+    #[tokio::test]
+    async fn test_generate_hover_skip_reason_footer_shown_for_no_concrete_version() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "serde".to_string(),
+            ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let content = hover.markdown();
+        assert!(
+            content.contains("Vulnerability data not checked: no resolved or exact version"),
+            "a resolvable source with a NoConcreteVersion skip must show the reason-specific \
+             footer; got: {}",
+            content
+        );
+    }
+
+    /// Issue #1392: the reason-specific footer must not double up with the existing #483
+    /// offline footer — while offline, only the broader "Offline: version and
+    /// vulnerability data not checked" wording should render.
+    #[tokio::test]
+    async fn test_generate_hover_skip_reason_footer_omitted_while_offline() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "serde".to_string(),
+            ScanOutcome::Skipped(SkipReason::QueryFailed),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new())
+                .with_vulnerabilities(&vulns)
+                .with_offline(true),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let content = hover.markdown();
+        assert!(
+            content.contains("Offline: version and vulnerability data not checked"),
+            "offline must still show its own broader footer; got: {}",
+            content
+        );
+        assert!(
+            !content.contains("Vulnerability data not checked: the OSV.dev query failed"),
+            "the reason-specific footer must not also render while offline; got: {}",
+            content
+        );
+    }
+
+    /// Issue #1392 (tester gap 2): `QueryFailed` while online (not offline, unlike the
+    /// test right above) must show its own reason-specific footer — a real OSV.dev query
+    /// failure with network reachable, distinct from the offline case.
+    #[tokio::test]
+    async fn test_generate_hover_skip_reason_footer_shown_for_query_failed_online() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "serde".to_string(),
+            ScanOutcome::Skipped(SkipReason::QueryFailed),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let content = hover.markdown();
+        assert!(
+            content.contains("Vulnerability data not checked: the OSV.dev query failed"),
+            "an online QueryFailed skip must show the reason-specific footer; got: {}",
+            content
+        );
+    }
+
+    /// Issue #1392 (tester gap 2): table-driven coverage for the remaining `SkipReason`
+    /// variants at the hover integration level (`UnmappableName`, `UnmappableEcosystem`,
+    /// `Truncated`) — the hover footer shows every non-`NonRegistrySource` reason,
+    /// unlike the diagnostics notice (M1), so all three must render here.
+    #[tokio::test]
+    async fn test_generate_hover_skip_reason_footer_covers_remaining_variants() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let cases = [
+            (
+                SkipReason::UnmappableName,
+                "the package name could not be mapped",
+            ),
+            (
+                SkipReason::UnmappableEcosystem,
+                "this ecosystem is not supported",
+            ),
+            (
+                SkipReason::Truncated,
+                "the OSV.dev result set was truncated",
+            ),
+        ];
+        for (reason, expected_fragment) in cases {
+            let parse_result = freshness_test_parse_result("serde");
+            let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+            vulns.insert("serde".to_string(), ScanOutcome::Skipped(reason));
+
+            let hover = generate_hover(
+                &parse_result,
+                Position::new(0, 2).into(),
+                VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
+                &MockRegistry,
+                &MockFormatter,
+                crate::freshness::FreshnessSettings::default(),
+                PublishTime::now(),
+            )
+            .await
+            .expect("hover should be generated");
+
+            let content = hover.markdown();
+            assert!(
+                content.contains(expected_fragment),
+                "{reason:?} must show its reason-specific footer; got: {content}"
+            );
+        }
+    }
+
+    /// Issue #1392: `NonRegistrySource` must not gain a reason-specific footer either —
+    /// mirrors [`test_generate_hover_offline_footer_omitted_for_non_resolvable_source`]'s
+    /// reasoning for a source that was never going to be checked regardless.
+    #[tokio::test]
+    async fn test_generate_hover_skip_reason_footer_omitted_for_non_registry_source() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let parse_result = MockParseResult {
+            deps: vec![dep_at("path-pkg")],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            "path-pkg".to_string(),
+            ScanOutcome::Skipped(SkipReason::NonRegistrySource),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let content = hover.markdown();
+        assert!(
+            !content.contains("Vulnerability data not checked"),
+            "a non-registry source must never render the reason-specific footer; got: {}",
             content
         );
     }
