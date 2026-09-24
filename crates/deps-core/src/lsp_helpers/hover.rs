@@ -4,6 +4,7 @@ use std::time::Duration;
 use tower_lsp_server::ls_types::Position;
 
 use crate::deps_dev::deps_dev_system;
+use crate::edit::requirement_is_placeholder_for;
 use crate::hover::Hover;
 use crate::licenses::resolve_license_entries_for_display;
 use crate::osv::ScanOutcome;
@@ -402,14 +403,24 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         );
     }
 
+    // #1402: an unexpanded template placeholder (`{{ VAR }}`, `${VAR}`, ...) is refused by
+    // the same write-path guard `codeAction` routes every fix through (`edit::replacement_text`
+    // / #1393), so `Cmd+.` would return zero actions here regardless of what data was rendered
+    // above — the footer must consult the identical predicate to avoid advertising a dead action.
+    let requirement_is_placeholder = dep
+        .version_requirement()
+        .is_some_and(|req| requirement_is_placeholder_for(formatter, dep, req.as_str()));
     push_cmd_dot_footer_hover_section(
         &mut markdown,
-        resolvable,
-        available_versions.as_deref(),
-        cached_latest,
-        vuln_outcome,
-        deprecation,
-        versions.offline,
+        CmdDotFooterState {
+            resolvable,
+            available_versions: available_versions.as_deref(),
+            cached_latest,
+            vuln_outcome,
+            deprecation,
+            offline: versions.offline,
+            requirement_is_placeholder,
+        },
     );
 
     push_offline_footer_hover_section(&mut markdown, resolvable, versions.offline);
@@ -709,25 +720,36 @@ fn push_recent_versions_hover_section(
 /// `dtolnay/rust-toolchain@stable` but not specific to any one ecosystem. Every other
 /// online case (a non-empty live list, or no live fetch at all) keeps the pre-#550
 /// unconditional-when-resolvable behavior.
-fn push_cmd_dot_footer_hover_section(
-    markdown: &mut HoverMarkdown,
-    resolvable: bool,
-    available_versions: Option<&[Box<dyn Version>]>,
-    cached_latest: Option<&super::PackageVersions>,
-    vuln_outcome: Option<&ScanOutcome>,
-    deprecation: Option<&Deprecation>,
-    offline: bool,
-) {
-    let has_offline_actionable_data = available_versions.is_some_and(|v| !v.is_empty())
-        || cached_latest.is_some()
-        || matches!(vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
-        || deprecation.is_some();
-    let live_fetch_definitively_empty = available_versions.is_some_and(<[_]>::is_empty);
+///
+/// `requirement_is_placeholder` (#1402) suppresses the footer independent of all of the
+/// above: an unexpanded template placeholder (`{{ VAR }}`, `${VAR}`, `$var`, ...) is
+/// rejected by the same write-path guard every `codeAction` fix routes through
+/// ([`crate::edit::requirement_is_placeholder_for`], default-on across ecosystems since
+/// #1393), so `Cmd+.` would return zero actions regardless of how much version,
+/// vulnerability, or deprecation data was rendered above.
+fn push_cmd_dot_footer_hover_section(markdown: &mut HoverMarkdown, state: CmdDotFooterState<'_>) {
+    let has_offline_actionable_data = state.available_versions.is_some_and(|v| !v.is_empty())
+        || state.cached_latest.is_some()
+        || matches!(state.vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
+        || state.deprecation.is_some();
+    let live_fetch_definitively_empty = state.available_versions.is_some_and(<[_]>::is_empty);
     let footer_actionable =
-        has_offline_actionable_data || (!live_fetch_definitively_empty && !offline);
-    if resolvable && footer_actionable {
+        has_offline_actionable_data || (!live_fetch_definitively_empty && !state.offline);
+    if state.resolvable && footer_actionable && !state.requirement_is_placeholder {
         markdown.push_static(CMD_DOT_FOOTER);
     }
+}
+
+/// Bundles [`push_cmd_dot_footer_hover_section`]'s parameters — kept as one struct (rather
+/// than eight positional parameters) to stay under `clippy::too_many_arguments`.
+struct CmdDotFooterState<'a> {
+    resolvable: bool,
+    available_versions: Option<&'a [Box<dyn Version>]>,
+    cached_latest: Option<&'a super::PackageVersions>,
+    vuln_outcome: Option<&'a ScanOutcome>,
+    deprecation: Option<&'a Deprecation>,
+    offline: bool,
+    requirement_is_placeholder: bool,
 }
 
 /// Appends the "Offline: version and vulnerability data not checked" footer (issue
@@ -5286,6 +5308,51 @@ mod tests {
         assert!(
             content.contains("Press `Cmd+.` to update version"),
             "a resolvable source with live version data must show the update footer; got: {}",
+            content
+        );
+    }
+
+    /// #1402: an unexpanded template placeholder requirement (`{{ VAR }}`) is rejected by
+    /// the same write-path guard every `codeAction` fix routes through
+    /// (`edit::requirement_is_placeholder_for`, default-on since #1393), so `codeAction`
+    /// returns zero actions for it — the footer must not advertise `Cmd+.` here even though
+    /// live version data was fetched, or it becomes a false affordance.
+    #[tokio::test]
+    async fn test_generate_hover_footer_omitted_for_placeholder_requirement() {
+        let registry = MockRegistryWithVersions {
+            versions: vec![MockVersionWithAge {
+                version: "1.2.3".into(),
+                yanked: false,
+                published_at: None,
+            }],
+        };
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "{{ SERDE_VERSION }}".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()),
+            &registry,
+            &MockFormatter,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let content = hover.markdown();
+        assert!(
+            !content.contains("Press `Cmd+.` to update version"),
+            "an unresolved template placeholder has no code action `Cmd+.` could ever \
+             produce, so the footer must not render; got: {}",
             content
         );
     }
