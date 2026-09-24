@@ -141,22 +141,18 @@ impl PackageRendering for GitlabCiFormatter {
     /// changes the pin's *kind*, not just its value, so the shared no-op guard correctly
     /// suppresses the code action instead of writing a value-changing-but-kind-wrong edit.
     ///
-    /// #1365 hardening: `current` containing an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI
-    /// variable reference (see `contains_unresolved_gitlab_variable`) is also returned
-    /// unchanged, checked ahead of the `PinStyle` match — a variable reference can be
-    /// embedded inside an otherwise `Tag`-shaped ref (`is_tag_shaped` only inspects the
-    /// leading characters, e.g. `v1.2-$BUILD` or `v1-%BUILD%`), not just the `Branch`
-    /// catch-all a bare `$VAR` classifies as, so gating on `PinStyle` alone would miss that
-    /// case.
+    /// Since #1391, `current` is never an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI
+    /// variable reference here — the sole production caller,
+    /// [`deps_core::edit::replacement_text`], gates on
+    /// [`RequirementResolution::requirement_is_placeholder`] first (backed by
+    /// `contains_unresolved_gitlab_variable`, which also catches a variable reference
+    /// embedded inside an otherwise `Tag`-shaped ref, e.g. `v1.2-$BUILD`).
     fn format_version_replacing_for(
         &self,
         dep: &dyn Dependency,
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
-        if contains_unresolved_gitlab_variable(current) {
-            return current.to_string();
-        }
         let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return self.format_version_for_text_edit(version);
         };
@@ -221,8 +217,8 @@ impl RequirementResolution for GitlabCiFormatter {
     /// concrete but undecidable ref (safe, sometimes intentional, to rewrite forward by a
     /// vulnerability fix), while an unresolved `$VAR`/`${VAR}`/`%VAR%` GitLab CI variable
     /// reference (see `contains_unresolved_gitlab_variable`) has no concrete version text at
-    /// all — the same distinction [`PackageRendering::format_version_replacing_for`]'s guard
-    /// already draws. Unlike `requirement_is_unresolved` (whose `PinStyle` classification can
+    /// all — the same distinction [`deps_core::edit::replacement_text`]'s central placeholder
+    /// gate already draws. Unlike `requirement_is_unresolved` (whose `PinStyle` classification can
     /// only ever be `Sha`/`Branch`), a variable reference can be embedded inside an otherwise
     /// `Tag`- or `Partial`-shaped ref (`v1.2-$BUILD`), so this checks the raw text directly
     /// rather than going through `PinStyle` at all.
@@ -304,8 +300,10 @@ impl RequirementResolution for GitlabCiFormatter {
 /// ref/pin containing this shape is not a value this crate should ever treat as bumpable —
 /// distinct from `RequirementResolution::requirement_is_unresolved` (issue #1365), which stays
 /// a broad "any SHA or branch ref, can't tell if outdated" diagnostic predicate; this is a
-/// narrower predicate consulted only by `PackageRendering::format_version_replacing_for`'s
-/// guard, to tell a genuinely unresolvable variable/input reference apart from an ordinary,
+/// narrower predicate backing [`GitlabCiFormatter`]'s
+/// [`RequirementResolution::requirement_is_placeholder`] override, consulted by
+/// [`deps_core::edit::replacement_text`] (the sole production rewrite path, #1391) to tell a
+/// genuinely unresolvable variable/input reference apart from an ordinary,
 /// intentionally-bumpable branch name like `main` (both currently classify as
 /// `PinStyle::Branch`). Mirrors `deps_bundler`'s `requirement_contains_unresolved_interpolation`
 /// and `deps_swift`'s equivalent guard (#1354/#1367).
@@ -332,8 +330,8 @@ fn contains_unresolved_gitlab_variable(text: &str) -> bool {
 /// (`is_tag_shaped`/`gitlab_version_req` only inspect the requirement's own text) previously
 /// fell through to the `Tag`/`Partial` arms' literal comparison, which can never match `latest`
 /// and so reported a permanent, un-clearable `Outdated` instead of the honest "can't tell"
-/// `Unresolved` this same reference already gets
-/// [`PackageRendering::format_version_replacing_for`]'s write-path guard for.
+/// `Unresolved` this same reference already gets from
+/// [`deps_core::edit::replacement_text`]'s central placeholder gate.
 fn status_for_pin(pin: &PinStyle, requirement: &str, latest: &str) -> RequirementStatus {
     if contains_unresolved_gitlab_variable(requirement) {
         return RequirementStatus::Unresolved;
@@ -847,7 +845,9 @@ mod tests {
     }
 
     #[test]
-    fn test_format_version_replacing_for_guards_bare_variable_reference() {
+    fn test_replacement_text_guards_bare_variable_reference() {
+        use deps_core::edit::replacement_text;
+
         let fmt = formatter();
         let d = dep(
             Some(PinStyle::Branch),
@@ -855,16 +855,17 @@ mod tests {
             DependencySource::Registry,
         );
         assert_eq!(
-            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("2.0.0"), "$DEPLOY_VERSION"),
-            "$DEPLOY_VERSION"
+            replacement_text(&fmt, &d, &ConcreteVersion::new("2.0.0"), "$DEPLOY_VERSION"),
+            None
         );
         assert_eq!(
-            fmt.format_version_replacing_for(
+            replacement_text(
+                &fmt,
                 &d,
                 &ConcreteVersion::new("2.0.0"),
                 "${DEPLOY_VERSION}"
             ),
-            "${DEPLOY_VERSION}"
+            None
         );
     }
 
@@ -873,24 +874,28 @@ mod tests {
     /// `PinStyle` alone — `v1.2-$BUILD` classifies as `PinStyle::Tag` yet still contains an
     /// unresolvable placeholder.
     #[test]
-    fn test_format_version_replacing_for_guards_embedded_variable_in_tag_shaped_ref() {
+    fn test_replacement_text_guards_embedded_variable_in_tag_shaped_ref() {
+        use deps_core::edit::replacement_text;
+
         let fmt = formatter();
         let d = dep(Some(PinStyle::Tag), "org/proj", DependencySource::Registry);
         assert_eq!(
-            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("2.0.0"), "v1.2-$BUILD"),
-            "v1.2-$BUILD"
+            replacement_text(&fmt, &d, &ConcreteVersion::new("2.0.0"), "v1.2-$BUILD"),
+            None
         );
     }
 
     /// #1365 critic S1: the `%VAR%` form, live-reproduced as a real destructive rewrite
     /// against gitlab.com before this guard covered it.
     #[test]
-    fn test_format_version_replacing_for_guards_percent_variable_reference() {
+    fn test_replacement_text_guards_percent_variable_reference() {
+        use deps_core::edit::replacement_text;
+
         let fmt = formatter();
         let d = dep(Some(PinStyle::Tag), "org/proj", DependencySource::Registry);
         assert_eq!(
-            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("19.4.1"), "v1-%BUILD%"),
-            "v1-%BUILD%"
+            replacement_text(&fmt, &d, &ConcreteVersion::new("19.4.1"), "v1-%BUILD%"),
+            None
         );
     }
 
@@ -917,11 +922,12 @@ mod tests {
     /// `test_plan_vulnerability_fix_unresolved_interpolation_skips_via_no_op_rewrite` (#1367).
     ///
     /// GitLab CI's parser does not degrade `$VAR` to `version_requirement: None` (it is
-    /// preserved verbatim, same as Bundler's `#{...}`). Since #1370, `plan_verified_fix`'s
-    /// central placeholder gate (via `GitlabCiFormatter::requirement_is_placeholder`) fires
-    /// before `format_version_replacing_for` is ever reached — the older
-    /// `format_version_replacing_for` no-op guard this test used to key off still holds too, as
-    /// defense-in-depth.
+    /// preserved verbatim, same as Bundler's `#{...}`). Since #1370/#1391, `plan_verified_fix`'s
+    /// central placeholder gate (via `deps_core::edit::requirement_is_placeholder_for`, backed
+    /// by `GitlabCiFormatter::requirement_is_placeholder`) is the only guard reached —
+    /// `format_version_replacing_for`'s former no-op guard this test used to key off was
+    /// removed (#1391): `deps_core::edit::replacement_text` never calls into it once this gate
+    /// says `true`.
     #[test]
     fn test_plan_vulnerability_fix_var_placeholder_skips_via_no_op_rewrite() {
         use deps_core::ParseResult;

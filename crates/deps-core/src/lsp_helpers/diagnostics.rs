@@ -617,7 +617,14 @@ pub fn requirement_is_unsatisfiable(
     if requirement.as_str().len() > MAX_REQUIREMENT_LEN {
         return false;
     }
-    if formatter.requirement_is_unresolved(requirement) {
+    // #1391: also consults `requirement_is_placeholder` directly, not only
+    // `requirement_is_unresolved` — closes a gap for `deps-github-actions`/`deps-gitlab-ci`,
+    // whose `requirement_is_unresolved` override answers a narrower question (see that
+    // method's doc) and so would not by itself suppress this diagnostic for a placeholder
+    // embedded in an otherwise concrete-looking ref (e.g. `v1.2-$BUILD`).
+    if formatter.requirement_is_unresolved(requirement)
+        || formatter.requirement_is_placeholder(requirement)
+    {
         return false;
     }
     if formatter.requirement_is_undecidable_given_available(requirement, available) {

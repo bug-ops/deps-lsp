@@ -1304,16 +1304,16 @@ mod tests {
         non_registry_fixture: ".github/workflows/ci.yml" => "steps:\n  - uses: ./local-action\n";
     }
 
-    // #1354/#1370 security audit: GitHub Actions preserves an unresolved `${{ }}` expression
-    // ref as `Some(version_requirement)` (unlike NuGet/PyPI/npm, which degrade to `None`) —
-    // reachable through the full `plan_vulnerability_fix`/`format_version_replacing_for`
-    // pipeline, so `GithubActionsFormatter::requirement_is_placeholder`'s central gate (and,
-    // for the bare-expression form, `PinStyle::Branch`'s no-op fallback — see
-    // `format_version_replacing_for`'s doc) must actually hold. The second step is a
-    // Tag-shaped ref with an embedded expression (`is_tag_shaped` only inspects the leading
-    // characters, so `v4-${{ env.X }}` classifies `PinStyle::Tag`, not `Branch` — the same
-    // embedded-placeholder shape #1370 fixed for `deps-gitlab-ci`), which
-    // `requirement_is_unresolved`'s shape-only check alone would miss.
+    // #1354/#1370/#1391 security audit: GitHub Actions preserves an unresolved `${{ }}`
+    // expression ref as `Some(version_requirement)` (unlike NuGet/PyPI/npm, which degrade to
+    // `None`) — reachable through the full `deps_core::edit::plan_vulnerability_fix` pipeline,
+    // so `GithubActionsFormatter::requirement_is_placeholder`'s central gate (consulted via
+    // `deps_core::edit::requirement_is_placeholder_for`, the sole guard reached since #1391)
+    // must actually hold. The second fixture entry is a Tag-shaped ref with an embedded
+    // expression (`is_tag_shaped` only inspects the leading characters, so `v4-${{ env.X }}`
+    // classifies `PinStyle::Tag`, not `Branch` — the same embedded-placeholder shape #1370
+    // fixed for `deps-gitlab-ci`), which `requirement_is_unresolved`'s shape-only check alone
+    // would miss.
     deps_core::unresolved_requirement_conformance! {
         mod github_actions_unresolved_requirement_conformance;
         build: GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));

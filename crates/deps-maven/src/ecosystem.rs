@@ -906,13 +906,13 @@ mod tests {
         non_registry_fixture: "pom.xml" => "<project><dependencies><dependency><groupId>com.acme</groupId><artifactId>internal-jar</artifactId><version>1.0.0</version><scope>system</scope><systemPath>/opt/lib/internal-jar-1.0.0.jar</systemPath></dependency></dependencies></project>";
     }
 
-    // #1370/#1372/#1384: Maven's parser preserves an unexpanded `${property}` placeholder,
-    // a malformed range with one embedded (e.g. `[1.0,${hi}`), and an unexpanded
+    // #1370/#1372/#1384/#1391: Maven's parser preserves an unexpanded `${property}`
+    // placeholder, a malformed range with one embedded (e.g. `[1.0,${hi}`), and an unexpanded
     // `@property@` resource-filtering placeholder (e.g. `@project.version@`) as
-    // `Some(version_requirement)` — all three reach `plan_vulnerability_fix`/
-    // `format_version_replacing_for` directly, so `MavenFormatter::requirement_is_placeholder`'s
-    // central gate (and its own `format_version_replacing` no-op guard) must actually hold
-    // for both placeholder grammars.
+    // `Some(version_requirement)` — all three reach `deps_core::edit::plan_vulnerability_fix`
+    // directly, so `RequirementResolution::requirement_is_placeholder`'s central gate
+    // (`MavenFormatter` has no override; the shared default's own `is_unresolved`-equivalent
+    // detector covers both grammars) must actually hold for both placeholder grammars.
     deps_core::unresolved_requirement_conformance! {
         mod maven_unresolved_requirement_conformance;
         build: MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));

@@ -456,10 +456,10 @@ mod tests {
         non_registry_fixture: "Package.swift" => r#".package(url: "https://github.com/dev/tool", .branch("main"))"#;
     }
 
-    // #1354 security audit: `deps-swift`'s parser does not degrade an unexpanded Swift string
-    // interpolation (`\(...)`) to `version_requirement: None` — it reaches
-    // `plan_vulnerability_fix`/`format_version_replacing_for` directly, so
-    // `SwiftFormatter`'s `\(`-guard (see `formatter::requirement_contains_unresolved_interpolation`)
+    // #1354/#1391 security audit: `deps-swift`'s parser does not degrade an unexpanded Swift
+    // string interpolation (`\(...)`) to `version_requirement: None` — it reaches
+    // `deps_core::edit::plan_vulnerability_fix` directly, so `SwiftFormatter`'s
+    // `requirement_is_placeholder` (see `formatter::requirement_contains_unresolved_interpolation`)
     // must actually hold.
     deps_core::unresolved_requirement_conformance! {
         mod swift_unresolved_requirement_conformance;

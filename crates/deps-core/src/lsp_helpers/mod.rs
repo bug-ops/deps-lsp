@@ -1536,7 +1536,7 @@ pub fn is_same_major_minor(v1: &str, v2: &str) -> bool {
 /// The length of the maximal `[a-zA-Z_][a-zA-Z0-9_]*`-shaped identifier starting at `start` in
 /// `bytes`, or `None` if `bytes[start]` does not start one — the identifier grammar shared by
 /// shell/envsubst-style variable expansion (`$VAR`, `${VAR}`) and the `@VAR@`/`%VAR%` forms
-/// below. Mirrors `deps_gitlab_ci::formatter::identifier_end`.
+/// below.
 fn template_placeholder_identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
     let first = *bytes.get(start)?;
     if !(first.is_ascii_alphabetic() || first == b'_') {
@@ -3480,6 +3480,23 @@ mod tests {
     #[test]
     fn test_requirement_contains_template_placeholder_unclosed_brace_fails_safe() {
         assert!(requirement_contains_template_placeholder("${VAR"));
+    }
+
+    /// #1391 fixture/detector drift guard: every entry in
+    /// [`crate::conformance::GENERIC_TEMPLATE_PLACEHOLDERS`] (the mandatory conformance
+    /// fixture every ecosystem's `formatter_conformance!` invocation is checked against) must
+    /// actually be recognized by the shared detector itself — otherwise a fixture entry that
+    /// silently stopped matching would make every crate's conformance test pass vacuously
+    /// instead of proving anything about that form.
+    #[test]
+    fn test_generic_template_placeholders_fixture_matches_detector() {
+        for &placeholder in crate::conformance::GENERIC_TEMPLATE_PLACEHOLDERS {
+            assert!(
+                requirement_contains_template_placeholder(placeholder),
+                "{placeholder:?} (from GENERIC_TEMPLATE_PLACEHOLDERS) must be recognized by \
+                 requirement_contains_template_placeholder"
+            );
+        }
     }
 
     #[test]

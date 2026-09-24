@@ -8,7 +8,8 @@ use deps_core::VersionReq;
 use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, warn_rejected_value,
+    RequirementMatcher, RequirementResolution, SourcePolicy,
+    requirement_contains_template_placeholder, warn_rejected_value,
 };
 
 /// Precise semver `VersionReq` matcher, compiled once per dependency by
@@ -140,50 +141,14 @@ impl PackageRendering for SwiftFormatter {
         }
     }
 
-    /// #1354 hardening: an unresolved Swift string interpolation (see
-    /// `requirement_contains_unresolved_interpolation`) in `current` leaves `current`
-    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
-    /// latest" edit can never hardcode a literal version over `\(...)` — mirrors
-    /// `NuGetFormatter::format_version_replacing`'s `$(Property)` guard.
-    ///
-    /// Not sufficient on its own for Swift — see [`Self::format_version_replacing_for`]'s doc
-    /// (#1354 critic S1) for why the dependency-aware override below is the one every real
-    /// caller actually reaches.
-    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if requirement_contains_unresolved_interpolation(current) {
-            return current.to_string();
-        }
-        self.format_version_for_text_edit(version)
-    }
-
-    /// #1354 critic S1: both production callers
-    /// (`lsp_helpers::code_actions::build_vulnerability_fix_action`, `deps-cli`'s
-    /// `update::security`) pass the *declared requirement string* as `current`, never
-    /// `dep.version_literal()`. For a synthesized comparator like `from: "\(v)"`'s
-    /// `">=\(v), <1.0.0"`, [`Self::format_version_replacing`]'s guard leaves `current` itself
-    /// unchanged — but `plan_vulnerability_fix`'s no-op guard compares that result against
-    /// `dep.version_literal()` (the narrower `\(v)` span actually spliced into the manifest),
-    /// not against `current`. A `current`-echoing no-op therefore still reads as a genuine
-    /// rewrite there and gets spliced in as `">=\(v), <1.0.0"` over the bare `\(v)` literal,
-    /// corrupting the manifest. Returning the literal itself (when either `current` or the
-    /// literal is unresolved) makes the two compare equal, so the planner correctly no-ops —
-    /// and, as a side effect, makes every REFACTOR "Update to X" candidate for this dependency
-    /// dedup away against the unchanged literal too, closing S3 (a bogus REFACTOR action with
-    /// text `">=\(v), <1.0.0"`) for free.
-    fn format_version_replacing_for(
-        &self,
-        dep: &dyn Dependency,
-        version: &ConcreteVersion,
-        current: &str,
-    ) -> String {
-        let literal = dep.version_literal();
-        let unresolved = requirement_contains_unresolved_interpolation(current)
-            || literal.is_some_and(requirement_contains_unresolved_interpolation);
-        if unresolved {
-            return literal.unwrap_or(current).to_string();
-        }
-        self.format_version_replacing(version, current)
-    }
+    // Since #1391, neither `format_version_replacing` nor `format_version_replacing_for`
+    // needs its own placeholder guard: `deps_core::edit::requirement_is_placeholder_for`
+    // checks both `current` and `dep.version_literal()` centrally (folding in exactly the
+    // literal-vs-synthesized-comparator distinction the former `format_version_replacing_for`
+    // override existed to handle for `from: "\(v)"`), and
+    // `deps_core::edit::replacement_text` never calls into either method once that check
+    // says `true`. Both overrides are gone; the trait defaults are equivalent for the
+    // resolved case.
 }
 
 impl RequirementResolution for SwiftFormatter {
@@ -233,10 +198,15 @@ impl RequirementResolution for SwiftFormatter {
     ///
     /// #1370: Swift has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// unresolved Swift string interpolation is the only unresolved shape Swift has, so its
-    /// default delegates here rather than duplicating the detector (#1380).
+    /// unresolved Swift string interpolation is the only *native* unresolved shape Swift has,
+    /// so its default delegates here rather than duplicating the detector (#1380).
+    ///
+    /// #1391: `shared || native` — `\(...)` has no overlap with the shared
+    /// [`requirement_contains_template_placeholder`] detector's forms, so both are checked.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_unresolved_interpolation(requirement.as_str())
+        let requirement = requirement.as_str();
+        requirement_contains_template_placeholder(requirement)
+            || requirement_contains_unresolved_interpolation(requirement)
     }
 }
 
@@ -645,26 +615,41 @@ mod tests {
     }
 
     #[test]
-    fn test_format_version_replacing_guards_unresolved_interpolation() {
+    fn test_replacement_text_guards_unresolved_interpolation() {
+        use deps_core::edit::replacement_text;
+        use deps_core::parser::DependencySource;
+        use deps_core::position::Range;
+
         let fmt = SwiftFormatter;
+        let dep = SwiftDependency {
+            name: "apple/swift-nio".into(),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            url: "https://github.com/apple/swift-nio".to_string(),
+            source: DependencySource::Registry,
+        };
         assert_eq!(
-            fmt.format_version_replacing(&ConcreteVersion::new("9.9.9"), "\\(v)"),
-            "\\(v)"
+            replacement_text(&fmt, &dep, &ConcreteVersion::new("9.9.9"), "\\(v)"),
+            None
         );
         assert_eq!(
-            fmt.format_version_replacing(&ConcreteVersion::new("9.9.9"), "1.5.0"),
-            "9.9.9"
+            replacement_text(&fmt, &dep, &ConcreteVersion::new("9.9.9"), "1.5.0"),
+            Some("9.9.9".to_string())
         );
     }
 
-    /// #1354 critic S1: reproduces the exact shape `from:` produces — `current` is the
+    /// #1354/#1391 critic S1: reproduces the exact shape `from:` produces — `current` is the
     /// synthesized comparator (`">=\(v), <1.0.0"`, what real callers pass), and
     /// `version_literal` is the narrower raw span (`"\(v)"`) actually spliced into the
-    /// manifest. `format_version_replacing_for` must return the *literal*, not `current`
-    /// unchanged — otherwise `plan_vulnerability_fix`'s no-op guard (which compares against
-    /// `version_literal`) still sees a difference and plans a destructive rewrite.
+    /// manifest. `deps_core::edit::requirement_is_placeholder_for` checks both, so
+    /// `replacement_text` must be `None` for this dependency regardless of which one carries
+    /// the interpolation — otherwise `plan_vulnerability_fix`'s no-op guard (which compares
+    /// against `version_literal`) could still see a difference and plan a destructive rewrite.
     #[test]
-    fn test_format_version_replacing_for_returns_literal_not_synthesized_current() {
+    fn test_replacement_text_none_for_synthesized_current_with_literal_interpolation() {
+        use deps_core::edit::replacement_text;
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position, Range};
 
@@ -679,11 +664,10 @@ mod tests {
             source: DependencySource::Registry,
         };
         let current = dep.version_req.as_ref().unwrap().as_str();
-        let rewritten =
-            fmt.format_version_replacing_for(&dep, &ConcreteVersion::new("2.40.0"), current);
         assert_eq!(
-            rewritten, "\\(v)",
-            "must reproduce the literal span, not echo the synthesized requirement back"
+            replacement_text(&fmt, &dep, &ConcreteVersion::new("2.40.0"), current),
+            None,
+            "must never rewrite when either current or version_literal is unresolved"
         );
     }
 
@@ -770,19 +754,72 @@ mod tests {
             &SwiftFormatter,
         );
 
-        // #1370: `plan_verified_fix`'s central placeholder gate
-        // (`SwiftFormatter::requirement_is_placeholder`) fires first now, on `current` (which
-        // itself contains `\(`, same as the narrower `version_literal`). Before that gate
-        // existed: `compile_requirement` was `None` here (undecidable, guarded by
-        // `requirement_is_unresolved`), so `requirement_already_resolves_to`'s default gate
-        // never short-circuited — `format_version_replacing_for`'s S1 override, reproducing
-        // `version_literal` unchanged, made the planner's textual no-op check fire instead
-        // (`NoOpRewrite`), and still does, as defense-in-depth.
+        // #1370/#1391: `plan_verified_fix`'s central placeholder gate
+        // (`deps_core::edit::requirement_is_placeholder_for`, backed by
+        // `SwiftFormatter::requirement_is_placeholder`) fires first, on `current` (which
+        // itself contains `\(`, same as the narrower `version_literal`) — the only guard
+        // reached, since `format_version_replacing_for`'s former S1 override was removed
+        // (#1391): `deps_core::edit::replacement_text` never calls into it once this gate
+        // says `true`.
         assert_eq!(
             planned,
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
             "the real SwiftFormatter must suppress the fix for an unresolved interpolation, \
              got {planned:?}"
+        );
+    }
+
+    /// #1391 review S1: #1390's own repro text (`{{ ap_version }}`), parsed through the real
+    /// `crate::parser::parse_package_swift` path rather than a hand-built `SwiftDependency` —
+    /// closes the gap `test_replacement_text_none_for_synthesized_current_with_literal_interpolation`
+    /// above leaves (it hand-constructs the dependency instead of parsing manifest text), and
+    /// covers the shared generic-template detector rather than Swift's native `\(...)` form.
+    #[test]
+    fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
+        use deps_core::ParseResult;
+        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let manifest = r#".package(url: "https://github.com/apple/swift-argument-parser", from: "{{ ap_version }}")"#;
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        let result = crate::parser::parse_package_swift(manifest, &uri).expect("valid manifest");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("from: synthesizes a version requirement")
+            .as_str();
+        assert_eq!(dep.version_literal(), Some("{{ ap_version }}"));
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0004".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["1.3.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "1.3.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            deps_core::position::Range::default(),
+            current,
+            &dv,
+            &SwiftFormatter,
+        );
+
+        assert_eq!(
+            planned,
+            Err(VulnFixSkip::UnresolvedPlaceholder),
+            "the real SwiftFormatter must suppress the fix for #1390's unexpanded ap_version \
+             template placeholder, got {planned:?}"
         );
     }
 }

@@ -751,11 +751,12 @@ dependencies {
 "#;
     }
 
-    // #1370/#1372: Gradle's parser preserves an unresolved `$var`/`${var}` reference (and a
-    // malformed bracket range with one embedded, e.g. `[1.0,$hi`) as `Some(version_requirement)`
-    // — it reaches `plan_vulnerability_fix`/`format_version_replacing_for` directly, so
-    // `GradleFormatter::requirement_is_placeholder`'s central gate (and its own
-    // `format_version_replacing` no-op guard) must actually hold.
+    // #1370/#1372/#1391: Gradle's parser preserves an unresolved `$var`/`${var}` reference
+    // (and a malformed bracket range with one embedded, e.g. `[1.0,$hi`) as
+    // `Some(version_requirement)` — it reaches `deps_core::edit::plan_vulnerability_fix`
+    // directly, so `GradleFormatter::requirement_is_placeholder`'s central gate must actually
+    // hold (`GradleFormatter` no longer has its own `format_version_replacing` guard; the
+    // shared `edit::replacement_text` gate covers it).
     deps_core::unresolved_requirement_conformance! {
         mod gradle_unresolved_requirement_conformance;
         build: GradleEcosystem::new(make_cache());

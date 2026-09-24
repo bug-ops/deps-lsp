@@ -321,18 +321,19 @@ mod tests {
         no_non_registry_fixture: "Deno's non-Registry classification (parser::classify_npm_imports) only fires once a real .npmrc file resolves from disk for an npm: import's scope — the shared macro's fixture has no filesystem backing to supply one. Covered instead by parser::tests::test_npm_scoped_import_resolves_via_npmrc, which builds a real tempfile::tempdir() with a .npmrc and asserts the same gate properties end-to-end.";
     }
 
-    // #1377/#1379: `deno.json`/`deno.jsonc`'s JSR/npm import-specifier grammar has no
+    // #1377/#1379/#1391: `deno.json`/`deno.jsonc`'s JSR/npm import-specifier grammar has no
     // placeholder/interpolation syntax of its own, but a manifest pre-processed by external
     // templating (`envsubst`, CI templating, Yeoman-style generators) commonly leaves a
     // `$VAR`/`${VAR}`/`{{ }}`/`@VAR@`/`%VAR%`/`<%= %>`-shaped literal in the version slot —
     // `parse_specifier` isolates just that text (after the `jsr:`/`npm:` scheme and package
     // name) as `version_req`, and neither it nor `classify_npm_imports` special-cases the
     // shape, so it stays a normal registry-sourced `Some(version_requirement)` and reaches
-    // `plan_vulnerability_fix`/`format_version_replacing_for` directly — depends on
-    // `DenoFormatter`'s own `requirement_contains_template_placeholder` guard. Supersedes the
-    // pre-#1377 `no_placeholder_syntax:` marker here, which predated the discovery that an
-    // embedded `@version` slot can itself carry one of these shapes (#1354's own "no
-    // placeholder grammar" claim covered only the specifier as a whole, not this slot).
+    // `deps_core::edit::plan_vulnerability_fix` directly — depends on
+    // `RequirementResolution::requirement_is_placeholder`'s shared default (`DenoFormatter`
+    // has no override). Supersedes the pre-#1377 `no_placeholder_syntax:` marker here, which
+    // predated the discovery that an embedded `@version` slot can itself carry one of these
+    // shapes (#1354's own "no placeholder grammar" claim covered only the specifier as a
+    // whole, not this slot).
     deps_core::unresolved_requirement_conformance! {
         mod deno_unresolved_requirement_conformance;
         build: DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));

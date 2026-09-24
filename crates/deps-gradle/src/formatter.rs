@@ -3,6 +3,7 @@
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    requirement_contains_template_placeholder,
 };
 use deps_core::{
     ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
@@ -15,6 +16,15 @@ pub struct GradleFormatter;
 /// version-catalog entry (`[versions] foo = ""`) that a `version.ref` could point at.
 fn is_unresolved(requirement: &str) -> bool {
     requirement.is_empty() || requirement.contains('$')
+}
+
+/// `requirement_is_placeholder`'s composed predicate: the shared generic-template detector
+/// OR'd with Gradle's own `$`/empty check (#1391). `is_unresolved` alone is a superset of the
+/// shared detector's `$IDENT`/`${IDENT}` forms, but misses the brace/percent/angle forms
+/// (`{{ v }}`, `%V%`, `<%= v %>`, `@V@`) a `libs.versions.toml` value copy-pasted from another
+/// ecosystem's templating could still carry.
+fn is_placeholder(requirement: &str) -> bool {
+    requirement_contains_template_placeholder(requirement) || is_unresolved(requirement)
 }
 
 /// Strips Gradle's rich-version strict/preferred shorthand
@@ -192,20 +202,12 @@ impl PackageRendering for GradleFormatter {
     /// return here is safely excluded from `deps-core`'s `collect_update_all_edits`
     /// ("Update N outdated dependencies" lens) by its own no-op guard.
     ///
-    /// Issue #1353 hardening: an unresolved `$var`/`${var}` reference anywhere in
-    /// `current` (checked before the strict-marker handling above, so it also catches an
-    /// unresolved half of the `!!` shorthand, e.g. `${r}!!`) leaves `current` unchanged
-    /// instead of substituting `version` — mirrors `MavenFormatter`'s identical guard and
-    /// `deps-nuget`'s `$(...)`-property one (#1347/#1352). Closes the gap the default
-    /// `requirement_already_resolves_to`/`compile_requirement` pairing misses for a
-    /// requirement that is *both* unresolved and an undecidable malformed range (e.g.
-    /// `[1.0,$hi`), since `compile_requirement` returns `None` for that shape rather than
-    /// `GradleMatcher::AlwaysSatisfied`.
+    /// Since #1391, placeholder/unresolved-variable safety is enforced upstream by
+    /// [`deps_core::edit::replacement_text`] (the sole production caller), gated on
+    /// [`RequirementResolution::requirement_is_placeholder`] — this method itself no longer
+    /// needs to guard against `current` being unresolved.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
         let trimmed = current.trim();
-        if is_unresolved(trimmed) {
-            return current.to_string();
-        }
         let version = version.as_str();
         match trimmed.split_once("!!") {
             Some((_, "")) => format!("{version}!!"),
@@ -228,9 +230,11 @@ impl RequirementResolution for GradleFormatter {
     /// #1370: Gradle has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
     /// unresolved `$var`/`${var}` reference is the only unresolved shape Gradle has, so both
-    /// predicates key off the same `is_unresolved` detector.
+    /// predicates key off the same composed `is_placeholder` detector (#1391: `shared ||
+    /// native`, never native-only — see [`RequirementResolution::requirement_is_placeholder`]'s
+    /// trait doc).
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        is_unresolved(requirement.as_str())
+        is_placeholder(requirement.as_str())
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
@@ -255,7 +259,7 @@ impl RequirementResolution for GradleFormatter {
             requirement,
             |r| r.starts_with(['[', '(', ']']) && crate::range::parse_range(r).is_none(),
             |r| {
-                if is_unresolved(&r) || r == "latest" || r.starts_with("latest.") {
+                if is_placeholder(&r) || r == "latest" || r.starts_with("latest.") {
                     return GradleMatcher::AlwaysSatisfied;
                 }
                 if is_snapshot(&r) {
@@ -291,6 +295,22 @@ impl OsvNaming for GradleFormatter {}
 mod tests {
     use super::*;
     use deps_core::lsp_helpers::RequirementStatus;
+
+    /// A minimal [`deps_core::Dependency`] for probing
+    /// [`deps_core::edit::replacement_text`] directly — its identity is irrelevant to the
+    /// placeholder gate, which checks `current`/`version_literal()` only.
+    fn placeholder_probe_dependency() -> crate::types::GradleDependency {
+        crate::types::GradleDependency {
+            group_id: "com.example".into(),
+            artifact_id: "probe".into(),
+            name: PackageName::new("com.example:probe"),
+            name_range: deps_core::position::Range::default(),
+            version_req: None,
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        }
+    }
 
     #[test]
     fn test_format_version() {
@@ -721,37 +741,36 @@ mod tests {
         assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
     }
 
-    /// #1353: `format_version_replacing` must leave an unresolved `$var`/`${var}` reference
-    /// unchanged rather than substituting the fix/latest version — the guard mirrors
-    /// `MavenFormatter`'s and `deps-nuget`'s `$(...)`-property one (#1347/#1352). Covers both
-    /// a plain reference and one embedded in the strict-shorthand's degenerate suffix form
-    /// (`${r}!!`), which the pre-existing `!!`-handling logic alone would otherwise rewrite
-    /// to `{version}!!`, silently dropping the property reference.
+    /// #1353/#1391: `deps_core::edit::replacement_text` — the sole production rewrite path —
+    /// must never produce a replacement for an unresolved `$var`/`${var}` reference. Covers
+    /// both a plain reference and one embedded in the strict-shorthand's degenerate suffix
+    /// form (`${r}!!`), which the pre-existing `!!`-handling logic alone would otherwise
+    /// rewrite to `{version}!!`, silently dropping the property reference.
     #[test]
-    fn test_format_version_replacing_unresolved_variable_is_unchanged() {
+    fn test_replacement_text_unresolved_variable_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = GradleFormatter;
-        assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "$someVersion"),
-            "$someVersion"
-        );
-        assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "${someVersion}"),
-            "${someVersion}"
-        );
-        assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "${r}!!"),
-            "${r}!!"
-        );
+        let dep = placeholder_probe_dependency();
+        let version = ConcreteVersion::new("1.2.0");
+        assert_eq!(replacement_text(&f, &dep, &version, "$someVersion"), None);
+        assert_eq!(replacement_text(&f, &dep, &version, "${someVersion}"), None);
+        assert_eq!(replacement_text(&f, &dep, &version, "${r}!!"), None);
     }
 
-    /// #1353 S1: `[1.0,$hi` and `[$lo,` are classified unresolved (`is_unresolved` matches
-    /// `$`), but both are *also* malformed ranges — `compile_requirement`'s malformed-range
-    /// guard returns `None` for them (not `GradleMatcher::AlwaysSatisfied`), making the
-    /// default `requirement_already_resolves_to` inert. `format_version_replacing`'s direct
-    /// `is_unresolved` check is what actually closes this gap.
+    /// #1353/#1391 S1: `[1.0,$hi` and `[$lo,` are classified placeholders (`is_placeholder`
+    /// matches `$`), but both are *also* malformed ranges — `compile_requirement`'s
+    /// malformed-range guard returns `None` for them (not `GradleMatcher::AlwaysSatisfied`),
+    /// making the default `requirement_already_resolves_to` inert.
+    /// `RequirementResolution::requirement_is_placeholder`'s direct `is_placeholder` check —
+    /// consulted by `deps_core::edit::replacement_text` before ever calling
+    /// `format_version_replacing` — is what actually closes this gap.
     #[test]
-    fn test_format_version_replacing_unresolved_malformed_range_is_unchanged() {
+    fn test_replacement_text_unresolved_malformed_range_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = GradleFormatter;
+        let dep = placeholder_probe_dependency();
         for malformed_unresolved in ["[1.0,$hi", "[$lo,"] {
             assert!(
                 f.compile_requirement(&VersionReq::new(malformed_unresolved))
@@ -759,8 +778,13 @@ mod tests {
                 "expected {malformed_unresolved:?} to be undecidable"
             );
             assert_eq!(
-                f.format_version_replacing(&ConcreteVersion::new("1.2.0"), malformed_unresolved),
-                malformed_unresolved
+                replacement_text(
+                    &f,
+                    &dep,
+                    &ConcreteVersion::new("1.2.0"),
+                    malformed_unresolved
+                ),
+                None
             );
         }
     }
@@ -826,5 +850,40 @@ mod tests {
         let planned = plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, &GradleFormatter)
             .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "1.2.0");
+    }
+
+    /// #1391 review S1: #1390's own repro text (`{{ guava_version }}`), parsed through the
+    /// real `parse_gradle` path rather than a hand-built `GradleDependency` — closes the gap
+    /// left by `placeholder_probe_dependency`-based tests above, which never exercise the
+    /// parser itself.
+    #[test]
+    fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
+        use deps_core::ParseResult;
+        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+
+        let content = "dependencies {\n    implementation \"com.google.guava:guava:{{ guava_version }}\"\n}\n";
+        let uri = deps_core::test_util::test_uri("/test/build.gradle");
+        let result = crate::parser::parse_gradle(content, &uri).expect("valid build.gradle");
+        let deps = result.dependencies();
+        let dep = deps
+            .iter()
+            .find(|d| d.name().as_str() == "com.google.guava:guava")
+            .expect("guava dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("parser preserves the raw templated version text")
+            .as_str();
+        assert_eq!(current, "{{ guava_version }}");
+        let version_range = dep.version_range().expect("templated version has a range");
+
+        let dv = vuln_fix_dv("33.0.0-jre");
+        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, &GradleFormatter);
+
+        assert_eq!(
+            planned,
+            Err(VulnFixSkip::UnresolvedPlaceholder),
+            "the real GradleFormatter must suppress the fix for #1390's unexpanded \
+             guava_version template placeholder, got {planned:?}"
+        );
     }
 }

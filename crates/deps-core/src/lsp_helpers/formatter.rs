@@ -68,6 +68,13 @@ pub trait PackageNaming: Send + Sync {
 /// replacement-preserving methods ([`format_version_replacing`](Self::format_version_replacing),
 /// [`format_version_replacing_for`](Self::format_version_replacing_for)) never change a
 /// requirement's semantics unless the ecosystem has explicitly opted in to that transformation.
+///
+/// Since #1391, implementors of [`format_version_replacing`](Self::format_version_replacing)/
+/// [`format_version_replacing_for`](Self::format_version_replacing_for) need not guard against
+/// an unexpanded placeholder themselves: [`crate::edit::replacement_text`] is the only
+/// production path that calls into either method, and it never does so once
+/// [`RequirementResolution::requirement_is_placeholder`](super::RequirementResolution::requirement_is_placeholder)
+/// says `true` for the requirement being replaced.
 pub trait PackageRendering: Send + Sync {
     /// Format version string for code action text edit.
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String;
@@ -302,11 +309,26 @@ pub trait RequirementResolution: Send + Sync {
     /// "concrete but undecidably outdated" — and callers needing either guarantee must consult
     /// the specific predicate they need, not assume one implies the other.
     ///
-    /// Default: never a placeholder. Ecosystems whose requirement syntax can contain an
-    /// unexpanded placeholder override this single predicate instead of hand-rolling the same
-    /// check separately inside [`format_version_replacing`](PackageRendering::format_version_replacing),
+    /// Default: the shared [`super::requirement_contains_template_placeholder`] detector —
+    /// every ecosystem starts out recognizing the generic `{{ }}`/`<%= %>`/`@VAR@`/`%VAR%`/
+    /// `${VAR}`/`$VAR` forms (#1391), not "never a placeholder". An override must always be
+    /// `shared || native` — i.e. call the shared detector and OR it with any
+    /// ecosystem-specific grammar (Maven's `${property}`, Gradle's `$var`, NuGet's
+    /// `$(Property)`/`%(Metadata)`/`@(ItemList)`, ...) — never replace the shared check with a
+    /// native-only one, or a generic form this ecosystem's manifest also accepts would stop
+    /// being guarded. [`crate::conformance::assert_generic_template_placeholders_guarded`]
+    /// (called unconditionally from every crate's `formatter_conformance!` invocation, and
+    /// from `deps-engine`'s universal-invariants loop over every *registered* ecosystem) is
+    /// the mandatory, non-opt-out gate that catches a native-only override. Ecosystems whose
+    /// requirement syntax can contain an unexpanded placeholder override this single predicate
+    /// instead of hand-rolling the same check separately inside
+    /// [`format_version_replacing`](PackageRendering::format_version_replacing),
     /// [`compile_requirement`](Self::compile_requirement), and
-    /// [`version_satisfies_requirement`](Self::version_satisfies_requirement).
+    /// [`version_satisfies_requirement`](Self::version_satisfies_requirement) — and, since
+    /// #1391, need not guard [`format_version_replacing`](PackageRendering::format_version_replacing)/
+    /// [`format_version_replacing_for`](PackageRendering::format_version_replacing_for) at all:
+    /// [`crate::edit::replacement_text`] is the only production path that ever calls into
+    /// those methods, and it never does so once this predicate says `true`.
     ///
     /// # Examples
     ///
@@ -318,9 +340,10 @@ pub trait RequirementResolution: Send + Sync {
     /// impl RequirementResolution for DefaultFormatter {}
     ///
     /// assert!(!DefaultFormatter.requirement_is_placeholder(&VersionReq::new("^1.2")));
+    /// assert!(DefaultFormatter.requirement_is_placeholder(&VersionReq::new("{{ version }}")));
     /// ```
-    fn requirement_is_placeholder(&self, _requirement: &VersionReq) -> bool {
-        false
+    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
+        super::requirement_contains_template_placeholder(requirement.as_str())
     }
 
     /// Tri-state variant of `is_requirement_up_to_date` that distinguishes "confirmed up to

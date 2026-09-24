@@ -128,18 +128,6 @@ impl PackageRendering for ComposerFormatter {
         crate::registry::package_url(name.as_str())
     }
 
-    /// #1373 hardening: `self.version` or an inline alias (see
-    /// `requirement_is_composer_unresolved`) in `current` leaves `current` unchanged
-    /// instead of substituting `version`, so a vulnerability-fix or "update to latest" edit
-    /// can never hardcode a literal version over either native Composer form — mirrors
-    /// `BundlerFormatter::format_version_replacing`'s `#{...}` guard (#1354).
-    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if requirement_is_composer_unresolved(current) {
-            return current.to_string();
-        }
-        self.format_version_for_text_edit(version)
-    }
-
     /// Widens the rename quickfix's discoverability: without this, only a cursor on
     /// `version_range` (the default) reaches `generate_code_actions`, so a user reading
     /// "this package is abandoned" and clicking the package *name* — the very token the
@@ -1218,30 +1206,58 @@ mod tests {
         assert!(!f.requirement_is_unresolved(&VersionReq::new("^1.2")));
     }
 
+    /// A minimal [`ComposerDependency`] for probing [`deps_core::edit::replacement_text`]
+    /// directly — its identity is irrelevant to the placeholder gate, which checks
+    /// `current`/`version_literal()` only.
+    fn placeholder_probe_dependency() -> ComposerDependency {
+        ComposerDependency {
+            name: PackageName::new("vendor/probe"),
+            name_range: Range::default(),
+            version_req: None,
+            version_range: None,
+            section: ComposerSection::Require,
+            source: deps_core::parser::DependencySource::Registry,
+        }
+    }
+
     #[test]
-    fn test_format_version_replacing_self_version_unchanged() {
+    fn test_replacement_text_self_version_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = ComposerFormatter;
+        let dep = placeholder_probe_dependency();
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("3.12.0"), "self.version"),
-            "self.version"
+            replacement_text(&f, &dep, &ConcreteVersion::new("3.12.0"), "self.version"),
+            None
         );
     }
 
     #[test]
-    fn test_format_version_replacing_inline_alias_unchanged() {
+    fn test_replacement_text_inline_alias_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = ComposerFormatter;
+        let dep = placeholder_probe_dependency();
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.0.0"), "dev-main as 1.0.0"),
-            "dev-main as 1.0.0"
+            replacement_text(
+                &f,
+                &dep,
+                &ConcreteVersion::new("1.0.0"),
+                "dev-main as 1.0.0"
+            ),
+            None
         );
     }
 
     #[test]
-    fn test_format_version_replacing_dollar_placeholder_unchanged() {
+    fn test_replacement_text_dollar_placeholder_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = ComposerFormatter;
+        let dep = placeholder_probe_dependency();
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("3.0.2"), "${PSR_LOG}"),
-            "${PSR_LOG}"
+            replacement_text(&f, &dep, &ConcreteVersion::new("3.0.2"), "${PSR_LOG}"),
+            None
         );
     }
 
@@ -1344,12 +1360,10 @@ mod tests {
     }
 
     /// #1373/#1370 end-to-end regression: `plan_vulnerability_fix` must never rewrite
-    /// `self.version` to a literal fix version. Since #1370,
-    /// `ComposerFormatter::requirement_is_placeholder`'s central gate fires first; before
-    /// that gate existed, `compile_requirement` returned `None` for it (undecidable), so the
-    /// `RequirementAlreadyResolves` gate was inert and `format_version_replacing`'s own
-    /// no-op guard stopped the rewrite instead (`NoOpRewrite`), which still holds as
-    /// defense-in-depth.
+    /// `self.version` to a literal fix version — `ComposerFormatter::requirement_is_placeholder`'s
+    /// central gate (consulted via `deps_core::edit::requirement_is_placeholder_for`) fires
+    /// first and short-circuits to `UnresolvedPlaceholder`, before `format_version_replacing`
+    /// is ever reached (#1391: that method no longer guards placeholders itself).
     #[test]
     fn test_plan_vulnerability_fix_self_version_is_not_rewritten() {
         use deps_core::edit::plan_vulnerability_fix;

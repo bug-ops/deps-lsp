@@ -9,6 +9,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    requirement_contains_template_placeholder,
 };
 
 /// Whether every character of `name` is in RubyGems' gem-name charset
@@ -253,33 +254,23 @@ impl PackageRendering for BundlerFormatter {
         crate::registry::gem_url(name.as_str())
     }
 
-    /// #1354 hardening: an unresolved Ruby interpolation (see
-    /// `requirement_contains_unresolved_interpolation`) in `current` leaves `current`
-    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
-    /// latest" edit can never hardcode a literal version over `#{...}` — mirrors
-    /// `NuGetFormatter::format_version_replacing`'s `$(Property)` guard.
-    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if requirement_contains_unresolved_interpolation(current) {
-            return current.to_string();
-        }
-        self.format_version_for_text_edit(version)
-    }
-
     /// #1366 impl-critic S2: a multi-constraint requirement whose constraints were written
     /// with inconsistent quote characters (see `literal_span_has_mixed_quote_styles`) echoes
     /// [`Dependency::version_literal`] back unchanged instead of collapsing to a bare
-    /// replacement version, mirroring [`Self::format_version_replacing`]'s `#{...}` guard.
+    /// replacement version — this is a genuine text-shape concern (which quote characters
+    /// bound the replaced span), not a placeholder-safety one, so it stays here rather than
+    /// moving to [`RequirementResolution::requirement_is_placeholder`] (#1391: the former
+    /// `#{...}`-interpolation guard this method also carried is gone, since
+    /// `deps_core::edit::replacement_text` now enforces that centrally).
     ///
     /// **Must** echo `literal_target` (`dep.version_literal()`, falling back to `current`) —
-    /// not `current` — on every no-op path here, unlike [`Self::format_version_replacing`]
-    /// itself (which has no `dep` and echoes `current`, its only option): both
-    /// `deps_core::edit::plan_verified_fix`'s and `generate_code_actions`'s no-op check compare
-    /// the text this returns against that exact `literal_target`, not `current`. For a
-    /// multi-constraint dependency the two differ (`current` is the `", "`-joined comparator,
-    /// e.g. `">= 5.0, < 6.0"`, with no quote characters at all regardless of how the source
-    /// `Gemfile` quoted each constraint; `literal_target` is the raw source span, quotes and
-    /// comma included) — echoing `current` there would fail the no-op comparison and still
-    /// produce a corrupting replacement despite the interpolation/mixed-quote guard firing.
+    /// not `current`: both `deps_core::edit::plan_verified_fix`'s and `generate_code_actions`'s
+    /// no-op check compare the text this returns against that exact `literal_target`, not
+    /// `current`. For a multi-constraint dependency the two differ (`current` is the `", "`-joined
+    /// comparator, e.g. `">= 5.0, < 6.0"`, with no quote characters at all regardless of how the
+    /// source `Gemfile` quoted each constraint; `literal_target` is the raw source span, quotes
+    /// and comma included) — echoing `current` there would fail the no-op comparison and still
+    /// produce a corrupting replacement despite the mixed-quote guard firing.
     fn format_version_replacing_for(
         &self,
         dep: &dyn Dependency,
@@ -287,9 +278,7 @@ impl PackageRendering for BundlerFormatter {
         current: &str,
     ) -> String {
         let literal_target = dep.version_literal().unwrap_or(current);
-        if requirement_contains_unresolved_interpolation(current)
-            || literal_span_has_mixed_quote_styles(literal_target)
-        {
+        if literal_span_has_mixed_quote_styles(literal_target) {
             return literal_target.to_string();
         }
         self.format_version_for_text_edit(version)
@@ -355,11 +344,18 @@ impl RequirementResolution for BundlerFormatter {
     ///
     /// #1370/#1380: Bundler has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// unresolved Ruby interpolation is the only unresolved shape Bundler has, so its
+    /// unresolved Ruby interpolation is the only *native* unresolved shape Bundler has, so its
     /// default delegates here rather than duplicating the
     /// `requirement_contains_unresolved_interpolation` detector.
+    ///
+    /// #1391: `shared || native` — `#{...}`/`#@ivar`/`#$global` forms have no overlap with the
+    /// shared [`requirement_contains_template_placeholder`] detector's forms (and, since a
+    /// bare `#$VAR` now happens to also match the shared detector's `$IDENT` rule, that overlap
+    /// is harmless), so both are checked.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_unresolved_interpolation(requirement.as_str())
+        let requirement = requirement.as_str();
+        requirement_contains_template_placeholder(requirement)
+            || requirement_contains_unresolved_interpolation(requirement)
     }
 }
 
@@ -841,30 +837,58 @@ mod tests {
         );
     }
 
+    /// A minimal [`crate::types::BundlerDependency`] for probing
+    /// [`deps_core::edit::replacement_text`] directly — its identity is irrelevant to the
+    /// placeholder gate, which checks `current`/`version_literal()` only.
+    fn placeholder_probe_dependency() -> crate::types::BundlerDependency {
+        crate::types::BundlerDependency {
+            name: PackageName::new("probe"),
+            name_range: deps_core::position::Range::default(),
+            version_req: None,
+            version_range: None,
+            version_literal: None,
+            group: crate::types::DependencyGroup::Default,
+            source: deps_core::parser::DependencySource::Registry,
+            platforms: Vec::new(),
+            require: None,
+        }
+    }
+
     #[test]
-    fn test_format_version_replacing_guards_unresolved_interpolation() {
+    fn test_replacement_text_guards_unresolved_interpolation() {
+        use deps_core::edit::replacement_text;
+
         let formatter = BundlerFormatter;
+        let dep = placeholder_probe_dependency();
         assert_eq!(
-            formatter.format_version_replacing(&ConcreteVersion::new("9.9.9"), "~> #{V}"),
-            "~> #{V}"
+            replacement_text(&formatter, &dep, &ConcreteVersion::new("9.9.9"), "~> #{V}"),
+            None
         );
         assert_eq!(
-            formatter.format_version_replacing(&ConcreteVersion::new("9.9.9"), "~> 7.0"),
-            "9.9.9"
+            replacement_text(&formatter, &dep, &ConcreteVersion::new("9.9.9"), "~> 7.0"),
+            Some("9.9.9".to_string())
         );
     }
 
     /// #1354 critic S4: the shorthand form must be guarded identically to `#{...}`.
     #[test]
-    fn test_format_version_replacing_guards_ruby_shorthand_interpolation() {
+    fn test_replacement_text_guards_ruby_shorthand_interpolation() {
+        use deps_core::edit::replacement_text;
+
         let formatter = BundlerFormatter;
+        let dep = placeholder_probe_dependency();
         assert_eq!(
-            formatter.format_version_replacing(&ConcreteVersion::new("9.9.9"), "~> #@v"),
-            "~> #@v"
+            replacement_text(&formatter, &dep, &ConcreteVersion::new("9.9.9"), "~> #@v"),
+            None
         );
         assert_eq!(
-            formatter.format_version_replacing(&ConcreteVersion::new("0.0.1"), "~> #$GVAR"),
-            "~> #$GVAR"
+            replacement_text(
+                &formatter,
+                &dep,
+                &ConcreteVersion::new("0.0.1"),
+                "~> #$GVAR"
+            ),
+            None
         );
     }
 
@@ -918,13 +942,11 @@ mod tests {
             &BundlerFormatter,
         );
 
-        // #1370: `plan_verified_fix`'s central placeholder gate
-        // (`BundlerFormatter::requirement_is_placeholder`) fires first now. Before that gate
-        // existed: `compile_requirement` is `None` here (undecidable), so
-        // `requirement_already_resolves_to`'s default gate never short-circuited —
-        // `format_version_replacing`'s own `#{`-guard, echoing `current` back unchanged, made
-        // the planner's textual no-op check fire instead (`NoOpRewrite`), and still does, as
-        // defense-in-depth.
+        // #1370/#1391: `plan_verified_fix`'s central placeholder gate
+        // (`deps_core::edit::requirement_is_placeholder_for`, backed by
+        // `BundlerFormatter::requirement_is_placeholder`) fires first — the only guard reached,
+        // since `format_version_replacing`'s former `#{`-guard was removed (#1391):
+        // `deps_core::edit::replacement_text` never calls into it once this gate says `true`.
         assert_eq!(
             planned,
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
@@ -1053,6 +1075,59 @@ mod tests {
             formatter
                 .compile_requirement(&VersionReq::new(">= 1.0, < 2.0"))
                 .is_some()
+        );
+    }
+
+    /// #1391 review S1: #1390's own repro text (`1.0.0.<%= s %>`), parsed through the real
+    /// `crate::parser::parse_gemfile` path — covers the shared generic-template (ERB) form,
+    /// distinct from `test_plan_vulnerability_fix_unresolved_interpolation_is_not_rewritten`
+    /// above, which only exercises Ruby's native `#{...}` interpolation.
+    #[test]
+    fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
+        use deps_core::ParseResult;
+        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let gemfile = r#"gem "sinatra", "1.0.0.<%= s %>""#;
+        let uri = deps_core::test_util::test_uri("/test/Gemfile");
+        let result = crate::parser::parse_gemfile(gemfile, &uri).expect("valid gemfile");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("parser preserves the raw templated requirement text")
+            .as_str();
+        assert_eq!(current, "1.0.0.<%= s %>");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0005".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["3.0.0".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "3.0.0".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            deps_core::position::Range::default(),
+            current,
+            &dv,
+            &BundlerFormatter,
+        );
+
+        assert_eq!(
+            planned,
+            Err(VulnFixSkip::UnresolvedPlaceholder),
+            "the real BundlerFormatter must suppress the fix for #1390's unexpanded ERB \
+             template placeholder, got {planned:?}"
         );
     }
 }

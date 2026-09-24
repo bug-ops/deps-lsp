@@ -1,7 +1,6 @@
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy,
-    requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
@@ -102,23 +101,6 @@ impl PackageRendering for CargoFormatter {
         crate::registry::crate_url(name.as_str())
     }
 
-    /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
-    /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>` — see
-    /// `requirement_contains_template_placeholder`) in `current` leaves `current`
-    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
-    /// latest" edit can never hardcode a literal version over a `Cargo.toml` version
-    /// requirement pre-processed by `envsubst`/CI templating — mirrors
-    /// `MavenFormatter`/`GradleFormatter`/`NuGetFormatter`'s identical-shaped
-    /// `${property}`/`$(Property)` guards, all on this same non-`dep`-aware hook (Cargo has no
-    /// dependency-identity-dependent rewrite logic, unlike `GitlabCiFormatter`/
-    /// `BundlerFormatter`, which override `format_version_replacing_for` instead).
-    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if requirement_contains_template_placeholder(current) {
-            return current.to_string();
-        }
-        self.format_version_for_text_edit(version)
-    }
-
     /// Suppresses the hover heading's crates.io link for any source other than plain
     /// [`DependencySource::Registry`] or a verified crates.io mirror (spec FR-014, F2) — a
     /// genuinely different `AlternateRegistry` resolves against a different index entirely,
@@ -147,20 +129,11 @@ impl RequirementResolution for CargoFormatter {
             .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 
-    /// #1370: Cargo has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// external-templating placeholder is the only unresolved shape Cargo has, so its
-    /// default delegates here rather than duplicating the
-    /// `requirement_contains_template_placeholder` detector (#1380).
-    ///
-    /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
-    /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>`) — see
-    /// `requirement_contains_template_placeholder`. `Cargo.toml`'s own TOML grammar has
-    /// no such syntax; this only fires for a value pre-processed (and left unexpanded) by
-    /// tooling outside Cargo, e.g. `envsubst`.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_template_placeholder(requirement.as_str())
-    }
+    // #1370/#1391: `Cargo.toml`'s own TOML grammar has no placeholder syntax of its own —
+    // `RequirementResolution::requirement_is_placeholder`'s shared default (the
+    // `requirement_contains_template_placeholder` detector) already covers the only
+    // unresolved shape Cargo has (a value pre-processed and left unexpanded by tooling
+    // outside Cargo, e.g. `envsubst`), so no override is needed here (#1380/#1391).
 }
 
 impl DiagnosticMessages for CargoFormatter {}

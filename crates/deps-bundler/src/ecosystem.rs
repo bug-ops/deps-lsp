@@ -160,10 +160,10 @@ mod tests {
         non_registry_fixture: "Gemfile" => "source 'https://rubygems.org'\ngem 'local_gem', path: '../local_gem'\n";
     }
 
-    // #1354 security audit: Bundler's parser does not degrade an unexpanded Ruby
+    // #1354/#1391 security audit: Bundler's parser does not degrade an unexpanded Ruby
     // interpolation (`#{...}`) to `version_requirement: None` — it reaches
-    // `plan_vulnerability_fix`/`format_version_replacing_for` directly, so
-    // `BundlerFormatter`'s `#{`-guard (see `formatter::requirement_contains_unresolved_interpolation`)
+    // `deps_core::edit::plan_vulnerability_fix` directly, so `BundlerFormatter`'s
+    // `requirement_is_placeholder` (see `formatter::requirement_contains_unresolved_interpolation`)
     // must actually hold.
     deps_core::unresolved_requirement_conformance! {
         mod bundler_unresolved_requirement_conformance;

@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementResolution, RequirementStatus, SourcePolicy, match_v_prefix_style,
+    requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -200,17 +201,6 @@ impl PackageRendering for GithubActionsFormatter {
         version: &ConcreteVersion,
         current: &str,
     ) -> String {
-        // #1370: an unresolved `${{ }}` expression can sit inside an otherwise
-        // [`is_tag_shaped`] ref (`is_tag_shaped` only inspects the leading characters), so
-        // this is checked ahead of the `PinStyle` match below — mirrors
-        // `GitlabCiFormatter::format_version_replacing_for`'s identical
-        // `contains_unresolved_gitlab_variable` guard for the same embedded-placeholder
-        // shape. Defense-in-depth alongside the central `requirement_is_placeholder` gate in
-        // `deps-core`'s edit-planning call sites, for a caller that reaches this method some
-        // other way.
-        if self.requirement_is_placeholder(&VersionReq::new(current)) {
-            return dep.version_literal().unwrap_or(current).to_string();
-        }
         let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
             return self.format_version_for_text_edit(version);
         };
@@ -324,8 +314,14 @@ impl RequirementResolution for GithubActionsFormatter {
     /// syntax. `${{` alone is sufficient: it cannot appear in a SHA (hex-only) or a genuine
     /// branch/tag name (GitHub's own ref-name rules reject `{`/`$`), and GitHub itself never
     /// resolves an unexpanded expression inside a `uses:` value.
+    ///
+    /// #1391: `shared || native` — the shared [`requirement_contains_template_placeholder`]
+    /// detector already matches `${{ env.X }}` via its generic `{{ ... }}` rule, so the native
+    /// `${{`-prefix check here is kept only to also catch the empty `${{}}`/`${{ }}` form the
+    /// shared detector's non-empty-content requirement misses.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        requirement.as_str().contains("${{")
+        let requirement = requirement.as_str();
+        requirement_contains_template_placeholder(requirement) || requirement.contains("${{")
     }
 
     /// Prefers a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`, ground truth
@@ -1430,6 +1426,59 @@ mod tests {
         assert_eq!(
             fmt.format_version_replacing_for(&d, &ConcreteVersion::new("1.0.0"), "0.9.0"),
             "1.0.0"
+        );
+    }
+
+    /// #1391 review S1: #1390's own repro text (`v4.<%= py %>`), parsed through the real
+    /// `crate::parser::parse_workflow_yaml` path rather than a hand-built `GithubActionsDependency`
+    /// — closes the coverage gap the existing `plan_vulnerability_fix` tests above leave (they
+    /// only exercise ordinary tag/SHA pins, not the shared generic-template detector).
+    #[test]
+    fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
+        use deps_core::ParseResult;
+        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4.<%= py %>\n";
+        let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
+        let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
+        let deps = result.dependencies();
+        let dep = deps
+            .iter()
+            .find(|d| d.name().as_str() == "actions/checkout")
+            .expect("actions/checkout parsed");
+        let current = dep
+            .version_requirement()
+            .expect("parser preserves the raw templated ref text")
+            .as_str();
+        assert_eq!(current, "v4.<%= py %>");
+        let version_range = dep
+            .version_range()
+            .expect("templated ref has a version range");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0004".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["v5".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "v5".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, &formatter());
+
+        assert_eq!(
+            planned,
+            Err(VulnFixSkip::UnresolvedPlaceholder),
+            "the real GithubActionsFormatter must suppress the fix for #1390's unexpanded ERB \
+             template placeholder, got {planned:?}"
         );
     }
 }

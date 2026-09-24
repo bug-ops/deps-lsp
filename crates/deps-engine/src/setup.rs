@@ -838,6 +838,7 @@ mod tests {
     /// lockfile_provider().is_none()`; `package_url` hostile-input safety (display sink only —
     /// see `deps_core::conformance`'s doc for the display-vs-fetch sink split; does **not**
     /// prove the URL is non-degenerate, that is `formatter_conformance!`'s job per ecosystem);
+    /// every [`deps_core::conformance::GENERIC_TEMPLATE_PLACEHOLDERS`] form is guarded (#1391);
     /// `completion_insert_text` does not panic.
     #[test]
     fn test_registered_ecosystems_universal_invariants() {
@@ -887,6 +888,14 @@ mod tests {
             // shared with `formatter_conformance!`'s per-crate check (#782 gap 1) — see
             // `assert_package_url_hostile_input_safe`'s doc for the full rationale.
             deps_core::conformance::assert_package_url_hostile_input_safe(
+                ecosystem.formatter(),
+                &format!("{id:?}"),
+            );
+
+            // Generic-template-placeholder guard (#1391), shared with `formatter_conformance!`'s
+            // per-crate check — covers every *registered* ecosystem here, including a future
+            // 15th one, with no per-crate wiring needed.
+            deps_core::conformance::assert_generic_template_placeholders_guarded(
                 ecosystem.formatter(),
                 &format!("{id:?}"),
             );

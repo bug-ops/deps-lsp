@@ -163,22 +163,6 @@ impl PackageRendering for MavenFormatter {
         version.to_string()
     }
 
-    /// Issue #1353/#1384 hardening: an unresolved `${property}`/`@property@` placeholder in
-    /// `current` leaves `current` unchanged instead of substituting `version`, so a
-    /// vulnerability-fix/update rewrite can
-    /// never hardcode a literal version over a centrally-managed property — mirrors
-    /// `deps-nuget`'s `$(...)`-property no-op guard (#1347/#1352). This is the guard that
-    /// closes the gap the default `requirement_already_resolves_to`/`compile_requirement`
-    /// pairing misses for a requirement that is *both* unresolved and an undecidable
-    /// malformed range (e.g. `[1.0,${hi}`), since `compile_requirement` returns `None` for
-    /// that shape rather than `MavenMatcher::AlwaysSatisfied`.
-    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if is_unresolved(current) {
-            return current.to_string();
-        }
-        self.format_version_for_text_edit(version)
-    }
-
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -203,16 +187,12 @@ impl RequirementResolution for MavenFormatter {
         version == requirement
     }
 
-    /// #1370/#1384: Maven has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — `is_unresolved`
-    /// (which both predicates key off) fully delegates to the shared
-    /// `requirement_contains_template_placeholder`, so it covers `${property}`/`@property@`
-    /// (the two forms Maven's own tooling actually produces) plus the other four
-    /// cross-ecosystem shapes (`%VAR%`, `{{ }}`, `{% %}`, `<%= %>`) defensively, in case a
-    /// `pom.xml` was mangled by an unrelated external templating step before parsing.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        is_unresolved(requirement.as_str())
-    }
+    // #1370/#1384/#1391: Maven's `is_unresolved` fully delegates to the shared
+    // `requirement_contains_template_placeholder` — the same detector
+    // `RequirementResolution::requirement_is_placeholder`'s shared default calls — so it
+    // covers `${property}`/`@property@` (the two forms Maven's own tooling actually
+    // produces) plus the other four cross-ecosystem shapes (`%VAR%`, `{{ }}`, `{% %}`,
+    // `<%= %>`) defensively, with no override needed here.
 
     /// Uses [`compile_requirement_unless`] (see that function and
     /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
@@ -434,12 +414,13 @@ mod tests {
 
     /// #1347 S1 deferral rationale: an unresolved `${property}` compiles to
     /// `MavenMatcher::AlwaysSatisfied`, which reports `Some(true)` against *any* candidate —
-    /// including a vulnerability's fix target. `deps-cli`'s `requirement_already_admits_fix`
-    /// gate relies on exactly this to safely short-circuit `plan_vulnerability_fix` before it
-    /// would otherwise rewrite the unresolved property (Maven has no
-    /// `format_version_replacing` no-op guard mirroring NuGet's #1347 fix), so removing this
-    /// gate without first adding one would reintroduce the same destructive-rewrite bug for
-    /// Maven.
+    /// including a vulnerability's fix target. Since #1391, the actual guard against a
+    /// destructive rewrite is [`deps_core::edit::replacement_text`]'s central placeholder gate
+    /// (backed by `RequirementResolution::requirement_is_placeholder`, which composes the
+    /// shared generic-template detector for Maven's `${property}` form) — this
+    /// `AlwaysSatisfied` classification now only feeds `requirement_already_resolves_to`'s
+    /// secondary no-op check, not the sole line of defense `deps-cli`'s
+    /// `requirement_already_admits_fix` originally relied on.
     #[test]
     fn test_compile_requirement_unresolved_property_always_satisfied() {
         let f = MavenFormatter;
@@ -595,32 +576,60 @@ mod tests {
         assert!(!f.requirement_is_unresolved(&VersionReq::new("[1.0,2.0)")));
     }
 
-    /// #1353: `format_version_replacing` must leave an unresolved `${property}` unchanged
-    /// rather than substituting the fix/latest version — mirrors `deps-nuget`'s
-    /// `$(...)`-property no-op guard (#1347/#1352). This is what actually closes the gap
-    /// the default `requirement_already_resolves_to`/`compile_requirement` pairing misses
-    /// for a requirement that is *both* unresolved and an undecidable malformed range (see
-    /// the malformed-range test below) — `compile_requirement` returns `None` for that
-    /// shape, not `MavenMatcher::AlwaysSatisfied`, making the pairing inert.
+    /// A minimal [`crate::types::MavenDependency`] for probing
+    /// [`deps_core::edit::replacement_text`] directly — its identity is irrelevant to the
+    /// placeholder gate, which checks `current`/`version_literal()` only.
+    fn placeholder_probe_dependency() -> crate::types::MavenDependency {
+        crate::types::MavenDependency {
+            group_id: "com.example".into(),
+            artifact_id: "probe".into(),
+            name: PackageName::new("com.example:probe"),
+            name_range: deps_core::position::Range::default(),
+            version_req: None,
+            version_range: None,
+            scope: crate::types::MavenScope::default(),
+            source: deps_core::parser::DependencySource::Registry,
+        }
+    }
+
+    /// #1353/#1391: `deps_core::edit::replacement_text` — the sole production rewrite path —
+    /// must leave an unresolved `${property}` unrewritten rather than substituting the
+    /// fix/latest version — mirrors `deps-nuget`'s `$(...)`-property equivalent
+    /// (#1347/#1352). This is what actually closes the gap the default
+    /// `requirement_already_resolves_to`/`compile_requirement` pairing misses for a
+    /// requirement that is *both* unresolved and an undecidable malformed range (see the
+    /// malformed-range test below) — `compile_requirement` returns `None` for that shape,
+    /// not `MavenMatcher::AlwaysSatisfied`, making the pairing inert.
     #[test]
-    fn test_format_version_replacing_unresolved_property_is_unchanged() {
+    fn test_replacement_text_unresolved_property_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = MavenFormatter;
+        let dep = placeholder_probe_dependency();
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "${ver}"),
-            "${ver}"
+            replacement_text(&f, &dep, &ConcreteVersion::new("1.2.0"), "${ver}"),
+            None
         );
     }
 
-    /// #1384: the same no-op guard must hold for an unresolved `@property@`
+    /// #1384: the same guarantee must hold for an unresolved `@property@`
     /// resource-filtering placeholder — this is the exact reproduction from issue #1384,
     /// where a real (non-dry-run) `deps-cli update` rewrote `@project.version@` to a
     /// literal fix version.
     #[test]
-    fn test_format_version_replacing_at_placeholder_is_unchanged() {
+    fn test_replacement_text_at_placeholder_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = MavenFormatter;
+        let dep = placeholder_probe_dependency();
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "@project.version@"),
-            "@project.version@"
+            replacement_text(
+                &f,
+                &dep,
+                &ConcreteVersion::new("1.2.0"),
+                "@project.version@"
+            ),
+            None
         );
     }
 
@@ -629,35 +638,42 @@ mod tests {
     /// it is *also* a malformed range — `is_range` is true and `crate::range::parse_range`
     /// fails on it, so `compile_requirement`'s malformed-range guard returns `None` (not
     /// `MavenMatcher::AlwaysSatisfied`), making the default `requirement_already_resolves_to`
-    /// inert. `format_version_replacing`'s direct `is_unresolved` check is what actually
-    /// closes this gap.
+    /// inert. `RequirementResolution::requirement_is_placeholder`'s direct `is_unresolved`
+    /// check — consulted by `deps_core::edit::replacement_text` before ever calling into the
+    /// formatter's rewrite logic — is what actually closes this gap.
     #[test]
-    fn test_format_version_replacing_unresolved_malformed_range_is_unchanged() {
+    fn test_replacement_text_unresolved_malformed_range_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = MavenFormatter;
+        let dep = placeholder_probe_dependency();
         assert!(
             f.compile_requirement(&VersionReq::new("[1.0,${hi}"))
                 .is_none(),
             "expected the malformed range to be undecidable"
         );
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "[1.0,${hi}"),
-            "[1.0,${hi}"
+            replacement_text(&f, &dep, &ConcreteVersion::new("1.2.0"), "[1.0,${hi}"),
+            None
         );
     }
 
     /// #1384 counterpart to the test above: the same malformed-range-with-embedded-placeholder
     /// gap, for the `@property@` grammar instead of `${property}`.
     #[test]
-    fn test_format_version_replacing_unresolved_malformed_range_at_placeholder_is_unchanged() {
+    fn test_replacement_text_unresolved_malformed_range_at_placeholder_is_none() {
+        use deps_core::edit::replacement_text;
+
         let f = MavenFormatter;
+        let dep = placeholder_probe_dependency();
         assert!(
             f.compile_requirement(&VersionReq::new("[1.0,@hi@"))
                 .is_none(),
             "expected the malformed range to be undecidable"
         );
         assert_eq!(
-            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "[1.0,@hi@"),
-            "[1.0,@hi@"
+            replacement_text(&f, &dep, &ConcreteVersion::new("1.2.0"), "[1.0,@hi@"),
+            None
         );
     }
 

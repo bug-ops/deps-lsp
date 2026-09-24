@@ -382,14 +382,15 @@ mod tests {
         non_registry_fixture: "Cargo.toml" => "[dependencies]\nlocal-crate = { path = \"../local-crate\" }\n";
     }
 
-    // #1374/#1379: Cargo.toml's TOML grammar has no placeholder/interpolation syntax of its
-    // own, but a manifest pre-processed by external templating (`envsubst`, CI templating,
+    // #1374/#1379/#1391: Cargo.toml's TOML grammar has no placeholder/interpolation syntax of
+    // its own, but a manifest pre-processed by external templating (`envsubst`, CI templating,
     // cookiecutter-style generators) commonly leaves an unresolved `$VAR`/`${VAR}`/`{{ }}`/
     // `@VAR@`/`%VAR%`/`<%= %>`-shaped literal in the version slot; the TOML parser has no way
     // to distinguish that from an ordinary string, so it stays a normal
-    // `Some(version_requirement)` and reaches `plan_vulnerability_fix`/
-    // `format_version_replacing_for` directly — depends on `CargoFormatter`'s own
-    // `requirement_contains_template_placeholder` guard.
+    // `Some(version_requirement)` and reaches `deps_core::edit::plan_vulnerability_fix`
+    // directly — guarded by `RequirementResolution::requirement_is_placeholder`'s shared
+    // default (`CargoFormatter` has no override), consulted via
+    // `deps_core::edit::requirement_is_placeholder_for`.
     deps_core::unresolved_requirement_conformance! {
         mod cargo_unresolved_requirement_conformance;
         build: CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));

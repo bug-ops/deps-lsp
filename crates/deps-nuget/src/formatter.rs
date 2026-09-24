@@ -3,6 +3,7 @@
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    requirement_contains_template_placeholder,
 };
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 
@@ -101,30 +102,6 @@ impl PackageRendering for NuGetFormatter {
         version.to_string()
     }
 
-    /// Issue #1347 hardening: an unexpanded MSBuild reference (`$(SomeProperty)`,
-    /// `%(MetadataName)`, or `@(ItemList)`) in `current` leaves `current` unchanged instead of
-    /// substituting `version`, so hardcoding a literal version over a centrally-managed
-    /// reference is structurally impossible even if a future caller reaches this method with
-    /// such text. Returning `current` verbatim trips the pre-existing textual no-op guards in
-    /// `deps_core::edit::collect_update_candidates`/`plan_vulnerability_fix`.
-    ///
-    /// Currently defense-in-depth only, not a fix for a reproducible defect: `crate::parser`
-    /// already degrades every MSBuild-reference-containing manifest shape to
-    /// `version_requirement: None` before either the LSP code-action path or `deps-cli` ever
-    /// reaches this method (verified across `.csproj` attribute/child-element form,
-    /// `Directory.Packages.props`, `packages.config`, and the bracketed `[$(Min),$(Max))`
-    /// form — see `parser::test_unresolved_msbuild_property_degrades_to_none`), so `current`
-    /// never actually contains one of these references in production today. This guards
-    /// against that parser invariant ever relaxing, at negligible cost. Uses the same
-    /// `crate::parser::is_msbuild_reference` predicate as `requirement_is_unresolved` and the
-    /// parser's own degrade guards, for consistency (#1355).
-    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if crate::parser::is_msbuild_reference(current) {
-            return current.to_string();
-        }
-        self.format_version_for_text_edit(version)
-    }
-
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -204,11 +181,19 @@ impl RequirementResolution for NuGetFormatter {
     ///
     /// #1370/#1380: NuGet has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// unexpanded MSBuild reference is the only unresolved shape NuGet has, so both
-    /// predicates key off the same `crate::parser::is_msbuild_reference` detector, and
-    /// `requirement_is_unresolved`'s default delegates here rather than duplicating it.
+    /// unexpanded MSBuild reference is the only *native* unresolved shape NuGet has, so both
+    /// predicates key off the same composed detector, and `requirement_is_unresolved`'s
+    /// default delegates here rather than duplicating it.
+    ///
+    /// #1391: `shared || native` — `is_msbuild_reference`'s `$(X)`/`%(X)`/`@(X)` forms have no
+    /// overlap with the shared [`requirement_contains_template_placeholder`] detector's
+    /// `{{ }}`/`<%= %>`/`@VAR@`/`%VAR%`/`${VAR}`/`$VAR` forms (NuGet's own `$(` always needs the
+    /// paren), so both must be checked — a manifest carrying a generic templating placeholder
+    /// from some external tool (`envsubst`, CI templating) is not on its own MSBuild syntax.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        crate::parser::is_msbuild_reference(requirement.as_str())
+        let requirement = requirement.as_str();
+        requirement_contains_template_placeholder(requirement)
+            || crate::parser::is_msbuild_reference(requirement)
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
@@ -227,9 +212,9 @@ impl RequirementResolution for NuGetFormatter {
     /// decisively (and wrongly) report every version as satisfying it. Not a fix for a
     /// reproducible defect, though: `crate::parser` already degrades this input to
     /// `version_requirement: None` before it ever reaches a `VersionReq` this method is called
-    /// with (see [`Self::format_version_replacing`]'s doc for the full unreachability
-    /// argument), so this guard is defense-in-depth, consistent with the parser's own treatment
-    /// of the same input as "no requirement" rather than a real constraint.
+    /// with (see `parser::test_unresolved_msbuild_property_degrades_to_none`), so this guard is
+    /// defense-in-depth, consistent with the parser's own treatment of the same input as "no
+    /// requirement" rather than a real constraint.
     // `compile_requirement_unless`'s contract only invokes the build closure when the
     // undecidable predicate returned `false`, i.e. parsing already succeeded.
     #[allow(clippy::expect_used)]
@@ -705,12 +690,11 @@ mod tests {
             &NuGetFormatter,
         );
 
-        // #1370: `plan_verified_fix`'s central placeholder gate checks `current` directly
+        // #1370/#1391: `plan_verified_fix`'s central placeholder gate checks `current` directly
         // (independent of `dep.version_requirement()`, which is `None` here) and fires first,
-        // via `NuGetFormatter::requirement_is_placeholder`. Before that gate existed,
-        // suppression came from `format_version_replacing`'s own `$(` short-circuit instead
-        // (`VulnFixSkip::NoOpRewrite`) — still true as defense-in-depth, but no longer the
-        // first guard reached.
+        // via `NuGetFormatter::requirement_is_placeholder` — the only guard reached, since
+        // `format_version_replacing`'s own former `$(` short-circuit was removed (#1391):
+        // `deps_core::edit::replacement_text` never calls into it once this gate says `true`.
         assert_eq!(
             planned,
             Err(VulnFixSkip::UnresolvedPlaceholder),
@@ -872,5 +856,59 @@ mod tests {
         );
         assert_eq!(planned.edit.new_text, "1.0.2");
         assert_eq!(planned.target, ConcreteVersion::new("1.0.2"));
+    }
+
+    /// #1391 review S1: #1390's own repro text (`{{ nj_version }}`), parsed through the real
+    /// `crate::parser::parse_project_file` path rather than a hand-built `NuGetDependency` —
+    /// closes the coverage gap `test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency`
+    /// leaves: that test only exercises the native `$(...)` MSBuild form, not the shared
+    /// generic-template detector.
+    #[test]
+    fn test_plan_vulnerability_fix_generic_placeholder_through_real_parser_is_not_rewritten() {
+        use deps_core::ParseResult;
+        use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+
+        let xml = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="{{ nj_version }}" /></ItemGroup></Project>"#;
+        let uri = deps_core::test_util::test_uri("/test/generic-placeholder.csproj");
+        let result = crate::parser::parse_project_file(xml, &uri).expect("valid xml");
+        let deps = result.dependencies();
+        let dep = deps.first().expect("one dependency parsed");
+        let current = dep
+            .version_requirement()
+            .expect("parser preserves the raw templated version text")
+            .as_str();
+        assert_eq!(current, "{{ nj_version }}");
+
+        let advisory = std::sync::Arc::new(
+            Advisory::new(
+                "GHSA-test-0004".to_string(),
+                "2024-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["13.0.4".to_string()]),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
+            .with_fix_target_status(UpgradeStatus::CandidateClean {
+                version: "13.0.4".to_string(),
+            });
+
+        let planned = plan_vulnerability_fix(
+            *dep,
+            deps_core::position::Range::default(),
+            current,
+            &dv,
+            &NuGetFormatter,
+        );
+
+        assert_eq!(
+            planned,
+            Err(VulnFixSkip::UnresolvedPlaceholder),
+            "the real NuGetFormatter must suppress the fix for #1390's unexpanded nj_version \
+             template placeholder, got {planned:?}"
+        );
     }
 }

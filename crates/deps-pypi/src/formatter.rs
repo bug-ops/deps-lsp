@@ -6,7 +6,6 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy,
-    requirement_contains_template_placeholder,
 };
 use pep440_rs::{Version, VersionSpecifiers};
 use std::str::FromStr;
@@ -68,23 +67,13 @@ impl PackageRendering for PypiFormatter {
         format!(">={version},<{next_major}")
     }
 
-    /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
-    /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>` — see
-    /// `requirement_contains_template_placeholder`) in `current` leaves `current`
-    /// unchanged instead of substituting `version`, so a vulnerability-fix or "update to
-    /// latest" edit can never hardcode a literal version over a `[tool.poetry.dependencies]`
-    /// version pre-processed by `envsubst`/CI templating — mirrors
-    /// `MavenFormatter`/`GradleFormatter`/`NuGetFormatter`'s identical-shaped
-    /// `${property}`/`$(Property)` guards, all on this same non-`dep`-aware hook (PyPI has no
-    /// dependency-identity-dependent rewrite logic, unlike `GitlabCiFormatter`/
-    /// `BundlerFormatter`, which override `format_version_replacing_for` instead). PEP 621
-    /// `dependencies = [...]` array entries never reach this: an unresolved `${VAR}` there
-    /// already fails PEP 440 dependency-specifier parsing at `parse_manifest` time, so the
-    /// whole line is dropped before a dependency (and thus `current`) ever exists.
+    /// Since #1391, `current` is never a placeholder here — the sole production caller,
+    /// [`deps_core::edit::replacement_text`], gates on
+    /// [`RequirementResolution::requirement_is_placeholder`] first. PEP 621
+    /// `dependencies = [...]` array entries could never reach this anyway: an unresolved
+    /// `${VAR}` there already fails PEP 440 dependency-specifier parsing at `parse_manifest`
+    /// time, so the whole line is dropped before a dependency (and thus `current`) ever exists.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if requirement_contains_template_placeholder(current) {
-            return current.to_string();
-        }
         let version = version.as_str();
         let terms: Vec<&str> = current.trim().split(',').map(str::trim).collect();
 
@@ -203,21 +192,13 @@ impl RequirementResolution for PypiFormatter {
         Some(Box::new(Pep440Matcher(specs)))
     }
 
-    /// #1370: PyPI has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// external-templating placeholder is the only unresolved shape PyPI has, so its
-    /// default delegates here rather than duplicating the
-    /// `requirement_contains_template_placeholder` detector (#1380).
-    ///
-    /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
-    /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>`) — see
-    /// `requirement_contains_template_placeholder`. A PEP 621 `dependencies = [...]`
-    /// entry carrying this shape already fails PEP 440 parsing and is dropped before a
-    /// dependency exists (never reaches this method); a `[tool.poetry.dependencies]` table
-    /// entry has no such upstream validation, so this is that guard's sole line of defense.
-    fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_template_placeholder(requirement.as_str())
-    }
+    // #1370/#1374/#1379/#1391: PyPI's requirement grammar has no placeholder syntax of its
+    // own — `RequirementResolution::requirement_is_placeholder`'s shared default (the
+    // `requirement_contains_template_placeholder` detector) already covers the only
+    // unresolved shape PyPI has, so no override is needed here. A PEP 621
+    // `dependencies = [...]` entry carrying this shape already fails PEP 440 parsing and is
+    // dropped before a dependency exists; a `[tool.poetry.dependencies]` table entry has no
+    // such upstream validation, so the shared default is that case's sole line of defense.
 }
 
 impl DiagnosticMessages for PypiFormatter {}
