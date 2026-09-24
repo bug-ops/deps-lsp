@@ -91,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-lsp**: a debounced manifest edit that changes no dependency itself now still re-runs the OSV vulnerability scan when the lock file moved a resolved version underneath it, matching `handle_lockfile_change`'s existing check (resolves #1399) (#1410)
 
 ### Breaking
-- **deps-core**: `osv::VulnerabilityMap`/`ScanTarget::key`/`OsvClient::check_candidates` are now keyed/typed by `VulnKey` instead of `String`; `VulnKey::into_string` is removed (resolves #1413)
+- **deps-core**: `osv::VulnerabilityMap`/`ScanTarget::key`/`OsvClient::check_candidates` are now keyed/typed by `VulnKey` instead of `String`; `VulnKey::into_string` is removed (resolves #1413) (#1418)
 - **deps-lsp**: `DocumentState::update_resolved_versions` is no longer public (resolves #1398) (#1410)
 - **deps-engine**: `classify::resolved::load_resolved_versions` now returns a 3-tuple, adding a `bool` distinguishing a successful reload (including a genuinely absent/empty lock file) from a parse failure, so callers that treat an empty-to-non-empty transition as a staleness signal can avoid mistaking one for the other (resolves #1407) (#1415)
 - **deps-core**: `edit::plan_vulnerability_fix` returns `Result<PlannedUpdate, VulnFixSkip>` instead of `Option<PlannedUpdate>`; `edit::fix_target_is_verified` is `pub(crate)` again (part of #1350) (#1361)
