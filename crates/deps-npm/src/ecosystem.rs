@@ -476,7 +476,8 @@ mod tests {
                 "solid": "@SOLID_VERSION@",
                 "preact": "%PREACT_VERSION%",
                 "lit": "<%= LIT_VERSION %>",
-                "lodash": "$(LODASH_VERSION)"
+                "lodash": "$(LODASH_VERSION)",
+                "chalk": "$(CHALK-VERSION)"
             }}"#;
     }
 

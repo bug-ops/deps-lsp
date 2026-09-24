@@ -346,7 +346,8 @@ mod tests {
                 "autoconf": "npm:lodash@@PACKAGE_VERSION@",
                 "batch": "npm:left-pad@%LEFT_PAD_VERSION%",
                 "erb": "npm:react@<%= REACT_VERSION %>",
-                "makefile": "npm:lodash@$(LODASH_VERSION)"
+                "makefile": "npm:lodash@$(LODASH_VERSION)",
+                "msbuild": "npm:chalk@$(CHALK-VERSION)"
             }}"#;
     }
 

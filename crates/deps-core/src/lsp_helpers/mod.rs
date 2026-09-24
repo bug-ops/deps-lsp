@@ -1638,6 +1638,28 @@ fn template_placeholder_identifier_end(bytes: &[u8], start: usize) -> Option<usi
     Some(end)
 }
 
+/// Like [`template_placeholder_identifier_end`], but also allows `-` (never `.`) in the
+/// identifier's tail — the `$(...)` Makefile/MSBuild form's own grammar (spec 070, issue
+/// #1421): MSBuild property names may contain a hyphen in subsequent positions
+/// (`$(MOD-VERSION)`) but never a period, unlike the `@VAR@` form's
+/// [`dotted_identifier_end`], which permits both. Deliberately not reused verbatim for
+/// `$(...)` — doing so would silently admit the dotted `$(A.VERSION)` form this project's
+/// prevalence research rejected as unsupported by real tooling.
+fn hyphenated_identifier_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let first = *bytes.get(start)?;
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return None;
+    }
+    let mut end = start + 1;
+    while bytes
+        .get(end)
+        .is_some_and(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-'))
+    {
+        end += 1;
+    }
+    Some(end)
+}
+
 /// Like [`template_placeholder_identifier_end`], but also allows `.`/`-` in the identifier's
 /// tail (never as the leading character) — the shape a CMake/Autotools `configure_file`
 /// placeholder needs (`@project.version@`, `@some-flag@`), which is the actual common
@@ -1737,6 +1759,12 @@ fn contains_bracketed_placeholder(text: &str, open: &str, close_or_skip: &[u8]) 
 /// load-bearing there: `is_msbuild_reference` already covered NuGet's `$(VAR)` case before this
 /// function did.
 ///
+/// The `$(VAR)` identifier grammar additionally accepts `-` in subsequent (never leading)
+/// positions (`$(MOD-VERSION)`), matching real MSBuild property-name syntax (spec 070, issue
+/// #1421). A `.` anywhere before the closing `)` (`$(A.VERSION)`) is a deliberate, researched
+/// exclusion — not valid MSBuild syntax and not a documented real-world convention — and is
+/// never matched, even in combination with a hyphen (`$(MOD.SUB-VERSION)`).
+///
 /// # Examples
 ///
 /// ```
@@ -1747,6 +1775,8 @@ fn contains_bracketed_placeholder(text: &str, open: &str, close_or_skip: &[u8]) 
 /// assert!(requirement_contains_template_placeholder("1.0.0-$BUILD"));
 /// assert!(requirement_contains_template_placeholder("$(LODASH_VERSION)"));
 /// assert!(requirement_contains_template_placeholder("1.0.0-$(BUILD_SUFFIX)"));
+/// assert!(requirement_contains_template_placeholder("$(MOD-VERSION)"));
+/// assert!(requirement_contains_template_placeholder("1.0.0-$(BUILD-SUFFIX)"));
 /// assert!(requirement_contains_template_placeholder("{{ .NetVersion }}"));
 /// assert!(requirement_contains_template_placeholder("{% if x %}"));
 /// assert!(requirement_contains_template_placeholder("@PACKAGE_VERSION@"));
@@ -1758,6 +1788,9 @@ fn contains_bracketed_placeholder(text: &str, open: &str, close_or_skip: &[u8]) 
 /// assert!(!requirement_contains_template_placeholder("price-is-$(five"));
 /// assert!(!requirement_contains_template_placeholder("me@example.com"));
 /// assert!(!requirement_contains_template_placeholder("100%"));
+/// assert!(!requirement_contains_template_placeholder("$(A.VERSION)"));
+/// assert!(!requirement_contains_template_placeholder("$(MOD.SUB-VERSION)"));
+/// assert!(!requirement_contains_template_placeholder("$(-VERSION)"));
 /// ```
 pub fn requirement_contains_template_placeholder(requirement: &str) -> bool {
     let bytes = requirement.as_bytes();
@@ -1765,10 +1798,10 @@ pub fn requirement_contains_template_placeholder(requirement: &str) -> bool {
         b == b'$'
             && match bytes.get(i + 1) {
                 Some(b'{') => template_placeholder_identifier_end(bytes, i + 2).is_some(),
-                // #1417 scope boundary: strict `[a-zA-Z_][a-zA-Z0-9_]*` grammar per spec
-                // FR-001 — a hyphen/dot identifier (`$(MOD-VERSION)`, `$(A.VERSION)`) is not
-                // matched; tracked as a deliberate follow-up, not fixed here.
-                Some(b'(') => template_placeholder_identifier_end(bytes, i + 2)
+                // #1421: `[a-zA-Z_][a-zA-Z0-9_-]*` — a hyphen is accepted in subsequent
+                // positions (real MSBuild property-name syntax, `$(MOD-VERSION)`); a dot
+                // (`$(A.VERSION)`) remains a deliberate, researched exclusion (spec 070).
+                Some(b'(') => hyphenated_identifier_end(bytes, i + 2)
                     .is_some_and(|end| bytes.get(end) == Some(&b')')),
                 _ => template_placeholder_identifier_end(bytes, i + 1).is_some(),
             }
@@ -3615,6 +3648,43 @@ mod tests {
         assert!(!requirement_contains_template_placeholder("$(123)"));
         assert!(!requirement_contains_template_placeholder(
             "$(SERDE VERSION)"
+        ));
+    }
+
+    /// Spec 070 / issue #1421: `-` is accepted in subsequent positions inside `$(...)`, real
+    /// MSBuild property-name syntax (`$(MOD-VERSION)`).
+    #[test]
+    fn test_requirement_contains_template_placeholder_dollar_paren_hyphen_form() {
+        assert!(requirement_contains_template_placeholder("$(MOD-VERSION)"));
+        assert!(requirement_contains_template_placeholder(
+            "$(SERDE-VERSION)"
+        ));
+        assert!(requirement_contains_template_placeholder(
+            "1.0.0-$(BUILD-SUFFIX)"
+        ));
+        assert!(!requirement_contains_template_placeholder("$(-VERSION)"));
+    }
+
+    /// Spec 070 / issue #1421 impl-critic M2: a trailing hyphen, consecutive hyphens, and a
+    /// leading underscore followed by a hyphen are all still valid subsequent-position
+    /// characters and must match; a bracketed content consisting of only a hyphen fails the
+    /// first-character constraint (never a valid leading character) and must NOT match.
+    #[test]
+    fn test_requirement_contains_template_placeholder_dollar_paren_hyphen_edge_cases() {
+        assert!(requirement_contains_template_placeholder("$(VERSION-)"));
+        assert!(requirement_contains_template_placeholder("$(MOD--VERSION)"));
+        assert!(requirement_contains_template_placeholder("$(_-X)"));
+        assert!(!requirement_contains_template_placeholder("$(-)"));
+    }
+
+    /// Spec 070 / issue #1421: `.` anywhere before the closing `)` remains a deliberate,
+    /// researched exclusion (not valid MSBuild syntax) — never matched, even combined with a
+    /// hyphen.
+    #[test]
+    fn test_requirement_contains_template_placeholder_dollar_paren_dotted_form_not_matched() {
+        assert!(!requirement_contains_template_placeholder("$(A.VERSION)"));
+        assert!(!requirement_contains_template_placeholder(
+            "$(MOD.SUB-VERSION)"
         ));
     }
 

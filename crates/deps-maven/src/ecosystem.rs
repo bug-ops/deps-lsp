@@ -918,7 +918,7 @@ mod tests {
         build: MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         reachable: true;
         fixture: "pom.xml" =>
-            "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>some-lib</artifactId><version>${ver}</version></dependency><dependency><groupId>com.example</groupId><artifactId>malformed-range</artifactId><version>[1.0,${hi}</version></dependency><dependency><groupId>com.example</groupId><artifactId>at-placeholder</artifactId><version>@project.version@</version></dependency><dependency><groupId>com.example</groupId><artifactId>dollar-paren-placeholder</artifactId><version>$(MAKEFILE_VERSION)</version></dependency></dependencies></project>";
+            "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>some-lib</artifactId><version>${ver}</version></dependency><dependency><groupId>com.example</groupId><artifactId>malformed-range</artifactId><version>[1.0,${hi}</version></dependency><dependency><groupId>com.example</groupId><artifactId>at-placeholder</artifactId><version>@project.version@</version></dependency><dependency><groupId>com.example</groupId><artifactId>dollar-paren-placeholder</artifactId><version>$(MAKEFILE_VERSION)</version></dependency><dependency><groupId>com.example</groupId><artifactId>dollar-paren-hyphen-placeholder</artifactId><version>$(MOD-VERSION)</version></dependency></dependencies></project>";
     }
 
     // #794: `complete_package_names_for_field` (defined above in `impl MavenEcosystem`)

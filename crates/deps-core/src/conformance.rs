@@ -970,10 +970,10 @@ impl crate::Dependency for PlaceholderProbeDependency {
 ///
 /// One example each of the shared
 /// [`requirement_contains_template_placeholder`](crate::lsp_helpers::requirement_contains_template_placeholder)
-/// detector's `{{ }}`, `<%= %>`, `@VAR@`, `%VAR%`, `${VAR}`, `$VAR`, and `$(VAR)` forms, its
-/// `{% %}` Jinja-tag form, and a version string with an *embedded* (not whole-value)
-/// placeholder — recognized regardless of what native placeholder syntax (if any) an ecosystem
-/// also has.
+/// detector's `{{ }}`, `<%= %>`, `@VAR@`, `%VAR%`, `${VAR}`, `$VAR`, and `$(VAR)` forms
+/// (plus `$(MOD-VERSION)`, the hyphenated `$(...)` grammar spec 070/#1421 added), its `{% %}`
+/// Jinja-tag form, and a version string with an *embedded* (not whole-value) placeholder —
+/// recognized regardless of what native placeholder syntax (if any) an ecosystem also has.
 ///
 /// `test_generic_template_placeholders_fixture_matches_detector` (in `lsp_helpers::mod`'s own
 /// test module) guards this list against drifting out of sync with the detector it exists to
@@ -986,6 +986,7 @@ pub const GENERIC_TEMPLATE_PLACEHOLDERS: &[&str] = &[
     "${VERSION}",
     "$VERSION",
     "$(VERSION)",
+    "$(MOD-VERSION)",
     "{% if x %}",
     "1.0.0-$BUILD",
 ];
