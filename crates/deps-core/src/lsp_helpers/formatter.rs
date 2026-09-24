@@ -175,12 +175,13 @@ pub trait PackageRendering: Send + Sync {
 /// or filesystem access — since these run on the hot hover/diagnostic path. The default
 /// [`requirement_status`](Self::requirement_status) maps
 /// [`requirement_is_unresolved`](Self::requirement_is_unresolved) to its `Unresolved` variant
-/// and otherwise defers to [`is_requirement_up_to_date`](Self::is_requirement_up_to_date) — but
-/// an override of one without the other is not a contract violation: an ecosystem whose
-/// requirement syntax can be unresolved (Maven, Gradle, NuGet, `deps-github-actions`) overrides
-/// `requirement_is_unresolved` precisely so `requirement_status` can distinguish "not yet
-/// decidable" from "decided outdated", a distinction the boolean method has no variant for.
-/// Callers needing that distinction use `requirement_status`, not the boolean method.
+/// and otherwise defers to [`is_requirement_up_to_date`](Self::is_requirement_up_to_date). Most
+/// ecosystems whose requirement syntax can be unresolved (Maven, Gradle, NuGet, Cargo, npm, ...)
+/// need only override [`requirement_is_placeholder`](Self::requirement_is_placeholder) —
+/// `requirement_is_unresolved` defaults to delegating to it. Only `deps-github-actions` and
+/// `deps-gitlab-ci` override `requirement_is_unresolved` directly, since their two predicates
+/// answer genuinely different questions there (see `requirement_is_placeholder`'s doc). Callers
+/// needing the tri-state distinction use `requirement_status`, not the boolean method.
 pub trait RequirementResolution: Send + Sync {
     /// Check if a version satisfies a requirement string.
     ///
@@ -253,11 +254,11 @@ pub trait RequirementResolution: Send + Sync {
     /// Whether `requirement` could not be resolved to a concrete version constraint (e.g. an
     /// unexpanded property/variable placeholder rather than a real version or range).
     ///
-    /// Default: always resolvable. Ecosystems whose requirement syntax can contain
-    /// unresolved placeholders (Maven's `${property}`, Gradle's `$var`/`${var}`) override
-    /// this single predicate; both `version_satisfies_requirement`'s "treat as satisfied"
-    /// short-circuit and `requirement_status`'s `Unresolved` variant are derived from it, so
-    /// the two can't drift out of sync with each other.
+    /// Default: delegates to [`requirement_is_placeholder`](Self::requirement_is_placeholder),
+    /// which is correct for every ecosystem except `deps-github-actions` and `deps-gitlab-ci`
+    /// (see that method's doc for why their two predicates genuinely differ). Overriding
+    /// `requirement_is_placeholder` alone therefore keeps both predicates in sync; only those
+    /// two ecosystems need their own `requirement_is_unresolved` override.
     ///
     /// # Examples
     ///
@@ -270,8 +271,8 @@ pub trait RequirementResolution: Send + Sync {
     ///
     /// assert!(!DefaultFormatter.requirement_is_unresolved(&VersionReq::new("^1.2")));
     /// ```
-    fn requirement_is_unresolved(&self, _requirement: &VersionReq) -> bool {
-        false
+    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
+        self.requirement_is_placeholder(requirement)
     }
 
     /// Whether `requirement` is an unexpanded placeholder/interpolation (Maven's

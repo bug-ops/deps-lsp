@@ -31,6 +31,13 @@ related:
 > The continuous-improvement workflow is read-only with respect to code — no
 > implementation was attempted or should be attempted from this finding alone.
 
+> [!warning] Stale reference (2026-09-23)
+> `deps-lsp.updateVersion` — referenced throughout this spec as the command a `Command.tooltip`
+> would be populated on — was removed in #1378 (dead command, no in-tree producer, bypassed the
+> central placeholder gate). If/when this spec is unblocked and planned, `Command.tooltip`
+> support should target the REFACTOR "Update to X" code action's command instead, and every
+> `deps-lsp.updateVersion` reference below needs updating first.
+
 ## 1. Overview
 
 ### Problem Statement

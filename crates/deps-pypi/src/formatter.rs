@@ -202,19 +202,16 @@ impl RequirementResolution for PypiFormatter {
         Some(Box::new(Pep440Matcher(specs)))
     }
 
-    /// #1374 hardening: an unresolved `$VAR`/`${VAR}`-style external-templating placeholder
-    /// — see `requirement_contains_dollar_placeholder`. A PEP 621 `dependencies = [...]`
-    /// entry carrying this shape already fails PEP 440 parsing and is dropped before a
-    /// dependency exists (never reaches this method); a `[tool.poetry.dependencies]` table
-    /// entry has no such upstream validation, so this is that guard's sole line of defense.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_dollar_placeholder(requirement.as_str())
-    }
-
     /// #1370: PyPI has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — a
-    /// `$VAR`/`${VAR}`-style placeholder is the only unresolved shape PyPI has, so both
-    /// predicates key off the same `requirement_contains_dollar_placeholder` detector.
+    /// `$VAR`/`${VAR}`-style placeholder is the only unresolved shape PyPI has, so its
+    /// default delegates here rather than duplicating the
+    /// `requirement_contains_dollar_placeholder` detector (#1380).
+    ///
+    /// #1374 hardening: a PEP 621 `dependencies = [...]` entry carrying this shape already
+    /// fails PEP 440 parsing and is dropped before a dependency exists (never reaches this
+    /// method); a `[tool.poetry.dependencies]` table entry has no such upstream validation,
+    /// so this predicate is that entry's sole line of defense.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         requirement_contains_dollar_placeholder(requirement.as_str())
     }
