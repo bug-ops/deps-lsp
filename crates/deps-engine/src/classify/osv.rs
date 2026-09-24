@@ -128,7 +128,7 @@ pub fn build_scan_targets(
 
     for dep in parse_result.dependencies() {
         let normalized_name = formatter.normalize_package_name(dep.name());
-        let key = deps_core::osv::vuln_key_for(dep, Some(&keys), formatter).into_string();
+        let key = deps_core::osv::vuln_key_for(dep, Some(&keys), formatter);
 
         if !formatter.source_is_public_registry_content(&dep.source()) {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::NonRegistrySource));
@@ -168,10 +168,6 @@ pub fn build_scan_targets(
 
     (targets, skipped)
 }
-/// Synthetic [`deps_core::osv::ScanTarget::key`] suffix marking a fix-target (F) live-check
-/// candidate as distinct from the same dependency's "latest" candidate (B.1) within the
-/// shared `VulnerabilityMap` key space — see `run_osv_fix_target_verification`.
-const FIX_TARGET_KEY_SUFFIX: &str = "\u{0}fix";
 /// Outcome of `resolve_fix_target` for one vulnerable dependency.
 #[derive(Debug, PartialEq, Eq)]
 enum FixTargetResolution {
@@ -184,9 +180,10 @@ enum FixTargetResolution {
     Resolved(deps_core::osv::UpgradeStatus),
     /// F differs from latest and needs a live [`deps_core::osv::OsvClient::check_candidates`]
     /// check — carries the [`deps_core::osv::ScanTarget`] to batch into the caller's single
-    /// combined call (NFR-001), keyed with `FIX_TARGET_KEY_SUFFIX` so its result cannot
-    /// collide with the same dependency's "latest" candidate in the same `VulnerabilityMap`
-    /// key space.
+    /// combined call (NFR-001). Keyed with the dependency's plain [`deps_core::osv::VulnKey`]:
+    /// this candidate is always checked via a *separate* `check_candidates` call from the "B.1
+    /// latest" candidates, so its result `HashMap` never shares a key space with the phase-A
+    /// `VulnerabilityMap` — no suffix is needed to disambiguate.
     NeedsLiveCheck(deps_core::osv::ScanTarget),
 }
 /// Pure (network-free) decision logic for `run_osv_fix_target_verification`'s per-dependency
@@ -194,9 +191,9 @@ enum FixTargetResolution {
 /// out so each case is unit-testable without an `OsvClient`/network dependency.
 fn resolve_fix_target(
     dv: &deps_core::osv::DependencyVulnerabilities,
-    key: &str,
-    latest_native_by_key: &HashMap<String, String>,
-    osv_name_by_key: &HashMap<String, String>,
+    key: &deps_core::osv::VulnKey,
+    latest_native_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetResolution {
     use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
@@ -216,7 +213,7 @@ fn resolve_fix_target(
         // only the batch-scan `key` that generic warning doesn't carry.
         Err(VulnFixSkip::UnsafeVersion) => {
             tracing::debug!(
-                key,
+                key = %key,
                 "OSV #462: fix-target version failed validation, skipping verification"
             );
             return FixTargetResolution::Skip;
@@ -242,13 +239,13 @@ fn resolve_fix_target(
 
     let Some(osv_name) = osv_name_by_key.get(key).cloned() else {
         tracing::debug!(
-            key,
+            key = %key,
             "OSV #462: no osv_name on record for fix-target verification, skipping"
         );
         return FixTargetResolution::Skip;
     };
     FixTargetResolution::NeedsLiveCheck(ScanTarget::new(
-        format!("{key}{FIX_TARGET_KEY_SUFFIX}"),
+        key.clone(),
         osv_name,
         fix.version,
         version_native,
@@ -275,6 +272,7 @@ fn resolve_fix_target(
 ///     Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
 ///     VulnerabilityMap,
 /// };
+/// use deps_core::test_util::vuln_key;
 /// use deps_core::{ConcreteVersion, PackageName};
 /// use deps_engine::classify::osv::collect_fix_target_resolutions;
 /// use std::collections::HashMap;
@@ -312,32 +310,32 @@ fn resolve_fix_target(
 ///     .with_upgrade_status(latest_status.clone());
 ///
 /// let mut vulnerabilities = VulnerabilityMap::new();
-/// vulnerabilities.insert("pkg".to_string(), ScanOutcome::Vulnerable(dv));
+/// vulnerabilities.insert(vuln_key("pkg"), ScanOutcome::Vulnerable(dv));
 ///
 /// let mut latest_native_by_key = HashMap::new();
-/// latest_native_by_key.insert("pkg".to_string(), "1.2.0".to_string());
+/// latest_native_by_key.insert(vuln_key("pkg"), "1.2.0".to_string());
 ///
 /// // F (the fix, 1.2.0) equals the already-checked "latest" candidate — resolved without a
 /// // live network check.
 /// let (resolved, live_check_candidates) = collect_fix_target_resolutions(
 ///     &vulnerabilities,
-///     &["pkg".to_string()],
+///     &[vuln_key("pkg")],
 ///     &HashMap::new(),
 ///     &latest_native_by_key,
 ///     &SimpleFormatter,
 /// );
 ///
-/// assert_eq!(resolved, vec![("pkg".to_string(), latest_status)]);
+/// assert_eq!(resolved, vec![(vuln_key("pkg"), latest_status)]);
 /// assert!(live_check_candidates.is_empty());
 /// ```
 pub fn collect_fix_target_resolutions(
     vulnerabilities: &deps_core::osv::VulnerabilityMap,
-    vulnerable_keys: &[String],
-    osv_name_by_key: &HashMap<String, String>,
-    latest_native_by_key: &HashMap<String, String>,
+    vulnerable_keys: &[deps_core::osv::VulnKey],
+    osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    latest_native_by_key: &HashMap<deps_core::osv::VulnKey, String>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
-    Vec<(String, deps_core::osv::UpgradeStatus)>,
+    Vec<(deps_core::osv::VulnKey, deps_core::osv::UpgradeStatus)>,
     Vec<deps_core::osv::ScanTarget>,
 ) {
     use deps_core::osv::ScanOutcome;
@@ -346,7 +344,7 @@ pub fn collect_fix_target_resolutions(
     let mut live_check_candidates = Vec::new();
 
     for key in vulnerable_keys {
-        let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get(key.as_str()) else {
+        let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get(key) else {
             continue;
         };
         match resolve_fix_target(dv, key, latest_native_by_key, osv_name_by_key, formatter) {
@@ -358,8 +356,11 @@ pub fn collect_fix_target_resolutions(
 
     (resolved, live_check_candidates)
 }
-/// Applies a live [`deps_core::osv::OsvClient::check_candidates`] result keyed with
-/// `FIX_TARGET_KEY_SUFFIX` back onto the matching dependency's `fix_target_status`.
+/// Applies a live [`deps_core::osv::OsvClient::check_candidates`] result back onto the matching
+/// dependency's `fix_target_status`.
+///
+/// Keyed by the same plain [`deps_core::osv::VulnKey`] the vulnerable dependency was scanned
+/// under.
 ///
 /// A key absent from `statuses` (timeout, OSV outage, or a chunk `check_candidates` itself
 /// dropped) simply leaves that dependency's `fix_target_status` untouched — still
@@ -373,6 +374,7 @@ pub fn collect_fix_target_resolutions(
 ///     Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
 ///     VulnerabilityMap,
 /// };
+/// use deps_core::test_util::vuln_key;
 /// use deps_engine::classify::osv::apply_live_fix_target_statuses;
 /// use std::collections::HashMap;
 /// use std::sync::Arc;
@@ -388,12 +390,11 @@ pub fn collect_fix_target_resolutions(
 /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
 ///
 /// let mut vulnerabilities = VulnerabilityMap::new();
-/// vulnerabilities.insert("pkg".to_string(), ScanOutcome::Vulnerable(dv));
+/// vulnerabilities.insert(vuln_key("pkg"), ScanOutcome::Vulnerable(dv));
 ///
 /// let mut statuses = HashMap::new();
-/// // Keyed with the fix-target suffix a live `check_candidates` call was batched under.
 /// statuses.insert(
-///     "pkg\u{0}fix".to_string(),
+///     vuln_key("pkg"),
 ///     UpgradeStatus::CandidateClean {
 ///         version: "1.2.0".to_string(),
 ///     },
@@ -401,7 +402,7 @@ pub fn collect_fix_target_resolutions(
 ///
 /// apply_live_fix_target_statuses(&mut vulnerabilities, statuses);
 ///
-/// let ScanOutcome::Vulnerable(dv) = vulnerabilities.get("pkg").unwrap() else {
+/// let ScanOutcome::Vulnerable(dv) = vulnerabilities.get(&vuln_key("pkg")).unwrap() else {
 ///     unreachable!()
 /// };
 /// assert_eq!(
@@ -413,15 +414,12 @@ pub fn collect_fix_target_resolutions(
 /// ```
 pub fn apply_live_fix_target_statuses(
     vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
-    statuses: HashMap<String, deps_core::osv::UpgradeStatus>,
+    statuses: HashMap<deps_core::osv::VulnKey, deps_core::osv::UpgradeStatus>,
 ) {
     use deps_core::osv::ScanOutcome;
 
-    for (synthetic_key, status) in statuses {
-        let Some(key) = synthetic_key.strip_suffix(FIX_TARGET_KEY_SUFFIX) else {
-            continue;
-        };
-        if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(key) {
+    for (key, status) in statuses {
+        if let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get_mut(&key) {
             dv.fix_target_status = status;
         }
     }
@@ -438,19 +436,22 @@ pub fn apply_live_fix_target_statuses(
 ///
 /// ```
 /// use deps_core::osv::ScanTarget;
+/// use deps_core::test_util::vuln_key;
 /// use deps_engine::classify::osv::osv_name_by_key;
 ///
 /// let targets = vec![ScanTarget::new(
-///     "serde".to_string(),
+///     vuln_key("serde"),
 ///     "serde".to_string(),
 ///     "1.0.0".to_string(),
 ///     "1.0.0".to_string(),
 /// )];
 /// let map = osv_name_by_key(&targets);
-/// assert_eq!(map.get("serde").map(String::as_str), Some("serde"));
+/// assert_eq!(map.get(&vuln_key("serde")).map(String::as_str), Some("serde"));
 /// ```
 #[must_use]
-pub fn osv_name_by_key(targets: &[deps_core::osv::ScanTarget]) -> HashMap<String, String> {
+pub fn osv_name_by_key(
+    targets: &[deps_core::osv::ScanTarget],
+) -> HashMap<deps_core::osv::VulnKey, String> {
     targets
         .iter()
         .map(|t| (t.key.clone(), t.osv_name.clone()))
@@ -560,7 +561,7 @@ mod tests {
             );
             assert!(targets.is_empty());
             assert_matches!(
-                skipped.get("time"),
+                skipped.get(&deps_core::test_util::vuln_key("time")),
                 Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
             );
         }
@@ -754,7 +755,7 @@ mod tests {
             // `normalize_package_name`, unlike `osv_package_name` (which strips the
             // scheme only for `npm:` and returns `None` for everything else).
             assert_matches!(
-                skipped.get("jsr:@std/fs"),
+                skipped.get(&deps_core::test_util::vuln_key("jsr:@std/fs")),
                 Some(ScanOutcome::Skipped(SkipReason::UnmappableName))
             );
         }
@@ -843,7 +844,7 @@ mod tests {
             );
             assert!(targets.is_empty());
             assert_matches!(
-                skipped.get("serde"),
+                skipped.get(&deps_core::test_util::vuln_key("serde")),
                 Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
             );
         }
@@ -868,7 +869,7 @@ mod tests {
             );
             assert!(targets.is_empty());
             assert_matches!(
-                skipped.get("serde"),
+                skipped.get(&deps_core::test_util::vuln_key("serde")),
                 Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
             );
         }
@@ -911,7 +912,7 @@ mod tests {
                 );
                 assert!(targets.is_empty(), "{source:?} must be skipped (step 0)");
                 assert_matches!(
-                    skipped.get("pkg"),
+                    skipped.get(&deps_core::test_util::vuln_key("pkg")),
                     Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
                 );
             }
@@ -954,14 +955,14 @@ mod tests {
             );
 
             assert_eq!(targets.len(), 1);
-            assert_eq!(targets[0].key, "concrete");
+            assert_eq!(targets[0].key.as_str(), "concrete");
             assert_eq!(skipped.len(), 2);
             assert_matches!(
-                skipped.get("range-only"),
+                skipped.get(&deps_core::test_util::vuln_key("range-only")),
                 Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
             );
             assert_matches!(
-                skipped.get("git-dep"),
+                skipped.get(&deps_core::test_util::vuln_key("git-dep")),
                 Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource))
             );
         }
@@ -1172,7 +1173,7 @@ mod tests {
             let dv = dv(vec![advisory("A1", &[])], UpgradeStatus::NotChecked);
             let resolution = resolve_fix_target(
                 &dv,
-                "pkg",
+                &deps_core::test_util::vuln_key("pkg"),
                 &HashMap::new(),
                 &HashMap::new(),
                 &StubFormatter::DEFAULT,
@@ -1189,11 +1190,11 @@ mod tests {
             };
             let dv = dv(vec![advisory("A1", &["1.2.0"])], latest_status.clone());
             let mut latest_native_by_key = HashMap::new();
-            latest_native_by_key.insert("pkg".to_string(), "1.2.0".to_string());
+            latest_native_by_key.insert(deps_core::test_util::vuln_key("pkg"), "1.2.0".to_string());
 
             let resolution = resolve_fix_target(
                 &dv,
-                "pkg",
+                &deps_core::test_util::vuln_key("pkg"),
                 &latest_native_by_key,
                 &HashMap::new(),
                 &StubFormatter::DEFAULT,
@@ -1214,13 +1215,13 @@ mod tests {
                 },
             );
             let mut latest_native_by_key = HashMap::new();
-            latest_native_by_key.insert("pkg".to_string(), "3.0.0".to_string());
+            latest_native_by_key.insert(deps_core::test_util::vuln_key("pkg"), "3.0.0".to_string());
             let mut osv_name_by_key = HashMap::new();
-            osv_name_by_key.insert("pkg".to_string(), "pkg".to_string());
+            osv_name_by_key.insert(deps_core::test_util::vuln_key("pkg"), "pkg".to_string());
 
             let resolution = resolve_fix_target(
                 &dv,
-                "pkg",
+                &deps_core::test_util::vuln_key("pkg"),
                 &latest_native_by_key,
                 &osv_name_by_key,
                 &StubFormatter::DEFAULT,
@@ -1228,7 +1229,7 @@ mod tests {
             assert_eq!(
                 resolution,
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
-                    format!("pkg{FIX_TARGET_KEY_SUFFIX}"),
+                    deps_core::test_util::vuln_key("pkg"),
                     "pkg".to_string(),
                     "1.2.0".to_string(),
                     "1.2.0".to_string(),
@@ -1244,7 +1245,7 @@ mod tests {
             let dv = dv(vec![advisory("A1", &["1.0.0"])], UpgradeStatus::NotChecked);
             let resolution = resolve_fix_target(
                 &dv,
-                "pkg",
+                &deps_core::test_util::vuln_key("pkg"),
                 &HashMap::new(),
                 &HashMap::new(),
                 &StubFormatter::DEFAULT,
@@ -1264,7 +1265,7 @@ mod tests {
             );
             let resolution = resolve_fix_target(
                 &dv,
-                "pkg",
+                &deps_core::test_util::vuln_key("pkg"),
                 &HashMap::new(),
                 &HashMap::new(),
                 &StubFormatter::DEFAULT,
@@ -1282,7 +1283,7 @@ mod tests {
             // into a single prospective `check_candidates` call rather than one per dependency.
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
-                "reused".to_string(),
+                deps_core::test_util::vuln_key("reused"),
                 ScanOutcome::Vulnerable(dv(
                     vec![advisory("A1", &["1.0.0"])],
                     UpgradeStatus::CandidateClean {
@@ -1291,14 +1292,14 @@ mod tests {
                 )),
             );
             vulnerabilities.insert(
-                "live-a".to_string(),
+                deps_core::test_util::vuln_key("live-a"),
                 ScanOutcome::Vulnerable(dv(
                     vec![advisory("A2", &["1.2.0"])],
                     UpgradeStatus::NotChecked,
                 )),
             );
             vulnerabilities.insert(
-                "live-b".to_string(),
+                deps_core::test_util::vuln_key("live-b"),
                 ScanOutcome::Vulnerable(dv(
                     vec![advisory("A3", &["2.2.0"])],
                     UpgradeStatus::NotChecked,
@@ -1306,18 +1307,36 @@ mod tests {
             );
 
             let vulnerable_keys = vec![
-                "reused".to_string(),
-                "live-a".to_string(),
-                "live-b".to_string(),
+                deps_core::test_util::vuln_key("reused"),
+                deps_core::test_util::vuln_key("live-a"),
+                deps_core::test_util::vuln_key("live-b"),
             ];
             let mut latest_native_by_key = HashMap::new();
-            latest_native_by_key.insert("reused".to_string(), "1.0.0".to_string());
-            latest_native_by_key.insert("live-a".to_string(), "9.0.0".to_string());
-            latest_native_by_key.insert("live-b".to_string(), "9.0.0".to_string());
+            latest_native_by_key.insert(
+                deps_core::test_util::vuln_key("reused"),
+                "1.0.0".to_string(),
+            );
+            latest_native_by_key.insert(
+                deps_core::test_util::vuln_key("live-a"),
+                "9.0.0".to_string(),
+            );
+            latest_native_by_key.insert(
+                deps_core::test_util::vuln_key("live-b"),
+                "9.0.0".to_string(),
+            );
             let mut osv_name_by_key = HashMap::new();
-            osv_name_by_key.insert("reused".to_string(), "reused".to_string());
-            osv_name_by_key.insert("live-a".to_string(), "live-a".to_string());
-            osv_name_by_key.insert("live-b".to_string(), "live-b".to_string());
+            osv_name_by_key.insert(
+                deps_core::test_util::vuln_key("reused"),
+                "reused".to_string(),
+            );
+            osv_name_by_key.insert(
+                deps_core::test_util::vuln_key("live-a"),
+                "live-a".to_string(),
+            );
+            osv_name_by_key.insert(
+                deps_core::test_util::vuln_key("live-b"),
+                "live-b".to_string(),
+            );
 
             let (resolved, live_check_candidates) = collect_fix_target_resolutions(
                 &vulnerabilities,
@@ -1328,15 +1347,15 @@ mod tests {
             );
 
             assert_eq!(resolved.len(), 1, "{resolved:?}");
-            assert_eq!(resolved[0].0, "reused");
+            assert_eq!(resolved[0].0.as_str(), "reused");
 
             assert_eq!(live_check_candidates.len(), 2, "{live_check_candidates:?}");
             let keys: std::collections::HashSet<&str> = live_check_candidates
                 .iter()
                 .map(|t| t.key.as_str())
                 .collect();
-            assert!(keys.contains(format!("live-a{FIX_TARGET_KEY_SUFFIX}").as_str()));
-            assert!(keys.contains(format!("live-b{FIX_TARGET_KEY_SUFFIX}").as_str()));
+            assert!(keys.contains("live-a"));
+            assert!(keys.contains("live-b"));
         }
 
         #[test]
@@ -1347,14 +1366,14 @@ mod tests {
             // arrive gets it applied.
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
-                "checked".to_string(),
+                deps_core::test_util::vuln_key("checked"),
                 ScanOutcome::Vulnerable(dv(
                     vec![advisory("A1", &["1.0.0"])],
                     UpgradeStatus::NotChecked,
                 )),
             );
             vulnerabilities.insert(
-                "timed-out".to_string(),
+                deps_core::test_util::vuln_key("timed-out"),
                 ScanOutcome::Vulnerable(dv(
                     vec![advisory("A2", &["1.0.0"])],
                     UpgradeStatus::NotChecked,
@@ -1363,7 +1382,7 @@ mod tests {
 
             let mut statuses = HashMap::new();
             statuses.insert(
-                format!("checked{FIX_TARGET_KEY_SUFFIX}"),
+                deps_core::test_util::vuln_key("checked"),
                 UpgradeStatus::CandidateClean {
                     version: "1.0.0".to_string(),
                 },
@@ -1372,7 +1391,10 @@ mod tests {
 
             apply_live_fix_target_statuses(&mut vulnerabilities, statuses);
 
-            let ScanOutcome::Vulnerable(checked) = vulnerabilities.get("checked").unwrap() else {
+            let ScanOutcome::Vulnerable(checked) = vulnerabilities
+                .get(&deps_core::test_util::vuln_key("checked"))
+                .unwrap()
+            else {
                 panic!("expected Vulnerable");
             };
             assert_eq!(
@@ -1382,7 +1404,9 @@ mod tests {
                 }
             );
 
-            let ScanOutcome::Vulnerable(timed_out) = vulnerabilities.get("timed-out").unwrap()
+            let ScanOutcome::Vulnerable(timed_out) = vulnerabilities
+                .get(&deps_core::test_util::vuln_key("timed-out"))
+                .unwrap()
             else {
                 panic!("expected Vulnerable");
             };

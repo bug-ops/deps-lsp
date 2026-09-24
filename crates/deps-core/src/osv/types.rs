@@ -35,21 +35,22 @@ use crate::lsp_helpers::is_safe_version_string;
 ///
 /// ```
 /// use deps_core::osv::ScanTarget;
+/// use deps_core::test_util::vuln_key;
 ///
 /// let target = ScanTarget::new(
-///     "time".to_string(),
+///     vuln_key("time"),
 ///     "time".to_string(),
 ///     "0.1.43".to_string(),
 ///     "0.1.43".to_string(),
 /// );
-/// assert_eq!(target.key, target.osv_name);
+/// assert_eq!(target.key.as_str(), target.osv_name);
 /// ```
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, crate::redact_debug::RedactingDebug)]
 pub struct ScanTarget {
     /// This project's internal lookup key — used to key [`VulnerabilityMap`].
     #[redact(key)]
-    pub key: String,
+    pub key: VulnKey,
     /// OSV's canonical package name for this ecosystem — sent on the wire.
     #[redact(key)]
     pub osv_name: String,
@@ -83,7 +84,7 @@ impl ScanTarget {
     /// * `display_version` - The same version in the ecosystem's native spelling, for
     ///   surfacing back to the user instead of `version`
     #[must_use]
-    pub fn new(key: String, osv_name: String, version: String, display_version: String) -> Self {
+    pub fn new(key: VulnKey, osv_name: String, version: String, display_version: String) -> Self {
         Self {
             key,
             osv_name,
@@ -95,13 +96,13 @@ impl ScanTarget {
 
 #[cfg(test)]
 mod scan_target_debug_redaction_tests {
-    use super::ScanTarget;
+    use super::{ScanTarget, VulnKey};
 
     crate::debug_redaction_conformance!(
         test_scan_target_debug_redacts_credentials,
         2,
         ScanTarget {
-            key: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            key: VulnKey(crate::conformance::CREDENTIAL_PROBE_KEY.into()),
             osv_name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
             version: "1.0.0".to_string(),
             display_version: "1.0.0".to_string(),
@@ -833,16 +834,11 @@ pub enum ScanOutcome {
     Vulnerable(DependencyVulnerabilities),
 }
 
-/// Per-scan result map.
+/// Per-scan result map, keyed by [`VulnKey`].
 ///
-/// Normally keyed by the normalized dependency name
-/// (`EcosystemFormatter::normalize_package_name` — the same key
-/// [`crate::lsp_helpers::generate_diagnostics_from_cache`] and
-/// [`crate::lsp_helpers::generate_hover`] already use to look up
-/// `cached`/`resolved` versions), but see [`vulnerability_keys`] for the
-/// version-qualified form a duplicated dependency name's occurrences use.
-// TODO(#1413): key VulnerabilityMap by VulnKey instead of String.
-pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
+/// See [`vulnerability_keys`] for how a key is derived — normally the normalized dependency
+/// name, but version-qualified for a duplicated dependency name's ambiguous occurrences.
+pub type VulnerabilityMap = HashMap<VulnKey, ScanOutcome>;
 
 /// A single occurrence's [`VulnerabilityMap`] lookup key, as computed by [`vulnerability_keys`]
 /// or [`vuln_key_for`].
@@ -850,8 +846,8 @@ pub type VulnerabilityMap = HashMap<String, ScanOutcome>;
 /// A newtype rather than a bare `String` so a key value is never silently interchangeable
 /// with a plain declared or normalized package name at a call site — see [`VulnKeys`] for why
 /// that distinction is the point of this whole type pair. Deliberately has no `Borrow<str>`
-/// impl: that is only useful once a type is used as a map key itself, which
-/// [`VulnerabilityMap`] does not yet do (`#1413`).
+/// impl: that would let a caller look `VulnerabilityMap` up by a raw `&str`, reopening the
+/// exact bug class this type closes (#1413).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VulnKey(String);
 
@@ -862,11 +858,17 @@ impl VulnKey {
         &self.0
     }
 
-    /// Consumes this key, returning the owned `String` a [`VulnerabilityMap`] producer
-    /// inserts under (`#1413`: the map itself is not yet keyed by `VulnKey`).
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
+    /// Builds a key directly from an already-computed name, for `deps-core`-internal fallback
+    /// construction (e.g. [`crate::lsp_helpers::resolve_scan_outcome`]'s normalized/declared-name
+    /// lookups) where going through [`vuln_key_for`] would require a full [`crate::Dependency`].
+    pub(crate) fn from_name(name: String) -> Self {
+        Self(name)
+    }
+}
+
+impl AsRef<str> for VulnKey {
+    fn as_ref(&self) -> &str {
+        &self.0
     }
 }
 
@@ -884,11 +886,16 @@ impl std::fmt::Display for VulnKey {
 /// [`vuln_key_for`] and [`crate::lsp_helpers::resolve_scan_outcome`] may read an entry, which
 /// makes a forgotten normalized-name/declared-name fallback impossible for any caller outside
 /// `deps-core` — the exact bug class (four independently hand-written copies of the same
-/// 3-step chain) issue #1400 closes on the read-by-range side. This guarantees the
-/// range-to-key *rule* only, not full [`VulnerabilityMap`] key typing: the map itself stays a
-/// plain `HashMap<String, ScanOutcome>` in this PR (`#1413`), so a producer or consumer that
-/// bypasses [`vuln_key_for`]/[`crate::lsp_helpers::resolve_scan_outcome`] entirely (e.g. a raw
-/// `vulnerabilities.insert(some_other_string, ..)`) is not prevented by this type.
+/// 3-step chain) issue #1400 closes on the read-by-range side. Combined with
+/// [`VulnerabilityMap`] itself being keyed by `VulnKey` (#1413), a producer or consumer can no
+/// longer bypass [`vuln_key_for`]/[`crate::lsp_helpers::resolve_scan_outcome`] with a raw
+/// string insert/lookup — the type system rejects it at the call site.
+///
+/// One caveat survives the re-key: a dependency with a synthetic
+/// [`name_range`](crate::Dependency::name_range) has no entry here — [`vulnerability_keys`]
+/// excludes it deliberately, since a synthetic range is not a stable per-occurrence position —
+/// so it falls back to [`vuln_key_for`]'s plain normalized-name key. Two or more synthetic-range
+/// occurrences that share a name therefore still share one [`VulnerabilityMap`] entry.
 #[derive(Debug, Clone, Default)]
 pub struct VulnKeys(HashMap<crate::position::Range, VulnKey>);
 

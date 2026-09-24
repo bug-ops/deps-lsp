@@ -3956,7 +3956,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "serde".to_string(),
+            crate::test_util::vuln_key("serde"),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
 
@@ -4003,7 +4003,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            CREDENTIAL_SHAPED_NAME.to_string(),
+            crate::test_util::vuln_key(CREDENTIAL_SHAPED_NAME),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
 
@@ -4059,7 +4059,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "serde".to_string(),
+            crate::test_util::vuln_key("serde"),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
 
@@ -4105,7 +4105,7 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "path-pkg".to_string(),
+            crate::test_util::vuln_key("path-pkg"),
             ScanOutcome::Skipped(SkipReason::NonRegistrySource),
         );
 
@@ -4157,11 +4157,11 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "jsr-pkg".to_string(),
+            crate::test_util::vuln_key("jsr-pkg"),
             ScanOutcome::Skipped(SkipReason::UnmappableName),
         );
         vulns.insert(
-            "unmapped-eco-pkg".to_string(),
+            crate::test_util::vuln_key("unmapped-eco-pkg"),
             ScanOutcome::Skipped(SkipReason::UnmappableEcosystem),
         );
 
@@ -4214,11 +4214,11 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "pkg-a".to_string(),
+            crate::test_util::vuln_key("pkg-a"),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
         vulns.insert(
-            "pkg-b".to_string(),
+            crate::test_util::vuln_key("pkg-b"),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
 
@@ -4281,11 +4281,11 @@ mod tests {
         let resolved_versions = HashMap::new();
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "pkg-a".to_string(),
+            crate::test_util::vuln_key("pkg-a"),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
         vulns.insert(
-            "pkg-b".to_string(),
+            crate::test_util::vuln_key("pkg-b"),
             ScanOutcome::Skipped(SkipReason::QueryFailed),
         );
 
@@ -4343,7 +4343,7 @@ mod tests {
         // leftover from a dependency no longer declared in `parse_result`.
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "removed-pkg".to_string(),
+            crate::test_util::vuln_key("removed-pkg"),
             ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
         );
 
@@ -4386,7 +4386,10 @@ mod tests {
                 version_range: Range::new(Position::new(i, 10), Position::new(i, 20)),
                 name_range: Range::new(Position::new(i, 0), Position::new(i, 5)),
             });
-            vulns.insert(name, ScanOutcome::Skipped(SkipReason::NoConcreteVersion));
+            vulns.insert(
+                crate::test_util::vuln_key(&name),
+                ScanOutcome::Skipped(SkipReason::NoConcreteVersion),
+            );
         }
         let parse_result = MockParseResult {
             deps,
@@ -6371,7 +6374,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "vulnerable-pkg".to_string(),
+            crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
@@ -6419,7 +6422,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "vulnerable-pkg".to_string(),
+            crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
@@ -6497,7 +6500,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "vulnerable-pkg".to_string(),
+            crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -6550,7 +6553,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "vulnerable-pkg".to_string(),
+            crate::test_util::vuln_key("vulnerable-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
@@ -6623,7 +6626,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "bad-pkg".to_string(),
+            crate::test_util::vuln_key("bad-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![advisory], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -6679,7 +6682,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "noisy-pkg".to_string(),
+            crate::test_util::vuln_key("noisy-pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(advisories, 40),
                 fix_target_status: UpgradeStatus::NotChecked,
@@ -6758,7 +6761,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            vulnerable_key.into_string(),
+            vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
@@ -6768,7 +6771,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(patched_key.into_string(), ScanOutcome::Clean);
+        vulns.insert(patched_key, ScanOutcome::Clean);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6862,7 +6865,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            current_key.into_string(),
+            current_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
@@ -6872,7 +6875,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(renamed_key.into_string(), ScanOutcome::Clean);
+        vulns.insert(renamed_key, ScanOutcome::Clean);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6918,7 +6921,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            "git-pkg".to_string(),
+            crate::test_util::vuln_key("git-pkg"),
             ScanOutcome::Skipped(SkipReason::NonRegistrySource),
         );
 

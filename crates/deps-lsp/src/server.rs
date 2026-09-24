@@ -2660,11 +2660,10 @@ mod tests {
         // rather than assumed complete the instant the call above returns.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                if backend
-                    .state
-                    .get_document(&alpha_uri)
-                    .is_some_and(|d| d.vulnerabilities.contains_key("alpha-dep"))
-                {
+                if backend.state.get_document(&alpha_uri).is_some_and(|d| {
+                    d.vulnerabilities
+                        .contains_key(&deps_core::test_util::vuln_key("alpha-dep"))
+                }) {
                     return;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -2675,7 +2674,9 @@ mod tests {
 
         let alpha_doc = backend.state.get_document(&alpha_uri).unwrap();
         assert_matches!(
-            alpha_doc.vulnerabilities.get("alpha-dep"),
+            alpha_doc
+                .vulnerabilities
+                .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource)),
             "alpha-dep's newly-resolved version must trigger a rescan, which commits its \
              (network-free) NonRegistrySource skip outcome"
@@ -2747,7 +2748,7 @@ mod tests {
         // with the correct `NonRegistrySource` outcome.
         let mut stale = VulnerabilityMap::new();
         stale.insert(
-            "alpha-dep".to_string(),
+            deps_core::test_util::vuln_key("alpha-dep"),
             ScanOutcome::Skipped(SkipReason::UnmappableName),
         );
         doc_state.update_vulnerabilities(stale);
@@ -2760,7 +2761,8 @@ mod tests {
 
         let doc = backend.state.get_document(&uri).unwrap();
         assert_matches!(
-            doc.vulnerabilities.get("alpha-dep"),
+            doc.vulnerabilities
+                .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
             "an unchanged resolved version must not trigger a rescan — the stale marker \
              would have been overwritten with NonRegistrySource if it had"
@@ -2824,7 +2826,7 @@ mod tests {
             .insert("alpha-dep".into(), ConcreteVersion::from("0.1.0"));
         let mut existing = VulnerabilityMap::new();
         existing.insert(
-            "alpha-dep".to_string(),
+            deps_core::test_util::vuln_key("alpha-dep"),
             ScanOutcome::Skipped(SkipReason::UnmappableName),
         );
         doc_state.update_vulnerabilities(existing);
@@ -2842,7 +2844,8 @@ mod tests {
              unchanged behavior this fix deliberately does not touch"
         );
         assert_matches!(
-            doc.vulnerabilities.get("alpha-dep"),
+            doc.vulnerabilities
+                .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
             "a lock-file reload error must not trigger an OSV rescan — the stale marker \
              would have been overwritten if it had"
@@ -2904,7 +2907,7 @@ mod tests {
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
         let mut stale = VulnerabilityMap::new();
         stale.insert(
-            "alpha-dep".to_string(),
+            deps_core::test_util::vuln_key("alpha-dep"),
             ScanOutcome::Skipped(SkipReason::UnmappableName),
         );
         doc_state.update_vulnerabilities(stale);
@@ -2933,7 +2936,8 @@ mod tests {
             "resolved_versions must still update regardless of vulnerabilities_enabled"
         );
         assert_matches!(
-            doc.vulnerabilities.get("alpha-dep"),
+            doc.vulnerabilities
+                .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
             "vulnerabilities_enabled = false must suppress the rescan even though the \
              resolved version changed"

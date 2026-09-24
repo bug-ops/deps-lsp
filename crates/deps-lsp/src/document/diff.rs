@@ -570,7 +570,7 @@ time = "0.1.43"
             state.update_document(uri.clone(), doc_state1);
 
             let mut vulns = VulnerabilityMap::new();
-            vulns.insert("time".to_string(), ScanOutcome::Clean);
+            vulns.insert(deps_core::test_util::vuln_key("time"), ScanOutcome::Clean);
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
                 doc.update_vulnerabilities(vulns);
@@ -596,7 +596,11 @@ time = "0.1.43"
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_matches!(doc.vulnerabilities.get("time"), Some(ScanOutcome::Clean));
+            assert_matches!(
+                doc.vulnerabilities
+                    .get(&deps_core::test_util::vuln_key("time")),
+                Some(ScanOutcome::Clean)
+            );
         }
 
         #[tokio::test]

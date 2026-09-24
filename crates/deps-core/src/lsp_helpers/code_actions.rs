@@ -674,7 +674,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
@@ -759,7 +759,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
@@ -834,7 +834,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
@@ -907,7 +907,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -971,7 +971,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1038,7 +1038,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![
@@ -1113,7 +1113,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1168,7 +1168,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1231,7 +1231,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1289,7 +1289,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1461,7 +1461,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1563,7 +1563,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            vulnerable_key.into_string(),
+            vulnerable_key,
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1583,7 +1583,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulnerabilities.insert(patched_key.into_string(), ScanOutcome::Clean);
+        vulnerabilities.insert(patched_key, ScanOutcome::Clean);
 
         let versions = VersionData::new(&cached, &resolved)
             .with_vulnerabilities(&vulnerabilities)
@@ -1644,7 +1644,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1770,7 +1770,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1833,7 +1833,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1899,7 +1899,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -1967,7 +1967,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -2327,7 +2327,7 @@ mod tests {
 
         let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
         vulnerabilities.insert(
-            "pkg".to_string(),
+            crate::test_util::vuln_key("pkg"),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![std::sync::Arc::new(
@@ -2613,7 +2613,7 @@ mod tests {
 
             let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
             vulnerabilities.insert(
-                "serde".to_string(),
+                crate::test_util::vuln_key("serde"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(
@@ -3298,7 +3298,7 @@ mod tests {
 
             let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
             vulnerabilities.insert(
-                "pkg".to_string(),
+                crate::test_util::vuln_key("pkg"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(
@@ -3380,7 +3380,7 @@ mod tests {
 
             let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
             vulnerabilities.insert(
-                "pkg".to_string(),
+                crate::test_util::vuln_key("pkg"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(
@@ -3441,7 +3441,7 @@ mod tests {
 
             let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
             vulnerabilities.insert(
-                "pkg".to_string(),
+                crate::test_util::vuln_key("pkg"),
                 ScanOutcome::Vulnerable(DependencyVulnerabilities {
                     advisories: Capped::new(
                         vec![std::sync::Arc::new(

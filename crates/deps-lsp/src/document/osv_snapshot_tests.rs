@@ -78,7 +78,7 @@ async fn diagnostics_snapshot_for(
 
     let mut vulnerabilities = VulnerabilityMap::new();
     vulnerabilities.insert(
-        normalized_key,
+        deps_core::test_util::vuln_key(&normalized_key),
         ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
             vec![sample_advisory()],
             6,
