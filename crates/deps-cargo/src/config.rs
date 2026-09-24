@@ -400,12 +400,13 @@ const MAX_SOURCE_ENTRIES: usize = 256;
 /// (see [`resolve_source_chain`]).
 fn parse_source_entries_raw(content: &str) -> HashMap<String, SourceEntry> {
     let mut out = HashMap::new();
-    if deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH).is_err() {
-        tracing::warn!("skipping [source] tables: nesting depth exceeds maximum");
-        return out;
-    }
-    let Ok(doc) = toml_span::parse(content) else {
-        return out;
+    let doc = match deps_core::parse_toml_checked(content) {
+        Ok(doc) => doc,
+        Err(deps_core::CheckedTomlError::NestingTooDeep { .. }) => {
+            tracing::warn!("skipping [source] tables: nesting depth exceeds maximum");
+            return out;
+        }
+        Err(deps_core::CheckedTomlError::Syntax(_)) => return out,
     };
     let Some(sources) = doc
         .as_table()
@@ -455,12 +456,13 @@ fn parse_raw_index_field(entry: &Table<'_>) -> Option<String> {
 /// reader can populate one for a workspace-sourced entry even by mistake (plan-1b §1.5(c)).
 fn parse_workspace_registries_raw(content: &str) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    if deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH).is_err() {
-        tracing::warn!("skipping .cargo/config.toml: nesting depth exceeds maximum");
-        return out;
-    }
-    let Ok(doc) = toml_span::parse(content) else {
-        return out;
+    let doc = match deps_core::parse_toml_checked(content) {
+        Ok(doc) => doc,
+        Err(deps_core::CheckedTomlError::NestingTooDeep { .. }) => {
+            tracing::warn!("skipping .cargo/config.toml: nesting depth exceeds maximum");
+            return out;
+        }
+        Err(deps_core::CheckedTomlError::Syntax(_)) => return out,
     };
     let Some(registries) = doc
         .as_table()
@@ -485,12 +487,13 @@ fn parse_workspace_registries_raw(content: &str) -> HashMap<String, String> {
 /// [`AuthToken`], since its input is, by construction, always `$CARGO_HOME`-sourced.
 fn parse_cargo_home_registries_raw(content: &str) -> HashMap<String, (String, Option<AuthToken>)> {
     let mut out = HashMap::new();
-    if deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH).is_err() {
-        tracing::warn!("skipping $CARGO_HOME/config.toml: nesting depth exceeds maximum");
-        return out;
-    }
-    let Ok(doc) = toml_span::parse(content) else {
-        return out;
+    let doc = match deps_core::parse_toml_checked(content) {
+        Ok(doc) => doc,
+        Err(deps_core::CheckedTomlError::NestingTooDeep { .. }) => {
+            tracing::warn!("skipping $CARGO_HOME/config.toml: nesting depth exceeds maximum");
+            return out;
+        }
+        Err(deps_core::CheckedTomlError::Syntax(_)) => return out,
     };
     let Some(registries) = doc
         .as_table()

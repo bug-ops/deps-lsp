@@ -192,19 +192,8 @@ pub fn parse_cargo_toml_with_context(
     doc_uri: &Url,
     ctx: &CargoParseContext,
 ) -> Result<CargoParseResult> {
-    if let Err(depth) =
-        deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
-    {
-        return Err(DepsError::parse_error(
-            "Cargo.toml",
-            &format!(
-                "array/table nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_TOML_NESTING_DEPTH
-            ),
-        ));
-    }
-
-    let doc = toml_span::parse(content).map_err(|e| DepsError::parse_error("Cargo.toml", &e))?;
+    let doc = deps_core::parse_toml_checked(content)
+        .map_err(|e| DepsError::parse_error("Cargo.toml", &e))?;
 
     let line_table = LineOffsetTable::new(content);
     let mut dependencies = Vec::new();
@@ -706,38 +695,30 @@ fn discover_workspace(doc_uri: &Url) -> Result<WorkspaceDiscovery> {
                         &workspace_toml,
                         deps_core::MAX_CACHED_FILE_BYTES,
                     ) {
-                        Ok(Some(content)) => {
-                            if deps_core::check_toml_nesting_depth(
-                                &content,
-                                deps_core::MAX_TOML_NESTING_DEPTH,
-                            )
-                            .is_err()
-                            {
+                        Ok(Some(content)) => match deps_core::parse_toml_checked(&content) {
+                            Ok(doc) => {
+                                if doc
+                                    .as_table()
+                                    .and_then(|t| get_val(t, "workspace"))
+                                    .is_some()
+                                {
+                                    workspace_root = Some(dir.to_path_buf());
+                                }
+                            }
+                            Err(deps_core::CheckedTomlError::NestingTooDeep { .. }) => {
                                 tracing::warn!(
                                     path = %workspace_toml.display(),
                                     "skipping ancestor Cargo.toml during workspace root discovery: nesting depth exceeds maximum"
                                 );
-                            } else {
-                                match toml_span::parse(&content) {
-                                    Ok(doc) => {
-                                        if doc
-                                            .as_table()
-                                            .and_then(|t| get_val(t, "workspace"))
-                                            .is_some()
-                                        {
-                                            workspace_root = Some(dir.to_path_buf());
-                                        }
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            path = %workspace_toml.display(),
-                                            error = %deps_core::net_policy::redact_parse_error_for_log(&e.to_string()),
-                                            "skipping ancestor Cargo.toml during workspace root discovery: TOML parse failed"
-                                        );
-                                    }
-                                }
                             }
-                        }
+                            Err(deps_core::CheckedTomlError::Syntax(e)) => {
+                                tracing::warn!(
+                                    path = %workspace_toml.display(),
+                                    error = %deps_core::net_policy::redact_parse_error_for_log(&e.to_string()),
+                                    "skipping ancestor Cargo.toml during workspace root discovery: TOML parse failed"
+                                );
+                            }
+                        },
                         Ok(None) => {
                             // The stat pre-filter above passed, but the read itself still
                             // hit the cap — a symlink swap or concurrent growth between the

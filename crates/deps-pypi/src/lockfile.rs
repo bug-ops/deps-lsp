@@ -118,23 +118,11 @@ impl LockFileProvider for PypiLockParser {
 /// The CPU-bound half of [`PypiLockParser::parse_lockfile`], run inside
 /// [`deps_core::lockfile::read_and_parse_lockfile`]'s `spawn_blocking`.
 fn parse_pypi_lock(content: String) -> Result<ResolvedPackages> {
-    if let Err(depth) =
-        deps_core::check_toml_nesting_depth(&content, deps_core::MAX_TOML_NESTING_DEPTH)
-    {
-        return Err(DepsError::parse_error(
-            "Python lock file",
-            &format!(
-                "array/table nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_TOML_NESTING_DEPTH
-            ),
-        ));
-    }
-
     // toml_span::Error::Display echoes raw key/table names (see PypiError::reason_for_log's
     // doc) — redacted here (#1228 S3) via `DepsError::parse_error`'s internal
     // `parse_error_source` call.
-    let doc =
-        toml_span::parse(&content).map_err(|e| DepsError::parse_error("Python lock file", &e))?;
+    let doc = deps_core::parse_toml_checked(&content)
+        .map_err(|e| DepsError::parse_error("Python lock file", &e))?;
 
     let mut packages = ResolvedPackages::new();
 

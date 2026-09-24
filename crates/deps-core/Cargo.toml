@@ -64,6 +64,7 @@ tempfile = { workspace = true, optional = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["std", "parsing"] }
 tokio = { workspace = true, features = ["sync", "time", "fs", "net"] }
+toml-span = { workspace = true }
 tower-lsp-server = { workspace = true, optional = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }

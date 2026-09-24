@@ -88,6 +88,9 @@ pub const MAX_TOML_NESTING_DEPTH: usize = 64;
 /// let deep_dotted_key = format!("a{} = 1", ".a".repeat(10));
 /// assert_eq!(check_toml_nesting_depth(&deep_dotted_key, 4), Err(5));
 /// ```
+///
+/// See [`parse_toml_checked`] for the single entry point combining this guard with the
+/// actual `toml-span` parse.
 #[expect(
     clippy::indexing_slicing,
     reason = "every bytes[i] below is preceded by an i < len bounds check (loop condition or \
@@ -199,6 +202,61 @@ pub fn check_toml_nesting_depth(content: &str, max_depth: usize) -> std::result:
     }
 
     Ok(())
+}
+
+/// Error returned by [`parse_toml_checked`]: either `content` nests deeper than
+/// [`MAX_TOML_NESTING_DEPTH`] or `toml-span` itself rejects it as invalid syntax.
+///
+/// Distinct from a bare `toml_span::Error` so callers can branch on "too deep" vs.
+/// "malformed" without string-matching a message.
+#[derive(Debug, thiserror::Error)]
+pub enum CheckedTomlError {
+    /// `content` exceeded [`MAX_TOML_NESTING_DEPTH`] before `toml-span` ever parsed it.
+    #[error("array/table nesting depth {depth} exceeds maximum of {MAX_TOML_NESTING_DEPTH}")]
+    NestingTooDeep {
+        /// The nesting depth reached the instant it exceeded [`MAX_TOML_NESTING_DEPTH`].
+        depth: usize,
+    },
+    /// `content` passed the depth guard but `toml-span` rejected it as invalid TOML.
+    #[error(transparent)]
+    Syntax(#[from] toml_span::Error),
+}
+
+/// Parses `content` as TOML, first rejecting input whose nesting exceeds
+/// [`MAX_TOML_NESTING_DEPTH`] (see that constant's doc for why).
+///
+/// The single shared entry point for every untrusted-TOML parse site in this workspace —
+/// collapses what would otherwise be a per-crate copy of [`check_toml_nesting_depth`] +
+/// `toml_span::parse` into one call.
+///
+/// # Errors
+///
+/// Returns [`CheckedTomlError::NestingTooDeep`] if `content` nests deeper than
+/// [`MAX_TOML_NESTING_DEPTH`], or [`CheckedTomlError::Syntax`] if `toml-span` itself rejects
+/// `content` as invalid TOML.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::parser::{CheckedTomlError, parse_toml_checked};
+///
+/// assert!(parse_toml_checked("a = [1, 2, 3]").is_ok());
+///
+/// let deeply_nested = format!("a = {}1{}", "[".repeat(100), "]".repeat(100));
+/// assert!(matches!(
+///     parse_toml_checked(&deeply_nested),
+///     Err(CheckedTomlError::NestingTooDeep { .. })
+/// ));
+///
+/// assert!(matches!(parse_toml_checked("a = "), Err(CheckedTomlError::Syntax(_))));
+/// ```
+pub fn parse_toml_checked(
+    content: &str,
+) -> std::result::Result<toml_span::Value<'_>, CheckedTomlError> {
+    if let Err(depth) = check_toml_nesting_depth(content, MAX_TOML_NESTING_DEPTH) {
+        return Err(CheckedTomlError::NestingTooDeep { depth });
+    }
+    Ok(toml_span::parse(content)?)
 }
 
 /// Advances past a single-line TOML string (`"..."` or `'...'`), returning
@@ -1520,6 +1578,44 @@ cpu_load = 3.14
             "]".repeat(5)
         );
         assert_eq!(check_toml_nesting_depth(&content, 4), Err(5));
+    }
+
+    #[test]
+    fn test_parse_toml_checked_valid_document_ok() {
+        let content = "a = [1, 2, { b = 3 }]";
+        assert!(parse_toml_checked(content).is_ok());
+    }
+
+    #[test]
+    fn test_parse_toml_checked_over_depth_reports_nesting_too_deep() {
+        let bracket_count = MAX_TOML_NESTING_DEPTH + 1;
+        let content = format!(
+            "a = {}1{}",
+            "[".repeat(bracket_count),
+            "]".repeat(bracket_count)
+        );
+        let err = parse_toml_checked(&content).unwrap_err();
+        assert!(matches!(
+            err,
+            CheckedTomlError::NestingTooDeep { depth } if depth == bracket_count
+        ));
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "array/table nesting depth {bracket_count} exceeds maximum of {MAX_TOML_NESTING_DEPTH}"
+            )
+        );
+    }
+
+    #[test]
+    fn test_parse_toml_checked_syntax_error_matches_raw_toml_span_error() {
+        let content = "a = ";
+        let err = parse_toml_checked(content).unwrap_err();
+        assert!(matches!(err, CheckedTomlError::Syntax(_)));
+        assert_eq!(
+            err.to_string(),
+            toml_span::parse(content).unwrap_err().to_string()
+        );
     }
 
     /// Builds `n` lines of block mapping, each one column deeper than the

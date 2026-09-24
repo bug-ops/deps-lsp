@@ -1213,6 +1213,7 @@ jobs:
         target:
           - parser_checks
           - parse_json_checked
+          - parse_toml_checked
           - json_ast
           - bundler_parser
           - go_parser

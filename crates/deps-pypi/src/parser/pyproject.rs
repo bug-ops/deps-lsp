@@ -91,23 +91,13 @@ impl PypiParser {
         uri: &Url,
         policy: &RegistryAccessPolicy,
     ) -> Result<ParseResult> {
-        if let Err(depth) =
-            deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
-        {
-            return Err(crate::error::PypiError::TomlParseError {
-                message: format!(
-                    "array/table nesting depth {depth} exceeds maximum of {}",
-                    deps_core::MAX_TOML_NESTING_DEPTH
-                ),
-            });
-        }
-
         // toml_span::Error::Display echoes raw key/table names (see PypiError::reason_for_log's
         // doc) — redacted here (#1228 M5).
-        let doc =
-            toml_span::parse(content).map_err(|e| crate::error::PypiError::TomlParseError {
+        let doc = deps_core::parse_toml_checked(content).map_err(|e| {
+            crate::error::PypiError::TomlParseError {
                 message: super::truncate_for_log(&e.to_string()).into_owned(),
-            })?;
+            }
+        })?;
 
         let line_table = LineOffsetTable::new(content);
         let mut dependencies = Vec::new();

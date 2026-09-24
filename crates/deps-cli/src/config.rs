@@ -156,8 +156,8 @@ pub enum ConfigError {
         /// {error}")` straight to stderr/CI logs. Storing the already-redacted text (instead of
         /// the raw `toml_span::Error`) means every consumer of this variant is safe by
         /// construction, not just the current call site. Also used for
-        /// [`deps_core::check_toml_nesting_depth`]'s own message (#1403) when `content` exceeds
-        /// [`deps_core::MAX_TOML_NESTING_DEPTH`] before `toml_span::parse` ever runs.
+        /// [`deps_core::parse_toml_checked`]'s `NestingTooDeep` message (#1403) when `content`
+        /// exceeds [`deps_core::MAX_TOML_NESTING_DEPTH`] before `toml_span::parse` ever runs.
         message: String,
     },
     /// `path` parsed as TOML but does not match [`CliConfig`]'s schema (an unknown top-level
@@ -339,25 +339,13 @@ fn ignored_sections(policy: &PolicyConfig) -> Vec<&'static str> {
 
 /// Parses `content` as TOML and deserializes it into [`CliConfig`].
 ///
-/// Goes through `toml_span::parse` (this project's TOML parser of record) and then bridges
-/// the parsed [`toml_span::Value`] into [`CliConfig`] via its `serde::Deserialize` impl
-/// (`toml_span::Value` implements `serde::Serialize` under its own `serde` feature) — so
+/// Goes through [`deps_core::parse_toml_checked`] (this project's TOML parser of record) and
+/// then bridges the parsed [`toml_span::Value`] into [`CliConfig`] via its `serde::Deserialize`
+/// impl (`toml_span::Value` implements `serde::Serialize` under its own `serde` feature) — so
 /// `deps-cli` reuses `PolicyConfig`'s existing `Deserialize` impl instead of writing a
 /// second, `toml_span::Deserialize`-based one.
 fn parse(content: &str, path: &Path) -> Result<CliConfig, ConfigError> {
-    if let Err(depth) =
-        deps_core::check_toml_nesting_depth(content, deps_core::MAX_TOML_NESTING_DEPTH)
-    {
-        return Err(ConfigError::Toml {
-            path: path.to_path_buf(),
-            message: format!(
-                "array/table nesting depth {depth} exceeds maximum of {}",
-                deps_core::MAX_TOML_NESTING_DEPTH
-            ),
-        });
-    }
-
-    let value = toml_span::parse(content).map_err(|source| ConfigError::Toml {
+    let value = deps_core::parse_toml_checked(content).map_err(|source| ConfigError::Toml {
         path: path.to_path_buf(),
         message: deps_core::net_policy::redact_parse_error_for_log(&source.to_string())
             .into_owned(),
