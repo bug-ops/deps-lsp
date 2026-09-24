@@ -1,14 +1,16 @@
 //! Dependency diffing and cache reconciliation between successive
 //! parses of a manifest.
 
-use super::state::DocumentState;
+use super::state::{DocumentState, ServerState};
 use deps_core::ConcreteVersion;
 use deps_core::Dependency;
+use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::FetchFailure;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use std::collections::{HashMap, HashSet};
+use tower_lsp_server::ls_types::Uri;
 
 /// Preserves cached version data from old document state to new state.
 /// Called during document updates to avoid re-fetching versions for unchanged deps.
@@ -234,6 +236,72 @@ pub(crate) fn resolved_versions_changed(
     })
 }
 
+/// Writes a freshly-reloaded `resolved_versions`/`resolved_version_candidates` pair into
+/// `uri`'s document and bumps `resolved_versions_generation` when a rescan is warranted —
+/// shared by `server::handle_lockfile_change` and
+/// `document::lifecycle::run_document_change_task` (issue #1398/#1399 code review: keeps
+/// their drift-detection-and-write sequence from silently diverging, exactly the bug class
+/// #1398/#1399 themselves exist to close).
+///
+/// `detect_drift` gates whether [`resolved_versions_changed`] runs at all (each caller passes
+/// its own precondition — `vulnerabilities_enabled` plus, for the lock-file-watcher path,
+/// `lockfile_reload_ok`). `own_trigger` is a caller-specific rescan signal independent of the
+/// lock-file drift check (the debounced-edit path's diff-level `needs_osv_rescan`; the
+/// lock-file-watcher path has none, so it always passes `false`). Returns whether drift was
+/// detected (`false` whenever `detect_drift` is `false`, without running the comparison).
+///
+/// The drift comparison runs under a *shared* read lock on the document (via
+/// [`ServerState::with_document`]), not the exclusive lock the write below needs — issue
+/// #1399 code-review finding: [`resolved_versions_changed`] allocates and compares once per
+/// dependency, which would otherwise hold an exclusive DashMap shard lock (blocking every
+/// other document sharing that shard, including concurrent hover/completion reads) for the
+/// duration. The write itself (unconditional map replace, conditional generation bump) still
+/// happens under one exclusive lock acquisition, so `resolved_versions` and
+/// `resolved_versions_generation` can never desync relative to *this* call's own write — a
+/// concurrent writer for the same URI landing between the read and the write can only make
+/// this call's drift verdict imprecise, a narrow, already-tolerated window (see
+/// `server::handle_lockfile_change`'s critic M4 "Known limitation" comment for the same class
+/// of tolerated staleness), never violate that invariant.
+pub(crate) fn reload_resolved_versions(
+    uri: &Uri,
+    state: &ServerState,
+    ecosystem: &dyn Ecosystem,
+    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    detect_drift: bool,
+    own_trigger: bool,
+) -> bool {
+    let lock_changed = detect_drift
+        && state
+            .with_document(uri, |doc| {
+                doc.parse_result().is_some_and(|parse_result| {
+                    let deps = parse_result.dependencies();
+                    resolved_versions_changed(
+                        &deps,
+                        &doc.resolved_versions,
+                        &doc.resolved_version_candidates,
+                        resolved_versions,
+                        resolved_version_candidates,
+                        ecosystem.formatter(),
+                        ecosystem.ecosystem_id(),
+                    )
+                })
+            })
+            .unwrap_or(false);
+
+    if let Some(mut doc) = state.documents.get_mut(uri) {
+        doc.set_resolved_versions_without_bump(
+            resolved_versions.clone(),
+            resolved_version_candidates.clone(),
+        );
+        if own_trigger || lock_changed {
+            doc.bump_resolved_generation(state.next_resolved_versions_generation());
+        }
+    }
+
+    lock_changed
+}
+
 // The single `incremental_fetch_tests` module below is gated on `feature = "cargo"` (it
 // parses Cargo.toml manifests), and it is `mod tests`'s only content — so these imports (used
 // exclusively by that module) are unused, and this whole module unreachable, without it.
@@ -437,8 +505,8 @@ serde = "1.0"
                 );
                 doc.resolved_versions_generation
             };
-            assert_ne!(
-                generation_before, 0,
+            assert!(
+                !generation_before.is_initial(),
                 "the bump above must have taken effect"
             );
 

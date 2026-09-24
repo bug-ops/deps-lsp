@@ -44,6 +44,50 @@ const FETCH_PERMITS: usize = 4;
 
 pub use deps_core::LoadingState;
 
+/// Opaque, server-global generation token for [`DocumentState::resolved_versions_generation`]
+/// (issue #1398). Its only constructor is [`ServerState::next_resolved_versions_generation`] —
+/// unlike the `u64` it replaces, there is no public or `pub(crate)` way to mint an arbitrary
+/// value, so a call site can no longer pass a literal stand-in (e.g. `1`) that silently defeats
+/// the staleness guard [`super::osv_scan::run_osv_phase_b_and_commit`] relies on.
+///
+/// Every fresh or `did_close`-reopened [`DocumentState`] starts at [`Self::INITIAL`], since the
+/// counter behind `next_resolved_versions_generation` starts at 1 and never produces it — so two
+/// independent `DocumentState` instances can briefly share this one value. That is safe today only
+/// because the one OSV rescan that deliberately survives a `did_close`
+/// (`document::osv_scan::rescan_after_resolved_version_change`) always runs after a real bump; if
+/// that invariant ever changes, `INITIAL` stops being a safe shared default. It is additionally
+/// safe against a `did_close`+`did_open` racing in *after* that bump but before the rescan's
+/// phase A actually reads the document: phase A snapshots whatever generation the (possibly
+/// freshly reopened, possibly still-`INITIAL`) document holds at that moment, so its own commit
+/// is always self-consistent with the snapshot it took, never with a stale, pre-reopen value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedGeneration(u64);
+
+impl ResolvedGeneration {
+    /// Shared starting value for every fresh/reopened [`DocumentState`] — see the type's own
+    /// doc for why sharing this one value across instances is safe. Never produced by
+    /// [`ServerState::next_resolved_versions_generation`]'s counter, which starts at 1.
+    ///
+    /// Private (issue #1398 impl-critic S1): a `pub(crate)` constant would itself be exactly
+    /// the mintable literal/default stand-in this type exists to forbid — any in-crate code
+    /// could pass `ResolvedGeneration::INITIAL` to [`Self::bump_resolved_generation`] the same
+    /// way the old `u64` let a call site pass a bare `1`. A test that needs to assert on this
+    /// value uses the test-only `is_initial` instead of naming the constant.
+    const INITIAL: Self = Self(0);
+
+    /// Test-only: whether `self` is the shared starting value every fresh/reopened
+    /// [`DocumentState`] begins at (issue #1398 impl-critic S1) — lets a test assert on the
+    /// invariant without gaining a way to construct `Self::INITIAL` itself.
+    ///
+    /// Gated on `feature = "cargo"` in addition to `test`: every current call site is a
+    /// `cargo`-fixture test, so a `--no-default-features` test build (the CI feature-matrix
+    /// `baseline` job) would otherwise see this as dead code under `-D warnings`.
+    #[cfg(all(test, feature = "cargo"))]
+    pub(crate) fn is_initial(self) -> bool {
+        self == Self::INITIAL
+    }
+}
+
 /// State for a single open document.
 ///
 /// Stores the document content, parsed dependency information, and cached
@@ -108,7 +152,7 @@ pub struct DocumentState {
     /// `ServerState::next_resolved_versions_generation` (issue #1395 critic M10), never
     /// incremented from this field's own prior value — see that method's doc for why a
     /// per-document-instance counter is unsafe across a `did_close`/reopen.
-    pub(crate) resolved_versions_generation: u64,
+    pub(crate) resolved_versions_generation: ResolvedGeneration,
     /// OSV.dev scan results, keyed by normalized package name. Empty until
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
@@ -327,7 +371,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             resolved_version_candidates: HashMap::new(),
-            resolved_versions_generation: 0,
+            resolved_versions_generation: ResolvedGeneration::INITIAL,
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
@@ -350,7 +394,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             resolved_version_candidates: HashMap::new(),
-            resolved_versions_generation: 0,
+            resolved_versions_generation: ResolvedGeneration::INITIAL,
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
@@ -395,12 +439,8 @@ impl DocumentState {
     /// out of sync — the same rationale [`PackageVersions::published_at`](deps_core::PackageVersions)
     /// documents for bundling `latest`/`published_at` together.
     ///
-    /// `generation` must come from `ServerState::next_resolved_versions_generation` (issue
-    /// #1395 critic M10) — never a value derived from this document's own prior
-    /// generation (e.g. incrementing it in place). A per-document-instance counter
-    /// restarts at 0 on every `DocumentState` rebuild, including a `did_close` followed by
-    /// a reopen, so it can coincidentally collide with a stale, close-surviving scan's
-    /// earlier snapshot; a server-global, ever-increasing source never repeats.
+    /// `generation` must come from `ServerState::next_resolved_versions_generation` — see
+    /// [`ResolvedGeneration`]'s doc for why an arbitrary value must never be minted instead.
     ///
     /// Always bumps `resolved_versions_generation` (issue #1395 S3) — correct only for a
     /// caller whose own OSV phase A spawn is *unconditional* on this call actually having
@@ -411,11 +451,16 @@ impl DocumentState {
     /// crate-private `set_resolved_versions_without_bump` plus `bump_resolved_generation`
     /// instead, bumping only on the same condition that spawns its own phase A; see those
     /// methods' docs for why (critic N2 and its bidirectional-race follow-up).
-    pub fn update_resolved_versions(
+    ///
+    /// `pub(crate)` (issue #1398): forced by the `private_interfaces` lint once `generation`
+    /// is the `pub(crate)` [`ResolvedGeneration`] type — every real caller already lives
+    /// in-crate, and the two call sites that have no real generation to pass use
+    /// [`Self::set_resolved_versions_without_bump`] instead.
+    pub(crate) fn update_resolved_versions(
         &mut self,
         versions: HashMap<PackageName, ConcreteVersion>,
         candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
-        generation: u64,
+        generation: ResolvedGeneration,
     ) {
         self.set_resolved_versions_without_bump(versions, candidates);
         self.bump_resolved_generation(generation);
@@ -447,12 +492,11 @@ impl DocumentState {
     }
 
     /// Sets [`Self::resolved_versions_generation`] to `generation` (from
-    /// `ServerState::next_resolved_versions_generation`, issue #1395 critic M10 — see
-    /// [`Self::update_resolved_versions`]'s doc for why it must not be derived from this
-    /// document's own prior value), without touching the resolved-version maps — see
+    /// `ServerState::next_resolved_versions_generation` — see [`ResolvedGeneration`]'s doc),
+    /// without touching the resolved-version maps — see
     /// [`Self::set_resolved_versions_without_bump`]'s doc for why this is split out
     /// (issue #1395 critic N2).
-    pub(crate) fn bump_resolved_generation(&mut self, generation: u64) {
+    pub(crate) fn bump_resolved_generation(&mut self, generation: ResolvedGeneration) {
         self.resolved_versions_generation = generation;
     }
 
@@ -970,10 +1014,12 @@ impl ServerState {
     /// `DocumentState` rebuild (including a `did_close` followed by a reopen), so it can
     /// collide with a stale, close-surviving scan's earlier snapshot. See
     /// `resolved_versions_generation_source`'s doc for the full scenario.
-    pub(crate) fn next_resolved_versions_generation(&self) -> u64 {
-        self.resolved_versions_generation_source
-            .fetch_add(1, Ordering::SeqCst)
-            + 1
+    pub(crate) fn next_resolved_versions_generation(&self) -> ResolvedGeneration {
+        ResolvedGeneration(
+            self.resolved_versions_generation_source
+                .fetch_add(1, Ordering::SeqCst)
+                + 1,
+        )
     }
 
     /// Whether the pending coalesced reparse has been waiting at least `max_wait` since it
@@ -2437,7 +2483,8 @@ mod tests {
             let mut resolved = HashMap::new();
             resolved.insert("serde".into(), "1.0.195".into());
 
-            state.update_resolved_versions(resolved, HashMap::new(), 1);
+            let generation = ServerState::new().next_resolved_versions_generation();
+            state.update_resolved_versions(resolved, HashMap::new(), generation);
             assert_eq!(state.resolved_versions.len(), 1);
             assert_eq!(
                 state.resolved_versions.get("serde"),

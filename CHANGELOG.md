@@ -86,8 +86,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: hover and diagnostics now surface a "vulnerability data not checked" signal when the OSV scan skipped a dependency for a non-offline reason (most commonly no resolved/exact version to query), instead of rendering nothing and looking identical to a scanned, clean dependency (resolves #1392) (#1394)
 - **deps-lsp**: `handle_lockfile_change` now re-runs the OSV vulnerability scan for a document whose resolved version newly appeared or changed, instead of leaving `Skipped`/`Clean`/`Vulnerable` results stale after a lock-file-only change (resolves #1395) (#1397)
 - **deps-cli**: an auto-discovered `deps.toml` with excessive array/table nesting now returns a `ConfigError` instead of overflowing the stack (resolves #1403) (#1405)
+- **deps-lsp**: a debounced manifest edit that changes no dependency itself now still re-runs the OSV vulnerability scan when the lock file moved a resolved version underneath it, matching `handle_lockfile_change`'s existing check (resolves #1399) (#1410)
 
 ### Breaking
+- **deps-lsp**: `DocumentState::update_resolved_versions` is no longer public (resolves #1398) (#1410)
 - **deps-core**: `edit::plan_vulnerability_fix` returns `Result<PlannedUpdate, VulnFixSkip>` instead of `Option<PlannedUpdate>`; `edit::fix_target_is_verified` is `pub(crate)` again (part of #1350) (#1361)
 - **deps-cli**: `update::Outcome::Applied` is now a tuple variant carrying `ManifestEdit`; `update::PlannedUpdateItem` no longer has a separate `edit` field (part of #1349) (#1361)
 - **deps-core**: `Ecosystem::generate_hover` and `lsp_helpers::generate_hover` now return the protocol-agnostic `deps_core::hover::Hover` instead of `tower_lsp_server::ls_types::Hover` (resolves #1277) (#1309)
@@ -104,6 +106,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `RequirementResolution::requirement_is_placeholder`'s default implementation now delegates to the shared `requirement_contains_template_placeholder` detector instead of returning `false`; every ecosystem's own override now composes it via `shared || native` or was deleted where it became redundant. The write-path guard is centralized in new `edit::requirement_is_placeholder_for`/`edit::replacement_text` helpers, and the 14 per-crate hand-rolled guards inside `format_version_replacing`/`_for` are removed — a direct call to `format_version_replacing_for` no longer re-checks for a placeholder itself. A downstream `Ecosystem`/`RequirementResolution` implementor relying on the old `false` default now correctly skips a templated placeholder in the write path too (resolves #1391, closes #1390) (#1393)
 
 ### Changed
+- **deps-lsp**: `handle_lockfile_change`'s lock-file-driven OSV rescan is now supervised, logging a panic instead of silently dropping it (resolves #1399) (#1410)
+- **deps-lsp**: diagnostics snapshotting/generation across the open, change, lockfile-change, and pull-diagnostics paths now share one `DiagnosticsSnapshot` type (resolves #1399) (#1410)
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)
 - **deps-core, deps-gitlab-ci**: `impl_parse_result!` collapses its 8 near-identical match arms into one, using `$(...)?` optional-fragment matching; `deps-gitlab-ci`'s hand-written `ParseResult` impl now uses the macro (resolves #985) (#1339)
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-npm**: six of the nine `= 128` diagnostic-value length-cap constants now share one `deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`, removing a duplicate `MAX_MUTABLE_REF_PIN_MESSAGE_VALUE_CHARS` independently declared in two crates (resolves #1278) (#1313)

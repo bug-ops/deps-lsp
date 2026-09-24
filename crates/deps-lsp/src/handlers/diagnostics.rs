@@ -80,6 +80,71 @@ pub(crate) fn document_dependency_count(state: &ServerState, uri: &Uri) -> usize
         .unwrap_or(0)
 }
 
+/// Config values needed to generate and publish diagnostics, snapshotted from `DepsConfig`
+/// once per background task/request so the caller never has to hold the config lock itself
+/// (mirrors `document::lifecycle::ChangeTaskConfig`'s own snapshot-once rationale). Shared by
+/// every diagnostics call site (issue #1399): the three push-path sites —
+/// `document::lifecycle`'s open- and change-path background refreshes and `server.rs`'s
+/// lockfile-change refresh — build one via [`publish_document_diagnostics`], and the
+/// pull-diagnostics path ([`handle_diagnostics`]) builds one directly (overriding only
+/// `severities`, see that function's doc). Replaces five near-identical copies of the same
+/// generate(-then-publish) sequence.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DiagnosticsSnapshot {
+    pub(crate) freshness: deps_core::FreshnessSettings,
+    pub(crate) severities: deps_core::DiagnosticSeverities,
+    pub(crate) offline: bool,
+    pub(crate) fetch_timeout_secs: u64,
+    pub(crate) max_concurrent_fetches: usize,
+}
+
+impl DiagnosticsSnapshot {
+    /// Builds a snapshot from the currently loaded [`DepsConfig`].
+    pub(crate) fn from_config(config: &DepsConfig) -> Self {
+        Self {
+            freshness: config.policy.freshness.to_settings(),
+            severities: config.policy.diagnostics.to_severities(),
+            offline: config.policy.network.offline,
+            fetch_timeout_secs: config.policy.cache.fetch_timeout_secs,
+            max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
+        }
+    }
+}
+
+/// Generates diagnostics for `uri` from `snapshot` and publishes them to `client` — the
+/// generate-then-publish sequence every push-path diagnostics refresh needs (issue #1399):
+/// `document::lifecycle`'s open- and change-path background tasks, and `server.rs`'s
+/// lockfile-change refresh. Not used by the pull-diagnostics path ([`handle_diagnostics`]),
+/// which returns its diagnostics to the caller instead of publishing them.
+///
+/// `dep_count` is not part of `snapshot` because it varies per call site: a manifest-wide
+/// count for a fresh open or a lockfile-change refresh, or a fetch-batch size for a
+/// change-path refresh that only fetched a subset of dependencies — see [`loading_ceiling`]'s
+/// doc for why this matters.
+pub(crate) async fn publish_document_diagnostics(
+    state: &Arc<ServerState>,
+    client: &Client,
+    uri: &Uri,
+    snapshot: &DiagnosticsSnapshot,
+    dep_count: usize,
+) {
+    let ceiling = loading_ceiling(
+        snapshot.fetch_timeout_secs,
+        dep_count,
+        snapshot.max_concurrent_fetches,
+    );
+    let diags = generate_diagnostics_internal(
+        Arc::clone(state),
+        uri,
+        snapshot.freshness,
+        snapshot.severities,
+        snapshot.offline,
+        ceiling,
+    )
+    .await;
+    client.publish_diagnostics(uri.clone(), diags, None).await;
+}
+
 /// Handles diagnostic requests using trait-based delegation.
 #[tracing::instrument(
     skip(state, config, client, full_config),
@@ -103,21 +168,34 @@ pub async fn handle_diagnostics(
         tracing::Span::current().record("ecosystem", ecosystem_id.id());
     }
 
-    // Snapshot before generating diagnostics (Copy value, no lock held across the call)
-    let (freshness, offline, fetch_timeout_secs, max_concurrent_fetches) = {
+    // Snapshot before generating diagnostics (Copy value, no lock held across the call).
+    // Severities come from `config` — the caller's own pre-race `DiagnosticsConfig` snapshot
+    // (issue #227 C1 regression coverage) — rather than a fresh read off `full_config` here,
+    // since this is the one diagnostics call site that must keep observing whichever config
+    // its caller captured before a concurrent `workspace/didChangeConfiguration` write; every
+    // other field is unaffected by that race, so it still comes from `DiagnosticsSnapshot`.
+    let mut snapshot = {
         let full_config = full_config.read().await;
-        (
-            full_config.policy.freshness.to_settings(),
-            full_config.policy.network.offline,
-            full_config.policy.cache.fetch_timeout_secs,
-            full_config.policy.cache.max_concurrent_fetches,
-        )
+        DiagnosticsSnapshot::from_config(&full_config)
     };
-    let dep_count = document_dependency_count(&state, uri);
-    let ceiling = loading_ceiling(fetch_timeout_secs, dep_count, max_concurrent_fetches);
-    let severities = config.to_severities();
+    snapshot.severities = config.to_severities();
 
-    generate_diagnostics_internal(state, uri, freshness, severities, offline, ceiling).await
+    let dep_count = document_dependency_count(&state, uri);
+    let ceiling = loading_ceiling(
+        snapshot.fetch_timeout_secs,
+        dep_count,
+        snapshot.max_concurrent_fetches,
+    );
+
+    generate_diagnostics_internal(
+        state,
+        uri,
+        snapshot.freshness,
+        snapshot.severities,
+        snapshot.offline,
+        ceiling,
+    )
+    .await
 }
 
 /// Internal diagnostic generation without cold start support.
@@ -1116,7 +1194,8 @@ serde = "1.0.0"
             // in-use-version check (#263), not the manifest-requirement check (#247).
             let mut resolved = std::collections::HashMap::new();
             resolved.insert("left-pad".into(), "1.0.1".into());
-            doc_state.update_resolved_versions(resolved, std::collections::HashMap::new(), 1);
+            doc_state
+                .set_resolved_versions_without_bump(resolved, std::collections::HashMap::new());
 
             doc_state.replace_outcomes(deps_core::DependencyOutcomes::new().with_yanked(
                 "left-pad",

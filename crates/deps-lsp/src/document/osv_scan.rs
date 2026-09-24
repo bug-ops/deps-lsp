@@ -2,7 +2,7 @@
 //! phase A/B execution, license pre-fetch, and fix-target
 //! verification.
 
-use super::state::ServerState;
+use super::state::{ResolvedGeneration, ServerState};
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
@@ -49,7 +49,7 @@ pub(crate) struct OsvScanResult {
     /// #1395 critic S3) — `content_snapshot` alone cannot order two phase-A/B pairs whose
     /// resolved-version snapshots differ but whose `content` doesn't (a lock-file-only
     /// reload never touches `content`).
-    resolved_generation: u64,
+    resolved_generation: ResolvedGeneration,
     vulnerabilities: deps_core::osv::VulnerabilityMap,
     /// `key -> osv_name`, needed to build phase B candidates.
     osv_name_by_key: HashMap<String, String>,
@@ -163,7 +163,18 @@ pub(crate) async fn rescan_after_resolved_version_change(
     ecosystem: &Arc<dyn Ecosystem>,
     fetch_timeout_secs: u64,
 ) {
-    // TODO(critic): license prefetch is not refreshed on lockfile-only changes
+    // Issue #1398 critic M2: this is the one OSV rescan that deliberately survives a
+    // `did_close` (see `ResolvedGeneration`'s doc) — its caller (`server::handle_lockfile_change`)
+    // always bumps the generation via a real `next_resolved_versions_generation()` draw before
+    // spawning this. No assert here (impl-critic S2): a `did_close`+`did_open` racing in between
+    // the bump and this function's first poll can legitimately reopen the document at the
+    // shared `INITIAL` value before this runs — phase A snapshots whatever the document holds
+    // when it starts, so a commit against a freshly reopened, still-`INITIAL` document is
+    // self-consistent, not a bug.
+    //
+    // License prefetch is not refreshed on lockfile-only changes: see issue #1407 for why
+    // this isn't a trivial trigger-wiring fix (the commit needs a generation-style
+    // staleness guard first, not just a new call site here).
     let Some(phase_a_result) = run_osv_scan_phase_a(
         uri.clone(),
         Arc::clone(state),

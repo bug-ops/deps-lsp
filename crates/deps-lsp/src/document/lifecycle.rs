@@ -3,7 +3,7 @@
 //! This module provides unified open/change/close handlers that work with
 //! the ecosystem trait architecture, eliminating per-ecosystem duplication.
 
-use super::diff::{DependencyDiff, preserve_cache};
+use super::diff::{DependencyDiff, preserve_cache, reload_resolved_versions};
 use super::fetch::{
     fetch_failure_toast, fetch_registry_versions_for_change, merge_registry_fetch_result,
 };
@@ -138,14 +138,11 @@ pub async fn handle_document_open(
 
     // Read before any OSV request is built, so disabling the feature suppresses the
     // network call itself (FR-011).
-    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
+    let (diagnostics_snapshot, vulnerabilities_enabled) = {
         let cfg = config.read().await;
         (
-            cfg.policy.cache.clone(),
+            diagnostics::DiagnosticsSnapshot::from_config(&cfg),
             cfg.policy.diagnostics.vulnerabilities_enabled,
-            cfg.policy.freshness.to_settings(),
-            cfg.policy.diagnostics.to_severities(),
-            cfg.policy.network.offline,
         )
     };
 
@@ -159,11 +156,8 @@ pub async fn handle_document_open(
             Arc::clone(&state),
             Arc::clone(&ecosystem),
             client.clone(),
-            cache_config,
+            diagnostics_snapshot,
             vulnerabilities_enabled,
-            freshness_settings,
-            diagnostic_severities,
-            offline,
         )
         .instrument(span),
     );
@@ -189,11 +183,8 @@ async fn run_document_open_background_task(
     state: Arc<ServerState>,
     ecosystem: Arc<dyn Ecosystem>,
     client: Client,
-    cache_config: crate::config::CacheConfig,
+    diagnostics_snapshot: diagnostics::DiagnosticsSnapshot,
     vulnerabilities_enabled: bool,
-    freshness_settings: deps_core::freshness::FreshnessSettings,
-    diagnostic_severities: deps_core::DiagnosticSeverities,
-    offline: bool,
 ) {
     tracing::debug!("background task started");
 
@@ -257,7 +248,7 @@ async fn run_document_open_background_task(
                 uri.clone(),
                 Arc::clone(&state),
                 Arc::clone(&ecosystem),
-                cache_config.fetch_timeout_secs,
+                diagnostics_snapshot.fetch_timeout_secs,
             )
             .instrument(tracing::Span::current()),
         )
@@ -274,7 +265,7 @@ async fn run_document_open_background_task(
             uri.clone(),
             Arc::clone(&state),
             Arc::clone(&ecosystem),
-            cache_config.fetch_timeout_secs,
+            diagnostics_snapshot.fetch_timeout_secs,
         )
         .instrument(tracing::Span::current()),
     );
@@ -370,9 +361,9 @@ async fn run_document_open_background_task(
         dep_sources,
         &in_use,
         progress_sender,
-        freshness_settings,
-        cache_config.fetch_timeout_secs,
-        cache_config.max_concurrent_fetches,
+        diagnostics_snapshot.freshness,
+        diagnostics_snapshot.fetch_timeout_secs,
+        diagnostics_snapshot.max_concurrent_fetches,
         minimum_stability.as_deref(),
     )
     .await;
@@ -475,7 +466,7 @@ async fn run_document_open_background_task(
                     &state,
                     ecosystem_id,
                     ecosystem.formatter(),
-                    cache_config.fetch_timeout_secs,
+                    diagnostics_snapshot.fetch_timeout_secs,
                     phase_a_result,
                 )
                 .await;
@@ -490,21 +481,14 @@ async fn run_document_open_background_task(
     await_license_prefetch(Some(license_task)).await;
 
     // Publish diagnostics (may be slower, runs after hints are already visible)
-    let diags = diagnostics::generate_diagnostics_internal(
-        Arc::clone(&state),
+    diagnostics::publish_document_diagnostics(
+        &state,
+        &client,
         &uri,
-        freshness_settings,
-        diagnostic_severities,
-        offline,
-        diagnostics::loading_ceiling(
-            cache_config.fetch_timeout_secs,
-            dep_count,
-            cache_config.max_concurrent_fetches,
-        ),
+        &diagnostics_snapshot,
+        dep_count,
     )
     .await;
-
-    client.publish_diagnostics(uri.clone(), diags, None).await;
 }
 
 /// Parses the freshly-edited manifest content and diffs its dependencies against the
@@ -802,14 +786,11 @@ pub(crate) async fn handle_document_change_guarded(
     }
 
     // Read before any OSV request is built (FR-011).
-    let (cache_config, vulnerabilities_enabled, freshness_settings, diagnostic_severities, offline) = {
+    let (diagnostics_snapshot, vulnerabilities_enabled) = {
         let cfg = config.read().await;
         (
-            cfg.policy.cache.clone(),
+            diagnostics::DiagnosticsSnapshot::from_config(&cfg),
             cfg.policy.diagnostics.vulnerabilities_enabled,
-            cfg.policy.freshness.to_settings(),
-            cfg.policy.diagnostics.to_severities(),
-            cfg.policy.network.offline,
         )
     };
 
@@ -839,11 +820,8 @@ pub(crate) async fn handle_document_change_guarded(
             ecosystem,
             client,
             ChangeTaskConfig {
-                cache: cache_config,
+                diagnostics: diagnostics_snapshot,
                 vulnerabilities_enabled,
-                freshness: freshness_settings,
-                diagnostic_severities,
-                offline,
                 refetch,
             },
             needs_osv_rescan,
@@ -857,14 +835,17 @@ pub(crate) async fn handle_document_change_guarded(
 
 /// Config values snapshotted from `DepsConfig` before spawning [`run_document_change_task`]
 /// (FR-011: all read before any OSV request is built), so the task never needs to hold the
-/// config lock itself. Bundled into one struct rather than five parameters since every field
+/// config lock itself. Bundled into one struct rather than four parameters since every field
 /// is captured together by the same snapshot in [`handle_document_change`].
+///
+/// `diagnostics` (issue #1399 critic M6) doubles as this task's fetch-timeout/concurrency
+/// source, not just its diagnostics-ceiling one: `CacheConfig`'s only other field,
+/// `enabled`, isn't read anywhere in [`run_document_change_task`], so keeping a separate
+/// `CacheConfig` snapshot here would only duplicate `diagnostics.fetch_timeout_secs`/
+/// `max_concurrent_fetches` under a second name.
 struct ChangeTaskConfig {
-    cache: crate::config::CacheConfig,
+    diagnostics: diagnostics::DiagnosticsSnapshot,
     vulnerabilities_enabled: bool,
-    freshness: deps_core::FreshnessSettings,
-    diagnostic_severities: deps_core::DiagnosticSeverities,
-    offline: bool,
     refetch: RefetchPolicy,
 }
 
@@ -906,60 +887,67 @@ async fn run_document_change_task(
         load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
 
     // Must not touch cached_versions here — it holds the latest registry versions.
-    // TODO(critic): lock changes observed here don't trigger an OSV rescan without a
-    // watcher event
-    if !resolved_versions.is_empty()
-        && let Some(mut doc) = state.documents.get_mut(&uri)
-    {
-        doc.set_resolved_versions_without_bump(
-            resolved_versions.clone(),
-            resolved_version_candidates.clone(),
+    //
+    // Issue #1399: a lock-file rewrite observed here (e.g. a `cargo build` racing this
+    // debounced edit) must trigger an OSV rescan even when the edit itself touches no
+    // dependency (`needs_osv_rescan == false`) — mirrors `server::handle_lockfile_change`'s
+    // own drift check, which is exactly this gap for the lock-file-watcher path instead of
+    // this debounced-edit path. `reload_resolved_versions` (issue #1398/#1399 code review)
+    // shares the compute-and-write sequence with that other call site, so bump only when
+    // `osv_task` below is actually about to spawn (issue #1395 critic bidirectional-race
+    // finding): this function runs on *every* debounced edit with a non-empty lock file,
+    // including ones that touch no dependency at all and have no lock-file drift either —
+    // an unconditional bump here would silently invalidate any *other* in-flight OSV scan
+    // for this same document (e.g. a concurrent lock-file-triggered rescan,
+    // `server::handle_lockfile_change`) via `run_osv_phase_b_and_commit`'s shared staleness
+    // guard, with no rescan of this call's own to pair with it and produce a fresh
+    // replacement. Also covers the reparse path (`reparse.rs`), which reuses this same
+    // function: a reparse's `DependencyDiff` is always empty (the manifest text itself is
+    // untouched), so it now correctly never bumps unless the lock file itself drifted.
+    let mut osv_rescan = config.vulnerabilities_enabled && needs_osv_rescan;
+    if !resolved_versions.is_empty() {
+        let lock_changed = reload_resolved_versions(
+            &uri,
+            &state,
+            ecosystem.as_ref(),
+            &resolved_versions,
+            &resolved_version_candidates,
+            config.vulnerabilities_enabled,
+            osv_rescan,
         );
-        // Bump only when `osv_task` below is actually about to spawn (issue #1395
-        // critic bidirectional-race finding): this function runs on *every* debounced
-        // edit with a non-empty lock file, including ones that touch no dependency at
-        // all (`needs_osv_rescan == false`, e.g. a comment-only edit) — an unconditional
-        // bump here would silently invalidate any *other* in-flight OSV scan for this
-        // same document (e.g. a concurrent lock-file-triggered rescan,
-        // `server::handle_lockfile_change`) via `run_osv_phase_b_and_commit`'s shared
-        // staleness guard, with no rescan of this call's own to pair with it and
-        // produce a fresh replacement. Also covers the reparse path (`reparse.rs`),
-        // which reuses this same function: a reparse's `DependencyDiff` is always empty
-        // (the manifest text itself is untouched), so it now correctly never bumps.
-        if config.vulnerabilities_enabled && needs_osv_rescan {
-            doc.bump_resolved_generation(state.next_resolved_versions_generation());
-        }
+        osv_rescan = osv_rescan || lock_changed;
     }
 
-    // Phase A OSV scan (only when a dependency was added or an existing
-    // one's version changed — critique S1), spawned so it runs
-    // concurrently with the registry fetch below.
-    let osv_task = (config.vulnerabilities_enabled && needs_osv_rescan).then(|| {
+    // Phase A OSV scan (only when a dependency was added or an existing one's version
+    // changed, or the lock file moved a resolved version underneath this edit — critique
+    // S1, issue #1399), spawned so it runs concurrently with the registry fetch below.
+    let osv_task = osv_rescan.then(|| {
         tokio::spawn(
             run_osv_scan_phase_a(
                 uri.clone(),
                 Arc::clone(&state),
                 Arc::clone(&ecosystem),
-                config.cache.fetch_timeout_secs,
+                config.diagnostics.fetch_timeout_secs,
             )
             .instrument(tracing::Span::current()),
         )
     });
 
-    // Tier-3 license pre-fetch (issue #660), re-run on the same trigger as the OSV
-    // rescan above (a dependency was added or an existing one's version changed) —
-    // an edit that touches neither has no new resolved version to fetch a license
-    // for, so re-running would just repeat the previous pre-fetch's result. Joined
-    // (round 3 finding #3) via `await_license_prefetch` below, same shape as
-    // `osv_task`, so its commit lands before either of this function's diagnostics
-    // publishes below, not after.
+    // Tier-3 license pre-fetch (issue #660), gated on `needs_osv_rescan` — the diff-level
+    // "a dependency was added or an existing one's version changed" trigger only, deliberately
+    // narrower than `osv_task` above since #1399: a lock-only drift with no manifest change
+    // (`lock_changed`) still has no *new* dependency to fetch a license for, so re-running here
+    // would just repeat the previous pre-fetch's result. A lock-driven license refresh is
+    // issue #1407's scope, not this one. Joined (round 3 finding #3) via
+    // `await_license_prefetch` below, same shape as `osv_task`, so its commit lands before
+    // either of this function's diagnostics publishes below, not after.
     let license_task = needs_osv_rescan.then(|| {
         tokio::spawn(
             run_license_prefetch(
                 uri.clone(),
                 Arc::clone(&state),
                 Arc::clone(&ecosystem),
-                config.cache.fetch_timeout_secs,
+                config.diagnostics.fetch_timeout_secs,
             )
             .instrument(tracing::Span::current()),
         )
@@ -988,12 +976,13 @@ async fn run_document_change_task(
             &uri,
             &state,
             ecosystem.as_ref(),
-            config.cache.fetch_timeout_secs,
+            config.diagnostics.fetch_timeout_secs,
         )
         .await;
         await_license_prefetch(license_task).await;
 
-        generate_and_publish_diagnostics(&state, &uri, &client, &config, 0).await;
+        diagnostics::publish_document_diagnostics(&state, &client, &uri, &config.diagnostics, 0)
+            .await;
         return;
     }
 
@@ -1021,9 +1010,9 @@ async fn run_document_change_task(
             &resolved_versions,
             &resolved_version_candidates,
             deps_to_fetch,
-            config.freshness,
-            config.cache.fetch_timeout_secs,
-            config.cache.max_concurrent_fetches,
+            config.diagnostics.freshness,
+            config.diagnostics.fetch_timeout_secs,
+            config.diagnostics.max_concurrent_fetches,
             config.refetch,
         )
         .await;
@@ -1073,12 +1062,19 @@ async fn run_document_change_task(
         &uri,
         &state,
         ecosystem.as_ref(),
-        config.cache.fetch_timeout_secs,
+        config.diagnostics.fetch_timeout_secs,
     )
     .await;
     await_license_prefetch(license_task).await;
 
-    generate_and_publish_diagnostics(&state, &uri, &client, &config, dep_count).await;
+    diagnostics::publish_document_diagnostics(
+        &state,
+        &client,
+        &uri,
+        &config.diagnostics,
+        dep_count,
+    )
+    .await;
 }
 
 /// Awaits the concurrently-spawned OSV phase-A scan, if one was started, and — when it
@@ -1128,36 +1124,6 @@ async fn await_license_prefetch(task: Option<JoinHandle<()>>) {
     if let Err(e) = task.await {
         tracing::warn!("license pre-fetch task failed: {e}");
     }
-}
-
-/// Generates diagnostics from the current document/cache state and publishes them to the
-/// client. Shared by both branches of [`run_document_change_task`], each of which must end
-/// with an up-to-date publish regardless of whether a registry fetch actually ran.
-///
-/// Takes `&ChangeTaskConfig` rather than its individual fields (both call sites already hold
-/// one) plus `dep_count`, the one value that isn't part of that snapshot — a fetch-batch size
-/// only the caller knows.
-async fn generate_and_publish_diagnostics(
-    state: &Arc<ServerState>,
-    uri: &Uri,
-    client: &Client,
-    config: &ChangeTaskConfig,
-    dep_count: usize,
-) {
-    let diags = diagnostics::generate_diagnostics_internal(
-        Arc::clone(state),
-        uri,
-        config.freshness,
-        config.diagnostic_severities,
-        config.offline,
-        diagnostics::loading_ceiling(
-            config.cache.fetch_timeout_secs,
-            dep_count,
-            config.cache.max_concurrent_fetches,
-        ),
-    )
-    .await;
-    client.publish_diagnostics(uri.clone(), diags, None).await;
 }
 
 /// Ensures a document is loaded in state.
@@ -1438,10 +1404,9 @@ mod tests {
                 PackageName::new("serde"),
                 PackageVersions::latest_only("1.0.0"),
             )]));
-            doc.update_resolved_versions(
+            doc.set_resolved_versions_without_bump(
                 HashMap::from([(PackageName::new("serde"), ConcreteVersion::new("1.0.0"))]),
                 HashMap::new(),
-                1,
             );
             doc.replace_outcomes(
                 DependencyOutcomes::new()
@@ -2673,8 +2638,8 @@ tokio = "1.0"
                 .get_document(&uri)
                 .unwrap()
                 .resolved_versions_generation;
-            assert_ne!(
-                generation_before, 0,
+            assert!(
+                !generation_before.is_initial(),
                 "the open path is expected to have resolved (and bumped once) from the real \
                  lock file on disk"
             );
@@ -2707,6 +2672,134 @@ tokio = "1.0"
                 "a debounced edit that changes no dependency must not bump \
                  resolved_versions_generation, even though the lock-file reload it also \
                  performs is non-empty"
+            );
+        }
+
+        /// Regression guard for issue #1399 (`run_document_change_task`'s `lifecycle.rs:909`
+        /// TODO): the inverse of the test above — a debounced edit that changes no
+        /// dependency itself (`needs_osv_rescan == false`) must still bump
+        /// `resolved_versions_generation` and trigger an OSV rescan when the lock file
+        /// moved a resolved version underneath it in the meantime, mirroring
+        /// `server::handle_lockfile_change`'s own `resolved_versions_changed` check.
+        #[tokio::test]
+        async fn test_lock_file_change_under_unrelated_edit_bumps_resolved_generation() {
+            // See the comment in `test_document_parsing` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+            use tempfile::TempDir;
+
+            let temp_dir = TempDir::new().unwrap();
+            let lock_path = temp_dir.path().join("Cargo.lock");
+            std::fs::write(
+                &lock_path,
+                "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+                 [[package]]\nname = \"alpha-dep\"\nversion = \"0.1.0\"\n\
+                 source = \"git+https://github.com/example/alpha-dep\
+                 #abcdef1234567890abcdef1234567890abcdef12\"\n",
+            )
+            .unwrap();
+            let manifest_dir = temp_dir.path().join("crate");
+            std::fs::create_dir(&manifest_dir).unwrap();
+            let manifest_path = manifest_dir.join("Cargo.toml");
+            let original_content =
+                "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+                    .to_string();
+            std::fs::write(&manifest_path, &original_content).unwrap();
+            let uri = Uri::from_file_path(&manifest_path).unwrap();
+
+            let state = Arc::new(ServerState::new());
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content.clone(),
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed")
+            .await
+            .expect("initial open's background task must not panic");
+
+            let generation_before = state
+                .get_document(&uri)
+                .unwrap()
+                .resolved_versions_generation;
+            assert!(
+                !generation_before.is_initial(),
+                "the open path is expected to have resolved (and bumped once) from the real \
+                 lock file on disk"
+            );
+            assert_eq!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .resolved_versions
+                    .get(&PackageName::new("alpha-dep")),
+                Some(&ConcreteVersion::new("0.1.0")),
+                "sanity check: the open path must have resolved the original locked version"
+            );
+
+            // Rewrite the lock file to a different resolved version for the same
+            // git-sourced dependency — critic M3: the lockfile cache is mtime-validated
+            // with a `<=` comparison (`deps_core::lockfile::LockFileCache::get_or_parse`),
+            // so the mtime must be forced strictly forward, or this rewrite can land as an
+            // undetected cache hit on a coarse-mtime filesystem and make this test flaky.
+            std::fs::write(
+                &lock_path,
+                "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+                 [[package]]\nname = \"alpha-dep\"\nversion = \"0.2.0\"\n\
+                 source = \"git+https://github.com/example/alpha-dep\
+                 #abcdef1234567890abcdef1234567890abcdef12\"\n",
+            )
+            .unwrap();
+            // `write(true)`, not a read-only `File::open`: on Windows, `set_modified` calls
+            // `SetFileTime`, which needs `FILE_WRITE_ATTRIBUTES` access — a plain
+            // `GENERIC_READ` handle is denied that with `ERROR_ACCESS_DENIED` (Unix's
+            // `futimens` has no such requirement, so this only surfaces on Windows CI).
+            let lock_file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            let new_mtime =
+                lock_file.metadata().unwrap().modified().unwrap() + Duration::from_secs(2);
+            lock_file.set_modified(new_mtime).unwrap();
+            drop(lock_file);
+
+            // Comment-only edit — touches no dependency, so `needs_osv_rescan` (the
+            // diff-level flag `run_document_change_task` receives) is false; any rescan
+            // must instead come from the lock-file drift the fixed code now also detects.
+            let edited_content = format!("{original_content}# a comment\n");
+            let (client, config) = create_test_client_and_config();
+            let task = handle_document_change(
+                uri.clone(),
+                edited_content,
+                Some(2),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("comment-only edit should be accepted");
+
+            tokio::time::timeout(Duration::from_secs(10), task)
+                .await
+                .expect("background task must complete promptly")
+                .expect("background task must not panic");
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.resolved_versions.get(&PackageName::new("alpha-dep")),
+                Some(&ConcreteVersion::new("0.2.0")),
+                "the lock-file rewrite must have been picked up by the debounced edit's own \
+                 reload — otherwise the generation assertion below would be vacuous"
+            );
+            assert_ne!(
+                doc.resolved_versions_generation, generation_before,
+                "a debounced edit that changes no dependency itself must still bump \
+                 resolved_versions_generation when the lock file moved a resolved version \
+                 underneath it (issue #1399)"
             );
         }
     }
