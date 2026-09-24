@@ -32,6 +32,9 @@ pub use lockfile::NpmLockParser;
 pub use catalog::fuzz_parse_pnpm_workspace;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
+pub use lockfile::fuzz_parse_package_lock_json_content;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
 pub use lockfile::fuzz_parse_pnpm_lock_yaml;
 pub use parser::{NpmParseResult, parse_package_json, parse_package_json_with_context};
 pub use registry::{NpmRegistry, package_url};

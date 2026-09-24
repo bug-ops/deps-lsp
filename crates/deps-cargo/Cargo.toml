@@ -13,6 +13,12 @@ publish = true
 workspace = true
 
 [features]
+# Exposes `lockfile::fuzz_parse_cargo_lock` for the `fuzz/` cargo-fuzz workspace's
+# `toml_lockfiles` target (#1404) — never enabled by this crate's own default feature set,
+# so `parse_cargo_lock` stays out of the normal public API surface. Mirrors
+# `deps-gradle`/`deps-npm`'s identical `fuzzing` feature.
+fuzzing = []
+
 # Relaxes `RegistryIndex::new`'s https-only gate for a loopback host, so a test (unit or
 # integration) can point it at a `mockito::Server` without weakening the gate for real
 # builds — mirrors `deps-core`'s own `test-util` feature and `HttpCache::ensure_https`'s

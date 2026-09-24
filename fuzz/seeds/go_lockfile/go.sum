@@ -1,0 +1,5 @@
+github.com/gin-gonic/gin v1.9.1 h1:4idEAncQnU5cB7BeOkPtxjfCSye0AAm1R0RVIqJ+Jmg=
+github.com/gin-gonic/gin v1.9.1/go.mod h1:hPrL9t9/HBtKc7e/Q7Nb2nqKqTW8mHZy6E7k8m4dLvs=
+golang.org/x/sync v0.5.0 h1:60k92dhOjHxJkrqAKXvOTVGA8w4mCLW6ZE9M4wcTv1I=
+golang.org/x/sync v0.5.0/go.mod h1:RxMgew5VJxzue5/jJTE5uejpjVlOe/izrB70Jof72aM=
+github.com/stretchr/testify v1.8.4 h1:CcVCVerv/qCEt5RC6y9BhxEfP5+m5RKgLj2evbUmbzY=

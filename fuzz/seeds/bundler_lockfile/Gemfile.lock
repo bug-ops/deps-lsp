@@ -1,0 +1,29 @@
+GIT
+  remote: https://github.com/rails/rails.git
+  revision: abc123
+  specs:
+    rails (7.1.0.alpha)
+
+PATH
+  remote: ../my_gem
+  specs:
+    my_gem (0.1.0)
+
+GEM
+  remote: https://rubygems.org/
+  specs:
+    pg (1.5.4)
+    puma (6.4.0)
+
+PLATFORMS
+  ruby
+  x86_64-linux
+
+DEPENDENCIES
+  rails!
+  my_gem!
+  pg
+  puma (~> 6.0)
+
+BUNDLED WITH
+   2.5.3

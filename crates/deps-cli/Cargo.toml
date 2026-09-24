@@ -54,6 +54,12 @@ gitlab-ci = ["deps-engine/gitlab-ci"]
 # the "npm" feature itself is disabled — mirrors deps-lsp/deps-engine's identical carve-out.
 deno = ["deps-engine/deno"]
 
+# Exposes `config::fuzz_parse_config` for the `fuzz/` cargo-fuzz workspace's
+# `deps_cli_config` target (#1404) — never enabled by this crate's own default feature
+# set, so `config::parse` stays out of the normal public API surface. Mirrors
+# `deps-gradle`/`deps-npm`'s identical `fuzzing` feature.
+fuzzing = []
+
 [dependencies]
 deps-core = { workspace = true }
 deps-engine = { workspace = true }

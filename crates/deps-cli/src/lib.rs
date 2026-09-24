@@ -18,6 +18,13 @@ mod sanitize;
 pub mod update;
 pub mod walk;
 
+// Wrapper exposed only under non-default `fuzzing` feature (#1404) so `fuzz/`'s
+// `deps_cli_config` target can reach the otherwise-private `deps.toml` parser; mirrors
+// `deps-gradle`'s `fuzz_parse_pom_licenses`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use config::fuzz_parse_config;
+
 /// Manifest file size cap, shared by `check`'s and `update`'s manifest reads and `update`'s
 /// TOCTOU re-read (FR-019).
 ///

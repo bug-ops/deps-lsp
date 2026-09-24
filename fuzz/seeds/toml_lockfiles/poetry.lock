@@ -1,0 +1,21 @@
+[[package]]
+name = "certifi"
+version = "2023.7.22"
+description = "Python package for providing Mozilla's CA Bundle."
+optional = false
+python-versions = ">=3.6"
+files = []
+
+[[package]]
+name = "my-git-pkg"
+version = "1.0.0"
+description = "example"
+optional = false
+python-versions = ">=3.8"
+files = []
+
+[package.source]
+type = "git"
+url = "https://github.com/example/my-git-pkg.git"
+reference = "HEAD"
+resolved_reference = "abcdef123456"

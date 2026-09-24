@@ -13,6 +13,12 @@ publish = true
 workspace = true
 
 [features]
+# Exposes `lockfile::fuzz_parse_pypi_lock` for the `fuzz/` cargo-fuzz workspace's
+# `toml_lockfiles` target (#1404) — never enabled by this crate's own default feature set,
+# so `parse_pypi_lock` stays out of the normal public API surface. Mirrors
+# `deps-gradle`/`deps-npm`'s identical `fuzzing` feature.
+fuzzing = []
+
 # Gates the test-only https loopback carve-out in `config::PypiIndexUrl::new` for
 # downstream crates' own test builds (`cfg(test)` alone would not apply there) —
 # mirrors `deps-npm`'s identical `test-util` feature. The carve-out itself now lives in

@@ -39,6 +39,12 @@ pub use config::{CargoConfig, Provenance, RegistryIndex, ResolvedRegistryEntry};
 pub use ecosystem::CargoEcosystem;
 pub use formatter::CargoFormatter;
 pub use lockfile::CargoLockParser;
+// Wrapper exposed only under non-default `fuzzing` feature (#1404) so `fuzz/`'s
+// `toml_lockfiles` target can reach the otherwise-private `Cargo.lock` parser; mirrors
+// `deps-gradle`'s `fuzz_parse_pom_licenses`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lockfile::fuzz_parse_cargo_lock;
 pub use parser::{CargoParseResult, CargoParser, parse_cargo_toml};
 pub use registry::{CargoRegistry, CratesIoRegistry, crate_url};
 pub use sparse::SparseIndexClient;

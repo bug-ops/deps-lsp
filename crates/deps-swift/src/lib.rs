@@ -25,6 +25,12 @@ pub mod types;
 pub use ecosystem::SwiftEcosystem;
 pub use formatter::SwiftFormatter;
 pub use lockfile::SwiftLockParser;
+// Wrapper exposed only under non-default `fuzzing` feature (#1404) so `fuzz/`'s
+// `json_lockfiles` target can reach the otherwise-private lock-file parser; mirrors
+// `deps-gradle`'s `fuzz_parse_pom_licenses`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lockfile::fuzz_parse_package_resolved;
 pub use parser::{SwiftParseResult, parse_package_swift};
 pub use registry::SwiftRegistry;
 pub use types::{SwiftDependency, SwiftPackage, SwiftVersion};

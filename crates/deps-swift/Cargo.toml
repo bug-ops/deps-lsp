@@ -12,6 +12,12 @@ description = "Swift Package Manager support for deps-lsp"
 workspace = true
 
 [features]
+# Exposes `lockfile::fuzz_parse_package_resolved` for the `fuzz/` cargo-fuzz workspace's
+# `json_lockfiles` target (#1404) — never enabled by this crate's own default feature set,
+# so `parse_package_resolved` stays out of the normal public API surface. Mirrors
+# `deps-gradle`/`deps-npm`'s identical `fuzzing` feature.
+fuzzing = []
+
 # Gates this crate's own `tower-lsp-server` dependency and LSP-response-shaped code,
 # forwarding to `deps-core`'s identically-named feature (issue #1083, spec 064). Not
 # `default`: Cargo does not allow a `workspace = true` dependency edge to turn off a

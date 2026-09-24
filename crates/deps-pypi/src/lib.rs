@@ -127,6 +127,12 @@ pub use ecosystem::PypiEcosystem;
 pub use error::{Pep508ParseError, PypiError, Result};
 pub use formatter::PypiFormatter;
 pub use lockfile::PypiLockParser;
+// Wrapper exposed only under non-default `fuzzing` feature (#1404) so `fuzz/`'s
+// `toml_lockfiles` target can reach the otherwise-private lock-file parser; mirrors
+// `deps-gradle`'s `fuzz_parse_pom_licenses`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lockfile::fuzz_parse_pypi_lock;
 pub use parser::PypiParser;
 pub use registry::{PypiRegistry, package_url};
 pub use types::{

@@ -1,0 +1,39 @@
+[diagnostics]
+outdated_severity = 1
+unknown_severity = 1
+yanked_severity = 4
+unsatisfiable_severity = 1
+deprecated_severity = 2
+vulnerabilities_enabled = true
+mutable_ref_pin_enabled = true
+
+[cache]
+enabled = true
+fetch_timeout_secs = 30
+max_concurrent_fetches = 8
+
+[freshness]
+enabled = true
+cooldown_secs = 259200
+
+[supply_chain]
+enabled = true
+
+[registries]
+workspace_registries = "public_only"
+nuget_user_profile_sources = false
+gitlab_instance_host = ""
+
+[network]
+offline = false
+
+[license_policy]
+allow = ["MIT", "Apache-2.0", "BSD-3-Clause"]
+deny = ["GPL-3.0"]
+
+[[update.ignore]]
+name = "tokio"
+update_types = ["major"]
+
+[[update.ignore]]
+name = "legacy-thing"

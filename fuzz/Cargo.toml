@@ -30,6 +30,7 @@ path = "../crates/deps-go"
 
 [dependencies.deps-swift]
 path = "../crates/deps-swift"
+features = ["fuzzing"]
 
 [dependencies.deps-gradle]
 path = "../crates/deps-gradle"
@@ -41,9 +42,11 @@ features = ["fuzzing"]
 
 [dependencies.deps-nuget]
 path = "../crates/deps-nuget"
+features = ["fuzzing"]
 
 [dependencies.deps-pypi]
 path = "../crates/deps-pypi"
+features = ["fuzzing"]
 
 [dependencies.deps-github-actions]
 path = "../crates/deps-github-actions"
@@ -60,12 +63,23 @@ features = ["fuzzing"]
 
 [dependencies.deps-cargo]
 path = "../crates/deps-cargo"
+features = ["fuzzing"]
 
 [dependencies.deps-composer]
 path = "../crates/deps-composer"
+features = ["fuzzing"]
 
 [dependencies.deps-deno]
 path = "../crates/deps-deno"
+
+# `default-features = false`: the `deps_cli_config` target only exercises
+# `config::fuzz_parse_config`, which never touches any ecosystem-specific code, so the
+# default `deps-engine` ecosystem feature set (cargo/npm/pypi/.../gitlab-ci) would only add
+# build time here without adding fuzz coverage.
+[dependencies.deps-cli]
+path = "../crates/deps-cli"
+default-features = false
+features = ["fuzzing"]
 
 [profile.release]
 debug = 1
@@ -206,6 +220,41 @@ bench = false
 [[bin]]
 name = "redact_declaration_key"
 path = "fuzz_targets/redact_declaration_key.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bundler_lockfile"
+path = "fuzz_targets/bundler_lockfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "go_lockfile"
+path = "fuzz_targets/go_lockfile.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "toml_lockfiles"
+path = "fuzz_targets/toml_lockfiles.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_lockfiles"
+path = "fuzz_targets/json_lockfiles.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "deps_cli_config"
+path = "fuzz_targets/deps_cli_config.rs"
 test = false
 doc = false
 bench = false

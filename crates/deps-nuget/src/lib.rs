@@ -24,6 +24,12 @@ pub mod version;
 pub use ecosystem::NuGetEcosystem;
 pub use formatter::NuGetFormatter;
 pub use lockfile::NuGetLockParser;
+// Wrapper exposed only under non-default `fuzzing` feature (#1404) so `fuzz/`'s
+// `json_lockfiles` target can reach the otherwise-private lock-file parser; mirrors
+// `deps-gradle`'s `fuzz_parse_pom_licenses`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lockfile::fuzz_parse_packages_lock_json;
 pub use parser::{
     NuGetParseResult, parse_directory_packages_props, parse_packages_config, parse_project_file,
 };

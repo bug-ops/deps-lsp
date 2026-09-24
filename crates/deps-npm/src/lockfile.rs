@@ -189,6 +189,15 @@ fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> 
     Ok(packages)
 }
 
+/// Fuzz-only entry point for [`parse_package_lock_json_content`] (issue #1404). Gated on
+/// the `fuzzing` Cargo feature (never enabled by this crate's own default set) so this
+/// stays out of the crate's public API surface in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_package_lock_json_content(content: String) {
+    let _ = parse_package_lock_json_content(content);
+}
+
 /// Lowest supported `pnpm-lock.yaml` `lockfileVersion` major component (spec 052 FR-006, Out
 /// of Scope): pre-pnpm-8 lock files use an incompatible `packages` shape and peer-suffix
 /// syntax, so they are rejected rather than silently misparsed.
