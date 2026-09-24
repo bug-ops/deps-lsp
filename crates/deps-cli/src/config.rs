@@ -374,6 +374,16 @@ fn parse(content: &str, path: &Path) -> Result<CliConfig, ConfigError> {
     })
 }
 
+/// Fuzz-only entry point for [`parse`] (issue #1404), using a fixed dummy path since the
+/// fuzz target only supplies file content. Gated on the `fuzzing` Cargo feature (never
+/// enabled by this crate's own default set) so this stays out of the crate's public API
+/// surface in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_config(content: &str) {
+    let _ = parse(content, Path::new(DEFAULT_CONFIG_FILENAME));
+}
+
 /// Applies `--offline`/`--cooldown` CLI overrides onto a loaded [`CliConfig`] for this run
 /// only (FR-015).
 ///

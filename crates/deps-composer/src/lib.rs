@@ -21,6 +21,12 @@ pub mod types;
 pub use ecosystem::ComposerEcosystem;
 pub use formatter::ComposerFormatter;
 pub use lockfile::ComposerLockParser;
+// Wrapper exposed only under non-default `fuzzing` feature (#1404) so `fuzz/`'s
+// `json_lockfiles` target can reach the otherwise-private lock-file parser; mirrors
+// `deps-gradle`'s `fuzz_parse_pom_licenses`.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use lockfile::fuzz_parse_composer_lock;
 pub use parser::{ComposerParseResult, parse_composer_json};
 pub use registry::{PackagistRegistry, package_url};
 pub use types::{ComposerDependency, ComposerPackage, ComposerSection, ComposerVersion};

@@ -1230,6 +1230,11 @@ jobs:
           - fallback_completion
           - redact_userinfo
           - redact_declaration_key
+          - bundler_lockfile
+          - go_lockfile
+          - toml_lockfiles
+          - json_lockfiles
+          - deps_cli_config
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -1263,8 +1268,9 @@ jobs:
           path: ~/.cargo/bin
 
       - name: Make cargo-fuzz executable
-        # Built once in `fuzz-tool` and shared here via artifact instead of each of the
-        # 19 matrix legs independently running `cargo install cargo-fuzz --locked`.
+        # Built once in `fuzz-tool` and shared here via artifact instead of each of this
+        # job's `strategy.matrix.target` legs independently running `cargo install
+        # cargo-fuzz --locked`.
         run: chmod +x ~/.cargo/bin/cargo-fuzz
 
       - name: Run ${{ matrix.target }} for 60s

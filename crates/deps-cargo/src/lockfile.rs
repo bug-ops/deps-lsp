@@ -156,6 +156,15 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
     Ok(packages)
 }
 
+/// Fuzz-only entry point for [`parse_cargo_lock`] (issue #1404). Gated on the `fuzzing`
+/// Cargo feature (never enabled by this crate's own default set) so this stays out of the
+/// crate's public API surface in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_cargo_lock(content: String) {
+    let _ = parse_cargo_lock(content);
+}
+
 /// Parses Cargo source field into ResolvedSource.
 ///
 /// # Source Formats

@@ -164,6 +164,15 @@ fn parse_package_resolved(content: String) -> Result<ResolvedPackages> {
     Ok(packages)
 }
 
+/// Fuzz-only entry point for [`parse_package_resolved`] (issue #1404). Gated on the
+/// `fuzzing` Cargo feature (never enabled by this crate's own default set) so this stays
+/// out of the crate's public API surface in a normal build.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_parse_package_resolved(content: String) {
+    let _ = parse_package_resolved(content);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
