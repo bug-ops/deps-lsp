@@ -906,17 +906,19 @@ mod tests {
         non_registry_fixture: "pom.xml" => "<project><dependencies><dependency><groupId>com.acme</groupId><artifactId>internal-jar</artifactId><version>1.0.0</version><scope>system</scope><systemPath>/opt/lib/internal-jar-1.0.0.jar</systemPath></dependency></dependencies></project>";
     }
 
-    // #1370/#1372: Maven's parser preserves an unexpanded `${property}` placeholder (and a
-    // malformed range with one embedded, e.g. `[1.0,${hi}`) as `Some(version_requirement)` — it
-    // reaches `plan_vulnerability_fix`/`format_version_replacing_for` directly, so
-    // `MavenFormatter::requirement_is_placeholder`'s central gate (and its own
-    // `format_version_replacing` no-op guard) must actually hold.
+    // #1370/#1372/#1384: Maven's parser preserves an unexpanded `${property}` placeholder,
+    // a malformed range with one embedded (e.g. `[1.0,${hi}`), and an unexpanded
+    // `@property@` resource-filtering placeholder (e.g. `@project.version@`) as
+    // `Some(version_requirement)` — all three reach `plan_vulnerability_fix`/
+    // `format_version_replacing_for` directly, so `MavenFormatter::requirement_is_placeholder`'s
+    // central gate (and its own `format_version_replacing` no-op guard) must actually hold
+    // for both placeholder grammars.
     deps_core::unresolved_requirement_conformance! {
         mod maven_unresolved_requirement_conformance;
         build: MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         reachable: true;
         fixture: "pom.xml" =>
-            "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>some-lib</artifactId><version>${ver}</version></dependency><dependency><groupId>com.example</groupId><artifactId>malformed-range</artifactId><version>[1.0,${hi}</version></dependency></dependencies></project>";
+            "<project><dependencies><dependency><groupId>com.example</groupId><artifactId>some-lib</artifactId><version>${ver}</version></dependency><dependency><groupId>com.example</groupId><artifactId>malformed-range</artifactId><version>[1.0,${hi}</version></dependency><dependency><groupId>com.example</groupId><artifactId>at-placeholder</artifactId><version>@project.version@</version></dependency></dependencies></project>";
     }
 
     // #794: `complete_package_names_for_field` (defined above in `impl MavenEcosystem`)

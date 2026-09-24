@@ -1070,7 +1070,8 @@ mod tests {
         non_registry_fixture: ".gitlab-ci.yml" => "include:\n  - project: org/proj\n    ref: v1.0.0\n";
     }
 
-    // #1365/#1370: GitLab CI's `$VAR`/`${VAR}`/`%VAR%`-in-ref placeholder is guarded both by
+    // #1365/#1370: GitLab CI's `$VAR`/`${VAR}`/`%VAR%`/`{{ }}`/`{% %}`/`@VAR@`/`<%= %>`/
+    // `$[[ inputs.x ]]`-in-ref placeholder is guarded both by
     // `GitlabCiFormatter::requirement_is_placeholder` (the central gate `deps-core`'s
     // `plan_verified_fix`/`build_unsatisfiable_fix_action`/REFACTOR loop all consult) and,
     // independently, by `format_version_replacing_for`'s own no-op guard (see
@@ -1102,12 +1103,17 @@ mod tests {
     // `contains_unresolved_gitlab_variable`'s full delegation to
     // `requirement_contains_template_placeholder` inherited for free — no fixture previously
     // pinned that (the doc comment describing this behavior was also stale, fixed alongside).
+    // #1386: `$[[ inputs.x ]]` is GitLab CI/CD components' own input-interpolation syntax
+    // (`contains_unresolved_gitlab_variable`'s doc), added alongside the `$VAR`/`${VAR}`/
+    // `%VAR%` pipeline-variable forms and the `{{ }}`/`@VAR@`/`<%= %>` external-templating
+    // forms this fixture already covers.
     deps_core::unresolved_requirement_conformance! {
         mod gitlab_ci_unresolved_requirement_conformance;
         formatter_guarded: GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()));
         placeholders: [
             "$DEPLOY_VERSION", "${DEPLOY_VERSION}", "%DEPLOY_VERSION%", "v1.2-$BUILD",
-            "{{ DEPLOY_VERSION }}", "@DEPLOY_VERSION@", "<%= DEPLOY_VERSION %>"
+            "{{ DEPLOY_VERSION }}", "@DEPLOY_VERSION@", "<%= DEPLOY_VERSION %>",
+            "$[[ inputs.minor ]]", "1.$[[ inputs.minor ]]",
         ];
         // #1370 critic M2: negative control — a SHA, a branch, and an ordinary tag must never
         // be conflated with the variable-reference placeholder grammar above.
