@@ -875,7 +875,7 @@ pub fn resolve_recommended_fix(
     formatter: &dyn EcosystemFormatter,
 ) -> Result<(crate::osv::FixRecommendation, String), VulnFixSkip> {
     let fix = dv.recommended_fix().ok_or(VulnFixSkip::NoRecommendedFix)?;
-    let version_native = formatter.osv_version_to_native(&fix.version);
+    let version_native = formatter.osv_version_to_native(&fix.version).into_string();
     if !is_safe_version_string(&version_native) {
         warn_rejected_value(
             "is_safe_version_string",
@@ -964,7 +964,9 @@ pub(crate) fn fix_target_is_verified(
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy,
 /// };
-/// use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+/// use deps_core::osv::{
+///     Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+/// };
 /// use deps_core::{ConcreteVersion, PackageName};
 /// use std::sync::Arc;
 ///
@@ -991,7 +993,7 @@ pub(crate) fn fix_target_is_verified(
 ///         VulnSeverity::High,
 ///     )
 ///     .expect("valid osv id")
-///     .with_fixed_versions(vec!["1.2.0".to_string()]),
+///     .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
 /// );
 /// // `fix_target_status` left at its `NotChecked` default — never live-checked yet.
 /// let unverified = DependencyVulnerabilities::new(Capped::new(vec![advisory.clone()], 1));
@@ -1062,7 +1064,9 @@ pub fn resolve_verified_fix(
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy,
 /// };
-/// use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+/// use deps_core::osv::{
+///     Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+/// };
 /// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
 /// use deps_core::position::{Position, Range};
 /// use std::any::Any;
@@ -1115,7 +1119,7 @@ pub fn resolve_verified_fix(
 ///         VulnSeverity::High,
 ///     )
 ///     .expect("valid osv id")
-///     .with_fixed_versions(vec!["1.2.0".to_string()]),
+///     .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
 /// );
 /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
 ///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: "1.2.0".to_string() });
@@ -1593,7 +1597,7 @@ mod tests {
             RequirementMatcher, RequirementResolution, SourcePolicy,
         };
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         fn dep(name: &str, req: &str, version_range: crate::position::Range) -> MockDep {
@@ -1613,7 +1617,7 @@ mod tests {
                     VulnSeverity::High,
                 )
                 .expect("valid osv id")
-                .with_fixed_versions(vec![fixed_version.to_string()]),
+                .with_fixed_versions(vec![OsvVersion::new(fixed_version)]),
             );
             DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
                 UpgradeStatus::CandidateClean {

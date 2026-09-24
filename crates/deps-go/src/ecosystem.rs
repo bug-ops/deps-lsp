@@ -725,6 +725,87 @@ mod tests {
         );
     }
 
+    /// Regression for #1423 (live-verified Go symptom, tester/impl-critic follow-up): the
+    /// **real** `GoFormatter`, driven end-to-end through the public `Ecosystem::generate_hover`
+    /// entry point (not a synthetic non-identity formatter substituted in `deps-core`'s own
+    /// unit test), must render an OSV advisory's `fixed_versions` entry — OSV's wire spelling,
+    /// never carrying Go's mandatory `v` prefix — as `v0.55.0`, not the raw wire `0.55.0`.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_generate_hover_renders_fixed_version_in_go_native_namespace() {
+        use deps_core::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, VulnSeverity,
+            VulnerabilityMap,
+        };
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/golang.org/x/net/@v/list")
+            .with_status(200)
+            .with_body("v0.17.0\n")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let registry = Arc::new(GoRegistry::with_public_base_for_test(
+            Arc::clone(&cache),
+            server.url(),
+        ));
+        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
+        let parse_result = MockParseResult {
+            dependencies: vec![mock_dependency("golang.org/x/net", Some("v0.17.0"), 5)],
+            uri,
+        };
+
+        let mut vulnerabilities = VulnerabilityMap::new();
+        vulnerabilities.insert(
+            deps_core::test_util::vuln_key("golang.org/x/net"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+                vec![Arc::new(
+                    Advisory::new(
+                        "GO-2024-0001".to_string(),
+                        "2024-01-01T00:00:00Z".to_string(),
+                        VulnSeverity::High,
+                    )
+                    .expect("valid osv id")
+                    // OSV's wire spelling for Go never carries the `v` prefix `go.mod` requires.
+                    .with_fixed_versions(vec![OsvVersion::new("0.55.0")]),
+                )],
+                1,
+            ))),
+        );
+
+        let position = Position::new(5, 5);
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let versions = VersionData::new(&cached_versions, &resolved_versions)
+            .with_vulnerabilities(&vulnerabilities);
+
+        let hover = ecosystem
+            .generate_hover(
+                &parse_result,
+                position,
+                versions,
+                deps_core::FreshnessSettings::default(),
+            )
+            .await;
+
+        assert!(hover.is_some());
+        let hover_content = hover.unwrap();
+        let markdown = hover_content.markdown();
+        assert!(
+            markdown.contains("v0.55.0"),
+            "Fixed in: must render the native-namespace version (v0.55.0), not the raw OSV \
+             wire spelling (0.55.0); got: {markdown}"
+        );
+        assert!(
+            !markdown.contains("Fixed in: `0.55.0`"),
+            "must not render the unconverted OSV wire spelling; got: {markdown}"
+        );
+    }
+
     #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_generate_hover_outside_dependency() {

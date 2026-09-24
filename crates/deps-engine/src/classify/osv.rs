@@ -158,11 +158,11 @@ pub fn build_scan_targets(
             continue;
         };
 
-        targets.push(deps_core::osv::ScanTarget::new(
+        targets.push(deps_core::osv::ScanTarget::from_native(
             key,
             osv_name,
-            formatter.osv_version(&version),
-            version,
+            ConcreteVersion::new(version),
+            formatter,
         ));
     }
 
@@ -248,7 +248,7 @@ fn resolve_fix_target(
         key.clone(),
         osv_name,
         fix.version,
-        version_native,
+        ConcreteVersion::new(version_native),
     ))
 }
 /// Pure aggregation step of `run_osv_fix_target_verification`: resolves every vulnerable
@@ -269,8 +269,8 @@ fn resolve_fix_target(
 ///     RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::osv::{
-///     Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-///     VulnerabilityMap,
+///     Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
+///     VulnSeverity, VulnerabilityMap,
 /// };
 /// use deps_core::test_util::vuln_key;
 /// use deps_core::{ConcreteVersion, PackageName};
@@ -301,7 +301,7 @@ fn resolve_fix_target(
 ///         VulnSeverity::High,
 ///     )
 ///     .expect("valid osv id")
-///     .with_fixed_versions(vec!["1.2.0".to_string()]),
+///     .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
 /// );
 /// let latest_status = UpgradeStatus::CandidateClean {
 ///     version: "1.2.0".to_string(),
@@ -435,15 +435,16 @@ pub fn apply_live_fix_target_statuses(
 /// # Examples
 ///
 /// ```
-/// use deps_core::osv::ScanTarget;
+/// use deps_core::ConcreteVersion;
+/// use deps_core::osv::{OsvVersion, ScanTarget};
 /// use deps_core::test_util::vuln_key;
 /// use deps_engine::classify::osv::osv_name_by_key;
 ///
 /// let targets = vec![ScanTarget::new(
 ///     vuln_key("serde"),
 ///     "serde".to_string(),
-///     "1.0.0".to_string(),
-///     "1.0.0".to_string(),
+///     OsvVersion::new("1.0.0"),
+///     ConcreteVersion::new("1.0.0"),
 /// )];
 /// let map = osv_name_by_key(&targets);
 /// assert_eq!(map.get(&vuln_key("serde")).map(String::as_str), Some("serde"));
@@ -619,8 +620,9 @@ mod tests {
         impl SourcePolicy for MockVPrefixFormatter {}
 
         impl OsvNaming for MockVPrefixFormatter {
-            fn osv_version(&self, version: &str) -> String {
-                version.strip_prefix('v').unwrap_or(version).to_string()
+            fn osv_version(&self, version: &ConcreteVersion) -> deps_core::osv::OsvVersion {
+                let version = version.as_str();
+                deps_core::osv::OsvVersion::new(version.strip_prefix('v').unwrap_or(version))
             }
         }
 
@@ -1140,8 +1142,8 @@ mod tests {
     mod fix_target_verification_tests {
         use super::*;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-            VulnerabilityMap,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
         };
         use deps_core::test_util::StubFormatter;
         use std::sync::Arc;
@@ -1154,7 +1156,13 @@ mod tests {
                     VulnSeverity::High,
                 )
                 .expect("valid osv id")
-                .with_fixed_versions(fixed_versions.iter().map(ToString::to_string).collect()),
+                .with_fixed_versions(
+                    fixed_versions
+                        .iter()
+                        .copied()
+                        .map(OsvVersion::new)
+                        .collect(),
+                ),
             )
         }
 
@@ -1231,8 +1239,8 @@ mod tests {
                 FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
                     deps_core::test_util::vuln_key("pkg"),
                     "pkg".to_string(),
-                    "1.2.0".to_string(),
-                    "1.2.0".to_string(),
+                    OsvVersion::new("1.2.0"),
+                    ConcreteVersion::new("1.2.0"),
                 ))
             );
         }

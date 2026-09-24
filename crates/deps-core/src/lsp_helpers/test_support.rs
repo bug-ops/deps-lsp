@@ -1136,7 +1136,10 @@ pub(crate) fn sample_advisory(
             .expect("valid osv id")
             .with_summary("Something went wrong".to_string())
             .with_aliases(vec!["CVE-2020-0001".to_string()])
-            .with_fixed_versions(vec!["1.2.0".to_string(), "1.5.0".to_string()]),
+            .with_fixed_versions(vec![
+                crate::osv::OsvVersion::new("1.2.0"),
+                crate::osv::OsvVersion::new("1.5.0"),
+            ]),
     )
 }
 

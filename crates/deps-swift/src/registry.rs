@@ -8,7 +8,7 @@ use deps_core::github::{
     GithubTag, GithubTagsClient, ReleaseDatesCache, classify_tags_fetch_error, normalize_tag,
     paginate_tags, validate_owner_repo,
 };
-use deps_core::{HttpCache, PublishTime, Result};
+use deps_core::{EcosystemId, HttpCache, PublishTime, Result};
 use serde::Deserialize;
 use std::any::Any;
 use std::collections::HashMap;
@@ -54,7 +54,7 @@ impl SwiftRegistry {
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<SwiftVersion>> {
         validate_owner_repo(name)?;
-        let tags = paginate_tags("Swift", name, |page| async move {
+        let tags = paginate_tags(EcosystemId::Swift, name, |page| async move {
             self.github
                 .fetch_tags_page(name, page)
                 .await
@@ -103,7 +103,9 @@ impl SwiftRegistry {
     /// the best-effort/memoization contract.
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     async fn release_dates(&self, name: &str) -> Arc<HashMap<String, PublishTime>> {
-        self.release_dates.fetch(&self.github, name, "Swift").await
+        self.release_dates
+            .fetch(&self.github, name, EcosystemId::Swift)
+            .await
     }
 
     /// Fetches `name`'s (`owner/repo`) SPDX license identifier from the GitHub
@@ -792,11 +794,11 @@ mod tests {
     }
 
     /// Regression for #472 critic M3: `get_versions` must label its pagination-cap
-    /// truncation warning `"Swift"`, not some other ecosystem's name or a stale literal
-    /// left over from the shared `deps_core::github::paginate_tags` extraction. A
-    /// hardcoded/rearranged `paginate_tags("Swift", ...)` call site would silently break
-    /// this without failing any other test, since `deps_core::github`'s own tests only
-    /// exercise `paginate_tags` with an arbitrary ecosystem string.
+    /// truncation warning `EcosystemId::Swift`, not some other ecosystem's id or a stale
+    /// literal left over from the shared `deps_core::github::paginate_tags` extraction. A
+    /// hardcoded/rearranged `paginate_tags(EcosystemId::Swift, ...)` call site would silently
+    /// break this without failing any other test, since `deps_core::github`'s own tests only
+    /// exercise `paginate_tags` with an arbitrary `EcosystemId`.
     #[tokio::test]
     async fn test_get_versions_pagination_cap_warning_is_labeled_swift() {
         let mut server = mockito::Server::new_async().await;
@@ -822,9 +824,9 @@ mod tests {
         })
         .await;
 
-        assert!(output.contains("Swift"), "output was: {output}");
+        assert!(output.contains("swift"), "output was: {output}");
         assert!(output.contains("cap"), "output was: {output}");
-        assert!(!output.contains("GitHub Actions"), "output was: {output}");
+        assert!(!output.contains("github-actions"), "output was: {output}");
     }
 
     // --- issue #660: license detection ---

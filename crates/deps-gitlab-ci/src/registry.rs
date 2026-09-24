@@ -9,7 +9,7 @@ use deps_core::error::{DepsError, Result};
 use deps_core::github::normalize_tag;
 use deps_core::rate_limit::RateLimitGate;
 use deps_core::registry::{CapResult, KeyShape, register_capped};
-use deps_core::{PackageName, PublishTime};
+use deps_core::{EcosystemId, PackageName, PublishTime};
 use std::any::Any;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -239,7 +239,7 @@ impl GitlabCiRegistry {
             if register_capped(
                 &self.routes,
                 key.clone(),
-                "GitLab CI",
+                EcosystemId::GitlabCi,
                 KeyShape::Opaque,
                 || route.clone(),
             ) == CapResult::RefusedAtCapacity
@@ -350,7 +350,7 @@ impl GitlabCiRegistry {
                 let path = project_path.as_str();
                 let tags = deps_core::pagination::paginate_pages(
                     "GitLab",
-                    "GitLab CI",
+                    EcosystemId::GitlabCi,
                     "tags",
                     name.as_str(),
                     MAX_GITLAB_PAGES,
@@ -374,7 +374,7 @@ impl GitlabCiRegistry {
                 let path = project_path.as_str();
                 let releases = deps_core::pagination::paginate_pages(
                     "GitLab",
-                    "GitLab CI",
+                    EcosystemId::GitlabCi,
                     "releases",
                     name.as_str(),
                     MAX_GITLAB_PAGES,

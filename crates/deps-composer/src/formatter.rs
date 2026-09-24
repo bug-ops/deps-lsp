@@ -1339,7 +1339,7 @@ mod tests {
 
     fn vuln_fix_dv(fixed_version: &str) -> deps_core::osv::DependencyVulnerabilities {
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::sync::Arc;
 
@@ -1350,7 +1350,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec![fixed_version.to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new(fixed_version)]),
         );
         DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
             UpgradeStatus::CandidateClean {

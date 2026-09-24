@@ -3,6 +3,7 @@
 //! verification.
 
 use super::state::{ResolvedGeneration, ServerState};
+use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
@@ -398,12 +399,12 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             .iter()
             .filter_map(|key| {
                 let osv_name = result.osv_name_by_key.get(key)?.clone();
-                let latest_native = latest_native_by_key.get(key)?.clone();
-                Some(deps_core::osv::ScanTarget::new(
+                let latest_native = ConcreteVersion::new(latest_native_by_key.get(key)?.clone());
+                Some(deps_core::osv::ScanTarget::from_native(
                     key.clone(),
                     osv_name,
-                    formatter.osv_version(&latest_native),
                     latest_native,
+                    formatter,
                 ))
             })
             .collect();

@@ -33,7 +33,7 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, HttpCache, Result, is_dot_segment,
+    DepsError, EcosystemId, HttpCache, Result, is_dot_segment,
     lsp_helpers::warn_rejected_value,
     not_found_or as core_not_found_or,
     registry::{KeyShape, register_capped},
@@ -332,7 +332,7 @@ impl GoRegistry {
         register_capped(
             &root.alternates,
             chain.key.clone(),
-            "Go",
+            EcosystemId::Go,
             KeyShape::Opaque,
             || {
                 // `chain.separators[i]` is the separator between `hops[i]` and `hops[i + 1]`
@@ -2168,7 +2168,7 @@ mod tests {
         });
 
         assert!(
-            log.contains("Go alternate registry cap reached"),
+            log.contains("go alternate registry cap reached"),
             "log: {log}"
         );
         assert!(

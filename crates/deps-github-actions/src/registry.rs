@@ -9,7 +9,7 @@ use deps_core::github::{
     validate_owner_repo,
 };
 use deps_core::rate_limit::RateLimitGate;
-use deps_core::{DepsError, HttpCache, PackageName, PublishTime, Result};
+use deps_core::{DepsError, EcosystemId, HttpCache, PackageName, PublishTime, Result};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -305,7 +305,7 @@ impl GithubActionsRegistry {
 
         // Applied to the outcome, not inside the per-page closure: pages fetch concurrently,
         // so a discarded page's 403 must not trip the gate if the batch still resolves `Ok`.
-        let tags = paginate_tags("GitHub Actions", name, |page| async move {
+        let tags = paginate_tags(EcosystemId::GithubActions, name, |page| async move {
             self.github.fetch_tags_page(name, page).await
         })
         .await
@@ -355,7 +355,7 @@ impl GithubActionsRegistry {
         let (versions, dates) = tokio::join!(
             self.get_versions(name),
             self.release_dates
-                .fetch(&self.github, name, "GitHub Actions")
+                .fetch(&self.github, name, EcosystemId::GithubActions)
         );
         let mut versions = versions?;
         attach_publish_times(&mut versions, &dates);
@@ -1147,10 +1147,10 @@ mod tests {
     }
 
     /// Regression for #472 critic M3: `get_versions` must label its pagination-cap
-    /// truncation warning `"GitHub Actions"`, not some other ecosystem's name. A
-    /// hardcoded/rearranged `paginate_tags("GitHub Actions", ...)` call site would
-    /// silently break this without failing any other test, since `deps_core::github`'s
-    /// own tests only exercise `paginate_tags` with an arbitrary ecosystem string.
+    /// truncation warning `EcosystemId::GithubActions`, not some other ecosystem's id. A
+    /// hardcoded/rearranged `paginate_tags(EcosystemId::GithubActions, ...)` call site
+    /// would silently break this without failing any other test, since `deps_core::github`'s
+    /// own tests only exercise `paginate_tags` with an arbitrary `EcosystemId`.
     #[tokio::test]
     async fn test_get_versions_pagination_cap_warning_is_labeled_github_actions() {
         use deps_core::test_util::capture_tracing_output_async;
@@ -1179,7 +1179,7 @@ mod tests {
         })
         .await;
 
-        assert!(output.contains("GitHub Actions"), "output was: {output}");
+        assert!(output.contains("github-actions"), "output was: {output}");
         assert!(output.contains("cap"), "output was: {output}");
     }
 

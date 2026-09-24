@@ -372,10 +372,9 @@ mod tests {
         // requirement text that edit produces — proving the default hook is
         // safe for this ecosystem rather than merely assumed so.
         let f = MavenFormatter;
-        let osv_version = "1.2.3";
-        let native = f.osv_version_to_native(osv_version);
-        assert_eq!(native, osv_version);
-        let native = ConcreteVersion::new(native);
+        let osv_version = deps_core::osv::OsvVersion::new("1.2.3");
+        let native = f.osv_version_to_native(&osv_version);
+        assert_eq!(native, osv_version.as_str());
         let edit_text = f.format_version_for_text_edit(&native);
         assert!(f.version_satisfies_requirement(&native, &edit_text));
     }
@@ -690,7 +689,7 @@ mod tests {
 
     fn vuln_fix_dv(fixed_version: &str) -> deps_core::osv::DependencyVulnerabilities {
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::sync::Arc;
 
@@ -701,7 +700,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec![fixed_version.to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new(fixed_version)]),
         );
         DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
             UpgradeStatus::CandidateClean {

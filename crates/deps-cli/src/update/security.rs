@@ -452,7 +452,7 @@ mod tests {
         DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
         RequirementMatcher, RequirementResolution, SourcePolicy,
     };
-    use deps_core::osv::{Advisory, Capped, UpgradeStatus, VulnSeverity};
+    use deps_core::osv::{Advisory, Capped, OsvVersion, UpgradeStatus, VulnSeverity};
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
     use deps_core::{
@@ -537,14 +537,18 @@ mod tests {
     impl DiagnosticPolicy for TestFormatter {}
     impl SourcePolicy for TestFormatter {}
     impl OsvNaming for TestFormatter {
-        fn osv_version_to_native(&self, version: &str) -> String {
+        fn osv_version_to_native(
+            &self,
+            version: &deps_core::osv::OsvVersion,
+        ) -> deps_core::ConcreteVersion {
             // SC-005: simulates an ecosystem whose OSV and native version spellings diverge
             // (PyPI/Maven/NuGet) — prefixes with "v" so a yank-filter test can prove the
             // comparison goes through this conversion, not the raw OSV wire form.
+            let version = version.as_str();
             if self.osv_native_differs {
-                format!("v{version}")
+                deps_core::ConcreteVersion::new(format!("v{version}"))
             } else {
-                version.to_string()
+                deps_core::ConcreteVersion::new(version)
             }
         }
     }
@@ -562,7 +566,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec![fixed_version.to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new(fixed_version)]),
         )
     }
 

@@ -12,7 +12,7 @@ use dashmap::DashMap;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
+    DepsError, EcosystemId, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
     lsp_helpers::dot_segment_rejection_error,
     not_found_or as core_not_found_or,
     parser::DependencySource,
@@ -283,9 +283,13 @@ impl NpmRegistry {
     /// (spec FR-010 dispatch table).
     pub fn register_alternate(&self, index: NpmRegistryIndex) {
         let key = index.as_str().to_string();
-        register_capped(&self.alternates, key, "npm", KeyShape::Url, || {
-            Arc::new(Self::with_base(Arc::clone(&self.cache), &index))
-        });
+        register_capped(
+            &self.alternates,
+            key,
+            EcosystemId::Npm,
+            KeyShape::Url,
+            || Arc::new(Self::with_base(Arc::clone(&self.cache), &index)),
+        );
     }
 
     /// The registered client for `index`, if any — read-only, performs no registration, no

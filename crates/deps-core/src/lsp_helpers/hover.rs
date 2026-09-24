@@ -272,7 +272,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // Package-level context (#205) renders before per-version security advisories:
     // deprecation is a property of the package, advisories of the version.
     push_deprecation_hover_section(&mut markdown, formatter, deprecation);
-    push_vulnerability_hover_section(&mut markdown, vuln_outcome);
+    push_vulnerability_hover_section(&mut markdown, formatter, vuln_outcome);
 
     // Awaited last so the wait overlaps as much of this function's own work as possible.
     // Bounds only the wait: over budget, the spawned task keeps running and warms
@@ -938,7 +938,11 @@ fn candidate_vulnerable_line_should_render(
 /// derives it from the already-validated, `<= 128`-byte `id` rather than accepting it raw
 /// (#1271), so no length cap applies to it here — [`HoverMarkdown::push_link`] only strips
 /// it, matching that exemption.
-fn push_vulnerability_hover_section(markdown: &mut HoverMarkdown, outcome: Option<&ScanOutcome>) {
+fn push_vulnerability_hover_section(
+    markdown: &mut HoverMarkdown,
+    formatter: &dyn EcosystemFormatter,
+    outcome: Option<&ScanOutcome>,
+) {
     match outcome {
         Some(ScanOutcome::Vulnerable(dv)) => {
             markdown.push_static("### Security advisories\n\n");
@@ -963,8 +967,12 @@ fn push_vulnerability_hover_section(markdown: &mut HoverMarkdown, outcome: Optio
                 if has_fixed || has_aliases {
                     markdown.push_static("  ");
                     if let Some(fixed) = advisory.fixed_versions.last() {
+                        // #1423: `fixed_versions` is OSV's wire spelling — convert to this
+                        // ecosystem's native namespace before showing it (Go's mandatory `v`
+                        // prefix is the live-verified symptom otherwise).
+                        let native = formatter.osv_version_to_native(fixed);
                         markdown.push_static("Fixed in: ");
-                        markdown.push_code(fixed, FieldKind::Version);
+                        markdown.push_code(native.as_str(), FieldKind::Version);
                     }
                     if has_aliases {
                         if has_fixed {
@@ -4718,7 +4726,8 @@ mod tests {
     #[test]
     fn push_vulnerability_hover_section_caps_fixed_version_summary_and_aliases() {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, UpgradeStatus,
+            VulnSeverity,
         };
 
         let mut advisory = Advisory::new(
@@ -4728,7 +4737,7 @@ mod tests {
         )
         .expect("valid osv id");
         advisory.summary = Some("S".repeat(500));
-        advisory.fixed_versions = vec!["F".repeat(500)];
+        advisory.fixed_versions = vec![OsvVersion::new("F".repeat(500))];
         // A non-ASCII, multi-byte-per-char alias (within the first `MAX_ADVISORY_ALIASES_RENDERED`
         // entries, so it actually renders) pins that the per-alias cap
         // (`truncate_for_diagnostic`) is genuinely char-based, not byte-based — a
@@ -4747,7 +4756,7 @@ mod tests {
 
         let outcome = ScanOutcome::Vulnerable(dv);
         let mut markdown = HoverMarkdown::new();
-        push_vulnerability_hover_section(&mut markdown, Some(&outcome));
+        push_vulnerability_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&outcome));
 
         // `S`/`F`/`V` are not ASCII punctuation, so `escape_markdown`/`markdown_code_span`
         // leave them untouched — the rendered run is pinned to exactly
@@ -4790,6 +4799,47 @@ mod tests {
         assert!(
             markdown.as_str().contains("+4 more"),
             "alias list must be capped; got: {markdown}"
+        );
+    }
+
+    /// Regression for #1423 (live-verified Go symptom): a `Fixed in:` line must render an
+    /// advisory's `fixed_versions` entry through `OsvNaming::osv_version_to_native`, not the
+    /// raw OSV wire spelling. Uses a non-identity, Go-style formatter (adds back the `v`
+    /// prefix `osv_version_to_native` strips by default) — the identity `MOCK_FORMATTER` used
+    /// by the sibling test above would pass even if `push_vulnerability_hover_section`
+    /// silently stopped converting, since identity conversion can't distinguish "converted"
+    /// from "never converted".
+    #[test]
+    fn push_vulnerability_hover_section_converts_fixed_version_to_native_namespace() {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, VulnSeverity,
+        };
+
+        const GO_STYLE_FORMATTER: crate::test_util::StubFormatter =
+            crate::test_util::StubFormatter::new().with_go_style_osv_version_to_native();
+
+        let advisory = Advisory::new(
+            "RUSTSEC-2024-0432".to_string(),
+            "2024-01-01T00:00:00Z".to_string(),
+            VulnSeverity::High,
+        )
+        .expect("valid osv id")
+        // OSV's wire spelling for Go never carries the `v` prefix `go.mod` requires.
+        .with_fixed_versions(vec![OsvVersion::new("0.55.0")]);
+
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
+        let outcome = ScanOutcome::Vulnerable(dv);
+        let mut markdown = HoverMarkdown::new();
+        push_vulnerability_hover_section(&mut markdown, &GO_STYLE_FORMATTER, Some(&outcome));
+
+        assert!(
+            markdown.as_str().contains("v0.55.0"),
+            "Fixed in: must render the native-namespace version (v0.55.0), not the raw OSV \
+             wire spelling (0.55.0); got: {markdown}"
+        );
+        assert!(
+            !markdown.as_str().contains("Fixed in: `0.55.0`"),
+            "must not render the unconverted OSV wire spelling; got: {markdown}"
         );
     }
 

@@ -906,7 +906,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let gemfile = r#"gem "rails", "~> #{RAILS_VERSION}""#;
@@ -927,7 +927,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["7.0.8".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("7.0.8")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -966,7 +966,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let gemfile = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
@@ -988,7 +988,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["6.1.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("6.1.0")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -1017,7 +1017,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let gemfile = "gem \"rails\", \"~> 1.0\", \"< #{RAILS_MAX}\"";
@@ -1038,7 +1038,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["7.0.8".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("7.0.8")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -1087,7 +1087,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let gemfile = r#"gem "sinatra", "1.0.0.<%= s %>""#;
@@ -1108,7 +1108,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["3.0.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("3.0.0")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {

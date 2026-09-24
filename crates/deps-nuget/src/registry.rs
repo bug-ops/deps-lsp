@@ -16,7 +16,8 @@ use deps_core::parser::DependencySource;
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{
-    DepsError, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result,
+    DepsError, EcosystemId, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime,
+    Result,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -271,7 +272,7 @@ impl ServiceIndex {
         deps_core::net_policy::validate_index_url(
             &package_base_address,
             &package_base_address,
-            "nuget",
+            EcosystemId::NuGet,
             gate,
         )
         .map_err(|e| {
@@ -280,10 +281,12 @@ impl ServiceIndex {
                 &format!("PackageBaseAddress blocked by workspace registry policy: {e}"),
             )
         })?;
-        let search_query_service = search_query_service
-            .filter(|u| deps_core::net_policy::validate_index_url(u, u, "nuget", gate).is_ok());
-        let registrations_base_url = registrations_base_url
-            .filter(|u| deps_core::net_policy::validate_index_url(u, u, "nuget", gate).is_ok());
+        let search_query_service = search_query_service.filter(|u| {
+            deps_core::net_policy::validate_index_url(u, u, EcosystemId::NuGet, gate).is_ok()
+        });
+        let registrations_base_url = registrations_base_url.filter(|u| {
+            deps_core::net_policy::validate_index_url(u, u, EcosystemId::NuGet, gate).is_ok()
+        });
 
         Ok(Self {
             package_base_address,
@@ -595,7 +598,7 @@ impl NuGetRegistry {
         register_capped_with_occupied(
             &root.alternates,
             chain.key.clone(),
-            "NuGet",
+            EcosystemId::NuGet,
             KeyShape::Opaque,
             || Arc::new(Self::build_head(root, chain, first_hop, policy, new_digest)),
             |current| {
@@ -3515,7 +3518,7 @@ mod tests {
         });
 
         assert!(
-            log.contains("NuGet alternate registry cap reached"),
+            log.contains("nuget alternate registry cap reached"),
             "log: {log}"
         );
         assert!(

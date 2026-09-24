@@ -24,7 +24,8 @@ use std::sync::Arc;
 
 use deps_core::VersionData;
 use deps_core::osv::{
-    Advisory, Capped, DependencyVulnerabilities, ScanOutcome, VulnSeverity, VulnerabilityMap,
+    Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, VulnSeverity,
+    VulnerabilityMap,
 };
 
 use super::ServerState;
@@ -39,7 +40,7 @@ fn sample_advisory() -> Arc<Advisory> {
         .expect("valid osv id")
         .with_summary("Example vulnerability for snapshot testing".to_string())
         .with_aliases(vec!["CVE-2023-00000".to_string()])
-        .with_fixed_versions(vec!["9.9.9".to_string()]),
+        .with_fixed_versions(vec![OsvVersion::new("9.9.9")]),
     )
 }
 
