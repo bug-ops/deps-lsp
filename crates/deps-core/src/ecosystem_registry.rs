@@ -1,7 +1,7 @@
 use dashmap::DashMap;
 use std::sync::Arc;
 
-use crate::Ecosystem;
+use crate::{Ecosystem, EcosystemId};
 
 /// Registry for all available ecosystems.
 ///
@@ -33,9 +33,9 @@ use crate::Ecosystem;
 /// ```
 pub struct EcosystemRegistry {
     /// Map from ecosystem ID to implementation
-    ecosystems: DashMap<&'static str, Arc<dyn Ecosystem>>,
+    ecosystems: DashMap<EcosystemId, Arc<dyn Ecosystem>>,
     /// Map from filename to ecosystem ID (for fast lookup)
-    filename_map: DashMap<&'static str, &'static str>,
+    filename_map: DashMap<&'static str, EcosystemId>,
     /// Map from lowercased file extension (e.g. ".csproj") to ecosystem ID.
     ///
     /// Consulted only when an exact `filename_map` lookup misses. Kept as a
@@ -46,7 +46,7 @@ pub struct EcosystemRegistry {
     /// release build (or if the assertion is otherwise skipped) `DashMap::insert`
     /// silently last-write-wins, so the outcome is registration-order-dependent,
     /// not deterministic.
-    extension_map: DashMap<&'static str, &'static str>,
+    extension_map: DashMap<&'static str, EcosystemId>,
     /// Map from a basename pattern (e.g. `"requirements*.txt"`) to
     /// `(prefix, suffix, ecosystem_id)`, split on the pattern's single `*` at
     /// [`register`](EcosystemRegistry::register) time. Consulted between the
@@ -54,7 +54,7 @@ pub struct EcosystemRegistry {
     /// [`for_filename`](EcosystemRegistry::for_filename), using
     /// most-specific-wins selection over all matches for determinism
     /// regardless of `DashMap` iteration order.
-    patterns: DashMap<&'static str, (&'static str, &'static str, &'static str)>,
+    patterns: DashMap<&'static str, (&'static str, &'static str, EcosystemId)>,
 }
 
 impl EcosystemRegistry {
@@ -96,7 +96,7 @@ impl EcosystemRegistry {
     /// // registry.register(Arc::new(CargoEcosystem::new(cache)));
     /// ```
     pub fn register(&self, ecosystem: Arc<dyn Ecosystem>) {
-        let id = ecosystem.id();
+        let id = ecosystem.ecosystem_id();
 
         for filename in ecosystem.manifest_filenames() {
             self.filename_map.insert(*filename, id);
@@ -149,7 +149,7 @@ impl EcosystemRegistry {
     ///
     /// # Arguments
     ///
-    /// * `id` - Ecosystem identifier (e.g., "cargo", "npm", "pypi")
+    /// * `id` - Ecosystem identifier
     ///
     /// # Returns
     ///
@@ -159,15 +159,15 @@ impl EcosystemRegistry {
     /// # Examples
     ///
     /// ```no_run
-    /// use deps_core::EcosystemRegistry;
+    /// use deps_core::{EcosystemId, EcosystemRegistry};
     ///
     /// let registry = EcosystemRegistry::new();
-    /// if let Some(ecosystem) = registry.get("cargo") {
+    /// if let Some(ecosystem) = registry.get(EcosystemId::Cargo) {
     ///     println!("Found: {}", ecosystem.display_name());
     /// }
     /// ```
-    pub fn get(&self, id: &str) -> Option<Arc<dyn Ecosystem>> {
-        self.ecosystems.get(id).map(|e| Arc::clone(&e))
+    pub fn get(&self, id: EcosystemId) -> Option<Arc<dyn Ecosystem>> {
+        self.ecosystems.get(&id).map(|e| Arc::clone(&e))
     }
 
     /// Get ecosystem for a filename
@@ -229,12 +229,12 @@ impl EcosystemRegistry {
     /// match (greatest `prefix.len() + suffix.len()`, ties broken by pattern
     /// string ascending) rather than the first `DashMap` hit — so the result
     /// is deterministic regardless of map iteration order.
-    fn match_pattern(&self, filename: &str) -> Option<&'static str> {
+    fn match_pattern(&self, filename: &str) -> Option<EcosystemId> {
         if self.patterns.is_empty() {
             return None;
         }
 
-        let mut best: Option<(usize, &'static str, &'static str)> = None; // (specificity, pattern, id)
+        let mut best: Option<(usize, &'static str, EcosystemId)> = None; // (specificity, pattern, id)
         for e in self.patterns.iter() {
             let (prefix, suffix, id) = *e.value();
             if prefix_suffix_matches(filename, prefix, suffix) {
@@ -295,7 +295,9 @@ impl EcosystemRegistry {
         let by_filename = self.for_filename(filename);
         let by_directory = self.get_for_directory_pattern(path, filename);
         match (by_filename, by_directory) {
-            (Some(by_filename), Some(by_directory)) if by_filename.id() != by_directory.id() => {
+            (Some(by_filename), Some(by_directory))
+                if by_filename.ecosystem_id() != by_directory.ecosystem_id() =>
+            {
                 Some(by_directory)
             }
             (Some(by_filename), _) => Some(by_filename),
@@ -353,7 +355,7 @@ impl EcosystemRegistry {
     ///
     /// # Returns
     ///
-    /// Vector of ecosystem ID strings
+    /// Vector of ecosystem IDs
     ///
     /// # Examples
     ///
@@ -368,7 +370,7 @@ impl EcosystemRegistry {
     ///     println!("Registered ecosystem: {}", id);
     /// }
     /// ```
-    pub fn ecosystem_ids(&self) -> Vec<&'static str> {
+    pub fn ecosystem_ids(&self) -> Vec<EcosystemId> {
         self.ecosystems.iter().map(|e| *e.key()).collect()
     }
 
@@ -627,6 +629,7 @@ mod tests {
 
     struct MockEcosystem {
         id: &'static str,
+        ecosystem: EcosystemId,
         display_name: &'static str,
         filenames: &'static [&'static str],
         lockfiles: &'static [&'static str],
@@ -644,7 +647,7 @@ mod tests {
         }
 
         fn ecosystem_id(&self) -> crate::EcosystemId {
-            crate::EcosystemId::Cargo
+            self.ecosystem
         }
 
         fn display_name(&self) -> &'static str {
@@ -712,6 +715,7 @@ mod tests {
     // Unbounded-basename extension routing, mirrors NuGet's *.csproj
     struct MockExtEcosystem {
         id: &'static str,
+        ecosystem: EcosystemId,
         filenames: &'static [&'static str],
         extensions: &'static [&'static str],
     }
@@ -724,7 +728,7 @@ mod tests {
         }
 
         fn ecosystem_id(&self) -> crate::EcosystemId {
-            crate::EcosystemId::Cargo
+            self.ecosystem
         }
 
         fn display_name(&self) -> &'static str {
@@ -790,6 +794,7 @@ mod tests {
     // `action.yml`/`action.yaml` alongside another ecosystem's directory pattern).
     struct MockPatternEcosystem {
         id: &'static str,
+        ecosystem: EcosystemId,
         filenames: &'static [&'static str],
         patterns: &'static [&'static str],
         dir_patterns: &'static [(&'static str, &'static str)],
@@ -803,7 +808,7 @@ mod tests {
         }
 
         fn ecosystem_id(&self) -> crate::EcosystemId {
-            crate::EcosystemId::Cargo
+            self.ecosystem
         }
 
         fn display_name(&self) -> &'static str {
@@ -872,6 +877,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pypi",
+            ecosystem: EcosystemId::Pypi,
             filenames: &[],
             patterns: &[
                 "requirements*.txt",
@@ -891,6 +897,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockPatternEcosystem {
             id: "github-actions",
+            ecosystem: EcosystemId::GithubActions,
             filenames: &[],
             patterns: &[],
             dir_patterns: &[
@@ -958,6 +965,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockPatternEcosystem {
             id: "github-actions",
+            ecosystem: EcosystemId::GithubActions,
             filenames: &["action.yml", "action.yaml"],
             patterns: &[],
             dir_patterns: &[
@@ -967,6 +975,7 @@ mod tests {
         }));
         registry.register(Arc::new(MockPatternEcosystem {
             id: "gitlab-ci",
+            ecosystem: EcosystemId::GitlabCi,
             filenames: &[],
             patterns: &[],
             dir_patterns: &[(".gitlab/ci", ".yml"), (".gitlab/ci", ".yaml")],
@@ -1061,6 +1070,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockEcosystem {
             id: "exact",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Exact",
             filenames: &["requirements.txt"],
             lockfiles: &[],
@@ -1068,6 +1078,7 @@ mod tests {
         }));
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pattern",
+            ecosystem: EcosystemId::Pypi,
             filenames: &[],
             patterns: &["requirements*.txt"],
             dir_patterns: &[],
@@ -1084,11 +1095,13 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "ext",
+            ecosystem: EcosystemId::NuGet,
             filenames: &[],
             extensions: &[".txt"],
         }));
         registry.register(Arc::new(MockPatternEcosystem {
             id: "pattern",
+            ecosystem: EcosystemId::Pypi,
             filenames: &[],
             patterns: &["requirements*.txt"],
             dir_patterns: &[],
@@ -1125,6 +1138,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "test",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
             lockfiles: &[],
@@ -1134,7 +1148,7 @@ mod tests {
         registry.register(ecosystem);
 
         assert_eq!(registry.ecosystem_ids().len(), 1);
-        assert!(registry.get("test").is_some());
+        assert!(registry.get(EcosystemId::Cargo).is_some());
     }
 
     #[test]
@@ -1142,6 +1156,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "test",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
             lockfiles: &[],
@@ -1150,7 +1165,7 @@ mod tests {
 
         registry.register(ecosystem);
 
-        let retrieved = registry.get("test").unwrap();
+        let retrieved = registry.get(EcosystemId::Cargo).unwrap();
         assert_eq!(retrieved.id(), "test");
         assert_eq!(retrieved.display_name(), "Test Ecosystem");
     }
@@ -1160,6 +1175,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "test",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Test Ecosystem",
             filenames: &["test.toml", "test.json"],
             lockfiles: &[],
@@ -1182,6 +1198,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "test",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Test Ecosystem",
             filenames: &["test.toml"],
             lockfiles: &[],
@@ -1277,6 +1294,7 @@ mod tests {
 
         let eco1 = Arc::new(MockEcosystem {
             id: "cargo",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
@@ -1285,6 +1303,7 @@ mod tests {
 
         let eco2 = Arc::new(MockEcosystem {
             id: "npm",
+            ecosystem: EcosystemId::Npm,
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
@@ -1305,6 +1324,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "cargo",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
@@ -1325,6 +1345,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "pypi",
+            ecosystem: EcosystemId::Pypi,
             display_name: "PyPI",
             filenames: &["pyproject.toml"],
             lockfiles: &["poetry.lock", "uv.lock"],
@@ -1350,6 +1371,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "nuget",
+            ecosystem: EcosystemId::NuGet,
             display_name: "NuGet",
             filenames: &["Directory.Packages.props"],
             lockfiles: &["packages.lock.json", "packages.*.lock.json"],
@@ -1384,6 +1406,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "cargo",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
@@ -1403,6 +1426,7 @@ mod tests {
 
         let eco1 = Arc::new(MockEcosystem {
             id: "cargo",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Cargo",
             filenames: &["Cargo.toml"],
             lockfiles: &["Cargo.lock"],
@@ -1411,6 +1435,7 @@ mod tests {
 
         let eco2 = Arc::new(MockEcosystem {
             id: "npm",
+            ecosystem: EcosystemId::Npm,
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
@@ -1419,6 +1444,7 @@ mod tests {
 
         let eco3 = Arc::new(MockEcosystem {
             id: "pypi",
+            ecosystem: EcosystemId::Pypi,
             display_name: "PyPI",
             filenames: &["pyproject.toml"],
             lockfiles: &["poetry.lock", "uv.lock"],
@@ -1442,6 +1468,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "test",
+            ecosystem: EcosystemId::Cargo,
             display_name: "Test",
             filenames: &["test.toml"],
             lockfiles: &[],
@@ -1459,6 +1486,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let npm = Arc::new(MockEcosystem {
             id: "npm",
+            ecosystem: EcosystemId::Npm,
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
@@ -1487,6 +1515,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let npm = Arc::new(MockEcosystem {
             id: "npm",
+            ecosystem: EcosystemId::Npm,
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
@@ -1494,6 +1523,7 @@ mod tests {
         });
         let deno = Arc::new(MockEcosystem {
             id: "deno",
+            ecosystem: EcosystemId::Deno,
             display_name: "Deno",
             filenames: &["deno.json", "deno.jsonc"],
             lockfiles: &[],
@@ -1522,6 +1552,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let ecosystem = Arc::new(MockEcosystem {
             id: "npm",
+            ecosystem: EcosystemId::Npm,
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
@@ -1556,6 +1587,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         let npm = Arc::new(MockEcosystem {
             id: "npm",
+            ecosystem: EcosystemId::Npm,
             display_name: "npm",
             filenames: &["package.json"],
             lockfiles: &["package-lock.json"],
@@ -1563,6 +1595,7 @@ mod tests {
         });
         let deno = Arc::new(MockEcosystem {
             id: "deno",
+            ecosystem: EcosystemId::Deno,
             display_name: "Deno",
             filenames: &["deno.json", "deno.jsonc"],
             lockfiles: &[],
@@ -1586,6 +1619,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
+            ecosystem: EcosystemId::NuGet,
             filenames: &["Directory.Packages.props"],
             extensions: &[".csproj", ".fsproj"],
         }));
@@ -1606,6 +1640,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
+            ecosystem: EcosystemId::NuGet,
             filenames: &["Directory.Packages.props"],
             extensions: &[".csproj"],
         }));
@@ -1618,6 +1653,7 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
+            ecosystem: EcosystemId::NuGet,
             filenames: &["packages.config"],
             extensions: &[],
         }));
@@ -1631,10 +1667,63 @@ mod tests {
         let registry = EcosystemRegistry::new();
         registry.register(Arc::new(MockExtEcosystem {
             id: "nuget",
+            ecosystem: EcosystemId::NuGet,
             filenames: &[],
             extensions: &[".csproj"],
         }));
 
         assert!(registry.for_filename("README").is_none());
+    }
+
+    /// Registering a second ecosystem under the same [`EcosystemId`] replaces the first
+    /// registration outright (`DashMap::insert`'s last-write-wins semantics), rather than
+    /// somehow coexisting under distinct slots.
+    #[test]
+    fn test_register_same_ecosystem_id_replaces_first() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockEcosystem {
+            id: "first",
+            ecosystem: EcosystemId::Cargo,
+            display_name: "First",
+            filenames: &["first.toml"],
+            lockfiles: &[],
+            watched_configs: &[],
+        }));
+        registry.register(Arc::new(MockEcosystem {
+            id: "second",
+            ecosystem: EcosystemId::Cargo,
+            display_name: "Second",
+            filenames: &["second.toml"],
+            lockfiles: &[],
+            watched_configs: &[],
+        }));
+
+        assert_eq!(registry.ecosystem_ids(), vec![EcosystemId::Cargo]);
+        assert_eq!(
+            registry.get(EcosystemId::Cargo).unwrap().display_name(),
+            "Second"
+        );
+    }
+
+    /// Routing keys on `Ecosystem::ecosystem_id`, not `Ecosystem::id` — even when an
+    /// implementor overrides `id()` to something that disagrees with `ecosystem_id()` (as
+    /// `ecosystem::tests::StubEcosystem` does). Uses `MockEcosystem` here (`StubEcosystem`
+    /// is private to its own module) with `id: "not-cargo"` deliberately mismatched against
+    /// `ecosystem: EcosystemId::Cargo`.
+    #[test]
+    fn test_registry_routes_on_ecosystem_id_not_id() {
+        let registry = EcosystemRegistry::new();
+        registry.register(Arc::new(MockEcosystem {
+            id: "not-cargo",
+            ecosystem: EcosystemId::Cargo,
+            display_name: "Mismatched",
+            filenames: &[],
+            lockfiles: &[],
+            watched_configs: &[],
+        }));
+
+        let found = registry.get(EcosystemId::Cargo).unwrap();
+        assert_eq!(found.id(), "not-cargo");
+        assert_eq!(found.ecosystem_id(), EcosystemId::Cargo);
     }
 }

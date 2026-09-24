@@ -59,7 +59,7 @@ pub(crate) async fn reparse_open_documents(
     let affected: Vec<(Uri, String, Option<i32>)> = state
         .documents
         .iter()
-        .filter(|entry| scope.matches(entry.value().ecosystem_id()))
+        .filter(|entry| scope.matches(entry.value().ecosystem))
         .map(|entry| {
             (
                 entry.key().clone(),
@@ -189,7 +189,7 @@ mod tests {
         let uri = crate::lsp_types_interop::to_lsp_uri(&url);
         let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = state.ecosystem_registry.get(EcosystemId::Cargo).unwrap();
         let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
         let mut doc_state =
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
@@ -199,7 +199,7 @@ mod tests {
         // "npm" matches no document here — the cargo document must be left untouched
         // (still present, still version 1, no background task installed for it).
         reparse_open_documents(
-            ReparseScope::Ecosystems(vec!["npm"]),
+            ReparseScope::Ecosystems(vec![EcosystemId::Npm]),
             RefetchPolicy::Diff,
             "test",
             Arc::clone(&state),

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use deps_core::Ecosystem;
 use deps_core::edit::{VulnFixSkip, plan_verified_fix, resolve_verified_fix};
-use deps_core::lsp_helpers::resolve_in_use_version;
+use deps_core::lsp_helpers::{resolve_in_use_version, resolve_scan_outcome};
 use deps_core::osv::{OsvClient, ScanOutcome};
 
 use crate::analyze::ManifestAnalysis;
@@ -155,12 +155,12 @@ pub async fn plan_security_updates(
     let mut items = Vec::new();
     for dep in analysis.parse_result.dependencies() {
         let normalized_name = formatter.normalize_package_name(dep.name());
-        let key = vuln_key_by_range
-            .get(&dep.name_range())
-            .cloned()
-            .unwrap_or_else(|| normalized_name.clone());
-
-        let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get(key.as_str()) else {
+        let Some(ScanOutcome::Vulnerable(dv)) = resolve_scan_outcome(
+            &vulnerabilities,
+            dep,
+            Some(&vuln_key_by_range),
+            &normalized_name,
+        ) else {
             continue;
         };
 

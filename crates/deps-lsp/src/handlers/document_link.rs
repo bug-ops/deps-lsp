@@ -34,7 +34,7 @@ pub async fn handle_document_link(
     // by other handlers even though `generate_document_links` is sync today.
     let Some((ecosystem, parse_result)) = state
         .with_document(uri, |doc| {
-            let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
+            let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
             let parse_result = doc.parse_result_arc()?;
             Some((ecosystem, parse_result))
         })
@@ -91,7 +91,10 @@ mod tests {
             let url = deps_core::test_util::test_uri("/test/requirements.txt");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Pypi)
+                .unwrap();
             let content = "-r other-requirements.txt\nrequests==2.31.0\n".to_string();
 
             let parse_result = ecosystem

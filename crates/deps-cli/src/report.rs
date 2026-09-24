@@ -15,7 +15,7 @@ use deps_core::lsp_helpers::{
     DEPRECATED_DIAGNOSTIC_CODE, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     UNSATISFIABLE_DIAGNOSTIC_CODE, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
 };
-use deps_core::osv::{OsvClient, ScanOutcome, VulnSeverity, VulnerabilityMap};
+use deps_core::osv::{OsvClient, ScanOutcome, VulnKeys, VulnSeverity, VulnerabilityMap};
 use deps_core::policy_config::PolicyConfig;
 use deps_core::position::Range;
 use deps_core::{Dependency, Ecosystem, EcosystemId, HttpCache};
@@ -540,7 +540,7 @@ fn to_finding(
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     diagnostic: Diagnostic,
     advisory_severities: &HashMap<(String, String), VulnSeverity>,
-    vuln_keys: &HashMap<Range, String>,
+    vuln_keys: &VulnKeys,
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
@@ -550,9 +550,13 @@ fn to_finding(
         .as_ref()
         .map(|code_description| code_description.href.as_str().to_string());
     let advisory_severity = code.as_deref().zip(dep).and_then(|(code, dep)| {
-        let dependency_key = vuln_keys.get(&dep.name_range())?;
+        // Deliberately narrower than resolve_scan_outcome: None on synthetic ranges, no further fallback.
+        if dep.name_range_is_synthetic() {
+            return None;
+        }
+        let dependency_key = deps_core::osv::vuln_key_for(dep, Some(vuln_keys), formatter);
         advisory_severities
-            .get(&(dependency_key.clone(), code.to_string()))
+            .get(&(dependency_key.into_string(), code.to_string()))
             .copied()
     });
     CheckFinding {
@@ -905,7 +909,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
         assert_eq!(finding.code.as_deref(), Some("RUSTSEC-2024-0001"));
     }
@@ -922,7 +926,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
         assert!(finding.code.is_none());
     }
@@ -943,7 +947,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
         assert_eq!(
             finding.advisory_url.as_deref(),
@@ -963,7 +967,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
         assert!(finding.advisory_url.is_none());
     }
@@ -986,7 +990,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
 
         let name = finding
@@ -1018,7 +1022,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
 
         let sarif = crate::format::sarif::to_sarif(&CheckReport {
@@ -1065,7 +1069,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
 
         let sanitized = finding.manifest_path.to_string_lossy().into_owned();
@@ -1130,7 +1134,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
 
         let requirement = finding.requirement.expect("range matched the dependency");
@@ -1162,7 +1166,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
 
         let report = CheckReport {
@@ -1194,8 +1198,13 @@ mod tests {
         let dep_index = DependencyIndex::build(parse_result.as_ref());
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
 
-        let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(Range::default(), "dep-0".to_string());
+        let vuln_keys = deps_core::osv::vulnerability_keys(
+            parse_result.as_ref(),
+            &HashMap::new(),
+            None,
+            &STUB_FORMATTER,
+            EcosystemId::Cargo,
+        );
         let mut severities = HashMap::new();
         severities.insert(
             ("dep-0".to_string(), "RUSTSEC-2024-0001".to_string()),
@@ -1219,8 +1228,13 @@ mod tests {
         let parse_result = dep_index_with_one_dependency();
         let dep_index = DependencyIndex::build(parse_result.as_ref());
         let diagnostic = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
-        let mut vuln_keys = HashMap::new();
-        vuln_keys.insert(Range::default(), "dep-0".to_string());
+        let vuln_keys = deps_core::osv::vulnerability_keys(
+            parse_result.as_ref(),
+            &HashMap::new(),
+            None,
+            &STUB_FORMATTER,
+            EcosystemId::Cargo,
+        );
 
         let finding = to_finding(
             EcosystemId::Cargo,
@@ -1255,7 +1269,7 @@ mod tests {
             &STUB_FORMATTER,
             diagnostic,
             &severities,
-            &HashMap::new(),
+            &VulnKeys::default(),
         );
         assert!(finding.advisory_severity.is_none());
     }

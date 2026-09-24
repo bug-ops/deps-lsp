@@ -285,8 +285,8 @@ fn test_mirror_distinct_pinned_versions_produce_distinct_vulnerability_keys() {
         EcosystemId::Cargo,
     );
     let deps = parse_result.dependencies();
-    let key0 = keys.get(&deps[0].name_range()).unwrap();
-    let key1 = keys.get(&deps[1].name_range()).unwrap();
+    let key0 = deps_core::osv::vuln_key_for(deps[0], Some(&keys), &formatter);
+    let key1 = deps_core::osv::vuln_key_for(deps[1], Some(&keys), &formatter);
     assert_ne!(
         key0, key1,
         "two mirrored occurrences pinned to different versions must get distinct OSV keys"

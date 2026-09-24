@@ -1555,7 +1555,10 @@ mod tests {
             content.push_str(&format!("dep-{i} = \"1.0.0\"\n"));
         }
 
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &url)
             .await
             .unwrap();
@@ -1612,7 +1615,10 @@ mod tests {
             content.push_str(&format!("dep-{i} = \"1.0.0\"\n"));
         }
 
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let parse_result = deps_core::parse_manifest_blocking(&ecosystem, &content, &url)
             .await
             .unwrap();
@@ -1754,7 +1760,10 @@ mod tests {
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let mut doc_state =
                 DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
@@ -1857,7 +1866,10 @@ mod tests {
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
             let mut doc_state = DocumentState::new_from_parse_result(
                 EcosystemId::Cargo,
@@ -2314,7 +2326,10 @@ mod tests {
 serde = "1.0"
 anyhow = "1.0"
 "#;
-        let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
         let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
         let doc_state1 = DocumentState::new_from_parse_result(
             EcosystemId::Cargo,
@@ -2439,7 +2454,7 @@ serde = "1.0"
 
             assert_eq!(state.document_count(), 1);
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id(), "cargo");
+            assert_eq!(doc.ecosystem, EcosystemId::Cargo);
         }
 
         #[tokio::test]
@@ -2479,7 +2494,7 @@ serde = "1.0"
             );
 
             let doc = doc.unwrap();
-            assert_eq!(doc.ecosystem_id(), "cargo");
+            assert_eq!(doc.ecosystem, EcosystemId::Cargo);
             assert_eq!(doc.content, content);
             assert!(
                 doc.parse_result().is_none(),
@@ -3361,7 +3376,7 @@ tokio = "1.0"
             state.update_document(uri.clone(), doc_state);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id(), "npm");
+            assert_eq!(doc.ecosystem, EcosystemId::Npm);
         }
 
         /// Impl-critic S1 regression: a version-guarded reparse whose `expected_version` no
@@ -3596,7 +3611,7 @@ require github.com/gorilla/mux v1.8.0
             state.update_document(uri.clone(), doc_state);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id(), "go");
+            assert_eq!(doc.ecosystem, EcosystemId::Go);
         }
 
         /// Regression test for critique S1 (`.local/handoff/2026-08-23T20-55-32-critic.md`):

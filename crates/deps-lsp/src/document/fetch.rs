@@ -434,7 +434,7 @@ dependencies = ["requests>=2.0.0"]
             state.update_document(uri.clone(), doc_state);
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.ecosystem_id(), "pypi");
+            assert_eq!(doc.ecosystem, EcosystemId::Pypi);
         }
     }
 

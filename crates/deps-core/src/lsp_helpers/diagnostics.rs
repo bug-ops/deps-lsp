@@ -1177,7 +1177,7 @@ fn skip_reason_notice(
     versions: VersionData<'_>,
     normalized_names: &HashMap<Range, String>,
     uri: &url::Url,
-    vuln_keys: Option<&HashMap<Range, String>>,
+    vuln_keys: Option<&crate::osv::VulnKeys>,
 ) {
     if versions.offline {
         return;
@@ -1204,15 +1204,7 @@ fn skip_reason_notice(
         let normalized_name = normalized_names
             .get(&dep.name_range())
             .map_or("", String::as_str);
-        let vuln_key = vuln_keys
-            .and_then(|keys| keys.get(&dep.name_range()))
-            .map(String::as_str);
-        let outcome = resolve_scan_outcome(
-            vulnerabilities,
-            vuln_key,
-            normalized_name,
-            dep.name().as_str(),
-        );
+        let outcome = resolve_scan_outcome(vulnerabilities, *dep, vuln_keys, normalized_name);
 
         if let Some(ScanOutcome::Skipped(reason)) = outcome
             && should_notify_in_diagnostics(*reason)
@@ -1460,20 +1452,13 @@ fn push_collapsed_blocked_registries(
 fn apply_vulnerability_rule(
     diagnostics: &mut Vec<Diagnostic>,
     ctx: &RuleContext<'_>,
-    vuln_keys: Option<&HashMap<Range, String>>,
+    vuln_keys: Option<&crate::osv::VulnKeys>,
 ) {
-    if let Some(vulnerabilities) = ctx.versions.vulnerabilities {
-        let vuln_key = vuln_keys
-            .and_then(|keys| keys.get(&ctx.dep.name_range()))
-            .map(String::as_str);
-        if let Some(ScanOutcome::Vulnerable(dv)) = resolve_scan_outcome(
-            vulnerabilities,
-            vuln_key,
-            ctx.normalized_name,
-            ctx.dep.name().as_str(),
-        ) {
-            push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
-        }
+    if let Some(vulnerabilities) = ctx.versions.vulnerabilities
+        && let Some(ScanOutcome::Vulnerable(dv)) =
+            resolve_scan_outcome(vulnerabilities, ctx.dep, vuln_keys, ctx.normalized_name)
+    {
+        push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
     }
 }
 
@@ -6773,7 +6758,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            vulnerable_key,
+            vulnerable_key.into_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
@@ -6783,7 +6768,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(patched_key, ScanOutcome::Clean);
+        vulns.insert(patched_key.into_string(), ScanOutcome::Clean);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
@@ -6877,7 +6862,7 @@ mod tests {
 
         let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
         vulns.insert(
-            current_key,
+            current_key.into_string(),
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(
                     vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
@@ -6887,7 +6872,7 @@ mod tests {
                 upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
-        vulns.insert(renamed_key, ScanOutcome::Clean);
+        vulns.insert(renamed_key.into_string(), ScanOutcome::Clean);
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,

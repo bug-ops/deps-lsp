@@ -128,10 +128,7 @@ pub fn build_scan_targets(
 
     for dep in parse_result.dependencies() {
         let normalized_name = formatter.normalize_package_name(dep.name());
-        let key = keys
-            .get(&dep.name_range())
-            .cloned()
-            .unwrap_or_else(|| normalized_name.clone());
+        let key = deps_core::osv::vuln_key_for(dep, Some(&keys), formatter).into_string();
 
         if !formatter.source_is_public_registry_content(&dep.source()) {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::NonRegistrySource));

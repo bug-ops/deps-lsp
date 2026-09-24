@@ -369,16 +369,16 @@ impl Default for CodeLensConfig {
 pub(crate) enum ReparseScope {
     /// Reparse every open document, regardless of ecosystem.
     All,
-    /// Reparse only open documents whose `ecosystem_id()` is one of these.
-    Ecosystems(Vec<&'static str>),
+    /// Reparse only open documents whose ecosystem is one of these.
+    Ecosystems(Vec<deps_core::EcosystemId>),
 }
 
 impl ReparseScope {
     /// Whether a document of this ecosystem falls within scope.
-    pub(crate) fn matches(&self, ecosystem_id: &str) -> bool {
+    pub(crate) fn matches(&self, ecosystem: deps_core::EcosystemId) -> bool {
         match self {
             Self::All => true,
-            Self::Ecosystems(ids) => ids.contains(&ecosystem_id),
+            Self::Ecosystems(ids) => ids.contains(&ecosystem),
         }
     }
 
@@ -401,7 +401,8 @@ impl ReparseScope {
 }
 
 /// The only ecosystem `registries.nuget_user_profile_sources` affects.
-const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[&str] = &["nuget"];
+const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[deps_core::EcosystemId] =
+    &[deps_core::EcosystemId::NuGet];
 
 /// The only ecosystem `registries.gitlab_instance_host` affects.
 ///
@@ -413,7 +414,8 @@ const NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS: &[&str] = &["nuget"];
 /// unconditionally here even though the `gitlab-ci` feature can be compiled out — `ReparseScope`
 /// only ever narrows an *already-registered* ecosystem, so naming an absent one is a no-op, not
 /// a hazard.
-const GITLAB_INSTANCE_HOST_ECOSYSTEMS: &[&str] = &["gitlab-ci"];
+const GITLAB_INSTANCE_HOST_ECOSYSTEMS: &[deps_core::EcosystemId] =
+    &[deps_core::EcosystemId::GitlabCi];
 
 /// Diffs `old` against `new` and returns the [`ReparseScope`] of open documents a
 /// live-reloaded config change invalidates, or `None` if nothing parse-affecting changed
@@ -445,7 +447,7 @@ const GITLAB_INSTANCE_HOST_ECOSYSTEMS: &[&str] = &["gitlab-ci"];
 pub(crate) fn reparse_scope(
     old: &DepsConfig,
     new: &DepsConfig,
-    workspace_registry_ecosystems: &[&'static str],
+    workspace_registry_ecosystems: &[deps_core::EcosystemId],
 ) -> Option<ReparseScope> {
     let DepsConfig {
         inlay_hints: new_inlay_hints,
@@ -1212,12 +1214,18 @@ mod tests {
     // `reparse_scope` / `ReparseScope` tests (issue #592)
     mod reparse_scope_tests {
         use super::*;
+        use deps_core::EcosystemId;
 
         /// A small, test-local stand-in for the real ecosystem list `reparse_scope` now
         /// takes as a parameter (issue #592 security M1) — these tests exercise
         /// `reparse_scope`'s diff/union *logic*, not the production ecosystem set, which is
         /// covered separately by `lib.rs`'s `register_ecosystems`-drift test.
-        const TEST_WORKSPACE_REGISTRY_ECOSYSTEMS: &[&str] = &["cargo", "npm", "pypi", "go"];
+        const TEST_WORKSPACE_REGISTRY_ECOSYSTEMS: &[EcosystemId] = &[
+            EcosystemId::Cargo,
+            EcosystemId::Npm,
+            EcosystemId::Pypi,
+            EcosystemId::Go,
+        ];
 
         #[test]
         fn test_no_change_returns_none() {
@@ -1251,9 +1259,9 @@ mod tests {
                 ReparseScope::Ecosystems(TEST_WORKSPACE_REGISTRY_ECOSYSTEMS.to_vec())
             );
             for id in TEST_WORKSPACE_REGISTRY_ECOSYSTEMS {
-                assert!(scope.matches(id));
+                assert!(scope.matches(*id));
             }
-            assert!(!scope.matches("bundler"));
+            assert!(!scope.matches(EcosystemId::Bundler));
         }
 
         /// The scope must come from the caller-supplied list, not a value baked into
@@ -1266,9 +1274,9 @@ mod tests {
             new.policy.registries.workspace_registries = WorkspaceRegistriesSetting::Off;
 
             let scope =
-                reparse_scope(&old, &new, &["only-this-one"]).expect("must trigger a reparse");
-            assert_eq!(scope, ReparseScope::Ecosystems(vec!["only-this-one"]));
-            assert!(!scope.matches("cargo"));
+                reparse_scope(&old, &new, &[EcosystemId::Swift]).expect("must trigger a reparse");
+            assert_eq!(scope, ReparseScope::Ecosystems(vec![EcosystemId::Swift]));
+            assert!(!scope.matches(EcosystemId::Cargo));
         }
 
         #[test]
@@ -1283,8 +1291,8 @@ mod tests {
                 scope,
                 ReparseScope::Ecosystems(NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS.to_vec())
             );
-            assert!(scope.matches("nuget"));
-            assert!(!scope.matches("cargo"));
+            assert!(scope.matches(EcosystemId::NuGet));
+            assert!(!scope.matches(EcosystemId::Cargo));
         }
 
         #[test]
@@ -1299,9 +1307,9 @@ mod tests {
                 scope,
                 ReparseScope::Ecosystems(GITLAB_INSTANCE_HOST_ECOSYSTEMS.to_vec())
             );
-            assert!(scope.matches("gitlab-ci"));
-            assert!(!scope.matches("cargo"));
-            assert!(!scope.matches("nuget"));
+            assert!(scope.matches(EcosystemId::GitlabCi));
+            assert!(!scope.matches(EcosystemId::Cargo));
+            assert!(!scope.matches(EcosystemId::NuGet));
         }
 
         #[test]
@@ -1314,48 +1322,35 @@ mod tests {
             let scope = reparse_scope(&old, &new, TEST_WORKSPACE_REGISTRY_ECOSYSTEMS)
                 .expect("must trigger a reparse");
             for id in TEST_WORKSPACE_REGISTRY_ECOSYSTEMS {
-                assert!(scope.matches(id), "must still cover {id}");
+                assert!(scope.matches(*id), "must still cover {id}");
             }
-            assert!(scope.matches("nuget"));
+            assert!(scope.matches(EcosystemId::NuGet));
         }
 
         #[test]
         fn test_scope_union_all_absorbs_ecosystems() {
             let all = ReparseScope::All;
-            let ecosystems = ReparseScope::Ecosystems(vec!["cargo"]);
+            let ecosystems = ReparseScope::Ecosystems(vec![EcosystemId::Cargo]);
             assert_eq!(all.clone().union(ecosystems.clone()), ReparseScope::All);
             assert_eq!(ecosystems.union(all), ReparseScope::All);
         }
 
         #[test]
         fn test_scope_union_ecosystems_dedups() {
-            let a = ReparseScope::Ecosystems(vec!["cargo", "npm"]);
-            let b = ReparseScope::Ecosystems(vec!["npm", "pypi"]);
+            let a = ReparseScope::Ecosystems(vec![EcosystemId::Cargo, EcosystemId::Npm]);
+            let b = ReparseScope::Ecosystems(vec![EcosystemId::Npm, EcosystemId::Pypi]);
             let ReparseScope::Ecosystems(union) = a.union(b) else {
                 panic!("expected Ecosystems variant");
             };
             assert_eq!(union.len(), 3, "npm must not be duplicated: {union:?}");
-            for id in ["cargo", "npm", "pypi"] {
+            for id in [EcosystemId::Cargo, EcosystemId::Npm, EcosystemId::Pypi] {
                 assert!(union.contains(&id));
             }
         }
 
         #[test]
         fn test_scope_matches_all_matches_any_ecosystem() {
-            assert!(ReparseScope::All.matches("anything"));
-        }
-
-        /// Every ecosystem id named in the `nuget_user_profile_sources` scope literal must
-        /// actually resolve in the registered ecosystem set (critic Q1: a typo here fails
-        /// silently closed — matching no document, no warning). The `workspace_registries`
-        /// scope's ids are no longer a literal in this module (security M1) — their
-        /// validity is covered by `lib.rs`'s `register_ecosystems`-drift test instead.
-        #[test]
-        fn test_nuget_user_profile_sources_ecosystem_ids_are_valid_ecosystem_ids() {
-            for id in NUGET_USER_PROFILE_SOURCES_ECOSYSTEMS {
-                id.parse::<deps_core::EcosystemId>()
-                    .unwrap_or_else(|_| panic!("{id:?} is not a valid EcosystemId"));
-            }
+            assert!(ReparseScope::All.matches(EcosystemId::Cargo));
         }
     }
 }

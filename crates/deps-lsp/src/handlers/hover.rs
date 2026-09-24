@@ -52,7 +52,7 @@ pub async fn handle_hover(
         licenses,
     ) = state
         .with_document(uri, |doc| {
-            let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
+            let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
             let parse_result = doc.parse_result_arc()?;
             Some((
                 ecosystem,
@@ -135,7 +135,10 @@ mod tests {
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -200,7 +203,10 @@ serde = "1.0.0"
             let url = deps_core::test_util::test_uri("/test/package.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Npm)
+                .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem

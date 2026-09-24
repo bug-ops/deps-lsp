@@ -328,8 +328,7 @@ impl ColdStartLimiter {
 impl std::fmt::Debug for DocumentState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DocumentState")
-            .field("ecosystem", &self.ecosystem)
-            .field("ecosystem_id", &self.ecosystem_id())
+            .field("ecosystem", &format_args!("{}", self.ecosystem))
             .field("content_len", &self.content.len())
             .field("has_parse_result", &self.parse_result.is_some())
             .field("cached_versions_count", &self.cached_versions.len())
@@ -403,13 +402,6 @@ impl DocumentState {
             loading_started_at: None,
             version: None,
         }
-    }
-
-    /// Returns the ecosystem identifier as a `&'static str`, derived from
-    /// [`DocumentState::ecosystem`]. Registry lookups (`EcosystemRegistry::get`)
-    /// are keyed by string, so this mirrors `ecosystem.id()`.
-    pub fn ecosystem_id(&self) -> &'static str {
-        self.ecosystem.id()
     }
 
     /// Gets a reference to the parse result if available.
@@ -755,7 +747,7 @@ pub struct ServerState {
     /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
     /// reparse, returned by that same function so the two facts can never independently
     /// drift. See [`crate::register_ecosystems`]'s doc.
-    pub(crate) workspace_registry_ecosystems: Vec<&'static str>,
+    pub(crate) workspace_registry_ecosystems: Vec<EcosystemId>,
     /// Cold start rate limiter
     pub cold_start_limiter: ColdStartLimiter,
     /// Background task handles, keyed by URI.
@@ -1309,7 +1301,7 @@ impl ServerState {
 
         let not_attempted: Vec<String> = self
             .ecosystem_registry
-            .get(doc.ecosystem_id())
+            .get(doc.ecosystem)
             .zip(doc.parse_result())
             .map(|(ecosystem, parse_result)| {
                 let formatter = ecosystem.formatter();
@@ -1828,28 +1820,28 @@ mod tests {
             let state = ServerState::new();
             assert_eq!(state.config_generation(), 0);
 
-            let gen1 = state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
+            let gen1 = state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Cargo]));
             assert_eq!(gen1, 1);
             assert_eq!(state.config_generation(), 1);
 
-            let gen2 = state.queue_reparse(ReparseScope::Ecosystems(vec!["npm"]));
+            let gen2 = state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Npm]));
             assert_eq!(gen2, 2);
         }
 
         #[test]
         fn test_queue_reparse_unions_pending_scope_across_calls() {
             let state = ServerState::new();
-            state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
-            state.queue_reparse(ReparseScope::Ecosystems(vec!["npm"]));
+            state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Cargo]));
+            state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Npm]));
 
             let scope = state
                 .take_pending_reparse()
                 .expect("a pending scope must exist after two queue_reparse calls");
             assert!(
-                scope.matches("cargo"),
+                scope.matches(EcosystemId::Cargo),
                 "earlier change's scope must survive"
             );
-            assert!(scope.matches("npm"));
+            assert!(scope.matches(EcosystemId::Npm));
         }
 
         #[test]
@@ -1879,7 +1871,7 @@ mod tests {
         #[tokio::test]
         async fn test_pending_reparse_overdue_becomes_true_after_max_wait_elapses() {
             let state = ServerState::new();
-            state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
+            state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Cargo]));
 
             assert!(
                 !state.pending_reparse_overdue(Duration::from_secs(10)),
@@ -1900,13 +1892,13 @@ mod tests {
         #[tokio::test]
         async fn test_queue_reparse_union_preserves_first_queued_at() {
             let state = ServerState::new();
-            state.queue_reparse(ReparseScope::Ecosystems(vec!["cargo"]));
+            state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Cargo]));
 
             tokio::time::sleep(Duration::from_millis(20)).await;
             // A second change arrives well after the first — if this union reset the
             // clock, `pending_reparse_overdue` below (checked against the first change's
             // age) would wrongly read `false`.
-            state.queue_reparse(ReparseScope::Ecosystems(vec!["npm"]));
+            state.queue_reparse(ReparseScope::Ecosystems(vec![EcosystemId::Npm]));
 
             assert!(
                 state.pending_reparse_overdue(Duration::from_millis(15)),
@@ -2361,7 +2353,6 @@ mod tests {
 
             let doc = DocumentState::new_without_parse_result(expected, String::new());
             assert_eq!(doc.ecosystem, expected);
-            assert_eq!(doc.ecosystem_id(), id);
         }
     }
 
@@ -2375,7 +2366,10 @@ mod tests {
     fn test_document_state_new_from_parse_result_maven_not_misclassified_as_cargo() {
         let state = ServerState::new();
         let uri = deps_core::test_util::test_uri("/test/pom.xml");
-        let ecosystem = state.ecosystem_registry.get("maven").unwrap();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Maven)
+            .unwrap();
         let content = r"<project>
   <dependencies>
     <dependency>
@@ -2398,7 +2392,6 @@ mod tests {
             .expect("maven must resolve to an EcosystemId");
         let doc_state = DocumentState::new_from_parse_result(ecosystem_id, content, parse_result);
 
-        assert_eq!(doc_state.ecosystem_id(), "maven");
         assert_eq!(doc_state.ecosystem, EcosystemId::Maven);
     }
 
@@ -2448,7 +2441,10 @@ mod tests {
             let _guard = deps_core::fs_probe::snapshot_guard();
             let state = ServerState::new();
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
 
             let parse_result = tokio::runtime::Runtime::new()
@@ -2462,7 +2458,7 @@ mod tests {
                 parse_result,
             );
 
-            assert_eq!(doc_state.ecosystem_id(), "cargo");
+            assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
             assert_eq!(doc_state.content, content);
             assert!(doc_state.parse_result.is_some());
         }
@@ -2472,7 +2468,6 @@ mod tests {
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
-            assert_eq!(doc_state.ecosystem_id(), "cargo");
             assert_eq!(doc_state.ecosystem, EcosystemId::Cargo);
             assert!(doc_state.parse_result.is_none());
         }
@@ -2531,7 +2526,10 @@ mod tests {
             // See the comment in `test_document_state_new_from_parse_result` on why this guard is needed here.
             let _guard = deps_core::fs_probe::snapshot_guard();
             let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
-            let ecosystem = ServerState::new().ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = ServerState::new()
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = "[dependencies]\nserde = \"1.0\"\n".to_string();
             let parse_result = tokio::runtime::Runtime::new()
                 .unwrap()
@@ -2573,7 +2571,6 @@ mod tests {
             let content = r#"{"dependencies": {"express": "^4.18.0"}}"#.to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Npm, content);
 
-            assert_eq!(doc_state.ecosystem_id(), "npm");
             assert_eq!(doc_state.ecosystem, EcosystemId::Npm);
             assert!(doc_state.parse_result.is_none());
         }
@@ -2592,7 +2589,6 @@ mod tests {
             let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0"}}"#.to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Deno, content);
 
-            assert_eq!(doc_state.ecosystem_id(), "deno");
             assert_eq!(doc_state.ecosystem, EcosystemId::Deno);
             assert!(doc_state.parse_result.is_none());
         }
@@ -2611,7 +2607,6 @@ mod tests {
             let content = "[project]\ndependencies = [\"requests>=2.0.0\"]\n".to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Pypi, content);
 
-            assert_eq!(doc_state.ecosystem_id(), "pypi");
             assert_eq!(doc_state.ecosystem, EcosystemId::Pypi);
             assert!(doc_state.parse_result.is_none());
         }
@@ -2632,7 +2627,6 @@ mod tests {
                     .to_string();
             let doc_state = DocumentState::new_without_parse_result(EcosystemId::Go, content);
 
-            assert_eq!(doc_state.ecosystem_id(), "go");
             assert_eq!(doc_state.ecosystem, EcosystemId::Go);
             assert!(doc_state.parse_result.is_none());
         }
@@ -2641,7 +2635,10 @@ mod tests {
         fn test_document_state_new_from_parse_result() {
             let state = ServerState::new();
             let uri = deps_core::test_util::test_uri("/test/go.mod");
-            let ecosystem = state.ecosystem_registry.get("go").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Go)
+                .unwrap();
             let content =
                 "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/gin-gonic/gin v1.9.1\n"
                     .to_string();
@@ -2657,7 +2654,7 @@ mod tests {
                 parse_result,
             );
 
-            assert_eq!(doc_state.ecosystem_id(), "go");
+            assert_eq!(doc_state.ecosystem, EcosystemId::Go);
             assert!(doc_state.parse_result.is_some());
         }
     }

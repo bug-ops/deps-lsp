@@ -47,7 +47,7 @@ pub async fn handle_code_actions(
         content,
     )) = state
         .with_document(uri, |doc| {
-            let ecosystem = state.ecosystem_registry.get(doc.ecosystem_id())?;
+            let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
             let parse_result = doc.parse_result_arc()?;
             Some((
                 ecosystem,
@@ -489,7 +489,10 @@ mod tests {
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -532,7 +535,10 @@ serde = "1.0.0"
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             // #1344: "0.9.0" (not "1.0.0"), so the fix action's own gate — the declared
             // requirement must not already admit the fix target ("1.0.5", which "^1.0.0"
             // would admit) — doesn't suppress the quickfix this test is exercising.
@@ -632,7 +638,10 @@ serde = "0.9.0"
             let url = deps_core::test_util::test_uri("/test/Cargo.toml");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -768,7 +777,10 @@ serde = "1.0.0"
                     "expected {raw:?} to be normalized by canonicalize_uri"
                 );
 
-                let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+                let ecosystem = state
+                    .ecosystem_registry
+                    .get(deps_core::EcosystemId::Cargo)
+                    .unwrap();
                 let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
                 let parse_result = ecosystem
                     .parse_manifest(&content, &url)
@@ -822,7 +834,10 @@ serde = "1.0.0"
             let url = deps_core::test_util::test_uri("/test/package.json");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Npm)
+                .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem
@@ -867,7 +882,10 @@ serde = "1.0.0"
             let url = deps_core::test_util::test_uri("/test/Package.swift");
             let uri = crate::lsp_types_interop::to_lsp_uri(&url);
 
-            let ecosystem = state.ecosystem_registry.get("swift").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Swift)
+                .unwrap();
             let content =
                 r#".package(url: "https://github.com/vapor/vapor", .exact("4.50.0"))"#.to_string();
             let version_col = content.find("4.50.0").unwrap() as u32;

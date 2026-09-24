@@ -49,8 +49,8 @@ pub async fn handle_inlay_hints(
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
     let Some(extracted) = state.with_document(uri, |doc| {
-        let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem_id()) else {
-            tracing::warn!("Ecosystem not found: {}", doc.ecosystem_id());
+        let Some(ecosystem) = state.ecosystem_registry.get(doc.ecosystem) else {
+            tracing::warn!("Ecosystem not found: {}", doc.ecosystem);
             return None;
         };
         let parse_result = doc.parse_result_arc()?;
@@ -279,7 +279,10 @@ mod tests {
                 needs_update_text: "❌ {}".to_string(),
             };
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -350,7 +353,10 @@ serde = "1.0.0"
                 needs_update_text: "UPDATE: {}".to_string(),
             };
 
-            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
             let content = r#"[dependencies]
 serde = "1.0.0"
 "#
@@ -397,7 +403,10 @@ serde = "1.0.0"
                 needs_update_text: "❌ {}".to_string(),
             };
 
-            let ecosystem = state.ecosystem_registry.get("npm").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Npm)
+                .unwrap();
             let content = r#"{"dependencies": {"express": "4.0.0"}}"#.to_string();
 
             let parse_result = ecosystem
@@ -439,7 +448,10 @@ serde = "1.0.0"
                 needs_update_text: "❌ {}".to_string(),
             };
 
-            let ecosystem = state.ecosystem_registry.get("pypi").unwrap();
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Pypi)
+                .unwrap();
             let content = r#"[project]
 dependencies = ["requests>=2.0.0"]
 "#
