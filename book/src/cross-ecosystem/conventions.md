@@ -51,6 +51,17 @@ Markdown convention of their own.
 | `### Security advisories` | `- **[CVE-XXXX-YYYY](advisory link)** — critical` then a summary line and `Fixed in: \`1.2.4\`` | One bullet per advisory: linked CVE/GHSA id, plain-text severity (`critical`/`high`/`medium`/`low`/`unknown severity`/`confirmed malicious package`/`maintenance-status notice, not a vulnerability`), a summary line, and the fixed-in version. When a package has been scanned and has no advisories, hover shows `**No known vulnerabilities** (OSV.dev)` instead — this line only appears after a scan actually ran, never for an unscanned package. |
 | unheaded line | `🔐 **Supply chain**: OpenSSF Scorecard \`7.5\`/10 · Provenance: verified` | OpenSSF Scorecard score and/or SLSA-provenance verdict (via deps.dev), on its own line with no heading. Omitted entirely when neither signal is available. |
 | `---` + footer | `⌨️ **Press \`Cmd+.\` to update version**`, `📴 *Offline: version and vulnerability data not checked*` | Each footer is preceded by a Markdown horizontal rule. The first appears when a newer version is available; the second while `network.offline` is active. |
+| `---` + footer | `*Vulnerability data was not checked: no resolved or exact version was available to query*` | Shown per dependency, while online, whenever the OSV scan was skipped for that dependency instead of run — same purpose as the offline footer above but for a per-dependency reason (no resolvable version, an OSV.dev query failure, a truncated result set, a package name or ecosystem OSV.dev doesn't support). Never appears together with the offline footer, and never for a dependency that OSV.dev genuinely scanned. |
+
+A dependency skipped for one of these reasons also gets a single, file-level
+Information diagnostic aggregating every skipped dependency in the document (one
+`RelatedInformation` entry per dependency, capped at 9 plus an "N more" tail), so the
+signal is visible in the Problems panel too, not just on hover. Dependencies skipped
+because the package name or ecosystem itself cannot be mapped to OSV.dev (e.g. a
+`jsr:`-pinned Deno dependency) are excluded from this diagnostic — that state is
+permanent for as long as the dependency is declared that way, so a standing
+Problems-panel entry would be unactionable noise — but still show the per-dependency
+hover footer above.
 
 **Diagnostics and code lens are plain text, not Markdown, and have no icon
 convention.** Diagnostic message wording is deliberately not unified across rule
