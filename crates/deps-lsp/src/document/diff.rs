@@ -2,6 +2,9 @@
 //! parses of a manifest.
 
 use super::state::DocumentState;
+use deps_core::ConcreteVersion;
+use deps_core::Dependency;
+use deps_core::EcosystemId;
 use deps_core::FetchFailure;
 use deps_core::PackageName;
 use deps_core::VersionReq;
@@ -33,6 +36,15 @@ pub(crate) fn preserve_cache(new_state: &mut DocumentState, old_state: &Document
     new_state
         .resolved_version_candidates
         .clone_from(&old_state.resolved_version_candidates);
+    // Must also travel with `resolved_versions` (issue #1395 bidirectional-race finding):
+    // `resolved_versions_generation` is a per-document epoch counter guarding
+    // `run_osv_phase_b_and_commit`'s staleness check — resetting it to 0 on every
+    // keystroke-triggered rebuild (DocumentState is rebuilt on every change, not mutated
+    // in place) would desync it from the `resolved_versions` value it's meant to guard,
+    // letting an in-flight scan's stale generation snapshot coincidentally match the
+    // freshly-reset counter and commit over newer data, or a fresh scan's post-bump
+    // generation collide with an unrelated earlier scan's snapshot.
+    new_state.resolved_versions_generation = old_state.resolved_versions_generation;
     // DocumentState is rebuilt on every change, so without this the OSV scan
     // result would be wiped on every keystroke — `run_osv_scan` overwrites it
     // once the (cheap, cache-backed) rescan completes, see §4.
@@ -171,6 +183,55 @@ impl DependencyDiff {
     pub(crate) fn needs_osv_rescan(&self) -> bool {
         !self.added.is_empty() || !self.version_changed.is_empty()
     }
+}
+
+/// Whether a lock-file-only reload (no manifest edit, so no [`DependencyDiff`] exists to
+/// consult) newly resolved, or changed, the in-use version for any of `deps` — the
+/// `handle_lockfile_change` counterpart of [`DependencyDiff::needs_osv_rescan`] (issue
+/// #1395).
+///
+/// Compares each dependency *occurrence* via [`deps_core::lsp_helpers::resolve_in_use_version`]
+/// — the exact same policy OSV target selection ([`deps_engine::classify::osv::build_scan_targets`])
+/// consults — rather than a raw `dep.name()` lookup against the collapsed `resolved_versions`
+/// map (issue #1395 critic S1). A raw-name lookup misses two real cases: an ecosystem whose
+/// lock file key is normalized differently from the manifest's declared name (e.g. Poetry's
+/// `Django` manifest key vs. `poetry.lock`'s PEP 503-normalized `django`), and a name with
+/// more than one retained lock-file entry (issue #649), where the collapsed `resolved_versions`
+/// value is an arbitrary "highest" pick that can stay unchanged while the occurrence's own
+/// per-requirement-disambiguated selection moves.
+///
+/// `old_resolved`/`old_candidates` and `new_resolved`/`new_candidates` are a document's
+/// [`super::state::DocumentState::resolved_versions`]/[`super::state::DocumentState::resolved_version_candidates`]
+/// before and after [`super::state::DocumentState::update_resolved_versions`].
+pub(crate) fn resolved_versions_changed(
+    deps: &[&dyn Dependency],
+    old_resolved: &HashMap<PackageName, ConcreteVersion>,
+    old_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    new_resolved: &HashMap<PackageName, ConcreteVersion>,
+    new_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem_id: EcosystemId,
+) -> bool {
+    deps.iter().any(|dep| {
+        let normalized = formatter.normalize_package_name(dep.name());
+        let old = deps_core::lsp_helpers::resolve_in_use_version(
+            *dep,
+            &normalized,
+            old_resolved,
+            Some(old_candidates),
+            formatter,
+            ecosystem_id,
+        );
+        let new = deps_core::lsp_helpers::resolve_in_use_version(
+            *dep,
+            &normalized,
+            new_resolved,
+            Some(new_candidates),
+            formatter,
+            ecosystem_id,
+        );
+        old != new
+    })
 }
 
 // The single `incremental_fetch_tests` module below is gated on `feature = "cargo"` (it
@@ -338,6 +399,69 @@ serde_old = { package = "serde", version = "0.9" }
                     ConcreteVersion::from("1.0.219")
                 ]),
                 "resolved_version_candidates must survive preserve_cache alongside resolved_versions"
+            );
+        }
+
+        /// Regression guard for issue #1395's bidirectional-generation-race finding:
+        /// `resolved_versions_generation` must travel with `resolved_versions` through
+        /// `preserve_cache`, exactly like `resolved_version_candidates` above — resetting
+        /// it to 0 on every keystroke-triggered `DocumentState` rebuild would desync it
+        /// from the value it's meant to guard, undermining `run_osv_phase_b_and_commit`'s
+        /// staleness check across an edit.
+        #[tokio::test]
+        async fn test_preserve_cache_carries_resolved_versions_generation_across_edit() {
+            // See the comment in `test_preserve_cached_versions_on_change` on why this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let content1 = r#"[dependencies]
+serde = "1.0"
+"#;
+            let ecosystem = state.ecosystem_registry.get("cargo").unwrap();
+            let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+            let doc_state1 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content1.to_string(),
+                parse_result1,
+            );
+            state.update_document(uri.clone(), doc_state1);
+
+            let generation_before = {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.update_resolved_versions(
+                    HashMap::from([(PackageName::new("serde"), ConcreteVersion::from("1.0.210"))]),
+                    HashMap::new(),
+                    state.next_resolved_versions_generation(),
+                );
+                doc.resolved_versions_generation
+            };
+            assert_ne!(
+                generation_before, 0,
+                "the bump above must have taken effect"
+            );
+
+            // Trivial re-edit (whitespace-only) — this must not reset the generation counter.
+            let content2 = r#"[dependencies]
+serde = "1.0"
+
+"#;
+            let parse_result2 = ecosystem.parse_manifest(content2, &url).await.unwrap();
+            let mut doc_state2 = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content2.to_string(),
+                parse_result2,
+            );
+
+            if let Some(old_doc) = state.get_document(&uri) {
+                preserve_cache(&mut doc_state2, &old_doc);
+            }
+
+            assert_eq!(
+                doc_state2.resolved_versions_generation, generation_before,
+                "resolved_versions_generation must survive preserve_cache alongside \
+                 resolved_versions, not reset to 0 on every rebuild"
             );
         }
 
@@ -1620,6 +1744,307 @@ tokio = "1.0"
             assert!(doc.cached_versions.contains_key("serde"));
             assert!(doc.cached_versions.contains_key("tokio"));
             assert!(!doc.cached_versions.contains_key("anyhow"));
+        }
+
+        struct StubDependency {
+            name: PackageName,
+            version_req: Option<VersionReq>,
+        }
+        impl Dependency for StubDependency {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> deps_core::position::Range {
+                deps_core::position::Range::default()
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.version_req.as_ref()
+            }
+            fn version_range(&self) -> Option<deps_core::position::Range> {
+                None
+            }
+            fn source(&self) -> deps_core::parser::DependencySource {
+                deps_core::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        struct IdentityFormatter;
+        impl deps_core::lsp_helpers::PackageNaming for IdentityFormatter {}
+        impl deps_core::lsp_helpers::PackageRendering for IdentityFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl deps_core::lsp_helpers::RequirementResolution for IdentityFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticMessages for IdentityFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticPolicy for IdentityFormatter {}
+        impl deps_core::lsp_helpers::SourcePolicy for IdentityFormatter {}
+        impl deps_core::lsp_helpers::OsvNaming for IdentityFormatter {}
+
+        /// Mimics a PEP 503-normalizing ecosystem (PyPI/Poetry, Composer): lowercases the
+        /// manifest-declared name the way the real lock-file key is produced.
+        struct LowercaseFormatter;
+        impl deps_core::lsp_helpers::PackageNaming for LowercaseFormatter {
+            fn normalize_package_name(&self, name: &PackageName) -> String {
+                name.as_str().to_lowercase()
+            }
+        }
+        impl deps_core::lsp_helpers::PackageRendering for LowercaseFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl deps_core::lsp_helpers::RequirementResolution for LowercaseFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticMessages for LowercaseFormatter {}
+        impl deps_core::lsp_helpers::DiagnosticPolicy for LowercaseFormatter {}
+        impl deps_core::lsp_helpers::SourcePolicy for LowercaseFormatter {}
+        impl deps_core::lsp_helpers::OsvNaming for LowercaseFormatter {}
+
+        /// Regression guard for issue #1395: `handle_lockfile_change` has no
+        /// `DependencyDiff` to consult (the manifest text is untouched), so it must detect
+        /// a newly-resolved or changed in-use version itself via `resolved_versions_changed`.
+        #[test]
+        fn test_resolved_versions_changed_detects_new_and_changed_resolutions() {
+            let time = StubDependency {
+                name: PackageName::new("time"),
+                version_req: None,
+            };
+            let serde = StubDependency {
+                name: PackageName::new("serde"),
+                version_req: None,
+            };
+            let deps: Vec<&dyn Dependency> = vec![&time, &serde];
+            let formatter = IdentityFormatter;
+            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+
+            // `time` newly resolved (no lock file entry before `cargo generate-lockfile`).
+            let old: HashMap<PackageName, ConcreteVersion> =
+                std::iter::once((PackageName::new("serde"), ConcreteVersion::from("1.0.210")))
+                    .collect();
+            let new: HashMap<PackageName, ConcreteVersion> = [
+                (PackageName::new("serde"), "1.0.210".into()),
+                (PackageName::new("time"), "0.1.43".into()),
+            ]
+            .into_iter()
+            .collect();
+            assert!(
+                resolved_versions_changed(
+                    &deps,
+                    &old,
+                    &no_candidates,
+                    &new,
+                    &no_candidates,
+                    &formatter,
+                    EcosystemId::Cargo,
+                ),
+                "a dependency newly gaining a resolved version must be detected"
+            );
+
+            // `cargo update` moves `time` to a different resolved version.
+            let old: HashMap<PackageName, ConcreteVersion> = [
+                (PackageName::new("serde"), "1.0.210".into()),
+                (PackageName::new("time"), "0.1.43".into()),
+            ]
+            .into_iter()
+            .collect();
+            let new: HashMap<PackageName, ConcreteVersion> = [
+                (PackageName::new("serde"), "1.0.210".into()),
+                (PackageName::new("time"), "0.1.44".into()),
+            ]
+            .into_iter()
+            .collect();
+            assert!(
+                resolved_versions_changed(
+                    &deps,
+                    &old,
+                    &no_candidates,
+                    &new,
+                    &no_candidates,
+                    &formatter,
+                    EcosystemId::Cargo,
+                ),
+                "a dependency's resolved version changing must be detected"
+            );
+
+            // Identical resolutions for every one of this document's own dependencies.
+            assert!(
+                !resolved_versions_changed(
+                    &deps,
+                    &new,
+                    &no_candidates,
+                    &new.clone(),
+                    &no_candidates,
+                    &formatter,
+                    EcosystemId::Cargo,
+                ),
+                "no change for this document's dependencies must not trigger a rescan"
+            );
+
+            // An unrelated package (not one of `deps`) changing must not trigger a rescan,
+            // since only entries for this document's own dependencies are consulted.
+            let old: HashMap<PackageName, ConcreteVersion> = [
+                (PackageName::new("serde"), "1.0.210".into()),
+                (PackageName::new("time"), "0.1.43".into()),
+                (PackageName::new("unrelated"), "2.0.0".into()),
+            ]
+            .into_iter()
+            .collect();
+            let new: HashMap<PackageName, ConcreteVersion> = [
+                (PackageName::new("serde"), "1.0.210".into()),
+                (PackageName::new("time"), "0.1.43".into()),
+                (PackageName::new("unrelated"), "3.0.0".into()),
+            ]
+            .into_iter()
+            .collect();
+            assert!(
+                !resolved_versions_changed(
+                    &deps,
+                    &old,
+                    &no_candidates,
+                    &new,
+                    &no_candidates,
+                    &formatter,
+                    EcosystemId::Cargo,
+                ),
+                "an unrelated transitive package's version moving must not trigger a rescan \
+                 for a document that doesn't declare it"
+            );
+        }
+
+        /// A dependency that had a resolved version and loses it (e.g. its `[[package]]`
+        /// entry is dropped from a hand-edited or corrupted lock file) must be treated as a
+        /// change like any other, not silently ignored.
+        #[test]
+        fn test_resolved_versions_changed_detects_lost_resolution() {
+            let time = StubDependency {
+                name: PackageName::new("time"),
+                version_req: None,
+            };
+            let deps: Vec<&dyn Dependency> = vec![&time];
+            let formatter = IdentityFormatter;
+            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+
+            let old: HashMap<PackageName, ConcreteVersion> =
+                std::iter::once((PackageName::new("time"), ConcreteVersion::from("0.1.43")))
+                    .collect();
+            let new: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+
+            assert!(
+                resolved_versions_changed(
+                    &deps,
+                    &old,
+                    &no_candidates,
+                    &new,
+                    &no_candidates,
+                    &formatter,
+                    EcosystemId::Cargo,
+                ),
+                "a dependency losing its resolved version must be detected as a change"
+            );
+        }
+
+        /// Regression guard for issue #1395 critic S1(a): a raw `dep.name()` lookup against
+        /// the collapsed `resolved_versions` map misses a dependency whose lock-file key is
+        /// normalized differently from its manifest-declared spelling (e.g. Poetry's
+        /// `Django` manifest key vs. `poetry.lock`'s PEP 503-normalized `django`).
+        /// `resolved_versions_changed` must consult the *normalized* name, exactly like OSV
+        /// target selection does.
+        #[test]
+        fn test_resolved_versions_changed_detects_normalized_name_mismatch() {
+            let django = StubDependency {
+                name: PackageName::new("Django"),
+                version_req: None,
+            };
+            let deps: Vec<&dyn Dependency> = vec![&django];
+            let formatter = LowercaseFormatter;
+            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+
+            // The lock file resolves under the normalized key, never the raw manifest
+            // spelling — a raw `old.get(dep.name())`/`new.get(dep.name())` lookup would
+            // see `None` on both sides forever and never detect this.
+            let old: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            let new: HashMap<PackageName, ConcreteVersion> =
+                std::iter::once((PackageName::new("django"), ConcreteVersion::from("4.2.0")))
+                    .collect();
+
+            assert!(
+                resolved_versions_changed(
+                    &deps,
+                    &old,
+                    &no_candidates,
+                    &new,
+                    &no_candidates,
+                    &formatter,
+                    EcosystemId::Pypi,
+                ),
+                "a dependency newly resolved under its normalized lock-file key must be \
+                 detected"
+            );
+        }
+
+        /// Regression guard for issue #1395 critic S1(b): the collapsed `resolved_versions`
+        /// map only ever holds the *highest* of a name's retained lock-file entries (issue
+        /// #649), so it can stay unchanged across a `cargo update` that only moves the
+        /// direct dependency's own lower-pinned entry while a higher transitive entry for
+        /// the same name is untouched. `resolved_versions_changed` must disambiguate by the
+        /// occurrence's own requirement via `resolved_version_candidates`, the same way OSV
+        /// target selection does, instead of missing the change entirely.
+        #[test]
+        fn test_resolved_versions_changed_detects_multi_candidate_occurrence_change() {
+            let time = StubDependency {
+                name: PackageName::new("time"),
+                version_req: Some(VersionReq::new("0.1")),
+            };
+            let deps: Vec<&dyn Dependency> = vec![&time];
+            let formatter = IdentityFormatter;
+
+            // The collapsed value is always the highest retained entry (0.3.36, a
+            // transitive dependency's pin) and never changes across the update below.
+            let resolved: HashMap<PackageName, ConcreteVersion> =
+                std::iter::once((PackageName::new("time"), ConcreteVersion::from("0.3.36")))
+                    .collect();
+
+            let old_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = std::iter::once((
+                PackageName::new("time"),
+                vec![
+                    ConcreteVersion::from("0.1.43"),
+                    ConcreteVersion::from("0.3.36"),
+                ],
+            ))
+            .collect();
+            // `cargo update -p time@0.1.43` moves only the direct dependency's own entry.
+            let new_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = std::iter::once((
+                PackageName::new("time"),
+                vec![
+                    ConcreteVersion::from("0.1.45"),
+                    ConcreteVersion::from("0.3.36"),
+                ],
+            ))
+            .collect();
+
+            assert!(
+                resolved_versions_changed(
+                    &deps,
+                    &resolved,
+                    &old_candidates,
+                    &resolved,
+                    &new_candidates,
+                    &formatter,
+                    EcosystemId::Cargo,
+                ),
+                "the direct dependency's own per-occurrence resolution moving \
+                 (0.1.43 -> 0.1.45) must be detected even though the collapsed \
+                 resolved_versions value (the highest entry, 0.3.36) stays unchanged"
+            );
         }
     }
 }

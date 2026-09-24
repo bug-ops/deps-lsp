@@ -1,6 +1,7 @@
 use crate::config::DepsConfig;
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ServerState, handle_document_change, handle_document_open,
+    rescan_after_resolved_version_change, resolved_versions_changed,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -266,14 +267,25 @@ impl Backend {
             affected_uris.len()
         );
 
-        // Reload lock file (cache was invalidated, so this re-parses)
-        let (resolved_versions, resolved_version_candidates) = match self
+        // Reload lock file (cache was invalidated, so this re-parses). `lockfile_reload_ok`
+        // gates the OSV rescan below (issue #1395 critic M1): on a reload error the maps
+        // fall back to empty, which would otherwise make every previously-resolved
+        // dependency look "changed" and rescan the whole document down to `Skipped` —
+        // replacing a real `Clean`/`Vulnerable` result with a false one — on what may be a
+        // transient read of a lock file mid-write. `resolved_versions`/`resolved_version_candidates`
+        // themselves still fall back to empty on error, unchanged pre-existing behavior
+        // this fix does not touch.
+        let (resolved_versions, resolved_version_candidates, lockfile_reload_ok) = match self
             .state
             .lockfile_cache
             .get_or_parse(lock_provider.as_ref(), lockfile_path)
             .await
         {
-            Ok(packages) => deps_engine::classify::resolved::split_resolved_packages(&packages),
+            Ok(packages) => {
+                let (versions, candidates) =
+                    deps_engine::classify::resolved::split_resolved_packages(&packages);
+                (versions, candidates, true)
+            }
             Err(e) => {
                 tracing::error!("Failed to reload lock file: {}", e);
                 self.client
@@ -282,14 +294,21 @@ impl Backend {
                         format!("Failed to reload lock file: {e}"),
                     )
                     .await;
-                (HashMap::new(), HashMap::new())
+                (HashMap::new(), HashMap::new(), false)
             }
         };
 
         // Snapshot before the loop and drop the guard: re-reading `self.config` per URI
         // inside the loop would hold this guard across a nested read of the same
         // write-preferring `RwLock`, and a writer queued in between would block it forever.
-        let (freshness, severities, offline, fetch_timeout_secs, max_concurrent_fetches) = {
+        let (
+            freshness,
+            severities,
+            offline,
+            fetch_timeout_secs,
+            max_concurrent_fetches,
+            vulnerabilities_enabled,
+        ) = {
             let config = self.config.read().await;
             (
                 config.policy.freshness.to_settings(),
@@ -297,15 +316,107 @@ impl Backend {
                 config.policy.network.offline,
                 config.policy.cache.fetch_timeout_secs,
                 config.policy.cache.max_concurrent_fetches,
+                config.policy.diagnostics.vulnerabilities_enabled,
             )
         };
 
         for uri in affected_uris {
+            // Detected before the overwrite below (issue #1395): a lock-file-only change
+            // has no `DependencyDiff` to gate the OSV rescan on the way a manifest edit
+            // does, so this compares each dependency occurrence's resolved-in-use version,
+            // before vs. after the reload, via the same policy OSV target selection itself
+            // consults (critic S1) — not a raw-name lookup against the collapsed
+            // `resolved_versions` map, which misses a normalized-name mismatch or a
+            // multi-candidate name whose per-occurrence selection moved.
+            let mut needs_osv_rescan = false;
             if let Some(mut doc) = self.state.documents.get_mut(&uri) {
-                doc.update_resolved_versions(
+                if vulnerabilities_enabled
+                    && lockfile_reload_ok
+                    && let Some(parse_result) = doc.parse_result()
+                {
+                    let deps = parse_result.dependencies();
+                    needs_osv_rescan = resolved_versions_changed(
+                        &deps,
+                        &doc.resolved_versions,
+                        &doc.resolved_version_candidates,
+                        &resolved_versions,
+                        &resolved_version_candidates,
+                        ecosystem.formatter(),
+                        ecosystem.ecosystem_id(),
+                    );
+                }
+                // The maps update unconditionally, but the generation only bumps when
+                // paired with a rescan that will produce a fresh commit under the new
+                // generation (issue #1395 critic N2): bumping on every lock-file reload
+                // regardless would silently invalidate a concurrently in-flight
+                // manifest-edit-triggered OSV scan's staleness guard (S3) with no rescan
+                // ever re-triggered to replace the now-discarded result — e.g. adding an
+                // already-locked transitive dependency races a `cargo metadata` lock-file
+                // rewrite that changes nothing about that dependency's own resolution.
+                doc.set_resolved_versions_without_bump(
                     resolved_versions.clone(),
                     resolved_version_candidates.clone(),
                 );
+                if needs_osv_rescan {
+                    doc.bump_resolved_generation(self.state.next_resolved_versions_generation());
+                }
+            }
+
+            if needs_osv_rescan {
+                // A detached `tokio::spawn`, deliberately NOT `spawn_background_task`
+                // (issue #1395 critic N1): that shared per-URI task slot is also owned by
+                // the open/edit path's own registry-fetch + `set_loaded` task
+                // (`run_document_open_background_task`/`run_document_change_task`), and
+                // installing this rescan there would abort that task — stranding the
+                // document in `Loading` until `loading_ceiling` and dropping its registry
+                // fetch entirely (the project already documents this exact hazard for the
+                // watched-config reparse path, see `lifecycle.rs`/`reparse.rs`). The S3
+                // generation guard (paired with the conditional bump above) already gives
+                // this rescan its ordering safety without needing the
+                // cancel-on-superseding-task semantics `spawn_background_task` provides,
+                // and a late commit against a closed/removed document is already a safe
+                // no-op (`run_osv_phase_b_and_commit` returns early when `get_document`
+                // finds nothing).
+                //
+                // Known limitation (critic M4): a manifest edit arriving mid-rescan still
+                // aborts this task via its own `spawn_background_task` install racing with
+                // nothing here to prevent it, or the content guard drops this rescan's
+                // stale-by-then result — the lock-file-driven refresh is then lost until
+                // the next lock-file/manifest event. Narrow window, not worth extra
+                // machinery to close.
+                //
+                // TODO(critic): license prefetch is not refreshed on lockfile-only changes
+                let state = Arc::clone(&self.state);
+                let client = self.client.clone();
+                let ecosystem = Arc::clone(&ecosystem);
+                let rescan_uri = uri.clone();
+                tokio::spawn(async move {
+                    rescan_after_resolved_version_change(
+                        &rescan_uri,
+                        &state,
+                        &ecosystem,
+                        fetch_timeout_secs,
+                    )
+                    .await;
+
+                    let dep_count = diagnostics::document_dependency_count(&state, &rescan_uri);
+                    let items = diagnostics::generate_diagnostics_internal(
+                        Arc::clone(&state),
+                        &rescan_uri,
+                        freshness,
+                        severities,
+                        offline,
+                        diagnostics::loading_ceiling(
+                            fetch_timeout_secs,
+                            dep_count,
+                            max_concurrent_fetches,
+                        ),
+                    )
+                    .await;
+
+                    client.publish_diagnostics(rescan_uri, items, None).await;
+                });
+                continue;
             }
 
             // Computed per URI (#636): each affected document can produce a different
@@ -2384,6 +2495,354 @@ mod tests {
              of elapsed loading time — if the ceiling were computed once outside the loop \
              (reusing whichever document's dependency count ran first) both documents would \
              reach the same verdict instead of diverging"
+        );
+    }
+
+    /// Regression coverage for issue #1395: `handle_lockfile_change` must re-run the OSV
+    /// scan when a lock-file-only reload changes a document's own resolved versions, and
+    /// must not touch a sibling document sharing the same lock file whose own dependencies
+    /// were unaffected. Uses a git-sourced dependency (`build_scan_targets`'s step-0
+    /// `NonRegistrySource` skip) so phase A resolves entirely from cached parse state and
+    /// never reaches the network: there is no seam to mock `OsvClient`'s OSV.dev HTTP calls
+    /// from this crate (`OsvClient::with_base_url` is `#[cfg(test)]`-private to
+    /// `deps-core`'s own `osv` module, not `pub`, so it isn't visible even from
+    /// `deps-core`'s other modules under `cfg(test)`, let alone from `deps-lsp`).
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_handle_lockfile_change_rescans_only_affected_document_without_network() {
+        // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and
+        // this test shares a binary with document/loader.rs's diffing test.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::EcosystemId;
+        use deps_core::osv::{ScanOutcome, SkipReason};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lockfile_path,
+            "# This file is automatically @generated by Cargo.\nversion = 3\n",
+        )
+        .unwrap();
+
+        // `alpha-dep`'s resolved version will change on reload below; `beta-dep`'s will not.
+        let alpha_dir = temp_dir.path().join("alpha");
+        std::fs::create_dir(&alpha_dir).unwrap();
+        let alpha_uri = Uri::from_file_path(alpha_dir.join("Cargo.toml")).unwrap();
+        let alpha_content =
+            "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+                .to_string();
+
+        let beta_dir = temp_dir.path().join("beta");
+        std::fs::create_dir(&beta_dir).unwrap();
+        let beta_uri = Uri::from_file_path(beta_dir.join("Cargo.toml")).unwrap();
+        let beta_content =
+            "[dependencies]\nbeta-dep = { git = \"https://github.com/example/beta-dep\" }\n"
+                .to_string();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        for (uri, content) in [(&alpha_uri, &alpha_content), (&beta_uri, &beta_content)] {
+            let parse_result = ecosystem
+                .parse_manifest(
+                    content,
+                    &crate::lsp_types_interop::from_lsp_uri(uri).unwrap(),
+                )
+                .await
+                .unwrap();
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.clone(),
+                parse_result,
+            );
+            backend.state.update_document(uri.clone(), doc_state);
+        }
+
+        // Only `alpha-dep` gains a resolved version.
+        std::fs::write(
+            &lockfile_path,
+            "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+             [[package]]\nname = \"alpha-dep\"\nversion = \"0.1.0\"\n\
+             source = \"git+https://github.com/example/alpha-dep#abcdef1234567890abcdef1234567890abcdef12\"\n",
+        )
+        .unwrap();
+
+        backend
+            .handle_lockfile_change(&lockfile_path, "cargo")
+            .await;
+
+        // The rescan now runs in a detached background task (issue #1395 critic S2), off
+        // the `handle_lockfile_change` future itself, so its commit must be polled for
+        // rather than assumed complete the instant the call above returns.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if backend
+                    .state
+                    .get_document(&alpha_uri)
+                    .is_some_and(|d| d.vulnerabilities.contains_key("alpha-dep"))
+                {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("rescan background task did not commit within 5s");
+
+        let alpha_doc = backend.state.get_document(&alpha_uri).unwrap();
+        assert_matches!(
+            alpha_doc.vulnerabilities.get("alpha-dep"),
+            Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource)),
+            "alpha-dep's newly-resolved version must trigger a rescan, which commits its \
+             (network-free) NonRegistrySource skip outcome"
+        );
+
+        let beta_doc = backend.state.get_document(&beta_uri).unwrap();
+        assert!(
+            beta_doc.vulnerabilities.is_empty(),
+            "beta-dep's own resolved version was unaffected by the lock file change, so its \
+             document must not have been rescanned"
+        );
+    }
+
+    /// Regression guard for issue #1395: when a lock-file-only reload doesn't change any of
+    /// a document's own dependencies' resolved versions, the OSV rescan must not run — a
+    /// deliberately wrong stale `vulnerabilities` entry must survive untouched, proving the
+    /// rescan itself (not just its outcome) was skipped rather than merely reproducing the
+    /// same result. Also covers critic M5/N2: `resolved_versions_generation` must not bump
+    /// either, since a bump with no rescan to pair it with would silently invalidate an
+    /// unrelated, concurrently in-flight manifest-edit-triggered scan's staleness guard
+    /// with nothing left to re-trigger a fresh commit under the new generation.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_handle_lockfile_change_skips_osv_rescan_when_resolved_versions_unchanged() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use deps_core::{ConcreteVersion, EcosystemId};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lockfile_path,
+            "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+             [[package]]\nname = \"alpha-dep\"\nversion = \"0.1.0\"\n\
+             source = \"git+https://github.com/example/alpha-dep#abcdef1234567890abcdef1234567890abcdef12\"\n",
+        )
+        .unwrap();
+
+        let manifest_dir = temp_dir.path().join("crate");
+        std::fs::create_dir(&manifest_dir).unwrap();
+        let uri = Uri::from_file_path(manifest_dir.join("Cargo.toml")).unwrap();
+        let content =
+            "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+                .to_string();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let parse_result = ecosystem
+            .parse_manifest(
+                &content,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
+        // Already resolved, matching the lock file above — the reload is a no-op for this name.
+        doc_state
+            .resolved_versions
+            .insert("alpha-dep".into(), ConcreteVersion::from("0.1.0"));
+        // Deliberately WRONG: if the rescan incorrectly ran, phase B would overwrite this
+        // with the correct `NonRegistrySource` outcome.
+        let mut stale = VulnerabilityMap::new();
+        stale.insert(
+            "alpha-dep".to_string(),
+            ScanOutcome::Skipped(SkipReason::UnmappableName),
+        );
+        doc_state.update_vulnerabilities(stale);
+        let generation_before = doc_state.resolved_versions_generation;
+        backend.state.update_document(uri.clone(), doc_state);
+
+        backend
+            .handle_lockfile_change(&lockfile_path, "cargo")
+            .await;
+
+        let doc = backend.state.get_document(&uri).unwrap();
+        assert_matches!(
+            doc.vulnerabilities.get("alpha-dep"),
+            Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
+            "an unchanged resolved version must not trigger a rescan — the stale marker \
+             would have been overwritten with NonRegistrySource if it had"
+        );
+        assert_eq!(
+            doc.resolved_versions_generation, generation_before,
+            "resolved_versions_generation must not bump when no rescan is scheduled to \
+             pair with it (critic N2)"
+        );
+    }
+
+    /// Regression guard for issue #1395 critic M1: a lock-file reload error falls back to
+    /// empty `resolved_versions`/`resolved_version_candidates` maps (pre-existing behavior,
+    /// unchanged by this fix) — without a dedicated guard, every previously-resolved
+    /// dependency losing its resolution to that empty fallback would look like a genuine
+    /// version change and trigger an OSV rescan, replacing a real `Clean`/`Vulnerable`
+    /// result with `Skipped` until the next event, on what may be a transient read of a
+    /// lock file mid-write.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_handle_lockfile_change_skips_osv_rescan_on_lockfile_reload_error() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use deps_core::{ConcreteVersion, EcosystemId};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        // Present (so the affected-document scan's `locate_lockfile` finds it) but
+        // malformed, so the reload itself fails.
+        std::fs::write(&lockfile_path, "not valid toml [[[\n").unwrap();
+
+        let manifest_dir = temp_dir.path().join("crate");
+        std::fs::create_dir(&manifest_dir).unwrap();
+        let uri = Uri::from_file_path(manifest_dir.join("Cargo.toml")).unwrap();
+        let content =
+            "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+                .to_string();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+
+        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let parse_result = ecosystem
+            .parse_manifest(
+                &content,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
+        // A previously-successful resolution/scan, which the reload error's empty-map
+        // fallback would otherwise make look like a lost resolution.
+        doc_state
+            .resolved_versions
+            .insert("alpha-dep".into(), ConcreteVersion::from("0.1.0"));
+        let mut existing = VulnerabilityMap::new();
+        existing.insert(
+            "alpha-dep".to_string(),
+            ScanOutcome::Skipped(SkipReason::UnmappableName),
+        );
+        doc_state.update_vulnerabilities(existing);
+        let generation_before = doc_state.resolved_versions_generation;
+        backend.state.update_document(uri.clone(), doc_state);
+
+        backend
+            .handle_lockfile_change(&lockfile_path, "cargo")
+            .await;
+
+        let doc = backend.state.get_document(&uri).unwrap();
+        assert!(
+            doc.resolved_versions.is_empty(),
+            "resolved_versions still falls back to empty on a reload error — pre-existing, \
+             unchanged behavior this fix deliberately does not touch"
+        );
+        assert_matches!(
+            doc.vulnerabilities.get("alpha-dep"),
+            Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
+            "a lock-file reload error must not trigger an OSV rescan — the stale marker \
+             would have been overwritten if it had"
+        );
+        assert_eq!(
+            doc.resolved_versions_generation, generation_before,
+            "resolved_versions_generation must not bump on a reload error either (critic \
+             N2) — a bump here, paired with no rescan, would invalidate an unrelated \
+             in-flight scan's staleness guard with nothing to re-trigger a fresh commit"
+        );
+    }
+
+    /// Config-gated coverage for issue #1395: `vulnerabilities_enabled = false` must
+    /// suppress the OSV rescan entirely, even though the resolved version genuinely
+    /// changed — `resolved_versions` itself must still update regardless.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_handle_lockfile_change_skips_osv_rescan_when_vulnerabilities_disabled() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        use crate::document::DocumentState;
+        use deps_core::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use deps_core::{ConcreteVersion, EcosystemId};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let lockfile_path = temp_dir.path().join("Cargo.lock");
+        std::fs::write(
+            &lockfile_path,
+            "# This file is automatically @generated by Cargo.\nversion = 3\n",
+        )
+        .unwrap();
+
+        let manifest_dir = temp_dir.path().join("crate");
+        std::fs::create_dir(&manifest_dir).unwrap();
+        let uri = Uri::from_file_path(manifest_dir.join("Cargo.toml")).unwrap();
+        let content =
+            "[dependencies]\nalpha-dep = { git = \"https://github.com/example/alpha-dep\" }\n"
+                .to_string();
+
+        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+        let backend = service.inner();
+        {
+            let mut config = backend.config.write().await;
+            config.policy.diagnostics.vulnerabilities_enabled = false;
+        }
+
+        let ecosystem = backend.state.ecosystem_registry.get("cargo").unwrap();
+        let parse_result = ecosystem
+            .parse_manifest(
+                &content,
+                &crate::lsp_types_interop::from_lsp_uri(&uri).unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
+        let mut stale = VulnerabilityMap::new();
+        stale.insert(
+            "alpha-dep".to_string(),
+            ScanOutcome::Skipped(SkipReason::UnmappableName),
+        );
+        doc_state.update_vulnerabilities(stale);
+        backend.state.update_document(uri.clone(), doc_state);
+
+        // `alpha-dep` newly gains a resolved version — would trigger a rescan if
+        // vulnerability scanning were enabled.
+        std::fs::write(
+            &lockfile_path,
+            "# This file is automatically @generated by Cargo.\nversion = 3\n\n\
+             [[package]]\nname = \"alpha-dep\"\nversion = \"0.1.0\"\n\
+             source = \"git+https://github.com/example/alpha-dep#abcdef1234567890abcdef1234567890abcdef12\"\n",
+        )
+        .unwrap();
+
+        backend
+            .handle_lockfile_change(&lockfile_path, "cargo")
+            .await;
+
+        let doc = backend.state.get_document(&uri).unwrap();
+        assert_eq!(
+            doc.resolved_versions
+                .get("alpha-dep")
+                .map(ConcreteVersion::as_str),
+            Some("0.1.0"),
+            "resolved_versions must still update regardless of vulnerabilities_enabled"
+        );
+        assert_matches!(
+            doc.vulnerabilities.get("alpha-dep"),
+            Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
+            "vulnerabilities_enabled = false must suppress the rescan even though the \
+             resolved version changed"
         );
     }
 

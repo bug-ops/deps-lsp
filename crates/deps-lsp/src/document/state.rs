@@ -98,6 +98,17 @@ pub struct DocumentState {
     /// see [`deps_core::VersionData::resolved_version_candidates`] for the per-occurrence
     /// disambiguation this enables.
     pub resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+    /// Set by every [`Self::update_resolved_versions`] call (issue #1395 critic S3):
+    /// distinguishes two resolved-version snapshots taken at the same [`Self::content`]
+    /// (a lock-file-only reload never changes `content`, so that guard alone cannot order
+    /// two OSV phase-A/B pairs that raced on which one saw the fresher resolved versions).
+    /// [`super::osv_scan::run_osv_scan_phase_a`] snapshots this alongside `content` when it
+    /// builds scan targets, and [`super::osv_scan::run_osv_phase_b_and_commit`]'s staleness
+    /// guard requires an exact match on both before committing. Always drawn from
+    /// `ServerState::next_resolved_versions_generation` (issue #1395 critic M10), never
+    /// incremented from this field's own prior value — see that method's doc for why a
+    /// per-document-instance counter is unsafe across a `did_close`/reopen.
+    pub(crate) resolved_versions_generation: u64,
     /// OSV.dev scan results, keyed by normalized package name. Empty until
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
@@ -166,6 +177,7 @@ impl Clone for DocumentState {
             cached_versions: self.cached_versions.clone(),
             resolved_versions: self.resolved_versions.clone(),
             resolved_version_candidates: self.resolved_version_candidates.clone(),
+            resolved_versions_generation: self.resolved_versions_generation,
             vulnerabilities: self.vulnerabilities.clone(),
             outcomes: self.outcomes.clone(),
             licenses: self.licenses.clone(),
@@ -282,6 +294,10 @@ impl std::fmt::Debug for DocumentState {
                 "resolved_version_candidates_count",
                 &self.resolved_version_candidates.len(),
             )
+            .field(
+                "resolved_versions_generation",
+                &self.resolved_versions_generation,
+            )
             .field("vulnerabilities_count", &self.vulnerabilities.len())
             .field("licenses_count", &self.licenses.len())
             .field("yanked_versions_count", &self.outcomes.yanked_count())
@@ -311,6 +327,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             resolved_version_candidates: HashMap::new(),
+            resolved_versions_generation: 0,
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
@@ -333,6 +350,7 @@ impl DocumentState {
             cached_versions: HashMap::new(),
             resolved_versions: HashMap::new(),
             resolved_version_candidates: HashMap::new(),
+            resolved_versions_generation: 0,
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
@@ -376,13 +394,66 @@ impl DocumentState {
     /// Takes both in one call, rather than two separate setters, so the two can never drift
     /// out of sync — the same rationale [`PackageVersions::published_at`](deps_core::PackageVersions)
     /// documents for bundling `latest`/`published_at` together.
+    ///
+    /// `generation` must come from `ServerState::next_resolved_versions_generation` (issue
+    /// #1395 critic M10) — never a value derived from this document's own prior
+    /// generation (e.g. incrementing it in place). A per-document-instance counter
+    /// restarts at 0 on every `DocumentState` rebuild, including a `did_close` followed by
+    /// a reopen, so it can coincidentally collide with a stale, close-surviving scan's
+    /// earlier snapshot; a server-global, ever-increasing source never repeats.
+    ///
+    /// Always bumps `resolved_versions_generation` (issue #1395 S3) — correct only for a
+    /// caller whose own OSV phase A spawn is *unconditional* on this call actually having
+    /// changed anything (e.g. `document::lifecycle`'s open path, which always rescans
+    /// when vulnerability scanning is enabled at all). A caller whose own rescan is
+    /// itself conditional — `handle_lockfile_change`, and `document::lifecycle`'s
+    /// debounced-change/reparse path (gated on `needs_osv_rescan`) — uses the
+    /// crate-private `set_resolved_versions_without_bump` plus `bump_resolved_generation`
+    /// instead, bumping only on the same condition that spawns its own phase A; see those
+    /// methods' docs for why (critic N2 and its bidirectional-race follow-up).
     pub fn update_resolved_versions(
+        &mut self,
+        versions: HashMap<PackageName, ConcreteVersion>,
+        candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
+        generation: u64,
+    ) {
+        self.set_resolved_versions_without_bump(versions, candidates);
+        self.bump_resolved_generation(generation);
+    }
+
+    /// Updates [`Self::resolved_versions`]/[`Self::resolved_version_candidates`] without
+    /// bumping [`Self::resolved_versions_generation`] (issue #1395 critic N2 and its
+    /// bidirectional-race follow-up).
+    ///
+    /// Used by `handle_lockfile_change` and `document::lifecycle`'s debounced-change/
+    /// reparse path, each pairing it with a conditional [`Self::bump_resolved_generation`]
+    /// call gated on the same condition that decides whether *that call* is about to
+    /// spawn its own OSV phase A (this document's own in-use versions changed, for the
+    /// lockfile path; `needs_osv_rescan`, for the change/reparse path). Both run on events
+    /// that don't imply a scan is needed for *this* call (a lock-file reload for a
+    /// document whose own dependencies are unaffected; a debounced edit that touches no
+    /// dependency), so [`Self::update_resolved_versions`]' unconditional bump would
+    /// silently invalidate a concurrently in-flight OSV scan from any *other* source —
+    /// `run_osv_phase_b_and_commit`'s staleness guard is shared across every commit site
+    /// — with no rescan of that call's own to pair with it and produce a fresh
+    /// replacement.
+    pub(crate) fn set_resolved_versions_without_bump(
         &mut self,
         versions: HashMap<PackageName, ConcreteVersion>,
         candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
     ) {
         self.resolved_versions = versions;
         self.resolved_version_candidates = candidates;
+    }
+
+    /// Sets [`Self::resolved_versions_generation`] to `generation` (from
+    /// `ServerState::next_resolved_versions_generation`, issue #1395 critic M10 — see
+    /// [`Self::update_resolved_versions`]'s doc for why it must not be derived from this
+    /// document's own prior value), without touching the resolved-version maps — see
+    /// [`Self::set_resolved_versions_without_bump`]'s doc for why this is split out
+    /// (issue #1395 critic N2).
+    pub(crate) fn bump_resolved_generation(&mut self, generation: u64) {
+        self.resolved_versions_generation = generation;
     }
 
     /// Updates the OSV.dev scan results.
@@ -682,6 +753,16 @@ pub struct ServerState {
     /// Generation counter bumped by [`Self::queue_reparse`], letting a debounce worker
     /// detect it was superseded by a newer config change before draining `pending_reparse`.
     config_generation: AtomicU64,
+    /// Server-global source for [`DocumentState::resolved_versions_generation`] (issue
+    /// #1395 critic M10), drawn via [`Self::next_resolved_versions_generation`]. A
+    /// per-document-instance counter that restarts at 0 on every `DocumentState` rebuild
+    /// can collide with a stale, `did_close`-surviving OSV rescan's earlier snapshot once
+    /// the document is closed and reopened (the one rescan kind that deliberately isn't
+    /// cancelled on close — see `document::osv_scan::rescan_after_resolved_version_change`'s
+    /// doc, critic N1); drawing every bump from one shared, ever-increasing sequence
+    /// instead means two different `DocumentState` instances can never coincidentally
+    /// land on the same generation value.
+    resolved_versions_generation_source: AtomicU64,
 }
 
 /// A coalesced, not-yet-drained reparse scope plus when it was first queued (issue #592
@@ -756,6 +837,7 @@ impl ServerState {
             fetch_permits: Arc::new(tokio::sync::Semaphore::new(FETCH_PERMITS)),
             pending_reparse: std::sync::Mutex::new(None),
             config_generation: AtomicU64::new(0),
+            resolved_versions_generation_source: AtomicU64::new(0),
         }
     }
 
@@ -878,6 +960,20 @@ impl ServerState {
     /// `pending_reparse`.
     pub(crate) fn config_generation(&self) -> u64 {
         self.config_generation.load(Ordering::SeqCst)
+    }
+
+    /// Draws the next server-global `DocumentState::resolved_versions_generation` value
+    /// (issue #1395 critic M10). Every writer of that field — `update_resolved_versions`
+    /// and the `bump_resolved_generation`/`set_resolved_versions_without_bump` pair —
+    /// must draw its value from here rather than incrementing the document's own prior
+    /// value in place: a per-document-instance counter restarts at 0 on every
+    /// `DocumentState` rebuild (including a `did_close` followed by a reopen), so it can
+    /// collide with a stale, close-surviving scan's earlier snapshot. See
+    /// `resolved_versions_generation_source`'s doc for the full scenario.
+    pub(crate) fn next_resolved_versions_generation(&self) -> u64 {
+        self.resolved_versions_generation_source
+            .fetch_add(1, Ordering::SeqCst)
+            + 1
     }
 
     /// Whether the pending coalesced reparse has been waiting at least `max_wait` since it
@@ -2341,7 +2437,7 @@ mod tests {
             let mut resolved = HashMap::new();
             resolved.insert("serde".into(), "1.0.195".into());
 
-            state.update_resolved_versions(resolved, HashMap::new());
+            state.update_resolved_versions(resolved, HashMap::new(), 1);
             assert_eq!(state.resolved_versions.len(), 1);
             assert_eq!(
                 state.resolved_versions.get("serde"),

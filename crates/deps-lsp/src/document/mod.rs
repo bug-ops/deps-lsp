@@ -38,8 +38,10 @@ pub(crate) mod reparse;
 mod resolved;
 mod state;
 
+pub(crate) use diff::resolved_versions_changed;
 pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_document_open};
 pub use loader::load_document_from_disk;
+pub(crate) use osv_scan::rescan_after_resolved_version_change;
 pub(crate) use resolved::RefetchPolicy;
 pub(crate) use state::CLIENT_REFRESH_TIMEOUT;
 pub use state::{ColdStartLimiter, DocumentState, LoadingState, ServerState};
