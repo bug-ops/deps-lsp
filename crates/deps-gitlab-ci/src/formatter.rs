@@ -282,39 +282,42 @@ impl RequirementResolution for GitlabCiFormatter {
     }
 }
 
-/// Whether `text` contains an unresolved GitLab CI variable reference — `$VARIABLE_NAME`
-/// (bare, POSIX-shell style), `${VARIABLE_NAME}` (braced), or `%VARIABLE_NAME%` (percent,
-/// GitLab's Windows-`cmd`-style form) — per GitLab's own variable-expansion grammar
-/// (`lib/expand_variables.rb`'s `/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/`, which
-/// `ExpandVariables.expand` applies to `include:` ref/component values, not just shell
-/// scripts — #1365 critic S1: this is not runner-OS-specific in this context), anywhere in
-/// `text`, not just as the whole value: `ref: $DEPLOY_VERSION`, `ref: ${DEPLOY_VERSION}`,
-/// `ref: %DEPLOY_VERSION%`, and an embedded form like `release-$VERSION` or `v1-%BUILD%` are
-/// all detected. The percent form requires a closing `%` immediately after the identifier
-/// (matching GitLab's own regex); the bare/braced forms do not require a closing `}` (#1365
-/// critic M3: failing safe on an unclosed `${VAR` — still not rewriting it — is acceptable).
+/// Whether `text` contains an unresolved GitLab CI variable/interpolation placeholder:
+/// `$VARIABLE_NAME`/`${VARIABLE_NAME}`/`%VARIABLE_NAME%` (GitLab's own pipeline-variable
+/// grammar, `lib/expand_variables.rb`'s `/\$([a-zA-Z_][a-zA-Z0-9_]*)|\${\g<1>}|%\g<1>%/`, which
+/// `ExpandVariables.expand` applies to `include:` ref/component values, not just shell scripts
+/// — #1365 critic S1: not runner-OS-specific here), `{{ VAR }}`/`{% ... %}`/`@VAR@`/
+/// `<%= VAR %>` (external-templating forms `.gitlab-ci.yml` has no grammar of its own for, but
+/// that Jinja2/ERB/autoconf pre-processing run before a pipeline is committed can equally leave
+/// unexpanded), or GitLab CI/CD components' own `$[[ inputs.<name> ]]` input-interpolation
+/// syntax (#1386, distinct from the pipeline-variable forms above — it interpolates a
+/// component's declared `spec.inputs` at include time, not a pipeline variable). Detected
+/// anywhere in `text`, not just as the whole value: `ref: $DEPLOY_VERSION`, `ref:
+/// %DEPLOY_VERSION%`, `1.$[[ inputs.minor ]]`, and an embedded form like `release-$VERSION` are
+/// all detected. `%VAR%` and `@VAR@` require their closing delimiter to be flagged (`trailing-
+/// %NOCLOSE` is not a placeholder); the `$VAR`/`${VAR}`, `{{ }}`/`{% %}`/`<% %>`, and `$[[`
+/// forms do not (#1365 critic M3: failing safe on e.g. an unclosed `${VAR` or
+/// `$[[ inputs.minor` — still not rewriting it — is acceptable).
 ///
-/// GitLab expands these at pipeline run time; this crate parses `.gitlab-ci.yml` statically
-/// and can never resolve one, so a ref/pin containing this shape is not a value this crate
-/// should ever treat as bumpable — distinct from `RequirementResolution::requirement_is_unresolved`
-/// (issue #1365), which stays a broad "any SHA or branch ref, can't tell if outdated"
-/// diagnostic predicate; this is a narrower predicate consulted only by
-/// `PackageRendering::format_version_replacing_for`'s guard, to tell a genuinely unresolvable
-/// variable reference apart from an ordinary, intentionally-bumpable branch name like `main`
-/// (both currently classify as `PinStyle::Branch`). Mirrors `deps_bundler`'s
-/// `requirement_contains_unresolved_interpolation` and `deps_swift`'s equivalent guard
-/// (#1354/#1367).
+/// GitLab (or, for the templating forms, external tooling) expands these before/at pipeline
+/// run time; this crate parses `.gitlab-ci.yml` statically and can never resolve one, so a
+/// ref/pin containing this shape is not a value this crate should ever treat as bumpable —
+/// distinct from `RequirementResolution::requirement_is_unresolved` (issue #1365), which stays
+/// a broad "any SHA or branch ref, can't tell if outdated" diagnostic predicate; this is a
+/// narrower predicate consulted only by `PackageRendering::format_version_replacing_for`'s
+/// guard, to tell a genuinely unresolvable variable/input reference apart from an ordinary,
+/// intentionally-bumpable branch name like `main` (both currently classify as
+/// `PinStyle::Branch`). Mirrors `deps_bundler`'s `requirement_contains_unresolved_interpolation`
+/// and `deps_swift`'s equivalent guard (#1354/#1367).
 ///
-/// #1374/#1379 (cross-ecosystem consistency, `CLAUDE.md`): fully delegates to
+/// #1374/#1379 (cross-ecosystem consistency, `CLAUDE.md`): the `$VAR`/`${VAR}`/`%VAR%`/
+/// `{{ }}`/`{% %}`/`@VAR@`/`<%= %>` forms fully delegate to
 /// [`deps_core::lsp_helpers::requirement_contains_template_placeholder`], the shared predicate
-/// npm/Cargo/Dart/PyPI/Deno/Go's equivalent guards also use — its `%VAR%` detection is
-/// identical in shape to this crate's own original scan, so the two can no longer drift apart.
-/// As a side effect this function now also recognizes `{{ VAR }}`/`{% ... %}`, `@VAR@`, and
-/// `<%= VAR %>` — forms `.gitlab-ci.yml` has no grammar of its own for either, but which the
-/// same external-templating pre-processing (Jinja2/ERB/autoconf tooling run before a pipeline
-/// is committed) can equally leave unexpanded in a `ref:`/`@version` pin.
+/// npm/Cargo/Dart/PyPI/Deno/Go's equivalent guards also use. The GitLab-specific
+/// `$[[ inputs.x ]]` component-input form (#1386) stays local to this crate on top of that
+/// delegation — no other ecosystem uses it.
 fn contains_unresolved_gitlab_variable(text: &str) -> bool {
-    requirement_contains_template_placeholder(text)
+    requirement_contains_template_placeholder(text) || text.contains("$[[")
 }
 
 /// The shared classification -> status rule every [`RequirementResolution`] method on
@@ -802,6 +805,21 @@ mod tests {
         // No closing '%' — GitLab's own regex requires one, so this is not variable syntax.
         assert!(!contains_unresolved_gitlab_variable("50% done"));
         assert!(!contains_unresolved_gitlab_variable("trailing-%NOCLOSE"));
+    }
+
+    /// #1386 (live-reproduced against gitlab.com): GitLab CI/CD components' own
+    /// `$[[ inputs.<name> ]]` interpolation syntax is distinct from the pipeline-variable
+    /// forms above but equally unresolvable statically — `include: component:
+    /// .../sast@1.$[[ inputs.minor ]]` was rewritten to a literal version
+    /// (`sast@3.4.0`) by `deps-cli update` before this predicate covered it.
+    #[test]
+    fn test_contains_unresolved_gitlab_variable_input_interpolation_form() {
+        assert!(contains_unresolved_gitlab_variable("$[[ inputs.minor ]]"));
+        assert!(contains_unresolved_gitlab_variable("1.$[[ inputs.minor ]]"));
+        assert!(contains_unresolved_gitlab_variable("$[[inputs.version]]"));
+        // Unclosed — fails safe, mirroring the `${VAR` precedent.
+        assert!(contains_unresolved_gitlab_variable("1.$[[ inputs.minor"));
+        assert!(!contains_unresolved_gitlab_variable("1.2.3"));
     }
 
     /// #1365 tester suggestion: variable names are case-sensitive in GitLab's grammar but
