@@ -705,6 +705,115 @@ impl SkipReason {
             Self::Truncated => "truncated",
         }
     }
+
+    /// Human-readable clause explaining why vulnerability data was never checked,
+    /// for the hover footer and diagnostic notice that surface a [`ScanOutcome::Skipped`]
+    /// outcome to the user (issue #1392) — the single source of wording both call sites
+    /// share, so the two surfaces never drift into describing the same reason differently.
+    ///
+    /// `NonRegistrySource` has no entry here: callers gate that case out themselves
+    /// (mirroring the pre-existing `resolvable` hover gate), since a source that is
+    /// never network-resolved under any setting was never going to be checked
+    /// regardless of this feature.
+    ///
+    /// The two call sites apply different additional filtering on top of this method
+    /// (issue #1392 M1): `deps-core::lsp_helpers::hover`'s per-dependency, on-demand
+    /// footer shows every reason returned here, but
+    /// `deps-core::lsp_helpers::diagnostics`'s file-level, persistent Problems-panel
+    /// notice further excludes `UnmappableName`/`UnmappableEcosystem` — those are
+    /// structurally permanent for as long as a dependency is declared the way it is
+    /// (every `jsr:`-pinned dependency is `UnmappableName` forever, for example), so a
+    /// standing diagnostic for them would be unresolvable noise, unlike the transient/
+    /// environment-dependent `NoConcreteVersion`/`QueryFailed`/`Truncated`. Wording here
+    /// states only the fact, never a remedy (e.g. never "add a lock file to fix this"):
+    /// resolving a version does not itself re-run the OSV scan for an already-open
+    /// document, so promising that the message clears immediately would overclaim.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::SkipReason;
+    ///
+    /// assert_eq!(
+    ///     SkipReason::NoConcreteVersion.unchecked_reason(),
+    ///     Some("no resolved or exact version was available to query")
+    /// );
+    /// assert_eq!(SkipReason::NonRegistrySource.unchecked_reason(), None);
+    /// ```
+    #[must_use]
+    pub const fn unchecked_reason(self) -> Option<&'static str> {
+        match self {
+            Self::NonRegistrySource => None,
+            Self::NoConcreteVersion => Some("no resolved or exact version was available to query"),
+            Self::UnmappableName => {
+                Some("the package name could not be mapped to an OSV.dev ecosystem")
+            }
+            Self::UnmappableEcosystem => Some("this ecosystem is not supported by OSV.dev"),
+            Self::QueryFailed => Some("the OSV.dev query failed"),
+            Self::Truncated => Some("the OSV.dev result set was truncated"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod skip_reason_unchecked_reason_tests {
+    use super::SkipReason;
+
+    /// Table-driven coverage for every `SkipReason` variant (issue #1392 tester gap 2) —
+    /// the doctest on `unchecked_reason` only asserts `NoConcreteVersion`/`NonRegistrySource`.
+    #[test]
+    fn unchecked_reason_covers_every_variant() {
+        let cases: &[(SkipReason, Option<&str>)] = &[
+            (SkipReason::NonRegistrySource, None),
+            (
+                SkipReason::NoConcreteVersion,
+                Some("no resolved or exact version was available to query"),
+            ),
+            (
+                SkipReason::UnmappableName,
+                Some("the package name could not be mapped to an OSV.dev ecosystem"),
+            ),
+            (
+                SkipReason::UnmappableEcosystem,
+                Some("this ecosystem is not supported by OSV.dev"),
+            ),
+            (SkipReason::QueryFailed, Some("the OSV.dev query failed")),
+            (
+                SkipReason::Truncated,
+                Some("the OSV.dev result set was truncated"),
+            ),
+        ];
+        for (reason, expected) in cases {
+            assert_eq!(
+                reason.unchecked_reason(),
+                *expected,
+                "unexpected text for {reason:?}"
+            );
+        }
+    }
+
+    /// None of the wordings promise an immediate remedy (issue #1392 S1: resolving a
+    /// version does not itself re-run the OSV scan for an already-open document, so
+    /// claiming a fix would overclaim).
+    #[test]
+    fn unchecked_reason_never_promises_a_remedy() {
+        for reason in [
+            SkipReason::NoConcreteVersion,
+            SkipReason::UnmappableName,
+            SkipReason::UnmappableEcosystem,
+            SkipReason::QueryFailed,
+            SkipReason::Truncated,
+        ] {
+            let lower = reason.unchecked_reason().expect("has text").to_lowercase();
+            for forbidden in ["fix", "lockfile", "lock file", "resolve this", "add a"] {
+                assert!(
+                    !lower.contains(forbidden),
+                    "{reason:?}'s text must state only the fact, not a remedy \
+                     (found {forbidden:?} in {lower:?})"
+                );
+            }
+        }
+    }
 }
 
 /// Outcome of scanning one dependency.
