@@ -287,8 +287,14 @@ Both phases share resolution logic bounded by an overall wall-clock `timeout`, c
 chunks rather than wrapping the whole scan in a single cancellation — so already-completed work
 is never discarded on timeout, only whatever hadn't started yet degrades to `Skipped`. A record's
 full detail (summary, fixed-in version, severity) is fetched via bounded-concurrency `GET
-/v1/vulns/{id}` calls, capped to `ADVISORY_DISPLAY_CAP` (5) full records rendered per dependency
-plus a trailing "+N more advisories" entry. Severity classification (`osv::severity`) checks, in
+/v1/vulns/{id}` calls, capped to `MAX_ADVISORY_RECORDS` (50) full records fetched per dependency —
+the input `DependencyVulnerabilities::recommended_fix`/fix-target verification compute over, so a
+fix recommendation is never computed from only a handful of the advisories OSV reported. Rendering
+(hover, diagnostics, `deps-cli`) truncates that further to `ADVISORY_DISPLAY_CAP` (5) via
+`DependencyVulnerabilities::advisories_for_display`, worst-severity-first, plus a trailing "+N more
+advisories" entry — the fetch and render bounds are deliberately independent constants, not one
+shared cap, so widening the render cap can never silently affect which fix version gets
+recommended (or vice versa). Severity classification (`osv::severity`) checks, in
 order: a confirmed-malicious `MAL-*` id/alias (always wins, regardless of any graded signal on
 the same record); `database_specific.severity`; `ecosystem_specific.severity`; an allowlisted
 `informational` value (`"unmaintained"` only — see

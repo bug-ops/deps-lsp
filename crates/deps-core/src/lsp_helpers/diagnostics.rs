@@ -2141,9 +2141,11 @@ fn push_deprecation_diagnostic(
 /// and clickable `code_description`), capped at
 /// [`crate::osv::ADVISORY_DISPLAY_CAP`] plus a trailing "+N more advisories" entry.
 ///
-/// `N` is derived from [`crate::osv::Capped::remaining`] — the batch result's reported count,
-/// never from `dv.advisories.items().len()`, since invariant 3 (`architecture.md` §8)
-/// caps the record *fetch* independently of the render cap.
+/// `N` is derived from [`crate::osv::Capped::remaining`] on
+/// [`crate::osv::DependencyVulnerabilities::advisories_for_display`] — the batch result's
+/// reported count, never from `dv.advisories.items().len()`, since invariant 3
+/// (`architecture.md` §8) caps the record *fetch* (`MAX_ADVISORY_RECORDS`) independently of the
+/// render cap (`ADVISORY_DISPLAY_CAP`, #1422).
 ///
 /// A [`crate::osv::VulnSeverity::Malicious`] advisory's message is prefixed with the
 /// `"[MALWARE]"` tag (SC-002) — deliberately not the word "malicious" again: OSV's own
@@ -2181,7 +2183,8 @@ fn push_vulnerability_diagnostics(
 ) {
     let range: Range = version_anchor_range(dep);
 
-    for advisory in dv.advisories.items() {
+    let display_advisories = dv.advisories_for_display();
+    for advisory in display_advisories.items() {
         let code_description = advisory
             .url()
             .parse::<url::Url>()
@@ -2220,7 +2223,7 @@ fn push_vulnerability_diagnostics(
         diagnostics.push(diagnostic);
     }
 
-    let remaining = dv.advisories.remaining();
+    let remaining = display_advisories.remaining();
     if remaining > 0 {
         diagnostics.push(
             Diagnostic::new(range, format!("+{remaining} more advisories"))

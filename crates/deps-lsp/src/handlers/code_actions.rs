@@ -705,6 +705,241 @@ serde = "1.0.0"
             );
         }
 
+        /// #1422 follow-up (lead-side review finding): end-to-end regression for the
+        /// diagnostic-binding gap the fetch/display cap decoupling could otherwise introduce.
+        /// Six advisories: A1-A5 (High, the displayed set — `push_vulnerability_diagnostics`
+        /// only ever publishes `Diagnostic`s for these) carry no known fix; A6 (Low, beyond the
+        /// display cap) is the only one with a fix. `context.diagnostics` here mirrors exactly
+        /// what a real client would hold after such a scan: `Diagnostic`s for A1-A5 only, never
+        /// A6. The quickfix must still be returned (the true fix, #1422's whole point), but
+        /// must not be bound to any of the unrelated A1-A5 diagnostics — `deps-core` restricts
+        /// `data.diagnostic_codes` to the displayed set, so `bind_diagnostics` finds no
+        /// candidate and correctly leaves `action.diagnostics` unset rather than mis-binding.
+        #[tokio::test]
+        async fn test_handle_code_actions_vulnerability_fix_beyond_display_cap_is_returned_unbound()
+        {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use deps_core::osv::{
+                Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
+                VulnSeverity, VulnerabilityMap,
+            };
+            use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
+
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
+            let content = r#"[dependencies]
+serde = "0.9.0"
+"#
+            .to_string();
+
+            let parse_result = ecosystem
+                .parse_manifest(&content, &url)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+
+            let mut advisories: Vec<Arc<Advisory>> = (1..=5)
+                .map(|i| {
+                    Arc::new(
+                        Advisory::new(
+                            format!("A{i}"),
+                            "2023-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id"),
+                    )
+                })
+                .collect();
+            advisories.push(Arc::new(
+                Advisory::new(
+                    "A6".to_string(),
+                    "2023-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::Low,
+                )
+                .expect("valid osv id")
+                .with_fixed_versions(vec!["1.0.5".to_string()]),
+            ));
+            let total = advisories.len();
+
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                deps_core::test_util::vuln_key("serde"),
+                ScanOutcome::Vulnerable(
+                    DependencyVulnerabilities::new(Capped::new(advisories, total))
+                        .with_fix_target_status(UpgradeStatus::CandidateClean {
+                            version: "1.0.5".to_string(),
+                        }),
+                ),
+            );
+            doc_state.vulnerabilities = vulnerabilities;
+            state.update_document(uri.clone(), doc_state);
+
+            // Exactly what `push_vulnerability_diagnostics` would have published: A1-A5 only.
+            let diagnostics: Vec<Diagnostic> = (1..=5)
+                .map(|i| Diagnostic {
+                    source: Some("deps-lsp".to_string()),
+                    code: Some(NumberOrString::String(format!("A{i}"))),
+                    ..Default::default()
+                })
+                .collect();
+
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range::new(Position::new(1, 9), Position::new(1, 16)),
+                context: CodeActionContext {
+                    diagnostics,
+                    only: Some(vec![CodeActionKind::QUICKFIX]),
+                    ..Default::default()
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+
+            let (client, config) = create_test_client_and_config();
+            let result = handle_code_actions(state, params, client, config).await;
+
+            assert_eq!(
+                result.len(),
+                1,
+                "the true fix (A6, beyond the display cap) must still be offered: {result:?}"
+            );
+            let CodeActionOrCommand::CodeAction(action) = &result[0] else {
+                panic!("expected a CodeAction, got {:?}", result[0]);
+            };
+            assert!(action.title.starts_with("Update to 1.0.5"));
+            assert!(
+                action.diagnostics.is_none(),
+                "must not be bound to any of the A1-A5 diagnostics, none of which A6's fix \
+                 was published under: {:?}",
+                action.diagnostics
+            );
+        }
+
+        /// Sibling of the test above: when the true fix *does* claim a displayed advisory
+        /// (not just one beyond the cap), binding must still succeed end-to-end.
+        #[tokio::test]
+        async fn test_handle_code_actions_vulnerability_fix_with_displayed_advisory_still_binds() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use deps_core::osv::{
+                Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
+                VulnSeverity, VulnerabilityMap,
+            };
+            use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
+
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
+            let content = r#"[dependencies]
+serde = "0.9.0"
+"#
+            .to_string();
+
+            let parse_result = ecosystem
+                .parse_manifest(&content, &url)
+                .await
+                .expect("Failed to parse manifest");
+
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+
+            // A1 (High, displayed) carries a fix; A2-A5 (High, displayed) do not; A6 (Low,
+            // beyond the cap) carries a higher fix. The recommended version (1.0.6, from A6)
+            // still claims A1 too, so `diagnostic_codes` retains A1 and binding succeeds.
+            let mut advisories: Vec<Arc<Advisory>> = vec![Arc::new(
+                Advisory::new(
+                    "A1".to_string(),
+                    "2023-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::High,
+                )
+                .expect("valid osv id")
+                .with_fixed_versions(vec!["1.0.5".to_string()]),
+            )];
+            advisories.extend((2..=5).map(|i| {
+                Arc::new(
+                    Advisory::new(
+                        format!("A{i}"),
+                        "2023-01-01T00:00:00Z".to_string(),
+                        VulnSeverity::High,
+                    )
+                    .expect("valid osv id"),
+                )
+            }));
+            advisories.push(Arc::new(
+                Advisory::new(
+                    "A6".to_string(),
+                    "2023-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::Low,
+                )
+                .expect("valid osv id")
+                .with_fixed_versions(vec!["1.0.6".to_string()]),
+            ));
+            let total = advisories.len();
+
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                deps_core::test_util::vuln_key("serde"),
+                ScanOutcome::Vulnerable(
+                    DependencyVulnerabilities::new(Capped::new(advisories, total))
+                        .with_fix_target_status(UpgradeStatus::CandidateClean {
+                            version: "1.0.6".to_string(),
+                        }),
+                ),
+            );
+            doc_state.vulnerabilities = vulnerabilities;
+            state.update_document(uri.clone(), doc_state);
+
+            let diagnostics: Vec<Diagnostic> = (1..=5)
+                .map(|i| Diagnostic {
+                    source: Some("deps-lsp".to_string()),
+                    code: Some(NumberOrString::String(format!("A{i}"))),
+                    ..Default::default()
+                })
+                .collect();
+
+            let params = CodeActionParams {
+                text_document: TextDocumentIdentifier { uri },
+                range: Range::new(Position::new(1, 9), Position::new(1, 16)),
+                context: CodeActionContext {
+                    diagnostics,
+                    only: Some(vec![CodeActionKind::QUICKFIX]),
+                    ..Default::default()
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+
+            let (client, config) = create_test_client_and_config();
+            let result = handle_code_actions(state, params, client, config).await;
+
+            assert_eq!(result.len(), 1, "{result:?}");
+            let CodeActionOrCommand::CodeAction(action) = &result[0] else {
+                panic!("expected a CodeAction, got {:?}", result[0]);
+            };
+            assert!(action.title.starts_with("Update to 1.0.6"));
+            let diagnostics = action
+                .diagnostics
+                .as_ref()
+                .expect("A1 is claimed and displayed, so binding must succeed");
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(
+                diagnostics[0].code,
+                Some(NumberOrString::String("A1".to_string()))
+            );
+        }
+
         #[tokio::test]
         async fn test_handle_code_actions_no_parse_result() {
             let state = Arc::new(ServerState::new());

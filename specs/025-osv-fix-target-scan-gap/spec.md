@@ -164,7 +164,7 @@ THEN CandidateClean / CandidateVulnerable for the "latest" candidate is
 | F < latest, F is still vulnerable to an advisory C not covered by the phase-A advisory set considered in `recommended_fix()`'s exclusion (the repro scenario: advisory C fixed only in 2.1.0, F=2.0.0) | System must not claim F as a clean fix for advisories excluded solely because they don't affect *latest* — either bump the recommendation to the version that clears C too, or explicitly surface C in the code action / suppress it until resolved |
 | OSV request for F times out or fails | Fall back per NFR-002 — do not silently present F as verified; degrade to omitting the extra guarantee or the whole code action, per implementation-time decision |
 | F cannot be parsed / is not a valid version in the target ecosystem's version scheme | Skip verification for that dependency, log at `debug`/`warn`, do not crash the scan |
-| Advisory data for F is only partially known due to `ADVISORY_DISPLAY_CAP` truncation (already-documented limitation of `recommended_fix()`) | Verification of F should be understood as best-effort within the same accepted incompleteness — no additional guarantee beyond what phase A's advisory fetch already provides |
+| Advisory data for F is only partially known due to `MAX_ADVISORY_RECORDS` fetch truncation (already-documented limitation of `recommended_fix()`; `ADVISORY_DISPLAY_CAP` is a separate, smaller render-only cap applied by `advisories_for_display()` — see #1422) | Verification of F should be understood as best-effort within the same accepted incompleteness — no additional guarantee beyond what phase A's advisory fetch already provides |
 
 ## 7. Success Criteria
 

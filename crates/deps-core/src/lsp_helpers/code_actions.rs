@@ -90,6 +90,28 @@ fn build_vulnerability_fix_action(
     // function of `dv` alone, so calling it again here is not a second decision.
     let fix = dv.recommended_fix()?;
 
+    // #1422 follow-up: `fix.advisory_ids` is computed over the full `MAX_ADVISORY_RECORDS`-capped
+    // fetch set, but only `dv.advisories_for_display()`'s ids are ever published as `Diagnostic`s
+    // (`push_vulnerability_diagnostics`). Restrict the ids handed to `bind_diagnostics` via
+    // `data.diagnostic_codes` to their intersection with the displayed set, so this action only
+    // ever claims a code the client could actually have a matching `Diagnostic` for. When the
+    // true fix targets only advisories beyond the display cap, the intersection is empty —
+    // `data` is then omitted entirely (below) rather than set to ids that can never match, so
+    // `bind_diagnostics` treats this as "no binding to attempt" instead of "matched nothing";
+    // the action is still returned, just not diagnostic-bound (title/edit are unaffected — they
+    // report the true fix regardless of what's displayed).
+    let display_advisories = dv.advisories_for_display();
+    let displayed_ids: HashSet<&str> = display_advisories
+        .items()
+        .iter()
+        .map(|a| a.id.as_str())
+        .collect();
+    let diagnostic_codes: Vec<&String> = fix
+        .advisory_ids
+        .iter()
+        .filter(|id| displayed_ids.contains(id.as_str()))
+        .collect();
+
     // S3: the scan target may have been the lockfile-resolved version, not
     // the declared requirement — rewriting the manifest alone would then not
     // clear the diagnostic until the lockfile is regenerated. Say so in the
@@ -102,7 +124,7 @@ fn build_vulnerability_fix_action(
 
     // Names only the first (worst-severity, per `recommended_fix`'s sort)
     // advisory id and summarizes the rest — `recommended_fix` can return an
-    // unbounded number of ids (up to `ADVISORY_DISPLAY_CAP`), and a title
+    // unbounded number of ids (up to `MAX_ADVISORY_RECORDS`), and a title
     // listing every one of them would overflow an editor's code-action menu.
     let (first_id, rest_ids) = fix.advisory_ids.split_first()?;
     let fixes = if rest_ids.is_empty() {
@@ -133,11 +155,15 @@ fn build_vulnerability_fix_action(
             // bind this action to matching client-supplied diagnostics without deps-core
             // needing to know about LSP request context. Shape shared with
             // `build_unsatisfiable_fix_action`'s payload — `bind_diagnostics` matches on
-            // `diagnostic_codes` regardless of producer.
-            data: Some(serde_json::json!({
-                "diagnostic_codes": fix.advisory_ids,
-                "diagnostic_range": version_range,
-            })),
+            // `diagnostic_codes` regardless of producer. `diagnostic_codes` is
+            // `fix.advisory_ids` restricted to the displayed set (see above, #1422) — never the
+            // unrestricted full claim.
+            data: (!diagnostic_codes.is_empty()).then(|| {
+                serde_json::json!({
+                    "diagnostic_codes": diagnostic_codes,
+                    "diagnostic_range": version_range,
+                })
+            }),
             ..Default::default()
         },
     })
@@ -725,14 +751,198 @@ mod tests {
         assert_eq!(titles, vec!["Update to 1.2.0 (fixes A2 +1 more)"]);
         assert_eq!(actions[0].kind, Some(CodeActionKind::QUICKFIX));
         assert_eq!(actions[0].is_preferred, Some(true));
-        // The full id list still travels in `data` for the diagnostics
-        // binding, even though the title only names the first one.
+        // Both A1 and A2 are within the display cap (only 2 advisories total) here, so the
+        // full claimed id list travels in `data` for the diagnostics binding — see the
+        // `_diagnostic_codes_restricted_to_displayed_advisories` tests below for the case
+        // where a claimed id sits beyond the display cap and must be excluded from `data`.
         assert_eq!(
             actions[0].data,
             Some(serde_json::json!({
                 "diagnostic_codes": ["A2", "A1"],
                 "diagnostic_range": version_range,
             }))
+        );
+    }
+
+    /// #1422 follow-up (lead-side review finding): `recommended_fix()`'s `advisory_ids` is
+    /// computed over the full `MAX_ADVISORY_RECORDS`-capped fetch set, but
+    /// `push_vulnerability_diagnostics` only ever publishes `Diagnostic`s for
+    /// `advisories_for_display()`'s `ADVISORY_DISPLAY_CAP`-truncated set. When some — but not
+    /// all — of a fix's claimed ids fall outside the displayed set, `data.diagnostic_codes`
+    /// must list only the displayed ones, so `bind_diagnostics` never carries an id the client
+    /// could never have a matching `Diagnostic` for.
+    #[tokio::test]
+    async fn test_generate_code_actions_diagnostic_codes_restricted_to_displayed_advisories_partial_overlap()
+     {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        // A1..A5 (High, displayed — ties break by id) plus A6 (Low, beyond the 5-item display
+        // cap). Only A1 (displayed) and A6 (not displayed) carry a known fix; A6's is higher.
+        let mut advisories: Vec<Arc<Advisory>> = vec![Arc::new(
+            Advisory::new(
+                "A1".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                VulnSeverity::High,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["1.5.0".to_string()]),
+        )];
+        advisories.extend((2..=5).map(|i| {
+            Arc::new(
+                Advisory::new(
+                    format!("A{i}"),
+                    "2023-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::High,
+                )
+                .expect("valid osv id"),
+            )
+        }));
+        advisories.push(Arc::new(
+            Advisory::new(
+                "A6".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                VulnSeverity::Low,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["2.0.0".to_string()]),
+        ));
+        let total = advisories.len();
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(advisories, total),
+                fix_target_status: UpgradeStatus::CandidateClean {
+                    version: "2.0.0".to_string(),
+                },
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MOCK_FORMATTER,
+        )
+        .await;
+
+        let titles = quickfix_titles(&actions);
+        assert_eq!(
+            titles,
+            vec!["Update to 2.0.0 (fixes A1 +1 more)"],
+            "the title still names the true fix, unrestricted"
+        );
+        assert_eq!(
+            actions[0].data,
+            Some(serde_json::json!({
+                "diagnostic_codes": ["A1"],
+                "diagnostic_range": version_range,
+            })),
+            "A6 is claimed but never displayed as a Diagnostic, so it must not appear in \
+             diagnostic_codes even though the title/edit still report the true A1+A6 fix"
+        );
+    }
+
+    /// Same follow-up as the partial-overlap test above, but for the case none of a fix's
+    /// claimed ids are displayed at all — `data` must be omitted entirely (not set to an id
+    /// list that can never match any client-supplied `Diagnostic`), while the action itself
+    /// (title, edit, target version) is still returned correctly.
+    #[tokio::test]
+    async fn test_generate_code_actions_diagnostic_codes_omitted_when_fix_is_entirely_beyond_display_cap()
+     {
+        use crate::osv::{
+            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+        };
+        use std::collections::HashMap;
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        // A1..A5 (Critical, displayed, no known fix) plus A6 (Low, beyond the display cap, the
+        // only advisory with a known fix) — the exact #1422 repro shape (golang.org/x/net-style:
+        // the highest-severity, displayed advisories have no fix; the fix lives beyond the cap).
+        let mut advisories: Vec<Arc<Advisory>> = (1..=5)
+            .map(|i| {
+                Arc::new(
+                    Advisory::new(
+                        format!("A{i}"),
+                        "2023-01-01T00:00:00Z".to_string(),
+                        VulnSeverity::Critical,
+                    )
+                    .expect("valid osv id"),
+                )
+            })
+            .collect();
+        advisories.push(Arc::new(
+            Advisory::new(
+                "A6".to_string(),
+                "2023-01-01T00:00:00Z".to_string(),
+                VulnSeverity::Low,
+            )
+            .expect("valid osv id")
+            .with_fixed_versions(vec!["2.0.0".to_string()]),
+        ));
+        let total = advisories.len();
+
+        let mut vulnerabilities = crate::osv::VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(advisories, total),
+                fix_target_status: UpgradeStatus::CandidateClean {
+                    version: "2.0.0".to_string(),
+                },
+                upgrade_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &MockRegistry,
+            &MOCK_FORMATTER,
+        )
+        .await;
+
+        let titles = quickfix_titles(&actions);
+        assert_eq!(
+            titles,
+            vec!["Update to 2.0.0 (fixes A6)"],
+            "the true fix (A6, beyond the display cap) must still be recommended"
+        );
+        assert!(
+            actions[0].data.is_none(),
+            "no claimed id is displayed, so data must be omitted rather than set to an id \
+             list bind_diagnostics could never match: {:?}",
+            actions[0].data
         );
     }
 
@@ -1020,7 +1230,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_omits_fix_when_fix_target_status_advisory_ids_are_truncated()
      {
-        // #462 critic M1: `advisory_ids` is capped at `ADVISORY_DISPLAY_CAP`, so a shorter-than-
+        // #462 critic M1: `advisory_ids` is capped at `MAX_ADVISORY_RECORDS`, so a shorter-than-
         // `total_known` list is not the complete set still affecting F — a truncated-away id
         // could be the one that should suppress this fix. Here the single reported id (A2) is
         // known and unclaimed, but `total_known: 2` proves an unreported advisory exists, so

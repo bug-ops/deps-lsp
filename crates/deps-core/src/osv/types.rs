@@ -318,8 +318,10 @@ impl Advisory {
 /// Exists so a truncated list can never be silently read as complete: items are
 /// only reachable through [`Capped::items`] and the real count only through
 /// [`Capped::total`], so `items().len()` is never mistaken for "everything there
-/// is". Both OSV lists capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] use it —
-/// [`DependencyVulnerabilities::advisories`] and [`UpgradeStatus::CandidateVulnerable`].
+/// is". [`DependencyVulnerabilities::advisories`] and [`UpgradeStatus::CandidateVulnerable`]
+/// both use it, capped at [`crate::osv::MAX_ADVISORY_RECORDS`]; the render-only view
+/// [`DependencyVulnerabilities::advisories_for_display`] returns a further-truncated
+/// `Capped` of its own, capped at [`crate::osv::ADVISORY_DISPLAY_CAP`].
 ///
 /// # Examples
 ///
@@ -441,7 +443,7 @@ pub enum UpgradeStatus {
         /// The version that was checked.
         version: String,
         /// Advisory IDs that still apply to the candidate version, capped at
-        /// [`crate::osv::ADVISORY_DISPLAY_CAP`] the same way
+        /// [`crate::osv::MAX_ADVISORY_RECORDS`] the same way
         /// [`DependencyVulnerabilities::advisories`] is (#462 critic M1) —
         /// **not necessarily exhaustive**. Check [`Capped::is_complete`] before
         /// treating it as the complete set of advisories still affecting this
@@ -455,11 +457,18 @@ pub enum UpgradeStatus {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct DependencyVulnerabilities {
-    /// Advisories fetched in full, capped at [`crate::osv::ADVISORY_DISPLAY_CAP`] (invariant 3
-    /// in `architecture.md` §8: the fetch itself is capped, not only the render) — the total
-    /// advisory count OSV reported is carried alongside via [`Capped::total`], independent of
-    /// how many were actually fetched, and is the source of the render layer's "+N more
-    /// advisories" count (`architecture.md` §7/§8 invariant 3).
+    /// Advisories fetched in full, capped at [`crate::osv::MAX_ADVISORY_RECORDS`] (invariant 3
+    /// in `architecture.md` §8) — the input [`Self::recommended_fix`] and
+    /// `lsp_helpers::code_actions::fix_target_is_verified` compute over. The total advisory
+    /// count OSV reported is carried alongside via [`Capped::total`], independent of how many
+    /// were actually fetched.
+    ///
+    /// **Not for direct rendering** (#1422): `MAX_ADVISORY_RECORDS` is deliberately larger than
+    /// [`crate::osv::ADVISORY_DISPLAY_CAP`], so a hover/diagnostics/`deps-cli` renderer that
+    /// iterates this field directly would list far more advisories than the UI is meant to
+    /// show. Use [`Self::advisories_for_display`] instead, which truncates to
+    /// `ADVISORY_DISPLAY_CAP` and is the source of the render layer's "+N more advisories"
+    /// count (`architecture.md` §7).
     pub advisories: Capped<Arc<Advisory>>,
     /// Result of phase B's "latest" check, if it has run for this dependency.
     pub upgrade_status: UpgradeStatus,
@@ -523,6 +532,60 @@ impl DependencyVulnerabilities {
     pub fn with_fix_target_status(mut self, fix_target_status: UpgradeStatus) -> Self {
         self.fix_target_status = fix_target_status;
         self
+    }
+
+    /// Advisories intended for direct rendering (hover footer, diagnostics list, `deps-cli`
+    /// report), sorted worst-severity-first (tied by id, mirroring [`Self::recommended_fix`]'s
+    /// own [`FixRecommendation::advisory_ids`] ordering) and truncated to
+    /// [`crate::osv::ADVISORY_DISPLAY_CAP`] regardless of how many [`Self::advisories`] holds
+    /// for fix computation (#1422) — the structural guard against a renderer accidentally
+    /// consuming the larger fix-computation set unclipped. [`Capped::total`] still reports
+    /// OSV's real advisory count, so the "+N more advisories" hint stays accurate even when
+    /// [`Self::advisories`] itself holds more than `ADVISORY_DISPLAY_CAP` entries.
+    ///
+    /// The sort is deliberate, not cosmetic (#1422 S1): [`Self::advisories`] is populated by a
+    /// concurrent, `buffer_unordered` record fetch (`crate::osv::OsvClient::fetch_records`), so
+    /// its item order is completion order, not OSV's reported order — a bare `take` would make
+    /// which advisories get shown vary run-to-run, and could hide a `Malicious`/`Critical`
+    /// advisory behind a lower-severity one that merely finished fetching first. Sorting here
+    /// makes the displayed set both stable and always the most severe subset available.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::{
+    ///     ADVISORY_DISPLAY_CAP, Advisory, Capped, DependencyVulnerabilities, VulnSeverity,
+    /// };
+    /// use std::sync::Arc;
+    ///
+    /// let advisories: Vec<Arc<Advisory>> = (0..ADVISORY_DISPLAY_CAP + 3)
+    ///     .map(|i| {
+    ///         Arc::new(
+    ///             Advisory::new(
+    ///                 format!("ADV-{i}"),
+    ///                 "2023-01-01T00:00:00Z".to_string(),
+    ///                 VulnSeverity::High,
+    ///             )
+    ///             .expect("valid osv id"),
+    ///         )
+    ///     })
+    ///     .collect();
+    /// let dv = DependencyVulnerabilities::new(Capped::new(advisories, ADVISORY_DISPLAY_CAP + 5));
+    ///
+    /// let display = dv.advisories_for_display();
+    /// assert_eq!(display.items().len(), ADVISORY_DISPLAY_CAP);
+    /// assert_eq!(display.total(), ADVISORY_DISPLAY_CAP + 5);
+    /// ```
+    #[must_use]
+    pub fn advisories_for_display(&self) -> Capped<Arc<Advisory>> {
+        let mut items: Vec<Arc<Advisory>> = self.advisories.items().to_vec();
+        items.sort_by(|a, b| {
+            severity_rank(b.severity)
+                .cmp(&severity_rank(a.severity))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        items.truncate(super::ADVISORY_DISPLAY_CAP);
+        Capped::new(items, self.advisories.total())
     }
 }
 
@@ -591,10 +654,12 @@ impl DependencyVulnerabilities {
     /// # Limitations
     ///
     /// `advisories` is capped at fetch time
-    /// ([`crate::osv::ADVISORY_DISPLAY_CAP`]), so `version` is the max over a
-    /// possibly incomplete subset — the "+N more advisories" hint already
-    /// signals that incompleteness, so this is an accepted under-report, not
-    /// a bug. `Advisory` also retains only `fixed_versions`, never
+    /// ([`crate::osv::MAX_ADVISORY_RECORDS`], deliberately larger than the render-only
+    /// [`crate::osv::ADVISORY_DISPLAY_CAP`] — see [`Self::advisories_for_display`] — so this
+    /// method sees every advisory a renderer would not), so `version` is the max over a
+    /// possibly incomplete subset only when a dependency exceeds `MAX_ADVISORY_RECORDS`
+    /// advisories — the "+N more advisories" hint already signals that incompleteness, so this
+    /// is an accepted under-report, not a bug. `Advisory` also retains only `fixed_versions`, never
     /// `introduced` events, so a version reintroduced above its own last
     /// known fix (and not yet re-fixed) can still be claimed as a fix
     /// whenever phase B has not run for this dependency
@@ -1605,6 +1670,113 @@ mod recommended_fix_tests {
 
         let fix = vulns.recommended_fix().unwrap();
         assert_eq!(fix.advisory_ids, vec!["A1".to_string(), "B1".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod advisories_for_display_tests {
+    use super::*;
+
+    fn advisory(id: &str, severity: VulnSeverity) -> Arc<Advisory> {
+        Arc::new(Advisory {
+            id: id.to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity,
+            cvss_vector: None,
+            fixed_versions: vec![],
+            url: String::new(),
+        })
+    }
+
+    fn dv(advisories: Vec<Arc<Advisory>>, total: usize) -> DependencyVulnerabilities {
+        DependencyVulnerabilities {
+            advisories: Capped::new(advisories, total),
+            upgrade_status: UpgradeStatus::NotChecked,
+            fix_target_status: UpgradeStatus::NotChecked,
+        }
+    }
+
+    /// #1422 S1 regression: `advisories.items()` reflects `fetch_records`'
+    /// `buffer_unordered` completion order, not severity or OSV's reported order — a bare
+    /// `take(ADVISORY_DISPLAY_CAP)` could show only low-severity advisories while hiding a
+    /// `Critical`/`Malicious` one that merely finished fetching last. `advisories_for_display`
+    /// must always surface the most severe subset, regardless of input order.
+    #[test]
+    fn returns_the_most_severe_subset_regardless_of_input_order() {
+        // Deliberately out of severity order and larger than ADVISORY_DISPLAY_CAP (5):
+        // the single Critical/Malicious advisories are the least-recently-"completed" (last in
+        // the vec), exactly the case a plain `take` would drop.
+        let advisories = vec![
+            advisory("LOW-1", VulnSeverity::Low),
+            advisory("MED-1", VulnSeverity::Medium),
+            advisory("UNK-1", VulnSeverity::Unknown),
+            advisory("LOW-2", VulnSeverity::Low),
+            advisory("MED-2", VulnSeverity::Medium),
+            advisory("CRIT-1", VulnSeverity::Critical),
+            advisory("MAL-1", VulnSeverity::Malicious),
+        ];
+        let vulns = dv(advisories, 7);
+
+        let display = vulns.advisories_for_display();
+        let ids: Vec<&str> = display.items().iter().map(|a| a.id.as_str()).collect();
+
+        assert_eq!(ids.len(), crate::osv::ADVISORY_DISPLAY_CAP);
+        // Worst severity first: Malicious, Critical, the two Mediums (tied, by id), then the
+        // lower-id Low — UNK-1 (rank below Low) is correctly the one truncated away.
+        assert_eq!(ids, vec!["MAL-1", "CRIT-1", "MED-1", "MED-2", "LOW-1"]);
+        assert_eq!(display.total(), 7);
+    }
+
+    /// Same input, permuted — the output must not depend on arrival order at all, which is
+    /// the actual property S1 requires (stability across repeated/concurrent fetches).
+    #[test]
+    fn output_is_stable_across_differently_ordered_input() {
+        let ordered_a = vec![
+            advisory("A", VulnSeverity::High),
+            advisory("B", VulnSeverity::Critical),
+            advisory("C", VulnSeverity::Low),
+        ];
+        let ordered_b = vec![
+            advisory("C", VulnSeverity::Low),
+            advisory("B", VulnSeverity::Critical),
+            advisory("A", VulnSeverity::High),
+        ];
+
+        let ids_a: Vec<String> = dv(ordered_a, 3)
+            .advisories_for_display()
+            .items()
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+        let ids_b: Vec<String> = dv(ordered_b, 3)
+            .advisories_for_display()
+            .items()
+            .iter()
+            .map(|a| a.id.clone())
+            .collect();
+
+        assert_eq!(ids_a, ids_b);
+        assert_eq!(
+            ids_a,
+            vec!["B".to_string(), "A".to_string(), "C".to_string()]
+        );
+    }
+
+    #[test]
+    fn equal_severity_ties_break_lexicographically_by_id() {
+        let vulns = dv(
+            vec![
+                advisory("B1", VulnSeverity::High),
+                advisory("A1", VulnSeverity::High),
+            ],
+            2,
+        );
+
+        let display = vulns.advisories_for_display();
+        let ids: Vec<&str> = display.items().iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, vec!["A1", "B1"]);
     }
 }
 
