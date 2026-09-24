@@ -203,20 +203,18 @@ impl RequirementResolution for PypiFormatter {
         Some(Box::new(Pep440Matcher(specs)))
     }
 
+    /// #1370: PyPI has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// external-templating placeholder is the only unresolved shape PyPI has, so its
+    /// default delegates here rather than duplicating the
+    /// `requirement_contains_template_placeholder` detector (#1380).
+    ///
     /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
     /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>`) — see
     /// `requirement_contains_template_placeholder`. A PEP 621 `dependencies = [...]`
     /// entry carrying this shape already fails PEP 440 parsing and is dropped before a
     /// dependency exists (never reaches this method); a `[tool.poetry.dependencies]` table
     /// entry has no such upstream validation, so this is that guard's sole line of defense.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_template_placeholder(requirement.as_str())
-    }
-
-    /// #1370: PyPI has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// external-templating placeholder is the only unresolved shape PyPI has, so both
-    /// predicates key off the same `requirement_contains_template_placeholder` detector.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         requirement_contains_template_placeholder(requirement.as_str())
     }

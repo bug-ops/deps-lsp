@@ -23,6 +23,14 @@ related:
 > **Type**: research / competitive-parity gap — this spec documents WHAT is missing and WHY;
 > the HOW (exact wiring, placement, batching strategy) is deferred to a future `/sdd plan` session.
 
+> [!warning] Stale reference (2026-09-23)
+> `deps-lsp.updateVersion` — referenced below as the existing per-line command this spec builds
+> on/extends — was removed in #1378 (dead command, bypassed the central placeholder gate and
+> `EcosystemFormatter`, no in-tree producer). The per-line update interaction is now the
+> REFACTOR "Update to X" code action; the aggregate command this spec proposes should build on
+> that path, not on `deps-lsp.updateVersion`. A future `/sdd plan`/`/sdd tasks` pass on this spec
+> must update every `deps-lsp.updateVersion` reference below accordingly before implementation.
+
 ## 1. Overview
 
 ### Problem Statement

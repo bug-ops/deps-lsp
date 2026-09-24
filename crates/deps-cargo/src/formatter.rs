@@ -147,19 +147,17 @@ impl RequirementResolution for CargoFormatter {
             .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
     }
 
+    /// #1370: Cargo has no separate "concrete but undecidable ref" case
+    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
+    /// external-templating placeholder is the only unresolved shape Cargo has, so its
+    /// default delegates here rather than duplicating the
+    /// `requirement_contains_template_placeholder` detector (#1380).
+    ///
     /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
     /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>`) — see
     /// `requirement_contains_template_placeholder`. `Cargo.toml`'s own TOML grammar has
     /// no such syntax; this only fires for a value pre-processed (and left unexpanded) by
     /// tooling outside Cargo, e.g. `envsubst`.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_template_placeholder(requirement.as_str())
-    }
-
-    /// #1370: Cargo has no separate "concrete but undecidable ref" case
-    /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
-    /// external-templating placeholder is the only unresolved shape Cargo has, so both
-    /// predicates key off the same `requirement_contains_template_placeholder` detector.
     fn requirement_is_placeholder(&self, requirement: &VersionReq) -> bool {
         requirement_contains_template_placeholder(requirement.as_str())
     }

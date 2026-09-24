@@ -175,10 +175,7 @@ impl RequirementResolution for NpmFormatter {
     /// #1374/#1379 hardening: an unresolved external-templating placeholder (`$VAR`/`${VAR}`,
     /// `{{ VAR }}`/`{% ... %}`, `@VAR@`, `%VAR%`, `<%= VAR %>`) — see
     /// `requirement_contains_template_placeholder`.
-    fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
-        requirement_contains_template_placeholder(requirement.as_str())
-    }
-
+    ///
     /// #1370: npm has no separate "concrete but undecidable ref" case
     /// [`Self::requirement_is_unresolved`] would need to stay broader than this — an
     /// external-templating placeholder is the only unresolved shape npm has, so both

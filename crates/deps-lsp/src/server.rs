@@ -6,7 +6,6 @@ use crate::file_watcher;
 use crate::handlers::{
     code_actions, code_lens, completion, diagnostics, document_link, hover, inlay_hints,
 };
-use deps_core::is_safe_version_string;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -20,17 +19,14 @@ use tower_lsp_server::ls_types::{
     DocumentLink, DocumentLinkOptions, DocumentLinkParams, ExecuteCommandOptions,
     ExecuteCommandParams, FullDocumentDiagnosticReport, Hover, HoverParams,
     HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams, InlayHint,
-    InlayHintParams, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Range,
-    Registration, RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo,
-    TextDocumentEdit, TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri,
-    WorkspaceEdit,
+    InlayHintParams, MessageType, OneOf, OptionalVersionedTextDocumentIdentifier, Registration,
+    RelatedFullDocumentDiagnosticReport, ServerCapabilities, ServerInfo, TextDocumentEdit,
+    TextDocumentSyncCapability, TextDocumentSyncKind, TextEdit, Uri, WorkspaceEdit,
 };
 use tower_lsp_server::{Client, LanguageServer, jsonrpc::Result};
 
 /// LSP command identifiers.
 mod commands {
-    /// Command to update a dependency version.
-    pub(super) const UPDATE_VERSION: &str = "deps-lsp.updateVersion";
     /// Command to update every outdated dependency in a document, bound to the code
     /// lens produced by `handlers::code_lens`.
     pub(super) const UPDATE_ALL_OUTDATED: &str = crate::handlers::code_lens::COMMAND_ID;
@@ -443,7 +439,6 @@ impl Backend {
             })),
             execute_command_provider: Some(ExecuteCommandOptions {
                 commands: vec![
-                    commands::UPDATE_VERSION.into(),
                     commands::UPDATE_ALL_OUTDATED.into(),
                     commands::PIN_ALL_TO_SHA.into(),
                 ],
@@ -1082,23 +1077,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<serde_json::Value>> {
         tracing::info!("execute_command: {:?}", params.command);
 
-        if params.command == commands::UPDATE_VERSION
-            && let Some(args) = params.arguments.first()
-            && let Ok(mut update_args) = serde_json::from_value::<UpdateVersionArgs>(args.clone())
-        {
-            update_args.uri = crate::lsp_types_interop::canonicalize_uri(&update_args.uri);
-            if let Some(edit) = build_update_version_edit(&update_args) {
-                match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, self.client.apply_edit(edit))
-                    .await
-                {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => tracing::error!("Failed to apply edit: {:?}", e),
-                    Err(_) => tracing::warn!(
-                        "apply_edit for deps-lsp.updateVersion timed out after {CLIENT_REFRESH_TIMEOUT:?}"
-                    ),
-                }
-            }
-        } else if params.command == commands::UPDATE_ALL_OUTDATED
+        if params.command == commands::UPDATE_ALL_OUTDATED
             && let Some(args) = params.arguments.first()
             && let Ok(update_args) = serde_json::from_value::<UpdateAllOutdatedArgs>(args.clone())
         {
@@ -1351,41 +1330,6 @@ impl Backend {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct UpdateVersionArgs {
-    uri: Uri,
-    range: Range,
-    version: String,
-}
-
-/// Builds the `WorkspaceEdit` for `deps-lsp.updateVersion`, or `None` if `args.version`
-/// fails [`is_safe_version_string`] — this command builds its `TextEdit` directly from a
-/// client-supplied argument, bypassing `EcosystemFormatter` entirely, so the same
-/// manifest-injection risk `is_safe_version_string` guards elsewhere applies here too.
-fn build_update_version_edit(args: &UpdateVersionArgs) -> Option<WorkspaceEdit> {
-    if !is_safe_version_string(&args.version) {
-        tracing::error!(
-            version = %args.version,
-            "deps-lsp.updateVersion: rejecting unsafe version string"
-        );
-        return None;
-    }
-
-    let mut edits = HashMap::new();
-    edits.insert(
-        args.uri.clone(),
-        vec![TextEdit {
-            range: args.range,
-            new_text: format!("\"{}\"", args.version),
-        }],
-    );
-
-    Some(WorkspaceEdit {
-        changes: Some(edits),
-        ..Default::default()
-    })
-}
-
 /// Arguments for `deps-lsp.updateAllOutdated` — the URI only. Ranges are recomputed at
 /// execution time (see `Backend::execute_update_all_outdated`), never baked into the
 /// command arguments.
@@ -1441,6 +1385,7 @@ mod tests {
     use super::*;
 
     use std::assert_matches;
+    use tower_lsp_server::ls_types::Range;
 
     /// Awaits the next server-to-client JSON-RPC message sent through `socket`, panicking
     /// if none arrives within a bounded timeout.
@@ -1577,25 +1522,6 @@ mod tests {
             }
             _ => panic!("Expected diagnostic options"),
         }
-    }
-
-    #[test]
-    fn test_server_capabilities_execute_command() {
-        let caps = Backend::server_capabilities();
-
-        let execute = caps
-            .execute_command_provider
-            .expect("execute command provider should exist");
-        assert!(
-            execute
-                .commands
-                .contains(&commands::UPDATE_VERSION.to_string())
-        );
-    }
-
-    #[test]
-    fn test_commands_constants() {
-        assert_eq!(commands::UPDATE_VERSION, "deps-lsp.updateVersion");
     }
 
     #[tokio::test]
@@ -2184,15 +2110,6 @@ mod tests {
     /// distinguish "document found after canonicalization" from "lookup missed" by its
     /// message text.
     ///
-    /// Also does not cover `commands::UPDATE_VERSION`'s own `canonicalize_uri` call
-    /// (server.rs, in `execute_command`'s first arm): still uncovered by any test, and
-    /// not coverable by the message-capture technique above either — that arm's only
-    /// client-observable effect on success is a `workspace/applyEdit` request, and
-    /// `apply_edit` is gated on `State::Initialized` (see `next_client_message`'s doc
-    /// comment), so nothing reaches this test harness's loopback socket for it, success
-    /// or failure. A different observation technique (e.g. a real `initialize`d service)
-    /// would be needed to close this gap; tracked in #1335.
-    ///
     /// Unix-only: the fixture path is drive-letter-less, so `url::Url::to_file_path`
     /// (which `parse_manifest`'s workspace-root discovery and `ensure_document_loaded`'s
     /// cold-start disk read both call internally) always fails on Windows regardless of
@@ -2467,224 +2384,6 @@ mod tests {
              of elapsed loading time — if the ceiling were computed once outside the loop \
              (reusing whichever document's dependency count ran first) both documents would \
              reach the same verdict instead of diverging"
-        );
-    }
-
-    #[test]
-    fn test_update_version_args_deserialization() {
-        let json = serde_json::json!({
-            "uri": "file:///test/Cargo.toml",
-            "range": {
-                "start": {"line": 5, "character": 10},
-                "end": {"line": 5, "character": 15}
-            },
-            "version": "1.0.0"
-        });
-
-        let args: UpdateVersionArgs = serde_json::from_value(json).unwrap();
-        assert_eq!(args.version, "1.0.0");
-        assert_eq!(args.range.start.line, 5);
-        assert_eq!(args.range.start.character, 10);
-    }
-
-    #[tokio::test]
-    async fn test_execute_command_update_version_with_unsafe_version_does_not_panic() {
-        // Smoke test only: on this uninitialized backend, `execute_command` returns
-        // `Ok(None)` whether the guard fired or not, so it can't distinguish the two.
-        // Real regression coverage for the guard is on `build_update_version_edit` below.
-        let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
-        let backend = service.inner();
-
-        let params = ExecuteCommandParams {
-            command: commands::UPDATE_VERSION.to_string(),
-            arguments: vec![serde_json::json!({
-                "uri": "file:///test/Cargo.toml",
-                "range": {
-                    "start": {"line": 0, "character": 9},
-                    "end": {"line": 0, "character": 14}
-                },
-                "version": "1.2.0\", \"evil\": \"true"
-            })],
-            work_done_progress_params: Default::default(),
-        };
-
-        let result = backend.execute_command(params).await;
-        assert!(result.is_ok());
-    }
-
-    fn update_version_args(version: &str) -> UpdateVersionArgs {
-        UpdateVersionArgs {
-            uri: crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri(
-                "/test/Cargo.toml",
-            )),
-            range: Range::default(),
-            version: version.to_string(),
-        }
-    }
-
-    #[test]
-    fn test_build_update_version_edit_rejects_unsafe_version() {
-        // Regression for #302: an unsafe client-supplied version must never reach a
-        // `TextEdit` via `deps-lsp.updateVersion`.
-        let args = update_version_args("1.2.0\", \"evil\": \"true");
-        assert!(build_update_version_edit(&args).is_none());
-    }
-
-    #[test]
-    fn test_build_update_version_edit_accepts_safe_version() {
-        let args = update_version_args("1.2.0");
-        let edit = build_update_version_edit(&args).expect("a safe version must produce an edit");
-
-        let changes = edit.changes.expect("changes present");
-        let edits = changes.get(&args.uri).expect("edit for the given uri");
-        assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].range, args.range);
-        assert_eq!(edits[0].new_text, "\"1.2.0\"");
-    }
-
-    /// Issue #1335: `commands::UPDATE_VERSION`'s own `canonicalize_uri` call is the one
-    /// entry point the chokepoint test's doc comment documents as uncoverable by the
-    /// `window/showMessage`-capture technique — its only client-observable success
-    /// effect is a `workspace/applyEdit` request, and `Client::apply_edit` is gated on
-    /// `State::Initialized`, which an uninitialized test `Backend` (every other test in
-    /// this file) never reaches.
-    ///
-    /// Drives a real `initialize` handshake through the `tower::Service<Request>`
-    /// `LspService` implements — not `Backend::initialize` directly, which would leave
-    /// the shared `ServerState` at `Uninitialized`, since that transition happens in
-    /// `tower_lsp_server`'s `InitializeService` middleware wrapping the request-routing
-    /// path, not in the `LanguageServer::initialize` method itself. Once initialized,
-    /// dispatches `updateVersion` with a non-canonical URI, intercepts the resulting
-    /// `workspace/applyEdit` request off the loopback `ClientSocket`, and asserts its
-    /// `WorkspaceEdit` is keyed by the canonical `Uri` — proving `canonicalize_uri` ran
-    /// before `build_update_version_edit`.
-    ///
-    /// Unix-only: `deps_core::test_util::test_uri` prefixes a `C:` drive letter on
-    /// Windows, which the `FILE://{path}` non-canonical spelling below does not account
-    /// for — matches the chokepoint test's and PR #1334's own tests' platform gate.
-    ///
-    /// Deliberately never sends `initialized`: only the `initialize` *response* flips
-    /// `ServerState` to `Initialized` (`tower-lsp-server`'s `InitializeService` layer),
-    /// which is all `apply_edit`'s gate checks. Sending `initialized` too would make
-    /// `Backend::initialized`'s `window/logMessage` notification the first message off
-    /// the socket instead of the `applyEdit` request this test expects, and would leak
-    /// its periodic cleanup task for no benefit here.
-    #[tokio::test]
-    #[cfg(not(windows))]
-    async fn test_execute_command_update_version_canonicalizes_uri_before_apply_edit() {
-        use futures::{SinkExt as _, StreamExt as _};
-        use tower::{Service as _, ServiceExt as _};
-        use tower_lsp_server::jsonrpc;
-        use tower_lsp_server::ls_types::{ApplyWorkspaceEditParams, ApplyWorkspaceEditResponse};
-
-        let canonical_url = deps_core::test_util::test_uri("/test/Cargo.toml");
-        let canonical_uri = crate::lsp_types_interop::to_lsp_uri(&canonical_url);
-        let non_canonical_uri: Uri = format!("FILE://{}", canonical_url.path()).parse().unwrap();
-        assert_eq!(
-            crate::lsp_types_interop::canonicalize_uri(&non_canonical_uri),
-            canonical_uri,
-            "test premise: both spellings must canonicalize to the same Uri"
-        );
-        assert_ne!(
-            canonical_uri, non_canonical_uri,
-            "test premise: the command-argument spelling must be non-canonical"
-        );
-
-        let (mut service, mut socket) = tower_lsp_server::LspService::build(Backend::new).finish();
-
-        let init_response = service
-            .ready()
-            .await
-            .unwrap()
-            .call(
-                jsonrpc::Request::build("initialize")
-                    .id(1)
-                    .params(serde_json::to_value(InitializeParams::default()).unwrap())
-                    .finish(),
-            )
-            .await
-            .unwrap();
-        assert!(
-            init_response.is_some_and(|r| r.is_ok()),
-            "test premise: initialize must succeed for ServerState to reach Initialized"
-        );
-
-        let backend = service.inner();
-        let range = Range {
-            start: tower_lsp_server::ls_types::Position {
-                line: 0,
-                character: 9,
-            },
-            end: tower_lsp_server::ls_types::Position {
-                line: 0,
-                character: 14,
-            },
-        };
-
-        let exec = backend.execute_command(ExecuteCommandParams {
-            command: commands::UPDATE_VERSION.to_string(),
-            arguments: vec![serde_json::json!({
-                "uri": non_canonical_uri.as_str(),
-                "range": range,
-                "version": "1.2.0",
-            })],
-            work_done_progress_params: Default::default(),
-        });
-
-        let respond = async {
-            // Bounded (critic S1): a regression that makes the `UPDATE_VERSION` arm
-            // silently skip `apply_edit` (e.g. `UpdateVersionArgs` deserialization
-            // starting to fail) would otherwise leave this parked forever — `service`,
-            // which owns the socket's sender half, outlives this `tokio::join!` — and
-            // only surface as nextest's ~2-minute slow-timeout kill instead of a fast,
-            // clear failure.
-            let request = tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, socket.next())
-                .await
-                .expect(
-                    "no workspace/applyEdit request arrived — the UPDATE_VERSION arm never \
-                     reached apply_edit",
-                )
-                .expect("apply_edit request must reach the socket");
-            assert_eq!(request.method(), "workspace/applyEdit");
-
-            let params: ApplyWorkspaceEditParams = serde_json::from_value(
-                request
-                    .params()
-                    .expect("applyEdit request must carry params")
-                    .clone(),
-            )
-            .unwrap();
-            let changes = params.edit.changes.expect("changes present");
-            assert_eq!(
-                changes.keys().collect::<Vec<_>>(),
-                vec![&canonical_uri],
-                "the captured applyEdit request must key its TextEdit by the canonical \
-                 Uri, proving canonicalize_uri ran before build_update_version_edit"
-            );
-
-            socket
-                .send(jsonrpc::Response::from_parts(
-                    request
-                        .id()
-                        .expect("applyEdit is a request, not a notification")
-                        .clone(),
-                    Ok(serde_json::to_value(ApplyWorkspaceEditResponse {
-                        applied: true,
-                        failure_reason: None,
-                        failed_change: None,
-                    })
-                    .unwrap()),
-                ))
-                .await
-                .unwrap();
-        };
-
-        let (exec_result, ()) = tokio::join!(exec, respond);
-        assert_eq!(
-            exec_result,
-            Ok(None),
-            "execute_command has exactly one return path (Ok(None)); a different value \
-             would mean unrelated production code changed"
         );
     }
 

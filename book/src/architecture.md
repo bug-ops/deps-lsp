@@ -135,7 +135,7 @@ ecosystem composes rather than one large interface:
 |-----------|----------|
 | `PackageNaming` | Normalizes/validates a manifest-declared package name into a stable lookup key. |
 | `PackageRendering` | Formats a version into manifest-safe text edits and builds the registry package URL. |
-| `RequirementResolution` | Pure (no I/O) requirement parsing/matching and up-to-date status — the hot hover/diagnostic path. Overriding `requirement_is_unresolved` lets an ecosystem with genuinely undecidable requirement syntax (Maven, Gradle, NuGet, GitHub Actions) distinguish "not yet decidable" from "decided outdated." |
+| `RequirementResolution` | Pure (no I/O) requirement parsing/matching and up-to-date status — the hot hover/diagnostic path. `requirement_is_unresolved`'s default delegates to `requirement_is_placeholder`, so an ecosystem with an unexpanded-placeholder syntax (Maven, Gradle, NuGet, Cargo, npm, ...) overrides only the latter to distinguish "not yet decidable" from "decided outdated." GitHub Actions and GitLab CI override `requirement_is_unresolved` directly instead, since their SHA/branch pins are undecidable-but-not-a-placeholder — a case the default doesn't cover. |
 | `DiagnosticMessages` | Static, `'static` wording for yanked/deprecated diagnostics and hover — display copy only, cacheable across a whole diagnostics pass. |
 | `DiagnosticPolicy` | Per-ecosystem opt-outs narrowing or disabling a diagnostic a shared pass would otherwise emit (e.g. npm disables the yanked-requirement diagnostic to avoid duplicating its package-deprecation diagnostic). |
 | `SourcePolicy` | Whether a `DependencySource` (registry/git/path) can be resolved, and whether it counts as public-registry content for vulnerability scanning and cache-key trust. |
@@ -232,7 +232,7 @@ worker.
 | Code lens | Enabled, no resolve step |
 | Document links | Enabled, no resolve step |
 | Diagnostics | Pull model (`textDocument/diagnostic`), identifier `"deps"`, no inter-file dependencies, no workspace-wide pull |
-| Execute command | `deps-lsp.updateVersion`, `deps-lsp.updateAllOutdated`, `deps-lsp.pinAllToSha` |
+| Execute command | `deps-lsp.updateAllOutdated`, `deps-lsp.pinAllToSha` |
 
 ## Caching architecture
 
