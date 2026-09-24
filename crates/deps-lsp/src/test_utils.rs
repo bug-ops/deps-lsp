@@ -48,10 +48,9 @@ pub(crate) mod blocking_ecosystem {
     use deps_core::ecosystem::BoxFuture;
     use deps_core::ecosystem::private::Sealed;
     use deps_core::{
-        Dependency, DiagnosticMessages, DiagnosticPolicy, DiagnosticSeverities, Ecosystem,
-        EcosystemConfig, EcosystemFormatter, FreshnessSettings, Metadata, OsvNaming, PackageNaming,
-        PackageRendering, ParseResult, Registry, RequirementResolution, SourcePolicy, Version,
-        VersionData, completion::Completions,
+        Dependency, DiagnosticSeverities, Ecosystem, EcosystemConfig, EcosystemFormatter,
+        FreshnessSettings, Metadata, ParseResult, Registry, Version, VersionData,
+        completion::Completions,
     };
     use std::any::Any;
     use std::path::Path;
@@ -85,29 +84,6 @@ pub(crate) mod blocking_ecosystem {
             self
         }
     }
-
-    pub(crate) struct NoopFormatter;
-    impl PackageNaming for NoopFormatter {}
-
-    impl PackageRendering for NoopFormatter {
-        fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-            version.to_string()
-        }
-
-        fn package_url(&self, name: &deps_core::PackageName) -> String {
-            format!("https://example.com/{}", name.as_str())
-        }
-    }
-
-    impl RequirementResolution for NoopFormatter {}
-
-    impl DiagnosticMessages for NoopFormatter {}
-
-    impl DiagnosticPolicy for NoopFormatter {}
-
-    impl SourcePolicy for NoopFormatter {}
-
-    impl OsvNaming for NoopFormatter {}
 
     pub(crate) struct MockParseResult {
         pub(crate) uri: url::Url,
@@ -163,7 +139,7 @@ pub(crate) mod blocking_ecosystem {
             Arc::new(NoopRegistry)
         }
         fn formatter(&self) -> &dyn EcosystemFormatter {
-            &NoopFormatter
+            &deps_core::test_util::StubFormatter::DEFAULT
         }
         fn generate_inlay_hints<'a>(
             &'a self,

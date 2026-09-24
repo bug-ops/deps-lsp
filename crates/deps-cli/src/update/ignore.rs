@@ -75,21 +75,8 @@ mod tests {
     use super::*;
     use crate::config::UpdateTypeToken;
 
-    struct StubFormatter;
-    impl deps_core::lsp_helpers::PackageNaming for StubFormatter {}
-    impl deps_core::lsp_helpers::PackageRendering for StubFormatter {
-        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
-            v.to_string()
-        }
-        fn package_url(&self, name: &deps_core::PackageName) -> String {
-            name.as_str().to_string()
-        }
-    }
-    impl deps_core::lsp_helpers::RequirementResolution for StubFormatter {}
-    impl deps_core::lsp_helpers::DiagnosticMessages for StubFormatter {}
-    impl deps_core::lsp_helpers::DiagnosticPolicy for StubFormatter {}
-    impl deps_core::lsp_helpers::SourcePolicy for StubFormatter {}
-    impl deps_core::lsp_helpers::OsvNaming for StubFormatter {}
+    const STUB_FORMATTER: deps_core::test_util::StubFormatter =
+        deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
     #[test]
     fn test_empty_rules_never_skip() {
@@ -104,7 +91,7 @@ mod tests {
                 name: "legacy-thing".to_string(),
                 update_types: None,
             }],
-            &StubFormatter,
+            &STUB_FORMATTER,
         );
         assert_eq!(
             rules.skip_reason("legacy-thing", UpdateKind::Patch),
@@ -123,7 +110,7 @@ mod tests {
                 name: "tokio".to_string(),
                 update_types: Some(vec![UpdateTypeToken::Major]),
             }],
-            &StubFormatter,
+            &STUB_FORMATTER,
         );
         assert_eq!(
             rules.skip_reason("tokio", UpdateKind::Major),
@@ -142,7 +129,7 @@ mod tests {
                 name: "tokio".to_string(),
                 update_types: Some(vec![UpdateTypeToken::Major]),
             }],
-            &StubFormatter,
+            &STUB_FORMATTER,
         );
         assert_eq!(
             rules.skip_reason("tokio", UpdateKind::Unknown),
@@ -157,7 +144,7 @@ mod tests {
                 name: "tokio".to_string(),
                 update_types: None,
             }],
-            &StubFormatter,
+            &STUB_FORMATTER,
         );
         assert_eq!(rules.skip_reason("serde", UpdateKind::Major), None);
     }

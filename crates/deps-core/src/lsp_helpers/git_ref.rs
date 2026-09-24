@@ -1425,18 +1425,20 @@ mod tests {
     // which previously had only indirect coverage via ecosystem-crate wrapper tests.
 
     #[cfg(feature = "lsp-responses")]
-    use crate::lsp_helpers::test_support::MockFormatter;
+    use crate::lsp_helpers::test_support::MOCK_FORMATTER;
     #[cfg(feature = "lsp-responses")]
     use crate::position::Position as CorePosition;
+    #[cfg(feature = "lsp-responses")]
+    use crate::test_util::StubFormatter;
     #[cfg(feature = "lsp-responses")]
     use crate::{PackageName, VersionReq};
 
     /// Resolves a dependency named `"resolvable"` to a fixed SHA; declines everything else
     /// — the minimal [`ShaPinning`] fixture these tests need, layered onto the shared
-    /// [`MockFormatter`] fixture (already implements every [`EcosystemFormatter`] sub-trait)
+    /// [`MOCK_FORMATTER`] fixture (already implements every [`EcosystemFormatter`] sub-trait)
     /// rather than hand-rolling a second formatter mock.
     #[cfg(feature = "lsp-responses")]
-    impl ShaPinning for MockFormatter {
+    impl ShaPinning for StubFormatter {
         fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
             if dep.name().as_str() != "resolvable" {
                 return None;
@@ -1485,7 +1487,7 @@ mod tests {
             &parse_result,
             position,
             &uri,
-            &MockFormatter,
+            &MOCK_FORMATTER,
             "TEST_DIAGNOSTIC_CODE",
         )
         .expect("resolvable dependency at position must produce a quickfix");
@@ -1520,7 +1522,7 @@ mod tests {
                 &parse_result,
                 position,
                 &uri,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 "TEST_DIAGNOSTIC_CODE",
             )
             .is_none()
@@ -1546,7 +1548,7 @@ mod tests {
                 &parse_result,
                 position,
                 &uri,
-                &MockFormatter,
+                &MOCK_FORMATTER,
                 "TEST_DIAGNOSTIC_CODE",
             )
             .is_none()
@@ -1558,7 +1560,7 @@ mod tests {
     fn test_sha_pin_text_edit_resolves() {
         let dep = sha_pin_test_dep("resolvable");
         let edit =
-            sha_pin_text_edit(&MockFormatter, &dep).expect("resolvable dependency must resolve");
+            sha_pin_text_edit(&MOCK_FORMATTER, &dep).expect("resolvable dependency must resolve");
         assert_eq!(edit.new_text, "a".repeat(40));
         assert_eq!(edit.range, dep.version_range.into());
     }
@@ -1567,7 +1569,7 @@ mod tests {
     #[test]
     fn test_sha_pin_text_edit_none_when_pinning_declines() {
         let dep = sha_pin_test_dep("not-resolvable");
-        assert!(sha_pin_text_edit(&MockFormatter, &dep).is_none());
+        assert!(sha_pin_text_edit(&MOCK_FORMATTER, &dep).is_none());
     }
 
     #[cfg(feature = "lsp-responses")]

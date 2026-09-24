@@ -715,21 +715,8 @@ mod tests {
         assert!(report.summary().is_empty());
     }
 
-    struct StubFormatter;
-    impl deps_core::lsp_helpers::PackageNaming for StubFormatter {}
-    impl deps_core::lsp_helpers::PackageRendering for StubFormatter {
-        fn format_version_for_text_edit(&self, version: &deps_core::ConcreteVersion) -> String {
-            version.to_string()
-        }
-        fn package_url(&self, name: &PackageName) -> String {
-            name.as_str().to_string()
-        }
-    }
-    impl deps_core::lsp_helpers::RequirementResolution for StubFormatter {}
-    impl deps_core::lsp_helpers::DiagnosticMessages for StubFormatter {}
-    impl deps_core::lsp_helpers::DiagnosticPolicy for StubFormatter {}
-    impl deps_core::lsp_helpers::SourcePolicy for StubFormatter {}
-    impl deps_core::lsp_helpers::OsvNaming for StubFormatter {}
+    const STUB_FORMATTER: deps_core::test_util::StubFormatter =
+        deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
     fn diagnostic_with(code: Option<&str>, message: &str) -> Diagnostic {
         let diagnostic =
@@ -743,7 +730,7 @@ mod tests {
     #[test]
     fn test_classify_unsatisfiable_by_code() {
         let d = diagnostic_with(Some(UNSATISFIABLE_DIAGNOSTIC_CODE), "no matching version");
-        assert_eq!(classify(&d, &StubFormatter), Category::Unsatisfiable);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Unsatisfiable);
     }
 
     #[test]
@@ -752,45 +739,45 @@ mod tests {
             Some(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE),
             "GPL-3.0 denied",
         );
-        assert_eq!(classify(&d, &StubFormatter), Category::License);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::License);
     }
 
     #[test]
     fn test_classify_deprecated_by_code() {
         let d = diagnostic_with(Some(DEPRECATED_DIAGNOSTIC_CODE), "package deprecated");
-        assert_eq!(classify(&d, &StubFormatter), Category::Deprecated);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Deprecated);
     }
 
     #[test]
     fn test_classify_mutable_ref_pin_by_code() {
         let d = diagnostic_with(Some(GITHUB_ACTIONS_MUTABLE_REF_PIN_CODE), "pinned to a tag");
-        assert_eq!(classify(&d, &StubFormatter), Category::MutableRefPin);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::MutableRefPin);
         let d = diagnostic_with(Some(GITLAB_CI_MUTABLE_REF_PIN_CODE), "pinned to a tag");
-        assert_eq!(classify(&d, &StubFormatter), Category::MutableRefPin);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::MutableRefPin);
     }
 
     #[test]
     fn test_classify_advisory_code_is_vulnerable() {
         let d = diagnostic_with(Some("RUSTSEC-2024-0001"), "advisory summary");
-        assert_eq!(classify(&d, &StubFormatter), Category::Vulnerable);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Vulnerable);
     }
 
     #[test]
     fn test_classify_outdated_by_message_prefix() {
         let d = diagnostic_with(None, "Newer version available: 2.0.0");
-        assert_eq!(classify(&d, &StubFormatter), Category::Outdated);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Outdated);
     }
 
     #[test]
     fn test_classify_yanked_by_formatter_message() {
         let d = diagnostic_with(None, "This version has been yanked (1.0.0)");
-        assert_eq!(classify(&d, &StubFormatter), Category::Yanked);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Yanked);
     }
 
     #[test]
     fn test_classify_unknown_package_is_other() {
         let d = diagnostic_with(None, "Unknown package 'left-pad'");
-        assert_eq!(classify(&d, &StubFormatter), Category::Other);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Other);
     }
 
     /// Regression test for M1 (spec 062 review): the trailing "+N more advisories" overflow
@@ -798,7 +785,7 @@ mod tests {
     #[test]
     fn test_classify_advisory_overflow_summary_is_vulnerable() {
         let d = diagnostic_with(None, "+5 more advisories");
-        assert_eq!(classify(&d, &StubFormatter), Category::Vulnerable);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Vulnerable);
     }
 
     /// Regression test for C3 (spec 062 review): GitLab CI's `unresolved-gitlab-host` notice
@@ -810,7 +797,7 @@ mod tests {
             Some(GITLAB_CI_UNRESOLVED_HOST_CODE),
             "registries.gitlab_instance_host is unset; skipping component/project host resolution",
         );
-        assert_eq!(classify(&d, &StubFormatter), Category::Other);
+        assert_eq!(classify(&d, &STUB_FORMATTER), Category::Other);
     }
 
     /// A single-dependency parse result whose one dependency ("dep-0") sits at
@@ -915,7 +902,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -932,7 +919,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -953,7 +940,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -973,7 +960,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -996,7 +983,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -1028,7 +1015,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -1075,7 +1062,7 @@ mod tests {
             EcosystemId::Cargo,
             malicious_path,
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -1140,7 +1127,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -1172,7 +1159,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &HashMap::new(),
@@ -1219,7 +1206,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &severities,
             &vuln_keys,
@@ -1239,7 +1226,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &HashMap::new(),
             &vuln_keys,
@@ -1265,7 +1252,7 @@ mod tests {
             EcosystemId::Cargo,
             Path::new("Cargo.toml"),
             &dep_index,
-            &StubFormatter,
+            &STUB_FORMATTER,
             diagnostic,
             &severities,
             &HashMap::new(),

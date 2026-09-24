@@ -1421,24 +1421,11 @@ mod tests {
         use super::*;
         use deps_core::PackageVersions;
 
-        /// A no-op formatter with identity name normalization — no ecosystem-specific
-        /// behavior is under test here, just `drop_cache_for_forced_refetch`'s own
-        /// bookkeeping. Mirrors `test_utils::blocking_ecosystem::NoopFormatter`.
-        struct IdentityFormatter;
-        impl deps_core::lsp_helpers::PackageNaming for IdentityFormatter {}
-        impl deps_core::lsp_helpers::PackageRendering for IdentityFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &PackageName) -> String {
-                name.as_str().to_string()
-            }
-        }
-        impl deps_core::lsp_helpers::RequirementResolution for IdentityFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticMessages for IdentityFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticPolicy for IdentityFormatter {}
-        impl deps_core::lsp_helpers::SourcePolicy for IdentityFormatter {}
-        impl deps_core::lsp_helpers::OsvNaming for IdentityFormatter {}
+        /// A no-op formatter with identity name normalization and a bare (unprefixed)
+        /// package URL — no ecosystem-specific behavior is under test here, just
+        /// `drop_cache_for_forced_refetch`'s own bookkeeping.
+        const IDENTITY_FORMATTER: deps_core::test_util::StubFormatter =
+            deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
 
         /// Critic S1 fix: a dependency about to be refetched is marked
         /// `FetchFailure::NotAttempted` (a placeholder, not left absent) — see
@@ -1468,7 +1455,7 @@ mod tests {
             drop_cache_for_forced_refetch(
                 &mut doc,
                 &[PackageName::new("serde")],
-                &IdentityFormatter,
+                &IDENTITY_FORMATTER,
             );
 
             assert!(
@@ -1504,7 +1491,7 @@ mod tests {
                 PackageVersions::latest_only("1.0.0"),
             )]));
 
-            drop_cache_for_forced_refetch(&mut doc, &[], &IdentityFormatter);
+            drop_cache_for_forced_refetch(&mut doc, &[], &IDENTITY_FORMATTER);
 
             assert!(doc.cached_versions.is_empty());
             assert!(
@@ -1716,30 +1703,13 @@ mod tests {
         use deps_core::ecosystem::private::Sealed;
         use deps_core::{
             Dependency, DiagnosticSeverities, EcosystemConfig, EcosystemFormatter,
-            FreshnessSettings, Metadata, OsvNaming, PackageNaming, PackageRendering,
-            RequirementResolution, SourcePolicy, Version, VersionData, completion::Completions,
+            FreshnessSettings, Metadata, Version, VersionData, completion::Completions,
         };
         use std::any::Any;
         use std::path::Path;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use tokio::sync::Barrier;
         use tower_lsp_server::ls_types::{CodeLens, InlayHint, Position};
-
-        struct NoopFormatter;
-        impl PackageNaming for NoopFormatter {}
-        impl PackageRendering for NoopFormatter {
-            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
-                version.to_string()
-            }
-            fn package_url(&self, name: &PackageName) -> String {
-                format!("https://example.com/{}", name.as_str())
-            }
-        }
-        impl RequirementResolution for NoopFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticMessages for NoopFormatter {}
-        impl deps_core::lsp_helpers::DiagnosticPolicy for NoopFormatter {}
-        impl SourcePolicy for NoopFormatter {}
-        impl OsvNaming for NoopFormatter {}
 
         struct FakeDependency {
             name: PackageName,
@@ -1871,7 +1841,7 @@ mod tests {
                 Arc::clone(&self.registry) as Arc<dyn Registry>
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
-                &NoopFormatter
+                &deps_core::test_util::StubFormatter::DEFAULT
             }
             fn generate_inlay_hints<'a>(
                 &'a self,
