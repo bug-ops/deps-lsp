@@ -19,7 +19,9 @@ status: moc
 
 | ID | Feature | Phase | Status |
 |----|---------|-------|--------|
-| 071 | [[071-typosquat-similarity-diagnostic/spec\|Typosquat detection via deps.dev's GetSimilarlyNamedPackages endpoint]] | plan | implemented — PR #1451 open (issue #1437), pending review/merge |
+| 073 | [[073-gradle-package-completion-colon-solr-query/spec\|Gradle/Maven Package completion for a "group:partial-artifact" prefix returns 0 results — Maven Central rejects the raw colon with HTTP 400]] | specify | draft — bug, P1, 4 open `[NEEDS CLARIFICATION]` items |
+| 072 | [[072-deps-dev-gossip-signals/spec\|Adopt deps.dev GOSSIP signals (Google Open Source Security Intelligence Platform)]] | specify | draft — research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items (issue #1456) |
+| 071 | [[071-typosquat-similarity-diagnostic/spec\|Typosquat detection via deps.dev's GetSimilarlyNamedPackages endpoint]] | plan | shipped — opt-in typosquat-similarity diagnostic via deps.dev (PR #1451, issue #1437) |
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
 | 067 | [[067-redaction-enforcement-guardrails/spec\|Redaction Enforcement Guardrails: RedactingDebug derive + non-exhaustive ParseError construction]] | tasks | in review — testing-infra/security, P4, PR #1328 open (issues #1238/#1250); migration batch reduced 9→2 types during implementation, rest tracked in #1325 |
 | 015 | [[015-lsp-3-18-diagnostic-markup-tooltip-gap/spec\|LSP 3.18 diagnostic markup / command-tooltip support blocked by ls-types 0.0.6]] | specify | draft — research/dependency-gap, P4, 3 open `[NEEDS CLARIFICATION]` items, blocked on upstream — no `/sdd plan` (issue #308) |
