@@ -216,6 +216,11 @@ impl<K: RedactionKind> PartialEq<&str> for RedactedText<K> {
 /// `assert_eq!` usage), but makes `RedactedUrl` unsuitable as a cache key or any other context
 /// that needs to distinguish the underlying raw URLs — use the raw `String`/`reqwest::Url`
 /// value for that instead.
+///
+/// Also masks a token-shaped host label or path piece with no credential syntax of its own
+/// (`https://ghp_<36>.registry.example/`, `https://npm-proxy.fury.io/AbCdEf1234567890xyz/acme/`)
+/// — see [`super::url::url_for_tracing`]'s own doc for the heuristic and its accepted
+/// false-positive class (#1429).
 pub type RedactedUrl = RedactedText<UrlRedaction>;
 
 /// A package/coordinate name, stored pre-redacted via [`super::key::redact_declaration_key`] so
@@ -256,6 +261,7 @@ mod tests {
             "@types/node",
             "c:/user:hunter2@evil",
             "c:///user:hunter2@evil",
+            "https://npm-proxy.fury.io/AbCdEf1234567890xyz/acme/",
         ];
         for raw in inputs {
             assert_eq!(RedactedUrl::new(raw).to_string(), url_for_tracing(raw));

@@ -1690,6 +1690,300 @@ fn redact_userinfo_opaque_path(raw: &str) -> String {
     redact_credential(raw, path_start, RegionKind::OpaquePath)
 }
 
+/// Minimum byte length of a [`TOKEN_PREFIXES`] body (the piece text after the matched prefix)
+/// required for a [`SegmentKind::PathPiece`] to treat it as token-shaped rather than a short
+/// library-style name sharing the same prefix (`sk-lang`, `npm_thing`, `pypi-mirror` all fall
+/// short of this) — every real secret format behind a listed prefix (AWS's 16-byte suffix,
+/// GitLab's 20-byte suffix, GitHub/npm's 36-byte suffix, Stripe/Slack's own fixed-width
+/// suffixes) clears it comfortably. Raised from an original `8` (impl-critic S2, #1429): `8`
+/// let a versioned artifact filename sharing a prefix — `sk-foo-1.2.3.tgz`,
+/// `pypi-simple-1.4.0.tar.gz` — qualify on body length alone.
+const PREFIXED_TOKEN_MIN_BODY_LEN: usize = 16;
+
+/// Minimum byte length of an unprefixed, mixed-case-alphanumeric piece required for
+/// [`piece_should_mask`] to treat it as token-shaped (Gemfury/Cloudsmith-style opaque tokens for
+/// a [`SegmentKind::PathPiece`]; a [`TOKEN_PREFIXES`]-prefixed host label's body for
+/// [`SegmentKind::HostLabel`], impl-critic S1) — long enough that an ordinary lowercase hex hash,
+/// semver string, or hyphenated package/host name never qualifies on shape alone (hyphens/dots
+/// disqualify via [`is_token_piece_charset`]'s pure-prefix check, or, for a `HostLabel` body,
+/// this constant's own caller-side alphanumeric-only check; a hex hash has no uppercase; nothing
+/// this short is worth masking anyway).
+const UNPREFIXED_TOKEN_MIN_LEN: usize = 16;
+
+/// Byte delimiters that bound a path piece for [`mask_token_segments`]'s token-shape check: the
+/// `/` path-segment boundary plus the `= ; , @ :` sub-piece separators that close the
+/// `_authToken=npm_X` and `;ghp_`-in-path gaps a whole-segment-only scan would otherwise miss
+/// (#1429).
+const PATH_PIECE_DELIMITERS: &[u8] = b"/=;,@:";
+
+/// Which masking rule [`piece_should_mask`] applies to a piece: a dot-separated authority host
+/// label, or a [`PATH_PIECE_DELIMITERS`]-separated path piece. Kept as an exhaustive enum rather
+/// than a bool so a future third position can't silently inherit one of these two rules by
+/// accident — selects whether the unprefixed length-only rule applies at all, and the shape a
+/// prefixed piece's own body must have (see [`piece_should_mask`]). Every caller reaches a value
+/// of this type only through an exhaustive `match` (impl-critic M2, #1429: an earlier revision's
+/// `piece_should_mask` tested `kind == SegmentKind::PathPiece` instead), so no `PartialEq`/`Eq`
+/// derive is needed.
+#[derive(Clone, Copy)]
+enum SegmentKind {
+    /// A dot-separated label in a URL authority's host. Matched case-*sensitively* against
+    /// [`TOKEN_PREFIXES`] — impl-critic S1 (#1429): an earlier revision matched
+    /// case-insensitively on the theory that `Url` serialization always lowercases a host before
+    /// [`mask_token_segments`] sees it, but that only holds on the credential-bearing
+    /// redaction path ([`redact_authority_url_tail`]'s `url.as_str()` reserialization); a
+    /// userinfo-free authority short-circuits to `raw` unchanged
+    /// ([`redact_userinfo_with_parsed`]'s own `tail.contains(':')` early return), preserving
+    /// whatever case the input had. Case-insensitive matching against AWS/Google's
+    /// upper-case-only prefixes (`ASIA`, `ACCA`, `AKIA`, `AIza`, …) then matched ordinary
+    /// lowercase host labels sharing the same first few bytes — live counterexamples:
+    /// `asia-east1-docker.pkg.dev`/`asia-northeast1-npm.pkg.dev` (real Google Artifact Registry
+    /// hosts, used for npm/PyPI/Maven) and `acca-mirror1.example.org`. No known registry issues
+    /// an upper-case-prefixed token into a hostname, so the accepted trade is losing that
+    /// (unrealistic) detection to close this real false-positive class.
+    HostLabel,
+    /// A path piece. Matched case-sensitively against [`TOKEN_PREFIXES`], matching every other
+    /// prefix check in this module (e.g. [`find_token_prefix_at`]), and the only kind the
+    /// unprefixed length-only rule in [`piece_should_mask`] applies to.
+    PathPiece,
+}
+
+/// Whether every byte of `piece` is in the narrow charset a real token/host-label piece can be
+/// made of (`[A-Za-z0-9._-]`) — the gate that keeps an npm scope segment (`@types`), a
+/// percent-escape (`%2f`), or an unrelated punctuation-bearing segment (`!azure`,
+/// `+incompatible`) from ever reaching [`piece_should_mask`]'s prefix/length rules. Every byte
+/// this admits is single-byte ASCII, so a `piece` that passes this check can always be sliced by
+/// byte length against a [`TOKEN_PREFIXES`] entry without landing off a char boundary.
+fn is_token_piece_charset(piece: &str) -> bool {
+    piece
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Count of distinct character categories (upper, lower, digit) present in `body` — the shared
+/// "mixed-case-and-digit" shape check [`piece_should_mask`]'s two rules both use, just against
+/// different thresholds (`>= 2` for a prefixed body, `== 3` for an unprefixed whole piece).
+fn category_count(body: &str) -> usize {
+    let mut upper = false;
+    let mut lower = false;
+    let mut digit = false;
+    for b in body.bytes() {
+        match b {
+            b'A'..=b'Z' => upper = true,
+            b'a'..=b'z' => lower = true,
+            b'0'..=b'9' => digit = true,
+            _ => {}
+        }
+    }
+    usize::from(upper) + usize::from(lower) + usize::from(digit)
+}
+
+/// The [`TOKEN_PREFIXES`] entry `piece` starts with — matched case-sensitively regardless of
+/// `kind` (impl-critic S1, #1429: see [`SegmentKind::HostLabel`]'s own doc for why a prior
+/// case-insensitive `HostLabel` match was removed).
+fn matching_token_prefix(piece: &str) -> Option<&'static str> {
+    TOKEN_PREFIXES
+        .iter()
+        .copied()
+        .find(|&prefix| piece.starts_with(prefix))
+}
+
+/// Whether a [`TOKEN_PREFIXES`]-prefixed piece's `body` (the text after the matched `prefix`)
+/// looks token-shaped enough to mask, under `kind`'s own rule:
+///
+/// - [`SegmentKind::PathPiece`]: at least [`PREFIXED_TOKEN_MIN_BODY_LEN`] bytes, mixing at least
+///   two of {upper, lower, digit}, and containing no `.` unless `prefix` itself ends in one
+///   (`ya29.`, `hvs.`, `hvb.`) — impl-critic S2 (#1429): without the dot carve-out, a versioned
+///   artifact filename sharing a prefix (`sk-foo-1.2.3.tgz`, `pypi-simple-1.4.0.tar.gz`,
+///   `npm_package2-10.0.0.tgz`) can still clear the length/category bar on its version suffix
+///   alone.
+/// - [`SegmentKind::HostLabel`]: at least [`UNPREFIXED_TOKEN_MIN_LEN`] bytes, pure
+///   `[A-Za-z0-9]` (no `-`/`.` at all — stricter than [`is_token_piece_charset`]'s own gate),
+///   mixing at least two of {upper, lower, digit} — impl-critic S1 (#1429): a hyphenated host
+///   label sharing a short prefix (`sk-mirror01.example.com`) must not qualify just because its
+///   body clears a `PathPiece`-shaped bar tuned for path text.
+fn prefixed_body_qualifies(prefix: &str, body: &str, kind: SegmentKind) -> bool {
+    match kind {
+        SegmentKind::PathPiece => {
+            body.len() >= PREFIXED_TOKEN_MIN_BODY_LEN
+                && (prefix.ends_with('.') || !body.contains('.'))
+                && category_count(body) >= 2
+        }
+        SegmentKind::HostLabel => {
+            body.len() >= UNPREFIXED_TOKEN_MIN_LEN
+                && body.bytes().all(|b| b.is_ascii_alphanumeric())
+                && category_count(body) >= 2
+        }
+    }
+}
+
+/// Whether `piece` — a single dot-separated host label or [`PATH_PIECE_DELIMITERS`]-separated
+/// path piece, per `kind` — looks token-shaped enough for [`mask_token_segments`] to mask, per
+/// the security audit's #1429 recommendation (tightened per impl-critic's S1/S2 findings — see
+/// [`SegmentKind`], [`matching_token_prefix`], and [`prefixed_body_qualifies`]'s own docs for the
+/// specifics):
+///
+/// - A [`TOKEN_PREFIXES`]-prefixed piece whose body [`prefixed_body_qualifies`] under `kind` —
+///   keeps `sk-lang`, `npm_thing`, `pypi-mirror`, and the all-lowercase
+///   `sk-learn-contrib-extension` unmasked.
+/// - For a [`SegmentKind::PathPiece`] only, an unprefixed piece of at least
+///   [`UNPREFIXED_TOKEN_MIN_LEN`] pure-alphanumeric bytes mixing all three categories — catches a
+///   Gemfury/Cloudsmith-style opaque token. Never applied to a [`SegmentKind::HostLabel`]: no
+///   known registry puts a bare, unprefixed token in a hostname, and an ELB/CloudFront-style
+///   label (`name-1234567890`) would otherwise false-positive.
+///
+/// Every piece is first gated by [`is_token_piece_charset`], so a piece containing anything
+/// outside `[A-Za-z0-9._-]` never reaches either rule.
+///
+/// Known heuristic misses, accepted rather than fixed (impl-critic M4, #1429): an unprefixed
+/// random token with no digit in its first 16 bytes (roughly 6% of real base62 tokens) fails the
+/// three-category check; a token-shaped host label immediately followed by `:port` fails
+/// [`is_token_piece_charset`] outright (the colon is outside its charset) and is never even
+/// split out; and for schemeless input, text before the first `:` is never scanned at all
+/// (pre-existing at this module's own baseline, not introduced by this pass).
+fn piece_should_mask(piece: &str, kind: SegmentKind) -> bool {
+    if piece.is_empty() || !is_token_piece_charset(piece) {
+        return false;
+    }
+    if let Some(prefix) = matching_token_prefix(piece) {
+        return piece
+            .get(prefix.len()..)
+            .is_some_and(|body| prefixed_body_qualifies(prefix, body, kind));
+    }
+    match kind {
+        SegmentKind::PathPiece => {
+            piece.len() >= UNPREFIXED_TOKEN_MIN_LEN
+                && piece.bytes().all(|b| b.is_ascii_alphanumeric())
+                && category_count(piece) == 3
+        }
+        SegmentKind::HostLabel => false,
+    }
+}
+
+/// Whether any `delimiters`-bounded piece of `text` would be replaced by
+/// [`mask_delimited_pieces`] — a read-only scan [`mask_delimited_pieces`] runs first so it can
+/// return `Cow::Borrowed(text)` without ever allocating an output buffer on the common no-op
+/// path (impl-critic M3, #1429: an earlier revision allocated `String::with_capacity(text.len())`
+/// unconditionally, even when nothing qualified).
+#[expect(
+    clippy::string_slice,
+    reason = "piece_start/i come from enumerate() over text.as_bytes() and equality checks \
+              against single-byte ASCII entries of `delimiters`, so every slice bound is always \
+              a char boundary"
+)]
+fn has_maskable_piece(text: &str, delimiters: &[u8], kind: SegmentKind) -> bool {
+    let mut piece_start = 0;
+    for (i, &byte) in text.as_bytes().iter().enumerate() {
+        if !delimiters.contains(&byte) {
+            continue;
+        }
+        if piece_should_mask(&text[piece_start..i], kind) {
+            return true;
+        }
+        piece_start = i + 1;
+    }
+    piece_should_mask(&text[piece_start..], kind)
+}
+
+/// Masks each `delimiters`-bounded piece of `text` that [`piece_should_mask`] (under `kind`)
+/// flags, replacing it with `***` while every delimiter byte and every non-qualifying piece is
+/// copied through unchanged. Returns `Cow::Borrowed(text)` untouched, allocating nothing, when
+/// [`has_maskable_piece`] finds nothing to mask — the common case for a public registry URL, on
+/// [`mask_token_segments`]'s cache-fetch chokepoint.
+#[expect(
+    clippy::string_slice,
+    reason = "piece_start/i come from enumerate() over text.as_bytes() and equality checks \
+              against single-byte ASCII entries of `delimiters`, so every slice bound is always \
+              a char boundary"
+)]
+fn mask_delimited_pieces<'a>(text: &'a str, delimiters: &[u8], kind: SegmentKind) -> Cow<'a, str> {
+    if !has_maskable_piece(text, delimiters, kind) {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut piece_start = 0;
+    for (i, &byte) in text.as_bytes().iter().enumerate() {
+        if !delimiters.contains(&byte) {
+            continue;
+        }
+        mask_piece_into(&mut out, &text[piece_start..i], kind);
+        out.push(char::from(byte));
+        piece_start = i + 1;
+    }
+    mask_piece_into(&mut out, &text[piece_start..], kind);
+    Cow::Owned(out)
+}
+
+/// [`mask_delimited_pieces`]'s per-piece decision, factored out so its loop body stays a single
+/// call at both the interior (per-delimiter) and trailing (tail) piece boundary.
+fn mask_piece_into(out: &mut String, piece: &str, kind: SegmentKind) {
+    if piece_should_mask(piece, kind) {
+        out.push_str("***");
+    } else {
+        out.push_str(piece);
+    }
+}
+
+/// Masks any [`TOKEN_PREFIXES`]-shaped or opaque, high-entropy-looking host label or path piece
+/// still visible in `redacted` after userinfo redaction and query/fragment truncation — applied
+/// as the last step of both [`url_for_tracing_with_parsed`] branches, closing the #1429 gap
+/// where a registry-issued token embedded directly in a hostname
+/// (`https://ghp_<36>.registry.example/`) or an unauthenticated path
+/// (`https://npm-proxy.fury.io/AbCdEf1234567890xyz/acme/`, `.../_authToken=npm_SECRET123/`)
+/// passed through [`redact_userinfo`] untouched — that function's own scanning machinery only
+/// ever looks for a credential-shaped `user[:pass]@`, never a token sitting in the host or path
+/// on its own.
+///
+/// Returns `Cow::Borrowed(redacted)` when nothing qualifies, which is the common case for a
+/// public registry URL (npm, PyPI, NuGet, crates.io, GitHub/GitLab API, OSV, deps.dev) — this
+/// runs once per outbound request via [`url_for_tracing_with_parsed`]'s cache-fetch chokepoint,
+/// so avoiding an allocation on the no-op path matters.
+///
+/// A scheme-having `redacted` splits into an authority (from just past the scheme separator up
+/// to the first `/`, itself split into `.`-delimited host labels once any existing `***@`
+/// userinfo marker is skipped past) and a path (everything from that `/` onward, split into
+/// [`PATH_PIECE_DELIMITERS`]-bounded pieces); a schemeless `redacted` (no `:` at all) is treated
+/// entirely as path, mirroring [`redact_userinfo_opaque_path`]'s own "no host" fallback. See
+/// [`SegmentKind`] and [`piece_should_mask`] for the masking rule each position uses.
+#[expect(
+    clippy::string_slice,
+    reason = "colon comes from find(':'); authority_start from scheme_separator_end (ASCII- \
+              anchored); authority_len from find('/') on the ASCII-safe suffix starting at \
+              authority_start; host_start from rfind('@') on that same ASCII-safe authority \
+              slice — every bound here is an ASCII byte offset, so every slice always lands on \
+              a char boundary"
+)]
+fn mask_token_segments(redacted: &str) -> Cow<'_, str> {
+    let Some(colon) = redacted.find(':') else {
+        return mask_delimited_pieces(redacted, PATH_PIECE_DELIMITERS, SegmentKind::PathPiece);
+    };
+    let authority_start = scheme_separator_end(redacted, colon);
+    let authority_len = redacted[authority_start..]
+        .find('/')
+        .unwrap_or(redacted.len() - authority_start);
+    let authority_end = authority_start + authority_len;
+    let authority = &redacted[authority_start..authority_end];
+    let host_start = authority.rfind('@').map_or(0, |at| at + 1);
+    let host = &authority[host_start..];
+
+    let masked_host = mask_delimited_pieces(host, b".", SegmentKind::HostLabel);
+    let masked_path = mask_delimited_pieces(
+        &redacted[authority_end..],
+        PATH_PIECE_DELIMITERS,
+        SegmentKind::PathPiece,
+    );
+
+    if matches!(masked_host, Cow::Borrowed(_)) && matches!(masked_path, Cow::Borrowed(_)) {
+        return Cow::Borrowed(redacted);
+    }
+
+    let mut out = String::with_capacity(redacted.len() + 6);
+    out.push_str(&redacted[..authority_start]);
+    out.push_str(&authority[..host_start]);
+    out.push_str(&masked_host);
+    out.push_str(&masked_path);
+    Cow::Owned(out)
+}
+
 /// Strips the query string, fragment, and any userinfo from `raw`, for attaching to a
 /// `tracing` span field or log line at an outbound-request chokepoint.
 ///
@@ -1723,6 +2017,18 @@ fn redact_userinfo_opaque_path(raw: &str) -> String {
 /// (correctly drops the query, but shows the path). The new output leaks strictly less — the
 /// query is this function's one hard guarantee — just not byte-for-byte "a superset of what was
 /// masked before" in every case (review M2).
+///
+/// As a last step, a private token-masking pass additionally masks a `TOKEN_PREFIXES`-shaped or
+/// opaque, high-entropy-looking host label or path piece — a registry-issued token embedded
+/// directly in a hostname (`https://ghp_<36>.registry.example/`) or an unauthenticated path
+/// (`https://npm-proxy.fury.io/AbCdEf1234567890xyz/acme/`) is not credential-shaped (no
+/// `user[:pass]@`) and so is invisible to [`redact_userinfo`] on its own (#1429). This is a
+/// heuristic, not a parser: a mixed-case alphanumeric segment of 16+ bytes with no known token
+/// prefix (e.g. a GitHub API repo path like `Python3WebSpiderTest`) is masked too, an accepted
+/// false positive since this output only ever feeds log or diagnostic text — including a
+/// schemeless package name reaching this function via [`RedactedUrl`](super::RedactedUrl) (e.g.
+/// `RegistryError.package`), which can itself surface to an LSP client through
+/// `window/logMessage`, not only an internal `tracing` line.
 ///
 /// # Examples
 ///
@@ -1760,10 +2066,17 @@ pub(super) fn url_for_tracing_with_parsed(raw: &str, parsed: Option<url::Url>) -
     // `@` in the query/fragment would otherwise get widened over by `extend_credential_at`,
     // consuming that boundary before it can be truncated and leaking the rest of the query.
     let end = raw.find(['?', '#']).unwrap_or(raw.len());
-    if end == raw.len() {
-        return redact_userinfo_with_parsed(raw, parsed);
+    let redacted = if end == raw.len() {
+        redact_userinfo_with_parsed(raw, parsed)
+    } else {
+        redact_userinfo(&raw[..end])
+    };
+    // #1429: mask any remaining token-shaped host label/path piece `redact_userinfo` leaves
+    // untouched. `Cow::Borrowed` reuses `redacted` outright rather than allocating again.
+    match mask_token_segments(&redacted) {
+        Cow::Borrowed(_) => redacted,
+        Cow::Owned(masked) => masked,
     }
-    redact_userinfo(&raw[..end])
 }
 
 /// Parses `raw` as a URL, returning the parsed [`url::Url`] when it has an actual authority
@@ -3671,6 +3984,150 @@ mod tests {
         assert_eq!(
             url_for_tracing("c:/path#u=user:pw@a&token=SUPERSECRET"),
             "c:/path"
+        );
+    }
+
+    /// #1429 security audit: each of these leaked verbatim through `redact_userinfo` before
+    /// `mask_token_segments` (no credential-shaped `user[:pass]@` for it to find) — a
+    /// Gemfury-style opaque path token, a Cloudsmith-style opaque path token, a GitHub/GitLab
+    /// PAT sitting bare in a path segment, an npm token behind a `_authToken=` query-string-style
+    /// path piece (the `=` sub-piece gap), a GitHub PAT embedded directly in a hostname, and the
+    /// `;`-delimited sub-piece gap named explicitly in the original audit. Token bodies are
+    /// realistic lengths (16+ bytes) — impl-critic S2, #1429: `PREFIXED_TOKEN_MIN_BODY_LEN` was
+    /// raised to 16, so a synthetic short body would no longer qualify.
+    #[test]
+    fn test_url_for_tracing_masks_token_shaped_host_and_path_pieces() {
+        assert_eq!(
+            url_for_tracing("https://npm-proxy.fury.io/AbCdEf1234567890xyz/acme/"),
+            "https://npm-proxy.fury.io/***/acme/"
+        );
+        assert_eq!(
+            url_for_tracing("https://dl.cloudsmith.io/Xy9KqP2mZr8Lw4Tn/repo/deb/"),
+            "https://dl.cloudsmith.io/***/repo/deb/"
+        );
+        assert_eq!(
+            url_for_tracing("https://registry.example/ghp_1a2b3c4d5e6f7g8h9i/simple"),
+            "https://registry.example/***/simple"
+        );
+        assert_eq!(
+            url_for_tracing("https://gitlab.example/glpat-1a2b3c4d5e6f7g8h9i/simple"),
+            "https://gitlab.example/***/simple"
+        );
+        assert_eq!(
+            url_for_tracing(
+                "https://registry.npmjs.org/_authToken=npm_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6/"
+            ),
+            "https://registry.npmjs.org/_authToken=***/"
+        );
+        assert_eq!(
+            url_for_tracing("https://registry.example/tok;glpat-1a2b3c4d5e6f7g8h9i/simple"),
+            "https://registry.example/tok;***/simple"
+        );
+        assert_eq!(
+            url_for_tracing("https://ghp_1a2b3c4d5e6f7g8h9i.registry.example/"),
+            "https://***.registry.example/"
+        );
+    }
+
+    /// #1429 impl-critic S1: `SegmentKind::HostLabel` prefix matching was switched from
+    /// case-insensitive to case-sensitive to close a false-positive class on real registry
+    /// hosts (see the two `test_url_for_tracing_public_registry_urls_are_noop` `*.pkg.dev`
+    /// entries). This pins the surviving positive case — a lowercase `TOKEN_PREFIXES` entry
+    /// (`ghp_`) still matches a host label reached via the credential-bearing redaction branch,
+    /// where `Url` serialization always lowercases the host regardless of input case.
+    #[test]
+    fn test_url_for_tracing_masks_host_label_token_prefix() {
+        assert_eq!(
+            url_for_tracing("https://u:p@ghp_1a2b3c4d5e6f7g8h9i.host/"),
+            "https://***@***.host/"
+        );
+    }
+
+    /// #1429 impl-critic M1: the accepted flip side of switching to case-sensitive matching
+    /// (S1) — a `TOKEN_PREFIXES`-shaped host token whose case survives redaction unchanged (no
+    /// userinfo present, so `redact_userinfo_with_parsed`'s own `tail.contains(':')` check
+    /// returns `raw` verbatim rather than a lowercased `Url` reserialization) is no longer
+    /// masked if written upper-case. No known registry issues an upper-case-prefixed token into
+    /// a hostname, so this is accepted per `SegmentKind::HostLabel`'s own doc.
+    #[test]
+    fn test_url_for_tracing_uppercase_host_label_token_is_accepted_miss() {
+        assert_eq!(
+            url_for_tracing("https://GHP_1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r.host/"),
+            "https://GHP_1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r.host/"
+        );
+    }
+
+    /// #1429 impl-critic M5: the `?`-truncated branch of `url_for_tracing_with_parsed` (a
+    /// distinct code path from the plain-URL branch above) must mask a host-embedded token too.
+    #[test]
+    fn test_url_for_tracing_masks_host_label_token_in_query_truncated_branch() {
+        assert_eq!(
+            url_for_tracing("https://ghp_1a2b3c4d5e6f7g8h9i.host/?q=1"),
+            "https://***.host/"
+        );
+    }
+
+    /// #1429: every public registry host/path this project actually talks to must stay
+    /// byte-for-byte unchanged — `mask_token_segments`' heuristic must never widen onto ordinary
+    /// package names, versions, commit SHAs, or content hashes. The `*.pkg.dev`/`sk-`/`pypi-`/
+    /// `npm_`-prefixed entries are impl-critic S1/S2 counterexamples: a Google Artifact Registry
+    /// host (`asia-*-docker.pkg.dev`, real npm/PyPI/Maven traffic) that a case-insensitive
+    /// `ASIA`/`ACCA` host-label match used to mask, and versioned artifact filenames that the
+    /// original 8-byte prefixed-body threshold used to mask.
+    #[test]
+    fn test_url_for_tracing_public_registry_urls_are_noop() {
+        let urls = [
+            "https://registry.npmjs.org/lodash",
+            "https://pypi.org/simple/requests/",
+            "https://api.nuget.org/v3/index.json",
+            "https://proxy.golang.org/github.com/pkg/errors/@v/list",
+            "https://repo1.maven.org/maven2/com/google/guava/guava/31.1-jre/guava-31.1-jre.jar",
+            "https://index.crates.io/se/rd/serde",
+            "https://api.github.com/repos/rust-lang/rust",
+            "https://gitlab.com/api/v4/projects",
+            "https://api.osv.dev/v1/query",
+            "https://deps.dev/_/s/npm/p/lodash",
+            "https://files.pythonhosted.org/packages/9d/be/10918a2eac4ae9f02f6cfe6414b7a155ccd8f7f9d4380d62c95dd6ddaca/requests-2.31.0.tar.gz",
+            "https://asia-east1-docker.pkg.dev/my-project/npm-registry/pkg",
+            "https://asia-northeast1-npm.pkg.dev/my-project/npm-registry/",
+            "https://acca-mirror1.example.org/simple",
+            "https://sk-mirror01.example.com/simple",
+            "https://static.crates.io/crates/sk-lang/sk-lang-1.2.3.crate",
+            "https://registry.npmjs.org/sk-foo/-/sk-foo-1.2.3.tgz",
+            "https://files.pythonhosted.org/packages/aa/bb/pypi-simple-1.4.0.tar.gz",
+            "https://registry.npmjs.org/npm_package2/-/npm_package2-10.0.0.tgz",
+        ];
+        for url in urls {
+            assert_eq!(url_for_tracing(url), url, "url={url:?}");
+        }
+    }
+
+    /// #1429: a real crate/package identifier with a version suffix (`sk-lang@1.2.3`, the #887
+    /// pinned false-positive-acceptance decision) and an npm scope segment (`@types/node`) must
+    /// stay untouched — neither is prefixed-token-shaped (a hyphen disqualifies the unprefixed
+    /// rule's pure-alphanumeric check) nor long/mixed-case enough on its own.
+    #[test]
+    fn test_url_for_tracing_package_identifiers_are_noop() {
+        assert_eq!(
+            url_for_tracing("https://docs.rs/sk-lang@1.2.3"),
+            "https://docs.rs/sk-lang@1.2.3"
+        );
+        assert_eq!(url_for_tracing("@types/node"), "@types/node");
+    }
+
+    /// #1429: a bracketed IPv6 host and a plain `host:port` authority both fail
+    /// `is_token_piece_charset` (`[`, `]`, and `:` are all outside `[A-Za-z0-9._-]`), so neither
+    /// is ever reachable by either masking rule — pins the two collision cases the recommendation
+    /// called out explicitly.
+    #[test]
+    fn test_url_for_tracing_bracketed_ipv6_and_port_host_are_noop() {
+        assert_eq!(
+            url_for_tracing("https://[::1]:8443/x"),
+            "https://[::1]:8443/x"
+        );
+        assert_eq!(
+            url_for_tracing("https://host:8443/x"),
+            "https://host:8443/x"
         );
     }
 
