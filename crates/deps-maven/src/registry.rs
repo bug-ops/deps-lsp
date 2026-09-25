@@ -504,15 +504,77 @@ impl MavenCentralRegistry {
     }
 }
 
+/// Whether `segment` is safe to interpolate into a Solr `a:` field query as an
+/// artifact-id prefix.
+///
+/// Same allowlist as [`deps_core::is_safe_maven_coordinate_segment`] (`[A-Za-z0-9._-]`,
+/// not a dot-segment, 128-byte cap), but — unlike that function — also accepts an empty
+/// string: an empty artifact-prefix segment is the valid "group only" case (FR-002,
+/// `com.google.guava:`), not a rejected value. Kept local to `deps-maven` rather than
+/// added to `deps-core`, since this Solr-query-prefix shape is specific to this caller.
+fn is_safe_maven_artifact_prefix_segment(segment: &str) -> bool {
+    segment.is_empty() || deps_core::is_safe_maven_coordinate_segment(segment)
+}
+
+/// Translates a Gradle/Maven `Package`-completion prefix into the Solr `q` query Maven
+/// Central's `solrsearch` endpoint expects, per spec `073`'s FR-001..FR-004.
+///
+/// `detect_dsl_context`'s `Package` arm (`deps-gradle`), this function's originating
+/// caller, guarantees a 0-or-1-colon `prefix` — but `search_url` (and so this function)
+/// has two other callers with no such guarantee: `deps-maven`'s own `pom.xml` field
+/// completion and `deps-lsp`'s `fallback_completion` path, either of which can pass an
+/// arbitrary-colon-count string. Only the first `:` (via `split_once`) is ever
+/// meaningful here; everything past it, including any further colons, lands in
+/// `artifact_prefix` and is handled the same way a single extra character would be — by
+/// the allowlist check below, never by an upstream invariant:
+///
+/// - 0 colons: returned unchanged, sent as free-text `q=<prefix>`.
+/// - 1 colon, non-empty group and artifact-prefix: `g:<group> AND a:<artifact-prefix>*`.
+/// - 1 colon, non-empty group, empty artifact-prefix: `g:<group>` alone.
+/// - 1 colon, empty group, or either segment failing the allowlist: falls back to the
+///   0-colon free-text behavior (FR-004/NFR-005 edge case) rather than sending a
+///   rejected/unescaped segment as a Solr *field* query. This fallback is not itself a
+///   new injection guarantee — a rejected segment still reaches Solr verbatim as
+///   free-text `q`, with the same Lucene-syntax exposure `search_url` already had before
+///   this fix (live-confirmed: a crafted prefix like `zzzqqq OR g:com.google.guava:x`
+///   still executes the injected `OR` clause as free text). NFR-002 is met only for the
+///   translated (allowlist-passing) path, matching this project's existing
+///   allowlist-not-escape posture — real `groupId`/`artifactId` values never need this
+///   fallback, so it is reached only by adversarial or malformed input, same as before.
+fn solr_query_for_prefix(prefix: &str) -> String {
+    let Some((group, artifact_prefix)) = prefix.split_once(':') else {
+        return prefix.to_string();
+    };
+    if group.is_empty()
+        || !deps_core::is_safe_maven_coordinate_segment(group)
+        || !is_safe_maven_artifact_prefix_segment(artifact_prefix)
+    {
+        return prefix.to_string();
+    }
+    if artifact_prefix.is_empty() {
+        format!("g:{group}")
+    } else {
+        format!("g:{group} AND a:{artifact_prefix}*")
+    }
+}
+
 /// Builds the `solrsearch` request URL for `query`.
 ///
 /// Deliberately takes no `limit`: the URL doubles as `HttpCache`'s cache key, and
 /// always requesting [`SEARCH_CACHE_ROWS`] rows keeps that key identical across calls
 /// for the same `query` regardless of the caller's requested `limit` (#282 gap 2).
+///
+/// `query` is first translated by [`solr_query_for_prefix`] (spec `073`): a
+/// `group:partial-artifact`-shaped completion prefix is rewritten into a Solr
+/// field-query (`g:<group> AND a:<artifact-prefix>*`) instead of being forwarded
+/// verbatim, since Maven Central's Solr endpoint otherwise parses the raw colon as an
+/// invalid `field:value` query and returns `HTTP 400` (#1457). Still a pure,
+/// deterministic function of `query` alone, so it remains a stable `HttpCache` key
+/// (FR-006).
 fn search_url(query: &str) -> String {
     format!(
         "{MAVEN_SEARCH_BASE}?q={q}&rows={SEARCH_CACHE_ROWS}&wt=json",
-        q = urlencoding::encode(query),
+        q = urlencoding::encode(&solr_query_for_prefix(query)),
     )
 }
 
@@ -2511,7 +2573,114 @@ mod tests {
         assert!(err.is_not_found());
     }
 
+    // --- spec 073: Solr field-query translation for Package-completion prefixes ---
+
+    #[test]
+    fn test_solr_query_for_prefix_no_colon_is_unchanged() {
+        assert_eq!(solr_query_for_prefix("gua"), "gua");
+    }
+
+    #[test]
+    fn test_solr_query_for_prefix_one_colon_both_non_empty_translates() {
+        assert_eq!(
+            solr_query_for_prefix("com.google.guava:gua"),
+            "g:com.google.guava AND a:gua*"
+        );
+    }
+
+    #[test]
+    fn test_solr_query_for_prefix_one_colon_empty_artifact_is_group_only() {
+        assert_eq!(
+            solr_query_for_prefix("com.google.guava:"),
+            "g:com.google.guava"
+        );
+    }
+
+    #[test]
+    fn test_solr_query_for_prefix_one_colon_empty_group_falls_back_to_free_text() {
+        assert_eq!(solr_query_for_prefix(":gua"), ":gua");
+    }
+
+    #[test]
+    fn test_solr_query_for_prefix_rejects_lucene_special_char_in_group() {
+        assert_eq!(
+            solr_query_for_prefix("com.google\".evil:gua"),
+            "com.google\".evil:gua"
+        );
+    }
+
+    #[test]
+    fn test_solr_query_for_prefix_rejects_extra_colon_in_artifact() {
+        // A second `:` inside the artifact-prefix segment (shouldn't happen given
+        // `detect_dsl_context`'s 0-1-colon invariant, but must not be trusted blindly).
+        assert_eq!(
+            solr_query_for_prefix("com.google.guava:gua:evil"),
+            "com.google.guava:gua:evil"
+        );
+    }
+
+    #[test]
+    fn test_solr_query_for_prefix_rejects_wildcard_in_artifact() {
+        assert_eq!(
+            solr_query_for_prefix("com.google.guava:*"),
+            "com.google.guava:*"
+        );
+    }
+
+    #[test]
+    fn test_search_url_encodes_translated_solr_query() {
+        let url = search_url("com.google.guava:gua");
+        assert!(
+            url.contains(&urlencoding::encode("g:com.google.guava AND a:gua*").into_owned()),
+            "expected translated Solr field-query in URL, got {url}"
+        );
+    }
+
+    #[test]
+    fn test_search_url_no_colon_prefix_is_byte_for_byte_unchanged_behavior() {
+        assert_eq!(search_url("gua"), search_url("gua"));
+        let url = search_url("gua");
+        assert!(url.contains(&urlencoding::encode("gua").into_owned()));
+    }
+
     // --- NFR-006 live verification (real network, run explicitly with `--ignored`) ---
+
+    /// SC-001/NFR-001: live-verifies the issue's own reproduction — a `group:partial`
+    /// completion prefix must return real Maven Central matches, not the pre-fix `HTTP
+    /// 400`-downgraded-to-empty result.
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn test_live_search_group_partial_artifact_prefix_returns_real_matches() {
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let results = registry
+            .search("com.google.guava:gua", 20)
+            .await
+            .expect("live solrsearch request must succeed after the Solr field-query fix");
+
+        assert!(!results.is_empty(), "expected non-empty completion matches");
+        assert!(
+            results
+                .iter()
+                .all(|r| r.group_id == "com.google.guava" && r.artifact_id.starts_with("gua")),
+            "expected only com.google.guava:gua* matches, got {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn test_live_search_group_only_prefix_returns_real_matches() {
+        let registry = MavenCentralRegistry::new(Arc::new(HttpCache::new()));
+        let results = registry
+            .search("com.google.guava:", 20)
+            .await
+            .expect("live solrsearch request must succeed for a group-only field-query");
+
+        assert!(!results.is_empty(), "expected non-empty completion matches");
+        assert!(
+            results.iter().all(|r| r.group_id == "com.google.guava"),
+            "expected only com.google.guava:* matches, got {results:?}"
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires network access"]
