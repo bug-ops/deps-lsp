@@ -88,9 +88,8 @@ without generating noisy false positives on legitimate, intentionally-similarly-
   `supports_package_rename` precedent (issue #205), a *similarity* signal from an undocumented black-box
   algorithm is far weaker evidence than a registry-supplied structured replacement field, so no
   code-action / rename quickfix is proposed by this spec at all, opt-in or otherwise.
-- Defining the exact similarity/popularity-gap threshold, caching/TTL strategy, and whether this ships as
-  a diagnostic, a hover-only note, or both — these are `/sdd plan`-phase design decisions and are flagged
-  as open questions below, not decided here.
+- The exact similarity/popularity-gap threshold, caching/TTL strategy, and diagnostic-vs-hover channel are
+  `/sdd plan`-phase design decisions — see [[plan]] for the resolved values (summarized in §9 below).
 - Any change to `deps_dev_system()` or the existing Scorecard/SLSA trust-signal feature — this is an
   additive, independent use of the same client/mapping, not a modification of issue #543's delivered
   behavior.
@@ -153,7 +152,7 @@ THEN the dependency's other diagnostics/hover content (vulnerabilities, license,
 |----|------------|----------|
 | FR-001 | WHEN a manifest-declared direct dependency belongs to one of the seven ecosystems `deps_dev_system()` already maps (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) THE SYSTEM SHALL be capable of querying deps.dev's `GetSimilarlyNamedPackages` endpoint for that dependency's name | must |
 | FR-002 | WHEN a dependency belongs to an ecosystem `deps_dev_system()` maps to `None` (Deno, Dart, Gradle, Swift, Composer, GitHub Actions, GitLab CI/CD) THE SYSTEM SHALL skip the similarity lookup entirely for that dependency, with no attempted request | must |
-| FR-003 | WHEN `GetSimilarlyNamedPackages` returns a `packages[]` entry whose reported popularity is materially higher than the declared dependency's own popularity (exact metric and threshold: see Open Questions) THE SYSTEM SHALL treat that entry as a typosquat-suspect candidate | must |
+| FR-003 | WHEN `GetSimilarlyNamedPackages` returns a `packages[]` entry whose `GetDependents`-derived popularity is materially higher than the declared dependency's own (exact metric and threshold: see [[plan#3. Data Model\|plan.md]]) THE SYSTEM SHALL treat that entry as a typosquat-suspect candidate | must |
 | FR-004 | WHEN a typosquat-suspect candidate is identified for a declared dependency THE SYSTEM SHALL surface a signal that names the more-popular candidate package, distinguishable from OSV/license/deprecation diagnostics in severity and message framing (this is a *possible* mistake, not a confirmed vulnerability) | must |
 | FR-005 | WHEN the `GetSimilarlyNamedPackages` request fails (network error, timeout, non-2xx, malformed JSON, or the endpoint no longer exists) THE SYSTEM SHALL degrade to showing no typosquat signal for that dependency, without raising an error and without blocking any other hover/diagnostic content — mirroring the existing infallible-by-construction pattern in `DepsDevClient::trust_signal` | must |
 | FR-006 | WHEN a dependency's declared name is an exact match for the canonical `packageKey` deps.dev returns (i.e. the package is not itself flagged as the low-popularity side of any pair) THE SYSTEM SHALL NOT surface a typosquat signal for it | must |
@@ -166,7 +165,7 @@ THEN the dependency's other diagnostics/hover content (vulnerabilities, license,
 | ID | Category | Requirement |
 |----|----------|-------------|
 | NFR-001 | Reliability | A `GetSimilarlyNamedPackages` failure or v3alpha removal must never propagate as a user-visible error or delay other diagnostics/hover content — same infallible-by-construction bar as the existing `deps_dev::trust_signal` (FR-006 of issue #543's spec). |
-| NFR-002 | Performance | The similarity lookup must not add synchronous latency to hover/diagnostic response paths — it must be spawned/cached the same way the existing Scorecard/SLSA lookups are, per `deps-lsp`'s non-blocking-handler convention (`AGENTS.md`/`CLAUDE.md`: "All handler methods must stay non-blocking"). |
+| NFR-002 | Performance | Resolving one dependency's signal is a fan-out of up to `2 + 2N` deps.dev requests (`GetSimilarlyNamedPackages`, `GetPackage` + `GetDependents` for the declared package, then the same pair per candidate `N`) — see [[plan#1. Architecture\|plan.md]]. None of this may add synchronous latency to hover/diagnostic response paths; it must be spawned/cached the same way the existing Scorecard/SLSA lookups are, per `deps-lsp`'s non-blocking-handler convention (`CLAUDE.md`: "All handler methods must stay non-blocking"). |
 | NFR-003 | Precision / noise control | The false-positive rate for legitimate similarly-named or family packages (e.g. `serde`/`serde_json`, scoped npm packages) must be low enough that the signal remains trustworthy; exact target is an open design question (see below) but "must not fire on `serde` vs `serde_json`"-class cases is a hard constraint on any threshold chosen in the plan phase. |
 | NFR-004 | Forward compatibility | Because `GetSimilarlyNamedPackages` is v3alpha with no published stability guarantee, the client must be isolated behind the same kind of graceful-degradation boundary as the rest of `deps_dev` so an incompatible upstream change degrades to "feature silently stops firing," not a build or runtime failure. |
 | NFR-005 | Caching | Given the algorithm is undocumented and the endpoint has no stated cache-control validators (`deps_dev`'s existing module doc already notes deps.dev sends no `ETag`/`Last-Modified` on its other endpoints), a TTL-memo approach consistent with `DEPS_DEV_SUCCESS_TTL`/`DEPS_DEV_ERROR_TTL` should be reused rather than re-deriving new caching semantics from scratch. |
@@ -212,10 +211,10 @@ a modification of the existing trust-signal assembly.
 - Keep this behind the same infallible-by-construction boundary as `DepsDevClient::trust_signal`
 
 ### Ask First
-- Choosing the specific similarity/popularity-gap threshold and its data source (this spec deliberately
-  leaves it open — see below)
-- Deciding whether the signal ships as a diagnostic, a hover note, or both
-- Adding any new configuration surface/schema for the opt-in/opt-out switch (FR-009)
+- Changing the resolved ratio threshold or `GetDependents`-based popularity comparison approach in
+  [[plan]] once implementation begins (e.g. if live testing surfaces a false positive/negative the plan's
+  empirical basis didn't anticipate)
+- Flipping the opt-in default to on-by-default (explicitly deferred to a separate follow-up issue)
 
 ### Never
 - Wire this signal into `supports_package_rename` or any automatic rename/quickfix — the similarity
@@ -226,23 +225,32 @@ a modification of the existing trust-signal assembly.
 
 ## 9. Open Questions
 
-- [NEEDS CLARIFICATION: What popularity metric and threshold determines "materially more popular" for
-  FR-003/NFR-003? deps.dev's own docs do not publish one. Candidate approaches (dependent-package count via
-  deps.dev's own project data, download-count proxy, or simply "any asymmetric result at all") need to be
-  evaluated empirically against real popular-package-pair and known-typosquat-pair data in the plan phase.]
-- [NEEDS CLARIFICATION: Is depending on a v3alpha-only endpoint (no published stability/deprecation
-  guarantee) acceptable for a shipped, non-experimental feature, or should this remain gated behind an
-  explicit opt-in flag indefinitely — even after the algorithm/threshold question above is resolved —
-  specifically because of the alpha status rather than the noise concern?]
-- [NEEDS CLARIFICATION: Diagnostic severity/channel — should this render as an LSP `Hint`/`Information`-
-  severity diagnostic, a hover-only annotation, or both? Existing precedent (OSV, license policy) uses
-  diagnostics for confirmed/structured findings; this signal's confidence level is qualitatively weaker.]
-- [NEEDS CLARIFICATION: Should the opt-out in FR-009 be a global LSP setting, a per-workspace config, or
-  per-ecosystem — and does it belong in the same config surface as the existing license-policy toggle, or
-  a new one?]
-- [NEEDS CLARIFICATION: Caching key/TTL specifics — reuse `DEPS_DEV_SUCCESS_TTL`/`DEPS_DEV_ERROR_TTL`
-  verbatim, or does a similarity result (which is not version-specific, unlike the existing trust-signal
-  memo keyed by `(system, name, version)`) warrant its own key shape and TTL tuned independently?]
+All five items below were open at spec-authoring time and are now resolved; see [[plan#1. Architecture|plan.md]] for the full technical detail behind each decision.
+
+- ~~What popularity metric and threshold determines "materially more popular"?~~ **Resolved**:
+  `GetSimilarlyNamedPackages` itself carries no popularity field (verified live against the v3alpha API,
+  2026-09-25) — popularity is derived from a second call to deps.dev's `GetDependents` endpoint, comparing
+  `dependentCount` for the declared package's default version against each candidate's default version. A
+  live empirical check against real deps.dev data found a >150x separation between confirmed typosquat pairs
+  (`cross-env`/`crossenv` ≈300x, `express`/`expres` ≈1490x, `lodash`/`loadash` ≈1235x,
+  `request`/`requests` ≈3000x) and the closest known false-positive-risk pair found
+  (`coffee-script`/`coffeescript` ≈6.9x, both legitimate). See [[plan#3. Data Model|plan.md]] for the chosen
+  ratio threshold and its margin.
+- ~~Is a v3alpha-only endpoint acceptable for a shipped feature?~~ **Resolved**: ship behind an explicit
+  opt-in flag at launch (default: disabled); revisit default-on only as a separate, deliberate follow-up
+  issue once the endpoint has shown stability across multiple releases with no incompatible changes — not
+  bundled into this feature's initial delivery.
+- ~~Diagnostic severity/channel?~~ **Resolved**: an LSP diagnostic at `Severity::Hint`, reusing the existing
+  typed `Severity` enum (`crates/deps-core/src/diagnostic.rs`) — visible in the Problems panel but clearly
+  distinguished from `Warning`/`Error`-level OSV and unsatisfiable-requirement diagnostics. No hover-only
+  variant in v1.
+- ~~Opt-out config surface?~~ **Resolved**: a new field alongside the existing license-policy configuration
+  (`crates/deps-core/src/policy_config.rs`, wired the same way as `config.policy.license_policy`), not a new
+  top-level `initializationOptions` section — same parsing/validation path, already covered by existing
+  config tests.
+- ~~Caching key/TTL specifics?~~ **Resolved**: reuse `DEPS_DEV_SUCCESS_TTL`/`DEPS_DEV_ERROR_TTL` verbatim,
+  but under a new cache key shape distinct from the existing `(system, name, version)` trust-signal memo —
+  see [[plan#3. Data Model|plan.md]].
 
 ## 10. See Also
 
