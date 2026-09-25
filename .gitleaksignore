@@ -1,0 +1,4 @@
+# False positives from crates/deps-core/src/redact/url.rs's #1432 masking-regression tests:
+# synthetic token-shaped fixtures deliberately constructed to trigger our own masking heuristic
+# match gitleaks' own default rule regexes too. Reviewed and confirmed not real credentials.
+d4b51172240b9c82106a62c95d5ebf4777cf1b3c:crates/deps-core/src/redact/url.rs:gitlab-cicd-job-token:4153
