@@ -741,6 +741,30 @@ mod tests {
         assert!(result.dependencies[0].version_range.is_none());
     }
 
+    /// Spec 070 / issue #1421 FR-005: the shared `$(...)`-branch grammar was widened to accept
+    /// a hyphen in subsequent positions; `is_msbuild_reference`'s own unconditional substring
+    /// check already tolerated both the hyphenated and dotted forms before and after that
+    /// widening, so both must still degrade to `None` here, unaffected either way.
+    #[test]
+    fn test_msbuild_property_hyphenated_and_dotted_forms_unaffected_by_shared_grammar_widening() {
+        assert!(is_msbuild_reference("$(Mod-VersionProp)"));
+        assert!(is_msbuild_reference("$(A.VersionProp)"));
+        assert!(
+            deps_core::lsp_helpers::requirement_contains_template_placeholder("$(Mod-VersionProp)")
+        );
+
+        let xml = r#"<Project><ItemGroup>
+  <PackageReference Include="HyphenPkg" Version="$(Mod-VersionProp)" />
+  <PackageReference Include="DottedPkg" Version="$(A.VersionProp)" />
+</ItemGroup></Project>"#;
+        let result = parse_project_file(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        for dep in &result.dependencies {
+            assert!(dep.version_requirement.is_none());
+            assert!(dep.version_range.is_none());
+        }
+    }
+
     /// #1355: `%(Version)` (MSBuild item-metadata syntax) must degrade to `None` the same as
     /// `$(PropertyName)` — before this fix it survived parsing as a real requirement string
     /// and could plan an incorrect version-rewrite edit, offer completions, and render a

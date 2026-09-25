@@ -349,7 +349,8 @@ mod tests {
              require golang.org/x/mod @MOD_VERSION@\n\
              require golang.org/x/sync %SYNC_VERSION%\n\
              require golang.org/x/tools <%= TOOLS_VERSION %>\n\
-             require example.com/fake-makefile-dep $(FAKE_MAKEFILE_VERSION)\n";
+             require example.com/fake-makefile-dep $(FAKE_MAKEFILE_VERSION)\n\
+             require example.com/fake-msbuild-dep $(FAKE-MSBUILD-VERSION)\n";
     }
 
     // #794: no `completion_guard_conformance!` for this crate — `complete_package_names`
