@@ -217,9 +217,12 @@ fn find_credential_at(region: &str) -> Option<usize> {
     found
 }
 
-/// Case-sensitive prefixes of well-known API-token/secret formats (GitHub, GitLab, npm, PyPI,
-/// Slack, AWS, Stripe-style, Google, DigitalOcean, HashiCorp Vault, Shopify, Figma, Docker, and
-/// other common cloud-key shapes), used as [`find_token_prefix_at`]'s only discriminator for an
+/// Case-sensitive prefixes of well-known API-token/secret formats (GitHub, GitLab — including the
+/// CI/CD job-token family: `glcbt-` project-scoped, `glft-` feed, `glimt-` deploy, `glagent-`
+/// runner-agent, `glffct-` feature-flags client tokens (#1432) — npm, PyPI, Slack, AWS,
+/// Stripe-style, Google, DigitalOcean, HashiCorp Vault, Shopify, Figma, Docker, Hugging Face
+/// (`hf_`), JFrog Artifactory, and other common cloud-key shapes), used as
+/// [`find_token_prefix_at`]'s only discriminator for an
 /// `OpaquePath` credential that has no password and so is not colon-shaped enough for
 /// [`find_credential_at`] to recognize (#858). Not exhaustive in either direction: it neither
 /// covers every real token format (see [`find_token_prefix_at`]'s own doc for exactly which
@@ -272,6 +275,12 @@ const TOKEN_PREFIXES: &[&str] = &[
     "figd_",
     "dckr_pat_",
     "AKCp",
+    "glcbt-",
+    "glft-",
+    "glimt-",
+    "glagent-",
+    "glffct-",
+    "hf_",
 ];
 
 /// [`find_credential_at`]'s fallback for [`RegionKind::OpaquePath`] (#858, S4): finds a `@` whose
@@ -1710,6 +1719,44 @@ const PREFIXED_TOKEN_MIN_BODY_LEN: usize = 16;
 /// this short is worth masking anyway).
 const UNPREFIXED_TOKEN_MIN_LEN: usize = 16;
 
+/// Minimum byte length of an unprefixed, mixed-case piece allowing `-`/`_` (base64url's own
+/// alphabet beyond plain alphanumeric) required for [`is_unprefixed_base64url_token`] to treat a
+/// [`SegmentKind::PathPiece`] as an opaque token (#1432) — a deliberately *higher* floor than
+/// [`UNPREFIXED_TOKEN_MIN_LEN`]'s sibling pure-alphanumeric rule, not a reuse of it (impl-critic
+/// S1): allowing `-`/`_` at 16 bytes newly masked real, benign dashed package names verified live
+/// against the public PyPI registry — `PyQtWebEngine-Qt5` (17 bytes), `PyQt6-Charts-Qt6` (16
+/// bytes), and `PyQt6-WebEngine-Qt6` (19 bytes) all clear the three-category mix a hyphenated name
+/// can incidentally have (a digit-suffixed component plus mixed-case letters). All three stay
+/// unmasked at 20. A longer dashed name that still clears 20 bytes and mixes all three categories
+/// (e.g. `Azure-Functions-Python3`, `Release-2024-Q3_Build`) remains an accepted over-redaction —
+/// consistent with this module's existing `Python3WebSpiderTest`-class trade-off documented on
+/// [`url_for_tracing`]'s own doc comment — since there is no shape-only discriminator between such
+/// a name and a genuine base64url token of the same length.
+const UNPREFIXED_BASE64URL_TOKEN_MIN_LEN: usize = 20;
+
+/// Minimum byte length of an unprefixed, pure-lowercase-hex [`SegmentKind::PathPiece`] required
+/// for [`piece_should_mask`] to treat it as an opaque hex-encoded token when it directly follows a
+/// [`HEX_TOKEN_MARKER_SEGMENTS`] segment (#1432) — deliberately longer than a 40-character git
+/// commit SHA, the most common benign pure-lowercase-hex path piece (e.g. `/commit/<40 hex>`), so
+/// that control case stays unmasked even when a marker segment happens to precede it.
+const MARKED_HEX_TOKEN_MIN_LEN: usize = 48;
+
+/// Path pieces after which an unprefixed, pure-lowercase-hex piece of at least
+/// [`MARKED_HEX_TOKEN_MIN_LEN`] bytes is still treated as an opaque token (#1432): registry
+/// convention for "the next path segment is a private/credential blob", not proof of hex shape
+/// alone — a bare 48+ hex piece with no such marker ahead of it is deliberately left unmasked (it
+/// is indistinguishable from a long, benign hex identifier). Lowercase only, matching how these
+/// registries render the segment (`/priv/`, never `/PRIV/`).
+///
+/// Known heuristic misses, accepted rather than fixed (impl-critic M2, #1432): matched
+/// case-sensitively against its exact lowercase spelling, so an otherwise-identical `/Priv/`
+/// segment never qualifies as a marker; an empty piece between two delimiters (`/priv//<hex>`)
+/// becomes the very next piece's `preceding` context instead of `priv` itself, so the marker is
+/// lost across a doubled separator; and an uppercase or mixed-case hex piece is never recognized
+/// ([`is_marked_hex_token`]'s own charset check is lowercase-only) — all narrow the rule's
+/// coverage, never widen it.
+const HEX_TOKEN_MARKER_SEGMENTS: &[&str] = &["priv", "private", "token", "tokens"];
+
 /// Byte delimiters that bound a path piece for [`mask_token_segments`]'s token-shape check: the
 /// `/` path-segment boundary plus the `= ; , @ :` sub-piece separators that close the
 /// `_authToken=npm_X` and `;ghp_`-in-path gaps a whole-segment-only scan would otherwise miss
@@ -1830,9 +1877,19 @@ fn prefixed_body_qualifies(prefix: &str, body: &str, kind: SegmentKind) -> bool 
 ///   Gemfury/Cloudsmith-style opaque token. Never applied to a [`SegmentKind::HostLabel`]: no
 ///   known registry puts a bare, unprefixed token in a hostname, and an ELB/CloudFront-style
 ///   label (`name-1234567890`) would otherwise false-positive.
+/// - For a [`SegmentKind::PathPiece`] only, an unprefixed base64url-shaped piece
+///   ([`is_unprefixed_base64url_token`]) — the same opaque-token shape as the rule above, but
+///   allowing `-`/`_` (base64url's own alphabet beyond plain alphanumeric), e.g. a
+///   Cloudsmith-style token (#1432).
+/// - For a [`SegmentKind::PathPiece`] only, an unprefixed, pure-lowercase-hex piece directly
+///   following a [`HEX_TOKEN_MARKER_SEGMENTS`] segment ([`is_marked_hex_token`]) — a
+///   packagecloud-style opaque hex token (#1432). Deliberately narrower than the two rules above:
+///   hex has only two possible categories (never uppercase), so this needs the marker-segment
+///   context to avoid mistaking an ordinary long hex identifier (a git commit SHA) for a token.
 ///
 /// Every piece is first gated by [`is_token_piece_charset`], so a piece containing anything
-/// outside `[A-Za-z0-9._-]` never reaches either rule.
+/// outside `[A-Za-z0-9._-]` never reaches any of these rules — including the base64url rule,
+/// which relies on this gate to keep out any byte other than `-`/`_` plus plain alphanumerics.
 ///
 /// Known heuristic misses, accepted rather than fixed (impl-critic M4, #1429): an unprefixed
 /// random token with no digit in its first 16 bytes (roughly 6% of real base62 tokens) fails the
@@ -1840,7 +1897,7 @@ fn prefixed_body_qualifies(prefix: &str, body: &str, kind: SegmentKind) -> bool 
 /// [`is_token_piece_charset`] outright (the colon is outside its charset) and is never even
 /// split out; and for schemeless input, text before the first `:` is never scanned at all
 /// (pre-existing at this module's own baseline, not introduced by this pass).
-fn piece_should_mask(piece: &str, kind: SegmentKind) -> bool {
+fn piece_should_mask(piece: &str, kind: SegmentKind, preceding: Option<&str>) -> bool {
     if piece.is_empty() || !is_token_piece_charset(piece) {
         return false;
     }
@@ -1851,12 +1908,44 @@ fn piece_should_mask(piece: &str, kind: SegmentKind) -> bool {
     }
     match kind {
         SegmentKind::PathPiece => {
-            piece.len() >= UNPREFIXED_TOKEN_MIN_LEN
+            (piece.len() >= UNPREFIXED_TOKEN_MIN_LEN
                 && piece.bytes().all(|b| b.is_ascii_alphanumeric())
-                && category_count(piece) == 3
+                && category_count(piece) == 3)
+                || is_unprefixed_base64url_token(piece)
+                || is_marked_hex_token(piece, preceding)
         }
         SegmentKind::HostLabel => false,
     }
+}
+
+/// [`piece_should_mask`]'s base64url carve-out (#1432): whether `piece` is at least
+/// [`UNPREFIXED_BASE64URL_TOKEN_MIN_LEN`] bytes (impl-critic S1: a distinct, higher floor than the
+/// sibling pure-alphanumeric rule's — see that constant's own doc for the false-positive class
+/// this avoids), passes [`is_token_piece_charset`]'s own `[A-Za-z0-9._-]` gate (reused rather than
+/// re-derived, code-review DRY finding) further narrowed to contain no `.` (so a dotted filename
+/// or version suffix never qualifies), contains at least one `-`/`_` (otherwise the
+/// plain-alphanumeric rule already covers it), and — `-`/`_` carry no case/digit information of
+/// their own, so this is effectively still scoped to the alphanumeric bytes — mixes all three of
+/// {upper, lower, digit}, exactly like the sibling pure-alphanumeric rule this extends.
+fn is_unprefixed_base64url_token(piece: &str) -> bool {
+    piece.len() >= UNPREFIXED_BASE64URL_TOKEN_MIN_LEN
+        && is_token_piece_charset(piece)
+        && !piece.contains('.')
+        && piece.bytes().any(|b| matches!(b, b'-' | b'_'))
+        && category_count(piece) == 3
+}
+
+/// [`piece_should_mask`]'s marker-gated hex carve-out (#1432): whether `piece` is at least
+/// [`MARKED_HEX_TOKEN_MIN_LEN`] bytes of pure lowercase hex (`0-9a-f`), and `preceding` — the path
+/// piece immediately before it — is one of [`HEX_TOKEN_MARKER_SEGMENTS`]. Both conditions are
+/// required: length alone would also flag a long, benign hex identifier with no marker context,
+/// and a marker segment alone would flag whatever ordinary path piece happens to follow it.
+fn is_marked_hex_token(piece: &str, preceding: Option<&str>) -> bool {
+    preceding.is_some_and(|segment| HEX_TOKEN_MARKER_SEGMENTS.contains(&segment))
+        && piece.len() >= MARKED_HEX_TOKEN_MIN_LEN
+        && piece
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f'))
 }
 
 /// Whether any `delimiters`-bounded piece of `text` would be replaced by
@@ -1872,16 +1961,19 @@ fn piece_should_mask(piece: &str, kind: SegmentKind) -> bool {
 )]
 fn has_maskable_piece(text: &str, delimiters: &[u8], kind: SegmentKind) -> bool {
     let mut piece_start = 0;
+    let mut preceding: Option<&str> = None;
     for (i, &byte) in text.as_bytes().iter().enumerate() {
         if !delimiters.contains(&byte) {
             continue;
         }
-        if piece_should_mask(&text[piece_start..i], kind) {
+        let piece = &text[piece_start..i];
+        if piece_should_mask(piece, kind, preceding) {
             return true;
         }
+        preceding = Some(piece);
         piece_start = i + 1;
     }
-    piece_should_mask(&text[piece_start..], kind)
+    piece_should_mask(&text[piece_start..], kind, preceding)
 }
 
 /// Masks each `delimiters`-bounded piece of `text` that [`piece_should_mask`] (under `kind`)
@@ -1901,22 +1993,27 @@ fn mask_delimited_pieces<'a>(text: &'a str, delimiters: &[u8], kind: SegmentKind
     }
     let mut out = String::with_capacity(text.len());
     let mut piece_start = 0;
+    let mut preceding: Option<&str> = None;
     for (i, &byte) in text.as_bytes().iter().enumerate() {
         if !delimiters.contains(&byte) {
             continue;
         }
-        mask_piece_into(&mut out, &text[piece_start..i], kind);
+        let piece = &text[piece_start..i];
+        mask_piece_into(&mut out, piece, kind, preceding);
         out.push(char::from(byte));
+        preceding = Some(piece);
         piece_start = i + 1;
     }
-    mask_piece_into(&mut out, &text[piece_start..], kind);
+    mask_piece_into(&mut out, &text[piece_start..], kind, preceding);
     Cow::Owned(out)
 }
 
 /// [`mask_delimited_pieces`]'s per-piece decision, factored out so its loop body stays a single
-/// call at both the interior (per-delimiter) and trailing (tail) piece boundary.
-fn mask_piece_into(out: &mut String, piece: &str, kind: SegmentKind) {
-    if piece_should_mask(piece, kind) {
+/// call at both the interior (per-delimiter) and trailing (tail) piece boundary. `preceding` is
+/// the piece immediately before this one (already visited, pre-mask text), threaded through for
+/// [`is_marked_hex_token`]'s marker-segment lookahead.
+fn mask_piece_into(out: &mut String, piece: &str, kind: SegmentKind, preceding: Option<&str>) {
+    if piece_should_mask(piece, kind, preceding) {
         out.push_str("***");
     } else {
         out.push_str(piece);
@@ -2028,7 +2125,11 @@ fn mask_token_segments(redacted: &str) -> Cow<'_, str> {
 /// false positive since this output only ever feeds log or diagnostic text — including a
 /// schemeless package name reaching this function via [`RedactedUrl`](super::RedactedUrl) (e.g.
 /// `RegistryError.package`), which can itself surface to an LSP client through
-/// `window/logMessage`, not only an internal `tracing` line.
+/// `window/logMessage`, not only an internal `tracing` line. The same trade extends to a
+/// dashed, mixed-case package name of 20+ bytes that happens to mix all three of {upper, lower,
+/// digit} (#1432, e.g. `Azure-Functions-Python3`, `Release-2024-Q3_Build`) — indistinguishable, by
+/// shape alone, from a genuine base64url-encoded token of the same length
+/// (`is_unprefixed_base64url_token`).
 ///
 /// # Examples
 ///
@@ -4026,6 +4127,72 @@ mod tests {
         assert_eq!(
             url_for_tracing("https://ghp_1a2b3c4d5e6f7g8h9i.registry.example/"),
             "https://***.registry.example/"
+        );
+    }
+
+    /// #1432 security audit follow-up: three token shapes that escaped the coverage above — a
+    /// packagecloud-style opaque hex token gated behind a `/priv/` marker segment (lowercase hex
+    /// has only two of the three categories the plain unprefixed rule requires), a
+    /// Cloudsmith-style base64url token (`-`/`_` fail the pure-alphanumeric unprefixed rule), and
+    /// a GitLab CI job-token family (`glcbt-`) that was missing from `TOKEN_PREFIXES` outright.
+    #[test]
+    fn test_url_for_tracing_masks_1432_token_shapes() {
+        assert_eq!(
+            url_for_tracing(
+                "https://packagecloud.io/priv/0123456789abcdef0123456789abcdef0123456789abcdef/acme/repo/pypi/simple"
+            ),
+            "https://packagecloud.io/priv/***/acme/repo/pypi/simple"
+        );
+        assert_eq!(
+            url_for_tracing(
+                "https://dl.cloudsmith.io/Xy9-KqP2_mZr8Lw4Tn6Q/acme/repo/python/simple/"
+            ),
+            "https://dl.cloudsmith.io/***/acme/repo/python/simple/"
+        );
+        assert_eq!(
+            url_for_tracing("https://gitlab.example.com/glcbt-64_AbCdEfGh1234567890xyzW/x"),
+            "https://gitlab.example.com/***/x"
+        );
+    }
+
+    /// #1432 impl-critic S1: `is_unprefixed_base64url_token`'s 16-byte reuse of
+    /// `UNPREFIXED_TOKEN_MIN_LEN` masked real, benign PyPI package names verified live against the
+    /// public registry — raised to a dedicated `UNPREFIXED_BASE64URL_TOKEN_MIN_LEN = 20` to keep
+    /// these readable (see that constant's own doc for the false-positive class this doesn't
+    /// fully close for longer dashed names).
+    #[test]
+    fn test_url_for_tracing_does_not_mask_short_dashed_package_names() {
+        assert_eq!(
+            url_for_tracing("https://pypi.org/simple/PyQtWebEngine-Qt5/"),
+            "https://pypi.org/simple/PyQtWebEngine-Qt5/"
+        );
+        assert_eq!(
+            url_for_tracing("https://pypi.org/pypi/PyQt6-Charts-Qt6/json"),
+            "https://pypi.org/pypi/PyQt6-Charts-Qt6/json"
+        );
+    }
+
+    /// #1432 impl-critic M1: a path piece below `MARKED_HEX_TOKEN_MIN_LEN`'s 48-byte floor stays
+    /// unmasked regardless of context — a bare 40-hex commit SHA never even reaches
+    /// [`is_marked_hex_token`]'s marker gate (`commit` isn't a `HEX_TOKEN_MARKER_SEGMENTS` entry),
+    /// while a 40-hex piece directly behind a genuine marker segment (`/token/`) does reach the
+    /// gate and is excluded by the length floor alone — pinning both is what actually exercises
+    /// the floor as the true reason for exclusion, rather than assuming the marker gate's absence
+    /// is doing the work (an earlier revision of this test only covered the `commit` case and
+    /// mismeasured 40 against 48, wrongly crediting the marker gate).
+    #[test]
+    fn test_url_for_tracing_does_not_mask_hex_path_piece_below_marker_floor() {
+        assert_eq!(
+            url_for_tracing(
+                "https://github.example/repo/commit/abcdef0123456789abcdef0123456789abcdef01"
+            ),
+            "https://github.example/repo/commit/abcdef0123456789abcdef0123456789abcdef01"
+        );
+        assert_eq!(
+            url_for_tracing(
+                "https://registry.example/token/abcdef0123456789abcdef0123456789abcdef01"
+            ),
+            "https://registry.example/token/abcdef0123456789abcdef0123456789abcdef01"
         );
     }
 
