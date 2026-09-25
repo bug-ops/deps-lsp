@@ -49,10 +49,10 @@ use base64::Engine;
 use deps_core::config_trust::{self, EnvVarSyntax};
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
-    RegistryUrlKind, ValidatedRegistryUrl,
+    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{BlockedSourceClass, EcosystemId, PackageName};
+use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use zeroize::Zeroizing;
@@ -79,6 +79,11 @@ const NO_SOURCES_CONFIGURED_SENTINEL: &str = "<clear/> removed every NuGet packa
 /// own reasoning for the same class of fan-out, one layer earlier in the pipeline.
 const MAX_BLOCKED_SOURCES_PER_PLAIN_CHAIN: usize = 8;
 
+/// Same cap, same reasoning, as [`MAX_BLOCKED_SOURCES_PER_PLAIN_CHAIN`] (issue #1442), but for
+/// [`NuGetConfig::rejected_reason_for`]'s plain-chain branch — kept as its own constant rather
+/// than reused directly so each cap's call site names the fan-out it is actually bounding.
+const MAX_REJECTED_SOURCES_PER_PLAIN_CHAIN: usize = MAX_BLOCKED_SOURCES_PER_PLAIN_CHAIN;
+
 /// Why a candidate `<add value="...">` failed validation, or why it was dropped as
 /// disabled/credentialed/unsupported.
 #[non_exhaustive]
@@ -88,10 +93,27 @@ pub enum NuGetFeedUrlError {
     /// [`IndexUrlError`].
     #[error(transparent)]
     Url(#[from] IndexUrlError),
-    /// The source has an entry under `<packageSourceCredentials>` — credentials are never
-    /// read, so the source is dropped rather than queried unauthenticated (FR-009).
-    #[error("source has packageSourceCredentials configured; credentials are never read")]
+    /// The source has an entry under `<packageSourceCredentials>` whose credential cannot be
+    /// used — either a repo-tier declaration, which this crate never even attempts to bind
+    /// (FR-009), or a user-profile binding that *was* attempted but failed (a missing
+    /// `ClearTextPassword`, an unresolvable/ambiguous binding per FR-007's conditions (0)-(3)),
+    /// for a reason not covered by [`Self::UndefinedEnvVar`]/
+    /// [`Self::EncryptedPasswordUnsupported`] below. The source is dropped rather than queried
+    /// unauthenticated. The message deliberately avoids implying an attempt was made, since the
+    /// repo-tier case never makes one (#1442 code review finding #1).
+    #[error("source has packageSourceCredentials configured that cannot be used")]
     HasCredentials,
+    /// A `%ENV_VAR%` reference inside a matched credential's `Username`/`ClearTextPassword`
+    /// names an environment variable that is not set (FR-002) — kept distinct from
+    /// [`Self::HasCredentials`] so this specific, actionable cause (issue #1442 code review)
+    /// gets its own [`deps_core::net_policy::RegistryRejectionReason::UndefinedEnvVar`]
+    /// classification instead of the generic one. Deliberately carries no payload (#1442 code
+    /// review S3): the matched `%NAME%` text is sliced out of the credential's own cleartext
+    /// value, so a plain password that merely happens to contain a `%...%`-shaped run (e.g.
+    /// `Ab%x9Q%z`) would otherwise leak a secret fragment into `fail_closed`'s `warn!(%reason)`
+    /// log line via this variant's `#[error]` Display.
+    #[error("an environment variable referenced in a credential value is not set")]
+    UndefinedEnvVar,
     /// The source is named in `<disabledPackageSources>` with a `true` value (FR-004).
     #[error("source is disabled via disabledPackageSources")]
     Disabled,
@@ -115,10 +137,50 @@ impl BlockedHostReason for NuGetFeedUrlError {
         match self {
             Self::Url(e) => e.blocked_host_class(),
             Self::HasCredentials
+            | Self::UndefinedEnvVar
             | Self::Disabled
             | Self::UnsupportedProtocolVersion(_)
             | Self::LocalFeedUnsupported
             | Self::EncryptedPasswordUnsupported => None,
+        }
+    }
+}
+
+/// Classifies every [`NuGetFeedUrlError`] variant so [`NuGetConfig::rejected_reason_for`] can
+/// surface a diagnostic for a rejected source regardless of *why* it was rejected (issue
+/// #1442, following #1438's npm/PyPI/Go wiring). An exhaustive match, not a wildcard arm: a
+/// future variant added to [`NuGetFeedUrlError`] must be classified here explicitly rather than
+/// silently falling into a generic bucket or `None`.
+///
+/// `BlockedHost` returns `None` — already covered by [`BlockedHostReason`] above. `Disabled`,
+/// `UnsupportedProtocolVersion`, and `LocalFeedUnsupported` also return `None`: each is an
+/// intentional, expected config state this module already logs at `debug!` rather than `warn!`
+/// (see `resolve_source_entry`'s and `fail_closed`'s own debug!/warn! split), so surfacing an
+/// editor diagnostic for them would contradict that deliberate "this is not a misconfiguration"
+/// design choice, not close a gap.
+///
+/// Every other variant *does* classify, each to its own distinct reason rather than folding
+/// into a shared generic one (#1442 code review S1/S2): `HasCredentials` for a credential this
+/// crate cannot use (whether never attempted — a repo-tier declaration — or attempted and
+/// failed — a user-profile binding), `UndefinedEnvVar` for an unset `%ENV_VAR%` inside a matched
+/// credential (previously misclassified as `HasCredentials`, which made the rendered diagnostic
+/// claim credentials are "never read" even though NuGet's own user-profile binding, issue #576,
+/// does read and attempt to bind them), and `EncryptedCredentialUnsupported` for a DPAPI-
+/// encrypted `<Password>` — this last one is the *default* outcome of `dotnet nuget add source
+/// -u -p` on Windows, so leaving it `None` would silently drop the most common private-feed
+/// setup with zero editor trace, exactly the class of gap #1442 exists to close.
+impl RegistryRejectionClassifier for NuGetFeedUrlError {
+    fn rejection_reason(&self) -> Option<RegistryRejectionReason> {
+        match self {
+            Self::Url(e) => e.rejection_reason(),
+            Self::HasCredentials => Some(RegistryRejectionReason::HasCredentials),
+            Self::UndefinedEnvVar => Some(RegistryRejectionReason::UndefinedEnvVar),
+            Self::EncryptedPasswordUnsupported => {
+                Some(RegistryRejectionReason::EncryptedCredentialUnsupported)
+            }
+            Self::Disabled | Self::UnsupportedProtocolVersion(_) | Self::LocalFeedUnsupported => {
+                None
+            }
         }
     }
 }
@@ -735,6 +797,69 @@ impl NuGetConfig {
                 })
             })
             .take(MAX_BLOCKED_SOURCES_PER_PLAIN_CHAIN)
+            .collect()
+    }
+
+    /// Mirrors [`Self::blocked_class_for`]'s exact branching (mapping first, plain chain
+    /// otherwise), but reports every source `package` would have used that was rejected for a
+    /// reason other than a policy-blocked host (#1442, following #1438's npm/PyPI/Go wiring) —
+    /// an invalid URL, a non-https scheme, embedded userinfo, or an unresolvable/encrypted
+    /// credential (see [`RegistryRejectionClassifier for
+    /// NuGetFeedUrlError`](NuGetFeedUrlError)'s own doc for which variants classify). The two
+    /// methods are disjoint per entry: [`InvalidEntry`]'s `blocked_class` and `rejection_reason`
+    /// never both return `Some` for the same error, and a
+    /// `Disabled`/`UnsupportedProtocolVersion`/`LocalFeedUnsupported` entry returns `None` from
+    /// both, so no source is ever double-reported and no deliberately-quiet rejection is
+    /// promoted to a diagnostic.
+    ///
+    /// Same declaration-key format, same per-dependency cap
+    /// (`MAX_REJECTED_SOURCES_PER_PLAIN_CHAIN`), and the same fan-out reasoning as
+    /// [`Self::blocked_class_for`] — see that method's doc.
+    ///
+    // TODO(critic #1442 M4, deferred): the mapping branch below reports nothing for a package
+    // mapped only to a `UnsupportedProtocolVersion`/`LocalFeedUnsupported` source, unlike the
+    // plain chain where that silence is deliberate fan-out avoidance — a mapping match is
+    // already a single, low-noise signal, so this is a real (if minor, deferred) gap.
+    #[must_use]
+    pub fn rejected_reason_for(&self, package: &PackageName) -> Vec<RejectedSourceClass> {
+        if !self.mapping.is_empty() {
+            let name_lower = package.as_str().to_lowercase();
+            let Some(keys) = self.mapping.resolve_keys_for(&name_lower) else {
+                return Vec::new();
+            };
+            return keys
+                .iter()
+                .find_map(|key| {
+                    let entry = resolve_mapping_source_key(key, &self.sources)?;
+                    let (reason, raw_value) = entry
+                        .value
+                        .as_ref()
+                        .err()
+                        .and_then(InvalidEntry::rejection_reason)?;
+                    Some(RejectedSourceClass {
+                        reason,
+                        raw_value,
+                        declaration_key: format!("source:{}", entry.key),
+                    })
+                })
+                .into_iter()
+                .collect();
+        }
+        self.sources
+            .iter()
+            .filter_map(|entry| {
+                let (reason, raw_value) = entry
+                    .value
+                    .as_ref()
+                    .err()
+                    .and_then(InvalidEntry::rejection_reason)?;
+                Some(RejectedSourceClass {
+                    reason,
+                    raw_value,
+                    declaration_key: format!("source:{}", entry.key),
+                })
+            })
+            .take(MAX_REJECTED_SOURCES_PER_PLAIN_CHAIN)
             .collect()
     }
 
@@ -1808,13 +1933,15 @@ fn bind_credentials_and_finalize(
 /// Why a source failed closed during the C2 credential-binding pass — logging-only detail,
 /// deliberately separate from [`NuGetFeedUrlError`] (issue #576 S1 follow-up, impl-critic).
 ///
-/// Several structurally different C2 sub-conditions all resolve to the same
-/// [`NuGetFeedUrlError::HasCredentials`] reason (by design — it stays the single, hover/
-/// diagnostic-safe, user-facing error), so logging `reason` alone makes issue #576's own repro
-/// (a user-profile `<packageSourceCredentials>` entry with no matching same-file
-/// `<packageSources><add>`, condition (2)) byte-identical in the log to an unrelated cause like
-/// a plain repo-tier `<packageSourceCredentials>` declaration. This enum exists only to break
-/// that tie in `fail_closed`'s log line.
+/// Conditions (0)-(3) all resolve to the same [`NuGetFeedUrlError::HasCredentials`] reason (by
+/// design — a binding-shape failure has no more specific classification), so logging `reason`
+/// alone makes issue #576's own repro (a user-profile `<packageSourceCredentials>` entry with
+/// no matching same-file `<packageSources><add>`, condition (2)) byte-identical in the log to
+/// an unrelated cause like a plain repo-tier `<packageSourceCredentials>` declaration.
+/// `CredentialExpansionFailed` is the one cause that does *not* collapse this way — since #1442
+/// code review S2 it can itself resolve to three distinct reasons (see its own doc) — but still
+/// shares this enum's `cause`-based log disambiguation for consistency. This enum exists only
+/// to break the reason-collision tie in `fail_closed`'s log line.
 #[derive(Debug, Clone, Copy, Hash)]
 enum FailClosedCause {
     /// FR-004: the source itself is named under a repo-tier `<packageSourceCredentials>`.
@@ -1915,8 +2042,12 @@ fn fail_closed(
 /// all (nothing to bind, not an error — the caller decides separately whether that's fine).
 /// Returns `Some(Err((reason, cause)))` when a credential key matched but conditions (0)-(3)
 /// failed, or the matched credential itself failed to expand (unset `%ENV_VAR%`,
-/// DPAPI-encrypted) — `cause` is a logging-only detail (see [`FailClosedCause`]), never part of
-/// the user-facing `reason`. Returns `Some(Ok(auth))` on a successful bind.
+/// DPAPI-encrypted) — `cause` is a logging-only detail (see [`FailClosedCause`]); `reason` is
+/// the user-facing classification, distinct per failure mode since #1442 code review S2 (a
+/// mismatched/missing binding stays `HasCredentials`, an unset `%ENV_VAR%` is
+/// [`NuGetFeedUrlError::UndefinedEnvVar`], DPAPI encryption is
+/// [`NuGetFeedUrlError::EncryptedPasswordUnsupported`]). Returns `Some(Ok(auth))` on a
+/// successful bind.
 fn bind_user_profile_credential(
     entry: &PackageSourceEntry,
     user_credentials: &[TieredCredential],
@@ -1992,9 +2123,11 @@ fn expand_credential(cred: &TieredCredential) -> Result<NuGetAuth, NuGetFeedUrlE
 /// regression routing a project-tier credential into [`AccumulatedConfig::user_credentials`]
 /// (defense in depth; the primary layer is [`accumulate_config_tiers`] itself never collecting
 /// a repo-tier file's credentials in the first place). A DPAPI-encrypted `<Password>` fails
-/// closed as [`NuGetFeedUrlError::EncryptedPasswordUnsupported`]; a missing `ClearTextPassword`,
-/// or any referenced environment variable being unset, fails closed as
-/// [`NuGetFeedUrlError::HasCredentials`].
+/// closed as [`NuGetFeedUrlError::EncryptedPasswordUnsupported`]; a missing `ClearTextPassword`
+/// fails closed as [`NuGetFeedUrlError::HasCredentials`]; a referenced environment variable
+/// being unset fails closed as [`NuGetFeedUrlError::UndefinedEnvVar`] (#1442 code review S2 —
+/// kept distinct from `HasCredentials` so the rendered diagnostic names the actual actionable
+/// cause).
 fn expand_credential_with(
     cred: &TieredCredential,
     lookup: impl Fn(&str) -> Option<Zeroizing<String>>,
@@ -2028,19 +2161,32 @@ fn expand_credential_with(
 }
 
 /// Expands every `%NAME%` reference in `raw` (via
-/// [`deps_core::config_trust::expand_env_vars`]) and maps its error into
-/// [`NuGetFeedUrlError::HasCredentials`] — both
-/// [`deps_core::config_trust::EnvExpansionError`] variants (an unset variable, or a
-/// project-tier value carrying a placeholder) fail closed identically here; unlike deps-npm,
-/// this crate's existing fail-closed shape never surfaced the undefined variable's name, so
-/// none is added now either.
+/// [`deps_core::config_trust::expand_env_vars`]) and maps its error into the matching
+/// [`NuGetFeedUrlError`] variant — [`config_trust::EnvExpansionError::UndefinedVar`] maps to
+/// [`NuGetFeedUrlError::UndefinedEnvVar`] and [`config_trust::EnvExpansionError::NotAllowedInProjectTier`]
+/// maps to [`NuGetFeedUrlError::HasCredentials`] (matching this crate's existing project-tier
+/// fail-closed semantics). Deliberately discards `UndefinedVar`'s `name` field rather than
+/// plumbing it through (#1442 code review S3): that name is sliced directly out of the
+/// credential's own cleartext value, so a plain password merely shaped like a placeholder
+/// (e.g. `Ab%x9Q%z`) would otherwise leak a secret fragment into `fail_closed`'s
+/// `warn!(%reason)` log line via `NuGetFeedUrlError::UndefinedEnvVar`'s `#[error]` Display —
+/// unlike deps-npm, which validates `${VAR}` syntax against real placeholder declarations
+/// rather than incidental text in a password.
 fn expand_env_vars(
     raw: &str,
     tier: ConfigTier,
     lookup: &impl Fn(&str) -> Option<Zeroizing<String>>,
 ) -> Result<Zeroizing<String>, NuGetFeedUrlError> {
-    config_trust::expand_env_vars(raw, EnvVarSyntax::Windows, tier, lookup)
-        .map_err(|_| NuGetFeedUrlError::HasCredentials)
+    config_trust::expand_env_vars(raw, EnvVarSyntax::Windows, tier, lookup).map_err(|error| {
+        match error {
+            config_trust::EnvExpansionError::UndefinedVar { .. } => {
+                NuGetFeedUrlError::UndefinedEnvVar
+            }
+            config_trust::EnvExpansionError::NotAllowedInProjectTier => {
+                NuGetFeedUrlError::HasCredentials
+            }
+        }
+    })
 }
 
 #[cfg(test)]
@@ -2065,6 +2211,13 @@ mod tests {
     /// tests below care about a single blocked source; `#965`'s own tests assert on the full
     /// `Vec` directly instead.
     fn only_blocked(occurrences: Vec<BlockedSourceClass>, msg: &str) -> BlockedSourceClass {
+        let mut occurrences = occurrences;
+        assert_eq!(occurrences.len(), 1, "{msg}");
+        occurrences.remove(0)
+    }
+
+    /// [`only_blocked`]'s counterpart for [`NuGetConfig::rejected_reason_for`] (#1442).
+    fn only_rejected(occurrences: Vec<RejectedSourceClass>, msg: &str) -> RejectedSourceClass {
         let mut occurrences = occurrences;
         assert_eq!(occurrences.len(), 1, "{msg}");
         occurrences.remove(0)
@@ -2837,6 +2990,333 @@ mod tests {
             "a disabled source must classify as Disabled, not BlockedHost, even though its \
              declared URL is separately policy-blocked"
         );
+    }
+
+    /// #1442: previously an invalid, non-`BlockedHost` `<add>` source (non-https here) had no
+    /// diagnostic equivalent at all — `blocked_class_for` only ever reports `BlockedHost`, and
+    /// `rejected_reason_for` did not exist yet, so the dependency's source silently vanished
+    /// with only a `tracing::warn!`.
+    #[test]
+    fn test_rejected_reason_for_plain_chain_non_https() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration><packageSources>
+                <add key="Insecure" value="http://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("Any.Package")),
+            "non-https entry must be reported",
+        );
+        assert_eq!(occurrence.reason, RegistryRejectionReason::NotHttps);
+        assert_eq!(occurrence.raw_value, "http://corp.example/v3/index.json");
+        assert_eq!(occurrence.declaration_key, "source:Insecure");
+        assert!(
+            config.blocked_class_for(&pkg("Any.Package")).is_empty(),
+            "a non-blocked-host rejection must never also report via blocked_class_for"
+        );
+    }
+
+    /// #1442: mirrors [`test_rejected_reason_for_plain_chain_non_https`] for embedded userinfo,
+    /// and additionally exercises the `<packageSourceMapping>` branch (unlike the plain-chain
+    /// case above), matching [`Self::blocked_class_for`]'s own mapping-branch tests.
+    #[test]
+    fn test_rejected_reason_for_mapping_user_info_present() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Corp" value="https://user:pass@corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="Corp">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("MyCompany.Internal")),
+            "userinfo entry must be reported through the mapping branch",
+        );
+        assert_eq!(occurrence.reason, RegistryRejectionReason::UserInfoPresent);
+        assert_eq!(occurrence.declaration_key, "source:Corp");
+    }
+
+    /// #1442 code review finding #2: `rejected_reason_for`'s mapping branch uses `find_map`
+    /// over every key in the resolved match group — this proves it classifies *per key*,
+    /// continuing past a deliberately-quiet earlier key to an actionable later one, rather than
+    /// stopping at the first *matched source* (declared entry) regardless of its classification.
+    /// `Legacy` (first key, `protocolVersion="2"`, deliberately quiet — see
+    /// `RegistryRejectionClassifier for NuGetFeedUrlError`'s doc) must not shadow `Insecure`
+    /// (second key, non-https, actionable).
+    #[test]
+    fn test_rejected_reason_for_mapping_later_key_not_shadowed_by_earlier_quiet_key() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Legacy" value="https://corp.example/v2/index.json" protocolVersion="2" />
+                    <add key="Insecure" value="http://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="Legacy">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                    <packageSource key="Insecure">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("MyCompany.Internal")),
+            "the later key's actionable rejection must surface despite an earlier quiet key \
+             in the same match group",
+        );
+        assert_eq!(occurrence.reason, RegistryRejectionReason::NotHttps);
+        assert_eq!(occurrence.declaration_key, "source:Insecure");
+    }
+
+    /// #1442: a source named under `<packageSourceCredentials>` is dropped fail-closed as
+    /// [`NuGetFeedUrlError::HasCredentials`] — unlike `Disabled`/`UnsupportedProtocolVersion`/
+    /// `LocalFeedUnsupported`/`EncryptedPasswordUnsupported`, this is treated as a genuine,
+    /// actionable misconfiguration (it already logs at `warn!` in `fail_closed`), so it must
+    /// classify here too, not join the deliberately-quiet variants.
+    #[test]
+    fn test_rejected_reason_for_has_credentials() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Corp Feed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <Corp_x0020_Feed>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="pass" />
+                    </Corp_x0020_Feed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("Any.Package")),
+            "credentialed source must be reported",
+        );
+        assert_eq!(occurrence.reason, RegistryRejectionReason::HasCredentials);
+        assert_eq!(occurrence.declaration_key, "source:Corp Feed");
+    }
+
+    /// #1442: `UnsupportedProtocolVersion` and `LocalFeedUnsupported` are deliberate, expected
+    /// config states this module already logs at `debug!` rather than `warn!` (an
+    /// unsupported-but-legitimate shape, per `resolve_source_entry`'s own doc) —
+    /// `rejected_reason_for` must stay empty for them, or a routine `protocolVersion="2"`/
+    /// local-feed setup would suddenly gain a noisy editor diagnostic for behavior that was
+    /// never a misconfiguration.
+    #[test]
+    fn test_rejected_reason_for_unsupported_shapes_not_reported() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration><packageSources>
+                <add key="Legacy" value="https://corp.example/v2/index.json" protocolVersion="2" />
+                <add key="Local" value="../packages" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        assert!(
+            config.rejected_reason_for(&pkg("Any.Package")).is_empty(),
+            "deliberately-quiet rejection reasons must never surface a diagnostic"
+        );
+    }
+
+    /// #1442: mirrors [`test_blocked_class_for_s3_disabled_wins_over_blocked_host`] — `Disabled`
+    /// is likewise a deliberate, expected config state (the user's own explicit opt-out), so it
+    /// must not surface via `rejected_reason_for` either.
+    #[test]
+    fn test_rejected_reason_for_disabled_not_reported() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Corp" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <disabledPackageSources>
+                    <add key="Corp" value="true" />
+                </disabledPackageSources>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        assert!(
+            config.rejected_reason_for(&pkg("Any.Package")).is_empty(),
+            "a disabled source must never surface a rejected-registry diagnostic"
+        );
+    }
+
+    /// #1442 code review S1: unlike `Disabled`/`UnsupportedProtocolVersion`/
+    /// `LocalFeedUnsupported`, a DPAPI-encrypted `<Password>` is the *default* outcome of
+    /// `dotnet nuget add source -u -p` on Windows — the most common private-feed setup — so it
+    /// must classify, not join the deliberately-quiet variants (mirrors
+    /// [`test_dpapi_encrypted_password_rejected_distinctly`]'s fixture, one layer up at
+    /// `rejected_reason_for`).
+    #[test]
+    fn test_rejected_reason_for_encrypted_password() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="Password" value="AQAAANCM...encrypted..." />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("Any.Package")),
+            "a DPAPI-encrypted credential must be reported, not silently dropped",
+        );
+        assert_eq!(
+            occurrence.reason,
+            RegistryRejectionReason::EncryptedCredentialUnsupported
+        );
+        assert_eq!(occurrence.declaration_key, "source:CorpFeed");
+    }
+
+    /// #1442 code review S2: an unset `%ENV_VAR%` inside a matched user-profile credential must
+    /// classify as `UndefinedEnvVar`, not the generic `HasCredentials` — the previous mapping
+    /// made the rendered diagnostic claim the credential is "never read" when in fact it *was*
+    /// read and an actionable, specific cause (the unset variable) was available.
+    #[test]
+    fn test_rejected_reason_for_undefined_env_var_in_credential() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="%NUGET_1442_UNDEFINED_TEST_VAR%" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("Any.Package")),
+            "an unset %ENV_VAR% in a credential must be reported",
+        );
+        assert_eq!(occurrence.reason, RegistryRejectionReason::UndefinedEnvVar);
+        assert_eq!(occurrence.declaration_key, "source:CorpFeed");
+    }
+
+    /// #1442 code review M3: `HasCredentials` must still classify for a genuine C2
+    /// credential-binding failure (URL mismatch between the repo-declared source and the
+    /// matched user-profile entry, per condition (3)) — previously only the simpler
+    /// repo-tier-`<packageSourceCredentials>` shape ([`test_rejected_reason_for_has_credentials`])
+    /// was covered at this level. Mirrors [`test_c2_same_origin_different_path_fails_closed`]'s
+    /// fixture, one layer up at `rejected_reason_for`.
+    #[test]
+    fn test_rejected_reason_for_has_credentials_from_binding_mismatch() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let user_profile = write_user_profile(
+            root.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="CorpFeed" value="https://pkgs.dev.azure.com/real-org/_packaging/x/nuget/v3/index.json" />
+                </packageSources>
+                <packageSourceCredentials>
+                    <CorpFeed>
+                        <add key="Username" value="user" />
+                        <add key="ClearTextPassword" value="pat" />
+                    </CorpFeed>
+                </packageSourceCredentials>
+            </configuration>"#,
+        );
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="CorpFeed" value="https://pkgs.dev.azure.com/attacker-org/_packaging/x/nuget/v3/index.json" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_ctx(&repo, &cache, &policy, Some(&user_profile), false);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("Any.Package")),
+            "a C2 URL-mismatch binding failure must be reported",
+        );
+        assert_eq!(occurrence.reason, RegistryRejectionReason::HasCredentials);
+        assert_eq!(occurrence.declaration_key, "source:CorpFeed");
     }
 
     /// #944 S1 regression: when a mapping match group resolves to *multiple* keys (two
@@ -3878,7 +4358,9 @@ mod tests {
     // `%ENV_VAR%` expansion itself is now covered by `deps_core::config_trust`'s own test
     // suite — see that module for the Windows-syntax vectors this crate's
     // `expand_env_vars`/`expand_env_vars_with` used to pin directly. `expand_credential_with`'s
-    // own tier-gate tests below cover the credential-binding-specific behavior.
+    // own tier-gate tests below cover the credential-binding-specific behavior, including the
+    // `UndefinedEnvVar`-vs-`HasCredentials` split
+    // (`test_expand_credential_user_tier_unset_env_var_fails_closed`, #1442 code review S2).
 
     /// SC-002 end-to-end: the same expansion wired through `resolve`'s credential-binding
     /// pass — a credential whose `RawCredential` has no `password` (the shape an unset env
@@ -4045,9 +4527,12 @@ mod tests {
     }
 
     /// SC-002 (impl-critic M4): a `User`-tagged credential referencing an unset `%VAR%`
-    /// password still fails closed as `HasCredentials`, the counterpart to
+    /// password still fails closed, the counterpart to
     /// `test_expand_credential_user_tier_still_expands_env_var_password` above — the tier
     /// gate passes, but expansion itself still fails for the same reason it always did.
+    /// Classifies as `UndefinedEnvVar`, not `HasCredentials` (#1442 code review S2): unlike the
+    /// project-tier gate above (a categorical, never-attempted rejection), this is an
+    /// attempted-and-failed expansion with its own specific, actionable reason.
     #[test]
     fn test_expand_credential_user_tier_unset_env_var_fails_closed() {
         let credential = TieredCredential {
@@ -4061,7 +4546,7 @@ mod tests {
         };
         assert_matches!(
             expand_credential_with(&credential, |_| None),
-            Err(NuGetFeedUrlError::HasCredentials)
+            Err(NuGetFeedUrlError::UndefinedEnvVar)
         );
     }
 

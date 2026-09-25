@@ -3729,6 +3729,11 @@ mod tests {
                 RegistryRejectionReason::EnvVarExpansionNotPermitted,
                 "environment-variable expansion",
             ),
+            (RegistryRejectionReason::HasCredentials, "cannot be used"),
+            (
+                RegistryRejectionReason::EncryptedCredentialUnsupported,
+                "encrypted credential",
+            ),
         ] {
             let rejected_diagnostic =
                 rejected_diagnostic_for("top-level", "https://example.com", reason);

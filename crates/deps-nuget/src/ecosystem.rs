@@ -231,6 +231,15 @@ impl Ecosystem for NuGetEcosystem {
                         .blocked_registries
                         .push(classification.into_occurrence(dep.name_range));
                 }
+                // #1442: mirrors the loop above for every rejection reason other than a
+                // policy-blocked host — `blocked_class_for`/`rejected_reason_for` are disjoint
+                // per source (see `NuGetConfig::rejected_reason_for`'s doc), so this never
+                // double-reports a source the loop above already classified.
+                for classification in config.rejected_reason_for(&dep.name) {
+                    result
+                        .rejected_registries
+                        .push(classification.into_occurrence(dep.name_range));
+                }
             }
             result.resolved_chains = config.resolved_chains();
             for chain in &result.resolved_chains {
@@ -733,6 +742,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -790,6 +800,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -817,6 +828,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -864,6 +876,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -915,6 +928,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -1004,6 +1018,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -1057,6 +1072,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 
@@ -1648,6 +1664,68 @@ mod tests {
         assert_eq!(occurrence.declaration_key, "source:Blocked");
     }
 
+    /// #1442 (mirrors [`test_parse_manifest_blocked_source_populates_blocked_registries`] for
+    /// every rejection reason other than a policy-blocked host): a `NuGet.Config` source
+    /// rejected for carrying embedded userinfo must populate `ParseResult::rejected_registries`
+    /// at the real `parse_manifest` call path — previously such a source vanished with only a
+    /// `tracing::warn!`, indistinguishable in the editor from a dependency simply not yet
+    /// checked.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_parse_manifest_rejected_source_populates_rejected_registries() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("NuGet.Config"),
+            r#"<configuration><packageSources>
+                <add key="Insecure" value="http://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+        )
+        .unwrap();
+        let manifest_path = dir.path().join("App.csproj");
+        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+        std::fs::write(&manifest_path, content).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+
+        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+            deps_core::net_policy::WorkspaceRegistryAccess::All,
+        ));
+        let context = crate::config::NuGetParseContext {
+            policy: Arc::clone(&policy),
+            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+            user_profile_config: None,
+            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        };
+        let eco = NuGetEcosystem::with_context(
+            Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
+            context,
+        );
+
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        let dep = parse_result
+            .dependencies()
+            .into_iter()
+            .find(|d| d.name().as_str() == "MyCompany.Internal")
+            .expect("dependency must be present");
+
+        let rejected = parse_result.rejected_registries();
+        assert_eq!(rejected.len(), 1);
+        let occurrence = &rejected[0];
+        assert_eq!(occurrence.range, dep.name_range());
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::NotHttps
+        );
+        assert_eq!(occurrence.raw_value, "http://corp.example/v3/index.json");
+        assert_eq!(occurrence.declaration_key, "source:Insecure");
+        assert!(
+            parse_result.blocked_registries().is_empty(),
+            "a non-blocked-host rejection must never also report via blocked_registries"
+        );
+    }
+
     /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve to
     /// a real ancestor directory for `NuGet.Config` discovery — same guard gap class as
     /// #1084/#1089's lock file fix, applied here to `parse_manifest`'s config lookup. Builds
@@ -2229,6 +2307,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
         let position = Position::new(0, 1);
@@ -2280,6 +2359,7 @@ mod tests {
             uri: deps_core::test_util::test_uri("/test/App.csproj"),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
         // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
