@@ -2,6 +2,7 @@ use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
+use deps_core::StabilityFloor;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
@@ -472,54 +473,55 @@ fn satisfies_caret(version: &str, req: &str) -> bool {
     true
 }
 
-/// Rank of a Composer stability keyword in `dev < alpha < beta < RC < stable` (matching
-/// Composer's `VersionParser` keyword aliases `a`/`b` for alpha/beta), matched
-/// case-insensitively. An empty word (no qualifier at all) ranks as `stable`, the top of the
-/// scale, and so does any unrecognized suffix word — this happens to agree with Composer for
-/// its own `stable`/`patch`/`pl`/`p` aliases (all release-equivalent), but is not a general
+/// Lenient, version-*qualifier* stability classification (matching Composer's `VersionParser`
+/// keyword aliases `a`/`b` for alpha/beta), matched case-insensitively. An empty word (no
+/// qualifier at all) classifies as [`StabilityFloor::Stable`], the top of the scale, and so
+/// does any unrecognized suffix word — this happens to agree with Composer for its own
+/// `stable`/`patch`/`pl`/`p` aliases (all release-equivalent), but is not a general
 /// unknown-qualifier rule: a truly unrecognized word is not otherwise a valid Composer
 /// stability suffix.
 ///
-/// `pub(crate)`: shared with `registry.rs`, which ranks a `composer.json` `minimum-stability`
-/// value and a per-dependency `@stability` flag word on this exact same scale (#424) — one
-/// ranking function for "what does this stability word mean" everywhere in the crate.
-pub(crate) const COMPOSER_STABLE_RANK: u8 = 4;
-
-pub(crate) fn composer_stability_rank(word: &str) -> u8 {
+/// Deliberately distinct from [`StabilityFloor`]'s own strict [`std::str::FromStr`] impl
+/// (#1444): a `minimum-stability` *config value* (or `@flag`) must reject an unrecognized
+/// word, but a version string's own qualifier suffix has always been classified leniently —
+/// this function preserves that unchanged behavior for `compare_versions`/
+/// `composer_version_stability`, while `registry.rs`'s config-facing paths go through
+/// [`StabilityFloor::from_str`] instead.
+fn qualifier_stability(word: &str) -> StabilityFloor {
     match word.to_ascii_lowercase().as_str() {
-        "dev" => 0,
-        "alpha" | "a" => 1,
-        "beta" | "b" => 2,
-        "rc" => 3,
-        _ => COMPOSER_STABLE_RANK,
+        "dev" => StabilityFloor::Dev,
+        "alpha" | "a" => StabilityFloor::Alpha,
+        "beta" | "b" => StabilityFloor::Beta,
+        "rc" => StabilityFloor::Rc,
+        _ => StabilityFloor::Stable,
     }
 }
 
-/// A version string's own Composer stability rank (`dev < alpha < beta < RC < stable`),
-/// reusing [`split_composer_core_and_suffix`]/[`parse_composer_qualifier`] — the same
+/// A version string's own Composer stability floor, reusing
+/// [`split_composer_core_and_suffix`]/[`parse_composer_qualifier`] — the same
 /// separator-optional qualifier parser `compare_versions` already relies on, so a
-/// separator-less suffix (`1.0.0RC1`) ranks identically to its hyphenated form
+/// separator-less suffix (`1.0.0RC1`) classifies identically to its hyphenated form
 /// (`1.0.0-RC1`) with no separate classification path to drift out of sync (#424 S3).
 ///
 /// `registry.rs` uses this instead of [`deps_core::Version::is_prerelease`] when filtering
-/// "latest version" candidates against an [`effective_minimum_stability_rank`]-computed
-/// floor: a boolean prerelease flag cannot express "beta or newer, but not alpha" the way a
+/// "latest version" candidates against an [`effective_minimum_stability`]-computed floor: a
+/// boolean prerelease flag cannot express "beta or newer, but not alpha" the way a
 /// `minimum-stability: beta` manifest setting requires.
 ///
 /// Strips a leading `v`/`V` before splitting — without this, `split_composer_core_and_suffix`
 /// finds its split point at that very first non-digit character, so a real candidate version
 /// like `v2.3.0-alpha.1` (Packagist tags are routinely `v`-prefixed, e.g. every `symfony/*`
-/// release) yields core `""` and qualifier word `"v"`, which `composer_stability_rank` cannot
-/// recognize and ranks as fully stable — silently reopening #422 for every `v`-prefixed
+/// release) yields core `""` and qualifier word `"v"`, which [`qualifier_stability`] cannot
+/// recognize and classifies as fully stable — silently reopening #422 for every `v`-prefixed
 /// prerelease (#424 critique C1). `version_satisfies_requirement`'s own operator branches
 /// already strip `v` before reaching `compare_versions`/`satisfies_caret`, so this is the only
 /// caller of `split_composer_core_and_suffix` that needed the same guard added directly.
 ///
-/// [`effective_minimum_stability_rank`]: crate::registry::effective_minimum_stability_rank
-pub(crate) fn composer_version_stability_rank(version: &str) -> u8 {
+/// [`effective_minimum_stability`]: crate::registry::effective_minimum_stability
+pub(crate) fn composer_version_stability(version: &str) -> StabilityFloor {
     let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
     let (_, suffix) = split_composer_core_and_suffix(version);
-    suffix.map_or(COMPOSER_STABLE_RANK, |s| parse_composer_qualifier(s).rank)
+    suffix.map_or(StabilityFloor::Stable, |s| parse_composer_qualifier(s).rank)
 }
 
 /// Splits a trailing Composer per-dependency stability flag (`@stable`, `@RC`, `@beta`,
@@ -535,34 +537,30 @@ pub(crate) fn composer_version_stability_rank(version: &str) -> u8 {
 /// before it would ever look at that garbled segment — every other operator (tilde,
 /// `>=`/`<=`, exact/partial) has no such fast path and silently never matches (#424).
 ///
-/// `pub(crate)`: also used by `registry.rs`'s [`effective_minimum_stability_rank`] to read
+/// `pub(crate)`: also used by `registry.rs`'s [`effective_minimum_stability`] to read
 /// the flag as a per-dependency stability opt-in, overriding both the concrete-requirement
 /// default and any manifest-level `minimum-stability`.
 ///
-/// [`effective_minimum_stability_rank`]: crate::registry::effective_minimum_stability_rank
+/// [`effective_minimum_stability`]: crate::registry::effective_minimum_stability
 // `at_idx` comes from `rfind('@')`, an ASCII byte, so both slice bounds are always char
 // boundaries.
 #[allow(clippy::string_slice)]
-pub(crate) fn strip_stability_flag(requirement: &str) -> (&str, Option<&str>) {
+pub(crate) fn strip_stability_flag(requirement: &str) -> (&str, Option<StabilityFloor>) {
     let Some(at_idx) = requirement.rfind('@') else {
         return (requirement, None);
     };
     let flag = &requirement[at_idx + 1..];
-    if matches!(
-        flag.to_ascii_lowercase().as_str(),
-        "stable" | "rc" | "beta" | "alpha" | "dev"
-    ) {
-        (&requirement[..at_idx], Some(flag))
-    } else {
-        (requirement, None)
+    match flag.parse::<StabilityFloor>() {
+        Ok(floor) => (&requirement[..at_idx], Some(floor)),
+        Err(_) => (requirement, None),
     }
 }
 
-/// A parsed Composer stability qualifier: a stability rank plus every numeric group in its
+/// A parsed Composer stability qualifier: a stability floor plus every numeric group in its
 /// suffix (Composer's modifier regex allows any number of them, e.g. `alpha1.5`), compared
 /// group by group so `beta10` outranks `beta2` and `alpha1.5` outranks `alpha1.2`.
 struct ComposerQualifier {
-    rank: u8,
+    rank: StabilityFloor,
     numeric: Vec<u64>,
 }
 
@@ -578,7 +576,7 @@ fn parse_composer_qualifier(suffix: &str) -> ComposerQualifier {
         .map(|s| s.parse().unwrap_or(0))
         .collect();
     ComposerQualifier {
-        rank: composer_stability_rank(word),
+        rank: qualifier_stability(word),
         numeric,
     }
 }
@@ -607,7 +605,7 @@ fn split_composer_core_and_suffix(version: &str) -> (&str, Option<&str>) {
 ///
 /// Compares the numeric-dot core segment by segment, then applies Composer's stability
 /// precedence to any qualifier suffix (`dev < alpha < beta < RC < stable`, see
-/// [`composer_stability_rank`]) — a qualified version always sorts below its unqualified
+/// [`qualifier_stability`]) — a qualified version always sorts below its unqualified
 /// counterpart, and two qualifiers of the same stability compare by their numeric suffix
 /// (e.g. `beta2` < `beta10`).
 fn compare_versions(a: &str, b: &str) -> i32 {
@@ -631,14 +629,14 @@ fn compare_versions(a: &str, b: &str) -> i32 {
 
     let a_q = a_suffix.map_or(
         ComposerQualifier {
-            rank: COMPOSER_STABLE_RANK,
+            rank: StabilityFloor::Stable,
             numeric: Vec::new(),
         },
         parse_composer_qualifier,
     );
     let b_q = b_suffix.map_or(
         ComposerQualifier {
-            rank: COMPOSER_STABLE_RANK,
+            rank: StabilityFloor::Stable,
             numeric: Vec::new(),
         },
         parse_composer_qualifier,
@@ -1045,12 +1043,30 @@ mod tests {
     /// case-insensitively and leaves an unrecognized trailing `@word` alone.
     #[test]
     fn test_strip_stability_flag_recognizes_known_words() {
-        assert_eq!(strip_stability_flag("^1.0@beta"), ("^1.0", Some("beta")));
-        assert_eq!(strip_stability_flag("^1.0@BETA"), ("^1.0", Some("BETA")));
-        assert_eq!(strip_stability_flag("1.0.*@dev"), ("1.0.*", Some("dev")));
-        assert_eq!(strip_stability_flag("2.0@RC"), ("2.0", Some("RC")));
-        assert_eq!(strip_stability_flag("2.0@alpha"), ("2.0", Some("alpha")));
-        assert_eq!(strip_stability_flag("2.0@stable"), ("2.0", Some("stable")));
+        assert_eq!(
+            strip_stability_flag("^1.0@beta"),
+            ("^1.0", Some(StabilityFloor::Beta))
+        );
+        assert_eq!(
+            strip_stability_flag("^1.0@BETA"),
+            ("^1.0", Some(StabilityFloor::Beta))
+        );
+        assert_eq!(
+            strip_stability_flag("1.0.*@dev"),
+            ("1.0.*", Some(StabilityFloor::Dev))
+        );
+        assert_eq!(
+            strip_stability_flag("2.0@RC"),
+            ("2.0", Some(StabilityFloor::Rc))
+        );
+        assert_eq!(
+            strip_stability_flag("2.0@alpha"),
+            ("2.0", Some(StabilityFloor::Alpha))
+        );
+        assert_eq!(
+            strip_stability_flag("2.0@stable"),
+            ("2.0", Some(StabilityFloor::Stable))
+        );
     }
 
     #[test]
@@ -1080,38 +1096,41 @@ mod tests {
         assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.2"), "~1.2.3@beta"));
     }
 
-    /// #424: `composer_version_stability_rank` ranks a version's own qualifier on the same
-    /// `dev < alpha < beta < RC < stable` scale as `composer_stability_rank`, agreeing with
+    /// #424: `composer_version_stability` classifies a version's own qualifier on the same
+    /// `dev < alpha < beta < RC < stable` scale as [`qualifier_stability`], agreeing with
     /// `compare_versions`'s qualifier ordering (`test_compare_versions_qualifier_ordering`).
     #[test]
-    fn test_composer_version_stability_rank_orders_qualifiers() {
-        assert_eq!(composer_version_stability_rank("1.0.0-dev"), 0);
-        assert_eq!(composer_version_stability_rank("1.0.0-alpha1"), 1);
-        assert_eq!(composer_version_stability_rank("1.0.0-beta1"), 2);
-        assert_eq!(composer_version_stability_rank("1.0.0-RC1"), 3);
+    fn test_composer_version_stability_orders_qualifiers() {
+        assert_eq!(composer_version_stability("1.0.0-dev"), StabilityFloor::Dev);
         assert_eq!(
-            composer_version_stability_rank("1.0.0"),
-            COMPOSER_STABLE_RANK
+            composer_version_stability("1.0.0-alpha1"),
+            StabilityFloor::Alpha
         );
+        assert_eq!(
+            composer_version_stability("1.0.0-beta1"),
+            StabilityFloor::Beta
+        );
+        assert_eq!(composer_version_stability("1.0.0-RC1"), StabilityFloor::Rc);
+        assert_eq!(composer_version_stability("1.0.0"), StabilityFloor::Stable);
     }
 
-    /// #424 S3: a separator-less suffix ranks identically to its hyphenated form — the same
-    /// qualifier parser (`split_composer_core_and_suffix`) backs both.
+    /// #424 S3: a separator-less suffix classifies identically to its hyphenated form — the
+    /// same qualifier parser (`split_composer_core_and_suffix`) backs both.
     #[test]
-    fn test_composer_version_stability_rank_separatorless_suffix() {
+    fn test_composer_version_stability_separatorless_suffix() {
         assert_eq!(
-            composer_version_stability_rank("2.0.0RC1"),
-            composer_version_stability_rank("2.0.0-RC1"),
+            composer_version_stability("2.0.0RC1"),
+            composer_version_stability("2.0.0-RC1"),
         );
     }
 
     /// #424 critique C1 (CRITICAL regression): a `v`-prefixed prerelease (e.g. every
-    /// `symfony/*`/`sylius/sylius` release) must still rank below `COMPOSER_STABLE_RANK` —
+    /// `symfony/*`/`sylius/sylius` release) must still rank below `StabilityFloor::Stable` —
     /// before the fix, the leading `v`/`V` was consumed as the qualifier "word" itself,
-    /// which `composer_stability_rank` cannot recognize and silently ranks as stable,
-    /// reopening #422 for any package whose newest release is `v`-prefixed.
+    /// which the classifier cannot recognize and silently ranks as stable, reopening #422 for
+    /// any package whose newest release is `v`-prefixed.
     #[test]
-    fn test_composer_version_stability_rank_strips_v_prefix() {
+    fn test_composer_version_stability_strips_v_prefix() {
         for prerelease in [
             "v2.3.0-alpha.1",
             "v6.0.0-BETA1",
@@ -1119,7 +1138,7 @@ mod tests {
             "V3.0.0-RC1",
         ] {
             assert!(
-                composer_version_stability_rank(prerelease) < COMPOSER_STABLE_RANK,
+                composer_version_stability(prerelease) < StabilityFloor::Stable,
                 "{prerelease:?} must rank below stable, not be swallowed as an unrecognized qualifier word"
             );
         }
@@ -1129,15 +1148,11 @@ mod tests {
     /// (or plain) stable release of the same series, matching the real Packagist ordering
     /// `sylius/sylius`'s `v2.3.0-alpha.1` vs. `v2.2.8` regressed on.
     #[test]
-    fn test_composer_version_stability_rank_v_prefixed_prerelease_below_stable() {
+    fn test_composer_version_stability_v_prefixed_prerelease_below_stable() {
         assert!(
-            composer_version_stability_rank("v2.3.0-alpha.1")
-                < composer_version_stability_rank("v2.2.8")
+            composer_version_stability("v2.3.0-alpha.1") < composer_version_stability("v2.2.8")
         );
-        assert!(
-            composer_version_stability_rank("v2.3.0-alpha.1")
-                < composer_version_stability_rank("2.3.0")
-        );
+        assert!(composer_version_stability("v2.3.0-alpha.1") < composer_version_stability("2.3.0"));
     }
 
     /// Regression test for impl-critic S1: a `v`-prefixed literal on the plain
@@ -1660,7 +1675,7 @@ mod tests {
         let corrupted_result = crate::parser::ComposerParseResult {
             dependencies: vec![corrupted_dep],
             uri: uri.clone(),
-            minimum_stability: None,
+            minimum_stability: crate::parser::MinimumStability::Absent,
             dependency_truncation: None,
         };
         let actions = deps_core::lsp_helpers::generate_code_actions(
@@ -1750,6 +1765,7 @@ mod tests {
             &'a self,
             _name: &'a PackageName,
             _req: &'a VersionReq,
+            _selection_context: &'a deps_core::SelectionContext,
         ) -> deps_core::ecosystem::BoxFuture<
             'a,
             deps_core::Result<Option<Box<dyn deps_core::Version>>>,

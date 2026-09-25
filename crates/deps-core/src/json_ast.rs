@@ -142,6 +142,46 @@ impl<'a> JsonAst<'a> {
         }
         Some(JsonSection { by_name })
     }
+
+    /// Looks up a **root-level** (not nested inside a section) property's own
+    /// `(name_range, value_range)` LSP position pair — the same shape
+    /// [`JsonSection::position`] returns, but for a top-level scalar field like Composer's
+    /// `minimum-stability` rather than a `dependencies`-style map of entries.
+    ///
+    /// Last-key-wins, matching `serde_json`'s own duplicate-key resolution (see
+    /// [`find_last_prop`]). `value_range` is `Some` only when the property's value is itself a
+    /// plain string literal, `None` for any other JSON value shape (number, bool, null,
+    /// object, array).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::json_ast::JsonAst;
+    /// use deps_core::lsp_helpers::LineOffsetTable;
+    ///
+    /// let content = r#"{"minimum-stability": "beta"}"#;
+    /// let table = LineOffsetTable::new(content);
+    /// let ast = JsonAst::parse(content).unwrap();
+    ///
+    /// let (name_range, value_range) = ast
+    ///     .root_property_position("minimum-stability", content, &table)
+    ///     .unwrap();
+    /// let name_start = content.find("minimum-stability").unwrap() as u32;
+    /// assert_eq!(name_range.start.character, name_start);
+    /// assert!(value_range.is_some());
+    ///
+    /// assert!(ast.root_property_position("missing", content, &table).is_none());
+    /// ```
+    #[must_use]
+    pub fn root_property_position(
+        &self,
+        key: &str,
+        content: &str,
+        table: &LineOffsetTable,
+    ) -> Option<(Range, Option<Range>)> {
+        let prop = find_last_prop(&self.root, key)?;
+        Some(dependency_position(content, table, prop))
+    }
 }
 
 /// One top-level section's direct properties, indexed by name.

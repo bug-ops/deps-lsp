@@ -325,6 +325,7 @@ impl deps_core::Registry for SwiftRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
@@ -360,6 +361,7 @@ impl deps_core::Registry for SwiftRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        _selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
         if deps_core::is_existence_wildcard(req) {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());

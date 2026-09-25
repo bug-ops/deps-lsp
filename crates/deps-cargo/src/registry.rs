@@ -284,7 +284,12 @@ impl deps_core::Registry for CratesIoRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         Box::pin(async move {
             let version = self
                 .get_latest_matching(name.as_str(), req.as_str())
@@ -297,7 +302,12 @@ impl deps_core::Registry for CratesIoRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         select_latest_matching_impl(versions, req)
     }
 
@@ -335,7 +345,12 @@ impl deps_core::Registry for SparseIndexClient {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         Box::pin(async move {
             let version = self
                 .get_latest_matching(name.as_str(), req.as_str())
@@ -348,7 +363,12 @@ impl deps_core::Registry for SparseIndexClient {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         select_latest_matching_impl(versions, req)
     }
 
@@ -635,22 +655,9 @@ impl deps_core::Registry for CargoRegistry {
         &'a self,
         name: &'a PackageName,
         req: &'a deps_core::VersionReq,
-    ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
-        deps_core::Registry::get_latest_matching(&self.crates_io, name, req)
-    }
-
-    fn get_latest_matching_with_context<'a>(
-        &'a self,
-        name: &'a PackageName,
-        req: &'a deps_core::VersionReq,
         selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
-        deps_core::Registry::get_latest_matching_with_context(
-            &self.crates_io,
-            name,
-            req,
-            selection_context,
-        )
+        deps_core::Registry::get_latest_matching(&self.crates_io, name, req, selection_context)
     }
 
     fn get_latest_matching_from<'a>(
@@ -672,6 +679,7 @@ impl deps_core::Registry for CargoRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        _selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
         select_latest_matching_impl(versions, req)
     }
@@ -862,7 +870,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -886,7 +897,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -968,6 +982,46 @@ mod tests {
             .expect("an unregistered mirror must fall back to crates.io, not error");
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].num, "1.0.0");
+        mock.assert_async().await;
+    }
+
+    /// #1444 M2/M3: `CargoRegistry::get_latest_matching` must forward the caller's own
+    /// `SelectionContext` to `crates_io`'s own trait method, not silently substitute a fresh
+    /// `SelectionContext::none()` — a regression invisible to every other assertion, since
+    /// Cargo never reads `minimum_stability` itself. Uses
+    /// [`deps_core::test_util::SelectionContextCapture`], which `CratesIoRegistry::get_latest_matching`
+    /// records into under `#[cfg(test)]`.
+    #[tokio::test]
+    async fn test_get_latest_matching_forwards_selection_context_to_crates_io() {
+        use deps_core::test_util::SelectionContextCapture;
+        use deps_core::{Registry, SelectionContext, StabilityFloor};
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/se/rd/serde")
+            .with_status(200)
+            .with_body(r#"{"name":"serde","vers":"1.0.0","yanked":false,"features":{},"deps":[]}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = cargo_registry_with_mocked_crates_io(&server.url(), cache);
+
+        let name = PackageName::new("serde");
+        let req = deps_core::VersionReq::new("*");
+        let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
+        SelectionContextCapture::reset();
+        let _ = registry
+            .get_latest_matching(&name, &req, &sentinel)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SelectionContextCapture::last(),
+            Some(sentinel),
+            "get_latest_matching must forward the caller's SelectionContext to crates_io, not \
+             a fresh SelectionContext::none()"
+        );
         mock.assert_async().await;
     }
 

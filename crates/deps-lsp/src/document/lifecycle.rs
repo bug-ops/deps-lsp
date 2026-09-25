@@ -1093,13 +1093,6 @@ async fn run_document_change_task(
         )
     });
 
-    // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
-    // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty
-    // and this early-return skips the fetch — existing dependencies keep their
-    // `cached_versions` computed under the *previous* stability floor until the document
-    // is closed and reopened. Not fixed here: doing so would mean treating a
-    // `minimum_stability` change as its own full-refetch trigger in the diff above, a
-    // separate concern from #424's parse+thread scope.
     if deps_to_fetch.is_empty() {
         tracing::debug!("no added or version-changed dependencies, skipping registry fetch");
 
@@ -2155,6 +2148,7 @@ mod tests {
                 &'a self,
                 _name: &'a PackageName,
                 _req: &'a VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>> {
                 Box::pin(async move {
                     let now = self.current.fetch_add(1, Ordering::SeqCst) + 1;

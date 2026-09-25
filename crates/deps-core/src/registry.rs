@@ -120,7 +120,7 @@ type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>
 ///         Box::pin(async move { Ok(vec![Box::new(MyVersion { version: "1.0.0".into() }) as Box<dyn Version>]) })
 ///     }
 ///
-///     fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq)
+///     fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq, _selection_context: &'a deps_core::SelectionContext)
 ///         -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Option<Box<dyn Version>>>> + Send + 'a>>
 ///     {
 ///         Box::pin(async move { Ok(None) })
@@ -220,10 +220,23 @@ pub trait Registry: Send + Sync {
     /// fetch loop actually goes through first); the exception never applies to a concrete
     /// requirement.
     ///
+    /// `selection_context` is the caller's [`crate::SelectionContext`] — opaque and
+    /// ecosystem-owned (see that type's own doc), mirroring [`get_versions_with`](Self::get_versions_with)'s
+    /// [`FreshnessSettings`](crate::freshness::FreshnessSettings) precedent for "an optional
+    /// extra parameter most registries ignore"; only the one registry that understands its
+    /// contents (`PackagistRegistry`, via [`crate::SelectionContext::minimum_stability`])
+    /// overrides this method to read it — every other registry ignores it. A caller with no
+    /// ecosystem-specific manifest state to thread passes [`crate::SelectionContext::none()`]
+    /// explicitly (#1444: this parameter is required, not defaulted, so skipping it is always
+    /// a visible, reviewable choice at the call site rather than an easy-to-forget separate
+    /// method name).
+    ///
     /// # Arguments
     ///
     /// * `name` - Package name
     /// * `req` - Version requirement string (e.g., "^1.0", ">=2.0")
+    /// * `selection_context` - Manifest-scoped selection state; [`crate::SelectionContext::none()`]
+    ///   when the caller has none
     ///
     /// # Returns
     ///
@@ -234,45 +247,21 @@ pub trait Registry: Send + Sync {
         &'a self,
         name: &'a PackageName,
         req: &'a VersionReq,
+        selection_context: &'a crate::SelectionContext,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>>;
 
-    /// Like [`get_latest_matching`](Self::get_latest_matching), but lets a registry whose
-    /// "latest matching" selection can be refined by ecosystem-specific manifest state (e.g.
-    /// Composer's `minimum-stability` field, #424/#1433) read it, alongside `req`.
-    ///
-    /// `selection_context` is the caller's [`crate::SelectionContext`] — opaque and
-    /// ecosystem-owned (see that type's own doc), mirroring [`get_versions_with`](Self::get_versions_with)'s
-    /// [`FreshnessSettings`](crate::freshness::FreshnessSettings) precedent for "an optional
-    /// extra parameter most registries ignore"; only the one registry that understands its
-    /// contents (`PackagistRegistry`, via [`crate::SelectionContext::minimum_stability`])
-    /// overrides this method.
+    /// Like [`get_latest_matching`](Self::get_latest_matching), but additionally carries the
+    /// dependency's resolved [`DependencySource`] — the `get_latest_matching`-shaped
+    /// counterpart to [`get_versions_from`](Self::get_versions_from), covering the fallback
+    /// path a caller takes when the list-based pick fails on a non-empty
+    /// [`get_versions_from`](Self::get_versions_from) result (see
+    /// `deps_core::lsp_helpers::hover`'s `list_fallback_latest` and `deps-lsp`'s
+    /// background-fetch fallback for the two call sites this exists for).
     ///
     /// Default: forwards to [`get_latest_matching`](Self::get_latest_matching), ignoring
-    /// `selection_context`. This keeps every registry with no manifest-level stability
-    /// concept unchanged.
-    fn get_latest_matching_with_context<'a>(
-        &'a self,
-        name: &'a PackageName,
-        req: &'a VersionReq,
-        selection_context: &'a crate::SelectionContext,
-    ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
-        let _ = selection_context;
-        self.get_latest_matching(name, req)
-    }
-
-    /// Like [`get_latest_matching_with_context`](Self::get_latest_matching_with_context),
-    /// but additionally carries the dependency's resolved [`DependencySource`] — the
-    /// `get_latest_matching`-shaped counterpart to
-    /// [`get_versions_from`](Self::get_versions_from), covering the fallback path a caller
-    /// takes when the list-based pick fails on a non-empty [`get_versions_from`](Self::get_versions_from)
-    /// result (see `deps_core::lsp_helpers::hover`'s `list_fallback_latest` and
-    /// `deps-lsp`'s background-fetch fallback for the two call sites this exists for).
-    ///
-    /// Default: forwards to
-    /// [`get_latest_matching_with_context`](Self::get_latest_matching_with_context),
-    /// ignoring `source` — every registry with no per-dependency routing concept stays
-    /// bit-identical, exactly as [`get_versions_from`](Self::get_versions_from) does for the
-    /// list-fetching side.
+    /// `source` — every registry with no per-dependency routing concept stays bit-identical,
+    /// exactly as [`get_versions_from`](Self::get_versions_from) does for the list-fetching
+    /// side.
     fn get_latest_matching_from<'a>(
         &'a self,
         name: &'a PackageName,
@@ -281,7 +270,7 @@ pub trait Registry: Send + Sync {
         selection_context: &'a crate::SelectionContext,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         let _ = source;
-        self.get_latest_matching_with_context(name, req, selection_context)
+        self.get_latest_matching(name, req, selection_context)
     }
 
     /// Searches for packages by name or keywords.
@@ -352,6 +341,11 @@ pub trait Registry: Send + Sync {
     /// [`get_latest_matching`](Self::get_latest_matching) needs to return an owned
     /// `Box<dyn Version>`, and `Version` has no `clone_box`.
     ///
+    /// `selection_context` is the caller's [`crate::SelectionContext`] — see
+    /// [`get_latest_matching`](Self::get_latest_matching) for why this parameter is required
+    /// rather than defaulted; every registry with no ecosystem-specific manifest state to
+    /// refine selection with ignores it via this method's own default.
+    ///
     /// Default: `None`. Every registry reachable from the LSP fetch path overrides this so
     /// the fetch loop can obtain both "latest" and the full version list from one round
     /// trip; the default exists so test doubles that never resolve a "latest" compile
@@ -360,27 +354,9 @@ pub trait Registry: Send + Sync {
         &self,
         _versions: &[Box<dyn Version>],
         _req: &VersionReq,
+        _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         None
-    }
-
-    /// Like [`select_latest_matching`](Self::select_latest_matching), but lets a registry
-    /// whose selection can be refined by ecosystem-specific manifest state (e.g. Composer's
-    /// `minimum-stability` field, #424/#1433) read it, alongside `versions` and `req`. See
-    /// [`get_latest_matching_with_context`](Self::get_latest_matching_with_context) for why
-    /// `selection_context` is [`crate::SelectionContext`] rather than a shared, typed DTO.
-    ///
-    /// Default: forwards to [`select_latest_matching`](Self::select_latest_matching), ignoring
-    /// `selection_context`. This keeps every registry with no manifest-level stability concept
-    /// unchanged.
-    fn select_latest_matching_with_context(
-        &self,
-        versions: &[Box<dyn Version>],
-        req: &VersionReq,
-        selection_context: &crate::SelectionContext,
-    ) -> Option<usize> {
-        let _ = selection_context;
-        self.select_latest_matching(versions, req)
     }
 
     /// Whether [`get_versions`](Self::get_versions) results carry meaningful
@@ -442,7 +418,7 @@ impl dyn Registry + '_ {
     /// #   fn get_versions<'a>(&'a self, _name: &'a PackageName)
     /// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Version>>>> + Send + 'a>>
     /// #   { Box::pin(async move { Ok(vec![]) }) }
-    /// #   fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq)
+    /// #   fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq, _selection_context: &'a deps_core::SelectionContext)
     /// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Option<Box<dyn Version>>>> + Send + 'a>>
     /// #   { Box::pin(async move { Ok(None) }) }
     ///     fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
@@ -1337,6 +1313,7 @@ mod tests {
             &'a self,
             _name: &'a PackageName,
             _req: &'a VersionReq,
+            _selection_context: &'a crate::SelectionContext,
         ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
             Box::pin(async move { Ok(None) })
         }

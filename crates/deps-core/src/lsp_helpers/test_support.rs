@@ -315,6 +315,7 @@ impl crate::Registry for MockRegistry {
         &'a self,
         _name: &'a PackageName,
         _req: &'a VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -355,6 +356,7 @@ impl crate::Registry for ErrorRegistry {
         &'a self,
         _name: &'a PackageName,
         _req: &'a VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -409,6 +411,7 @@ impl crate::Registry for SlowRegistry {
         &'a self,
         _name: &'a PackageName,
         _req: &'a VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -423,6 +426,7 @@ impl crate::Registry for SlowRegistry {
         &self,
         versions: &[Box<dyn crate::Version>],
         _req: &crate::VersionReq,
+        _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         versions.iter().position(|v| v.is_stable())
     }
@@ -465,6 +469,7 @@ impl crate::Registry for NotFoundRegistry {
         &'a self,
         _name: &'a PackageName,
         _req: &'a VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -564,6 +569,7 @@ impl crate::Registry for MockRegistryWithVersions {
         &'a self,
         _name: &'a crate::PackageName,
         _req: &'a crate::VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -587,6 +593,7 @@ impl crate::Registry for MockRegistryWithVersions {
         &self,
         versions: &[Box<dyn crate::Version>],
         _req: &crate::VersionReq,
+        _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         versions.iter().position(|v| v.is_stable())
     }
@@ -650,6 +657,7 @@ impl crate::Registry for MockRegistryWithLicensedVersions {
         &'a self,
         _name: &'a crate::PackageName,
         _req: &'a crate::VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -667,6 +675,7 @@ impl crate::Registry for MockRegistryWithLicensedVersions {
         &self,
         versions: &[Box<dyn crate::Version>],
         _req: &crate::VersionReq,
+        _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         versions.iter().position(|v| v.is_stable())
     }
@@ -736,6 +745,7 @@ impl crate::Registry for MockRegistryPreferringUnflagged {
         &'a self,
         _name: &'a crate::PackageName,
         _req: &'a crate::VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -753,6 +763,7 @@ impl crate::Registry for MockRegistryPreferringUnflagged {
         &self,
         versions: &[Box<dyn crate::Version>],
         _req: &crate::VersionReq,
+        _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         crate::select_latest_for_existence(versions, |v| v.as_ref())
     }
@@ -807,6 +818,7 @@ impl crate::Registry for MockRegistryListFailsLatestFallbackSucceeds {
         &'a self,
         _name: &'a crate::PackageName,
         _req: &'a crate::VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         self.get_latest_matching_calls
@@ -831,6 +843,7 @@ impl crate::Registry for MockRegistryListFailsLatestFallbackSucceeds {
         &self,
         _versions: &[Box<dyn crate::Version>],
         _req: &crate::VersionReq,
+        _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         self.list_pick_index
     }
@@ -871,6 +884,7 @@ impl crate::Registry for FixedVersionRegistry {
         &'a self,
         _name: &'a PackageName,
         _req: &'a VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
     {
         Box::pin(async move { Ok(None) })
@@ -892,6 +906,7 @@ impl crate::Registry for FixedVersionRegistry {
         &self,
         versions: &[Box<dyn crate::Version>],
         _req: &VersionReq,
+        _selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
         crate::select_latest_for_existence(versions, |v| v.as_ref())
     }

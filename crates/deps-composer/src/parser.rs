@@ -9,8 +9,57 @@ use deps_core::Result;
 use deps_core::json_ast::{JsonAst, JsonSection};
 use deps_core::json_helpers::string_valued_entries;
 use deps_core::lsp_helpers::LineOffsetTable;
+use deps_core::{InvalidStabilityOccurrence, StabilityFloor};
 use serde_json::Value;
 use url::Url;
+
+/// The manifest's own top-level `minimum-stability` field, as parsed (#1444).
+///
+/// Composer's project-wide default stability floor, one of `dev`, `alpha`, `beta`, `RC`,
+/// `stable` (case-insensitive) — see [`StabilityFloor`]. Distinguishing [`Self::Absent`] from
+/// [`Self::Invalid`] (rather than collapsing both to `None`) lets
+/// [`deps_core::ParseResult::invalid_minimum_stability`] surface only the latter as a
+/// diagnostic: an absent field is Composer's own documented default, not a mistake.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MinimumStability {
+    /// The manifest has no `minimum-stability` field at all — Composer itself treats this as
+    /// `stable`.
+    Absent,
+    /// The manifest declares a recognized stability keyword.
+    Declared(StabilityFloor),
+    /// The manifest declares a `minimum-stability` value that isn't one of the five
+    /// recognized keywords (an unrecognized string, or a non-string JSON value). Selection
+    /// still falls back to [`StabilityFloor::Stable`] (see [`Self::floor`]), but
+    /// [`deps_core::ParseResult::invalid_minimum_stability`] surfaces the occurrence so the
+    /// fallback is visible rather than silent.
+    Invalid(InvalidStabilityOccurrence),
+}
+
+impl MinimumStability {
+    /// The effective stability floor: `Some` only for [`Self::Declared`]. Both [`Self::Absent`]
+    /// and [`Self::Invalid`] give `None`, so [`deps_core::SelectionContext::none`]'s own
+    /// `stable` fallback applies identically to either case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_composer::parser::MinimumStability;
+    /// use deps_core::StabilityFloor;
+    ///
+    /// assert_eq!(MinimumStability::Absent.floor(), None);
+    /// assert_eq!(
+    ///     MinimumStability::Declared(StabilityFloor::Beta).floor(),
+    ///     Some(StabilityFloor::Beta)
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn floor(&self) -> Option<StabilityFloor> {
+        match self {
+            Self::Declared(floor) => Some(*floor),
+            Self::Absent | Self::Invalid(_) => None,
+        }
+    }
+}
 
 /// Result of parsing a composer.json file.
 ///
@@ -22,16 +71,9 @@ pub struct ComposerParseResult {
     pub dependencies: Vec<ComposerDependency>,
     /// URI of the manifest this result was parsed from.
     pub uri: Url,
-    /// Raw value of the manifest's own top-level `minimum-stability` field (e.g. `"beta"`),
-    /// if present — Composer's project-wide default stability floor, one of `dev`, `alpha`,
-    /// `beta`, `RC`, `stable` (case-insensitive). `None` when the field is absent, which
-    /// Composer itself treats as `stable` (#424).
-    ///
-    /// Consumers rank this word (`registry.rs`'s crate-private stability ranking) rather than
-    /// comparing it as a string — stored raw here rather than pre-ranked so a caller with no
-    /// interest in stability filtering (e.g. a future manifest-summary feature) is not forced
-    /// to depend on that ranking.
-    pub minimum_stability: Option<String>,
+    /// The manifest's own top-level `minimum-stability` field, as parsed — see
+    /// [`MinimumStability`]'s own doc.
+    pub minimum_stability: MinimumStability,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -40,10 +82,9 @@ pub struct ComposerParseResult {
 
 // Hand-written rather than `deps_core::impl_parse_result!`: that macro's optional fields
 // (`workspace_root`, `dependency_truncation`, `blocked_registries`) are all plain
-// field-to-getter passthroughs, but `selection_context` wraps `minimum_stability` in
-// `SelectionContext::with_composer_minimum_stability` (#1433) — Composer is the only
-// implementor today, so baking that one-ecosystem shape into the shared macro would be
-// premature generalization rather than DRY.
+// field-to-getter passthroughs, but `selection_context`/`invalid_minimum_stability` both read
+// `minimum_stability` (#1433/#1444) — Composer is the only implementor today, so baking that
+// one-ecosystem shape into the shared macro would be premature generalization rather than DRY.
 impl deps_core::ParseResult for ComposerParseResult {
     fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
         self.dependencies
@@ -64,11 +105,24 @@ impl deps_core::ParseResult for ComposerParseResult {
         self.dependency_truncation
     }
 
-    /// Surfaces [`Self::minimum_stability`] so hover, completion, and code actions can no
-    /// longer disagree with diagnostics about what "latest" means for the same dependency
-    /// (#1433) — see [`deps_core::SelectionContext`]'s own doc.
+    /// Surfaces [`Self::minimum_stability`]'s effective floor so hover, completion, and code
+    /// actions can no longer disagree with diagnostics about what "latest" means for the same
+    /// dependency (#1433) — see [`deps_core::SelectionContext`]'s own doc.
     fn selection_context(&self) -> deps_core::SelectionContext {
-        deps_core::SelectionContext::with_composer_minimum_stability(self.minimum_stability.clone())
+        self.minimum_stability
+            .floor()
+            .map_or_else(deps_core::SelectionContext::none, |floor| {
+                deps_core::SelectionContext::with_minimum_stability(floor)
+            })
+    }
+
+    /// Surfaces [`Self::minimum_stability`]'s [`MinimumStability::Invalid`] occurrence, if
+    /// any, so `deps_core::lsp_helpers::diagnostics`' shared notice can warn about it (#1444).
+    fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
+        match &self.minimum_stability {
+            MinimumStability::Invalid(occurrence) => Some(occurrence.clone()),
+            MinimumStability::Absent | MinimumStability::Declared(_) => None,
+        }
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -273,10 +327,41 @@ fn parse_composer_json_inner(content: &str, uri: &Url) -> Result<(ComposerParseR
         classify_repositories(&mut dependencies, &repositories, packagist_disabled);
     }
 
-    let minimum_stability = root
-        .get("minimum-stability")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let minimum_stability = match root.get("minimum-stability") {
+        None => MinimumStability::Absent,
+        Some(value) => {
+            // Shared by both `Invalid` arms below: the value's own span for a string that
+            // fails to parse, the declaring key's span for a non-string value.
+            let position = || {
+                ast.as_ref().and_then(|ast| {
+                    ast.root_property_position("minimum-stability", content, &line_table)
+                })
+            };
+            match value {
+                Value::String(raw) => match raw.parse::<StabilityFloor>() {
+                    Ok(floor) => MinimumStability::Declared(floor),
+                    Err(_) => {
+                        let range = position()
+                            .and_then(|(name_range, value_range)| value_range.or(Some(name_range)))
+                            .unwrap_or_default();
+                        MinimumStability::Invalid(InvalidStabilityOccurrence {
+                            range,
+                            raw: raw.clone(),
+                        })
+                    }
+                },
+                other => {
+                    let range = position()
+                        .map(|(name_range, _)| name_range)
+                        .unwrap_or_default();
+                    MinimumStability::Invalid(InvalidStabilityOccurrence {
+                        range,
+                        raw: other.to_string(),
+                    })
+                }
+            }
+        }
+    };
 
     Ok((
         ComposerParseResult {
@@ -1428,16 +1513,78 @@ mod tests {
   }
 }"#;
         let result = parse_composer_json(json, &test_uri()).unwrap();
-        assert_eq!(result.minimum_stability.as_deref(), Some("beta"));
+        assert_eq!(
+            result.minimum_stability,
+            MinimumStability::Declared(StabilityFloor::Beta)
+        );
     }
 
-    /// #424: a manifest with no `minimum-stability` field parses to `None`, not a fabricated
-    /// `"stable"` — the stable default is applied by the registry ranking, not the parser.
+    /// #424: a manifest with no `minimum-stability` field parses to `Absent`, not a
+    /// fabricated `"stable"` — the stable default is applied by the registry, not the parser.
     #[test]
     fn test_parse_minimum_stability_absent() {
         let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
         let result = parse_composer_json(json, &test_uri()).unwrap();
-        assert_eq!(result.minimum_stability, None);
+        assert_eq!(result.minimum_stability, MinimumStability::Absent);
+    }
+
+    /// #1444: an unrecognized `minimum-stability` string parses to `Invalid`, with the range
+    /// pointing at the value.
+    #[test]
+    fn test_parse_minimum_stability_invalid_string() {
+        let json = r#"{
+  "minimum-stability": "betta",
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        let MinimumStability::Invalid(occurrence) = &result.minimum_stability else {
+            panic!("expected Invalid, got {:?}", result.minimum_stability);
+        };
+        assert_eq!(occurrence.raw, "betta");
+        assert_eq!(occurrence.range.start.line, 1);
+        let line = "  \"minimum-stability\": \"betta\",";
+        assert_eq!(
+            occurrence.range.start.character,
+            line.find("betta").unwrap() as u32
+        );
+    }
+
+    /// #1444: a non-string `minimum-stability` value (a number) parses to `Invalid`, with the
+    /// range falling back to the declaring key since there is no string value span.
+    #[test]
+    fn test_parse_minimum_stability_invalid_number() {
+        let json = r#"{
+  "minimum-stability": 42,
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        let MinimumStability::Invalid(occurrence) = &result.minimum_stability else {
+            panic!("expected Invalid, got {:?}", result.minimum_stability);
+        };
+        assert_eq!(occurrence.raw, "42");
+        assert_eq!(occurrence.range.start.line, 1);
+        let line = "  \"minimum-stability\": 42,";
+        assert_eq!(
+            occurrence.range.start.character,
+            line.find("minimum-stability").unwrap() as u32
+        );
+    }
+
+    /// #1444: a `null` `minimum-stability` value also parses to `Invalid`.
+    #[test]
+    fn test_parse_minimum_stability_invalid_null() {
+        let json = r#"{
+  "minimum-stability": null,
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_matches!(result.minimum_stability, MinimumStability::Invalid(_));
     }
 
     /// #1433: `ParseResult::selection_context()` surfaces the parsed `minimum-stability`
@@ -1456,12 +1603,12 @@ mod tests {
         let result = parse_composer_json(json, &test_uri()).unwrap();
         assert_eq!(
             result.selection_context().minimum_stability(),
-            Some("alpha")
+            Some(StabilityFloor::Alpha)
         );
     }
 
     /// #1433: a manifest with no `minimum-stability` field surfaces an empty
-    /// `SelectionContext`, matching `minimum_stability`'s own `None` default.
+    /// `SelectionContext`, matching `minimum_stability`'s own `Absent` default.
     #[test]
     fn test_selection_context_none_when_minimum_stability_absent() {
         use deps_core::ParseResult;
@@ -1469,6 +1616,46 @@ mod tests {
         let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
         let result = parse_composer_json(json, &test_uri()).unwrap();
         assert_eq!(result.selection_context().minimum_stability(), None);
+    }
+
+    /// #1444: `selection_context()` for an `Invalid` `minimum-stability` equals
+    /// `SelectionContext::none()` — the range/raw text of the invalid occurrence must not
+    /// leak into `SelectionContext` (it derives `PartialEq`, and a caller diffs it to decide
+    /// whether to refetch; see `ParseResult::invalid_minimum_stability`'s own doc for why this
+    /// is deliberate).
+    #[test]
+    fn test_selection_context_none_when_minimum_stability_invalid() {
+        use deps_core::ParseResult;
+
+        let json = r#"{
+  "minimum-stability": "betta",
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.selection_context(),
+            deps_core::SelectionContext::none()
+        );
+    }
+
+    /// #1444: `invalid_minimum_stability()` is `None` for both `Absent` and `Declared`.
+    #[test]
+    fn test_invalid_minimum_stability_none_for_absent_and_declared() {
+        use deps_core::ParseResult;
+
+        let absent =
+            parse_composer_json(r#"{"require": {"symfony/console": "^6.0"}}"#, &test_uri())
+                .unwrap();
+        assert!(absent.invalid_minimum_stability().is_none());
+
+        let declared = parse_composer_json(
+            r#"{"minimum-stability": "beta", "require": {"symfony/console": "^6.0"}}"#,
+            &test_uri(),
+        )
+        .unwrap();
+        assert!(declared.invalid_minimum_stability().is_none());
     }
 
     #[test]

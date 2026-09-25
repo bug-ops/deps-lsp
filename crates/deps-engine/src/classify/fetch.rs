@@ -429,6 +429,7 @@ impl FetchResult {
 ///         &'a self,
 ///         _name: &'a PackageName,
 ///         _req: &'a VersionReq,
+///         _selection_context: &'a SelectionContext,
 ///     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>> {
 ///         Box::pin(async move {
 ///             Ok(Some(Box::new(SimpleVersion { version: "1.0.0".into() }) as Box<dyn Version>))
@@ -604,7 +605,7 @@ pub async fn fetch_latest_versions_parallel(
 /// [`FetchResult::licenses`]) — folded into [`fetch_latest_versions_parallel`]'s
 /// aggregate `FetchResult` once every package in the stream has finished.
 ///
-/// The license entry specifically comes from `select_latest_matching_with_context`'s
+/// The license entry specifically comes from `select_latest_matching`'s
 /// pick below (critic S1: previously documented here as "the resolved version's
 /// license", which is wrong — this function never reads `resolved_versions` at all, it
 /// picks the latest version matching the requirement/stability floor, same as
@@ -692,10 +693,11 @@ async fn fetch_and_classify_package(
             };
             // `.get(idx)` not `versions[idx]`: `select_latest_matching` is a public trait
             // method, so an out-of-tree impl returning a stale index must not panic this
-            // task. `_with_context` so a registry with manifest-level stability state
-            // (Composer's `minimum-stability`, #424 S1) can apply it.
+            // task. `selection_context` is threaded through so a registry with
+            // manifest-level stability state (Composer's `minimum-stability`, #424 S1) can
+            // apply it.
             let resolved = if let Some(v) = registry
-                .select_latest_matching_with_context(&versions, wildcard_req, selection_context)
+                .select_latest_matching(&versions, wildcard_req, selection_context)
                 .and_then(|idx| versions.get(idx))
             {
                 let latest = v.version_string().clone();
@@ -1302,6 +1304,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1376,6 +1379,7 @@ mod tests {
                 &'a self,
                 name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1468,6 +1472,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1552,6 +1557,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1652,6 +1658,7 @@ mod tests {
                 &'a self,
                 name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -1684,6 +1691,7 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
+                _selection_context: &deps_core::SelectionContext,
             ) -> Option<usize> {
                 // The fetch loop derives "latest" from `get_versions` via this method, not
                 // `get_latest_matching` — must override it (not rely on the `None` default)
@@ -1791,6 +1799,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1809,6 +1818,7 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
+                _selection_context: &deps_core::SelectionContext,
             ) -> Option<usize> {
                 versions
                     .iter()
@@ -1922,6 +1932,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1940,6 +1951,7 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
+                _selection_context: &deps_core::SelectionContext,
             ) -> Option<usize> {
                 versions
                     .iter()
@@ -2035,6 +2047,7 @@ mod tests {
                 &'a self,
                 _name: &'a PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2053,6 +2066,7 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
+                _selection_context: &deps_core::SelectionContext,
             ) -> Option<usize> {
                 (!versions.is_empty()).then_some(0)
             }
@@ -2159,6 +2173,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2177,6 +2192,7 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
+                _selection_context: &deps_core::SelectionContext,
             ) -> Option<usize> {
                 if versions.is_empty() { None } else { Some(0) }
             }
@@ -2213,15 +2229,15 @@ mod tests {
         );
     }
 
-    /// #424 S1: `fetch_latest_versions_parallel` must call `select_latest_matching_with_context`
-    /// with the `minimum_stability` value it was given, not the plain `select_latest_matching`
-    /// — otherwise a registry with manifest-level stability state (e.g. Composer's
-    /// `minimum-stability`) never actually sees it, and #424's S1 fix stays unreachable dead
-    /// code from the live LSP fetch path's perspective (critic S3/tester's reachability gap).
+    /// #424 S1: `fetch_latest_versions_parallel` must call `select_latest_matching` with the
+    /// `minimum_stability` value it was given — otherwise a registry with manifest-level
+    /// stability state (e.g. Composer's `minimum-stability`) never actually sees it, and
+    /// #424's S1 fix stays unreachable dead code from the live LSP fetch path's perspective
+    /// (critic S3/tester's reachability gap).
     #[tokio::test]
-    async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_select_latest_matching_with_context()
+    async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_select_latest_matching()
      {
-        use deps_core::{Metadata, Registry, Version};
+        use deps_core::{Metadata, Registry, StabilityFloor, Version};
         use std::any::Any;
         use std::sync::Mutex;
 
@@ -2241,8 +2257,8 @@ mod tests {
 
         struct ContextAwareRegistry {
             // Records every `minimum_stability` value observed, in call order — an empty
-            // `Vec` after the fetch means the `_with_context` method was never invoked.
-            seen_minimum_stability: Mutex<Vec<Option<String>>>,
+            // `Vec` after the fetch means `select_latest_matching` was never invoked.
+            seen_minimum_stability: Mutex<Vec<Option<StabilityFloor>>>,
         }
 
         impl Registry for ContextAwareRegistry {
@@ -2262,6 +2278,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2276,11 +2293,7 @@ mod tests {
                 Box::pin(async move { Ok(vec![]) })
             }
 
-            // Deliberately NOT overridden: if the fetch loop ever calls the plain
-            // `select_latest_matching` instead of the `_with_context` variant, this default
-            // (`None`) makes the pick fail, which the fallback below records as "not found" —
-            // distinguishable from the success path this test asserts on.
-            fn select_latest_matching_with_context(
+            fn select_latest_matching(
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
@@ -2289,7 +2302,7 @@ mod tests {
                 self.seen_minimum_stability
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .push(selection_context.minimum_stability().map(str::to_string));
+                    .push(selection_context.minimum_stability());
                 if versions.is_empty() { None } else { Some(0) }
             }
 
@@ -2311,7 +2324,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
-            &SelectionContext::with_composer_minimum_stability(Some("beta".to_string())),
+            &SelectionContext::with_minimum_stability(StabilityFloor::Beta),
         )
         .await;
 
@@ -2320,22 +2333,21 @@ mod tests {
                 .seen_minimum_stability
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()),
-            vec![Some("beta".to_string())],
-            "select_latest_matching_with_context must receive the caller's minimum_stability"
+            vec![Some(StabilityFloor::Beta)],
+            "select_latest_matching must receive the caller's minimum_stability"
         );
         assert!(
             result.versions.contains_key("vendor/pkg"),
-            "the pick must still succeed via the _with_context path"
+            "the pick must still succeed"
         );
     }
 
     /// #424 S1: the `get_latest_matching` fallback path (used when the pure list-based pick
-    /// finds nothing) must also thread `minimum_stability` through its own `_with_context`
-    /// variant.
+    /// finds nothing) must also thread `minimum_stability` through.
     #[tokio::test]
-    async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_get_latest_matching_with_context()
+    async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_get_latest_matching_fallback()
      {
-        use deps_core::{Metadata, Registry, Version};
+        use deps_core::{Metadata, Registry, StabilityFloor, Version};
         use std::any::Any;
         use std::sync::Mutex;
 
@@ -2355,8 +2367,8 @@ mod tests {
 
         struct FallbackContextAwareRegistry {
             // Records every `minimum_stability` value observed, in call order — an empty
-            // `Vec` after the fetch means the `_with_context` method was never invoked.
-            seen_minimum_stability: Mutex<Vec<Option<String>>>,
+            // `Vec` after the fetch means the fallback method was never invoked.
+            seen_minimum_stability: Mutex<Vec<Option<StabilityFloor>>>,
         }
 
         impl Registry for FallbackContextAwareRegistry {
@@ -2365,21 +2377,12 @@ mod tests {
                 _name: &'a deps_core::PackageName,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
-                // Empty list forces the fetch loop's `get_latest_matching_with_context`
-                // fallback (the pure list-based pick over an empty list finds nothing).
+                // Empty list forces the fetch loop's `get_latest_matching` fallback (the pure
+                // list-based pick over an empty list finds nothing).
                 Box::pin(async move { Ok(vec![]) })
             }
 
             fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn get_latest_matching_with_context<'a>(
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
@@ -2389,7 +2392,7 @@ mod tests {
                 self.seen_minimum_stability
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .push(selection_context.minimum_stability().map(str::to_string));
+                    .push(selection_context.minimum_stability());
                 Box::pin(async move {
                     Ok(Some(Box::new(MockVersion {
                         version: "2.0.0-beta1".into(),
@@ -2424,7 +2427,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
-            &SelectionContext::with_composer_minimum_stability(Some("beta".to_string())),
+            &SelectionContext::with_minimum_stability(StabilityFloor::Beta),
         )
         .await;
 
@@ -2433,8 +2436,8 @@ mod tests {
                 .seen_minimum_stability
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()),
-            vec![Some("beta".to_string())],
-            "get_latest_matching_with_context must receive the caller's minimum_stability"
+            vec![Some(StabilityFloor::Beta)],
+            "get_latest_matching must receive the caller's minimum_stability"
         );
         let widget = result
             .versions
@@ -2487,6 +2490,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -2560,6 +2564,7 @@ mod tests {
                 &'a self,
                 name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -2674,6 +2679,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -2770,6 +2776,7 @@ mod tests {
                 &'a self,
                 name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -2845,6 +2852,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2926,6 +2934,7 @@ mod tests {
                 &'a self,
                 name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -2998,6 +3007,7 @@ mod tests {
                 &'a self,
                 name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 let name = name.clone();
@@ -3081,6 +3091,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -3163,6 +3174,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -3243,6 +3255,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -3318,6 +3331,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
@@ -3401,7 +3415,10 @@ mod tests {
                 &HashMap::new(),
             );
 
-            assert_eq!(prep.selection_context.minimum_stability(), Some("beta"));
+            assert_eq!(
+                prep.selection_context.minimum_stability(),
+                Some(deps_core::StabilityFloor::Beta)
+            );
         }
 
         /// #1433: a `composer.json` with no `minimum-stability` field surfaces an empty
@@ -3507,6 +3524,7 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &VersionReq,
+                _selection_context: &deps_core::SelectionContext,
             ) -> Option<usize> {
                 versions
                     .iter()
@@ -3517,6 +3535,7 @@ mod tests {
                 &'a self,
                 name: &'a PackageName,
                 _req: &'a VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 let outcome = self.latest_fallback.get(name.as_str()).copied();
@@ -4024,6 +4043,7 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &VersionReq,
+                _selection_context: &deps_core::SelectionContext,
             ) -> Option<usize> {
                 (!versions.is_empty()).then_some(0)
             }
@@ -4032,6 +4052,7 @@ mod tests {
                 &'a self,
                 _name: &'a PackageName,
                 _req: &'a VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })

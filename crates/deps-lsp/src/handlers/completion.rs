@@ -551,6 +551,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -813,6 +814,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1032,6 +1034,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1079,6 +1082,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1150,6 +1154,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1197,6 +1202,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1265,6 +1271,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1312,6 +1319,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1365,6 +1373,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1428,6 +1437,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1559,6 +1569,7 @@ ser"
             &'a self,
             _name: &'a deps_core::PackageName,
             _req: &'a deps_core::VersionReq,
+            _selection_context: &'a deps_core::SelectionContext,
         ) -> deps_core::ecosystem::BoxFuture<
             'a,
             deps_core::Result<Option<Box<dyn deps_core::Version>>>,
@@ -1622,6 +1633,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1677,6 +1689,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1734,6 +1747,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1789,6 +1803,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1845,6 +1860,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -1919,6 +1935,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2070,6 +2087,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2255,6 +2273,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2567,6 +2586,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })
@@ -2755,6 +2775,7 @@ ser"
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move { Ok(None) })

@@ -485,6 +485,7 @@ impl deps_core::Registry for GitlabCiRegistry {
         &'a self,
         name: &'a PackageName,
         _req: &'a deps_core::VersionReq,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             Err(DepsError::PackageNotFound {
@@ -499,13 +500,13 @@ impl deps_core::Registry for GitlabCiRegistry {
         name: &'a PackageName,
         source: &'a deps_core::parser::DependencySource,
         req: &'a deps_core::VersionReq,
-        _selection_context: &'a deps_core::SelectionContext,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let versions: Vec<Box<dyn deps_core::Version>> = self
                 .get_versions_from(name, source, deps_core::FreshnessSettings::default())
                 .await?;
-            let idx = self.select_latest_matching(&versions, req);
+            let idx = self.select_latest_matching(&versions, req, selection_context);
             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
         })
     }
@@ -529,7 +530,12 @@ impl deps_core::Registry for GitlabCiRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         if deps_core::is_existence_wildcard(req) {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
@@ -608,7 +614,10 @@ mod tests {
         let registry = GitlabCiRegistry::new(test_client());
         let name = PackageName::new("gitlab.com/org/proj");
         let req = deps_core::VersionReq::new("*");
-        match registry.get_latest_matching(&name, &req).await {
+        match registry
+            .get_latest_matching(&name, &req, &deps_core::SelectionContext::none())
+            .await
+        {
             Err(e) => assert!(matches!(e, DepsError::PackageNotFound { .. })),
             Ok(_) => panic!("expected PackageNotFound"),
         }
@@ -707,6 +716,55 @@ mod tests {
 
         let refused = registry.register_alternate(&routes);
         assert!(refused.is_empty());
+    }
+
+    /// #1444 M2/M3: `get_latest_matching_from` must forward the caller's own
+    /// `SelectionContext` into `select_latest_matching`, not silently substitute a fresh
+    /// `SelectionContext::none()` — a regression invisible to every other assertion, since
+    /// GitLab CI never reads `minimum_stability` itself. Uses
+    /// [`deps_core::test_util::SelectionContextCapture`], which
+    /// `GitlabCiRegistry::select_latest_matching` records into under `#[cfg(test)]`.
+    #[tokio::test]
+    async fn test_get_latest_matching_from_forwards_selection_context() {
+        use deps_core::test_util::SelectionContextCapture;
+        use deps_core::{SelectionContext, StabilityFloor};
+
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(r#"[{{"name":"1.0.0","commit":{{"id":"{sha}"}}}}]"#))
+            .create_async()
+            .await;
+
+        let registry = GitlabCiRegistry::new(test_client());
+        let host_bare = server.url();
+        registry.register_alternate(&[(
+            "gitlab:test".to_string(),
+            route(&host_bare, EndpointKind::Tags),
+        )]);
+
+        let name = PackageName::new(format!("{host_bare}/org/proj"));
+        let source = DependencySource::AlternateRegistry {
+            index: "gitlab:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let req = deps_core::VersionReq::new("*");
+        let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
+        SelectionContextCapture::reset();
+        let _ = registry
+            .get_latest_matching_from(&name, &source, &req, &sentinel)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SelectionContextCapture::last(),
+            Some(sentinel),
+            "get_latest_matching_from must forward the caller's SelectionContext into \
+             select_latest_matching, not a fresh SelectionContext::none()"
+        );
     }
 
     // --- endpoint dispatch: a Releases route calls /releases, never /repository/tags ---
@@ -1084,7 +1142,11 @@ mod tests {
         // GitLab tilde semantics: "1.2" matches only 1.2.*, never 1.3.0 the way an implicit
         // caret (`^1.2`) would.
         let idx = registry
-            .select_latest_matching(&versions, &deps_core::VersionReq::new("1.2"))
+            .select_latest_matching(
+                &versions,
+                &deps_core::VersionReq::new("1.2"),
+                &deps_core::SelectionContext::none(),
+            )
             .unwrap();
         assert_eq!(versions[idx].version_string().as_str(), "1.2.5");
     }
@@ -1098,7 +1160,11 @@ mod tests {
             version("3.0.0-beta.1", true),
         ];
         let idx = registry
-            .select_latest_matching(&versions, &deps_core::VersionReq::new("~latest"))
+            .select_latest_matching(
+                &versions,
+                &deps_core::VersionReq::new("~latest"),
+                &deps_core::SelectionContext::none(),
+            )
             .unwrap();
         assert_eq!(versions[idx].version_string().as_str(), "2.0.0");
     }

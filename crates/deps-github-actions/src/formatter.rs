@@ -509,6 +509,7 @@ mod tests {
             &'a self,
             _name: &'a PackageName,
             _req: &'a VersionReq,
+            _selection_context: &'a deps_core::SelectionContext,
         ) -> std::pin::Pin<
             Box<
                 dyn std::future::Future<
@@ -705,6 +706,7 @@ mod tests {
                 &'a self,
                 _name: &'a PackageName,
                 _req: &'a VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> std::pin::Pin<
                 Box<
                     dyn std::future::Future<

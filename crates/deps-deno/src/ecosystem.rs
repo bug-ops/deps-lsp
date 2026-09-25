@@ -543,6 +543,7 @@ mod tests {
             "1.0",
             VERSION_OPERATOR_CHARS,
             deps_core::FreshnessSettings::default(),
+            &deps_core::SelectionContext::none(),
         )
         .await;
         mock.assert_async().await;

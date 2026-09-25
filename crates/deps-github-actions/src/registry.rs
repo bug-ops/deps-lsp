@@ -478,6 +478,7 @@ impl deps_core::Registry for GithubActionsRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
@@ -502,6 +503,7 @@ impl deps_core::Registry for GithubActionsRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        _selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
         if deps_core::is_existence_wildcard(req) {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
@@ -1048,7 +1050,10 @@ mod tests {
         })];
         let registry = mock_registry("http://127.0.0.1:1", false);
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     // #784: exercises the non-wildcard `semver::VersionReq` branch of select_latest_matching

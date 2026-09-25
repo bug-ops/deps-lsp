@@ -350,6 +350,7 @@ impl Ecosystem for GitlabCiEcosystem {
                 &prefix,
                 VERSION_OPERATOR_CHARS,
                 request.freshness,
+                &request.parse_result.selection_context(),
             )
             .await
             .into()
@@ -3180,6 +3181,7 @@ mod tests {
             "v1.0",
             VERSION_OPERATOR_CHARS,
             freshness,
+            &deps_core::SelectionContext::none(),
         )
         .await;
         assert_eq!(via_dispatch.items, direct);

@@ -789,8 +789,13 @@ impl deps_core::Registry for GoRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
     {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         Box::pin(async move {
             let version = self
                 .get_latest_matching(name.as_str(), req.as_str())
@@ -849,7 +854,7 @@ impl deps_core::Registry for GoRegistry {
         name: &'a deps_core::PackageName,
         source: &'a DependencySource,
         req: &'a deps_core::VersionReq,
-        _selection_context: &'a deps_core::SelectionContext,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>>
     {
         Box::pin(async move {
@@ -867,6 +872,7 @@ impl deps_core::Registry for GoRegistry {
                                 client.as_ref(),
                                 &versions,
                                 req,
+                                selection_context,
                             );
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
@@ -878,7 +884,10 @@ impl deps_core::Registry for GoRegistry {
                 }
                 // Preserves the plain public-registry path's existing `/@latest`
                 // fast-path/`/@v/list`-fallback behavior unchanged (NFR-005).
-                _ => deps_core::Registry::get_latest_matching(self, name, req).await,
+                _ => {
+                    deps_core::Registry::get_latest_matching(self, name, req, selection_context)
+                        .await
+                }
             }
         })
     }
@@ -897,7 +906,12 @@ impl deps_core::Registry for GoRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         _req: &deps_core::VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         // Mirrors the `/@v/list` fallback branch of the inherent `get_latest_matching`
         // above (the `/@latest` fast path isn't reachable here: this method is a pure,
         // no-I/O pick over an already-fetched list). `req` is ignored, matching that
@@ -1513,7 +1527,11 @@ mod tests {
             .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
             .collect();
         let idx = registry
-            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .select_latest_matching(
+                &boxed,
+                &VersionReq::new("*"),
+                &deps_core::SelectionContext::none(),
+            )
             .expect("non-empty list must select an index");
 
         assert_eq!(Some(boxed[idx].version_string().to_string()), fallback_pick);
@@ -1572,7 +1590,7 @@ mod tests {
         ];
         let req = VersionReq::new("*");
         assert_eq!(
-            registry.select_latest_matching(&versions, &req),
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
             None,
             "Go must not fall through to rung 3; a non-empty all-prerelease list must \
              still yield None so the /@latest fallback fires"
@@ -1659,6 +1677,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(versions.len(), 1);
+    }
+
+    /// #1444 M2/M3: `get_latest_matching_from`'s `AlternateRegistry` branch must forward the
+    /// caller's own `SelectionContext` to the alternate client's `select_latest_matching`
+    /// (via [`deps_core::Registry::select_latest_matching`]), not silently substitute a
+    /// fresh `SelectionContext::none()` — a regression that would be invisible to every
+    /// other assertion, since Go never reads `minimum_stability` itself. Uses
+    /// [`deps_core::test_util::SelectionContextCapture`], which `GoRegistry::select_latest_matching`
+    /// records into under `#[cfg(test)]`.
+    #[tokio::test]
+    async fn test_get_latest_matching_from_alternate_forwards_selection_context() {
+        use deps_core::test_util::SelectionContextCapture;
+        use deps_core::{Registry, SelectionContext, StabilityFloor, VersionReq};
+
+        let mut alt_server = mockito::Server::new_async().await;
+        alt_server
+            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+            .with_status(200)
+            .with_body("v1.9.1\n")
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(WorkspaceRegistryAccess::All);
+        let root = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+        let policy = all_policy();
+        let chain = GoProxyChain {
+            key: "go-proxy:test".to_string(),
+            hops: vec![url_hop(&alt_server.url(), &policy)],
+            ..Default::default()
+        };
+        GoRegistry::register_alternate(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: "go-proxy:test".to_string(),
+            mirrors_crates_io: false,
+        };
+        let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
+        SelectionContextCapture::reset();
+        let _ = root
+            .get_latest_matching_from(
+                &deps_core::PackageName::new("github.com/gin-gonic/gin"),
+                &source,
+                &VersionReq::new("*"),
+                &sentinel,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SelectionContextCapture::last(),
+            Some(sentinel),
+            "the alternate branch must forward the caller's SelectionContext, not a fresh \
+             SelectionContext::none()"
+        );
     }
 
     /// FR-005: a module absent from hop 0 (explicit not-found) falls through to hop 1.

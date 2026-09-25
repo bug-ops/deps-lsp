@@ -206,16 +206,16 @@ fn has_short_stability_alias(s: &str) -> bool {
 /// directly adjacent to a numeric run with no separator (e.g. `1.0.0RC1`, `1.0.0a1`,
 /// `1.0.0dev`) — `composer/semver`'s modifier grammar makes the `[._-]?` separator before the
 /// keyword optional for every recognized word (matching
-/// [`crate::formatter::composer_stability_rank`]'s full word list), not just `alpha`/`beta`/
+/// [`crate::formatter::qualifier_stability`]'s full word list), not just `alpha`/`beta`/
 /// `rc`. The hyphenated forms are already caught by
 /// [`deps_core::has_default_prerelease_marker`]'s `-rc`/`-alpha`/`-beta`/`-dev` substring
 /// checks and [`has_short_stability_alias`]'s hyphenated `-a`/`-b`.
 ///
 /// Covering only three of the six recognized words here left this classifier disagreeing with
-/// [`crate::formatter::composer_version_stability_rank`] on bare separator-less short-alias/
+/// [`crate::formatter::composer_version_stability`] on bare separator-less short-alias/
 /// `dev` forms (`1.0.0a1`, `1.0.0dev`): the rank function ranks them as prerelease (via the
-/// same word list `composer_stability_rank` uses), but this function said "not prerelease" —
-/// and since `registry.rs`'s `effective_minimum_stability_rank` uses this function for "does
+/// same word list `qualifier_stability` uses), but this function said "not prerelease" —
+/// and since `registry.rs`'s `effective_minimum_stability` uses this function for "does
 /// the requirement itself pin a prerelease" while the version-side filter uses the rank
 /// function, disagreement meant a pin like `1.0.0a1` could never match its own version — the
 /// exact #421 S1 failure mode, reintroduced by the original #424 S3 fix instead of being
@@ -229,7 +229,7 @@ fn has_short_stability_alias(s: &str) -> bool {
 ///
 /// The keyword may also sit directly after a `.`/`_` separator that is itself digit-adjacent
 /// (e.g. `2.6.3.alpha`, a live `api-platform/core` tag) — not just directly after a digit —
-/// since `composer_stability_rank`'s companion parser (`split_composer_core_and_suffix`)
+/// since `qualifier_stability`'s companion parser (`split_composer_core_and_suffix`)
 /// already strips a leading `.`/`_`/`-` separator before reading the qualifier word, so the
 /// rank function sees `2.6.3.alpha` as prerelease while this substring scan previously did
 /// not, the same #421 S1 failure mode S2 fixed for the hyphen-less case (#424 critique N3).
@@ -578,7 +578,7 @@ mod tests {
 
     /// #424 critique S2: the short-alias (`a`/`b`) and `dev` separator-less forms must also
     /// be recognized — not just `alpha`/`beta`/`rc` — or this classifier disagrees with
-    /// `composer_version_stability_rank` on exactly these forms (see that function's rank
+    /// `composer_version_stability` on exactly these forms (see that function's rank
     /// test `test_is_prerelease_marker_separatorless_suffix_agrees_with_rank` below).
     #[test]
     fn test_is_prerelease_marker_separatorless_short_alias_and_dev() {
@@ -622,7 +622,7 @@ mod tests {
     }
 
     /// #424 critique S2/N3: `is_prerelease_marker` (substring-scan classifier, used for
-    /// requirement strings) and `composer_version_stability_rank` (anchored-parse classifier,
+    /// requirement strings) and `composer_version_stability` (anchored-parse classifier,
     /// used for candidate versions) must agree on every grammar-valid bare version-shaped
     /// string — a real generated cross-product, not a hand-picked table, so a future addition
     /// to either classifier's word/separator list that misses the other is actually caught,
@@ -643,8 +643,8 @@ mod tests {
                     for suffix in ["", "1", ".1"] {
                         let s = format!("{prefix}2.6.3{sep}{word}{suffix}");
                         let is_prerelease = is_prerelease_marker(&s);
-                        let is_stable_rank = crate::formatter::composer_version_stability_rank(&s)
-                            == crate::formatter::COMPOSER_STABLE_RANK;
+                        let is_stable_rank = crate::formatter::composer_version_stability(&s)
+                            == deps_core::StabilityFloor::Stable;
                         if is_prerelease == is_stable_rank {
                             mismatches.push(s);
                         }
@@ -655,7 +655,7 @@ mod tests {
         assert!(
             mismatches.is_empty(),
             "{} / 216 grammar-valid forms disagree between is_prerelease_marker and \
-             composer_version_stability_rank: {mismatches:?}",
+             composer_version_stability: {mismatches:?}",
             mismatches.len()
         );
     }
