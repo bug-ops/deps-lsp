@@ -46,6 +46,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use base64::Engine;
+use deps_core::config_trust::{self, EnvVarSyntax};
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
     RegistryUrlKind, ValidatedRegistryUrl,
@@ -83,22 +84,10 @@ const MAX_BLOCKED_SOURCES_PER_PLAIN_CHAIN: usize = 8;
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NuGetFeedUrlError {
-    /// The value did not parse as a URL at all.
-    #[error("not a valid URL: {0}")]
-    InvalidUrl(RedactedUrl),
-    /// The URL's scheme is not `https`.
-    #[error("registry feed must use https, got scheme {0:?}")]
-    NotHttps(String),
-    /// The URL carries a `user:pass@`/`user@` component.
-    #[error("registry feed URL must not carry userinfo")]
-    UserInfoPresent,
-    /// The candidate's host is blocked by the current
-    /// [`deps_core::net_policy::WorkspaceRegistryAccess`] policy.
-    #[error("registry feed host class {class} blocked by registries.workspace_registries policy")]
-    BlockedHost {
-        /// The blocked host's classification.
-        class: deps_core::net_policy::HostClass,
-    },
+    /// Not a valid URL, wrong scheme, userinfo present, or a policy-blocked host — see
+    /// [`IndexUrlError`].
+    #[error(transparent)]
+    Url(#[from] IndexUrlError),
     /// The source has an entry under `<packageSourceCredentials>` — credentials are never
     /// read, so the source is dropped rather than queried unauthenticated (FR-009).
     #[error("source has packageSourceCredentials configured; credentials are never read")]
@@ -121,27 +110,15 @@ pub enum NuGetFeedUrlError {
     EncryptedPasswordUnsupported,
 }
 
-impl From<IndexUrlError> for NuGetFeedUrlError {
-    fn from(error: IndexUrlError) -> Self {
-        match error {
-            // `raw` is already a `RedactedUrl` (issue #808) — no further redaction needed.
-            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw),
-            IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
-            IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
-            IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
-            // `IndexUrlError` is `#[non_exhaustive]` (issue #769): a variant added upstream
-            // and not yet mapped here still surfaces, carrying its own message, rather than
-            // failing to compile.
-            other => Self::InvalidUrl(other.to_string().into()),
-        }
-    }
-}
-
 impl BlockedHostReason for NuGetFeedUrlError {
     fn blocked_host_class(&self) -> Option<HostClass> {
         match self {
-            Self::BlockedHost { class } => Some(*class),
-            _ => None,
+            Self::Url(e) => e.blocked_host_class(),
+            Self::HasCredentials
+            | Self::Disabled
+            | Self::UnsupportedProtocolVersion(_)
+            | Self::LocalFeedUnsupported
+            | Self::EncryptedPasswordUnsupported => None,
         }
     }
 }
@@ -204,23 +181,17 @@ fn trusted_public() -> NuGetFeedUrl {
         .unwrap_or_else(|error| panic!("NUGET_ORG_INDEX_URL {raw:?} failed validation: {error}"))
 }
 
-/// Which tier a parsed `NuGet.Config` file came from (issue #561, FR-001).
+/// Which tier a parsed `NuGet.Config` file came from (issue #561, FR-001; issue #1434:
+/// `UserProfile`/`Repo` renamed to [`deps_core::config_trust::ConfigTier`]'s `User`/`Project`).
 ///
 /// Diagnostics/gating metadata only — mirrors `deps_cargo::config::Provenance`'s "nothing
 /// branches on this to *widen* trust" invariant. In particular, [`PackageSourceEntry::tier`]
 /// is **not** consulted by the credential-binding logic in [`resolve_with_context`] (see that function's
 /// docs, §C2) — only by the [`resolve_with_context`] accumulation loop's own gate (which contribution half
-/// applies) and by `tracing::debug!` output.
-#[non_exhaustive]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ConfigTier {
-    /// A user-profile-tier `NuGet.Config` (issue #561, FR-001) — not something a cloned
-    /// repository controls.
-    UserProfile,
-    /// An in-repo `NuGet.Config`, discovered by the ancestor walk (spec 035 FR-001) —
-    /// attacker-controlled the moment a hostile repository is opened.
-    Repo,
-}
+/// applies) and by `tracing::debug!` output. See [`deps_core::config_trust`]'s module doc for
+/// the interpolation-gate contract this re-export carries — it gates env-var interpolation
+/// only, never credential binding on its own.
+pub use deps_core::config_trust::ConfigTier;
 
 /// A pre-formatted `Basic base64(username:password)` `Authorization` header value (issue #561).
 ///
@@ -242,7 +213,7 @@ pub struct NuGetAuth(deps_core::secret::Redacted);
 
 impl NuGetAuth {
     /// Formats `username`/`password` into a `Basic` header value. `pub(crate)`: only
-    /// [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::UserProfile`], ever constructs one.
+    /// [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::User`], ever constructs one.
     ///
     /// Every intermediate (the raw `user:pass` string, and the base64 encoding of it —
     /// reversible, not encryption) is held in [`Zeroizing`] from the point of construction,
@@ -348,7 +319,7 @@ pub struct PackageSourceEntry {
     /// only, see [`ConfigTier`]'s doc for the "never a credential gate" invariant.
     #[raw]
     pub tier: ConfigTier,
-    /// Set only by [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::UserProfile`] — never
+    /// Set only by [`resolve_with_context`]'s final C2 pass, gated on [`ConfigTier::User`] — never
     /// during accumulation (`upsert_source` always writes `None` here; see its doc). Already
     /// redacted by [`NuGetAuth`]'s own `Debug` impl.
     #[raw]
@@ -953,7 +924,7 @@ struct RawSourceAdd {
 
 /// One `<packageSourceCredentials>` child element's raw, pre-expansion credential values
 /// (issue #561, FR-002) — parsed unconditionally (parsing is tier-blind and memoized), but only
-/// ever read by [`resolve_with_context`]'s final pass when the owning file is [`ConfigTier::UserProfile`].
+/// ever read by [`resolve_with_context`]'s final pass when the owning file is [`ConfigTier::User`].
 #[derive(Debug, Default, Clone, Hash)]
 struct RawCredential {
     /// The credential element's raw (undecoded) name — a source key, compared via
@@ -965,6 +936,17 @@ struct RawCredential {
     /// Whether a DPAPI-encrypted `<Password>` child was present (FR-003) — a distinct fail
     /// reason from a missing/absent password, never itself held as a value.
     encrypted: bool,
+}
+
+/// A [`RawCredential`] paired with the [`ConfigTier`] of the file it was parsed from (issue
+/// #1434) — built by [`accumulate_config_tiers`] from the real `(tier, file)` loop pair, so
+/// [`expand_credential`]'s tier gate reflects genuine provenance rather than a hardcoded
+/// [`ConfigTier::User`] assumption. Not part of `config_fingerprint` (only
+/// [`RawNuGetConfigFile`]/[`RawCredential`] are hashed for that), so this deliberately derives
+/// neither `Hash` nor `Clone`.
+struct TieredCredential {
+    tier: ConfigTier,
+    credential: RawCredential,
 }
 
 /// One `NuGet.Config` file's raw, unvalidated, un-cross-referenced contents.
@@ -1461,7 +1443,7 @@ pub(crate) fn resolve(
 ///
 /// # Credential half vs. routing half (§3.8, FR-005/FR-006)
 ///
-/// A [`ConfigTier::UserProfile`] file's contribution splits into two halves:
+/// A [`ConfigTier::User`] file's contribution splits into two halves:
 ///
 /// - **Credential half — always applied, regardless of `user_profile_sources`**:
 ///   `credentialed_keys`, the §3.4 credential-suppression set (from its own
@@ -1556,10 +1538,10 @@ fn collect_config_ancestors(
 
     let mut ancestors: Vec<(ConfigTier, Arc<RawNuGetConfigFile>)> = repo_ancestors
         .into_iter()
-        .map(|f| (ConfigTier::Repo, f))
+        .map(|f| (ConfigTier::Project, f))
         .collect();
     if let Some(user_file) = user_profile_file {
-        ancestors.push((ConfigTier::UserProfile, user_file));
+        ancestors.push((ConfigTier::User, user_file));
     }
     ancestors
 }
@@ -1598,7 +1580,7 @@ struct AccumulatedConfig {
     mapping: PackageSourceMapping,
     /// Credential-half accumulators (§3.8) — populated identically regardless of
     /// `user_profile_sources`.
-    user_credentials: Vec<RawCredential>,
+    user_credentials: Vec<TieredCredential>,
     user_profile_add: Vec<PackageSourceEntry>,
     user_profile_credential_suppressed: HashSet<String>,
 }
@@ -1607,7 +1589,7 @@ struct AccumulatedConfig {
 /// discovery order), accumulating package sources, `<clear/>`/`<remove>` state, disabled/
 /// credentialed key sets, and `<packageSourceMapping>` into one [`AccumulatedConfig`].
 ///
-/// A [`ConfigTier::UserProfile`] file's contribution splits into two halves (§3.8, FR-005/
+/// A [`ConfigTier::User`] file's contribution splits into two halves (§3.8, FR-005/
 /// FR-006): its credential half (`credentialed_keys`, the §3.4 suppression set, raw
 /// `<packageSourceCredentials>` values, and its own `<clear/>`/`<add>`/`<remove>` batch
 /// tracked separately as `user_profile_add`) always applies; its routing half (`sources`,
@@ -1629,17 +1611,22 @@ fn accumulate_config_tiers(
     let mut mapping = PackageSourceMapping::default();
 
     // Credential-half accumulators (§3.8) — populated identically regardless of the flag.
-    let mut user_credentials: Vec<RawCredential> = Vec::new();
+    let mut user_credentials: Vec<TieredCredential> = Vec::new();
     let mut user_profile_add: Vec<PackageSourceEntry> = Vec::new();
     let mut user_profile_credential_suppressed: HashSet<String> = HashSet::new();
 
     for (tier, file) in ancestors.iter().rev() {
         let tier = *tier;
 
-        if tier == ConfigTier::UserProfile {
+        if tier == ConfigTier::User {
             // Credential half — always runs, regardless of `user_profile_sources` (§3.8).
             user_credentialed_raw.extend(file.credentialed_keys.iter().cloned());
-            user_credentials.extend(file.credentials.iter().cloned());
+            user_credentials.extend(
+                file.credentials
+                    .iter()
+                    .cloned()
+                    .map(|credential| TieredCredential { tier, credential }),
+            );
             for (key, value) in &file.disabled {
                 if value.eq_ignore_ascii_case("true") {
                     user_profile_credential_suppressed.extend(key_candidates(key));
@@ -1649,7 +1636,7 @@ fn accumulate_config_tiers(
                 user_profile_add.clear();
             }
             for add in &file.sources {
-                upsert_source(&mut user_profile_add, add, policy, ConfigTier::UserProfile);
+                upsert_source(&mut user_profile_add, add, policy, ConfigTier::User);
             }
             for key in &file.removed {
                 user_profile_add.retain(|e| !key_candidates_overlap(&e.key, key));
@@ -1684,7 +1671,7 @@ fn accumulate_config_tiers(
                 nuget_org_removed = true;
             }
         }
-        if tier == ConfigTier::Repo {
+        if tier == ConfigTier::Project {
             disabled_raw.extend(file.disabled.iter().cloned());
         }
         for (source_key, patterns) in &file.mapping {
@@ -1932,7 +1919,7 @@ fn fail_closed(
 /// the user-facing `reason`. Returns `Some(Ok(auth))` on a successful bind.
 fn bind_user_profile_credential(
     entry: &PackageSourceEntry,
-    user_credentials: &[RawCredential],
+    user_credentials: &[TieredCredential],
     user_profile_add: &[PackageSourceEntry],
     suppressed: &HashSet<String>,
     resolved_url: &str,
@@ -1945,7 +1932,7 @@ fn bind_user_profile_credential(
     let suppressed_match = candidates.iter().any(|c| suppressed.contains(c));
 
     // (1): exactly one user-profile credential's key-candidates overlap `entry.key`.
-    let credential = unique_overlap(&entry.key, user_credentials, |c| c.key.as_str())?;
+    let credential = unique_overlap(&entry.key, user_credentials, |c| c.credential.key.as_str())?;
 
     if suppressed_match {
         return Some(Err((
@@ -1956,8 +1943,9 @@ fn bind_user_profile_credential(
 
     // (2): exactly one `user_profile_add` entry's key-candidates overlap the credential's own
     // key.
-    let Some(add_entry) = unique_overlap(&credential.key, user_profile_add, |e| e.key.as_str())
-    else {
+    let Some(add_entry) = unique_overlap(&credential.credential.key, user_profile_add, |e| {
+        e.key.as_str()
+    }) else {
         return Some(Err((
             NuGetFeedUrlError::HasCredentials,
             FailClosedCause::NoMatchingUserProfileAdd,
@@ -1985,11 +1973,40 @@ fn bind_user_profile_credential(
 }
 
 /// FR-002/FR-003: expands `%ENV_VAR%` references (post-cache, credential values only) and
-/// formats the result into a [`NuGetAuth`]. A DPAPI-encrypted `<Password>` fails closed as
-/// [`NuGetFeedUrlError::EncryptedPasswordUnsupported`]; a missing `ClearTextPassword`, or any
-/// referenced environment variable being unset, fails closed as
+/// formats the result into a [`NuGetAuth`]. Delegates to [`expand_credential_with`] using
+/// [`deps_core::config_trust::process_env`] as the production lookup.
+fn expand_credential(cred: &TieredCredential) -> Result<NuGetAuth, NuGetFeedUrlError> {
+    expand_credential_with(cred, config_trust::process_env)
+}
+
+/// [`expand_credential`], but reading variables through `lookup` instead of
+/// [`deps_core::config_trust::process_env`] directly — lets tests inject a fake environment
+/// instead of mutating the real process environment (this workspace forbids `unsafe`, and Rust
+/// 2024 made `std::env::set_var` an `unsafe fn`, so a test cannot do that mutation at all).
+///
+/// `cred.tier` is checked first, before any other field is even read (issue #1434, S2): a
+/// [`ConfigTier::Project`]-tagged credential fails closed as
+/// [`NuGetFeedUrlError::HasCredentials`] unconditionally. In production this arm is
+/// unreachable — [`accumulate_config_tiers`] only ever tags a credential [`ConfigTier::User`] —
+/// but the tag, not that branch's current unreachability, is what would catch a future
+/// regression routing a project-tier credential into [`AccumulatedConfig::user_credentials`]
+/// (defense in depth; the primary layer is [`accumulate_config_tiers`] itself never collecting
+/// a repo-tier file's credentials in the first place). A DPAPI-encrypted `<Password>` fails
+/// closed as [`NuGetFeedUrlError::EncryptedPasswordUnsupported`]; a missing `ClearTextPassword`,
+/// or any referenced environment variable being unset, fails closed as
 /// [`NuGetFeedUrlError::HasCredentials`].
-fn expand_credential(credential: &RawCredential) -> Result<NuGetAuth, NuGetFeedUrlError> {
+fn expand_credential_with(
+    cred: &TieredCredential,
+    lookup: impl Fn(&str) -> Option<Zeroizing<String>>,
+) -> Result<NuGetAuth, NuGetFeedUrlError> {
+    match cred.tier {
+        ConfigTier::Project => return Err(NuGetFeedUrlError::HasCredentials),
+        // Exhaustive match kept instead of `if let`/`let-else` so that a future `ConfigTier`
+        // variant forces a compile-time decision here rather than silently falling through.
+        ConfigTier::User => {}
+    }
+
+    let credential = &cred.credential;
     if credential.encrypted {
         tracing::debug!(
             key = %credential.key,
@@ -2005,87 +2022,25 @@ fn expand_credential(credential: &RawCredential) -> Result<NuGetAuth, NuGetFeedU
         .as_ref()
         .map(RedactedSecret::expose_secret)
         .unwrap_or("");
-    let username = expand_env_vars(username)?;
-    let password = expand_env_vars(password.expose_secret())?;
+    let username = expand_env_vars(username, cred.tier, &lookup)?;
+    let password = expand_env_vars(password.expose_secret(), cred.tier, &lookup)?;
     Ok(NuGetAuth::new(&username, &password))
 }
 
-/// Expands every `%NAME%` reference in `raw` against the process environment. Any referenced
-/// variable being unset fails the *whole* expansion closed (FR-002) — never a partial
-/// substitution. `%` sequences that don't form a well-formed `%NAME%` reference (empty name, a
-/// non-alphanumeric/underscore character, or an unterminated `%`) are left as literal text.
-///
-/// Returns [`Zeroizing`], not a bare `String` — the caller (`expand_credential`) only ever
-/// expands a secret (`RedactedSecret` username/password), never an ordinary value.
-fn expand_env_vars(raw: &str) -> Result<Zeroizing<String>, NuGetFeedUrlError> {
-    expand_env_vars_with(raw, |name| std::env::var(name).ok().map(Zeroizing::new))
-}
-
-/// [`expand_env_vars`], but reading variables through `lookup` instead of [`std::env::var`]
-/// directly — lets tests inject a fake environment instead of mutating the real process
-/// environment (this workspace forbids `unsafe`, and Rust 2024 made `std::env::set_var` an
-/// `unsafe fn`, so a test cannot do that mutation at all; mirrors
-/// `deps_npm::config::expand_env_vars_with`'s identical rationale).
-///
-/// Scans `raw` (and each looked-up value) by `&str` slice, never collecting the secret into
-/// an intermediate `Vec<char>` copy, and precomputes the exact output length from the
-/// resolved segments before allocating — so the returned [`Zeroizing`] buffer is never grown
-/// past its initial capacity. `zeroize`'s own docs note it cannot guarantee a `Vec`/`String`
-/// reallocation didn't leave a stale copy on the heap; sizing exactly once, up front, is what
-/// avoids that reallocation in the first place, rather than merely zeroizing after the fact.
-// All indices come from `find('%')`, an ASCII byte, so every slice bound is always a char
-// boundary.
-#[allow(clippy::string_slice)]
-fn expand_env_vars_with(
+/// Expands every `%NAME%` reference in `raw` (via
+/// [`deps_core::config_trust::expand_env_vars`]) and maps its error into
+/// [`NuGetFeedUrlError::HasCredentials`] — both
+/// [`deps_core::config_trust::EnvExpansionError`] variants (an unset variable, or a
+/// project-tier value carrying a placeholder) fail closed identically here; unlike deps-npm,
+/// this crate's existing fail-closed shape never surfaced the undefined variable's name, so
+/// none is added now either.
+fn expand_env_vars(
     raw: &str,
-    lookup: impl Fn(&str) -> Option<Zeroizing<String>>,
+    tier: ConfigTier,
+    lookup: &impl Fn(&str) -> Option<Zeroizing<String>>,
 ) -> Result<Zeroizing<String>, NuGetFeedUrlError> {
-    enum Segment<'a> {
-        Literal(&'a str),
-        Value(Zeroizing<String>),
-    }
-
-    let mut segments = Vec::new();
-    let mut rest = raw;
-    while let Some(pct) = rest.find('%') {
-        let literal = &rest[..pct];
-        let after = &rest[pct + 1..];
-        if let Some(end) = after.find('%') {
-            let name = &after[..end];
-            if !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-                if !literal.is_empty() {
-                    segments.push(Segment::Literal(literal));
-                }
-                let value = lookup(name).ok_or(NuGetFeedUrlError::HasCredentials)?;
-                segments.push(Segment::Value(value));
-                rest = &after[end + 1..];
-                continue;
-            }
-        }
-        // Not a well-formed `%NAME%` reference: keep everything up to and including this
-        // `%` as literal text, then keep scanning from just past it.
-        segments.push(Segment::Literal(&rest[..=pct]));
-        rest = &rest[pct + 1..];
-    }
-    if !rest.is_empty() {
-        segments.push(Segment::Literal(rest));
-    }
-
-    let total_len: usize = segments
-        .iter()
-        .map(|segment| match segment {
-            Segment::Literal(s) => s.len(),
-            Segment::Value(v) => v.len(),
-        })
-        .sum();
-    let mut out = Zeroizing::new(String::with_capacity(total_len));
-    for segment in &segments {
-        match segment {
-            Segment::Literal(s) => out.push_str(s),
-            Segment::Value(v) => out.push_str(v.as_str()),
-        }
-    }
-    Ok(out)
+    config_trust::expand_env_vars(raw, EnvVarSyntax::Windows, tier, lookup)
+        .map_err(|_| NuGetFeedUrlError::HasCredentials)
 }
 
 #[cfg(test)]
@@ -2128,7 +2083,7 @@ mod tests {
         let policy = all_policy();
         assert_matches!(
             NuGetFeedUrl::new("https://user:pass@feed.example/v3/index.json", &policy),
-            Err(NuGetFeedUrlError::UserInfoPresent)
+            Err(NuGetFeedUrlError::Url(IndexUrlError::UserInfoPresent))
         );
     }
 
@@ -2202,7 +2157,7 @@ mod tests {
             key: key.to_string(),
             value: NuGetFeedUrl::new(url, policy)
                 .map_err(|reason| InvalidEntry::new(RedactedUrl::new(url), reason)),
-            tier: ConfigTier::Repo,
+            tier: ConfigTier::Project,
             auth: None,
         }
     }
@@ -3920,61 +3875,10 @@ mod tests {
         assert!(config.resolved_chains().is_empty());
     }
 
-    /// SC-002: `%ENV_VAR%` expansion — set resolves, unset fails closed, and the unexpanded
-    /// literal is never leaked into the result. Exercises `expand_env_vars_with` directly
-    /// (this workspace forbids `unsafe`, so a test cannot mutate the real process
-    /// environment — see that function's doc).
-    #[test]
-    fn test_env_var_expansion_set_and_unset() {
-        let set = expand_env_vars_with("%CORP_FEED_PAT%", |name| {
-            (name == "CORP_FEED_PAT").then(|| Zeroizing::new("secret-pat".to_string()))
-        });
-        assert_eq!(set.unwrap().as_str(), "secret-pat");
-
-        let unset = expand_env_vars_with("%CORP_FEED_PAT%", |_| None);
-        assert_matches!(unset, Err(NuGetFeedUrlError::HasCredentials));
-    }
-
-    /// Regression coverage for the `&str`-slice rewrite of `expand_env_vars_with` (it no
-    /// longer collects `raw` into an intermediate `Vec<char>`): surrounding literal text,
-    /// back-to-back substitutions with no literal between them, a malformed name (non
-    /// alphanumeric/underscore character) left as literal text, and an unterminated `%` at
-    /// end-of-string left as literal text — all must behave exactly as the prior
-    /// char-by-char scan did.
-    #[test]
-    fn test_env_var_expansion_edge_cases() {
-        let lookup = |name: &str| match name {
-            "A" => Some(Zeroizing::new("1".to_string())),
-            "B" => Some(Zeroizing::new("2".to_string())),
-            _ => None,
-        };
-
-        assert_eq!(
-            expand_env_vars_with("pre-%A%-post", lookup)
-                .unwrap()
-                .as_str(),
-            "pre-1-post"
-        );
-        assert_eq!(
-            expand_env_vars_with("%A%%B%", lookup).unwrap().as_str(),
-            "12"
-        );
-        assert_eq!(
-            expand_env_vars_with("abc%1bad!name%def", lookup)
-                .unwrap()
-                .as_str(),
-            "abc%1bad!name%def"
-        );
-        assert_eq!(
-            expand_env_vars_with("abc%A", lookup).unwrap().as_str(),
-            "abc%A"
-        );
-        assert_eq!(expand_env_vars_with("%%", lookup).unwrap().as_str(), "%%");
-        assert_matches!(
-            expand_env_vars_with("pre-%UNSET%-post", lookup),
-            Err(NuGetFeedUrlError::HasCredentials)
-        );
-    }
+    // `%ENV_VAR%` expansion itself is now covered by `deps_core::config_trust`'s own test
+    // suite — see that module for the Windows-syntax vectors this crate's
+    // `expand_env_vars`/`expand_env_vars_with` used to pin directly. `expand_credential_with`'s
+    // own tier-gate tests below cover the credential-binding-specific behavior.
 
     /// SC-002 end-to-end: the same expansion wired through `resolve`'s credential-binding
     /// pass — a credential whose `RawCredential` has no `password` (the shape an unset env
@@ -3982,11 +3886,14 @@ mod tests {
     /// at this layer) fails closed via `expand_credential`.
     #[test]
     fn test_expand_credential_missing_password_fails_closed() {
-        let credential = RawCredential {
-            key: "CorpFeed".to_string(),
-            username: Some(RedactedSecret::new("user".to_string())),
-            password: None,
-            encrypted: false,
+        let credential = TieredCredential {
+            tier: ConfigTier::User,
+            credential: RawCredential {
+                key: "CorpFeed".to_string(),
+                username: Some(RedactedSecret::new("user".to_string())),
+                password: None,
+                encrypted: false,
+            },
         };
         assert_matches!(
             expand_credential(&credential),
@@ -4058,15 +3965,103 @@ mod tests {
     /// fail-closed behavior).
     #[test]
     fn test_expand_credential_encrypted_password_is_distinct_reason() {
-        let credential = RawCredential {
-            key: "CorpFeed".to_string(),
-            username: Some(RedactedSecret::new("user".to_string())),
-            password: None,
-            encrypted: true,
+        let credential = TieredCredential {
+            tier: ConfigTier::User,
+            credential: RawCredential {
+                key: "CorpFeed".to_string(),
+                username: Some(RedactedSecret::new("user".to_string())),
+                password: None,
+                encrypted: true,
+            },
         };
         assert_matches!(
             expand_credential(&credential),
             Err(NuGetFeedUrlError::EncryptedPasswordUnsupported)
+        );
+    }
+
+    /// Issue #1434 S2: a `Project`-tagged credential fails closed as `HasCredentials`
+    /// unconditionally, before any other field (including a literal, non-`%VAR%` password) is
+    /// even read — proving the tier gate runs first, not merely as a fallback for expansion
+    /// failure. Exercises `expand_credential_with` directly with a panicking lookup, since a
+    /// literal value must never reach `lookup` at all.
+    #[test]
+    fn test_expand_credential_project_tier_rejects_literal_password() {
+        let credential = TieredCredential {
+            tier: ConfigTier::Project,
+            credential: RawCredential {
+                key: "CorpFeed".to_string(),
+                username: Some(RedactedSecret::new("user".to_string())),
+                password: Some(RedactedSecret::new("literal-pat".to_string())),
+                encrypted: false,
+            },
+        };
+        assert_matches!(
+            expand_credential_with(&credential, |_| panic!("lookup must not be called")),
+            Err(NuGetFeedUrlError::HasCredentials)
+        );
+    }
+
+    /// Issue #1434 S2: the `%VAR%` counterpart — a `Project`-tagged credential referencing an
+    /// environment variable is rejected the same way, and the variable is never looked up.
+    #[test]
+    fn test_expand_credential_project_tier_rejects_env_var_password() {
+        let credential = TieredCredential {
+            tier: ConfigTier::Project,
+            credential: RawCredential {
+                key: "CorpFeed".to_string(),
+                username: Some(RedactedSecret::new("user".to_string())),
+                password: Some(RedactedSecret::new("%CORP_FEED_PAT%".to_string())),
+                encrypted: false,
+            },
+        };
+        assert_matches!(
+            expand_credential_with(&credential, |_| panic!("lookup must not be called")),
+            Err(NuGetFeedUrlError::HasCredentials)
+        );
+    }
+
+    /// Issue #1434 S2: the `User`-tagged counterpart still expands a `%VAR%` password normally
+    /// — proving the rejection above is tier-gated, not a blanket ban.
+    #[test]
+    fn test_expand_credential_user_tier_still_expands_env_var_password() {
+        let credential = TieredCredential {
+            tier: ConfigTier::User,
+            credential: RawCredential {
+                key: "CorpFeed".to_string(),
+                username: Some(RedactedSecret::new("user".to_string())),
+                password: Some(RedactedSecret::new("%CORP_FEED_PAT%".to_string())),
+                encrypted: false,
+            },
+        };
+        let auth = expand_credential_with(&credential, |name| {
+            (name == "CORP_FEED_PAT").then(|| Zeroizing::new("secret-pat".to_string()))
+        })
+        .expect("User-tier %VAR% password must still expand");
+        assert_eq!(
+            auth.header_value(),
+            NuGetAuth::new("user", "secret-pat").header_value()
+        );
+    }
+
+    /// SC-002 (impl-critic M4): a `User`-tagged credential referencing an unset `%VAR%`
+    /// password still fails closed as `HasCredentials`, the counterpart to
+    /// `test_expand_credential_user_tier_still_expands_env_var_password` above — the tier
+    /// gate passes, but expansion itself still fails for the same reason it always did.
+    #[test]
+    fn test_expand_credential_user_tier_unset_env_var_fails_closed() {
+        let credential = TieredCredential {
+            tier: ConfigTier::User,
+            credential: RawCredential {
+                key: "CorpFeed".to_string(),
+                username: Some(RedactedSecret::new("user".to_string())),
+                password: Some(RedactedSecret::new("%CORP_FEED_PAT%".to_string())),
+                encrypted: false,
+            },
+        };
+        assert_matches!(
+            expand_credential_with(&credential, |_| None),
+            Err(NuGetFeedUrlError::HasCredentials)
         );
     }
 
@@ -4582,7 +4577,7 @@ mod tests {
                 &all_policy()
             )
             .unwrap(),),
-            tier: ConfigTier::Repo,
+            tier: ConfigTier::Project,
             auth: None,
         },
     );
