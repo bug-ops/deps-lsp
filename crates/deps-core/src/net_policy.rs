@@ -24,6 +24,8 @@ use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use crate::EcosystemId;
+
 /// Classification of a URL's host, for [`RegistryAccessPolicy`] to evaluate against
 /// [`WorkspaceRegistryAccess`].
 ///
@@ -453,8 +455,10 @@ impl Default for RegistryAccessPolicy {
 ///
 /// ```
 /// use deps_core::net_policy::{IndexUrlError, PolicyGate, RedactedUrl, validate_index_url};
+/// use deps_core::EcosystemId;
 ///
-/// let err = validate_index_url("not a url", "not a url", "cargo", PolicyGate::Skip).unwrap_err();
+/// let err =
+///     validate_index_url("not a url", "not a url", EcosystemId::Cargo, PolicyGate::Skip).unwrap_err();
 /// assert_eq!(err, IndexUrlError::InvalidUrl(RedactedUrl::new("not a url")));
 /// ```
 #[non_exhaustive]
@@ -488,6 +492,7 @@ pub enum IndexUrlError {
 /// # Examples
 ///
 /// ```
+/// use deps_core::EcosystemId;
 /// use deps_core::net_policy::{
 ///     PolicyGate, RegistryAccessPolicy, WorkspaceRegistryAccess, validate_index_url,
 /// };
@@ -497,7 +502,7 @@ pub enum IndexUrlError {
 ///     validate_index_url(
 ///         "https://index.mycorp.dev",
 ///         "https://index.mycorp.dev",
-///         "cargo",
+///         EcosystemId::Cargo,
 ///         PolicyGate::Skip
 ///     )
 ///     .is_ok()
@@ -506,7 +511,7 @@ pub enum IndexUrlError {
 ///     validate_index_url(
 ///         "https://index.mycorp.dev",
 ///         "https://index.mycorp.dev",
-///         "cargo",
+///         EcosystemId::Cargo,
 ///         PolicyGate::Enforce(&policy)
 ///     )
 ///     .is_err()
@@ -585,26 +590,32 @@ fn is_loopback_url(url: &url::Url) -> bool {
 /// # Examples
 ///
 /// ```
+/// use deps_core::EcosystemId;
 /// use deps_core::net_policy::{PolicyGate, validate_index_url};
 ///
 /// let url = validate_index_url(
 ///     "https://index.mycorp.dev",
 ///     "https://index.mycorp.dev",
-///     "cargo",
+///     EcosystemId::Cargo,
 ///     PolicyGate::Skip,
 /// )
 /// .unwrap();
 /// assert_eq!(url.as_str(), "https://index.mycorp.dev/");
 ///
 /// assert!(
-///     validate_index_url("http://example.com", "http://example.com", "cargo", PolicyGate::Skip)
-///         .is_err()
+///     validate_index_url(
+///         "http://example.com",
+///         "http://example.com",
+///         EcosystemId::Cargo,
+///         PolicyGate::Skip
+///     )
+///     .is_err()
 /// );
 /// ```
 pub fn validate_index_url(
     candidate: &str,
     raw_for_log: &str,
-    ecosystem: &'static str,
+    ecosystem: EcosystemId,
     gate: PolicyGate<'_>,
 ) -> Result<url::Url, IndexUrlError> {
     let url = url::Url::parse(candidate)
@@ -624,7 +635,7 @@ pub fn validate_index_url(
             tracing::warn!(
                 url = %RedactedUrl::new(raw_for_log),
                 ?class,
-                ecosystem,
+                %ecosystem,
                 "workspace-declared registry index host blocked by registries.workspace_registries policy"
             );
             return Err(IndexUrlError::BlockedHost { class });
@@ -673,6 +684,7 @@ pub mod private {
 /// # Examples
 ///
 /// ```
+/// use deps_core::EcosystemId;
 /// use deps_core::net_policy::{
 ///     IndexUrlError, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
 /// };
@@ -685,7 +697,9 @@ pub mod private {
 /// impl deps_core::net_policy::private::Sealed for MyIndexKind {}
 ///
 /// impl RegistryUrlKind for MyIndexKind {
-///     const ECOSYSTEM: &'static str = "my-ecosystem";
+///     // A real marker uses its own real `EcosystemId` variant; this example reuses `Cargo`'s
+///     // purely for illustration.
+///     const ECOSYSTEM: EcosystemId = EcosystemId::Cargo;
 ///     const REJECT_QUERY_FRAGMENT: bool = false;
 ///     type Error = IndexUrlError;
 /// }
@@ -697,7 +711,7 @@ pub mod private {
 /// ```
 pub trait RegistryUrlKind: private::Sealed {
     /// [`validate_index_url`]'s `ecosystem` tracing label for this kind.
-    const ECOSYSTEM: &'static str;
+    const ECOSYSTEM: EcosystemId;
     /// Whether a query string or fragment on the candidate is rejected outright, after the
     /// shared [`validate_index_url`] checks pass. `false` for every kind except `deps-go`'s (F3,
     /// spec 034 review): a `GOPROXY` hop is later suffixed with `/{module}/@v/...`, which has no
@@ -768,7 +782,9 @@ impl<K> Clone for ValidatedRegistryUrl<K> {
 /// ever instantiated with already implements `RegistryUrlKind`.
 impl<K: RegistryUrlKind> std::fmt::Debug for ValidatedRegistryUrl<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_tuple(K::ECOSYSTEM).field(&self.normalized).finish()
+        f.debug_tuple(K::ECOSYSTEM.id())
+            .field(&self.normalized)
+            .finish()
     }
 }
 
@@ -804,6 +820,7 @@ impl<K: RegistryUrlKind> ValidatedRegistryUrl<K> {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_core::net_policy::{
     ///     IndexUrlError, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
     /// };
@@ -813,7 +830,7 @@ impl<K: RegistryUrlKind> ValidatedRegistryUrl<K> {
     /// impl deps_core::net_policy::private::Sealed for MyIndexKind {}
     ///
     /// impl RegistryUrlKind for MyIndexKind {
-    ///     const ECOSYSTEM: &'static str = "my-ecosystem";
+    ///     const ECOSYSTEM: EcosystemId = EcosystemId::Cargo;
     ///     const REJECT_QUERY_FRAGMENT: bool = false;
     ///     type Error = IndexUrlError;
     /// }
@@ -977,22 +994,23 @@ impl<E> InvalidEntry<E> {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_core::net_policy::{IndexUrlError, InvalidEntry};
     ///
     /// let entry = InvalidEntry::logged(
     ///     "https://user:pass@example.com",
     ///     IndexUrlError::UserInfoPresent,
-    ///     "example-ecosystem",
+    ///     EcosystemId::Npm,
     ///     "index URL failed validation",
     /// );
     /// assert_eq!(entry.raw.to_string(), "https://***@example.com/");
     /// ```
-    pub fn logged(raw: &str, reason: E, ecosystem: &'static str, message: &'static str) -> Self
+    pub fn logged(raw: &str, reason: E, ecosystem: EcosystemId, message: &'static str) -> Self
     where
         E: std::fmt::Display,
     {
         let redacted = RedactedUrl::new(raw);
-        tracing::warn!(raw = %redacted, %reason, ecosystem, "{}", message);
+        tracing::warn!(raw = %redacted, %reason, %ecosystem, "{}", message);
         Self::new(redacted, reason)
     }
 }
@@ -1363,7 +1381,7 @@ mod tests {
         let result = validate_index_url(
             "https://user:pass@169.254.169.254/",
             "https://user:pass@169.254.169.254/",
-            "cargo",
+            EcosystemId::Cargo,
             PolicyGate::Enforce(&policy),
         );
         assert_eq!(result, Err(IndexUrlError::UserInfoPresent));
@@ -1379,7 +1397,7 @@ mod tests {
             validate_index_url(
                 "https://169.254.169.254/",
                 "https://169.254.169.254/",
-                "cargo",
+                EcosystemId::Cargo,
                 PolicyGate::Skip
             )
             .is_ok()
@@ -1388,7 +1406,7 @@ mod tests {
             validate_index_url(
                 "https://169.254.169.254/",
                 "https://169.254.169.254/",
-                "cargo",
+                EcosystemId::Cargo,
                 PolicyGate::Enforce(&policy)
             ),
             Err(IndexUrlError::BlockedHost { .. })
@@ -1405,7 +1423,8 @@ mod tests {
         let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::Off);
         let raw = "https://169.254.169.254/?ApiKey=super-secret-value";
         let log = crate::test_util::capture_tracing_output(|| {
-            let result = validate_index_url(raw, raw, "cargo", PolicyGate::Enforce(&policy));
+            let result =
+                validate_index_url(raw, raw, EcosystemId::Cargo, PolicyGate::Enforce(&policy));
             assert_matches!(result, Err(IndexUrlError::BlockedHost { .. }));
         });
         assert!(!log.contains("super-secret-value"), "log: {log}");
@@ -1418,7 +1437,7 @@ mod tests {
     #[test]
     fn test_validate_index_url_redacts_userinfo_in_invalid_url_error() {
         let raw = "https://user:hunter2@registry.example:99999/simple";
-        let err = validate_index_url(raw, raw, "cargo", PolicyGate::Skip).unwrap_err();
+        let err = validate_index_url(raw, raw, EcosystemId::Cargo, PolicyGate::Skip).unwrap_err();
         let IndexUrlError::InvalidUrl(redacted) = &err else {
             panic!("expected InvalidUrl, got {err:?}");
         };
@@ -1439,7 +1458,7 @@ mod tests {
     #[test]
     fn test_validate_index_url_invalid_url_redacts_query_string() {
         let raw = "https://user:hunter2@registry.example:99999/simple?token=super-secret-value";
-        for ecosystem in ["cargo", "npm"] {
+        for ecosystem in [EcosystemId::Cargo, EcosystemId::Npm] {
             let err = validate_index_url(raw, raw, ecosystem, PolicyGate::Skip).unwrap_err();
             let IndexUrlError::InvalidUrl(redacted) = &err else {
                 panic!("expected InvalidUrl, got {err:?}");
@@ -1469,7 +1488,7 @@ mod tests {
     impl private::Sealed for PermissiveTestKind {}
 
     impl RegistryUrlKind for PermissiveTestKind {
-        const ECOSYSTEM: &'static str = "test-permissive";
+        const ECOSYSTEM: EcosystemId = EcosystemId::Cargo;
         const REJECT_QUERY_FRAGMENT: bool = false;
         type Error = IndexUrlError;
     }
@@ -1481,7 +1500,7 @@ mod tests {
     impl private::Sealed for RejectingTestKind {}
 
     impl RegistryUrlKind for RejectingTestKind {
-        const ECOSYSTEM: &'static str = "test-rejecting";
+        const ECOSYSTEM: EcosystemId = EcosystemId::Go;
         const REJECT_QUERY_FRAGMENT: bool = true;
         type Error = IndexUrlError;
     }
@@ -1547,10 +1566,7 @@ mod tests {
             &permissive_policy(),
         )
         .unwrap();
-        assert_eq!(
-            format!("{url:?}"),
-            "test-permissive(\"https://example.com\")"
-        );
+        assert_eq!(format!("{url:?}"), "cargo(\"https://example.com\")");
     }
 
     /// Backs [`ValidatedRegistryUrl`]'s doc claim that `Send`/`Sync` stay unconditional

@@ -35,6 +35,7 @@
 use std::collections::HashMap;
 
 use deps_core::BlockedSourceClass;
+use deps_core::EcosystemId;
 #[cfg(test)]
 use deps_core::net_policy::HostClass;
 use deps_core::net_policy::{
@@ -55,7 +56,7 @@ pub enum PypiIndexKind {}
 impl deps_core::net_policy::private::Sealed for PypiIndexKind {}
 
 impl RegistryUrlKind for PypiIndexKind {
-    const ECOSYSTEM: &'static str = "pypi";
+    const ECOSYSTEM: EcosystemId = EcosystemId::Pypi;
     const REJECT_QUERY_FRAGMENT: bool = false;
     type Error = PypiIndexUrlError;
 }

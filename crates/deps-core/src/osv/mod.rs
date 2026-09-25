@@ -25,9 +25,9 @@ use dashmap::DashMap;
 
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 pub use types::{
-    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, ScanOutcome, ScanTarget,
-    SkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, is_valid_osv_id,
-    validated_osv_url, vuln_key_for, vulnerability_keys,
+    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, OsvVersion, ScanOutcome,
+    ScanTarget, SkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
+    is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
 };
 use types::{
     OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
@@ -120,7 +120,7 @@ struct RecordCacheEntry {
 /// every open document's scan benefits from the same query/record cache.
 pub struct OsvClient {
     cache: Arc<HttpCache>,
-    query_cache: DashMap<(&'static str, String, String), QueryCacheEntry>,
+    query_cache: DashMap<(&'static str, String, OsvVersion), QueryCacheEntry>,
     record_cache: DashMap<String, RecordCacheEntry>,
     /// Overridable in test builds only, so `mockito` can stand in for
     /// `https://api.osv.dev` — mirrors [`crate::cache::ensure_https`]'s existing
@@ -367,7 +367,7 @@ impl OsvClient {
                     name: t.osv_name.clone(),
                     ecosystem: osv_eco.to_string(),
                 },
-                version: t.version.clone(),
+                version: t.version.clone().into_string(),
             })
             .collect();
 
@@ -632,7 +632,7 @@ impl OsvClient {
                 name: target.osv_name.clone(),
                 ecosystem: osv_eco.to_string(),
             },
-            version: target.version.clone(),
+            version: target.version.clone().into_string(),
         };
 
         let bytes = match self.cache.post_json(&url, &body).await {
@@ -740,7 +740,7 @@ fn log_scan_summary(outcomes: &VulnerabilityMap) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EcosystemId;
+    use crate::{ConcreteVersion, EcosystemId};
     use std::assert_matches;
 
     fn client() -> OsvClient {
@@ -759,8 +759,8 @@ mod tests {
         ScanTarget {
             key: crate::test_util::vuln_key(name),
             osv_name: name.to_string(),
-            version: version.to_string(),
-            display_version: version.to_string(),
+            version: OsvVersion::new(version),
+            display_version: ConcreteVersion::new(version),
         }
     }
 
@@ -1011,7 +1011,7 @@ mod tests {
         assert_eq!(dv.advisories.items()[0].severity, VulnSeverity::Critical);
         assert_eq!(
             dv.advisories.items()[0].fixed_versions,
-            vec!["2.17.1".to_string()]
+            vec![OsvVersion::new("2.17.1")]
         );
     }
 
@@ -1127,11 +1127,14 @@ mod tests {
             vec![
                 "0.1.43", "0.1.44", "0.2.0", "0.2.1", "0.2.2", "0.2.3", "0.2.4", "0.2.23"
             ]
+            .into_iter()
+            .map(OsvVersion::new)
+            .collect::<Vec<_>>()
         );
         // The highest fixed version, not the first in document order.
         assert_eq!(
             dv.advisories.items()[0].fixed_versions.last(),
-            Some(&"0.2.23".to_string())
+            Some(&OsvVersion::new("0.2.23"))
         );
     }
 
@@ -1392,8 +1395,8 @@ mod tests {
         let candidate = ScanTarget {
             key: crate::test_util::vuln_key("golang.org/x/text"),
             osv_name: "golang.org/x/text".to_string(),
-            version: "0.4.0".to_string(),
-            display_version: "v0.4.0".to_string(),
+            version: OsvVersion::new("0.4.0"),
+            display_version: ConcreteVersion::new("v0.4.0"),
         };
         let statuses = client
             .check_candidates(EcosystemId::Go, &[candidate], TEST_TIMEOUT)

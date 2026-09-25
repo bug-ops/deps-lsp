@@ -912,15 +912,20 @@ pub trait OsvNaming: Send + Sync {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::ConcreteVersion;
     /// use deps_core::lsp_helpers::OsvNaming;
+    /// use deps_core::osv::OsvVersion;
     ///
     /// struct DefaultFormatter;
     /// impl OsvNaming for DefaultFormatter {}
     ///
-    /// assert_eq!(DefaultFormatter.osv_version_to_native("1.2.3"), "1.2.3");
+    /// assert_eq!(
+    ///     DefaultFormatter.osv_version_to_native(&OsvVersion::new("1.2.3")),
+    ///     ConcreteVersion::new("1.2.3")
+    /// );
     /// ```
-    fn osv_version_to_native(&self, version: &str) -> String {
-        version.to_string()
+    fn osv_version_to_native(&self, version: &crate::osv::OsvVersion) -> ConcreteVersion {
+        ConcreteVersion::new(version.as_str())
     }
 
     /// Rewrites a native-ecosystem version string into the spelling OSV.dev's
@@ -948,16 +953,23 @@ pub trait OsvNaming: Send + Sync {
     /// # Examples
     ///
     /// ```
+    /// use deps_core::ConcreteVersion;
     /// use deps_core::lsp_helpers::OsvNaming;
     ///
     /// struct DefaultFormatter;
     /// impl OsvNaming for DefaultFormatter {}
     ///
-    /// assert_eq!(DefaultFormatter.osv_version("1.2.3"), "1.2.3");
-    /// assert_eq!(DefaultFormatter.osv_version("v1.2.3"), "1.2.3");
+    /// assert_eq!(
+    ///     DefaultFormatter.osv_version(&ConcreteVersion::new("1.2.3")),
+    ///     "1.2.3"
+    /// );
+    /// assert_eq!(
+    ///     DefaultFormatter.osv_version(&ConcreteVersion::new("v1.2.3")),
+    ///     "1.2.3"
+    /// );
     /// ```
-    fn osv_version(&self, version: &str) -> String {
-        crate::github::normalize_tag(version).to_string()
+    fn osv_version(&self, version: &ConcreteVersion) -> crate::osv::OsvVersion {
+        crate::osv::OsvVersion::new(crate::github::normalize_tag(version.as_str()))
     }
 }
 

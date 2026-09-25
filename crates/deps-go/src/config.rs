@@ -32,6 +32,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+use deps_core::EcosystemId;
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, RedactedUrl, RegistryAccessPolicy, RegistryUrlKind,
     ValidatedRegistryUrl,
@@ -52,7 +53,7 @@ pub enum GoProxyKind {}
 impl deps_core::net_policy::private::Sealed for GoProxyKind {}
 
 impl RegistryUrlKind for GoProxyKind {
-    const ECOSYSTEM: &'static str = "go";
+    const ECOSYSTEM: EcosystemId = EcosystemId::Go;
     /// F3 (spec 034 review): every request URL is built by appending
     /// `/{module}/@v/...`/`/{module}/@latest` after this normalized base
     /// (`crate::registry::versions_list_url_at` and friends) — a hop carrying a query string or

@@ -33,7 +33,7 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
-use deps_core::{DepsError, HttpCache, PackageName, Result, net_policy::RedactedUrl};
+use deps_core::{DepsError, EcosystemId, HttpCache, PackageName, Result, net_policy::RedactedUrl};
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use std::any::Any;
@@ -471,7 +471,7 @@ impl CargoRegistry {
         register_capped_with_occupied(
             &self.alternates,
             key,
-            "Cargo",
+            EcosystemId::Cargo,
             KeyShape::Url,
             || {
                 Arc::new(SparseIndexClient::with_auth(

@@ -420,10 +420,9 @@ mod tests {
         // ecosystems use — must itself satisfy the requirement text that
         // edit produces.
         let formatter = PypiFormatter;
-        let osv_version = "2.28.0";
-        let native = formatter.osv_version_to_native(osv_version);
-        assert_eq!(native, osv_version);
-        let native = ConcreteVersion::new(native);
+        let osv_version = deps_core::osv::OsvVersion::new("2.28.0");
+        let native = formatter.osv_version_to_native(&osv_version);
+        assert_eq!(native, osv_version.as_str());
         let edit_text = formatter.format_version_for_text_edit(&native);
         assert!(formatter.version_satisfies_requirement(&native, &edit_text));
     }
@@ -436,10 +435,9 @@ mod tests {
         // written for. Same property, retargeted at the method the fix
         // path actually calls, across every `current` shape it recognizes.
         let formatter = PypiFormatter;
-        let osv_version = "2.28.0";
-        let native = formatter.osv_version_to_native(osv_version);
-        assert_eq!(native, osv_version);
-        let native = ConcreteVersion::new(native);
+        let osv_version = deps_core::osv::OsvVersion::new("2.28.0");
+        let native = formatter.osv_version_to_native(&osv_version);
+        assert_eq!(native, osv_version.as_str());
 
         for current in ["==2.20.0", "==2.20.*", "~=2.20", "~=2.20.0", ">=2.20,<2.21"] {
             let edit_text = formatter.format_version_replacing(&native, current);

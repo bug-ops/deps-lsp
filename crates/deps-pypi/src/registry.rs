@@ -16,7 +16,7 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, FreshnessSettings, HttpCache, Result, lsp_helpers::warn_rejected_value,
+    DepsError, EcosystemId, FreshnessSettings, HttpCache, Result, lsp_helpers::warn_rejected_value,
     not_found_or as core_not_found_or, registry::register_capped,
 };
 use pep440_rs::{Version, VersionSpecifiers};
@@ -310,7 +310,7 @@ impl PypiRegistry {
         register_capped(
             &root.alternates,
             chain.key.clone(),
-            "PyPI",
+            EcosystemId::Pypi,
             chain.key_shape,
             || {
                 let mut fallback_chain: Vec<Arc<Self>> = rest_hops
@@ -2413,7 +2413,7 @@ mod tests {
         });
 
         assert!(
-            log.contains("PyPI alternate registry cap reached"),
+            log.contains("pypi alternate registry cap reached"),
             "log: {log}"
         );
         assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");

@@ -1,6 +1,6 @@
 use crate::error::{DepsError, Result};
 use crate::parser::DependencySource;
-use crate::{ConcreteVersion, PackageName, VersionReq};
+use crate::{ConcreteVersion, EcosystemId, PackageName, VersionReq};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
 use std::any::Any;
@@ -1160,7 +1160,7 @@ pub enum CapResult {
 /// while `entry()` holds a write guard on one — checking capacity from inside the `Vacant`
 /// arm would self-deadlock on that shard.
 ///
-/// `ecosystem` names the caller in the cap-reached log line (e.g. `"npm"`, `"PyPI"`).
+/// `ecosystem` names the caller in the cap-reached log line.
 /// `key_shape` picks how `key` is rendered in that same line — see [`KeyShape`].
 ///
 /// Returns [`CapResult::Inserted`] when `make()` was inserted, [`CapResult::AlreadyPresent`]
@@ -1171,15 +1171,16 @@ pub enum CapResult {
 ///
 /// ```
 /// use dashmap::DashMap;
+/// use deps_core::EcosystemId;
 /// use deps_core::registry::{CapResult, KeyShape, register_capped};
 ///
 /// let map: DashMap<String, u32> = DashMap::new();
 /// assert_eq!(
-///     register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 1),
+///     register_capped(&map, "a".to_string(), EcosystemId::Cargo, KeyShape::Opaque, || 1),
 ///     CapResult::Inserted
 /// );
 /// assert_eq!(
-///     register_capped(&map, "a".to_string(), "test", KeyShape::Opaque, || 2),
+///     register_capped(&map, "a".to_string(), EcosystemId::Cargo, KeyShape::Opaque, || 2),
 ///     CapResult::AlreadyPresent
 /// );
 /// assert_eq!(*map.get("a").unwrap(), 1);
@@ -1187,7 +1188,7 @@ pub enum CapResult {
 pub fn register_capped<K, V>(
     map: &DashMap<K, V>,
     key: K,
-    ecosystem: &'static str,
+    ecosystem: EcosystemId,
     key_shape: KeyShape,
     make: impl FnOnce() -> V,
 ) -> CapResult
@@ -1216,14 +1217,22 @@ where
 ///
 /// ```
 /// use dashmap::DashMap;
+/// use deps_core::EcosystemId;
 /// use deps_core::registry::{CapResult, KeyShape, register_capped_with_occupied};
 ///
 /// let map: DashMap<String, u32> = DashMap::new();
-/// register_capped_with_occupied(&map, "a".to_string(), "test", KeyShape::Opaque, || 1, |_| {});
+/// register_capped_with_occupied(
+///     &map,
+///     "a".to_string(),
+///     EcosystemId::Cargo,
+///     KeyShape::Opaque,
+///     || 1,
+///     |_| {},
+/// );
 /// let outcome = register_capped_with_occupied(
 ///     &map,
 ///     "a".to_string(),
-///     "test",
+///     EcosystemId::Cargo,
 ///     KeyShape::Opaque,
 ///     || 1,
 ///     |v| *v += 10,
@@ -1234,7 +1243,7 @@ where
 pub fn register_capped_with_occupied<K, V>(
     map: &DashMap<K, V>,
     key: K,
-    ecosystem: &'static str,
+    ecosystem: EcosystemId,
     key_shape: KeyShape,
     make: impl FnOnce() -> V,
     on_occupied: impl FnOnce(&mut V),
@@ -1263,6 +1272,7 @@ where
                 tracing::warn!(
                     key = %rendered_key,
                     cap = MAX_ALTERNATE_REGISTRIES,
+                    %ecosystem,
                     "{ecosystem} alternate registry cap reached; not registering a new entry"
                 );
                 return CapResult::RefusedAtCapacity;
@@ -1828,7 +1838,7 @@ mod tests {
                 register_capped(
                     &map,
                     format!("https://index{i}.example"),
-                    "test",
+                    EcosystemId::Cargo,
                     KeyShape::Url,
                     || i,
                 ),
@@ -1840,14 +1850,14 @@ mod tests {
             register_capped(
                 &map,
                 "https://overflow.example/?api_key=SUPERSECRET_TOKEN".to_string(),
-                "test",
+                EcosystemId::Cargo,
                 KeyShape::Url,
                 || 0,
             );
         });
 
         assert!(
-            log.contains("test alternate registry cap reached"),
+            log.contains("cargo alternate registry cap reached"),
             "log: {log}"
         );
         assert!(!log.contains("SUPERSECRET_TOKEN"), "log: {log}");
@@ -1866,18 +1876,24 @@ mod tests {
         for i in 0..MAX_ALTERNATE_REGISTRIES {
             let key = hash_routing_key("test-chain", std::iter::once(i.to_string().as_str()));
             assert_eq!(
-                register_capped(&map, key, "test", KeyShape::Opaque, || i),
+                register_capped(&map, key, EcosystemId::Cargo, KeyShape::Opaque, || i),
                 CapResult::Inserted
             );
         }
 
         let overflow_key = hash_routing_key("test-chain", std::iter::once("overflow"));
         let log = crate::test_util::capture_tracing_output(|| {
-            register_capped(&map, overflow_key.clone(), "test", KeyShape::Opaque, || 0);
+            register_capped(
+                &map,
+                overflow_key.clone(),
+                EcosystemId::Cargo,
+                KeyShape::Opaque,
+                || 0,
+            );
         });
 
         assert!(
-            log.contains("test alternate registry cap reached"),
+            log.contains("cargo alternate registry cap reached"),
             "log: {log}"
         );
         assert!(

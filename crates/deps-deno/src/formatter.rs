@@ -453,7 +453,13 @@ mod tests {
     #[test]
     fn test_osv_version_strips_v_prefix() {
         let formatter = DenoFormatter;
-        assert_eq!(formatter.osv_version("v4.17.0"), "4.17.0");
-        assert_eq!(formatter.osv_version("4.17.0"), "4.17.0");
+        assert_eq!(
+            formatter.osv_version(&ConcreteVersion::new("v4.17.0")),
+            "4.17.0"
+        );
+        assert_eq!(
+            formatter.osv_version(&ConcreteVersion::new("4.17.0")),
+            "4.17.0"
+        );
     }
 }
