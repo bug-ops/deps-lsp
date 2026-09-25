@@ -811,7 +811,7 @@ fn resolve_registries(
                     blocked.insert(alias.clone(), class);
                 }
                 Err(error) => {
-                    if let Some(reason) = error.rejection_reason() {
+                    if let Some(reason) = error.rejection_reason().into_reason() {
                         rejected.insert(alias.clone(), reason);
                     }
                     tracing::warn!(alias, %error, "registry index failed validation");
@@ -896,7 +896,7 @@ fn resolve_cargo_home_tier(
             }
             Err(error) => {
                 tracing::warn!(alias, %error, "CARGO_REGISTRIES_*_INDEX environment override failed validation");
-                env_rejection = error.rejection_reason();
+                env_rejection = error.rejection_reason().into_reason();
             }
         }
     }
@@ -921,7 +921,7 @@ fn resolve_cargo_home_tier(
             // reporting the file-tier's unrelated failure instead would misattribute why the
             // env override the user actually set didn't take effect.
             env_rejection
-                .or_else(|| error.rejection_reason())
+                .or_else(|| error.rejection_reason().into_reason())
                 .map_or(CargoHomeResolution::Absent, CargoHomeResolution::Rejected)
         }
     }

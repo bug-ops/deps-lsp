@@ -1016,6 +1016,32 @@ pub enum RejectionOutcome {
     IntentionallySilent,
 }
 
+impl RejectionOutcome {
+    /// Extracts the [`RegistryRejectionReason`] a caller should report, collapsing
+    /// [`Self::HandledByBlockedHostPath`] and [`Self::IntentionallySilent`] to `None` — both
+    /// mean "do not surface a reason here", just for different reasons.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{RegistryRejectionReason, RejectionOutcome};
+    ///
+    /// assert_eq!(
+    ///     RejectionOutcome::Reject(RegistryRejectionReason::NotHttps).into_reason(),
+    ///     Some(RegistryRejectionReason::NotHttps)
+    /// );
+    /// assert!(RejectionOutcome::HandledByBlockedHostPath.into_reason().is_none());
+    /// assert!(RejectionOutcome::IntentionallySilent.into_reason().is_none());
+    /// ```
+    #[must_use]
+    pub const fn into_reason(self) -> Option<RegistryRejectionReason> {
+        match self {
+            Self::Reject(reason) => Some(reason),
+            Self::HandledByBlockedHostPath | Self::IntentionallySilent => None,
+        }
+    }
+}
+
 /// Whether an ecosystem's own validation-failure reason names a rejection other than a
 /// policy-blocked host — the shared half of [`InvalidEntry::rejection_reason`].
 ///
@@ -1182,12 +1208,10 @@ impl<E: RegistryRejectionClassifier> InvalidEntry<E> {
     /// ```
     #[must_use]
     pub fn rejection_reason(&self) -> Option<(RegistryRejectionReason, String)> {
-        match self.reason.rejection_reason() {
-            RejectionOutcome::Reject(reason) => Some((reason, self.raw.to_string())),
-            RejectionOutcome::HandledByBlockedHostPath | RejectionOutcome::IntentionallySilent => {
-                None
-            }
-        }
+        self.reason
+            .rejection_reason()
+            .into_reason()
+            .map(|reason| (reason, self.raw.to_string()))
     }
 }
 
