@@ -402,7 +402,8 @@ mod tests {
              regex = \"@REGEX_VERSION@\"\n\
              rand = \"%RAND_VERSION%\"\n\
              clap = \"<%= CLAP_VERSION %>\"\n\
-             anyhow = \"$(ANYHOW_VERSION)\"\n";
+             anyhow = \"$(ANYHOW_VERSION)\"\n\
+             thiserror = \"$(THISERROR-VERSION)\"\n";
     }
 
     // #758: the shared completion-prefix-length guard, replacing two hand-written tests.

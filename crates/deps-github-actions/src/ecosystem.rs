@@ -1319,7 +1319,7 @@ mod tests {
         build: GithubActionsEcosystem::new(Arc::new(deps_core::HttpCache::new()));
         reachable: true;
         fixture: ".github/workflows/unresolved.yml" =>
-            "on: push\njobs:\n  build:\n    steps:\n      - uses: \"actions/checkout@${{ env.CHECKOUT_REF }}\"\n      - uses: \"actions/setup-node@v4-${{ env.NODE_REF }}\"\n      - uses: \"actions/cache@$(CACHE_REF)\"\n";
+            "on: push\njobs:\n  build:\n    steps:\n      - uses: \"actions/checkout@${{ env.CHECKOUT_REF }}\"\n      - uses: \"actions/setup-node@v4-${{ env.NODE_REF }}\"\n      - uses: \"actions/cache@$(CACHE_REF)\"\n      - uses: \"actions/upload-artifact@$(UPLOAD-REF)\"\n";
     }
 
     // #1137: regression guard, not independent parser verification (see

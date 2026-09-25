@@ -717,7 +717,8 @@ mod tests {
              scipy = \"@SCIPY_VERSION@\"\n\
              requests = \"%REQUESTS_VERSION%\"\n\
              flask = \"<%= FLASK_VERSION %>\"\n\
-             django = \"$(DJANGO_VERSION)\"\n";
+             django = \"$(DJANGO_VERSION)\"\n\
+             gunicorn = \"$(GUNICORN-VERSION)\"\n";
     }
 
     // #758: the shared completion-prefix-length guard
