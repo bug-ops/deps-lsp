@@ -359,6 +359,7 @@ mod tests {
     /// server, for tests that need a genuine signal without hand-constructing
     /// `TyposquatSignal` (it's `#[non_exhaustive]`, deliberately not publicly constructible)
     /// and without re-deriving the mock setup at every call site.
+    #[cfg(feature = "npm")]
     async fn resolve_test_crossenv_typosquat_signal(
         ecosystem: &dyn deps_core::Ecosystem,
         parse_result: &dyn deps_core::ParseResult,
@@ -480,6 +481,7 @@ mod tests {
     /// regression reintroduced an inline deps.dev `.await` here, this would either hang
     /// against the real `https://api.deps.dev` `state.deps_dev` still points at (never
     /// otherwise reached in this test) or blow well past the timeout.
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_generate_diagnostics_internal_typosquat_prefetch_is_synchronous() {
         use crate::document::DocumentState;
@@ -557,6 +559,7 @@ mod tests {
     /// after it's turned off, simulated here by disabling only *after* populating the map
     /// directly (bypassing the prefetch, which would itself never repopulate once
     /// disabled — this test isolates the read-side half of the fix).
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_generate_diagnostics_internal_typosquat_disabled_suppresses_stale_signal() {
         use crate::document::DocumentState;
@@ -621,6 +624,7 @@ mod tests {
     /// the server goes offline, same rationale as the disabled case above, checked via the
     /// `offline` parameter `generate_diagnostics_internal` already threads through (still
     /// enabled the whole time, unlike the sibling test).
+    #[cfg(feature = "npm")]
     #[tokio::test]
     async fn test_generate_diagnostics_internal_offline_suppresses_stale_signal() {
         use crate::document::DocumentState;
