@@ -51,6 +51,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use deps_core::config_trust::{self, ConfigTier, EnvVarSyntax};
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
     RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, ValidatedRegistryUrl,
@@ -63,23 +64,10 @@ use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClas
 #[non_exhaustive]
 #[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum NpmRegistryIndexError {
-    /// The value did not parse as a URL at all.
-    #[error("not a valid URL: {0}")]
-    InvalidUrl(RedactedUrl),
-    /// The URL's scheme is not `https` (the sole carve-out is a `cfg(test)`/`test-util`-only
-    /// `http` loopback host — see [`NpmRegistryIndex::new`]).
-    #[error("registry index must use https, got scheme {0:?}")]
-    NotHttps(String),
-    /// The URL carries a `user:pass@`/`user@` component.
-    #[error("registry index URL must not carry userinfo")]
-    UserInfoPresent,
-    /// The candidate's host is blocked by the current
-    /// [`deps_core::net_policy::WorkspaceRegistryAccess`] policy.
-    #[error("registry index host class {class} blocked by registries.workspace_registries policy")]
-    BlockedHost {
-        /// The blocked host's classification.
-        class: HostClass,
-    },
+    /// Not a valid URL, wrong scheme, userinfo present, or a policy-blocked host — see
+    /// [`IndexUrlError`].
+    #[error(transparent)]
+    Url(#[from] IndexUrlError),
     /// A `${VAR}` placeholder in the value names an environment variable that is not set
     /// (FR-007) — the whole value is invalid, never fetched as the literal
     /// `${VAR}`-containing string.
@@ -96,17 +84,13 @@ pub enum NpmRegistryIndexError {
     ExpansionNotAllowedInProjectTier,
 }
 
-impl From<IndexUrlError> for NpmRegistryIndexError {
-    fn from(error: IndexUrlError) -> Self {
+impl From<config_trust::EnvExpansionError> for NpmRegistryIndexError {
+    fn from(error: config_trust::EnvExpansionError) -> Self {
         match error {
-            // `raw` is already a `RedactedUrl` (issue #808) — no further redaction needed.
-            IndexUrlError::InvalidUrl(raw) => Self::InvalidUrl(raw),
-            IndexUrlError::NotHttps(scheme) => Self::NotHttps(scheme),
-            IndexUrlError::UserInfoPresent => Self::UserInfoPresent,
-            IndexUrlError::BlockedHost { class } => Self::BlockedHost { class },
-            // `#[non_exhaustive]` (issue #769): an unmapped upstream variant still surfaces
-            // via its own message rather than failing to compile.
-            other => Self::InvalidUrl(other.to_string().into()),
+            config_trust::EnvExpansionError::UndefinedVar { name } => Self::UndefinedEnvVar(name),
+            config_trust::EnvExpansionError::NotAllowedInProjectTier => {
+                Self::ExpansionNotAllowedInProjectTier
+            }
         }
     }
 }
@@ -114,8 +98,8 @@ impl From<IndexUrlError> for NpmRegistryIndexError {
 impl BlockedHostReason for NpmRegistryIndexError {
     fn blocked_host_class(&self) -> Option<HostClass> {
         match self {
-            Self::BlockedHost { class } => Some(*class),
-            _ => None,
+            Self::Url(e) => e.blocked_host_class(),
+            Self::UndefinedEnvVar(_) | Self::ExpansionNotAllowedInProjectTier => None,
         }
     }
 }
@@ -406,73 +390,6 @@ fn parse_npmrc_raw(path: &Path, content: &str) -> RawNpmrc {
     out
 }
 
-/// The `.npmrc` env-var placeholder syntax's opening token (FR-007) — the single source of
-/// truth for both [`expand_env_vars_with`]'s scan and `resolve_entry`'s project-tier
-/// rejection gate (issue #1420), so a future placeholder syntax addition (e.g. a `$(VAR)`
-/// Makefile/MSBuild-style form, as added elsewhere in this workspace for a different purpose)
-/// cannot silently update the expander without also updating the gate, reopening the
-/// exfiltration vector for the new syntax.
-const ENV_VAR_PLACEHOLDER_START: &str = "${";
-
-/// Expands every `${VAR}` placeholder in `raw` from the process environment (FR-007).
-///
-/// Returns `Ok(expanded)` when every referenced variable is set (including the trivial case
-/// of no `${...}` placeholder at all), or `Err(var_name)` naming the first undefined
-/// variable encountered.
-fn expand_env_vars(raw: &str) -> Result<String, String> {
-    expand_env_vars_with(raw, |name| std::env::var(name).ok())
-}
-
-/// [`expand_env_vars`], but reading variables through `lookup` instead of
-/// [`std::env::var`] directly — lets tests inject a fake environment instead of mutating the
-/// real process environment (this workspace forbids `unsafe`, and Rust 2024 made
-/// `std::env::set_var` an `unsafe fn`, so a test cannot do that mutation at all).
-// All indices come from `find(ENV_VAR_PLACEHOLDER_START)`/`find('}')`, both ASCII tokens, so
-// every slice bound is always a char boundary.
-#[allow(clippy::string_slice)]
-fn expand_env_vars_with(
-    raw: &str,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> Result<String, String> {
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(start) = rest.find(ENV_VAR_PLACEHOLDER_START) {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + ENV_VAR_PLACEHOLDER_START.len()..];
-        let Some(end) = after.find('}') else {
-            // No closing brace: keep the rest of the string literal, same as npm's own
-            // parser does for a malformed placeholder.
-            out.push_str(&rest[start..]);
-            rest = "";
-            break;
-        };
-        let var_name = &after[..end];
-        match lookup(var_name) {
-            Some(value) => out.push_str(&value),
-            None => return Err(var_name.to_string()),
-        }
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
-
-/// Which `.npmrc` tier a raw `registry=`/`@scope:registry=` value was read from (issue
-/// #1420) — gates whether [`resolve_entry`] ever attempts `${VAR}` expansion at all.
-///
-/// A type-level distinction rather than a `bool`/string flag: [`resolve_entry`]'s tier
-/// parameter must always be one of exactly these two values, and every call site names the
-/// tier it read the value from explicitly (see [`resolve_with_home`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigTier {
-    /// Ancestor-walked from the opened manifest's directory. Attacker-controlled the
-    /// instant a hostile repository is cloned — `${VAR}` is never expanded here.
-    Project,
-    /// `~/.npmrc`. Not attacker-controlled the way a cloned repository's own files are, so
-    /// `${VAR}` expansion (FR-007) is safe.
-    User,
-}
-
 /// A raw `.npmrc` value paired with the tier it was read from, as [`resolve_with_home`]
 /// collects before calling [`resolve_entry`] — a named pair rather than a positional
 /// `(String, ConfigTier)` tuple, matching this project's preference for concrete types over
@@ -501,7 +418,9 @@ struct TieredRawValue {
 /// (#767 S2b, matching this function's own M1 threat-model note above about literal userinfo).
 ///
 /// `tier` gates expansion itself (issue #1420, amending FR-007): a project-tier `raw`
-/// containing `${` is rejected outright, before [`expand_env_vars`] ever runs, so a hostile
+/// containing `${` is rejected outright, before
+/// [`config_trust::expand_env_vars`](deps_core::config_trust::expand_env_vars) ever runs, so a
+/// hostile
 /// project-tier `.npmrc` can never have an environment variable's value substituted into a URL
 /// this function — or a caller fetching the [`NpmRegistryIndex`] it would have produced — ever
 /// sees.
@@ -510,41 +429,35 @@ fn resolve_entry(
     tier: ConfigTier,
     policy: &RegistryAccessPolicy,
 ) -> Result<NpmRegistryIndex, InvalidEntry> {
-    if tier == ConfigTier::Project && raw.contains(ENV_VAR_PLACEHOLDER_START) {
-        let redacted = RedactedUrl::new(raw);
-        tracing::warn!(
-            raw = %redacted,
-            "project-tier npm registry value uses env-var expansion syntax, which is only \
-             permitted for the user tier; rejecting entry"
-        );
-        return Err(InvalidEntry::new(
-            redacted,
-            NpmRegistryIndexError::ExpansionNotAllowedInProjectTier,
-        ));
-    }
-
-    match expand_env_vars(raw) {
-        Ok(expanded) => {
-            NpmRegistryIndex::new_with_raw_for_log(&expanded, raw, policy).map_err(|reason| {
+    match config_trust::expand_env_vars(raw, EnvVarSyntax::Shell, tier, config_trust::process_env) {
+        Ok(expanded) => NpmRegistryIndex::new_with_raw_for_log(expanded.as_str(), raw, policy)
+            .map_err(|reason| {
                 InvalidEntry::logged(
                     raw,
                     reason,
                     NpmRegistryIndexKind::ECOSYSTEM,
                     "npm registry index failed validation",
                 )
-            })
-        }
-        Err(var) => {
+            }),
+        Err(err) => {
             let redacted = RedactedUrl::new(raw);
-            tracing::warn!(
-                raw = %redacted,
-                var,
-                "npm registry value references an undefined environment variable"
-            );
-            Err(InvalidEntry::new(
-                redacted,
-                NpmRegistryIndexError::UndefinedEnvVar(var),
-            ))
+            match &err {
+                config_trust::EnvExpansionError::NotAllowedInProjectTier => {
+                    tracing::warn!(
+                        raw = %redacted,
+                        "project-tier npm registry value uses env-var expansion syntax, which \
+                         is only permitted for the user tier; rejecting entry"
+                    );
+                }
+                config_trust::EnvExpansionError::UndefinedVar { name } => {
+                    tracing::warn!(
+                        raw = %redacted,
+                        var = %name,
+                        "npm registry value references an undefined environment variable"
+                    );
+                }
+            }
+            Err(InvalidEntry::new(redacted, err.into()))
         }
     }
 }
@@ -773,7 +686,7 @@ mod tests {
         let policy = all_policy();
         assert_matches!(
             NpmRegistryIndex::new("http://registry.example.com", &policy),
-            Err(NpmRegistryIndexError::NotHttps(_))
+            Err(NpmRegistryIndexError::Url(IndexUrlError::NotHttps(_)))
         );
     }
 
@@ -784,7 +697,7 @@ mod tests {
         let policy = all_policy();
         assert_matches!(
             NpmRegistryIndex::new("http://localhost.evil.com", &policy),
-            Err(NpmRegistryIndexError::NotHttps(_))
+            Err(NpmRegistryIndexError::Url(IndexUrlError::NotHttps(_)))
         );
     }
 
@@ -800,7 +713,7 @@ mod tests {
         let policy = all_policy();
         assert_matches!(
             NpmRegistryIndex::new("https://user:pass@npm.example", &policy),
-            Err(NpmRegistryIndexError::UserInfoPresent)
+            Err(NpmRegistryIndexError::Url(IndexUrlError::UserInfoPresent))
         );
     }
 
@@ -809,7 +722,7 @@ mod tests {
         let policy = all_policy();
         assert_matches!(
             NpmRegistryIndex::new("not-a-valid-url", &policy),
-            Err(NpmRegistryIndexError::InvalidUrl(_))
+            Err(NpmRegistryIndexError::Url(IndexUrlError::InvalidUrl(_)))
         );
     }
 
@@ -843,11 +756,15 @@ mod tests {
         assert!(NpmRegistryIndex::new("https://127.0.0.1:4873", &all_policy()).is_ok());
         assert_matches!(
             NpmRegistryIndex::new("https://127.0.0.1:4873", &public_only_policy()),
-            Err(NpmRegistryIndexError::BlockedHost { .. })
+            Err(NpmRegistryIndexError::Url(
+                IndexUrlError::BlockedHost { .. }
+            ))
         );
         assert_matches!(
             NpmRegistryIndex::new("https://127.0.0.1:4873", &off_policy()),
-            Err(NpmRegistryIndexError::BlockedHost { .. })
+            Err(NpmRegistryIndexError::Url(
+                IndexUrlError::BlockedHost { .. }
+            ))
         );
     }
 
@@ -969,29 +886,9 @@ mod tests {
         assert!(!raw.scoped.contains_key("@myorg"));
     }
 
-    // --- expand_env_vars (FR-007) ---
-
-    #[test]
-    fn test_expand_env_vars_no_placeholder() {
-        assert_eq!(
-            expand_env_vars_with("https://npm.example/", |_| None),
-            Ok("https://npm.example/".to_string())
-        );
-    }
-
-    #[test]
-    fn test_expand_env_vars_defined() {
-        let result = expand_env_vars_with("${NPM_REGISTRY}/", |name| {
-            (name == "NPM_REGISTRY").then(|| "https://npm.mycorp.example".to_string())
-        });
-        assert_eq!(result, Ok("https://npm.mycorp.example/".to_string()));
-    }
-
-    #[test]
-    fn test_expand_env_vars_undefined() {
-        let result = expand_env_vars_with("${UNDEFINED_VAR}", |_| None);
-        assert_eq!(result, Err("UNDEFINED_VAR".to_string()));
-    }
+    // `${VAR}` expansion itself is now covered by `deps_core::config_trust`'s own test suite —
+    // see that module for the Shell-syntax vectors this crate's `expand_env_vars`/
+    // `expand_env_vars_with` used to pin directly.
 
     // --- resolve_entry / NpmConfig::resolve_source_for (FR-003–008) ---
 
@@ -1064,12 +961,14 @@ mod tests {
     /// S-1 regression: a rejected entry's error must report the raw `${VAR}`-referencing
     /// text, never the expanded value — an expanded value can carry an environment
     /// variable's contents (e.g. a token embedded in a query string), so leaking it into
-    /// `NpmRegistryIndexError::BlockedHost`'s `tracing::warn!` or into `InvalidUrl`'s payload
-    /// would defeat the whole point of never logging the expanded form (this module's
-    /// security-model doc, `InvalidEntry`'s doc). `expand_env_vars` cannot be exercised here
-    /// without mutating the real process environment (forbidden — see
-    /// `expand_env_vars_with`'s doc), so this drives `new_with_raw_for_log` directly with the
-    /// two strings `resolve_entry` would have passed it after a real `${VAR}` expansion.
+    /// `NpmRegistryIndexError::Url(IndexUrlError::BlockedHost { .. })`'s `tracing::warn!` or
+    /// into `Url(IndexUrlError::InvalidUrl(..))`'s payload would defeat the whole point of
+    /// never logging the expanded form (this module's security-model doc, `InvalidEntry`'s
+    /// doc). `resolve_entry` hardcodes `deps_core::config_trust::process_env` as its lookup, so
+    /// exercising a real `${VAR}` expansion through it would require mutating the real process
+    /// environment (forbidden — see that module's doc); this test instead drives
+    /// `new_with_raw_for_log` directly with the two strings `resolve_entry` would have passed
+    /// it after a real `${VAR}` expansion.
     #[test]
     fn test_new_for_log_blocked_host_reports_raw_not_expanded() {
         let expanded_secret = "https://127.0.0.1:9999/?token=super-secret-value";
@@ -1082,7 +981,10 @@ mod tests {
             let err =
                 NpmRegistryIndex::new_with_raw_for_log(expanded_secret, raw_placeholder, &policy)
                     .unwrap_err();
-            assert_matches!(err, NpmRegistryIndexError::BlockedHost { .. });
+            assert_matches!(
+                err,
+                NpmRegistryIndexError::Url(IndexUrlError::BlockedHost { .. })
+            );
         });
 
         assert!(
@@ -1106,7 +1008,10 @@ mod tests {
 
         let log = deps_core::test_util::capture_tracing_output(|| {
             let err = NpmRegistryIndex::new(raw, &policy).unwrap_err();
-            assert_matches!(err, NpmRegistryIndexError::BlockedHost { .. });
+            assert_matches!(
+                err,
+                NpmRegistryIndexError::Url(IndexUrlError::BlockedHost { .. })
+            );
         });
 
         assert!(
@@ -1126,7 +1031,7 @@ mod tests {
 
         assert_eq!(
             err,
-            NpmRegistryIndexError::InvalidUrl(raw_placeholder.into())
+            NpmRegistryIndexError::Url(IndexUrlError::InvalidUrl(raw_placeholder.into()))
         );
         assert!(!err.to_string().contains("super-secret-value"));
     }
@@ -1144,7 +1049,10 @@ mod tests {
                 &policy,
             )
             .unwrap_err();
-            assert_matches!(invalid.reason, NpmRegistryIndexError::UserInfoPresent);
+            assert_matches!(
+                invalid.reason,
+                NpmRegistryIndexError::Url(IndexUrlError::UserInfoPresent)
+            );
             assert!(
                 !invalid.raw.as_ref().contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
@@ -1180,7 +1088,10 @@ mod tests {
                 &policy,
             )
             .unwrap_err();
-            assert_matches!(invalid.reason, NpmRegistryIndexError::BlockedHost { .. });
+            assert_matches!(
+                invalid.reason,
+                NpmRegistryIndexError::Url(IndexUrlError::BlockedHost { .. })
+            );
             assert!(
                 !invalid.raw.as_ref().contains("super-secret-value"),
                 "InvalidEntry::raw leaked the credential: {}",
@@ -1198,8 +1109,9 @@ mod tests {
     }
 
     /// S1: a userinfo-bearing `.npmrc` value that also fails `Url::parse` for an unrelated
-    /// reason (an invalid port here) lands in `NpmRegistryIndexError::InvalidUrl`, not
-    /// `UserInfoPresent` — this is the shape `redact_userinfo`'s original parse-gated no-op
+    /// reason (an invalid port here) lands in
+    /// `NpmRegistryIndexError::Url(IndexUrlError::InvalidUrl(..))`, not `UserInfoPresent` —
+    /// this is the shape `redact_userinfo`'s original parse-gated no-op
     /// missed, so the credential must be checked in every channel: `InvalidEntry::raw`, the
     /// `%reason` `Display`, and the captured log.
     #[test]
@@ -1212,7 +1124,10 @@ mod tests {
                 &policy,
             )
             .unwrap_err();
-            assert_matches!(invalid.reason, NpmRegistryIndexError::InvalidUrl(_));
+            assert_matches!(
+                invalid.reason,
+                NpmRegistryIndexError::Url(IndexUrlError::InvalidUrl(_))
+            );
             assert!(
                 !invalid.raw.as_ref().contains("hunter2"),
                 "InvalidEntry::raw leaked the credential: {}",
