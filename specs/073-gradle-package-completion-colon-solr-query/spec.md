@@ -10,7 +10,7 @@ tags:
   - deps-maven
   - deps-core
 created: 2026-09-25
-status: draft
+status: ready
 related:
   - "[[constitution]]"
   - "[[071-typosquat-similarity-diagnostic/spec]]"
@@ -161,10 +161,10 @@ No new persistent data model. This is a pure request-construction change.
 | Prefix has 0 colons (e.g. `gua`) | Unchanged: sent as free-text `q=gua` (FR-003) |
 | Prefix has exactly 1 colon, non-empty both sides (e.g. `com.google.guava:gua`) | Translated to `g:com.google.guava AND a:gua*` (FR-001) |
 | Prefix has exactly 1 colon, empty artifact segment (e.g. `com.google.guava:`) | Translated to `g:com.google.guava` alone (FR-002) |
-| Prefix has exactly 1 colon, empty group segment (e.g. `:gua`) | `[NEEDS CLARIFICATION: does `detect_dsl_context` ever produce this shape in practice? If reachable, define behavior — likely fall back to free-text `q` or reject as invalid, since `g:` with an empty value is not a meaningful Solr filter]` |
-| Group or artifact segment contains Lucene special characters (`"`, extra `:`, `*`, parens, etc.) | Escaped per Lucene query-string escaping rules, or the offending prefix is rejected and falls back to the pre-fix behavior (empty result) rather than sending unescaped syntax (FR-004) |
+| Prefix has exactly 1 colon, empty group segment (e.g. `:gua`) | Resolved: reachable in theory — `package_completion_gate` classifies by call shape only, never by string content, so `implementation(":gua")` still reaches the `Package` arm with an empty group. `g:` alone is not a meaningful Solr filter (matches nothing usefully), so this falls back to the pre-fix free-text `q=<raw prefix>` behavior (same treatment as the 0-colon case), not a rejection/error |
+| Group or artifact segment contains Lucene special characters (`"`, extra `:`, `*`, parens, etc.) or fails the `[A-Za-z0-9._-]` allowlist otherwise | Resolved: rejected (not backslash-escaped) — reuses the same allowlist-not-denylist pattern as `is_safe_maven_coordinate_segment`/`reject_credential_bearing_value` already established in this codebase. A segment that fails the allowlist falls back to the pre-fix behavior (free-text `q=<raw prefix>`, same empty-result-on-400 outcome as today), never sending unescaped syntax (FR-004) |
 | Solr still returns non-200/malformed body after the fix (e.g. genuinely invalid coordinate, transient outage) | Existing `search_with_retry`/stale-cache-fallback/`recent_search_failures` machinery applies unchanged — this fix only changes the URL construction, not the retry/error-handling layer |
-| `detect_dsl_context` produces a `Package`-range value with more than 1 colon (should not happen per current heuristic, but defense-in-depth) | `[NEEDS CLARIFICATION: should the transform defensively handle >1 colon (treat only the first as group/artifact separator, or fall back to free-text query), or is it acceptable to trust the 0-1-colon invariant documented at the `detect_dsl_context` call site and treat a 2+-colon input as an internal-invariant violation not worth guarding against here?]` |
+| `detect_dsl_context` produces a `Package`-range value with more than 1 colon | Resolved: not reachable — `detect_dsl_context`'s `match colon_count { 0 \| 1 => ..., _ => /* Version arm */ }` means any prefix with 2+ colons is classified as `GradleCompletionContext::Version`, never `Package`, before `search_url` ever sees it. No defensive >1-colon handling is added; the 0-1-colon invariant is trusted per the spec's original second option |
 
 ## 7. Success Criteria
 
@@ -193,12 +193,33 @@ No new persistent data model. This is a pure request-construction change.
 - Change the `detect_dsl_context`/`GradleCompletionContext::Package` colon-count routing heuristic (out of scope, already correct)
 - Silently swallow a Lucene-injection-shaped prefix without either escaping or rejecting it (NFR-002)
 
-## 9. Open Questions
+## 9. Resolved Design Decisions
 
-- [NEEDS CLARIFICATION: Which layer should architecturally own the Solr-query-syntax transform — `deps-maven`'s `search_url`/`MavenCentralRegistry::search` (Maven-registry-specific Solr knowledge, recommended given NFR-005's shared-consumer requirement is satisfied automatically since both `deps-maven` and `deps-gradle` already funnel through the same `MavenCentralRegistry`), or should the colon-splitting happen earlier at the caller (`deps-core::completion::complete_package_names_generic` or `deps-gradle`'s `complete_package_names`) with a structured `(group, artifact_prefix)` argument passed down instead of a single string? The registry-owns-it approach requires no caller changes and keeps Solr syntax knowledge encapsulated in the one crate that talks to Solr; the caller-splits approach would give `deps-core`/`deps-gradle` type-level visibility into the two-part shape but requires touching the shared `Registry` trait's `search`/`search_raw` signature, which every other ecosystem's registry also implements.]
-- [NEEDS CLARIFICATION: exact Lucene-escaping strategy for FR-004 — full Lucene special-character backslash-escaping of both group and artifact segments (safest, matches Solr's own documented escaping rules), or a narrower reject-if-any-special-character-present gate (simpler, matches this codebase's existing "reject rather than sanitize" pattern seen in `is_safe_maven_coordinate_segment`/`reject_credential_bearing_value`)? A real `groupId`/`artifactId` per Maven's coordinate grammar never legitimately contains Lucene special characters (they are restricted to `[A-Za-z0-9_.-]`-ish sets already validated elsewhere in this file, e.g. `maven_coordinate_path`), so a reject-based gate may be sufficient and simpler than general escaping — needs a decision during `/sdd plan`.]
-- [NEEDS CLARIFICATION: should FR-002's `g:<group>`-only query (empty artifact segment) also be applied to the case where the *whole* prefix, pre-colon-split, would already have been considered "too short" by `is_valid_completion_prefix_len`'s existing minimum-length gate? i.e., does the minimum-length check apply to the raw prefix (pre-split) as it does today, or should it apply post-split to the group and/or artifact segment individually? Confirm during `/sdd plan` against `is_valid_completion_prefix_len`'s current semantics.]
-- [NEEDS CLARIFICATION: is a `g:<empty>` (colon-first, e.g. `:gua`) prefix shape actually reachable from `detect_dsl_context`'s `Package` arm, or is it excluded upstream by construction? See Section 6's edge case.]
+All three items below were open `[NEEDS CLARIFICATION]` markers, resolved by reading the current
+implementation (not guessed) before handing this spec to implementation:
+
+- **Transform ownership**: `deps-maven`'s `search_url`/`MavenCentralRegistry::search` owns the
+  colon-splitting and Solr field-query construction. No change to the shared `Registry` trait's
+  `search`/`search_raw` signature, and no caller changes in `deps-core` or `deps-gradle` — both
+  already funnel into the same `MavenCentralRegistry::search(query: &str, ...)`, satisfying
+  NFR-005 automatically. `search_url` (or a new private helper it delegates to) parses the 0-1
+  colon out of `query` itself and builds `g:<group> AND a:<artifact-prefix>*` (or the fallback
+  forms below) before URL-encoding.
+- **Escaping strategy (FR-004)**: reject, don't escape. Reuses the allowlist-not-denylist pattern
+  already established by `is_safe_maven_coordinate_segment` in `deps-core::lsp_helpers`
+  (`[A-Za-z0-9._-]`, non-empty, not a dot-segment) — real Maven `groupId`/`artifactId` values never
+  legitimately contain Lucene special characters, so a segment that fails this allowlist can only
+  be adversarial or nonsensical input. Either reuse `is_safe_maven_coordinate_segment` directly
+  (relaxed to also accept an empty artifact segment, per FR-002) or add a narrowly-scoped sibling
+  check in `deps-maven` — implementer's choice, as long as the character set matches. A
+  rejected segment falls back to the pre-fix free-text `q=<raw prefix>` behavior, not a crash.
+- **Minimum-length gate (`is_valid_completion_prefix_len`)**: unchanged, applies only to the raw,
+  pre-split prefix at the existing caller (`deps-core::completion::complete_package_names_generic`).
+  No new post-split length gate on the group/artifact segments individually — FR-002's
+  empty-artifact-segment case is expected and handled by the field-query construction itself, not
+  by a length check.
+- **`:gua` (empty group segment)** and **>1-colon inputs**: see the resolved rows in Section 6's
+  edge-case table.
 
 ## 10. See Also
 

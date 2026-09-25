@@ -19,7 +19,7 @@ status: moc
 
 | ID | Feature | Phase | Status |
 |----|---------|-------|--------|
-| 073 | [[073-gradle-package-completion-colon-solr-query/spec\|Gradle/Maven Package completion for a "group:partial-artifact" prefix returns 0 results — Maven Central rejects the raw colon with HTTP 400]] | specify | draft — bug, P1, 4 open `[NEEDS CLARIFICATION]` items |
+| 073 | [[073-gradle-package-completion-colon-solr-query/spec\|Gradle/Maven Package completion for a "group:partial-artifact" prefix returns 0 results — Maven Central rejects the raw colon with HTTP 400]] | specify | ready — bug, P1, all `[NEEDS CLARIFICATION]` items resolved (issue #1457) |
 | 072 | [[072-deps-dev-gossip-signals/spec\|Adopt deps.dev GOSSIP signals (Google Open Source Security Intelligence Platform)]] | specify | draft — research/parity, P3, 9 open `[NEEDS CLARIFICATION]` items (issue #1456) |
 | 071 | [[071-typosquat-similarity-diagnostic/spec\|Typosquat detection via deps.dev's GetSimilarlyNamedPackages endpoint]] | plan | shipped — opt-in typosquat-similarity diagnostic via deps.dev (PR #1451, issue #1437) |
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
