@@ -70,6 +70,7 @@ pub(crate) mod blocking_ecosystem {
             &'a self,
             _name: &'a deps_core::PackageName,
             _req: &'a deps_core::VersionReq,
+            _selection_context: &'a deps_core::SelectionContext,
         ) -> BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>> {
             Box::pin(async move { Ok(None) })
         }

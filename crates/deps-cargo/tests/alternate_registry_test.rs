@@ -3,7 +3,7 @@
 //!
 //! The design review's Risks section (plan.md) notes the routing enumeration was
 //! incomplete twice during design — first missing several `Registry` network methods
-//! entirely, then missing the `get_latest_matching`/`get_latest_matching_with_context`
+//! entirely, then missing the `get_latest_matching`/`get_latest_matching_from`
 //! fallback paths hover and the background fetch use when the list-based "latest" pick
 //! fails. This file exists specifically so that class of gap cannot recur silently: it
 //! exercises `get_versions_from` AND `get_latest_matching_from` against a mocked

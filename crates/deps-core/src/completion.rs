@@ -1524,7 +1524,7 @@ pub fn reject_credential_bearing_value(value: &str, context: &str) -> Option<Vec
 /// #   fn get_versions<'a>(&'a self, _name: &'a PackageName)
 /// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Vec<Box<dyn Version>>>> + Send + 'a>>
 /// #   { Box::pin(async move { Ok(vec![]) }) }
-/// #   fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq)
+/// #   fn get_latest_matching<'a>(&'a self, _name: &'a PackageName, _req: &'a deps_core::VersionReq, _selection_context: &'a deps_core::SelectionContext)
 /// #       -> Pin<Box<dyn std::future::Future<Output = deps_core::error::Result<Option<Box<dyn Version>>>> + Send + 'a>>
 /// #   { Box::pin(async move { Ok(None) }) }
 /// #   fn search_raw<'a>(&'a self, _query: &'a str, _limit: usize)
@@ -1649,105 +1649,16 @@ pub async fn complete_package_names_generic(
 /// necessarily the first — is marked with "(latest)" suffix and preselected; a pre-release or
 /// deprecated release sorting above it in fetch order is offered unlabeled instead (#952).
 ///
+/// `selection_context` carries manifest-level state such as Composer's `minimum-stability`
+/// (#1433). [`complete_versions_at_position`] is the only production caller that has a
+/// [`crate::ParseResult`] to build a real context from ([`crate::ParseResult::selection_context`]);
+/// every other completion entry point in this workspace has no manifest-level selection state
+/// of its own and passes [`crate::SelectionContext::none()`] instead.
+///
 /// # Examples
 ///
 /// ```no_run
 /// use deps_core::completion::{complete_versions_generic_replacing, VersionReplacement};
-/// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-///     RequirementResolution, SourcePolicy,
-/// };
-/// use deps_core::parser::DependencySource;
-/// use deps_core::{ConcreteVersion, PackageName};
-/// use tower_lsp_server::ls_types::{Position, Range};
-///
-/// struct DefaultFormatter;
-/// impl PackageNaming for DefaultFormatter {}
-/// impl PackageRendering for DefaultFormatter {
-///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
-///     fn package_url(&self, name: &PackageName) -> String { name.as_str().to_string() }
-/// }
-/// impl RequirementResolution for DefaultFormatter {}
-/// impl DiagnosticMessages for DefaultFormatter {}
-/// impl DiagnosticPolicy for DefaultFormatter {}
-/// impl SourcePolicy for DefaultFormatter {}
-/// impl OsvNaming for DefaultFormatter {}
-///
-/// # async fn example(registry: &dyn deps_core::Registry) {
-/// let freshness = deps_core::FreshnessSettings::default();
-///
-/// // Maven's self-closing `<version/>`: replace the whole tag instead of inserting at the
-/// // cursor, since no cursor position inside `<version/>` lands inside a value slot.
-/// let tag_range = Range {
-///     start: Position { line: 5, character: 6 },
-///     end: Position { line: 5, character: 17 },
-/// };
-/// let replacement = VersionReplacement {
-///     range: tag_range,
-///     lead: "<version>".to_string(),
-///     trail: "</version>".to_string(),
-///     replaced_text: "<version/>".to_string(),
-/// };
-///
-/// let items = complete_versions_generic_replacing(
-///     registry,
-///     &DefaultFormatter,
-///     &PackageName::new("junit:junit"),
-///     &DependencySource::Registry,
-///     "",
-///     &[],
-///     freshness,
-///     Some(&replacement),
-/// ).await;
-/// # }
-/// ```
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors complete_versions_generic_from's own 7 parameters plus the one new \
-              `replacement` param this function adds; wrapping the existing 7 in a request \
-              struct now would break every other ecosystem's already-stable call pattern"
-)]
-pub async fn complete_versions_generic_replacing(
-    registry: &dyn crate::Registry,
-    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
-    package_name: &PackageName,
-    source: &crate::parser::DependencySource,
-    prefix: &str,
-    operator_chars: &[char],
-    freshness: FreshnessSettings,
-    replacement: Option<&VersionReplacement>,
-) -> Vec<CompletionItem> {
-    complete_versions_generic_replacing_with_context(
-        registry,
-        formatter,
-        package_name,
-        source,
-        prefix,
-        operator_chars,
-        freshness,
-        replacement,
-        &crate::SelectionContext::none(),
-    )
-    .await
-}
-
-/// Like [`complete_versions_generic_replacing`], but also carries a [`crate::SelectionContext`]
-/// into the "latest" pick below.
-///
-/// `selection_context` carries manifest-level state such as Composer's `minimum-stability`
-/// (#1433), mirroring [`crate::Registry::select_latest_matching_with_context`]'s own
-/// `_with_context` naming.
-///
-/// [`complete_versions_at_position`] is the only production caller that has a
-/// [`crate::ParseResult`] to build a real context from ([`crate::ParseResult::selection_context`]);
-/// every other completion entry point in this workspace has no manifest-level selection state
-/// of its own and calls [`complete_versions_generic_replacing`] (which forwards here with
-/// [`crate::SelectionContext::none()`]) instead.
-///
-/// # Examples
-///
-/// ```no_run
-/// use deps_core::completion::{complete_versions_generic_replacing_with_context, VersionReplacement};
 /// use deps_core::lsp_helpers::{
 ///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
 ///     RequirementResolution, SourcePolicy,
@@ -1784,7 +1695,7 @@ pub async fn complete_versions_generic_replacing(
 ///     replaced_text: "<version/>".to_string(),
 /// };
 ///
-/// let items = complete_versions_generic_replacing_with_context(
+/// let items = complete_versions_generic_replacing(
 ///     registry,
 ///     &DefaultFormatter,
 ///     &PackageName::new("twig/twig"),
@@ -1793,16 +1704,18 @@ pub async fn complete_versions_generic_replacing(
 ///     &[],
 ///     freshness,
 ///     Some(&replacement),
-///     &SelectionContext::with_composer_minimum_stability(Some("alpha".to_string())),
+///     &SelectionContext::none(),
 /// ).await;
 /// # }
 /// ```
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors complete_versions_generic_replacing's own 8 parameters plus the one new \
-              `selection_context` param this function adds"
+    reason = "mirrors complete_versions_generic_from's own 7 parameters plus the two \
+              (`replacement`, `selection_context`) this function adds; wrapping the existing \
+              7 in a request struct now would break every other ecosystem's already-stable \
+              call pattern"
 )]
-pub async fn complete_versions_generic_replacing_with_context(
+pub async fn complete_versions_generic_replacing(
     registry: &dyn crate::Registry,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     package_name: &PackageName,
@@ -1858,18 +1771,12 @@ pub async fn complete_versions_generic_replacing_with_context(
             .into_iter()
             .filter(|v| version_matches_prefix(v.version_string().as_str()))
             .collect();
-        let latest_idx = registry.select_latest_matching_with_context(
-            &filtered_versions,
-            &wildcard_req,
-            selection_context,
-        );
+        let latest_idx =
+            registry.select_latest_matching(&filtered_versions, &wildcard_req, selection_context);
         prepare_version_display_items(&filtered_versions, package_name, latest_idx)
     } else {
-        let latest_idx = registry.select_latest_matching_with_context(
-            &versions,
-            &wildcard_req,
-            selection_context,
-        );
+        let latest_idx =
+            registry.select_latest_matching(&versions, &wildcard_req, selection_context);
         prepare_version_display_items(&versions, package_name, latest_idx)
     };
 
@@ -1954,6 +1861,7 @@ pub async fn complete_versions_generic_replacing_with_context(
 ///     "^1.0",
 ///     &['^', '~', '=', '<', '>'],
 ///     freshness,
+///     &deps_core::SelectionContext::none(),
 /// ).await;
 ///
 /// // Go: no operators to strip
@@ -1965,39 +1873,17 @@ pub async fn complete_versions_generic_replacing_with_context(
 ///     "v1.9",
 ///     &[],
 ///     freshness,
+///     &deps_core::SelectionContext::none(),
 /// ).await;
 /// # }
 /// ```
-pub async fn complete_versions_generic_from(
-    registry: &dyn crate::Registry,
-    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
-    package_name: &PackageName,
-    source: &crate::parser::DependencySource,
-    prefix: &str,
-    operator_chars: &[char],
-    freshness: FreshnessSettings,
-) -> Vec<CompletionItem> {
-    complete_versions_generic_replacing(
-        registry,
-        formatter,
-        package_name,
-        source,
-        prefix,
-        operator_chars,
-        freshness,
-        None,
-    )
-    .await
-}
-
-/// Like [`complete_versions_generic_from`], but also carries a [`crate::SelectionContext`]
-/// into the "latest" pick — see [`complete_versions_generic_replacing_with_context`].
 #[allow(
     clippy::too_many_arguments,
-    reason = "mirrors complete_versions_generic_from's own 7 parameters plus the one new \
-              `selection_context` param this function adds"
+    reason = "mirrors complete_versions_generic_replacing's own 9 parameters minus \
+              `replacement`; wrapping the existing 8 in a request struct now would break \
+              every other ecosystem's already-stable call pattern"
 )]
-async fn complete_versions_generic_from_with_context(
+pub async fn complete_versions_generic_from(
     registry: &dyn crate::Registry,
     formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     package_name: &PackageName,
@@ -2007,7 +1893,7 @@ async fn complete_versions_generic_from_with_context(
     freshness: FreshnessSettings,
     selection_context: &crate::SelectionContext,
 ) -> Vec<CompletionItem> {
-    complete_versions_generic_replacing_with_context(
+    complete_versions_generic_replacing(
         registry,
         formatter,
         package_name,
@@ -2025,11 +1911,9 @@ async fn complete_versions_generic_from_with_context(
 ///
 /// Finds the dependency in `parse_result` whose `version_range` contains `position` — the
 /// same containment check [`detect_completion_context`] used to decide this is a `Version`
-/// context in the first place — then completes through
-/// `complete_versions_generic_from_with_context` (the [`crate::SelectionContext`]-carrying
-/// sibling of [`complete_versions_generic_from`], threading `parse_result`'s own
-/// [`crate::ParseResult::selection_context`], #1433) against that dependency's own
-/// [`crate::Dependency::source`]. Unlike a name join (the old
+/// context in the first place — then completes through [`complete_versions_generic_from`],
+/// threading `parse_result`'s own [`crate::ParseResult::selection_context`] (#1433) against
+/// that dependency's own [`crate::Dependency::source`]. Unlike a name join (the old
 /// per-ecosystem `resolve_completion_source` pattern this replaces), two dependencies sharing
 /// one [`PackageName`] but resolving to different sources never collide: the cursor position
 /// unambiguously identifies which occurrence the user is editing, so each completes against
@@ -2043,9 +1927,8 @@ async fn complete_versions_generic_from_with_context(
 ///
 /// # Source-resolvability gate
 ///
-/// Delegates the actual gate to [`complete_versions_generic_from`] (via its
-/// `_with_context` sibling) — see its doc for why the check lives there rather than here —
-/// so this function's own contribution is purely the
+/// Delegates the actual gate to [`complete_versions_generic_from`] — see its doc for why the
+/// check lives there rather than here — so this function's own contribution is purely the
 /// position-based dependency lookup: find which dependency (and therefore which `source`) the
 /// cursor is actually in, before handing off.
 ///
@@ -2102,7 +1985,7 @@ pub async fn complete_versions_at_position(
         return vec![];
     };
 
-    complete_versions_generic_from_with_context(
+    complete_versions_generic_from(
         registry,
         formatter,
         dep.name(),
@@ -2310,6 +2193,7 @@ mod tests {
             &'a self,
             _name: &'a crate::PackageName,
             _req: &'a crate::VersionReq,
+            _selection_context: &'a crate::SelectionContext,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
@@ -2333,6 +2217,7 @@ mod tests {
             &self,
             versions: &[Box<dyn crate::Version>],
             _req: &crate::VersionReq,
+            _selection_context: &crate::SelectionContext,
         ) -> Option<usize> {
             crate::select_latest_for_existence(versions, |v| v.as_ref())
         }
@@ -2362,6 +2247,7 @@ mod tests {
             &'a self,
             _name: &'a crate::PackageName,
             _req: &'a crate::VersionReq,
+            _selection_context: &'a crate::SelectionContext,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
@@ -2504,6 +2390,7 @@ mod tests {
                 &'a self,
                 _name: &'a crate::PackageName,
                 _req: &'a crate::VersionReq,
+                _selection_context: &'a crate::SelectionContext,
             ) -> crate::ecosystem::BoxFuture<
                 'a,
                 crate::error::Result<Option<Box<dyn crate::Version>>>,
@@ -5142,6 +5029,7 @@ mod tests {
             "^1.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5157,6 +5045,7 @@ mod tests {
             "~1.1",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5171,6 +5060,7 @@ mod tests {
             "=2.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5185,6 +5075,7 @@ mod tests {
             "1.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5222,6 +5113,7 @@ mod tests {
             "4",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5284,6 +5176,7 @@ mod tests {
             "3.2",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5324,6 +5217,7 @@ mod tests {
             "^v4.0",
             &['^'],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5359,6 +5253,7 @@ mod tests {
             "",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5407,6 +5302,7 @@ mod tests {
             "!=2.0",
             &['^', '~', '=', '<', '>', '*', '!'],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5453,6 +5349,7 @@ mod tests {
             &[],
             FreshnessSettings::default(),
             Some(&replacement),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5497,6 +5394,7 @@ mod tests {
             &[],
             FreshnessSettings::default(),
             Some(&replacement),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5525,6 +5423,7 @@ mod tests {
                 &'a self,
                 _name: &'a crate::PackageName,
                 _req: &'a crate::VersionReq,
+                _selection_context: &'a crate::SelectionContext,
             ) -> crate::ecosystem::BoxFuture<
                 'a,
                 crate::error::Result<Option<Box<dyn crate::Version>>>,
@@ -5559,6 +5458,7 @@ mod tests {
             "1.0",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5616,6 +5516,7 @@ mod tests {
             &'a self,
             _name: &'a crate::PackageName,
             _req: &'a crate::VersionReq,
+            _selection_context: &'a crate::SelectionContext,
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Option<Box<dyn crate::Version>>>>
         {
             Box::pin(async move { Ok(None) })
@@ -5636,6 +5537,7 @@ mod tests {
             &self,
             versions: &[Box<dyn crate::Version>],
             _req: &crate::VersionReq,
+            _selection_context: &crate::SelectionContext,
         ) -> Option<usize> {
             crate::select_latest_for_existence(versions, |v| v.as_ref())
         }
@@ -5666,6 +5568,7 @@ mod tests {
             "",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
         assert_eq!(items[0].label, "2.0.0 (latest)");
@@ -5710,6 +5613,7 @@ mod tests {
             "3.0",
             &['^', '~', '=', '<', '>'],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5727,6 +5631,7 @@ mod tests {
             "",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5766,6 +5671,7 @@ mod tests {
             "1.0",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5802,6 +5708,7 @@ mod tests {
             "1.0",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5835,6 +5742,7 @@ mod tests {
             "1.0",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5874,6 +5782,7 @@ mod tests {
             "v1.9",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5915,6 +5824,7 @@ mod tests {
             "",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -5962,6 +5872,7 @@ mod tests {
             "",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -6001,6 +5912,7 @@ mod tests {
             "",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 
@@ -6075,6 +5987,7 @@ mod tests {
             "2.",
             &[],
             FreshnessSettings::default(),
+            &crate::SelectionContext::none(),
         )
         .await;
 

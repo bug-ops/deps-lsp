@@ -35,6 +35,7 @@ use std::path::Path;
 use crate::ecosystem::{
     BlockedRegistryOccurrence, Dependency, ParseResult, RejectedRegistryOccurrence,
 };
+use crate::selection::{InvalidStabilityOccurrence, SelectionContext};
 
 /// Maximum number of dependencies [`ParseResult::dependencies`] returns for one open
 /// document, enforced by [`cap_dependencies`].
@@ -164,6 +165,11 @@ pub fn cap_dependencies(inner: Box<dyn ParseResult>, cap: usize) -> Box<dyn Pars
 /// never what callers downcast to, so an ecosystem-specific read through `ParseResult`
 /// (e.g. Composer's `minimum_stability`) keeps working unchanged on a capped document.
 ///
+/// [`ParseResult::selection_context`]/[`ParseResult::invalid_minimum_stability`] are forwarded
+/// too (#1444 bug fix): before this, a Composer manifest above the dependency cap silently
+/// lost `minimum-stability` enforcement, since neither method was overridden here and both
+/// fell back to the trait's own empty defaults instead of `inner`'s real values.
+///
 /// This delegation means a caller that downcasts via `as_any()` and reads a concrete
 /// ecosystem type's own `pub dependencies` field directly (bypassing this wrapper's
 /// truncated [`ParseResult::dependencies`]) sees whatever that field holds. As long as
@@ -199,6 +205,14 @@ impl ParseResult for DependencyCappedParseResult {
 
     fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
         self.inner.rejected_registries()
+    }
+
+    fn selection_context(&self) -> SelectionContext {
+        self.inner.selection_context()
+    }
+
+    fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
+        self.inner.invalid_minimum_stability()
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -301,6 +315,8 @@ mod tests {
             uri: url::Url,
             blocked: Vec<BlockedRegistryOccurrence>,
             rejected: Vec<RejectedRegistryOccurrence>,
+            selection_context: SelectionContext,
+            invalid_minimum_stability: Option<InvalidStabilityOccurrence>,
         }
 
         impl ParseResult for StubWithOccurrences {
@@ -318,6 +334,12 @@ mod tests {
             }
             fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
                 self.rejected.clone()
+            }
+            fn selection_context(&self) -> SelectionContext {
+                self.selection_context
+            }
+            fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
+                self.invalid_minimum_stability.clone()
             }
             fn as_any(&self) -> &dyn Any {
                 self
@@ -344,6 +366,13 @@ mod tests {
                 raw_value: "not-a-valid-url".to_string(),
                 declaration_key: "top-level".to_string(),
             }],
+            selection_context: SelectionContext::with_minimum_stability(
+                crate::selection::StabilityFloor::Beta,
+            ),
+            invalid_minimum_stability: Some(InvalidStabilityOccurrence {
+                range,
+                raw: "betta".to_string(),
+            }),
         });
         let capped = cap_dependencies(inner, 10);
 
@@ -357,6 +386,16 @@ mod tests {
             1,
             "rejected_registries() must survive the cap wrapper, not silently fall back to \
              the trait's empty-Vec default"
+        );
+        assert_eq!(
+            capped.selection_context(),
+            SelectionContext::with_minimum_stability(crate::selection::StabilityFloor::Beta),
+            "selection_context() must survive the cap wrapper — a capped Composer manifest \
+             must not silently lose minimum-stability enforcement"
+        );
+        assert!(
+            capped.invalid_minimum_stability().is_some(),
+            "invalid_minimum_stability() must survive the cap wrapper too"
         );
     }
 

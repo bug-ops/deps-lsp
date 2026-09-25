@@ -603,6 +603,7 @@ impl Registry for DenoRegistry {
         &'a self,
         name: &'a PackageName,
         req: &'a VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         Box::pin(async move {
             match split_scheme(name.as_str()) {
@@ -621,7 +622,7 @@ impl Registry for DenoRegistry {
                 }
                 Some((Scheme::Npm, rest)) => {
                     let bare = npm_bare_name(name, rest)?;
-                    Registry::get_latest_matching(&self.npm, &bare, req).await
+                    Registry::get_latest_matching(&self.npm, &bare, req, selection_context).await
                 }
                 None => Err(unroutable(name)),
             }
@@ -652,7 +653,7 @@ impl Registry for DenoRegistry {
                     )
                     .await
                 }
-                _ => self.get_latest_matching(name, req).await,
+                _ => self.get_latest_matching(name, req, selection_context).await,
             }
         })
     }
@@ -694,6 +695,7 @@ impl Registry for DenoRegistry {
         &self,
         versions: &[Box<dyn Version>],
         req: &VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
         // Name-free and pure `node_semver`: correct for both JSR (which mandates semver)
         // and npm version strings, so npm's implementation covers both without a
@@ -702,7 +704,8 @@ impl Registry for DenoRegistry {
         // newest yanked version rather than `None`/"Unknown package" — not a bug to
         // "fix" by special-casing JSR here, since the alternative reintroduces #338
         // for JSR specifically.
-        self.npm.select_latest_matching(versions, req)
+        self.npm
+            .select_latest_matching(versions, req, selection_context)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -1000,6 +1003,7 @@ mod tests {
             &registry,
             &PackageName::new("npm:"),
             &VersionReq::new("*"),
+            &deps_core::SelectionContext::none(),
         )
         .await
         else {
@@ -1011,6 +1015,64 @@ mod tests {
                 registry: "deno",
                 ..
             }
+        );
+    }
+
+    /// #1444 M2/M3: the `npm:` arm of `get_latest_matching`/`select_latest_matching` must
+    /// forward the caller's own `SelectionContext` to `NpmRegistry`'s own trait methods, not
+    /// silently substitute a fresh `SelectionContext::none()` — a regression invisible to
+    /// every other assertion, since neither Deno nor npm reads `minimum_stability` itself.
+    /// Uses [`deps_core::test_util::SelectionContextCapture`], which
+    /// `NpmRegistry::get_latest_matching`/`select_latest_matching` record into under
+    /// `#[cfg(test)]`.
+    #[tokio::test]
+    async fn test_deno_registry_npm_scheme_forwards_selection_context() {
+        use deps_core::test_util::SelectionContextCapture;
+        use deps_core::{SelectionContext, StabilityFloor};
+
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/pkg")
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.0.0": {}}}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let npm = NpmRegistry::with_public_base_for_test(Arc::clone(&cache), server.url());
+        let registry = DenoRegistry::with_npm(cache, npm);
+        let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
+
+        SelectionContextCapture::reset();
+        let _ = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("npm:pkg"),
+            &VersionReq::new("*"),
+            &sentinel,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            SelectionContextCapture::last(),
+            Some(sentinel),
+            "get_latest_matching's npm: arm must forward the caller's SelectionContext, not a \
+             fresh SelectionContext::none()"
+        );
+
+        let versions: Vec<Box<dyn deps_core::Version>> =
+            vec![Box::new(JsrVersion::new("1.0.0".into(), false))];
+        SelectionContextCapture::reset();
+        let _ = Registry::select_latest_matching(
+            &registry,
+            &versions,
+            &VersionReq::new("*"),
+            &sentinel,
+        );
+        assert_eq!(
+            SelectionContextCapture::last(),
+            Some(sentinel),
+            "select_latest_matching must forward the caller's SelectionContext to npm, not a \
+             fresh SelectionContext::none()"
         );
     }
 
@@ -1181,6 +1243,7 @@ mod tests {
             &registry,
             &PackageName::new("jsr:@std/.."),
             &VersionReq::new("*"),
+            &deps_core::SelectionContext::none(),
         )
         .await
         else {

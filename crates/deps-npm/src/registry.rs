@@ -827,7 +827,12 @@ impl deps_core::Registry for NpmRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        #[cfg(any(test, feature = "test-util"))]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(any(test, feature = "test-util")))]
+        let _ = selection_context;
         Box::pin(async move {
             let version = self
                 .get_latest_matching(name.as_str(), req.as_str())
@@ -890,7 +895,12 @@ impl deps_core::Registry for NpmRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
+        #[cfg(any(test, feature = "test-util"))]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(any(test, feature = "test-util")))]
+        let _ = selection_context;
         if deps_core::is_existence_wildcard(req) {
             // #338: prefer the newest non-flagged, non-prerelease version, falling through to
             // the newest overall otherwise, rather than reporting "not found" for a package
@@ -1439,7 +1449,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     /// Same guarantee for the empty-requirement string, which `lifecycle.rs` treats
@@ -1457,7 +1470,10 @@ mod tests {
             published_at: None,
         })];
         let req = VersionReq::new("");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     /// B1 regression: the wildcard existence check must still skip a prerelease sitting
@@ -1487,7 +1503,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(1)
+        );
     }
 
     /// B1/FR-002-style fallback: when every version is a prerelease (no stable release
@@ -1514,7 +1533,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     /// B2: `get_latest_matching`'s wildcard branch must agree with
@@ -1599,7 +1621,11 @@ mod tests {
             })
             .collect();
         let idx = registry
-            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .select_latest_matching(
+                &boxed,
+                &VersionReq::new("*"),
+                &deps_core::SelectionContext::none(),
+            )
             .expect("fixture always has a pick");
 
         assert_eq!(

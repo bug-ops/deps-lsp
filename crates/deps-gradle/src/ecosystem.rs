@@ -108,6 +108,7 @@ impl GradleEcosystem {
             prefix,
             VERSION_OPERATOR_CHARS,
             freshness,
+            &deps_core::SelectionContext::none(),
         )
         .await
     }
@@ -893,6 +894,7 @@ impl Ecosystem for GradleEcosystem {
                                 value,
                                 VERSION_OPERATOR_CHARS,
                                 freshness,
+                                &parse_result.selection_context(),
                             )
                             .await
                         }

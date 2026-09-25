@@ -879,6 +879,7 @@ pub fn generate_diagnostics_from_cache(
         .collect();
 
     dependency_ceiling_notice(&mut diagnostics, parse_result);
+    invalid_minimum_stability_notice(&mut diagnostics, parse_result);
     offline_notice(&mut diagnostics, versions, &deps);
     skip_reason_notice(
         &mut diagnostics,
@@ -1075,6 +1076,37 @@ fn dependency_ceiling_notice(diagnostics: &mut Vec<Diagnostic>, parse_result: &d
                 ),
             )
             .with_severity(Severity::Information),
+        );
+    }
+}
+
+/// Invalid `minimum-stability`-style manifest field notice (#1444).
+///
+/// Not part of the R0-R8 per-dependency pipeline below: like
+/// [`dependency_ceiling_notice`], this is a document-level fact, not a per-dependency one.
+/// Composer's `minimum-stability` selection still falls back to
+/// [`crate::selection::StabilityFloor::Stable`] exactly as it did before #1444 — this notice
+/// makes that fallback visible instead of silent, rather than changing the fallback itself.
+///
+/// Reads: `parse_result.invalid_minimum_stability()`.
+/// Emits: at most one [`Severity::Warning`], at the offending value's own range (or the
+/// declaring key's range for a non-string value — see
+/// [`crate::selection::InvalidStabilityOccurrence`]'s own doc).
+fn invalid_minimum_stability_notice(
+    diagnostics: &mut Vec<Diagnostic>,
+    parse_result: &dyn ParseResult,
+) {
+    if let Some(occurrence) = parse_result.invalid_minimum_stability() {
+        let raw = sanitize_and_truncate_for_diagnostic(&occurrence.raw, MAX_DIAGNOSTIC_VALUE_CHARS);
+        diagnostics.push(
+            Diagnostic::new(
+                occurrence.range,
+                format!(
+                    "minimum-stability \"{raw}\" is not one of dev, alpha, beta, RC, stable; \
+                     \"stable\" is assumed when choosing the latest version"
+                ),
+            )
+            .with_severity(Severity::Warning),
         );
     }
 }
@@ -2803,6 +2835,145 @@ mod tests {
                 .contains("exceeding deps-lsp's per-document limit")),
             "a document under the ceiling must get no ceiling notice, got: {diagnostics:?}"
         );
+    }
+
+    /// #1444: an ecosystem's `invalid_minimum_stability()` override gets a single WARNING
+    /// diagnostic at the occurrence's own range, with the raw value quoted in the message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_reports_invalid_minimum_stability() {
+        use crate::position::{Position, Range};
+        use crate::selection::InvalidStabilityOccurrence;
+
+        struct InvalidStabilityParseResult {
+            deps: Vec<MockDep>,
+            uri: url::Url,
+            invalid: InvalidStabilityOccurrence,
+        }
+
+        impl ParseResult for InvalidStabilityParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
+                Some(self.invalid.clone())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let formatter = MOCK_FORMATTER;
+        let occurrence_range = Range::new(Position::new(1, 24), Position::new(1, 29));
+        let parse_result = InvalidStabilityParseResult {
+            deps: vec![MockDep {
+                name: "vendor/pkg".into(),
+                version_req: "^1.0".into(),
+                version_range: Range::new(Position::new(2, 20), Position::new(2, 24)),
+                name_range: Range::new(Position::new(2, 4), Position::new(2, 14)),
+            }],
+            uri: crate::test_util::test_uri("/test/composer.json"),
+            invalid: InvalidStabilityOccurrence {
+                range: occurrence_range,
+                raw: "betta".to_string(),
+            },
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notices: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message().contains("minimum-stability"))
+            .collect();
+        assert_eq!(
+            notices.len(),
+            1,
+            "expected exactly one invalid-minimum-stability diagnostic, got: {diagnostics:?}"
+        );
+        assert_eq!(notices[0].severity, Some(Severity::Warning));
+        assert_eq!(notices[0].range, occurrence_range);
+        assert!(notices[0].message().contains("\"betta\""));
+        assert!(
+            notices[0]
+                .message()
+                .contains("dev, alpha, beta, RC, stable")
+        );
+        assert!(notices[0].message().contains("stable"));
+    }
+
+    /// #1444: the sanitize/truncate pass already applied to every other diagnostic value must
+    /// also cover `raw` here — a control character must not reach the rendered message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_invalid_minimum_stability_sanitizes_raw() {
+        use crate::position::{Position, Range};
+        use crate::selection::InvalidStabilityOccurrence;
+
+        struct InvalidStabilityParseResult {
+            deps: Vec<MockDep>,
+            uri: url::Url,
+            invalid: InvalidStabilityOccurrence,
+        }
+
+        impl ParseResult for InvalidStabilityParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn invalid_minimum_stability(&self) -> Option<InvalidStabilityOccurrence> {
+                Some(self.invalid.clone())
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = InvalidStabilityParseResult {
+            deps: vec![],
+            uri: crate::test_util::test_uri("/test/composer.json"),
+            invalid: InvalidStabilityOccurrence {
+                range: Range::new(Position::new(0, 0), Position::new(0, 1)),
+                raw: "bid\u{202E}i".to_string(),
+            },
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notice = diagnostics
+            .iter()
+            .find(|d| d.message().contains("minimum-stability"))
+            .expect("expected an invalid-minimum-stability diagnostic");
+        assert!(!notice.message().contains('\u{202E}'));
     }
 
     /// Regression for #550: a package whose registry fetch succeeded but produced zero

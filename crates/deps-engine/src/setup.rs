@@ -1308,8 +1308,11 @@ mod tests {
             let ecosystem = registry.get(id).expect("id came from ecosystem_ids()");
             let ecosystem_registry = ecosystem.registry();
 
-            let control =
-                ecosystem_registry.select_latest_matching(&fixture(RemovalStatus::Available), &req);
+            let control = ecosystem_registry.select_latest_matching(
+                &fixture(RemovalStatus::Available),
+                &req,
+                &deps_core::SelectionContext::none(),
+            );
             assert!(
                 control.is_some(),
                 "{id}: control fixture (all Available) must resolve under a wildcard \
@@ -1317,8 +1320,11 @@ mod tests {
                  ecosystem's matcher, not that the advisory flag broke anything"
             );
 
-            let subject = ecosystem_registry
-                .select_latest_matching(&fixture(RemovalStatus::AdvisoryDeprecated), &req);
+            let subject = ecosystem_registry.select_latest_matching(
+                &fixture(RemovalStatus::AdvisoryDeprecated),
+                &req,
+                &deps_core::SelectionContext::none(),
+            );
             assert!(
                 subject.is_some(),
                 "{id}: an advisory-only flag must not hide an existing package under a \
@@ -1337,8 +1343,11 @@ mod tests {
                 continue;
             }
 
-            let prerelease_subject =
-                ecosystem_registry.select_latest_matching(&prerelease_only_fixture(), &req);
+            let prerelease_subject = ecosystem_registry.select_latest_matching(
+                &prerelease_only_fixture(),
+                &req,
+                &deps_core::SelectionContext::none(),
+            );
             assert!(
                 prerelease_subject.is_some(),
                 "{id}: a package whose only releases so far are prerelease must still \

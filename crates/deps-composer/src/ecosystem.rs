@@ -620,6 +620,50 @@ mod tests {
                  under minimum-stability: alpha, got: {actions:?}"
             );
         }
+
+        /// #1444 end-to-end: a real `composer.json` with an unrecognized `minimum-stability`
+        /// value produces a WARNING diagnostic through the full `Ecosystem::generate_diagnostics`
+        /// path — parse -> `ParseResult::invalid_minimum_stability` ->
+        /// `invalid_minimum_stability_notice`. No mock registry needed:
+        /// `generate_diagnostics_from_cache` never performs network I/O.
+        #[tokio::test]
+        async fn test_generate_diagnostics_reports_invalid_minimum_stability() {
+            let manifest = r#"{
+  "minimum-stability": "betta",
+  "require": {
+    "twig/twig": "3.28.0"
+  }
+}"#;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = ComposerEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+            let parse_result = ecosystem.parse_manifest(manifest, &uri).await.unwrap();
+
+            let diagnostics = ecosystem
+                .generate_diagnostics(
+                    parse_result.as_ref(),
+                    VersionData::new(&HashMap::new(), &HashMap::new()),
+                    &uri,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                )
+                .await;
+
+            let notice = diagnostics
+                .iter()
+                .find(|d| d.message().contains("minimum-stability"))
+                .unwrap_or_else(|| {
+                    panic!("expected an invalid-minimum-stability diagnostic, got: {diagnostics:?}")
+                });
+            assert!(notice.message().contains("\"betta\""));
+            // `manifest`'s second line (index 1) is `  "minimum-stability": "betta",`.
+            assert_eq!(notice.range.start.line, 1);
+            let line = "  \"minimum-stability\": \"betta\",";
+            assert_eq!(
+                notice.range.start.character,
+                line.find("betta").unwrap() as u32
+            );
+        }
     }
 
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +

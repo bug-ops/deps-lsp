@@ -50,6 +50,7 @@ impl Registry for StubRegistry {
         &'a self,
         _name: &'a PackageName,
         _req: &'a VersionReq,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> BoxFuture<'a, deps_core::Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move { Ok(None) })
     }

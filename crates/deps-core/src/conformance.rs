@@ -446,6 +446,7 @@ impl crate::Registry for AlwaysHasResultsRegistry {
         &'a self,
         _name: &'a PackageName,
         _req: &'a crate::VersionReq,
+        _selection_context: &'a crate::SelectionContext,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<Output = crate::Result<Option<Box<dyn crate::Version>>>>
@@ -1326,7 +1327,7 @@ pub fn assert_select_latest_matching_overridden(
 ) {
     let req = crate::VersionReq::new(req);
     assert_eq!(
-        registry.select_latest_matching(versions, &req),
+        registry.select_latest_matching(versions, &req, &crate::SelectionContext::none()),
         Some(expected_index),
         "select_latest_matching({req:?}) index mismatch"
     );
@@ -1410,7 +1411,7 @@ impl<T: ?Sized> NotInherent for T {}
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
-/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq)
+/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq, _selection_context: &'a deps_core::SelectionContext)
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(None) })
 /// #     }
@@ -2149,7 +2150,7 @@ macro_rules! json_depth_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
-/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq)
+/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq, _selection_context: &'a deps_core::SelectionContext)
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(None) })
 /// #     }
@@ -2157,7 +2158,7 @@ macro_rules! json_depth_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
-/// #     fn select_latest_matching(&self, versions: &[Box<dyn deps_core::Version>], req: &deps_core::VersionReq) -> Option<usize> {
+/// #     fn select_latest_matching(&self, versions: &[Box<dyn deps_core::Version>], req: &deps_core::VersionReq, _selection_context: &deps_core::SelectionContext) -> Option<usize> {
 /// #         let req = req.as_str();
 /// #         versions.iter().position(|v| v.version_string().as_str() == req)
 /// #     }
@@ -2374,7 +2375,7 @@ macro_rules! registry_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         panic!("must not be queried: the #1136 gate should reject this fixture's source first");
 /// #     }
-/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq)
+/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq, _selection_context: &'a deps_core::SelectionContext)
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         panic!("must not be queried: the #1136 gate should reject this fixture's source first");
 /// #     }
@@ -2628,7 +2629,7 @@ macro_rules! operator_chars_conformance {
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Vec<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(vec![]) })
 /// #     }
-/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq)
+/// #     fn get_latest_matching<'a>(&'a self, _name: &'a deps_core::PackageName, _req: &'a deps_core::VersionReq, _selection_context: &'a deps_core::SelectionContext)
 /// #         -> std::pin::Pin<Box<dyn std::future::Future<Output = deps_core::Result<Option<Box<dyn deps_core::Version>>>> + Send + 'a>> {
 /// #         Box::pin(async move { Ok(None) })
 /// #     }

@@ -1198,7 +1198,12 @@ impl deps_core::Registry for NuGetRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         Box::pin(async move {
             let version = self
                 .get_latest_matching(name.as_str(), req.as_str())
@@ -1251,7 +1256,7 @@ impl deps_core::Registry for NuGetRegistry {
         name: &'a deps_core::PackageName,
         source: &'a DependencySource,
         req: &'a deps_core::VersionReq,
-        _selection_context: &'a deps_core::SelectionContext,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             match source {
@@ -1264,7 +1269,8 @@ impl deps_core::Registry for NuGetRegistry {
                                 .into_iter()
                                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
                                 .collect();
-                            let idx = client.select_latest_matching(&versions, req);
+                            let idx =
+                                client.select_latest_matching(&versions, req, selection_context);
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
@@ -1301,7 +1307,12 @@ impl deps_core::Registry for NuGetRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         if versions.is_empty() {
             return None;
         }
@@ -1922,7 +1933,10 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> =
             vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     /// Regression for #423: empty `req` on the trait impl must also rescue a
@@ -1936,7 +1950,10 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> =
             vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
         let req = VersionReq::new("");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     /// Regression guard for #423: `"*-*"` is not an existence-check wildcard, so the trait
@@ -1955,7 +1972,10 @@ mod tests {
             Box::new(v("1.0.0")),
         ];
         let req = VersionReq::new("*-*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     /// Regression guard for #423: a concrete floating requirement must NOT be rescued by
@@ -1970,7 +1990,10 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> =
             vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
         let req = VersionReq::new("1.*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), None);
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            None
+        );
     }
 
     /// Regression guard for #423: a concrete exact-pin requirement matching nothing in a
@@ -1985,7 +2008,10 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> =
             vec![Box::new(v("2.0.0-beta2")), Box::new(v("2.0.0-beta1"))];
         let req = VersionReq::new("[9.9.9]");
-        assert_eq!(registry.select_latest_matching(&versions, &req), None);
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            None
+        );
     }
 
     // --- ServiceIndex::resolve: registrations_base_url preference (S2/rev2 OQ6) ---
@@ -3010,6 +3036,70 @@ mod tests {
         let versions = client.get_versions_chained("pkg").await.unwrap();
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version.as_str(), "9.0.0");
+    }
+
+    /// #1444 M2/M3: `get_latest_matching_from`'s `AlternateRegistry` branch must forward the
+    /// caller's own `SelectionContext` to the alternate client's `select_latest_matching`,
+    /// not silently substitute a fresh `SelectionContext::none()` — a regression invisible to
+    /// every other assertion, since NuGet never reads `minimum_stability` itself. Uses
+    /// [`deps_core::test_util::SelectionContextCapture`], which `NuGetRegistry::select_latest_matching`
+    /// records into under `#[cfg(test)]`.
+    #[tokio::test]
+    async fn test_get_latest_matching_from_alternate_forwards_selection_context() {
+        use deps_core::test_util::SelectionContextCapture;
+        use deps_core::{PackageName, Registry, SelectionContext, StabilityFloor, VersionReq};
+
+        let mut hop_server = mockito::Server::new_async().await;
+        hop_server
+            .mock("GET", "/index.json")
+            .with_status(200)
+            .with_body(service_index_body(
+                &format!("{}/flat", hop_server.url()),
+                &format!("{}/search", hop_server.url()),
+            ))
+            .create_async()
+            .await;
+        hop_server
+            .mock("GET", "/flat/pkg/index.json")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "1.5.0", "2.0.0"]}"#)
+            .create_async()
+            .await;
+
+        let policy = all_policy();
+        let cache = Arc::new(HttpCache::new());
+        let root = Arc::new(NuGetRegistry::new(Arc::clone(&cache)));
+        let hop_feed =
+            NuGetFeedUrl::new(&format!("{}/index.json", hop_server.url()), &policy).unwrap();
+        let chain = NuGetSourceChain {
+            key: "selection-context-forwarding".to_string(),
+            hops: vec![hop(&hop_feed)],
+            implicit_public_fallback: false,
+        };
+        NuGetRegistry::register_alternate(&root, &chain, &policy);
+
+        let source = DependencySource::AlternateRegistry {
+            index: chain.key.clone(),
+            mirrors_crates_io: false,
+        };
+        let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
+        SelectionContextCapture::reset();
+        let _ = root
+            .get_latest_matching_from(
+                &PackageName::new("pkg"),
+                &source,
+                &VersionReq::new("*"),
+                &sentinel,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            SelectionContextCapture::last(),
+            Some(sentinel),
+            "the alternate branch must forward the caller's SelectionContext, not a fresh \
+             SelectionContext::none()"
+        );
     }
 
     // --- issue #561: authenticated fetch (C1 origin-binding, four-site routing) ---

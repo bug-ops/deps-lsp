@@ -614,7 +614,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         // Threads `parse_result`'s own `SelectionContext` (e.g. Composer's
         // `minimum-stability`, #1433) so this action never disagrees with hover/diagnostics
         // about what "latest" means for the same dependency.
-        let latest_idx = registry.select_latest_matching_with_context(
+        let latest_idx = registry.select_latest_matching(
             registry_versions,
             &crate::existence_wildcard_req(),
             &parse_result.selection_context(),
@@ -2741,6 +2741,7 @@ mod tests {
                 &'a self,
                 _name: &'a PackageName,
                 _req: &'a VersionReq,
+                _selection_context: &'a crate::SelectionContext,
             ) -> crate::ecosystem::BoxFuture<
                 'a,
                 crate::error::Result<Option<Box<dyn crate::Version>>>,

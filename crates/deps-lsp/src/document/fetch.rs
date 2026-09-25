@@ -339,6 +339,7 @@ mod tests {
                 &'a self,
                 name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 let name = name.clone();
@@ -519,6 +520,7 @@ dependencies = ["requests>=2.0.0"]
                 &'a self,
                 _name: &'a PackageName,
                 _req: &'a VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 let latest = Box::new(MockYankVersion {

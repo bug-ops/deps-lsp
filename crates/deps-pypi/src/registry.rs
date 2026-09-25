@@ -700,10 +700,15 @@ impl deps_core::Registry for PypiRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<
         'a,
         deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
     > {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         Box::pin(async move {
             let version = Self::get_latest_matching(self, name.as_str(), req.as_str()).await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
@@ -765,7 +770,7 @@ impl deps_core::Registry for PypiRegistry {
         name: &'a deps_core::PackageName,
         source: &'a DependencySource,
         req: &'a deps_core::VersionReq,
-        _selection_context: &'a deps_core::SelectionContext,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<
         'a,
         deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
@@ -781,7 +786,8 @@ impl deps_core::Registry for PypiRegistry {
                                 .into_iter()
                                 .map(|v| Box::new(v) as Box<dyn deps_core::Version>)
                                 .collect();
-                            let idx = client.select_latest_matching(&versions, req);
+                            let idx =
+                                client.select_latest_matching(&versions, req, selection_context);
                             Ok(idx.and_then(|i| versions.into_iter().nth(i)))
                         }
                         None => Err(DepsError::PackageNotFound {
@@ -827,7 +833,12 @@ impl deps_core::Registry for PypiRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
+        #[cfg(test)]
+        deps_core::test_util::SelectionContextCapture::record(selection_context);
+        #[cfg(not(test))]
+        let _ = selection_context;
         if deps_core::is_existence_wildcard(req) {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
@@ -1865,7 +1876,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(1));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(1)
+        );
     }
 
     #[test]
@@ -1887,7 +1901,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     #[test]
@@ -1909,7 +1926,10 @@ mod tests {
             }),
         ];
         let req = VersionReq::new("*");
-        assert_eq!(registry.select_latest_matching(&versions, &req), Some(0));
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
     }
 
     #[tokio::test]
@@ -2654,6 +2674,62 @@ mod tests {
         assert_eq!(
             latest.map(|v| v.version_string().to_string()),
             Some("1.5.0".to_string())
+        );
+        mock.assert_async().await;
+    }
+
+    /// #1444 M2/M3: `get_latest_matching_from`'s `AlternateRegistry` branch must forward the
+    /// caller's own `SelectionContext` to the alternate client's `select_latest_matching`,
+    /// not silently substitute a fresh `SelectionContext::none()` — a regression invisible
+    /// to every other assertion, since PyPI never reads `minimum_stability` itself. Uses
+    /// [`deps_core::test_util::SelectionContextCapture`], which `PypiRegistry::select_latest_matching`
+    /// records into under `#[cfg(test)]`.
+    #[tokio::test]
+    async fn test_get_latest_matching_from_alternate_forwards_selection_context() {
+        use deps_core::test_util::SelectionContextCapture;
+        use deps_core::{PackageName, SelectionContext, StabilityFloor};
+
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/simple/pkg/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["1.0.0", "1.5.0", "2.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+
+        let chain = crate::config::ResolvedChain {
+            key: "selection-context-forwarding".to_string(),
+            key_shape: deps_core::registry::KeyShape::Opaque,
+            hops: vec![index_url(&format!("{}/simple", server.url()))],
+            implicit_public_fallback: false,
+        };
+        PypiRegistry::register_alternate(&root, &chain);
+
+        let source = DependencySource::AlternateRegistry {
+            index: chain.key.clone(),
+            mirrors_crates_io: false,
+        };
+        let sentinel = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
+        SelectionContextCapture::reset();
+        let _ = deps_core::Registry::get_latest_matching_from(
+            root.as_ref(),
+            &PackageName::new("pkg"),
+            &source,
+            &deps_core::VersionReq::new(">=1.0.0,<2.0.0"),
+            &sentinel,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            SelectionContextCapture::last(),
+            Some(sentinel),
+            "the alternate branch must forward the caller's SelectionContext, not a fresh \
+             SelectionContext::none()"
         );
         mock.assert_async().await;
     }

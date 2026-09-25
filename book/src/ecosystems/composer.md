@@ -42,7 +42,9 @@ hover, completion, and code actions, via a shared `SelectionContext` rather than
 diagnostics-only path. Editing `minimum-stability` in an already-open document forces a full
 re-fetch, so the other surfaces don't keep showing a stale "latest" behind the new stability
 floor. Separator-less and dot/underscore-separated prerelease suffixes (`1.0.0RC1`,
-`2.6.3.alpha`) classify consistently regardless of `v`/`V` prefix.
+`2.6.3.alpha`) classify consistently regardless of `v`/`V` prefix. A `minimum-stability` value
+that isn't one of `dev`/`alpha`/`beta`/`RC`/`stable` (or isn't a string at all) now surfaces a
+warning diagnostic pointing at the offending value; selection still falls back to `stable`.
 
 Composer's update code actions and completion also preserve the requirement's own `v`-prefix
 style instead of forcing the raw Packagist tag's prefix onto an unprefixed requirement (or vice

@@ -2353,6 +2353,7 @@ dependencies = []
                 &'a self,
                 _name: &'a PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<
                 'a,
                 deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,

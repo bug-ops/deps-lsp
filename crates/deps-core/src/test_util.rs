@@ -870,6 +870,68 @@ pub async fn should_skip_on_empty_result<T>(
         && rate_limit_skip_decision(probe.await, test_name, github_token_configured()).is_none()
 }
 
+/// Test-only recorder proving an internal `Registry`-to-`Registry` delegation forwards the
+/// [`crate::SelectionContext`] it actually received.
+///
+/// Instead of silently substituting a fabricated [`crate::SelectionContext::none()`] (#1444
+/// M2/M3) — the "convention, not guarantee" bug class #1444 exists to close, for the
+/// ecosystems (cargo, deno, go, pypi, nuget, gitlab-ci) whose own registry client reads
+/// nothing from the context and so cannot be proven correct by any assertion on its *return
+/// value* alone.
+///
+/// A production `Registry` implementor's `get_latest_matching`/`get_latest_matching_from`/
+/// `select_latest_matching` body calls [`SelectionContextCapture::record`] as its first
+/// statement, `#[cfg(test)]`-gated (zero cost and no behavior change outside test builds). A
+/// test then calls [`SelectionContextCapture::reset`], drives the delegation path under test
+/// with a distinguishable, non-[`crate::SelectionContext::none()`] context, and asserts
+/// [`SelectionContextCapture::last`] equals exactly that context — proving the value reaching
+/// the innermost delegate is the caller's own, not a fresh substitute. Thread-local, so
+/// parallel `cargo nextest` test processes never interfere (each test binary/process has its
+/// own thread-local state); tests using this recorder within the same crate should still avoid
+/// running concurrently against a shared thread if the harness ever multi-threads a single
+/// process's tests onto one thread pool with shared state elsewhere.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::selection::{SelectionContext, StabilityFloor};
+/// use deps_core::test_util::SelectionContextCapture;
+///
+/// SelectionContextCapture::reset();
+/// let ctx = SelectionContext::with_minimum_stability(StabilityFloor::Rc);
+/// SelectionContextCapture::record(&ctx);
+/// assert_eq!(SelectionContextCapture::last(), Some(ctx));
+/// ```
+#[derive(Debug)]
+pub struct SelectionContextCapture;
+
+thread_local! {
+    static CAPTURED_SELECTION_CONTEXT: std::cell::Cell<Option<crate::SelectionContext>> =
+        const { std::cell::Cell::new(None) };
+}
+
+impl SelectionContextCapture {
+    /// Records `ctx` as the most recently observed [`crate::SelectionContext`] on this
+    /// thread. Call from inside a `Registry` impl's `get_latest_matching`/
+    /// `get_latest_matching_from`/`select_latest_matching` body, `#[cfg(test)]`-gated.
+    pub fn record(ctx: &crate::SelectionContext) {
+        CAPTURED_SELECTION_CONTEXT.with(|c| c.set(Some(*ctx)));
+    }
+
+    /// Clears any previously recorded context. Call before exercising the delegation path
+    /// under test, so a leftover value from an earlier test on the same thread can't produce
+    /// a false pass.
+    pub fn reset() {
+        CAPTURED_SELECTION_CONTEXT.with(|c| c.set(None));
+    }
+
+    /// The most recently [`Self::record`]ed context since the last [`Self::reset`], if any.
+    #[must_use]
+    pub fn last() -> Option<crate::SelectionContext> {
+        CAPTURED_SELECTION_CONTEXT.with(std::cell::Cell::get)
+    }
+}
+
 /// Builds a [`crate::ParseResult`] fixture with `count` synthetic dependencies.
 ///
 /// Names them `"dep-0"`, `"dep-1"`, ... — for tests exercising dependency-count-ceiling

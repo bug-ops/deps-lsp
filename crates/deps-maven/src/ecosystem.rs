@@ -224,6 +224,7 @@ async fn complete_self_closing_version(
                 &[],
                 freshness,
                 Some(&replacement),
+                &parse_result.selection_context(),
             )
             .await
         }
@@ -382,6 +383,7 @@ impl MavenEcosystem {
             prefix,
             VERSION_OPERATOR_CHARS,
             freshness,
+            &deps_core::SelectionContext::none(),
         )
         .await
     }
@@ -702,6 +704,7 @@ impl Ecosystem for MavenEcosystem {
                                 value,
                                 VERSION_OPERATOR_CHARS,
                                 freshness,
+                                &parse_result.selection_context(),
                             )
                             .await
                         }
@@ -2678,6 +2681,7 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>>
             {
                 Box::pin(async move { Ok(None) })

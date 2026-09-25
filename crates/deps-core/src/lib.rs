@@ -208,6 +208,9 @@ pub mod redact_debug;
 pub mod registry;
 /// Re-export of [`redact::secret`] at its pre-#1247 path.
 pub use redact::secret;
+/// [`selection::SelectionContext`]/[`selection::StabilityFloor`]: manifest-scoped
+/// selection state (#1444).
+pub mod selection;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 pub mod version_matcher;
@@ -231,7 +234,7 @@ pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChai
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, Dependency, Ecosystem, EcosystemConfig,
     EcosystemId, LicenseSource, ParseResult, RegistryOccurrence, RejectedRegistryOccurrence,
-    RejectedSourceClass, SelectionContext, parse_manifest_blocking,
+    RejectedSourceClass, parse_manifest_blocking,
 };
 pub use ecosystem_registry::EcosystemRegistry;
 pub use edit::{
@@ -285,6 +288,9 @@ pub use registry::{
     Deprecation, Metadata, Registry, RemovalStatus, Version, classify_default_registry_url,
     existence_wildcard_req, find_latest_stable, has_default_prerelease_marker, hash_routing_key,
     is_existence_wildcard, is_existence_wildcard_str, not_found_or, select_latest_for_existence,
+};
+pub use selection::{
+    InvalidStabilityOccurrence, SelectionContext, StabilityFloor, UnknownStability,
 };
 pub use version_matcher::{
     Pep440Matcher, SemverMatcher, VersionRequirementMatcher, extract_pypi_min_version,

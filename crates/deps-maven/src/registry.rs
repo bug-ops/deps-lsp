@@ -915,6 +915,7 @@ impl deps_core::Registry for MavenCentralRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
@@ -942,6 +943,7 @@ impl deps_core::Registry for MavenCentralRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        _selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
         // `versions` is `get_versions`'s output, which already moved the maven-metadata.xml
         // `<release>` entry to the front (`move_release_to_front`). Unlike npm's curated
@@ -2032,7 +2034,11 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = MavenCentralRegistry::new(cache);
         let idx = registry
-            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .select_latest_matching(
+                &boxed,
+                &VersionReq::new("*"),
+                &deps_core::SelectionContext::none(),
+            )
             .expect("non-empty list must select an index");
 
         assert_eq!(
@@ -2092,7 +2098,11 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = MavenCentralRegistry::new(cache);
         let idx = registry
-            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .select_latest_matching(
+                &boxed,
+                &VersionReq::new("*"),
+                &deps_core::SelectionContext::none(),
+            )
             .expect("non-empty list must select an index");
 
         assert_eq!(boxed[idx].version_string(), "1.4.0");
@@ -2118,7 +2128,11 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = MavenCentralRegistry::new(cache);
         let idx = registry
-            .select_latest_matching(&versions, &VersionReq::new("*"))
+            .select_latest_matching(
+                &versions,
+                &VersionReq::new("*"),
+                &deps_core::SelectionContext::none(),
+            )
             .expect("non-empty list must select an index");
 
         assert_eq!(versions[idx].version_string(), "2.0.0-alpha");
@@ -2158,7 +2172,11 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let registry = MavenCentralRegistry::new(cache);
         let idx = registry
-            .select_latest_matching(&boxed, &VersionReq::new("*"))
+            .select_latest_matching(
+                &boxed,
+                &VersionReq::new("*"),
+                &deps_core::SelectionContext::none(),
+            )
             .expect("non-empty list must select an index");
 
         assert_eq!(

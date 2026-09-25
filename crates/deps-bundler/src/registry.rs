@@ -317,6 +317,7 @@ impl deps_core::Registry for RubyGemsRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
@@ -344,6 +345,7 @@ impl deps_core::Registry for RubyGemsRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
+        _selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
         versions.iter().position(|v| {
             version_matches_requirement(v.version_string().as_str(), req.as_str())

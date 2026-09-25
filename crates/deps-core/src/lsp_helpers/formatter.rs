@@ -426,7 +426,8 @@ pub trait RequirementResolution: Send + Sync {
     /// — every other ecosystem's requirement text alone is unambiguous, so this is a no-op
     /// for them. Callers that already have `dep` in hand (the diagnostic pipeline's outdated
     /// rule) call this instead of `requirement_status` directly, mirroring
-    /// `Registry::select_latest_matching_with_context`'s identical additive-default pattern.
+    /// `Registry::select_latest_matching`'s identical additive-default pattern for its own
+    /// `selection_context` parameter.
     fn requirement_status_for(
         &self,
         dep: &dyn Dependency,
