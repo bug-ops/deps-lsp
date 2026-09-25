@@ -1752,7 +1752,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.0.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.0.0")]),
                     )
                 })
                 .collect();
@@ -1766,7 +1766,7 @@ mod tests {
                     VulnSeverity::High,
                 )
                 .expect("valid osv id")
-                .with_fixed_versions(vec!["2.0.0".to_string()]),
+                .with_fixed_versions(vec![OsvVersion::new("2.0.0")]),
             );
             let total = advisories.len();
             let dv = DependencyVulnerabilities::new(Capped::new(advisories, total))

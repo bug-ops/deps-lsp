@@ -775,7 +775,7 @@ mod tests {
     async fn test_generate_code_actions_diagnostic_codes_restricted_to_displayed_advisories_partial_overlap()
      {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -794,7 +794,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["1.5.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("1.5.0")]),
         )];
         advisories.extend((2..=5).map(|i| {
             Arc::new(
@@ -813,7 +813,7 @@ mod tests {
                 VulnSeverity::Low,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["2.0.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("2.0.0")]),
         ));
         let total = advisories.len();
 
@@ -869,7 +869,7 @@ mod tests {
     async fn test_generate_code_actions_diagnostic_codes_omitted_when_fix_is_entirely_beyond_display_cap()
      {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -901,7 +901,7 @@ mod tests {
                 VulnSeverity::Low,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["2.0.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("2.0.0")]),
         ));
         let total = advisories.len();
 

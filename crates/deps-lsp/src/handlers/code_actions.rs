@@ -720,8 +720,8 @@ serde = "1.0.0"
         {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             use deps_core::osv::{
-                Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
-                VulnSeverity, VulnerabilityMap,
+                Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome,
+                UpgradeStatus, VulnSeverity, VulnerabilityMap,
             };
             use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
 
@@ -765,7 +765,7 @@ serde = "0.9.0"
                     VulnSeverity::Low,
                 )
                 .expect("valid osv id")
-                .with_fixed_versions(vec!["1.0.5".to_string()]),
+                .with_fixed_versions(vec![OsvVersion::new("1.0.5")]),
             ));
             let total = advisories.len();
 
@@ -829,8 +829,8 @@ serde = "0.9.0"
         async fn test_handle_code_actions_vulnerability_fix_with_displayed_advisory_still_binds() {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             use deps_core::osv::{
-                Advisory, Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus,
-                VulnSeverity, VulnerabilityMap,
+                Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome,
+                UpgradeStatus, VulnSeverity, VulnerabilityMap,
             };
             use tower_lsp_server::ls_types::{CodeActionContext, Diagnostic};
 
@@ -865,7 +865,7 @@ serde = "0.9.0"
                     VulnSeverity::High,
                 )
                 .expect("valid osv id")
-                .with_fixed_versions(vec!["1.0.5".to_string()]),
+                .with_fixed_versions(vec![OsvVersion::new("1.0.5")]),
             )];
             advisories.extend((2..=5).map(|i| {
                 Arc::new(
@@ -884,7 +884,7 @@ serde = "0.9.0"
                     VulnSeverity::Low,
                 )
                 .expect("valid osv id")
-                .with_fixed_versions(vec!["1.0.6".to_string()]),
+                .with_fixed_versions(vec![OsvVersion::new("1.0.6")]),
             ));
             let total = advisories.len();
 
