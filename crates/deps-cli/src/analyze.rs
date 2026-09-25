@@ -205,8 +205,10 @@ pub async fn analyze_manifest(
     // A one-shot check has no prior in-memory resolved-version state to protect from a
     // transient parse failure the way `deps-lsp` does, so the reload-ok signal (issue
     // #1407) isn't needed here.
-    let (resolved_versions, resolved_version_candidates, _lockfile_reload_ok) =
-        load_resolved_versions(&uri, &ctx.lockfile_cache, ecosystem.as_ref()).await;
+    let (resolved_versions, resolved_version_candidates) =
+        load_resolved_versions(&uri, &ctx.lockfile_cache, ecosystem.as_ref())
+            .await
+            .into_maps();
 
     let (dep_sources, collided_names) =
         dedup_dependencies_by_source(parse_result.as_ref(), formatter);

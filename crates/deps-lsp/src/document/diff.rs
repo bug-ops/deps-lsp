@@ -187,10 +187,10 @@ impl DependencyDiff {
     }
 }
 
-/// Whether a lock-file-only reload (no manifest edit, so no [`DependencyDiff`] exists to
-/// consult) newly resolved, or changed, the in-use version for any of `deps` — the
+/// Which of `deps` had their in-use version newly resolved or changed by a lock-file-only
+/// reload (no manifest edit, so no [`DependencyDiff`] exists to consult) — the
 /// `handle_lockfile_change` counterpart of [`DependencyDiff::needs_osv_rescan`] (issue
-/// #1395).
+/// #1395). Empty means no dependency's in-use version moved.
 ///
 /// Compares each dependency *occurrence* via [`deps_core::lsp_helpers::resolve_in_use_version`]
 /// — the exact same policy OSV target selection ([`deps_engine::classify::osv::build_scan_targets`])
@@ -205,6 +205,10 @@ impl DependencyDiff {
 /// `old_resolved`/`old_candidates` and `new_resolved`/`new_candidates` are a document's
 /// [`super::state::DocumentState::resolved_versions`]/[`super::state::DocumentState::resolved_version_candidates`]
 /// before and after [`super::state::DocumentState::update_resolved_versions`].
+///
+/// The returned names are also what [`reload_resolved_versions`] evicts from
+/// [`super::state::DocumentState::licenses`] (issue #1424): a dependency whose in-use version
+/// just moved can no longer vouch for its previously cached license.
 pub(crate) fn resolved_versions_changed(
     deps: &[&dyn Dependency],
     old_resolved: &HashMap<PackageName, ConcreteVersion>,
@@ -213,27 +217,29 @@ pub(crate) fn resolved_versions_changed(
     new_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: EcosystemId,
-) -> bool {
-    deps.iter().any(|dep| {
-        let normalized = formatter.normalize_package_name(dep.name());
-        let old = deps_core::lsp_helpers::resolve_in_use_version(
-            *dep,
-            &normalized,
-            old_resolved,
-            Some(old_candidates),
-            formatter,
-            ecosystem_id,
-        );
-        let new = deps_core::lsp_helpers::resolve_in_use_version(
-            *dep,
-            &normalized,
-            new_resolved,
-            Some(new_candidates),
-            formatter,
-            ecosystem_id,
-        );
-        old != new
-    })
+) -> Vec<PackageName> {
+    deps.iter()
+        .filter_map(|dep| {
+            let normalized = formatter.normalize_package_name(dep.name());
+            let old = deps_core::lsp_helpers::resolve_in_use_version(
+                *dep,
+                &normalized,
+                old_resolved,
+                Some(old_candidates),
+                formatter,
+                ecosystem_id,
+            );
+            let new = deps_core::lsp_helpers::resolve_in_use_version(
+                *dep,
+                &normalized,
+                new_resolved,
+                Some(new_candidates),
+                formatter,
+                ecosystem_id,
+            );
+            (old != new).then(|| dep.name().clone())
+        })
+        .collect()
 }
 
 /// Writes a freshly-reloaded `resolved_versions`/`resolved_version_candidates` pair into
@@ -242,11 +248,11 @@ pub(crate) fn resolved_versions_changed(
 /// (issue #1398/#1399 code review: keeps their drift-detection-and-write sequence from
 /// silently diverging, exactly the bug class #1398/#1399 themselves exist to close).
 ///
-/// `detect_drift` gates whether [`resolved_versions_changed`] runs at all — each caller
-/// passes its own precondition (`lockfile_reload_ok` on the lock-file-watcher path; the
-/// debounced-edit path only ever calls this function once it already knows the reload
-/// succeeded, so it always passes `true`). Returns whether drift was detected (`false`
-/// whenever `detect_drift` is `false`, without running the comparison).
+/// Both callers only ever call this once they already know the reload itself succeeded
+/// (`lockfile_reload_ok` on the lock-file-watcher path, the debounced-edit path's own
+/// equivalent check) — a caller that hasn't reached that point yet simply doesn't call this
+/// function at all, rather than calling it with a flag telling it to skip its own drift
+/// comparison. Returns whether a resolved-version move was detected.
 ///
 /// Deliberately does **not** bump `resolved_versions_generation` itself (issue #1407
 /// code-review reconciliation with #1410): the bump decision needs the caller's own
@@ -268,40 +274,57 @@ pub(crate) fn resolved_versions_changed(
 /// only make this call's drift verdict imprecise, a narrow, already-tolerated window (see
 /// `server::handle_lockfile_change`'s critic M4 "Known limitation" comment for the same class
 /// of tolerated staleness), never violate that invariant.
+///
+/// Also evicts [`super::state::DocumentState::licenses`] for every dependency whose in-use
+/// version moved, but only for an ecosystem whose
+/// <code>ecosystem.[license_source](deps_core::Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
+/// is `true` (issue #1424, resolving the prior `TODO(critic)` on
+/// [`super::state::DocumentState::merge_licenses`]) — done synchronously, in the same write
+/// that lands the fresh resolved-version maps, so a subsequent tier-3 re-fetch that fails
+/// this round leaves the license correctly absent instead of silently misattributing the
+/// *previous* version's license to the new one. Deliberately **not** evicted for a
+/// `RegistryDeclaredSpdx` ecosystem (PyPI/Composer's tier-1 backfill, `merge_licenses`'s
+/// other caller): that license is the registry's latest-matching pick, not tied to the
+/// resolved version in the first place, and — unlike the tier-3 case — is never re-fetched
+/// on a lock-file-only change (`change_task_triggers`' `requires_dedicated_fetch` gate), so
+/// evicting it here would just delete valid, still-displayable data with nothing to
+/// repopulate it until the next manifest edit or document reopen.
 pub(crate) fn reload_resolved_versions(
     uri: &Uri,
     state: &ServerState,
     ecosystem: &dyn Ecosystem,
     resolved_versions: &HashMap<PackageName, ConcreteVersion>,
     resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
-    detect_drift: bool,
 ) -> bool {
-    let lock_changed = detect_drift
-        && state
-            .with_document(uri, |doc| {
-                doc.parse_result().is_some_and(|parse_result| {
-                    let deps = parse_result.dependencies();
-                    resolved_versions_changed(
-                        &deps,
-                        &doc.resolved_versions,
-                        &doc.resolved_version_candidates,
-                        resolved_versions,
-                        resolved_version_candidates,
-                        ecosystem.formatter(),
-                        ecosystem.ecosystem_id(),
-                    )
-                })
+    let changed_names: Vec<PackageName> = state
+        .with_document(uri, |doc| {
+            doc.parse_result().map(|parse_result| {
+                let deps = parse_result.dependencies();
+                resolved_versions_changed(
+                    &deps,
+                    &doc.resolved_versions,
+                    &doc.resolved_version_candidates,
+                    resolved_versions,
+                    resolved_version_candidates,
+                    ecosystem.formatter(),
+                    ecosystem.ecosystem_id(),
+                )
             })
-            .unwrap_or(false);
+        })
+        .flatten()
+        .unwrap_or_default();
 
     if let Some(mut doc) = state.documents.get_mut(uri) {
+        if ecosystem.license_source().requires_dedicated_fetch() {
+            doc.evict_licenses(&changed_names);
+        }
         doc.set_resolved_versions_without_bump(
             resolved_versions.clone(),
             resolved_version_candidates.clone(),
         );
     }
 
-    lock_changed
+    !changed_names.is_empty()
 }
 
 // The single `incremental_fetch_tests` module below is gated on `feature = "cargo"` (it
@@ -1883,6 +1906,133 @@ tokio = "1.0"
             assert!(!doc.cached_versions.contains_key("anyhow"));
         }
 
+        /// Issue #1424 (impl-critic round 2, S1): for a `RegistryDeclaredSpdx` ecosystem
+        /// (Cargo), a resolved-version move must NOT evict `DocumentState::licenses` — that
+        /// license source is the registry's latest-matching pick, not tied to the resolved
+        /// version, and is never re-fetched on a lock-file-only reload, so evicting it here
+        /// would just delete valid, still-displayable data with nothing to repopulate it.
+        #[tokio::test]
+        async fn test_reload_resolved_versions_keeps_license_for_non_tier3_ecosystem() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let content = r#"[dependencies]
+time = "0.1"
+"#;
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Cargo)
+                .unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Cargo,
+                content.to_string(),
+                parse_result,
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.resolved_versions
+                    .insert(PackageName::new("time"), ConcreteVersion::from("0.1.43"));
+                doc.merge_licenses(HashMap::from([(
+                    PackageName::new("time"),
+                    vec!["MIT".to_string()],
+                )]));
+            }
+
+            // `cargo update` moves `time` to a new resolved version.
+            let new_resolved: HashMap<PackageName, ConcreteVersion> =
+                std::iter::once((PackageName::new("time"), ConcreteVersion::from("0.1.44")))
+                    .collect();
+            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+
+            let changed = reload_resolved_versions(
+                &uri,
+                &state,
+                ecosystem.as_ref(),
+                &new_resolved,
+                &no_candidates,
+            );
+
+            assert!(changed, "the version move must be detected");
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                doc.licenses.contains_key(&PackageName::new("time")),
+                "Cargo's registry-declared license must survive a resolved-version move, \
+                 since it isn't tied to the resolved version and nothing would repopulate \
+                 it if evicted here"
+            );
+        }
+
+        /// Issue #1424 (impl-critic round 2, S1): for a tier-3, dedicated-fetch ecosystem
+        /// (Dart), a resolved-version move must evict `DocumentState::licenses` for the
+        /// moved dependency, not leave it under its (unversioned) name key — otherwise a
+        /// subsequent license re-fetch that fails this round would leave the *previous*
+        /// version's license visibly misattributed to the new one (the prior
+        /// `TODO(critic)` on `DocumentState::merge_licenses`).
+        #[cfg(feature = "dart")]
+        #[tokio::test]
+        async fn test_reload_resolved_versions_evicts_stale_license_for_tier3_ecosystem() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+            let content = "dependencies:\n  http: ^1.0.0\n";
+
+            let ecosystem = state
+                .ecosystem_registry
+                .get(deps_core::EcosystemId::Dart)
+                .unwrap();
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Dart,
+                content.to_string(),
+                parse_result,
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            {
+                let mut doc = state.documents.get_mut(&uri).unwrap();
+                doc.resolved_versions
+                    .insert(PackageName::new("http"), ConcreteVersion::from("1.2.0"));
+                doc.merge_licenses(HashMap::from([(
+                    PackageName::new("http"),
+                    vec!["BSD-3-Clause".to_string()],
+                )]));
+            }
+
+            // A `pubspec.lock` update moves `http` to a new resolved version. The tier-3
+            // license re-fetch this move would trigger is never simulated here (and, in
+            // particular, never called again) — exactly the "re-fetch fails/doesn't run
+            // this round" half of the bug.
+            let new_resolved: HashMap<PackageName, ConcreteVersion> =
+                std::iter::once((PackageName::new("http"), ConcreteVersion::from("1.3.0")))
+                    .collect();
+            let no_candidates: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
+
+            let changed = reload_resolved_versions(
+                &uri,
+                &state,
+                ecosystem.as_ref(),
+                &new_resolved,
+                &no_candidates,
+            );
+
+            assert!(changed, "the version move must be detected");
+            let doc = state.get_document(&uri).unwrap();
+            assert!(
+                !doc.licenses.contains_key(&PackageName::new("http")),
+                "a moved dependency's stale license must be evicted for a tier-3 \
+                 (dedicated-fetch) ecosystem, not left misattributed to its new resolved \
+                 version"
+            );
+        }
+
         struct StubDependency {
             name: PackageName,
             version_req: Option<VersionReq>,
@@ -1946,7 +2096,7 @@ tokio = "1.0"
             .into_iter()
             .collect();
             assert!(
-                resolved_versions_changed(
+                !resolved_versions_changed(
                     &deps,
                     &old,
                     &no_candidates,
@@ -1954,7 +2104,8 @@ tokio = "1.0"
                     &no_candidates,
                     &formatter,
                     EcosystemId::Cargo,
-                ),
+                )
+                .is_empty(),
                 "a dependency newly gaining a resolved version must be detected"
             );
 
@@ -1972,7 +2123,7 @@ tokio = "1.0"
             .into_iter()
             .collect();
             assert!(
-                resolved_versions_changed(
+                !resolved_versions_changed(
                     &deps,
                     &old,
                     &no_candidates,
@@ -1980,13 +2131,14 @@ tokio = "1.0"
                     &no_candidates,
                     &formatter,
                     EcosystemId::Cargo,
-                ),
+                )
+                .is_empty(),
                 "a dependency's resolved version changing must be detected"
             );
 
             // Identical resolutions for every one of this document's own dependencies.
             assert!(
-                !resolved_versions_changed(
+                resolved_versions_changed(
                     &deps,
                     &new,
                     &no_candidates,
@@ -1994,7 +2146,8 @@ tokio = "1.0"
                     &no_candidates,
                     &formatter,
                     EcosystemId::Cargo,
-                ),
+                )
+                .is_empty(),
                 "no change for this document's dependencies must not trigger a rescan"
             );
 
@@ -2015,7 +2168,7 @@ tokio = "1.0"
             .into_iter()
             .collect();
             assert!(
-                !resolved_versions_changed(
+                resolved_versions_changed(
                     &deps,
                     &old,
                     &no_candidates,
@@ -2023,7 +2176,8 @@ tokio = "1.0"
                     &no_candidates,
                     &formatter,
                     EcosystemId::Cargo,
-                ),
+                )
+                .is_empty(),
                 "an unrelated transitive package's version moving must not trigger a rescan \
                  for a document that doesn't declare it"
             );
@@ -2048,7 +2202,7 @@ tokio = "1.0"
             let new: HashMap<PackageName, ConcreteVersion> = HashMap::new();
 
             assert!(
-                resolved_versions_changed(
+                !resolved_versions_changed(
                     &deps,
                     &old,
                     &no_candidates,
@@ -2056,7 +2210,8 @@ tokio = "1.0"
                     &no_candidates,
                     &formatter,
                     EcosystemId::Cargo,
-                ),
+                )
+                .is_empty(),
                 "a dependency losing its resolved version must be detected as a change"
             );
         }
@@ -2086,7 +2241,7 @@ tokio = "1.0"
                     .collect();
 
             assert!(
-                resolved_versions_changed(
+                !resolved_versions_changed(
                     &deps,
                     &old,
                     &no_candidates,
@@ -2094,7 +2249,8 @@ tokio = "1.0"
                     &no_candidates,
                     &formatter,
                     EcosystemId::Pypi,
-                ),
+                )
+                .is_empty(),
                 "a dependency newly resolved under its normalized lock-file key must be \
                  detected"
             );
@@ -2141,7 +2297,7 @@ tokio = "1.0"
             .collect();
 
             assert!(
-                resolved_versions_changed(
+                !resolved_versions_changed(
                     &deps,
                     &resolved,
                     &old_candidates,
@@ -2149,7 +2305,8 @@ tokio = "1.0"
                     &new_candidates,
                     &formatter,
                     EcosystemId::Cargo,
-                ),
+                )
+                .is_empty(),
                 "the direct dependency's own per-occurrence resolution moving \
                  (0.1.43 -> 0.1.45) must be detected even though the collapsed \
                  resolved_versions value (the highest entry, 0.3.36) stays unchanged"

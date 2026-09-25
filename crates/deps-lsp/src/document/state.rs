@@ -526,10 +526,53 @@ impl DocumentState {
     /// removed dependency's stale entry is reclaimed by
     /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop, not
     /// by this merge.
-    // TODO(critic): name-keyed merge keeps previous version's license on failed re-fetch
-    // after a version change
+    ///
+    /// This merge is name-keyed, not (name, version)-keyed, so it alone cannot tell a
+    /// still-valid cached license from one that belongs to a dependency's *previous*
+    /// resolved version — for a tier-3 (dedicated-fetch) ecosystem, that distinction is
+    /// instead enforced upstream, by [`Self::evict_licenses`] evicting a moved dependency's
+    /// entry before any re-fetch this merge later lands runs (issue #1424). A tier-1
+    /// (`RegistryDeclaredSpdx`) ecosystem's license isn't tied to the resolved version in
+    /// the first place (it's the registry's latest-matching pick), so [`Self::evict_licenses`]
+    /// deliberately never evicts for one — see its own doc.
     pub fn merge_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
         self.licenses.extend(licenses);
+    }
+
+    /// Evicts every name in `names` from [`Self::licenses`] — called ahead of a resolved
+    /// (in-use) version move, before any re-fetch that might repopulate it (issue #1424,
+    /// resolving the prior `TODO(critic)` on [`Self::merge_licenses`]).
+    ///
+    /// Without this, [`Self::merge_licenses`]'s additive-only, name-keyed contract keeps a
+    /// dependency's *previous* version's license visible under its (unversioned) name key
+    /// whenever the version-triggered tier-3 re-fetch fails this round — silently
+    /// misattributing a stale license to the new version instead of correctly showing it as
+    /// unknown until the next successful fetch.
+    ///
+    /// Callers only evict for a tier-3, dedicated-fetch ecosystem (`Ecosystem::license_source
+    /// ().requires_dedicated_fetch()`, e.g. `document::diff::reload_resolved_versions` and
+    /// `document::lifecycle::commit_parsed_document`) — a tier-1 (`RegistryDeclaredSpdx`)
+    /// ecosystem's license (PyPI/Composer's tier-1 backfill) is the registry's
+    /// latest-matching pick, not tied to the resolved version, and is never re-fetched on a
+    /// resolved-version-only change, so evicting it there would delete valid,
+    /// still-displayable data with nothing to repopulate it (impl-critic round 2, S1).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{EcosystemId, PackageName};
+    /// use deps_lsp::document::DocumentState;
+    /// use std::collections::HashMap;
+    ///
+    /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+    /// doc.merge_licenses(HashMap::from([(PackageName::new("foo"), vec!["MIT".to_string()])]));
+    /// doc.evict_licenses(&[PackageName::new("foo")]);
+    /// assert!(!doc.licenses.contains_key(&PackageName::new("foo")));
+    /// ```
+    pub fn evict_licenses(&mut self, names: &[PackageName]) {
+        for name in names {
+            self.licenses.remove(name);
+        }
     }
 
     /// Replaces the yanked/deprecation/fetch-failure outcome map wholesale (normalized-keyed,

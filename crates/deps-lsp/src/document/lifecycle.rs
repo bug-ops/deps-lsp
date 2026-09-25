@@ -202,8 +202,10 @@ async fn run_document_open_background_task(
     // Lock file read is instant and network-free, so it runs before the registry fetch below.
     // The reload-ok signal (issue #1407) isn't needed on this cold-open path: there is no
     // prior in-memory `resolved_versions` yet for a transient parse failure to clobber.
-    let (resolved_versions, resolved_version_candidates, _lockfile_reload_ok) =
-        load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
+    let (resolved_versions, resolved_version_candidates) =
+        load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref())
+            .await
+            .into_maps();
 
     if !resolved_versions.is_empty()
         && let Some(mut doc) = state.documents.get_mut(&uri)
@@ -660,6 +662,19 @@ fn commit_parsed_document(
         doc_state.outcomes.clear_fetch_failure(&normalized);
     }
 
+    // Issue #1424 (impl-critic round 2, S2): a manifest edit that changes a dependency's
+    // version requirement is this document's *only* resolved-version-move signal for
+    // Gradle/Deno (no `LockFileProvider`, so `document::diff::reload_resolved_versions`'s
+    // lock-file-driven eviction never runs for them) and can also race a Dart/Swift
+    // lock-file-driven eviction for the same dependency. Same tier-3-only gate and rationale
+    // as `document::diff::reload_resolved_versions`'s own license eviction — raw-name-keyed,
+    // like `DocumentState::licenses` itself.
+    if ecosystem.license_source().requires_dedicated_fetch() {
+        for changed_dep in &diff.version_changed {
+            doc_state.licenses.remove(changed_dep);
+        }
+    }
+
     state.update_document(uri.clone(), doc_state);
     true
 }
@@ -948,8 +963,9 @@ async fn run_document_change_task(
     // resolved to nothing (or doesn't apply to this ecosystem) from one that was found
     // but failed to parse — e.g. caught mid-rewrite by the package manager while this
     // edit's own change event was in flight. See its use below.
-    let (resolved_versions, resolved_version_candidates, lockfile_reload_ok) =
-        load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
+    let load = load_resolved_versions(&domain_uri, &state.lockfile_cache, ecosystem.as_ref()).await;
+    let lockfile_reload_ok = load.reload_ok();
+    let (resolved_versions, resolved_version_candidates) = load.into_maps();
 
     // Must not touch cached_versions here — it holds the latest registry versions.
     //
@@ -985,7 +1001,6 @@ async fn run_document_change_task(
             ecosystem.as_ref(),
             &resolved_versions,
             &resolved_version_candidates,
-            true,
         )
     } else {
         false
