@@ -168,20 +168,12 @@ impl GradleEcosystem {
                     deps_core::completion::DeclarationScope::Unchecked,
                 )
             }
+            // Plugin version literals (see `is_plugin_version_literal_position`) are narrowly
+            // suppressed here; every other completion in these manifest kinds still reaches
+            // `detect_dsl_context` below.
             crate::parser::GradleManifestKind::KotlinBuild
-            | crate::parser::GradleManifestKind::GroovyBuild => {
-                detect_dsl_context(before_cursor, line, col_idx, position.line)
-            }
-            // `settings.gradle(.kts)` also declares plugins (`id(...) version "..."`), a shape
-            // `detect_dsl_context` doesn't know about: a plugin version literal has no colon,
-            // so it was misdetected as a `Package` context and completion issued a registry
-            // *search* on the typed version prefix (verified live, issue #1436). Narrowly
-            // suppressed only at that exact position — not every Settings-kind completion —
-            // since `dependencyResolutionManagement { versionCatalogs { create("libs") {
-            // library("a", "g:a:<cursor>") } } }`'s real compact-coordinate literal is still
-            // completable through the same `detect_dsl_context` call every other Settings
-            // position uses (also verified live).
-            crate::parser::GradleManifestKind::Settings => {
+            | crate::parser::GradleManifestKind::GroovyBuild
+            | crate::parser::GradleManifestKind::Settings => {
                 if is_plugin_version_literal_position(before_cursor) {
                     (
                         GradleCompletionContext::None,
@@ -204,9 +196,12 @@ impl GradleEcosystem {
 }
 
 /// Whether `before_cursor` ends inside an open string literal immediately preceded (past
-/// whitespace) by the bare `version` keyword — `id("x") version "1.<cursor>"`, the plugin
-/// version-literal shape `detect_dsl_context`'s colon-count heuristic misreads as a `Package`
-/// context (issue #1436, see [`GradleEcosystem::detect_completion_context`]'s Settings arm).
+/// whitespace and an optional method-call `(`) by the bare `version` keyword — both the
+/// infix form `id("x") version "1.<cursor>"` and the method-call form
+/// `id("x").version("1.<cursor>"` — the plugin version-literal shape `detect_dsl_context`'s
+/// colon-count heuristic misreads as a `Package` context (issues #1436 and #1441, see
+/// [`GradleEcosystem::detect_completion_context`]'s `KotlinBuild`/`GroovyBuild`/`Settings`
+/// arm).
 ///
 /// Boundary-checked (`strip_suffix("version")` alone would also match `myversion`/
 /// `compileVersion`-style identifiers) so this only fires for the standalone `version` keyword,
@@ -222,10 +217,11 @@ fn is_plugin_version_literal_position(before_cursor: &str) -> bool {
     else {
         return false;
     };
-    let Some(before_version) = before_cursor[..open.open]
-        .trim_end()
-        .strip_suffix("version")
-    else {
+    let mut before = before_cursor[..open.open].trim_end();
+    if let Some(stripped) = before.strip_suffix('(') {
+        before = stripped.trim_end();
+    }
+    let Some(before_version) = before.strip_suffix("version") else {
         return false;
     };
     before_version.is_empty()
@@ -1504,6 +1500,170 @@ dependencies {
             "a real compact coordinate's version segment must still be detected in a Settings-kind file"
         );
         assert_eq!(v, "31.");
+    }
+
+    /// Regression test for issue #1441: the same plugin-version-literal misdetection fixed for
+    /// `settings.gradle.kts` in #1436 also applies to `build.gradle.kts`'s top-level
+    /// `plugins { id(...) version "..." }` block, which went through the unmodified
+    /// `detect_dsl_context` and issued the same stray registry search.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_kotlin_build_plugin_version_literal_is_none() {
+        let content = "plugins {\n    id(\"com.example.plugin\") version \"1.2.3\"\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let line = content.lines().nth(1).expect("line 1 exists");
+        let col =
+            u32::try_from(line.find("1.2.3\"").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(1, col);
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::None,
+            "plugin version literal must not be misdetected as Package"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    /// Groovy-DSL companion of the Kotlin-DSL regression test above (issue #1441): the same
+    /// `plugins { id "..." version "..." }` shape in `build.gradle` (Groovy) must not be
+    /// misdetected either — cross-DSL parity for this project's Gradle support.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_groovy_build_plugin_version_literal_is_none() {
+        let content = "plugins {\n    id \"com.example.plugin\" version \"1.2.3\"\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let line = content.lines().nth(1).expect("line 1 exists");
+        let col =
+            u32::try_from(line.find("1.2.3\"").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(1, col);
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::None,
+            "plugin version literal must not be misdetected as Package"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    /// Companion to the two regression tests above (issue #1441): the suppression must be
+    /// scoped to the plugin-version-literal shape specifically, not every completion in a
+    /// `build.gradle(.kts)` file — a regular dependency coordinate's version segment elsewhere
+    /// in the same file must still be detected.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_kotlin_build_compact_coordinate_still_detected() {
+        let content = "implementation(\"com.google.guava:guava:31.1\")\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let col =
+            u32::try_from(content.find("31.1\"").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(0, col);
+
+        let (t, v, _range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::Version,
+            "a real dependency coordinate's version segment must still be detected in a build.gradle.kts file"
+        );
+        assert_eq!(v, "31.");
+    }
+
+    /// Regression test for impl-critic finding M1 (issue #1441 review): the method-call form
+    /// `id("x").version("1.2<cursor>")` — a trailing `(` between `version` and the quote —
+    /// must also be suppressed, not just the infix `version "1.2<cursor>"` form.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_kotlin_build_plugin_version_method_call_literal_is_none() {
+        let content = "plugins {\n    id(\"com.example.plugin\").version(\"1.2.3\")\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let line = content.lines().nth(1).expect("line 1 exists");
+        let col =
+            u32::try_from(line.find("1.2.3\"").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(1, col);
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::None,
+            "method-call-form plugin version literal must not be misdetected as Package"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    /// Groovy companion of the method-call regression test above (impl-critic M1): the
+    /// `version(...)` call form (no dot, Groovy's optional-parens style) must also be
+    /// suppressed.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_groovy_build_plugin_version_call_literal_is_none() {
+        let content = "plugins {\n    id 'com.example.plugin' version('1.2.3')\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let line = content.lines().nth(1).expect("line 1 exists");
+        let col = u32::try_from(line.find("1.2.3'").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(1, col);
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::None,
+            "version(...) call-form plugin version literal must not be misdetected as Package"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    /// impl-critic M3: `kotlin("jvm") version "..."` — the Kotlin-DSL shorthand for
+    /// first-party plugins — must be suppressed the same as the generic `id(...)` form.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_kotlin_build_plugin_shorthand_version_literal_is_none() {
+        let content = "plugins {\n    kotlin(\"jvm\") version \"1.9.0\"\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let line = content.lines().nth(1).expect("line 1 exists");
+        let col =
+            u32::try_from(line.find("1.9.0\"").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(1, col);
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::None,
+            "kotlin(...) shorthand plugin version literal must not be misdetected as Package"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    /// impl-critic M3: the single-quoted Groovy infix form `id 'x' version '1.2'` must be
+    /// suppressed the same as the double-quoted form already covered above.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_groovy_build_plugin_single_quoted_version_literal_is_none() {
+        let content = "plugins {\n    id 'com.example.plugin' version '1.2.3'\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let line = content.lines().nth(1).expect("line 1 exists");
+        let col = u32::try_from(line.find("1.2.3'").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(1, col);
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::None,
+            "single-quoted plugin version literal must not be misdetected as Package"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
     }
 
     #[cfg(feature = "lsp-responses")]
