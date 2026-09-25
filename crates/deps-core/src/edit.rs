@@ -896,7 +896,10 @@ pub fn resolve_recommended_fix(
 /// advisories `recommended_fix()` never claimed to resolve in the first place — but is
 /// suppressed the moment `advisory_ids` names either a *claimed* advisory or one this
 /// dependency's own `advisories` never recorded at all. Any other state means F was never
-/// actually verified, so it is rejected too.
+/// actually verified, so it is rejected too. `known_ids` is built from `dv.advisories`, the
+/// fix-computation set capped at [`crate::osv::MAX_ADVISORY_RECORDS`] — not the smaller,
+/// render-only [`crate::osv::DependencyVulnerabilities::advisories_for_display`] — so this gate
+/// sees the same advisory set `recommended_fix()` itself claimed against (#1422).
 ///
 /// `pub(crate)`: `deps-cli update --security-only` (#1329) used to call this directly to
 /// distinguish "no verified fix target" from [`plan_vulnerability_fix`]'s other `None` cause,
@@ -1729,6 +1732,53 @@ mod tests {
             let planned =
                 plan_vulnerability_fix(&d, d.version_range, "\"1.0.2\"", &dv, &MOCK_FORMATTER);
             assert_eq!(planned, Err(VulnFixSkip::NoOpRewrite));
+        }
+
+        /// #1422 regression: a dependency with more than `ADVISORY_DISPLAY_CAP` advisories must
+        /// still resolve and verify a fix computed from an advisory beyond that display cap —
+        /// `resolve_recommended_fix`/`fix_target_is_verified` must read the full
+        /// `MAX_ADVISORY_RECORDS`-capped `advisories` set, not the render-only
+        /// `advisories_for_display` truncation.
+        #[test]
+        fn test_plan_vulnerability_fix_uses_advisory_beyond_display_cap() {
+            use crate::osv::ADVISORY_DISPLAY_CAP;
+
+            let mut advisories: Vec<std::sync::Arc<Advisory>> = (0..ADVISORY_DISPLAY_CAP + 3)
+                .map(|i| {
+                    std::sync::Arc::new(
+                        Advisory::new(
+                            format!("ADV-{i}"),
+                            "2024-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        .with_fixed_versions(vec![OsvVersion::new("1.0.0")]),
+                    )
+                })
+                .collect();
+            // The true highest fix sits past ADVISORY_DISPLAY_CAP; every other advisory fixes
+            // at a lower version.
+            let beyond_cap_index = ADVISORY_DISPLAY_CAP + 1;
+            advisories[beyond_cap_index] = std::sync::Arc::new(
+                Advisory::new(
+                    format!("ADV-{beyond_cap_index}"),
+                    "2024-01-01T00:00:00Z".to_string(),
+                    VulnSeverity::High,
+                )
+                .expect("valid osv id")
+                .with_fixed_versions(vec![OsvVersion::new("2.0.0")]),
+            );
+            let total = advisories.len();
+            let dv = DependencyVulnerabilities::new(Capped::new(advisories, total))
+                .with_fix_target_status(UpgradeStatus::CandidateClean {
+                    version: "2.0.0".to_string(),
+                });
+
+            let d = dep("serde", "0.9", range(0, 8, 0, 11));
+            let planned = plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &MOCK_FORMATTER)
+                .expect("fix beyond the display cap must still be recommended and verified");
+            assert_eq!(planned.edit.new_text, "\"2.0.0\"");
+            assert_eq!(planned.target.as_str(), "2.0.0");
         }
 
         /// A synthetic formatter mimicking a resolver that pins a bare requirement to its

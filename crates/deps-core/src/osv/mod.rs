@@ -35,9 +35,28 @@ use types::{
 
 use crate::cache::HttpCache;
 
-/// Advisories fetched (invariant 3) and rendered (§7) per dependency, plus a
-/// trailing "+N more advisories" entry when [`Capped::total`] exceeds this.
+/// Advisories rendered (§7) per dependency in hover/diagnostics/`deps-cli` output.
+///
+/// Paired with a trailing "+N more advisories" entry when [`Capped::total`] exceeds this.
+/// Deliberately smaller than [`MAX_ADVISORY_RECORDS`] (#1422): the *fetch* bound and the
+/// *render* bound used to be the same constant, which silently capped
+/// [`DependencyVulnerabilities::recommended_fix`]'s input to whatever fit in the hover panel —
+/// see [`DependencyVulnerabilities::advisories_for_display`] for the render-time truncation
+/// this cap now governs on its own.
 pub const ADVISORY_DISPLAY_CAP: usize = 5;
+
+/// Bound on full advisory records fetched (invariant 3) per dependency.
+///
+/// The input budget for [`DependencyVulnerabilities::recommended_fix`]/`fix_target_is_verified`,
+/// independent of [`ADVISORY_DISPLAY_CAP`] (#1422). Larger than the display cap because a
+/// dependency's highest `fixed` version is not guaranteed to appear among the first
+/// [`ADVISORY_DISPLAY_CAP`] advisories OSV returns — a fix recommendation computed from only
+/// those would claim to resolve everything while leaving a later-indexed advisory's
+/// vulnerability open. Still a cap, not "fetch everything": a dependency with more than this
+/// many advisories is the accepted, documented under-report case
+/// ([`DependencyVulnerabilities::recommended_fix`]'s "Limitations" section), traded off against
+/// bounding this client's per-scan fan-out cost.
+pub const MAX_ADVISORY_RECORDS: usize = 50;
 
 /// Query cache TTL (approved Q6).
 const QUERY_CACHE_TTL: Duration = Duration::from_hours(6);
@@ -470,7 +489,7 @@ impl OsvClient {
         records: Vec<OsvVulnRecord>,
     ) -> ScanOutcome {
         let total = records.len();
-        let mut advisories = Vec::with_capacity(total.min(ADVISORY_DISPLAY_CAP));
+        let mut advisories = Vec::with_capacity(total.min(MAX_ADVISORY_RECORDS));
         let mut vuln_ids = Vec::with_capacity(total);
 
         for record in records {
@@ -480,7 +499,7 @@ impl OsvClient {
             let advisory = Arc::new(advisory);
             vuln_ids.push((advisory.id.clone(), advisory.modified.clone()));
             self.store_record_cache(&advisory);
-            if advisories.len() < ADVISORY_DISPLAY_CAP {
+            if advisories.len() < MAX_ADVISORY_RECORDS {
                 advisories.push(advisory);
             }
         }
@@ -499,7 +518,7 @@ impl OsvClient {
     }
 
     /// Builds a [`ScanOutcome`] from a list of `(id, modified)` stubs,
-    /// fetching up to [`ADVISORY_DISPLAY_CAP`] full records.
+    /// fetching up to [`MAX_ADVISORY_RECORDS`] full records.
     async fn build_outcome(
         &self,
         osv_eco: &str,
@@ -512,10 +531,10 @@ impl OsvClient {
 
         #[expect(
             clippy::indexing_slicing,
-            reason = "the slice upper bound is min(vuln_ids.len(), ADVISORY_DISPLAY_CAP), \
+            reason = "the slice upper bound is min(vuln_ids.len(), MAX_ADVISORY_RECORDS), \
                       always <= vuln_ids.len()"
         )]
-        let to_fetch = &vuln_ids[..vuln_ids.len().min(ADVISORY_DISPLAY_CAP)];
+        let to_fetch = &vuln_ids[..vuln_ids.len().min(MAX_ADVISORY_RECORDS)];
         let advisories = self.fetch_records(osv_eco, osv_name, to_fetch).await;
 
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
@@ -1189,7 +1208,8 @@ mod tests {
     async fn scan_advisory_fetch_is_capped_but_total_known_reflects_full_count() {
         let (mut server, client) = mock_client().await;
 
-        let vulns_json: String = (0..40)
+        let vuln_count = MAX_ADVISORY_RECORDS + 10;
+        let vulns_json: String = (0..vuln_count)
             .map(|i| format!(r#"{{"id":"ADV-{i}","modified":"2023-01-01T00:00:00Z"}}"#))
             .collect::<Vec<_>>()
             .join(",");
@@ -1208,7 +1228,7 @@ mod tests {
             )
             .with_status(200)
             .with_body(r#"{"id":"ADV-x","modified":"2023-01-01T00:00:00Z"}"#)
-            .expect(ADVISORY_DISPLAY_CAP)
+            .expect(MAX_ADVISORY_RECORDS)
             .create_async()
             .await;
 
@@ -1221,9 +1241,89 @@ mod tests {
         else {
             panic!("expected Vulnerable outcome");
         };
-        assert_eq!(dv.advisories.total(), 40);
-        assert_eq!(dv.advisories.items().len(), ADVISORY_DISPLAY_CAP);
+        assert_eq!(dv.advisories.total(), vuln_count);
+        // The fix-computation set is capped at MAX_ADVISORY_RECORDS, well beyond what
+        // ADVISORY_DISPLAY_CAP alone would allow (#1422) ...
+        assert_eq!(dv.advisories.items().len(), MAX_ADVISORY_RECORDS);
+        // ... but rendering still truncates to ADVISORY_DISPLAY_CAP.
+        assert_eq!(
+            dv.advisories_for_display().items().len(),
+            ADVISORY_DISPLAY_CAP
+        );
+        assert_eq!(dv.advisories_for_display().total(), vuln_count);
         record.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn scan_recommended_fix_considers_advisories_beyond_display_cap() {
+        // #1422: reproduces the golang.org/x/net repro (18 advisories; the true highest
+        // `fixed` version sits on an advisory OSV returns after the first ADVISORY_DISPLAY_CAP
+        // records). `recommended_fix()` must not silently pick a lower version just because
+        // the display cap used to also bound the fetch.
+        let (mut server, client) = mock_client().await;
+
+        let advisory_count = 18;
+        let vulns_json: String = (0..advisory_count)
+            .map(|i| format!(r#"{{"id":"ADV-{i}","modified":"2023-01-01T00:00:00Z"}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(format!(r#"{{"results":[{{"vulns":[{vulns_json}]}}]}}"#))
+            .create_async()
+            .await;
+
+        for i in 0..advisory_count {
+            // Only the last advisory (well beyond ADVISORY_DISPLAY_CAP=5) carries the true
+            // highest fix — every other one fixes at a lower version.
+            let fixed = if i == advisory_count - 1 {
+                "0.56.0"
+            } else {
+                "0.20.0"
+            };
+            let _record = server
+                .mock("GET", format!("/v1/vulns/ADV-{i}").as_str())
+                .with_status(200)
+                .with_body(format!(
+                    r#"{{"id":"ADV-{i}","modified":"2023-01-01T00:00:00Z",
+                       "database_specific":{{"severity":"HIGH"}},
+                       "affected":[{{"package":{{"name":"golang.org/x/net","ecosystem":"Go"}},
+                         "ranges":[{{"events":[{{"introduced":"0"}},{{"fixed":"{fixed}"}}]}}]}}]}}"#
+                ))
+                .create_async()
+                .await;
+        }
+
+        let targets = vec![target("golang.org/x/net", "0.17.0")];
+        let outcomes = client.scan(EcosystemId::Go, &targets, TEST_TIMEOUT).await;
+
+        let Some(ScanOutcome::Vulnerable(dv)) =
+            outcomes.get(&crate::test_util::vuln_key("golang.org/x/net"))
+        else {
+            panic!("expected Vulnerable outcome");
+        };
+
+        assert_eq!(dv.advisories.total(), advisory_count);
+        assert_eq!(
+            dv.advisories.items().len(),
+            advisory_count,
+            "every advisory must be fetched: advisory_count is well under MAX_ADVISORY_RECORDS"
+        );
+
+        let fix = dv.recommended_fix().expect("a fix must be recommended");
+        assert_eq!(
+            fix.version, "0.56.0",
+            "recommended_fix must consider the advisory beyond ADVISORY_DISPLAY_CAP"
+        );
+
+        let display = dv.advisories_for_display();
+        assert_eq!(
+            display.items().len(),
+            ADVISORY_DISPLAY_CAP,
+            "rendering must still truncate to ADVISORY_DISPLAY_CAP"
+        );
+        assert_eq!(display.total(), advisory_count);
     }
 
     #[tokio::test]

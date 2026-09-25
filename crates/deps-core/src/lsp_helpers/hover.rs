@@ -880,7 +880,7 @@ fn push_deprecation_hover_section(
 /// (see below) AND EVERY id in it is found in `known_advisories` AND
 /// classified [`crate::osv::VulnSeverity::Informational`]. An id this crate
 /// cannot find a severity for (not present in `known_advisories` — e.g.
-/// beyond `ADVISORY_DISPLAY_CAP`, or genuinely a different advisory set for
+/// beyond `MAX_ADVISORY_RECORDS`, or genuinely a different advisory set for
 /// the candidate version) is conservatively treated as "not informational",
 /// so a real vulnerability signal is never silently dropped just because
 /// its severity could not be confirmed at render time.
@@ -947,7 +947,8 @@ fn push_vulnerability_hover_section(
         Some(ScanOutcome::Vulnerable(dv)) => {
             markdown.push_static("### Security advisories\n\n");
 
-            for advisory in dv.advisories.items() {
+            let display_advisories = dv.advisories_for_display();
+            for advisory in display_advisories.items() {
                 markdown.push_static("- **");
                 markdown.push_link(&advisory.id, FieldKind::Prose, advisory.url());
                 markdown.push_static("** — ");
@@ -988,7 +989,7 @@ fn push_vulnerability_hover_section(
                 }
             }
 
-            let remaining = dv.advisories.remaining();
+            let remaining = display_advisories.remaining();
             if remaining > 0 {
                 markdown.push_static("- *(+");
                 markdown.push_number(remaining);
@@ -999,6 +1000,9 @@ fn push_vulnerability_hover_section(
                 version,
                 advisory_ids,
             } = &dv.upgrade_status
+                // Deliberately the full (fix-computation) `dv.advisories`, not
+                // `display_advisories`: a larger known-severity index only ever makes this
+                // informational-suppression check more accurate, never less (#1422).
                 && candidate_vulnerable_line_should_render(advisory_ids, dv.advisories.items())
             {
                 markdown.push_static("\n\u{26a0}\u{fe0f} Latest version ");

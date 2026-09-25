@@ -34,6 +34,14 @@
 //!   unlike Cargo's `$CARGO_HOME`-is-trusted split, npm's project and user tiers are
 //!   policy-symmetric (spec NFR-003(a)): phase 1 has no credential provenance to protect, so
 //!   there is no tier that is "the user's own configuration" in the way `$CARGO_HOME` is.
+//! - **`${VAR}` expansion is tier-gated (issue #1420, amending FR-007).** Unlike the rest of
+//!   this module's policy-symmetric tiers, `${VAR}` expansion reads the *server's own process
+//!   environment* — a project-tier value is attacker-controlled the instant a hostile
+//!   repository is cloned, so a hostile `.npmrc` could otherwise name an arbitrary environment
+//!   variable and have that value embedded into a URL this server then fetches, exfiltrating
+//!   it to an attacker-chosen host. `resolve_entry` therefore rejects any project-tier value
+//!   containing `${` outright, before expansion ever runs (fail-closed, no partial
+//!   interpolation carve-out); only the user tier (`~/.npmrc`) ever expands `${VAR}`.
 //!
 //! See `specs/032-npm-npmrc-registry-support/spec.md` FR-001–FR-014 and
 //! `specs/032-npm-npmrc-registry-support/plan.md` §1/§3/§6 for the design review this module
@@ -77,6 +85,15 @@ pub enum NpmRegistryIndexError {
     /// `${VAR}`-containing string.
     #[error("environment variable {0:?} referenced in registry value is not set")]
     UndefinedEnvVar(String),
+    /// A project-tier `.npmrc` value contains a `${VAR}` placeholder (issue #1420,
+    /// amending FR-007). `${VAR}` expansion reads the *server's* process environment, so a
+    /// project-tier file — attacker-controlled the instant a hostile repository is cloned —
+    /// could otherwise choose an arbitrary environment variable and have its value embedded
+    /// into a URL the server then fetches, exfiltrating that variable's contents to an
+    /// attacker-chosen host. Expansion is therefore permitted only for the user tier
+    /// (`~/.npmrc`), which is not attacker-controlled the way a cloned repository is.
+    #[error("${{VAR}} expansion is not permitted in a project-tier .npmrc value")]
+    ExpansionNotAllowedInProjectTier,
 }
 
 impl From<IndexUrlError> for NpmRegistryIndexError {
@@ -333,6 +350,14 @@ fn parse_npmrc_raw(path: &Path, content: &str) -> RawNpmrc {
     out
 }
 
+/// The `.npmrc` env-var placeholder syntax's opening token (FR-007) — the single source of
+/// truth for both [`expand_env_vars_with`]'s scan and `resolve_entry`'s project-tier
+/// rejection gate (issue #1420), so a future placeholder syntax addition (e.g. a `$(VAR)`
+/// Makefile/MSBuild-style form, as added elsewhere in this workspace for a different purpose)
+/// cannot silently update the expander without also updating the gate, reopening the
+/// exfiltration vector for the new syntax.
+const ENV_VAR_PLACEHOLDER_START: &str = "${";
+
 /// Expands every `${VAR}` placeholder in `raw` from the process environment (FR-007).
 ///
 /// Returns `Ok(expanded)` when every referenced variable is set (including the trivial case
@@ -346,8 +371,8 @@ fn expand_env_vars(raw: &str) -> Result<String, String> {
 /// [`std::env::var`] directly — lets tests inject a fake environment instead of mutating the
 /// real process environment (this workspace forbids `unsafe`, and Rust 2024 made
 /// `std::env::set_var` an `unsafe fn`, so a test cannot do that mutation at all).
-// All indices come from `find("${")`/`find('}')`, both ASCII tokens, so every slice bound
-// is always a char boundary.
+// All indices come from `find(ENV_VAR_PLACEHOLDER_START)`/`find('}')`, both ASCII tokens, so
+// every slice bound is always a char boundary.
 #[allow(clippy::string_slice)]
 fn expand_env_vars_with(
     raw: &str,
@@ -355,9 +380,9 @@ fn expand_env_vars_with(
 ) -> Result<String, String> {
     let mut out = String::with_capacity(raw.len());
     let mut rest = raw;
-    while let Some(start) = rest.find("${") {
+    while let Some(start) = rest.find(ENV_VAR_PLACEHOLDER_START) {
         out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
+        let after = &rest[start + ENV_VAR_PLACEHOLDER_START.len()..];
         let Some(end) = after.find('}') else {
             // No closing brace: keep the rest of the string literal, same as npm's own
             // parser does for a malformed placeholder.
@@ -374,6 +399,31 @@ fn expand_env_vars_with(
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Which `.npmrc` tier a raw `registry=`/`@scope:registry=` value was read from (issue
+/// #1420) — gates whether [`resolve_entry`] ever attempts `${VAR}` expansion at all.
+///
+/// A type-level distinction rather than a `bool`/string flag: [`resolve_entry`]'s tier
+/// parameter must always be one of exactly these two values, and every call site names the
+/// tier it read the value from explicitly (see [`resolve_with_home`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfigTier {
+    /// Ancestor-walked from the opened manifest's directory. Attacker-controlled the
+    /// instant a hostile repository is cloned — `${VAR}` is never expanded here.
+    Project,
+    /// `~/.npmrc`. Not attacker-controlled the way a cloned repository's own files are, so
+    /// `${VAR}` expansion (FR-007) is safe.
+    User,
+}
+
+/// A raw `.npmrc` value paired with the tier it was read from, as [`resolve_with_home`]
+/// collects before calling [`resolve_entry`] — a named pair rather than a positional
+/// `(String, ConfigTier)` tuple, matching this project's preference for concrete types over
+/// positional data at call sites.
+struct TieredRawValue {
+    raw: String,
+    tier: ConfigTier,
 }
 
 /// Expands and validates one raw `.npmrc` value, producing the [`NpmConfig`] entry FR-006's
@@ -393,10 +443,30 @@ fn expand_env_vars_with(
 /// placeholder like `${VAR}`, never a real secret, but that assumption does not hold: a hostile
 /// `.npmrc` can write a credential directly into the raw value with no expansion involved at all
 /// (#767 S2b, matching this function's own M1 threat-model note above about literal userinfo).
+///
+/// `tier` gates expansion itself (issue #1420, amending FR-007): a project-tier `raw`
+/// containing `${` is rejected outright, before [`expand_env_vars`] ever runs, so a hostile
+/// project-tier `.npmrc` can never have an environment variable's value substituted into a URL
+/// this function — or a caller fetching the [`NpmRegistryIndex`] it would have produced — ever
+/// sees.
 fn resolve_entry(
     raw: &str,
+    tier: ConfigTier,
     policy: &RegistryAccessPolicy,
 ) -> Result<NpmRegistryIndex, InvalidEntry> {
+    if tier == ConfigTier::Project && raw.contains(ENV_VAR_PLACEHOLDER_START) {
+        let redacted = RedactedUrl::new(raw);
+        tracing::warn!(
+            raw = %redacted,
+            "project-tier npm registry value uses env-var expansion syntax, which is only \
+             permitted for the user tier; rejecting entry"
+        );
+        return Err(InvalidEntry::new(
+            redacted,
+            NpmRegistryIndexError::ExpansionNotAllowedInProjectTier,
+        ));
+    }
+
     match expand_env_vars(raw) {
         Ok(expanded) => {
             NpmRegistryIndex::new_with_raw_for_log(&expanded, raw, policy).map_err(|reason| {
@@ -552,8 +622,8 @@ fn resolve_with_home(
         .as_deref()
         .and_then(|p| std::fs::canonicalize(p).ok());
 
-    let mut registry_raw: Option<String> = None;
-    let mut scoped_raw: HashMap<String, String> = HashMap::new();
+    let mut registry_raw: Option<TieredRawValue> = None;
+    let mut scoped_raw: HashMap<String, TieredRawValue> = HashMap::new();
 
     // FR-002: deliberate superset of npm's own behavior (project-root `.npmrc` only) —
     // chosen for monorepo ergonomics, mirroring `deps-cargo`'s config.toml discovery.
@@ -562,13 +632,21 @@ fn resolve_with_home(
         let is_user_tier_duplicate =
             std::fs::canonicalize(&candidate).ok().as_deref() == user_canonical.as_deref();
         if !is_user_tier_duplicate && let Some(parsed) = config_cache.get_or_parse(&candidate) {
-            if registry_raw.is_none() {
-                registry_raw.clone_from(&parsed.registry);
+            if registry_raw.is_none()
+                && let Some(raw) = &parsed.registry
+            {
+                registry_raw = Some(TieredRawValue {
+                    raw: raw.clone(),
+                    tier: ConfigTier::Project,
+                });
             }
             for (scope, raw) in &parsed.scoped {
                 scoped_raw
                     .entry(scope.clone())
-                    .or_insert_with(|| raw.clone());
+                    .or_insert_with(|| TieredRawValue {
+                        raw: raw.clone(),
+                        tier: ConfigTier::Project,
+                    });
             }
         }
     }
@@ -576,21 +654,29 @@ fn resolve_with_home(
     if let Some(user_path) = user_npmrc_path.as_deref()
         && let Some(parsed) = config_cache.get_or_parse(user_path)
     {
-        if registry_raw.is_none() {
-            registry_raw.clone_from(&parsed.registry);
+        if registry_raw.is_none()
+            && let Some(raw) = &parsed.registry
+        {
+            registry_raw = Some(TieredRawValue {
+                raw: raw.clone(),
+                tier: ConfigTier::User,
+            });
         }
         for (scope, raw) in &parsed.scoped {
             scoped_raw
                 .entry(scope.clone())
-                .or_insert_with(|| raw.clone());
+                .or_insert_with(|| TieredRawValue {
+                    raw: raw.clone(),
+                    tier: ConfigTier::User,
+                });
         }
     }
 
     NpmConfig {
-        registry: registry_raw.map(|raw| resolve_entry(&raw, policy)),
+        registry: registry_raw.map(|v| resolve_entry(&v.raw, v.tier, policy)),
         scoped_registries: scoped_raw
             .into_iter()
-            .map(|(scope, raw)| (scope, resolve_entry(&raw, policy)))
+            .map(|(scope, v)| (scope, resolve_entry(&v.raw, v.tier, policy)))
             .collect(),
     }
 }
@@ -856,7 +942,7 @@ mod tests {
     #[test]
     fn test_resolve_entry_undefined_var_is_invalid() {
         let policy = all_policy();
-        let result = resolve_entry("${UNDEFINED_VAR}", &policy);
+        let result = resolve_entry("${UNDEFINED_VAR}", ConfigTier::User, &policy);
         assert_matches!(
             result,
             Err(InvalidEntry {
@@ -865,6 +951,58 @@ mod tests {
             })
         );
         assert_eq!(result.unwrap_err().raw.to_string(), "${UNDEFINED_VAR}");
+    }
+
+    /// #1420: a project-tier value containing `${VAR}` is rejected outright, even when the
+    /// named variable is genuinely defined in the process environment — proving rejection is
+    /// unconditional on the tier (checked before `expand_env_vars` ever runs), not merely a
+    /// fallback for an undefined variable. `PATH` is used as a variable virtually guaranteed
+    /// to be set in any test environment.
+    #[test]
+    fn test_resolve_entry_project_tier_rejects_env_var_expansion_even_when_defined() {
+        let policy = all_policy();
+        assert!(
+            std::env::var("PATH").is_ok(),
+            "test precondition: PATH must be set"
+        );
+        let raw = "https://exfil-${PATH}.invalid/p/${PATH}";
+        let result = resolve_entry(raw, ConfigTier::Project, &policy);
+        assert_matches!(
+            result,
+            Err(InvalidEntry {
+                reason: NpmRegistryIndexError::ExpansionNotAllowedInProjectTier,
+                ..
+            })
+        );
+        assert_eq!(
+            result.unwrap_err().raw.to_string(),
+            raw,
+            "rejected entry must report the raw, unexpanded placeholder"
+        );
+    }
+
+    /// The user-tier counterpart: the exact same value with the exact same variable defined
+    /// still expands normally when read from the user tier — proving the rejection above is
+    /// tier-gated, not a blanket ban on `${` syntax.
+    #[test]
+    fn test_resolve_entry_user_tier_still_expands_env_vars() {
+        let policy = all_policy();
+        let path_value = std::env::var("PATH").expect("test precondition: PATH must be set");
+        let result = resolve_entry("https://${PATH}.invalid/", ConfigTier::User, &policy);
+        // The expanded host is very unlikely to be a valid hostname, so this asserts it was
+        // at least attempted (not rejected for the project-tier reason) rather than that it
+        // resolves successfully.
+        assert!(
+            !matches!(
+                result,
+                Err(InvalidEntry {
+                    reason: NpmRegistryIndexError::ExpansionNotAllowedInProjectTier,
+                    ..
+                })
+            ),
+            "user-tier expansion must not be rejected by the project-tier gate: {result:?}, \
+             PATH={path_value:?}"
+        );
     }
 
     /// S-1 regression: a rejected entry's error must report the raw `${VAR}`-referencing
@@ -944,7 +1082,12 @@ mod tests {
     fn test_resolve_entry_redacts_literal_userinfo_from_raw_and_log() {
         let policy = all_policy();
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let invalid = resolve_entry("https://user:hunter2@npm.example/", &policy).unwrap_err();
+            let invalid = resolve_entry(
+                "https://user:hunter2@npm.example/",
+                ConfigTier::User,
+                &policy,
+            )
+            .unwrap_err();
             assert_matches!(invalid.reason, NpmRegistryIndexError::UserInfoPresent);
             assert!(
                 !invalid.raw.as_ref().contains("hunter2"),
@@ -977,6 +1120,7 @@ mod tests {
         let log = deps_core::test_util::capture_tracing_output(|| {
             let invalid = resolve_entry(
                 "https://npm.example/?_authToken=super-secret-value",
+                ConfigTier::User,
                 &policy,
             )
             .unwrap_err();
@@ -1006,8 +1150,12 @@ mod tests {
     fn test_resolve_entry_redacts_literal_userinfo_from_unparseable_raw() {
         let policy = all_policy();
         let log = deps_core::test_util::capture_tracing_output(|| {
-            let invalid =
-                resolve_entry("https://user:hunter2@npm.example:99999/", &policy).unwrap_err();
+            let invalid = resolve_entry(
+                "https://user:hunter2@npm.example:99999/",
+                ConfigTier::User,
+                &policy,
+            )
+            .unwrap_err();
             assert_matches!(invalid.reason, NpmRegistryIndexError::InvalidUrl(_));
             assert!(
                 !invalid.raw.as_ref().contains("hunter2"),
@@ -1040,7 +1188,11 @@ mod tests {
     fn test_resolve_source_for_top_level_override() {
         let policy = all_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry("https://npm.mycorp.example", &policy)),
+            registry: Some(resolve_entry(
+                "https://npm.mycorp.example",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: HashMap::new(),
         };
         assert_eq!(
@@ -1059,10 +1211,14 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("https://npm.pkg.github.com", &policy),
+            resolve_entry("https://npm.pkg.github.com", ConfigTier::User, &policy),
         );
         let config = NpmConfig {
-            registry: Some(resolve_entry("https://npm.mycorp.example", &policy)),
+            registry: Some(resolve_entry(
+                "https://npm.mycorp.example",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: scoped,
         };
         assert_eq!(
@@ -1101,7 +1257,7 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("not-a-valid-url", &policy),
+            resolve_entry("not-a-valid-url", ConfigTier::User, &policy),
         );
         let config = NpmConfig {
             registry: None,
@@ -1124,7 +1280,11 @@ mod tests {
     fn test_blocked_class_for_top_level_override_blocked_by_policy() {
         let policy = public_only_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry("https://169.254.169.254/registry", &policy)),
+            registry: Some(resolve_entry(
+                "https://169.254.169.254/registry",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: HashMap::new(),
         };
         assert_eq!(
@@ -1151,10 +1311,18 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("https://169.254.169.254/registry", &policy),
+            resolve_entry(
+                "https://169.254.169.254/registry",
+                ConfigTier::User,
+                &policy,
+            ),
         );
         let config = NpmConfig {
-            registry: Some(resolve_entry("https://npm.mycorp.example", &policy)),
+            registry: Some(resolve_entry(
+                "https://npm.mycorp.example",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: scoped,
         };
         let occurrence = config
@@ -1176,10 +1344,18 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("https://169.254.169.254/registry", &policy),
+            resolve_entry(
+                "https://169.254.169.254/registry",
+                ConfigTier::User,
+                &policy,
+            ),
         );
         let config = NpmConfig {
-            registry: Some(resolve_entry("https://169.254.169.254/registry", &policy)),
+            registry: Some(resolve_entry(
+                "https://169.254.169.254/registry",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: scoped,
         };
         let top_level = config
@@ -1200,7 +1376,11 @@ mod tests {
     fn test_blocked_class_for_none_when_not_blocked() {
         let policy = all_policy();
         let config = NpmConfig {
-            registry: Some(resolve_entry("https://npm.mycorp.example", &policy)),
+            registry: Some(resolve_entry(
+                "https://npm.mycorp.example",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: HashMap::new(),
         };
         assert_eq!(config.blocked_class_for(&pkg("express")), None);
@@ -1213,15 +1393,22 @@ mod tests {
         let mut scoped = HashMap::new();
         scoped.insert(
             "@myorg".to_string(),
-            resolve_entry("https://npm.pkg.github.com", &policy),
+            resolve_entry("https://npm.pkg.github.com", ConfigTier::User, &policy),
         );
         scoped.insert(
             "@other".to_string(),
-            resolve_entry("https://npm.pkg.github.com/", &policy), // same index, trailing slash
+            resolve_entry("https://npm.pkg.github.com/", ConfigTier::User, &policy), // same index, trailing slash
         );
-        scoped.insert("@bad".to_string(), resolve_entry("not-a-url", &policy));
+        scoped.insert(
+            "@bad".to_string(),
+            resolve_entry("not-a-url", ConfigTier::User, &policy),
+        );
         let config = NpmConfig {
-            registry: Some(resolve_entry("https://npm.pkg.github.com", &policy)),
+            registry: Some(resolve_entry(
+                "https://npm.pkg.github.com",
+                ConfigTier::User,
+                &policy,
+            )),
             scoped_registries: scoped,
         };
         let resolved = config.resolved_registries();
@@ -1265,6 +1452,49 @@ mod tests {
                 index: "https://npm.mycorp.example".to_string(),
                 mirrors_crates_io: false,
             }
+        );
+    }
+
+    /// #1420 end-to-end regression: a project-tier `.npmrc` `registry=` value containing
+    /// `${VAR}` must resolve to `CustomRegistry` (fail closed), never `AlternateRegistry` —
+    /// proving no fetchable `NpmRegistryIndex` is ever constructed for it, even though the
+    /// referenced variable is genuinely defined in the process environment. This is the
+    /// attack scenario from issue #1420: a hostile repository's `.npmrc` naming an
+    /// attacker-chosen variable and embedding it into a registry URL the server would
+    /// otherwise fetch, exfiltrating that variable's value to an attacker-controlled host.
+    #[test]
+    fn test_resolve_with_home_project_tier_rejects_env_var_expansion() {
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        let path_value = std::env::var("PATH").expect("test precondition: PATH must be set");
+        std::fs::write(
+            dir.path().join(".npmrc"),
+            "registry=https://exfil-${PATH}.invalid/p/${PATH}\n",
+        )
+        .unwrap();
+        let cache = NpmConfigCache::new();
+        let policy = all_policy();
+        let config = resolve_with_home(dir.path(), &cache, &policy, None);
+        match config.resolve_source_for(&pkg("express")) {
+            DependencySource::CustomRegistry { url } => {
+                assert!(
+                    url.contains("${PATH}"),
+                    "rejected entry must report the raw, unexpanded placeholder: {url}"
+                );
+                assert!(
+                    !url.contains(&path_value),
+                    "rejected entry must never contain the expanded environment value: {url}"
+                );
+            }
+            other => panic!(
+                "expected CustomRegistry (fail-closed) for a project-tier ${{VAR}} entry, got \
+                 {other:?}"
+            ),
+        }
+        assert!(
+            config.resolved_registries().is_empty(),
+            "a rejected project-tier entry must never contribute a fetchable registry index"
         );
     }
 
