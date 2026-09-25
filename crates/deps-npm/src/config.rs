@@ -114,10 +114,7 @@ impl BlockedHostReason for NpmRegistryIndexError {
 impl RegistryRejectionClassifier for NpmRegistryIndexError {
     fn rejection_reason(&self) -> Option<RegistryRejectionReason> {
         match self {
-            Self::InvalidUrl(_) => Some(RegistryRejectionReason::InvalidUrl),
-            Self::NotHttps(_) => Some(RegistryRejectionReason::NotHttps),
-            Self::UserInfoPresent => Some(RegistryRejectionReason::UserInfoPresent),
-            Self::BlockedHost { .. } => None,
+            Self::Url(e) => e.rejection_reason(),
             Self::UndefinedEnvVar(_) => Some(RegistryRejectionReason::UndefinedEnvVar),
             Self::ExpansionNotAllowedInProjectTier => {
                 Some(RegistryRejectionReason::EnvVarExpansionNotPermitted)
