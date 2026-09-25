@@ -377,6 +377,72 @@ impl BlockedSourceClass {
     }
 }
 
+/// Manifest-scoped state that can refine a registry's "latest matching" version selection
+/// beyond the plain requirement text — e.g. Composer's `minimum-stability` field (#424,
+/// #1433).
+///
+/// Opaque and ecosystem-owned: the type carries whatever an ecosystem's own [`ParseResult`]
+/// puts into it (today, only Composer's `minimum-stability`), and only that ecosystem's own
+/// [`crate::Registry`] implementation reads it back — every other registry's
+/// `*_with_context` method ignores it via that method's own default. Every LSP call site
+/// that needs "the latest version for this dependency" (hover, completion, code actions, and
+/// the background fetch path) obtains one from [`ParseResult::selection_context`] and threads
+/// it into `Registry::get_latest_matching_with_context`/`select_latest_matching_with_context`,
+/// so a call site that already has a `ParseResult` in scope no longer has to independently
+/// remember to extract and thread the same manifest-level state by hand (#1433).
+///
+/// This gives every such call site one shared source of truth to read from, not a
+/// compiler-enforced guarantee: `Registry::*_with_context`'s own `Option<&str>` boundary is
+/// unchanged (#424 predates this type), and the context-less `get_latest_matching`/
+/// `select_latest_matching` remain valid, freely callable trait methods — a call site with no
+/// `ParseResult` in scope, or one that simply forgets to call [`ParseResult::selection_context`],
+/// still compiles. [`PartialEq`] is derived so a caller can detect *that* the context changed
+/// between two parses (e.g. `deps-lsp`'s edit-triggered refetch escalation) without needing to
+/// know what changed.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::SelectionContext;
+///
+/// let none = SelectionContext::none();
+/// assert_eq!(none.minimum_stability(), None);
+///
+/// let composer = SelectionContext::with_composer_minimum_stability(Some("alpha".to_string()));
+/// assert_eq!(composer.minimum_stability(), Some("alpha"));
+/// assert_ne!(none, composer);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SelectionContext {
+    minimum_stability: Option<String>,
+}
+
+impl SelectionContext {
+    /// The empty context: every `Registry::*_with_context` call degrades to its plain,
+    /// context-less counterpart. [`ParseResult::selection_context`]'s default for every
+    /// ecosystem with no selection-context concept of its own.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Builds a context carrying Composer's own `minimum-stability` manifest field
+    /// (`ComposerParseResult::minimum_stability`, #424/#1433).
+    #[must_use]
+    pub fn with_composer_minimum_stability(minimum_stability: Option<String>) -> Self {
+        Self { minimum_stability }
+    }
+
+    /// Composer's `minimum-stability` value, read by
+    /// [`crate::Registry::get_latest_matching_with_context`]/
+    /// [`crate::Registry::select_latest_matching_with_context`]'s one real implementor
+    /// (`PackagistRegistry`) — every other registry ignores it via that method's own default.
+    #[must_use]
+    pub fn minimum_stability(&self) -> Option<&str> {
+        self.minimum_stability.as_deref()
+    }
+}
+
 /// One dependency declaration whose registry-config entry was rejected for a reason other
 /// than a policy-blocked host — returned by [`ParseResult::rejected_registries`] (#1438).
 ///
@@ -507,6 +573,17 @@ pub trait ParseResult: Send + Sync {
     /// point at an unreachable-by-policy host) has nothing to report here and keeps the default.
     fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
         Vec::new()
+    }
+
+    /// Manifest-scoped state that can refine "latest matching" version selection beyond the
+    /// plain requirement text — see [`SelectionContext`]'s own doc.
+    ///
+    /// Default: [`SelectionContext::none()`] — every ecosystem with no selection-context
+    /// concept of its own (all but Composer, as of #1433) needs no override. Composer's own
+    /// `ComposerParseResult` overrides this to surface its manifest's `minimum-stability`
+    /// field.
+    fn selection_context(&self) -> SelectionContext {
+        SelectionContext::none()
     }
 
     /// Dependency lines whose registry-config entry was rejected for a reason other than a

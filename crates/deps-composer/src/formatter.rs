@@ -6,7 +6,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
-    requirement_contains_template_placeholder,
+    match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -122,6 +122,30 @@ impl PackageRendering for ComposerFormatter {
     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
         let version = version.as_str();
         version.to_string()
+    }
+
+    /// Preserves `current`'s `v`-prefix style rather than inserting Packagist's tag text
+    /// verbatim (#1435): unlike `deps-github-actions`/`deps-gitlab-ci` (tag pins) or
+    /// `deps-swift` (whose `SwiftRegistry` already strips a GitHub tag's `v`/`V` prefix at
+    /// fetch time — see `crate::registry`'s doc — so `version` here is never `v`-prefixed to
+    /// begin with), Packagist's `p2` API reports a version's tag text unstripped (e.g.
+    /// `v4.0.0-alpha1`), so without this override an unprefixed requirement like `3.28.0`
+    /// would be rewritten to a `v`-prefixed one on every "update version" action even though
+    /// Composer itself already strips `v`/`V` before comparing
+    /// (`version_satisfies_requirement`'s own leading strip above).
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        match_v_prefix_style(current, version.as_str())
+    }
+
+    /// Same fix as [`format_version_replacing`](Self::format_version_replacing), for
+    /// completion's insert path (#1435 S3): `typed_prefix` carries only what the user has
+    /// typed so far, which is enough signal for a plain `v`-style check.
+    fn format_version_for_completion(
+        &self,
+        version: &ConcreteVersion,
+        typed_prefix: &str,
+    ) -> String {
+        match_v_prefix_style(typed_prefix, version.as_str())
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -676,6 +700,28 @@ mod tests {
             "vendor name/pkg"
         ];
         format_version: [ "1.2.3" => "1.2.3" ];
+    }
+
+    /// #1435: an unprefixed requirement stays unprefixed when replaced with a `v`-prefixed
+    /// registry tag — the bug this override fixes.
+    #[test]
+    fn test_format_version_replacing_preserves_unprefixed_style() {
+        let f = ComposerFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("v4.0.0-alpha1"), "3.28.0"),
+            "4.0.0-alpha1"
+        );
+    }
+
+    /// #1435: a `v`-prefixed requirement stays `v`-prefixed against an unprefixed registry
+    /// version — the mirror-image case `match_v_prefix_style` already covers for GHA/GitLab.
+    #[test]
+    fn test_format_version_replacing_preserves_v_prefixed_style() {
+        let f = ComposerFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("4.0.0"), "v3.28.0"),
+            "v4.0.0"
+        );
     }
 
     #[test]

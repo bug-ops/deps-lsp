@@ -23,15 +23,11 @@ use deps_core::FetchFailure;
 use deps_core::PackageName;
 use deps_core::Result;
 use deps_core::VersionReq;
-use deps_engine::classify::fetch::{
-    DepSources, composer_minimum_stability, dedup_dependencies_by_source,
-    fetch_latest_versions_parallel,
-};
+use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch};
 use deps_engine::classify::resolved::{
-    cached_versions_from_lockfile, collect_in_use_versions, dependency_version_map,
-    load_resolved_versions,
+    cached_versions_from_lockfile, dependency_version_map, load_resolved_versions,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -274,14 +270,21 @@ async fn run_document_open_background_task(
         .instrument(tracing::Span::current()),
     );
 
-    // Collect dependency names+sources and the in-use-version map (§4.6) in one
-    // pass while holding the reference (can't hold across await).
-    let (dep_sources, in_use, minimum_stability, collided_names): (
-        DepSources,
-        HashMap<PackageName, Vec<String>>,
-        Option<String>,
-        HashSet<PackageName>,
-    ) = {
+    // Collect dependency names+sources, the in-use-version map (§4.6), and the manifest's own
+    // `SelectionContext` (#1433) in one pass while holding the reference (can't hold across
+    // await). Deduped by name (critique M3): a duplicated name shares one registry fetch
+    // across all its occurrences — the result is name-keyed anyway (`FetchResult::versions`),
+    // so fetching it more than once would only issue wasted extra registry calls and inflate
+    // `RegistryProgress`'s total. A non-resolvable source is dropped entirely, and two
+    // occurrences of the same name resolving to *different* sources are dropped and recorded
+    // as collided instead (spec FR-011) — see `prepare_fetch`/`dedup_dependencies_by_source`.
+    let deps_engine::classify::fetch::FetchPreparation {
+        dep_sources,
+        in_use,
+        selection_context,
+        collided_names,
+        ..
+    } = {
         let doc = match state.get_document(&uri) {
             Some(d) => d,
             None => {
@@ -296,26 +299,13 @@ async fn run_document_open_background_task(
                 return;
             }
         };
-        // Deduped by name (critique M3): a duplicated name shares one
-        // registry fetch across all its occurrences — the result is
-        // name-keyed anyway (`FetchResult::versions`), so fetching it
-        // more than once would only issue wasted extra registry calls
-        // and inflate `RegistryProgress`'s total. A non-resolvable source is
-        // dropped entirely, and two occurrences of the same name resolving to
-        // *different* sources are dropped and recorded as collided instead
-        // (spec FR-011) — see `dedup_dependencies_by_source`.
-        let (sources_map, collided_names) =
-            dedup_dependencies_by_source(parse_result, ecosystem.formatter());
-        let dep_sources: Vec<_> = sources_map.into_iter().collect();
-        let in_use = collect_in_use_versions(
+        prepare_fetch(
             parse_result,
-            &resolved_versions,
-            &resolved_version_candidates,
             ecosystem.formatter(),
             ecosystem.ecosystem_id(),
-        );
-        let minimum_stability = composer_minimum_stability(parse_result);
-        (dep_sources, in_use, minimum_stability, collided_names)
+            &resolved_versions,
+            &resolved_version_candidates,
+        )
     };
 
     let dep_count = dep_sources.len();
@@ -368,7 +358,7 @@ async fn run_document_open_background_task(
         diagnostics_snapshot.freshness,
         diagnostics_snapshot.fetch_timeout_secs,
         diagnostics_snapshot.max_concurrent_fetches,
-        minimum_stability.as_deref(),
+        &selection_context,
     )
     .await;
     drop(fetch_permit);
@@ -499,18 +489,36 @@ async fn run_document_open_background_task(
 /// document's previously stored parse result, so the caller can react to what actually
 /// changed (added/removed/version-changed) instead of unconditionally re-fetching and
 /// re-scanning everything on every keystroke.
+///
+/// The returned `bool` is whether the manifest's own [`deps_core::SelectionContext`] (e.g.
+/// Composer's `minimum-stability`, #1433) changed between the old and new parse — `diff`
+/// alone cannot see this: editing only `minimum-stability` changes neither the dependency
+/// name set nor any single dependency's version requirement, so it would otherwise report an
+/// empty diff even though every dependency's "latest" pick may have just changed. The caller
+/// must escalate to [`RefetchPolicy::AllDependencies`] when this is `true`, or hover/
+/// completion/code-actions (which read the freshly committed parse result's context
+/// immediately) would disagree with diagnostics/inlay-hints (which stay on `cached_versions`
+/// from before the edit) until the next unrelated refetch.
 async fn parse_and_diff_manifest(
     uri: &Uri,
     content: &str,
     state: &ServerState,
     ecosystem: &Arc<dyn Ecosystem>,
-) -> (Option<Box<dyn deps_core::ParseResult>>, DependencyDiff) {
-    let old_deps: HashMap<PackageName, Vec<Option<VersionReq>>> =
-        state.get_document(uri).map_or_else(HashMap::new, |doc| {
-            doc.parse_result()
-                .map(dependency_version_map)
-                .unwrap_or_default()
-        });
+) -> (
+    Option<Box<dyn deps_core::ParseResult>>,
+    DependencyDiff,
+    bool,
+) {
+    let (old_deps, old_selection_context): (
+        HashMap<PackageName, Vec<Option<VersionReq>>>,
+        deps_core::SelectionContext,
+    ) = state.get_document(uri).map_or_else(
+        || (HashMap::new(), deps_core::SelectionContext::none()),
+        |doc| match doc.parse_result() {
+            Some(pr) => (dependency_version_map(pr), pr.selection_context()),
+            None => (HashMap::new(), deps_core::SelectionContext::none()),
+        },
+    );
 
     // Try to parse manifest (may fail for incomplete syntax, or for a URI shape
     // `url::Url` rejects — both are treated the same as "no parse result").
@@ -536,16 +544,23 @@ async fn parse_and_diff_manifest(
         .as_ref()
         .map(|pr| dependency_version_map(pr.as_ref()))
         .unwrap_or_default();
+    let new_selection_context = parse_result
+        .as_deref()
+        .map_or_else(deps_core::SelectionContext::none, |pr| {
+            pr.selection_context()
+        });
+    let selection_context_changed = old_selection_context != new_selection_context;
 
     let diff = DependencyDiff::compute(&old_deps, &new_deps);
     tracing::debug!(
         added = diff.added.len(),
         removed = diff.removed.len(),
         version_changed = diff.version_changed.len(),
+        selection_context_changed,
         "dependency diff"
     );
 
-    (parse_result, diff)
+    (parse_result, diff, selection_context_changed)
 }
 
 /// Whether [`commit_parsed_document`] should verify the document's current version before
@@ -750,7 +765,7 @@ pub(crate) async fn handle_document_change_guarded(
     content: String,
     version: Option<i32>,
     guard: CommitGuard,
-    refetch: RefetchPolicy,
+    mut refetch: RefetchPolicy,
     state: Arc<ServerState>,
     client: Client,
     config: Arc<RwLock<DepsConfig>>,
@@ -776,7 +791,17 @@ pub(crate) async fn handle_document_change_guarded(
 
     check_content_size(&content, &uri)?;
 
-    let (parse_result, diff) = parse_and_diff_manifest(&uri, &content, &state, &ecosystem).await;
+    let (parse_result, diff, selection_context_changed) =
+        parse_and_diff_manifest(&uri, &content, &state, &ecosystem).await;
+
+    // #1433: a `minimum-stability`-only edit changes no dependency name/version, so `diff`
+    // alone would see nothing to fetch — escalate so every dependency's "latest" pick is
+    // refetched under the new context, matching what hover/completion/code-actions already
+    // compute live against the freshly committed parse result (see `parse_and_diff_manifest`'s
+    // doc).
+    if selection_context_changed {
+        refetch = RefetchPolicy::AllDependencies;
+    }
 
     // Captured before `commit_parsed_document` consumes `parse_result` — only needed under
     // `RefetchPolicy::AllDependencies` (issue #592), where the fetch must cover every
@@ -1373,6 +1398,8 @@ mod tests {
     // Only the cargo-gated tests below sleep or time out on a bare `Duration`
     // (go_tests imports its own `tokio::time::Duration` locally instead).
     #[cfg(feature = "cargo")]
+    use std::collections::HashSet;
+    #[cfg(feature = "cargo")]
     use std::time::Duration;
 
     /// Issue #1407 R1: exhaustive truth table over `change_task_triggers`'s four
@@ -1417,6 +1444,83 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// impl-critic S1 (#1433): a `minimum-stability`-only edit changes no dependency
+    /// name/version, so `DependencyDiff` alone reports nothing to fetch — proves
+    /// `parse_and_diff_manifest`'s own `selection_context_changed` signal catches this case
+    /// regardless, which `handle_document_change_guarded` escalates to
+    /// `RefetchPolicy::AllDependencies` on (see that function's own comment at the call site).
+    #[cfg(feature = "composer")]
+    #[tokio::test]
+    async fn test_parse_and_diff_manifest_detects_minimum_stability_only_change() {
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/composer.json");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let ecosystem = state
+            .ecosystem_registry
+            .get(EcosystemId::Composer)
+            .expect("composer ecosystem registered under the composer feature");
+
+        let content1 = r#"{"require": {"symfony/console": "^6.0"}}"#;
+        let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+        let doc_state1 = DocumentState::new_from_parse_result(
+            EcosystemId::Composer,
+            content1.to_string(),
+            parse_result1,
+        );
+        state.update_document(uri.clone(), doc_state1);
+
+        // Same single dependency, same requirement — only `minimum-stability` is new.
+        let content2 = r#"{"minimum-stability": "alpha", "require": {"symfony/console": "^6.0"}}"#;
+        let (_, diff, selection_context_changed) =
+            parse_and_diff_manifest(&uri, content2, &state, &ecosystem).await;
+
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.version_changed.is_empty());
+        assert!(
+            selection_context_changed,
+            "a minimum-stability-only edit must be detected as a selection-context change \
+             even though the dependency diff itself is empty"
+        );
+    }
+
+    /// impl-critic S1 (#1433) mirror case: an edit that touches neither `minimum-stability`
+    /// nor any dependency must not spuriously report a selection-context change (which would
+    /// force an unnecessary `RefetchPolicy::AllDependencies` on every keystroke).
+    #[cfg(feature = "composer")]
+    #[tokio::test]
+    async fn test_parse_and_diff_manifest_no_selection_context_change_for_unrelated_edit() {
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/composer.json");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+        let ecosystem = state
+            .ecosystem_registry
+            .get(EcosystemId::Composer)
+            .expect("composer ecosystem registered under the composer feature");
+
+        let content1 = r#"{"name": "acme/app", "require": {"symfony/console": "^6.0"}}"#;
+        let parse_result1 = ecosystem.parse_manifest(content1, &url).await.unwrap();
+        let doc_state1 = DocumentState::new_from_parse_result(
+            EcosystemId::Composer,
+            content1.to_string(),
+            parse_result1,
+        );
+        state.update_document(uri.clone(), doc_state1);
+
+        // `name` changes, `minimum-stability` stays absent, the dependency is untouched.
+        let content2 = r#"{"name": "acme/renamed", "require": {"symfony/console": "^6.0"}}"#;
+        let (_, diff, selection_context_changed) =
+            parse_and_diff_manifest(&uri, content2, &state, &ecosystem).await;
+
+        assert!(diff.added.is_empty());
+        assert!(diff.removed.is_empty());
+        assert!(diff.version_changed.is_empty());
+        assert!(
+            !selection_context_changed,
+            "an edit unrelated to minimum-stability must not report a selection-context change"
+        );
     }
 
     /// Issue #1407 R1 regression case (a)/(c): a pure manifest edit

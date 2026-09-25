@@ -643,13 +643,13 @@ impl deps_core::Registry for CargoRegistry {
         &'a self,
         name: &'a PackageName,
         req: &'a deps_core::VersionReq,
-        minimum_stability: Option<&'a str>,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         deps_core::Registry::get_latest_matching_with_context(
             &self.crates_io,
             name,
             req,
-            minimum_stability,
+            selection_context,
         )
     }
 
@@ -658,7 +658,7 @@ impl deps_core::Registry for CargoRegistry {
         name: &'a PackageName,
         source: &'a DependencySource,
         req: &'a deps_core::VersionReq,
-        _minimum_stability: Option<&'a str>,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self

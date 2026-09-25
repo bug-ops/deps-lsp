@@ -1653,13 +1653,25 @@ pub async fn complete_package_names_generic(
 ///
 /// ```no_run
 /// use deps_core::completion::{complete_versions_generic_replacing, VersionReplacement};
-/// use deps_core::lsp_helpers::SourcePolicy;
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
 /// use deps_core::parser::DependencySource;
-/// use deps_core::PackageName;
+/// use deps_core::{ConcreteVersion, PackageName};
 /// use tower_lsp_server::ls_types::{Position, Range};
 ///
 /// struct DefaultFormatter;
+/// impl PackageNaming for DefaultFormatter {}
+/// impl PackageRendering for DefaultFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
+///     fn package_url(&self, name: &PackageName) -> String { name.as_str().to_string() }
+/// }
+/// impl RequirementResolution for DefaultFormatter {}
+/// impl DiagnosticMessages for DefaultFormatter {}
+/// impl DiagnosticPolicy for DefaultFormatter {}
 /// impl SourcePolicy for DefaultFormatter {}
+/// impl OsvNaming for DefaultFormatter {}
 ///
 /// # async fn example(registry: &dyn deps_core::Registry) {
 /// let freshness = deps_core::FreshnessSettings::default();
@@ -1697,13 +1709,109 @@ pub async fn complete_package_names_generic(
 )]
 pub async fn complete_versions_generic_replacing(
     registry: &dyn crate::Registry,
-    formatter: &dyn crate::lsp_helpers::SourcePolicy,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     package_name: &PackageName,
     source: &crate::parser::DependencySource,
     prefix: &str,
     operator_chars: &[char],
     freshness: FreshnessSettings,
     replacement: Option<&VersionReplacement>,
+) -> Vec<CompletionItem> {
+    complete_versions_generic_replacing_with_context(
+        registry,
+        formatter,
+        package_name,
+        source,
+        prefix,
+        operator_chars,
+        freshness,
+        replacement,
+        &crate::SelectionContext::none(),
+    )
+    .await
+}
+
+/// Like [`complete_versions_generic_replacing`], but also carries a [`crate::SelectionContext`]
+/// into the "latest" pick below.
+///
+/// `selection_context` carries manifest-level state such as Composer's `minimum-stability`
+/// (#1433), mirroring [`crate::Registry::select_latest_matching_with_context`]'s own
+/// `_with_context` naming.
+///
+/// [`complete_versions_at_position`] is the only production caller that has a
+/// [`crate::ParseResult`] to build a real context from ([`crate::ParseResult::selection_context`]);
+/// every other completion entry point in this workspace has no manifest-level selection state
+/// of its own and calls [`complete_versions_generic_replacing`] (which forwards here with
+/// [`crate::SelectionContext::none()`]) instead.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::{complete_versions_generic_replacing_with_context, VersionReplacement};
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::parser::DependencySource;
+/// use deps_core::{ConcreteVersion, PackageName, SelectionContext};
+/// use tower_lsp_server::ls_types::{Position, Range};
+///
+/// struct DefaultFormatter;
+/// impl PackageNaming for DefaultFormatter {}
+/// impl PackageRendering for DefaultFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
+///     fn package_url(&self, name: &PackageName) -> String { name.as_str().to_string() }
+/// }
+/// impl RequirementResolution for DefaultFormatter {}
+/// impl DiagnosticMessages for DefaultFormatter {}
+/// impl DiagnosticPolicy for DefaultFormatter {}
+/// impl SourcePolicy for DefaultFormatter {}
+/// impl OsvNaming for DefaultFormatter {}
+///
+/// # async fn example(registry: &dyn deps_core::Registry) {
+/// let freshness = deps_core::FreshnessSettings::default();
+///
+/// // Maven's self-closing `<version/>`: replace the whole tag instead of inserting at the
+/// // cursor, since no cursor position inside `<version/>` lands inside a value slot.
+/// let tag_range = Range {
+///     start: Position { line: 5, character: 6 },
+///     end: Position { line: 5, character: 17 },
+/// };
+/// let replacement = VersionReplacement {
+///     range: tag_range,
+///     lead: "<version>".to_string(),
+///     trail: "</version>".to_string(),
+///     replaced_text: "<version/>".to_string(),
+/// };
+///
+/// let items = complete_versions_generic_replacing_with_context(
+///     registry,
+///     &DefaultFormatter,
+///     &PackageName::new("twig/twig"),
+///     &DependencySource::Registry,
+///     "",
+///     &[],
+///     freshness,
+///     Some(&replacement),
+///     &SelectionContext::with_composer_minimum_stability(Some("alpha".to_string())),
+/// ).await;
+/// # }
+/// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors complete_versions_generic_replacing's own 8 parameters plus the one new \
+              `selection_context` param this function adds"
+)]
+pub async fn complete_versions_generic_replacing_with_context(
+    registry: &dyn crate::Registry,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    package_name: &PackageName,
+    source: &crate::parser::DependencySource,
+    prefix: &str,
+    operator_chars: &[char],
+    freshness: FreshnessSettings,
+    replacement: Option<&VersionReplacement>,
+    selection_context: &crate::SelectionContext,
 ) -> Vec<CompletionItem> {
     if !formatter.can_resolve_source(source) {
         return vec![];
@@ -1725,9 +1833,19 @@ pub async fn complete_versions_generic_replacing(
     };
 
     let clean_prefix = prefix.trim_start_matches(operator_chars).trim();
+    // A `v`/`V`-tagged registry version (e.g. Composer's raw Packagist tag text, #1435) is
+    // matched against an unprefixed typed prefix too — without this, a v-tagged package's
+    // prefix filter never matches at all (every candidate fails `starts_with`), silently
+    // falling back to the unfiltered list instead of narrowing it.
+    let version_matches_prefix = |version: &str| {
+        version.starts_with(clean_prefix)
+            || version
+                .trim_start_matches(['v', 'V'])
+                .starts_with(clean_prefix)
+    };
     let has_prefix_match = versions
         .iter()
-        .any(|v| v.version_string().as_str().starts_with(clean_prefix));
+        .any(|v| version_matches_prefix(v.version_string().as_str()));
 
     // The same registry-delegated pick `prepare_version_display_items` needs (see its doc
     // comment) — computed over whichever slice is actually about to be displayed (the
@@ -1738,12 +1856,20 @@ pub async fn complete_versions_generic_replacing(
     let display_items = if has_prefix_match {
         let filtered_versions: Vec<Box<dyn Version>> = versions
             .into_iter()
-            .filter(|v| v.version_string().as_str().starts_with(clean_prefix))
+            .filter(|v| version_matches_prefix(v.version_string().as_str()))
             .collect();
-        let latest_idx = registry.select_latest_matching(&filtered_versions, &wildcard_req);
+        let latest_idx = registry.select_latest_matching_with_context(
+            &filtered_versions,
+            &wildcard_req,
+            selection_context,
+        );
         prepare_version_display_items(&filtered_versions, package_name, latest_idx)
     } else {
-        let latest_idx = registry.select_latest_matching(&versions, &wildcard_req);
+        let latest_idx = registry.select_latest_matching_with_context(
+            &versions,
+            &wildcard_req,
+            selection_context,
+        );
         prepare_version_display_items(&versions, package_name, latest_idx)
     };
 
@@ -1764,7 +1890,26 @@ pub async fn complete_versions_generic_replacing(
             }
             safe
         })
-        .map(|item| build_version_completion(item, replacement, now, freshness.enabled))
+        .map(|item| {
+            let mut completion_item =
+                build_version_completion(item, replacement, now, freshness.enabled);
+            // #1435 S3: preserve the typed prefix's presentation style (e.g. Composer's
+            // `v`-prefix) instead of splicing the registry's raw candidate text verbatim —
+            // `label`/`detail` are left showing the real registry version (informational),
+            // only the text actually spliced into the manifest is adjusted. See
+            // `PackageRendering::format_version_for_completion`'s own doc for why this is a
+            // dedicated method rather than a reuse of `format_version_replacing`.
+            let styled = formatter.format_version_for_completion(&item.version, clean_prefix);
+            if styled != item.version.as_str() {
+                completion_item.insert_text = Some(styled.clone());
+                if let (Some(CompletionTextEdit::Edit(edit)), Some(r)) =
+                    (completion_item.text_edit.as_mut(), replacement)
+                {
+                    edit.new_text = r.render(&styled);
+                }
+            }
+            completion_item
+        })
         .collect()
 }
 
@@ -1778,12 +1923,24 @@ pub async fn complete_versions_generic_replacing(
 ///
 /// ```no_run
 /// use deps_core::completion::complete_versions_generic_from;
-/// use deps_core::lsp_helpers::SourcePolicy;
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
 /// use deps_core::parser::DependencySource;
-/// use deps_core::PackageName;
+/// use deps_core::{ConcreteVersion, PackageName};
 ///
 /// struct DefaultFormatter;
+/// impl PackageNaming for DefaultFormatter {}
+/// impl PackageRendering for DefaultFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
+///     fn package_url(&self, name: &PackageName) -> String { name.as_str().to_string() }
+/// }
+/// impl RequirementResolution for DefaultFormatter {}
+/// impl DiagnosticMessages for DefaultFormatter {}
+/// impl DiagnosticPolicy for DefaultFormatter {}
 /// impl SourcePolicy for DefaultFormatter {}
+/// impl OsvNaming for DefaultFormatter {}
 ///
 /// # async fn example(registry: &dyn deps_core::Registry) {
 /// let freshness = deps_core::FreshnessSettings::default();
@@ -1813,7 +1970,7 @@ pub async fn complete_versions_generic_replacing(
 /// ```
 pub async fn complete_versions_generic_from(
     registry: &dyn crate::Registry,
-    formatter: &dyn crate::lsp_helpers::SourcePolicy,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     package_name: &PackageName,
     source: &crate::parser::DependencySource,
     prefix: &str,
@@ -1833,12 +1990,46 @@ pub async fn complete_versions_generic_from(
     .await
 }
 
+/// Like [`complete_versions_generic_from`], but also carries a [`crate::SelectionContext`]
+/// into the "latest" pick — see [`complete_versions_generic_replacing_with_context`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors complete_versions_generic_from's own 7 parameters plus the one new \
+              `selection_context` param this function adds"
+)]
+async fn complete_versions_generic_from_with_context(
+    registry: &dyn crate::Registry,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    package_name: &PackageName,
+    source: &crate::parser::DependencySource,
+    prefix: &str,
+    operator_chars: &[char],
+    freshness: FreshnessSettings,
+    selection_context: &crate::SelectionContext,
+) -> Vec<CompletionItem> {
+    complete_versions_generic_replacing_with_context(
+        registry,
+        formatter,
+        package_name,
+        source,
+        prefix,
+        operator_chars,
+        freshness,
+        None,
+        selection_context,
+    )
+    .await
+}
+
 /// Version completion resolved by **cursor position**, not by package name (issue #593).
 ///
 /// Finds the dependency in `parse_result` whose `version_range` contains `position` — the
 /// same containment check [`detect_completion_context`] used to decide this is a `Version`
-/// context in the first place — then completes through [`complete_versions_generic_from`]
-/// against that dependency's own [`crate::Dependency::source`]. Unlike a name join (the old
+/// context in the first place — then completes through
+/// `complete_versions_generic_from_with_context` (the [`crate::SelectionContext`]-carrying
+/// sibling of [`complete_versions_generic_from`], threading `parse_result`'s own
+/// [`crate::ParseResult::selection_context`], #1433) against that dependency's own
+/// [`crate::Dependency::source`]. Unlike a name join (the old
 /// per-ecosystem `resolve_completion_source` pattern this replaces), two dependencies sharing
 /// one [`PackageName`] but resolving to different sources never collide: the cursor position
 /// unambiguously identifies which occurrence the user is editing, so each completes against
@@ -1852,8 +2043,9 @@ pub async fn complete_versions_generic_from(
 ///
 /// # Source-resolvability gate
 ///
-/// Delegates the actual gate to [`complete_versions_generic_from`] — see its doc for why the
-/// check lives there rather than here — so this function's own contribution is purely the
+/// Delegates the actual gate to [`complete_versions_generic_from`] (via its
+/// `_with_context` sibling) — see its doc for why the check lives there rather than here —
+/// so this function's own contribution is purely the
 /// position-based dependency lookup: find which dependency (and therefore which `source`) the
 /// cursor is actually in, before handing off.
 ///
@@ -1861,11 +2053,24 @@ pub async fn complete_versions_generic_from(
 ///
 /// ```no_run
 /// use deps_core::completion::complete_versions_at_position;
-/// use deps_core::lsp_helpers::SourcePolicy;
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::{ConcreteVersion, PackageName};
 /// use tower_lsp_server::ls_types::Position;
 ///
 /// struct DefaultFormatter;
+/// impl PackageNaming for DefaultFormatter {}
+/// impl PackageRendering for DefaultFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String { version.to_string() }
+///     fn package_url(&self, name: &PackageName) -> String { name.as_str().to_string() }
+/// }
+/// impl RequirementResolution for DefaultFormatter {}
+/// impl DiagnosticMessages for DefaultFormatter {}
+/// impl DiagnosticPolicy for DefaultFormatter {}
 /// impl SourcePolicy for DefaultFormatter {}
+/// impl OsvNaming for DefaultFormatter {}
 ///
 /// # async fn example(registry: &dyn deps_core::Registry, parse_result: &dyn deps_core::ParseResult) {
 /// let freshness = deps_core::FreshnessSettings::default();
@@ -1883,7 +2088,7 @@ pub async fn complete_versions_generic_from(
 /// ```
 pub async fn complete_versions_at_position(
     registry: &dyn crate::Registry,
-    formatter: &dyn crate::lsp_helpers::SourcePolicy,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
     parse_result: &dyn ParseResult,
     position: Position,
     prefix: &str,
@@ -1897,7 +2102,7 @@ pub async fn complete_versions_at_position(
         return vec![];
     };
 
-    complete_versions_generic_from(
+    complete_versions_generic_from_with_context(
         registry,
         formatter,
         dep.name(),
@@ -1905,6 +2110,7 @@ pub async fn complete_versions_at_position(
         prefix,
         operator_chars,
         freshness,
+        &parse_result.selection_context(),
     )
     .await
 }
@@ -4985,6 +5191,184 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].label, "1.0.0 (latest)");
         assert_eq!(items[1].label, "1.0.1");
+    }
+
+    /// impl-critic S3 (#1435 bug class survives in completion): an unprefixed typed prefix
+    /// must still narrow a `v`-tagged registry's version list, not silently fall back to the
+    /// unfiltered list (`starts_with` alone never matches a `v`-tag against an unprefixed
+    /// prefix).
+    #[tokio::test]
+    async fn test_complete_versions_generic_prefix_matches_v_tagged_version() {
+        let registry = MockRegistry {
+            versions: vec![
+                MockVersion {
+                    version: "v4.0.0".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+                MockVersion {
+                    version: "v3.0.0".into(),
+                    yanked: false,
+                    prerelease: false,
+                },
+            ],
+        };
+
+        let items = complete_versions_generic_from(
+            &registry,
+            &MOCK_FORMATTER,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "4",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(
+            items.len(),
+            1,
+            "an unprefixed prefix must narrow a v-tagged version list, not fall back to \
+             every version: {items:?}"
+        );
+        assert_eq!(items[0].label, "v4.0.0 (latest)");
+    }
+
+    /// Test-only formatter overriding
+    /// [`crate::lsp_helpers::PackageRendering::format_version_for_completion`] with the
+    /// same `match_v_prefix_style` fix `ComposerFormatter` uses (#1435 S3), for tests below
+    /// that don't need a real ecosystem formatter.
+    struct VStyleFormatter;
+    impl crate::lsp_helpers::PackageNaming for VStyleFormatter {}
+    impl crate::lsp_helpers::PackageRendering for VStyleFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+        fn format_version_for_completion(
+            &self,
+            version: &ConcreteVersion,
+            typed_prefix: &str,
+        ) -> String {
+            crate::lsp_helpers::match_v_prefix_style(typed_prefix, version.as_str())
+        }
+    }
+    impl crate::lsp_helpers::RequirementResolution for VStyleFormatter {}
+    impl crate::lsp_helpers::DiagnosticMessages for VStyleFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for VStyleFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for VStyleFormatter {}
+    impl crate::lsp_helpers::OsvNaming for VStyleFormatter {}
+
+    /// impl-critic S3: a `v`-prefixed registry version (e.g. Composer's raw Packagist tag
+    /// text) must not be spliced into the manifest verbatim once a formatter overrides
+    /// [`crate::lsp_helpers::PackageRendering::format_version_for_completion`] — `label`
+    /// stays the real, informational registry string, only `insert_text`/`text_edit` are
+    /// adjusted.
+    #[tokio::test]
+    async fn test_complete_versions_generic_preserves_prefix_v_style_on_insert() {
+        let registry = MockRegistry {
+            versions: vec![MockVersion {
+                version: "v4.0.0".into(),
+                yanked: false,
+                prerelease: false,
+            }],
+        };
+
+        let items = complete_versions_generic_from(
+            &registry,
+            &VStyleFormatter,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "3.2",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].label, "v4.0.0 (latest)",
+            "label stays the real registry tag text"
+        );
+        assert_eq!(
+            items[0].insert_text.as_deref(),
+            Some("4.0.0"),
+            "insert text must match the unprefixed style already typed, not the raw v-tag"
+        );
+    }
+
+    /// Code-review confirmed bug: `format_version_for_completion` was called with the
+    /// untrimmed `prefix` instead of `clean_prefix`, so a typed prefix that still carries a
+    /// leading version operator (e.g. Composer's `^` in `^v4.0`) made `match_v_prefix_style`
+    /// check `"^v4.0".starts_with(['v', 'V'])` (`false`) instead of the operator-stripped
+    /// `"v4.0"` (`true`), stripping the `v` the user had already typed. All prior tests used
+    /// an empty `operator_chars`, so `prefix == clean_prefix` in every case and never caught
+    /// this.
+    #[tokio::test]
+    async fn test_complete_versions_generic_preserves_prefix_v_style_with_leading_operator() {
+        let registry = MockRegistry {
+            versions: vec![MockVersion {
+                version: "v4.0.0".into(),
+                yanked: false,
+                prerelease: false,
+            }],
+        };
+
+        let items = complete_versions_generic_from(
+            &registry,
+            &VStyleFormatter,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "^v4.0",
+            &['^'],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].insert_text.as_deref(),
+            Some("v4.0.0"),
+            "the v-style already typed after the `^` operator must be preserved, not \
+             stripped because the raw prefix (before operator-stripping) has no leading v"
+        );
+    }
+
+    /// impl-critic S3 counter-case: a formatter with no `format_version_for_completion`
+    /// override (the default — every non-Composer ecosystem, e.g. `MOCK_FORMATTER`'s
+    /// quoted-text-edit stub) must keep inserting the bare registry version unchanged, proving
+    /// the new hook is opt-in and does not accidentally reuse `format_version_for_text_edit`'s
+    /// own (potentially non-identity) behavior.
+    #[tokio::test]
+    async fn test_complete_versions_generic_default_completion_style_hook_is_identity() {
+        let registry = MockRegistry {
+            versions: vec![MockVersion {
+                version: "1.0.0".into(),
+                yanked: false,
+                prerelease: false,
+            }],
+        };
+
+        let items = complete_versions_generic_from(
+            &registry,
+            &MOCK_FORMATTER,
+            &pkg("test-pkg"),
+            &crate::parser::DependencySource::Registry,
+            "",
+            &[],
+            FreshnessSettings::default(),
+        )
+        .await;
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].insert_text.as_deref(),
+            Some("1.0.0"),
+            "the default format_version_for_completion hook must not quote the insert text \
+             even though MOCK_FORMATTER's format_version_for_text_edit does"
+        );
     }
 
     /// Regression for #1137's `deps-composer` finding: `!=` needs *both* `!` and `=` stripped

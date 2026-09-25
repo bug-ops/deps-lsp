@@ -465,6 +465,163 @@ mod tests {
         assert_eq!(completions.items[0].label, "2.0.0 (latest)");
     }
 
+    /// #1433: hover, completion, and code actions must all agree with diagnostics about
+    /// what "latest" means for the same dependency once the manifest sets
+    /// `minimum-stability: alpha` — reproduces the issue's live repro (Packagist's newest
+    /// tag is a `v`-prefixed alpha, the newest *stable* release is older).
+    #[cfg(feature = "lsp-responses")]
+    mod minimum_stability_selection_context_tests {
+        use super::*;
+        use deps_core::VersionData;
+
+        async fn composer_ecosystem_with_alpha_and_stable(
+            server: &mut mockito::ServerGuard,
+        ) -> ComposerEcosystem {
+            server
+                .mock("GET", "/p2/twig/twig.json")
+                .with_status(200)
+                .with_body(
+                    r#"{"packages": {"twig/twig": [
+                        {"version": "v4.0.0-alpha1", "version_normalized": "4.0.0.0-alpha1", "abandoned": null},
+                        {"version": "v3.29.0", "version_normalized": "3.29.0.0"}
+                    ]}}"#,
+                )
+                .create_async()
+                .await;
+
+            ComposerEcosystem {
+                registry: Arc::new(PackagistRegistry::with_base(
+                    Arc::new(deps_core::HttpCache::new()),
+                    server.url(),
+                )),
+                formatter: ComposerFormatter,
+                lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            }
+        }
+
+        const MANIFEST: &str = r#"{
+  "minimum-stability": "alpha",
+  "require": {
+    "twig/twig": "3.28.0"
+  }
+}"#;
+
+        /// #1433: hover's `**Latest**` line must report the alpha version, matching
+        /// diagnostics/inlay-hints' own `minimum-stability`-aware pick.
+        #[tokio::test]
+        async fn test_generate_hover_respects_manifest_minimum_stability() {
+            let mut server = mockito::Server::new_async().await;
+            let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+            let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            let position = dep.version_range().unwrap().start.into();
+
+            let hover = ecosystem
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    VersionData::new(&HashMap::new(), &HashMap::new()),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover must fire on the version token");
+
+            assert!(
+                hover.markdown().contains("4.0.0-alpha1"),
+                "hover must report the alpha version as latest under minimum-stability: \
+                 alpha, got: {}",
+                hover.markdown()
+            );
+        }
+
+        /// #1433: completion's "(latest)" tag must land on the alpha version. #1435: the
+        /// item's insert text must stay unprefixed (matching the requirement already typed,
+        /// `"3.28.0"`) even though the label legitimately shows Packagist's real, `v`-prefixed
+        /// tag text — `label` is informational, `insert_text` is what gets spliced in.
+        #[tokio::test]
+        async fn test_generate_completions_respects_manifest_minimum_stability() {
+            let mut server = mockito::Server::new_async().await;
+            let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+            let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            let position = dep.version_range().unwrap().end.into();
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    MANIFEST,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            let latest_item = completions
+                .items
+                .iter()
+                .find(|item| item.label == "v4.0.0-alpha1 (latest)")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "completion must tag the alpha version as latest under \
+                         minimum-stability: alpha, got: {:?}",
+                        completions
+                            .items
+                            .iter()
+                            .map(|i| &i.label)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert_eq!(
+                latest_item.insert_text.as_deref(),
+                Some("4.0.0-alpha1"),
+                "insert text must stay unprefixed, matching the already-typed requirement, \
+                 not Packagist's raw v-tagged text (#1435)"
+            );
+        }
+
+        /// #1433: the "update to latest" code action must target the alpha version.
+        #[tokio::test]
+        async fn test_generate_code_actions_respects_manifest_minimum_stability() {
+            let mut server = mockito::Server::new_async().await;
+            let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+            let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            let position = dep.version_range().unwrap().start.into();
+
+            let actions = ecosystem
+                .generate_code_actions(
+                    parse_result.as_ref(),
+                    position,
+                    &uri,
+                    VersionData::new(&HashMap::new(), &HashMap::new()),
+                    MANIFEST,
+                )
+                .await;
+
+            // Exact match, not `.contains` (impl-critic M1): the manifest's own requirement
+            // ("3.28.0") is unprefixed, so this also end-to-end-proves #1435's fix through
+            // `generate_code_actions` — a `.contains("4.0.0-alpha1")` check would pass just
+            // as well for the unfixed, `v`-prefixed `"v4.0.0-alpha1"`.
+            let latest_action_targets_alpha = actions.iter().any(|action| {
+                action
+                    .edit
+                    .as_ref()
+                    .and_then(|edit| edit.changes.as_ref())
+                    .into_iter()
+                    .flat_map(|changes| changes.values())
+                    .flatten()
+                    .any(|edit| edit.new_text == "4.0.0-alpha1")
+            });
+            assert!(
+                latest_action_targets_alpha,
+                "an update-version code action must target the unprefixed alpha version \
+                 under minimum-stability: alpha, got: {actions:?}"
+            );
+        }
+    }
+
     /// Composition regression guard (#390/#282 bug class): proves `line_at` +
     /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
     /// trait method on realistic multi-line content.

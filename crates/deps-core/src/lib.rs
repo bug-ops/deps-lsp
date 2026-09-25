@@ -227,7 +227,7 @@ pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChai
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, Dependency, Ecosystem, EcosystemConfig,
     EcosystemId, LicenseSource, ParseResult, RegistryOccurrence, RejectedRegistryOccurrence,
-    RejectedSourceClass, parse_manifest_blocking,
+    RejectedSourceClass, SelectionContext, parse_manifest_blocking,
 };
 pub use ecosystem_registry::EcosystemRegistry;
 pub use edit::{

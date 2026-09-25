@@ -610,11 +610,15 @@ impl deps_core::Registry for PackagistRegistry {
         &'a self,
         name: &'a deps_core::PackageName,
         req: &'a deps_core::VersionReq,
-        minimum_stability: Option<&'a str>,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let version = self
-                .get_latest_matching_with_context(name.as_str(), req.as_str(), minimum_stability)
+                .get_latest_matching_with_context(
+                    name.as_str(),
+                    req.as_str(),
+                    selection_context.minimum_stability(),
+                )
                 .await?;
             Ok(version.map(|v| Box::new(v) as Box<dyn deps_core::Version>))
         })
@@ -669,9 +673,13 @@ impl deps_core::Registry for PackagistRegistry {
         &self,
         versions: &[Box<dyn deps_core::Version>],
         req: &deps_core::VersionReq,
-        minimum_stability: Option<&str>,
+        selection_context: &deps_core::SelectionContext,
     ) -> Option<usize> {
-        self.select_latest_matching_with_context(versions, req, minimum_stability)
+        self.select_latest_matching_with_context(
+            versions,
+            req,
+            selection_context.minimum_stability(),
+        )
     }
 
     // Packagist's `abandoned` is package-level, not per-version: `removal_status`
