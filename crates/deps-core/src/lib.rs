@@ -113,6 +113,10 @@ pub mod cache;
 pub mod cache_policy;
 #[cfg(feature = "lsp-responses")]
 pub mod completion;
+/// Config-value trust tiers and `${VAR}`/`%VAR%` env-var interpolation (issue #1434).
+///
+/// Shared by every ecosystem whose own config format supports it.
+pub mod config_trust;
 /// Shared `#[macro_export]`ed conformance-test scaffolding (#758).
 ///
 /// Ecosystem crates invoke these macros instead of hand-copying the same test family. Gated
