@@ -152,6 +152,7 @@ impl PypiParser {
         let mut dependencies = Vec::new();
         let mut document_links = Vec::new();
         let mut blocked_registries = Vec::new();
+        let mut rejected_registries = Vec::new();
         let mut strong_signal = false;
         let mut failed_lines: usize = 0;
         let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
@@ -300,6 +301,9 @@ impl PypiParser {
                         dep.source = config.resolve_source_for(None);
                         if let Some(classification) = config.blocked_class_for(None) {
                             blocked_registries.push(classification.into_occurrence(dep.name_range));
+                        } else if let Some(classification) = config.rejected_reason_for(None) {
+                            rejected_registries
+                                .push(classification.into_occurrence(dep.name_range));
                         }
                     }
                     dependencies.push(dep);
@@ -347,6 +351,11 @@ impl PypiParser {
                 Vec::new()
             },
             blocked_registries: if keep { blocked_registries } else { Vec::new() },
+            rejected_registries: if keep {
+                rejected_registries
+            } else {
+                Vec::new()
+            },
             dependency_truncation: if keep { budget.truncation() } else { None },
         })
     }
@@ -1310,6 +1319,34 @@ mod tests {
             deps_core::net_policy::HostClass::CloudMetadata
         );
         assert_eq!(occurrence.raw_value, "https://169.254.169.254/simple");
+        assert_eq!(occurrence.declaration_key, "primary");
+    }
+
+    /// #1438: an `--index-url` rejected for a reason *other* than a blocked host (an invalid
+    /// URL here) must populate `ParseResult::rejected_registries`, mirroring
+    /// `test_index_url_blocked_by_policy_populates_blocked_registries` above.
+    #[test]
+    fn test_index_url_invalid_populates_rejected_registries() {
+        let content = "--index-url not-a-valid-url\nrequests==2.31.0\n";
+        let result = parse_with_policy(content, &all_policy());
+        assert_eq!(
+            result.dependencies[0].source,
+            PypiDependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        );
+        assert!(
+            result.blocked_registries.is_empty(),
+            "this is not a BlockedHost rejection, so blocked_registries must stay empty"
+        );
+        assert_eq!(result.rejected_registries.len(), 1);
+        let occurrence = &result.rejected_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::InvalidUrl
+        );
+        assert_eq!(occurrence.raw_value, "not-a-valid-url");
         assert_eq!(occurrence.declaration_key, "primary");
     }
 

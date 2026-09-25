@@ -34,8 +34,8 @@ use std::sync::{Arc, OnceLock};
 
 use deps_core::EcosystemId;
 use deps_core::net_policy::{
-    BlockedHostReason, HostClass, RedactedUrl, RegistryAccessPolicy, RegistryUrlKind,
-    ValidatedRegistryUrl,
+    BlockedHostReason, HostClass, RedactedUrl, RegistryAccessPolicy, RegistryRejectionReason,
+    RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 
@@ -787,6 +787,23 @@ impl GoEnvConfig {
                 .first_blocked
                 .as_ref()
                 .map(|(class, raw)| (*class, raw.to_string())),
+            _ => None,
+        }
+    }
+
+    /// [`Self::blocked_class`]'s counterpart for every rejection reason *other* than a
+    /// policy-blocked host (#1438).
+    ///
+    /// Unlike [`Self::blocked_class`] (which tracks `first_blocked`, independent of which hop
+    /// [`Self::resolve_source_for`] actually names), this reads `for_resolution` — the exact
+    /// hop `resolve_source_for`'s `CustomRegistry` source is built from — since that is the
+    /// value this rejection reason describes. `None` when `for_resolution` is itself the
+    /// blocked-host hop (already covered by [`Self::blocked_class`] for that same hop) or when
+    /// `GOPROXY` is absent/valid.
+    #[must_use]
+    pub fn rejected_reason_for(&self) -> Option<(RegistryRejectionReason, String)> {
+        match &self.goproxy {
+            Some(Err(failure)) => failure.for_resolution.rejection_reason(),
             _ => None,
         }
     }
@@ -1607,6 +1624,66 @@ mod tests {
         let (class, raw) = config.blocked_class().expect("expected a blocked class");
         assert_eq!(class, HostClass::Global);
         assert_eq!(raw, "https://b.mycorp.example");
+    }
+
+    /// #1438: `rejected_reason_for` is [`GoEnvConfig::blocked_class`]'s counterpart for every
+    /// non-`BlockedHost` rejection reason — a sole invalid `GOPROXY` hop previously had no
+    /// equivalent reporting at all.
+    #[test]
+    fn test_rejected_reason_for_sole_invalid_entry() {
+        let config = GoEnvConfig::parse("GOPROXY=not-a-valid-url", &all_policy());
+        let (reason, raw) = config
+            .rejected_reason_for()
+            .expect("expected a rejected reason");
+        assert_eq!(reason, RegistryRejectionReason::InvalidUrl);
+        assert_eq!(raw, "not-a-valid-url");
+        assert_eq!(
+            config.blocked_class(),
+            None,
+            "a non-blocked-host rejection must never also report via blocked_class"
+        );
+    }
+
+    /// #1438: no `GOPROXY` override at all -> nothing to report.
+    #[test]
+    fn test_rejected_reason_for_none_when_no_goproxy() {
+        let config = GoEnvConfig::parse("", &off_policy());
+        assert_eq!(config.rejected_reason_for(), None);
+    }
+
+    /// #1438: `for_resolution` is itself the blocked-host hop — already covered by
+    /// `blocked_class`, so `rejected_reason_for` must not also report it.
+    #[test]
+    fn test_rejected_reason_for_none_when_sole_hop_is_blocked_host() {
+        let config = GoEnvConfig::parse("GOPROXY=https://goproxy.mycorp.example", &off_policy());
+        assert_eq!(config.rejected_reason_for(), None);
+    }
+
+    /// #1438: when a valid hop remains, the chain resolves successfully, so there is nothing
+    /// rejected to report even though one hop was invalid.
+    #[test]
+    fn test_rejected_reason_for_none_when_valid_hop_remains() {
+        let config = GoEnvConfig::parse("GOPROXY=not-a-valid-url,direct", &all_policy());
+        assert_eq!(config.rejected_reason_for(), None);
+    }
+
+    /// #1438: `for_resolution` (the first invalid hop, an `InvalidUrl`) and a *later* hop's
+    /// policy block are genuinely different signals about different hops — both
+    /// `rejected_reason_for` and `blocked_class` legitimately report, one per hop, not a
+    /// double-report of the same entry (mirrors
+    /// `test_blocked_class_not_masked_by_earlier_invalid_url_hop`).
+    #[test]
+    fn test_rejected_reason_for_reports_first_invalid_hop_alongside_later_blocked_hop() {
+        let config = GoEnvConfig::parse(
+            "GOPROXY=not-a-valid-url,https://goproxy.mycorp.example",
+            &off_policy(),
+        );
+        let (reason, raw) = config
+            .rejected_reason_for()
+            .expect("expected the first invalid hop's reason");
+        assert_eq!(reason, RegistryRejectionReason::InvalidUrl);
+        assert_eq!(raw, "not-a-valid-url");
+        assert!(config.blocked_class().is_some());
     }
 
     /// FR-002: everything declared after a terminal `direct`/`off` hop is unreachable and

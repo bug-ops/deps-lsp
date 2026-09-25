@@ -266,6 +266,19 @@ impl std::fmt::Display for EcosystemId {
     }
 }
 
+/// The shape shared by [`BlockedRegistryOccurrence`] and [`RejectedRegistryOccurrence`].
+///
+/// A dependency's name range plus which config declaration produced the notice (#1438 code
+/// review: extracted so `deps_core::lsp_helpers::diagnostics` can group/collapse both
+/// occurrence types through one generic algorithm instead of two near-identical copies).
+pub trait RegistryOccurrence {
+    /// Range of the affected dependency's name in the manifest.
+    fn range(&self) -> Range;
+    /// Implementation-opaque string identifying which underlying config declaration produced
+    /// this entry.
+    fn declaration_key(&self) -> &str;
+}
+
 /// One dependency declaration whose registry-index resolution was blocked by a
 /// workspace-registry reachability policy — returned by [`ParseResult::blocked_registries`].
 ///
@@ -292,6 +305,16 @@ pub struct BlockedRegistryOccurrence {
     /// from [`Self::raw_value`].
     #[redact(key)]
     pub declaration_key: String,
+}
+
+impl RegistryOccurrence for BlockedRegistryOccurrence {
+    fn range(&self) -> Range {
+        self.range
+    }
+
+    fn declaration_key(&self) -> &str {
+        &self.declaration_key
+    }
 }
 
 /// One host-class/raw-value/declaration-key classification an ecosystem config's own
@@ -354,6 +377,94 @@ impl BlockedSourceClass {
     }
 }
 
+/// One dependency declaration whose registry-config entry was rejected for a reason other
+/// than a policy-blocked host — returned by [`ParseResult::rejected_registries`] (#1438).
+///
+/// Same field shape as [`BlockedRegistryOccurrence`], with
+/// [`crate::net_policy::RegistryRejectionReason`] in place of
+/// [`crate::net_policy::HostClass`]: a `BlockedHost` rejection already has its own diagnostic
+/// path via [`BlockedRegistryOccurrence`], so the two occurrence types are deliberately
+/// disjoint rather than merged into one `class`-like field covering every reason.
+#[derive(Clone, crate::redact_debug::RedactingDebug)]
+pub struct RejectedRegistryOccurrence {
+    /// Range of the affected dependency's name in the manifest.
+    #[raw]
+    pub range: Range,
+    /// Why the entry was rejected.
+    #[raw]
+    pub reason: crate::net_policy::RegistryRejectionReason,
+    /// The exact `registry`/`registry-index` alias or URL the dependency declared.
+    #[redact(url)]
+    pub raw_value: String,
+    /// Implementation-opaque string identifying *which underlying config declaration*
+    /// produced this entry — same purpose and shape as
+    /// [`BlockedRegistryOccurrence::declaration_key`].
+    #[redact(key)]
+    pub declaration_key: String,
+}
+
+impl RegistryOccurrence for RejectedRegistryOccurrence {
+    fn range(&self) -> Range {
+        self.range
+    }
+
+    fn declaration_key(&self) -> &str {
+        &self.declaration_key
+    }
+}
+
+/// One reason/raw-value/declaration-key classification an ecosystem config's own
+/// `rejected_reason_for`-style helper produces.
+///
+/// The [`RegistryRejectionReason`] counterpart to [`BlockedSourceClass`] (#1438).
+///
+/// [`RegistryRejectionReason`]: crate::net_policy::RegistryRejectionReason
+#[derive(Clone, PartialEq, Eq, crate::redact_debug::RedactingDebug)]
+pub struct RejectedSourceClass {
+    /// Why the entry was rejected.
+    #[raw]
+    pub reason: crate::net_policy::RegistryRejectionReason,
+    /// The exact declared value (URL/alias) that was rejected.
+    #[redact(url)]
+    pub raw_value: String,
+    /// Implementation-opaque string identifying which underlying config declaration produced
+    /// this entry — see [`BlockedRegistryOccurrence::declaration_key`]'s doc for why this must
+    /// stay distinct from [`Self::raw_value`].
+    #[redact(key)]
+    pub declaration_key: String,
+}
+
+impl RejectedSourceClass {
+    /// Attaches the affected dependency's `range` to produce the
+    /// [`RejectedRegistryOccurrence`] a `ParseResult::rejected_registries()` override reports.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::RegistryRejectionReason;
+    /// use deps_core::RejectedSourceClass;
+    /// use deps_core::position::{Position, Range};
+    ///
+    /// let class = RejectedSourceClass {
+    ///     reason: RegistryRejectionReason::InvalidUrl,
+    ///     raw_value: "not-a-url".to_string(),
+    ///     declaration_key: "top-level".to_string(),
+    /// };
+    /// let range = Range::new(Position::new(0, 0), Position::new(0, 4));
+    /// let occurrence = class.into_occurrence(range);
+    /// assert_eq!(occurrence.declaration_key, "top-level");
+    /// ```
+    #[must_use]
+    pub fn into_occurrence(self, range: Range) -> RejectedRegistryOccurrence {
+        RejectedRegistryOccurrence {
+            range,
+            reason: self.reason,
+            raw_value: self.raw_value,
+            declaration_key: self.declaration_key,
+        }
+    }
+}
+
 /// Parse result trait containing dependencies and metadata.
 ///
 /// Implementations hold ecosystem-specific dependency types
@@ -395,6 +506,23 @@ pub trait ParseResult: Send + Sync {
     /// — an ecosystem with no such configurable host (nothing a workspace or user config could
     /// point at an unreachable-by-policy host) has nothing to report here and keeps the default.
     fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+        Vec::new()
+    }
+
+    /// Dependency lines whose registry-config entry was rejected for a reason other than a
+    /// policy-blocked host (#1438) — e.g. a malformed URL, a non-https scheme, embedded
+    /// userinfo, or an undefined `${VAR}` reference. Without this, such an entry is dropped
+    /// from the fetch queue with only a `tracing::warn!`, indistinguishable in the editor from
+    /// a dependency that was simply never checked yet. Used by
+    /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] to surface an
+    /// [`tower_lsp_server::ls_types::DiagnosticSeverity::WARNING`] diagnostic, mirroring
+    /// [`Self::blocked_registries`]'s own mechanism but for every other rejection reason.
+    ///
+    /// Default empty. An ecosystem overrides this when it produces
+    /// [`crate::net_policy::InvalidEntry`]-based rejections beyond the blocked-host case
+    /// already covered by [`Self::blocked_registries`] — at the time of writing, `deps_npm`,
+    /// `deps_pypi`, and `deps_go`.
+    fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
         Vec::new()
     }
 

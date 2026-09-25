@@ -23,6 +23,13 @@ use url::Url;
 /// diagnostic, unlike Cargo/npm's per-alias declaration keys.
 const GOPROXY_BLOCKED_DECLARATION_KEY: &str = "goproxy";
 
+/// [`GOPROXY_BLOCKED_DECLARATION_KEY`]'s counterpart for every
+/// [`GoParseResult::rejected_registries`] entry (#1438) — kept as a distinct constant, not
+/// reused, so the two mechanisms' diagnostics are never grouped together by
+/// `deps_core::lsp_helpers::generate_diagnostics_from_cache`'s declaration-key dedup even
+/// though both ultimately trace back to the same `GOPROXY` declaration.
+const GOPROXY_REJECTED_DECLARATION_KEY: &str = "goproxy-rejected";
+
 /// Result of parsing a go.mod file.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -52,6 +59,12 @@ pub struct GoParseResult {
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
+    /// [`Self::blocked_registries`]'s counterpart for every rejection reason *other* than a
+    /// policy-blocked host (#1438) — a `GOPROXY` hop that failed to parse as a URL, used a
+    /// non-https scheme, or carried userinfo. Same per-module fan-out and fixed
+    /// `GOPROXY_REJECTED_DECLARATION_KEY` shape as `blocked_registries`. Surfaced via
+    /// [`Self::rejected_registries`]'s trait override as a diagnostic.
+    pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -220,6 +233,7 @@ pub fn parse_go_mod_with_context(
     // vary across dependencies — computed once rather than once per dependency (up to
     // `MAX_DEPENDENCIES_PER_DOCUMENT`).
     let blocked_class = go_config.blocked_class();
+    let rejected_reason = go_config.rejected_reason_for();
 
     // C1 (#1202): a filesystem `replace` target's `Path` classification must propagate to
     // every directive sharing its module path, not just the `Replace` entry's own dependency.
@@ -238,6 +252,7 @@ pub fn parse_go_mod_with_context(
             .collect();
 
     let mut blocked_registries = Vec::new();
+    let mut rejected_registries = Vec::new();
     for dep in &mut dependencies {
         if let Some(path_source) = path_replacements.get(dep.module_path.as_str()) {
             dep.source = path_source.clone();
@@ -245,20 +260,26 @@ pub fn parse_go_mod_with_context(
         }
         dep.source = go_config.resolve_source_for(dep.module_path.as_str());
         // Only a dependency that actually fell back to `CustomRegistry` was affected by the
-        // blocked chain — a `GOPRIVATE`-matched module bypasses `GOPROXY` entirely and keeps
-        // resolving via `AlternateRegistry`, so it must not also get a blocked-registry notice.
-        if let (Some((class, raw)), true) = (
-            &blocked_class,
-            matches!(
-                dep.source,
-                deps_core::parser::DependencySource::CustomRegistry { .. }
-            ),
-        ) {
+        // blocked/rejected chain — a `GOPRIVATE`-matched module bypasses `GOPROXY` entirely and
+        // keeps resolving via `AlternateRegistry`, so it must not also get a notice.
+        let fell_back_to_custom_registry = matches!(
+            dep.source,
+            deps_core::parser::DependencySource::CustomRegistry { .. }
+        );
+        if let (Some((class, raw)), true) = (&blocked_class, fell_back_to_custom_registry) {
             blocked_registries.push(deps_core::BlockedRegistryOccurrence {
                 range: dep.module_path_range,
                 class: *class,
                 raw_value: raw.clone(),
                 declaration_key: GOPROXY_BLOCKED_DECLARATION_KEY.to_string(),
+            });
+        } else if let (Some((reason, raw)), true) = (&rejected_reason, fell_back_to_custom_registry)
+        {
+            rejected_registries.push(deps_core::RejectedRegistryOccurrence {
+                range: dep.module_path_range,
+                reason: *reason,
+                raw_value: raw.clone(),
+                declaration_key: GOPROXY_REJECTED_DECLARATION_KEY.to_string(),
             });
         }
     }
@@ -270,6 +291,7 @@ pub fn parse_go_mod_with_context(
         uri: doc_uri.clone(),
         resolved_chains: go_config.resolved_chains(),
         blocked_registries,
+        rejected_registries,
         dependency_truncation: budget.truncation(),
     })
 }
@@ -489,6 +511,7 @@ deps_core::impl_parse_result!(
         uri: uri,
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
+        rejected_registries: rejected_registries,
     }
 );
 
@@ -1044,6 +1067,52 @@ exclude github.com/bad/module v0.1.0
         assert_eq!(occurrence.class, HostClass::Global);
         assert_eq!(occurrence.raw_value, "https://goproxy.mycorp.example");
         assert_eq!(occurrence.declaration_key, GOPROXY_BLOCKED_DECLARATION_KEY);
+    }
+
+    /// #1438: a `GOPROXY` chain that fails closed to `CustomRegistry` because its sole hop is
+    /// invalid for a reason *other* than a blocked host (a malformed URL here) must surface
+    /// via `ParseResult::rejected_registries`, mirroring
+    /// `test_parse_go_mod_blocked_goproxy_populates_blocked_registries` above.
+    #[test]
+    fn test_parse_go_mod_rejected_goproxy_populates_rejected_registries() {
+        use crate::config::GoEnvCache;
+        use deps_core::ParseResult as _;
+        use deps_core::net_policy::{
+            RegistryAccessPolicy, RegistryRejectionReason, WorkspaceRegistryAccess,
+        };
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let goenv_path = dir.path().join("env");
+        std::fs::write(&goenv_path, "GOPROXY=not-a-valid-url\n").unwrap();
+
+        let ctx = GoParseContext::new(
+            Arc::new(RegistryAccessPolicy::new(WorkspaceRegistryAccess::All)),
+            Arc::new(GoEnvCache::new()),
+            Some(goenv_path),
+        );
+
+        let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.0\n";
+        let result = parse_go_mod_with_context(content, &test_uri(), &ctx).unwrap();
+
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        );
+        assert!(
+            result.blocked_registries().is_empty(),
+            "this is not a BlockedHost rejection, so blocked_registries must stay empty"
+        );
+
+        let rejected = result.rejected_registries();
+        assert_eq!(rejected.len(), 1);
+        let occurrence = &rejected[0];
+        assert_eq!(occurrence.range, result.dependencies[0].module_path_range);
+        assert_eq!(occurrence.reason, RegistryRejectionReason::InvalidUrl);
+        assert_eq!(occurrence.raw_value, "not-a-valid-url");
+        assert_eq!(occurrence.declaration_key, GOPROXY_REJECTED_DECLARATION_KEY);
     }
 
     /// `GOPROXY` is one config-global declaration — every affected `require` line gets its own

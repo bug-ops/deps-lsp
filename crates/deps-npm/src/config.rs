@@ -53,10 +53,10 @@ use std::sync::Arc;
 
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
-    RegistryUrlKind, ValidatedRegistryUrl,
+    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{BlockedSourceClass, EcosystemId, PackageName};
+use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
 /// validation, or why expansion of a `${VAR}` placeholder inside it failed (FR-007).
@@ -116,6 +116,28 @@ impl BlockedHostReason for NpmRegistryIndexError {
         match self {
             Self::BlockedHost { class } => Some(*class),
             _ => None,
+        }
+    }
+}
+
+/// Classifies every [`NpmRegistryIndexError`] variant except `BlockedHost` (already covered
+/// by [`BlockedHostReason`] above) so [`NpmConfig::rejected_reason_for`] can surface a
+/// diagnostic for a rejected `.npmrc` entry regardless of *why* it was rejected — previously
+/// only a `BlockedHost` rejection produced any user-visible feedback; every other reason
+/// (`InvalidUrl`, `NotHttps`, `UserInfoPresent`, `UndefinedEnvVar`,
+/// `ExpansionNotAllowedInProjectTier`) silently dropped the affected dependency from the fetch
+/// queue with no trace beyond a `tracing::warn!` (#1438).
+impl RegistryRejectionClassifier for NpmRegistryIndexError {
+    fn rejection_reason(&self) -> Option<RegistryRejectionReason> {
+        match self {
+            Self::InvalidUrl(_) => Some(RegistryRejectionReason::InvalidUrl),
+            Self::NotHttps(_) => Some(RegistryRejectionReason::NotHttps),
+            Self::UserInfoPresent => Some(RegistryRejectionReason::UserInfoPresent),
+            Self::BlockedHost { .. } => None,
+            Self::UndefinedEnvVar(_) => Some(RegistryRejectionReason::UndefinedEnvVar),
+            Self::ExpansionNotAllowedInProjectTier => {
+                Some(RegistryRejectionReason::EnvVarExpansionNotPermitted)
+            }
         }
     }
 }
@@ -248,6 +270,40 @@ impl NpmConfig {
             .and_then(InvalidEntry::blocked_class)?;
         Some(BlockedSourceClass {
             class,
+            raw_value,
+            declaration_key: "top-level".to_string(),
+        })
+    }
+
+    /// [`Self::blocked_class_for`]'s counterpart for every rejection reason *other* than a
+    /// policy-blocked host (#1438) — same branching, same declaration-key convention, but
+    /// reports whether the entry that resolution used was rejected as an invalid URL,
+    /// non-https, carrying userinfo, an undefined `${VAR}`, or a disallowed `${VAR}`
+    /// expansion. `None` for every other outcome (no entry, a valid entry, or a
+    /// blocked-host rejection, which [`Self::blocked_class_for`] already reports).
+    #[must_use]
+    pub fn rejected_reason_for(&self, package_name: &PackageName) -> Option<RejectedSourceClass> {
+        if let Some(scope) = scope_of(package_name.as_str())
+            && let Some(result) = self.scoped_registries.get(scope)
+        {
+            let (reason, raw_value) = result
+                .as_ref()
+                .err()
+                .and_then(InvalidEntry::rejection_reason)?;
+            return Some(RejectedSourceClass {
+                reason,
+                raw_value,
+                declaration_key: format!("scope:{scope}"),
+            });
+        }
+        let (reason, raw_value) = self
+            .registry
+            .as_ref()?
+            .as_ref()
+            .err()
+            .and_then(InvalidEntry::rejection_reason)?;
+        Some(RejectedSourceClass {
+            reason,
             raw_value,
             declaration_key: "top-level".to_string(),
         })
@@ -1385,6 +1441,131 @@ mod tests {
         };
         assert_eq!(config.blocked_class_for(&pkg("express")), None);
         assert_eq!(NpmConfig::default().blocked_class_for(&pkg("lodash")), None);
+    }
+
+    /// #1438: `rejected_reason_for` is [`Self::blocked_class_for`]'s counterpart for every
+    /// non-`BlockedHost` rejection reason — previously an invalid top-level `registry=`
+    /// override had no equivalent reporting at all, and the affected dependency silently
+    /// resolved to `CustomRegistry` with no diagnostic trace.
+    #[test]
+    fn test_rejected_reason_for_top_level_override_invalid_url() {
+        let policy = all_policy();
+        let config = NpmConfig {
+            registry: Some(resolve_entry("not-a-valid-url", ConfigTier::User, &policy)),
+            scoped_registries: HashMap::new(),
+        };
+        let occurrence = config
+            .rejected_reason_for(&pkg("express"))
+            .expect("rejected entry must be reported");
+        assert_eq!(occurrence.reason, RegistryRejectionReason::InvalidUrl);
+        assert_eq!(occurrence.raw_value, "not-a-valid-url");
+        assert_eq!(occurrence.declaration_key, "top-level");
+        assert_eq!(
+            config.blocked_class_for(&pkg("express")),
+            None,
+            "a non-blocked-host rejection must never also report via blocked_class_for"
+        );
+    }
+
+    /// #1438: every `NpmRegistryIndexError` variant other than `BlockedHost` must be
+    /// classified — this is the regression the issue reported (verified live with
+    /// `ExpansionNotAllowedInProjectTier` and `UserInfoPresent`, but the gap applied to every
+    /// variant in this list).
+    #[test]
+    fn test_rejected_reason_for_every_non_blocked_host_reason() {
+        let policy = all_policy();
+        for (raw, tier, expected) in [
+            (
+                "not-a-valid-url",
+                ConfigTier::User,
+                RegistryRejectionReason::InvalidUrl,
+            ),
+            (
+                "http://npm.example",
+                ConfigTier::User,
+                RegistryRejectionReason::NotHttps,
+            ),
+            (
+                "https://user:pass@npm.example",
+                ConfigTier::User,
+                RegistryRejectionReason::UserInfoPresent,
+            ),
+            (
+                "${UNDEFINED_VAR_XYZ}",
+                ConfigTier::User,
+                RegistryRejectionReason::UndefinedEnvVar,
+            ),
+            (
+                "${SOME_VAR}",
+                ConfigTier::Project,
+                RegistryRejectionReason::EnvVarExpansionNotPermitted,
+            ),
+        ] {
+            let config = NpmConfig {
+                registry: Some(resolve_entry(raw, tier, &policy)),
+                scoped_registries: HashMap::new(),
+            };
+            let occurrence = config
+                .rejected_reason_for(&pkg("express"))
+                .unwrap_or_else(|| panic!("expected a rejection for {raw:?} (tier {tier:?})"));
+            assert_eq!(occurrence.reason, expected, "raw={raw:?}");
+        }
+    }
+
+    /// A blocked-host rejection is already covered by [`NpmConfig::blocked_class_for`] — the
+    /// two mechanisms must never double-report the same entry.
+    #[test]
+    fn test_rejected_reason_for_none_when_blocked_host() {
+        let policy = public_only_policy();
+        let config = NpmConfig {
+            registry: Some(resolve_entry(
+                "https://169.254.169.254/registry",
+                ConfigTier::User,
+                &policy,
+            )),
+            scoped_registries: HashMap::new(),
+        };
+        assert_eq!(config.rejected_reason_for(&pkg("express")), None);
+    }
+
+    /// The scoped-entry counterpart, mirroring
+    /// `test_blocked_class_for_scoped_entry_blocked_by_policy`.
+    #[test]
+    fn test_rejected_reason_for_scoped_entry() {
+        let policy = all_policy();
+        let mut scoped = HashMap::new();
+        scoped.insert(
+            "@myorg".to_string(),
+            resolve_entry("not-a-valid-url", ConfigTier::User, &policy),
+        );
+        let config = NpmConfig {
+            registry: None,
+            scoped_registries: scoped,
+        };
+        let occurrence = config
+            .rejected_reason_for(&pkg("@myorg/internal-lib"))
+            .expect("rejected scoped entry must be reported");
+        assert_eq!(occurrence.declaration_key, "scope:@myorg");
+        assert_eq!(config.rejected_reason_for(&pkg("express")), None);
+    }
+
+    /// A valid (non-rejected) entry, or no entry at all, must never be reported as rejected.
+    #[test]
+    fn test_rejected_reason_for_none_when_valid() {
+        let policy = all_policy();
+        let config = NpmConfig {
+            registry: Some(resolve_entry(
+                "https://npm.mycorp.example",
+                ConfigTier::User,
+                &policy,
+            )),
+            scoped_registries: HashMap::new(),
+        };
+        assert_eq!(config.rejected_reason_for(&pkg("express")), None);
+        assert_eq!(
+            NpmConfig::default().rejected_reason_for(&pkg("lodash")),
+            None
+        );
     }
 
     #[test]
