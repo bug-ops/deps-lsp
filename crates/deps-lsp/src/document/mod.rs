@@ -39,7 +39,10 @@ mod resolved;
 mod state;
 
 pub(crate) use diff::reload_resolved_versions;
-pub(crate) use lifecycle::{ChangeTaskTriggerGates, ResolvedVersionMove, change_task_triggers};
+pub(crate) use lifecycle::{
+    ChangeTaskTriggerGates, ResolvedVersionMove, change_task_triggers,
+    trigger_typosquat_prefetch_for_open_documents,
+};
 pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_document_open};
 pub use loader::load_document_from_disk;
 pub(crate) use osv_scan::{rescan_after_resolved_version_change, run_license_prefetch};

@@ -31,16 +31,21 @@
 //! same confidence as an attested relation.
 
 mod types;
+mod typosquat;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::{DashMap, DashSet};
 
-use types::{DepsDevProject, DepsDevVersionInfo, ProvenanceEntry, RelatedProject};
+use types::{
+    DependentsWire, DepsDevProject, DepsDevVersionInfo, GetPackageWire, ProvenanceEntry,
+    RelatedProject, SimilarlyNamedPackagesWire,
+};
 pub use types::{ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
+pub use typosquat::TyposquatSignal;
+use typosquat::{SimilarPackageCandidate, TYPOSQUAT_MAX_CANDIDATES_CHECKED, evaluate_candidates};
 
-#[cfg(feature = "lsp-responses")]
 use crate::EcosystemId;
 use crate::cache::{BodyLimit, HttpCache};
 use crate::error::DepsError;
@@ -53,6 +58,19 @@ const DEPS_DEV_API: &str = "https://api.deps.dev";
 /// can never by itself consume the whole budget and starve the project call
 /// of any chance to return within it.
 const DEPS_DEV_CALL_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Per-call timeout for the typosquat client's deps.dev calls (issue #1437, impl-critic
+/// S4) — deliberately more generous than [`DEPS_DEV_CALL_TIMEOUT`]. That constant was
+/// tuned for `trust_signal`'s synchronous, hover-request-path budget
+/// (`DEPS_DEV_WAIT_BUDGET = 700ms`, itself tight for two sequential 400ms calls);
+/// typosquat resolution instead runs from a background document-lifecycle prefetch (not
+/// on any live-request path — see `deps-lsp::document::osv_scan::run_typosquat_prefetch`),
+/// so there is no reason to keep the same tight per-call budget. Live measurement found
+/// `GetPackage` for popular packages (`react`, `typescript`, `next`, `aws-sdk`) routinely
+/// takes 0.4-0.52s — i.e. these would silently time out (and, per FR-005's graceful
+/// degradation, produce no signal at all) under the tighter constant, dropping exactly
+/// the popular candidates the ratio math most needs.
+const TYPOSQUAT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// TTL for a successfully assembled signal, or a definitive HTTP 404 —
 /// matches deps.dev's own declared `cache-control: max-age=3600`. A 404 gets
@@ -128,14 +146,55 @@ struct ProjectMemoEntry {
     overall_score: Option<f32>,
 }
 
-/// Releases an in-flight claim on drop — including on panic — so a claim can
-/// never leak and permanently block later calls for the same key.
-struct InFlightGuard<'a> {
-    set: &'a DashSet<MemoKey>,
-    key: MemoKey,
+/// Key for [`DepsDevClient`]'s similarity memo (issue #1437) — package-level, not
+/// version-level: `GetSimilarlyNamedPackages` has no version parameter, mirroring
+/// [`ProjectKeyMemo`]'s precedent for a memo scoped narrower than [`MemoKey`].
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+struct SimilarityMemoKey {
+    base: String,
+    system: &'static str,
+    name: String,
 }
 
-impl Drop for InFlightGuard<'_> {
+struct SimilarityMemoEntry {
+    fetched_at: Instant,
+    ttl: Duration,
+    candidates: Vec<SimilarPackageCandidate>,
+}
+
+/// Key for [`DepsDevClient`]'s popularity memo (issue #1437) — likewise package-level: a
+/// package's `GetDependents`-derived popularity is a property of its own *default* version
+/// (resolved internally via `GetPackage`), not of whatever version a caller happens to ask
+/// about.
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+struct PopularityMemoKey {
+    base: String,
+    system: &'static str,
+    name: String,
+}
+
+struct PopularityMemoEntry {
+    fetched_at: Instant,
+    ttl: Duration,
+    /// `None` on any resolution failure (`GetPackage`, no default version found, or
+    /// `GetDependents`) — memoized the same way [`MemoEntry::signal`] memoizes negative
+    /// outcomes.
+    dependent_count: Option<u64>,
+}
+
+/// Releases an in-flight claim on drop — including on panic — so a claim can
+/// never leak and permanently block later calls for the same key.
+///
+/// Generic over the memo key type (issue #1437 widened this from a `MemoKey`-only guard so
+/// [`DepsDevClient::similar_packages`]/[`DepsDevClient::popularity`] can reuse the identical
+/// dedup mechanism for [`SimilarityMemoKey`]/[`PopularityMemoKey`] instead of hand-rolling a
+/// second copy).
+struct InFlightGuard<'a, K: std::hash::Hash + Eq> {
+    set: &'a DashSet<K>,
+    key: K,
+}
+
+impl<K: std::hash::Hash + Eq> Drop for InFlightGuard<'_, K> {
     fn drop(&mut self) {
         self.set.remove(&self.key);
     }
@@ -151,7 +210,12 @@ impl Drop for InFlightGuard<'_> {
 /// someone decides which side it belongs on — stronger than a trait default
 /// that would silently opt a new ecosystem out, and this is what makes
 /// FR-005/FR-011 hold by construction rather than by convention.
-#[cfg(feature = "lsp-responses")]
+///
+/// No longer `lsp-responses`-gated (issue #1437): [`DepsDevClient::typosquat_signal`]'s
+/// diagnostics-path caller (`lsp_helpers::diagnostics::fetch_typosquat_signals`, reached
+/// through `Ecosystem::generate_diagnostics`'s default impl) must compile without that
+/// feature — diagnostics generation is deliberately available to `deps-cli`, which does not
+/// enable `lsp-responses` (see that feature's own doc comment in `Cargo.toml`).
 #[must_use]
 pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<&'static str> {
     match id {
@@ -267,6 +331,23 @@ pub struct DepsDevClient {
     memo: DashMap<MemoKey, MemoEntry>,
     projects: DashMap<ProjectKeyMemo, ProjectMemoEntry>,
     in_flight: DashSet<MemoKey>,
+    /// Issue #1437: `GetSimilarlyNamedPackages` results, keyed package-level (see
+    /// [`SimilarityMemoKey`]).
+    similarity: DashMap<SimilarityMemoKey, SimilarityMemoEntry>,
+    /// Issue #1437: in-flight claims for [`Self::similarity`], mirroring [`Self::in_flight`]'s
+    /// dedup rationale — `fetch_typosquat_signals`'s concurrent fan-out across a document's
+    /// dependencies can otherwise issue duplicate `GetSimilarlyNamedPackages` requests for two
+    /// dependencies that happen to share a raw name before either write lands in the memo.
+    similarity_in_flight: DashSet<SimilarityMemoKey>,
+    /// Issue #1437: `GetPackage` + `GetDependents`-derived popularity, keyed package-level
+    /// (see [`PopularityMemoKey`]) — shared by every declared dependency and candidate that
+    /// resolves the same package name, the same way `projects` is shared across packages
+    /// sharing a Scorecard project key.
+    popularity: DashMap<PopularityMemoKey, PopularityMemoEntry>,
+    /// Issue #1437: in-flight claims for [`Self::popularity`] — the more valuable of the two
+    /// new dedup sets, since a popular typosquat target (e.g. `lodash`) is exactly the kind of
+    /// candidate multiple concurrently-resolved declared dependencies are likely to share.
+    popularity_in_flight: DashSet<PopularityMemoKey>,
 }
 
 /// Manual, non-exhaustive impl: `VersionData` derives `Debug` and holds this behind
@@ -303,6 +384,10 @@ impl DepsDevClient {
             memo: DashMap::new(),
             projects: DashMap::new(),
             in_flight: DashSet::new(),
+            similarity: DashMap::new(),
+            similarity_in_flight: DashSet::new(),
+            popularity: DashMap::new(),
+            popularity_in_flight: DashSet::new(),
         }
     }
 
@@ -389,14 +474,20 @@ impl DepsDevClient {
 
     /// One GET through the shared, transport-only, origin-pinned call site —
     /// no entry-map caching (this client's own memos own that), bounded by
-    /// [`DEPS_DEV_CALL_TIMEOUT`].
+    /// `timeout`. Callers on the synchronous hover wait-budget pass
+    /// [`DEPS_DEV_CALL_TIMEOUT`]; the typosquat background prefetch (issue #1437, not on
+    /// any live-request path since impl-critic S4) passes the more generous
+    /// [`TYPOSQUAT_CALL_TIMEOUT`] — live measurement found popular packages (`react`,
+    /// `typescript`, `next`, `aws-sdk`) routinely take 0.4-0.52s to resolve, which the
+    /// original single shared 400ms timeout dropped as silent (spec-compliant, but
+    /// self-defeating) degradation.
     #[tracing::instrument(
         skip(self),
         fields(url = %crate::redact::RedactedUrl::new(url))
     )]
-    async fn get(&self, url: &str) -> Result<bytes::Bytes, DepsDevFetchError> {
+    async fn get(&self, url: &str, timeout: Duration) -> Result<bytes::Bytes, DepsDevFetchError> {
         match tokio::time::timeout(
-            DEPS_DEV_CALL_TIMEOUT,
+            timeout,
             self.cache
                 .get_transport_only_with_headers_limited_trusted_origin(
                     url,
@@ -431,7 +522,10 @@ impl DepsDevClient {
             urlencoding::encode(version),
         );
 
-        let (provenance, related_projects, licenses) = match self.get(&version_url).await {
+        let (provenance, related_projects, licenses) = match self
+            .get(&version_url, DEPS_DEV_CALL_TIMEOUT)
+            .await
+        {
             Ok(bytes) => match crate::parser::parse_json_checked::<DepsDevVersionInfo>(&bytes) {
                 Ok(info) => {
                     let provenance =
@@ -510,7 +604,7 @@ impl DepsDevClient {
             urlencoding::encode(project_key),
         );
 
-        let (overall_score, ttl) = match self.get(&url).await {
+        let (overall_score, ttl) = match self.get(&url, DEPS_DEV_CALL_TIMEOUT).await {
             Ok(bytes) => match crate::parser::parse_json_checked::<DepsDevProject>(&bytes) {
                 Ok(project) => {
                     let overall_score = project
@@ -539,6 +633,290 @@ impl DepsDevClient {
 
         self.store_project_memo(memo_key, overall_score, ttl);
         (overall_score, ttl)
+    }
+
+    /// Returns a typosquat-suspect signal for one declared dependency (issue #1437, spec
+    /// 071), or `None` when nothing clears the ratio gate.
+    ///
+    /// Infallible by construction (NFR-001/FR-005), exactly like [`Self::trust_signal`]:
+    /// every failure at any stage — a below-threshold ratio included — degrades to `None`.
+    /// Does **not** itself check `system`/ecosystem coverage or any config opt-in switch;
+    /// callers (`lsp_helpers::diagnostics::fetch_typosquat_signals`) are responsible for
+    /// only calling this for a `system` `deps_dev_system` actually maps to, and only when
+    /// the feature is enabled (FR-002/FR-009) — mirroring how [`Self::trust_signal`] itself
+    /// never checks ecosystem coverage either.
+    pub async fn typosquat_signal(
+        &self,
+        system: &'static str,
+        name: &str,
+    ) -> Option<TyposquatSignal> {
+        let candidates = self.similar_packages(system, name).await;
+        if candidates.is_empty() {
+            return None;
+        }
+
+        // `candidates` is already self-match-filtered and capped at
+        // `TYPOSQUAT_MAX_CANDIDATES_CHECKED` by `Self::similar_packages` itself (issue
+        // #1437 security review M1/N2) — filtered and capped *before* the memo caches it,
+        // not just here at read time, so a large `packages[]` response never sits resident
+        // in the memo either.
+        //
+        // The declared package's own popularity and every candidate's are resolved
+        // concurrently, not sequentially (issue #1437 impl-critic N2): none depends on any
+        // other's result, only the final `evaluate_candidates` call below does. Sequential
+        // resolution could cost up to `2 * (1 + TYPOSQUAT_MAX_CANDIDATES_CHECKED)` deps.dev
+        // round trips end-to-end for one dependency — concurrent resolution collapses that
+        // to roughly the cost of the single slowest branch.
+        let candidate_futures = candidates.iter().map(|candidate| async move {
+            let dependent_count = self.popularity(system, &candidate.name).await;
+            (candidate.name.clone(), dependent_count)
+        });
+        let (declared_dependent_count, resolved_candidates) = futures::future::join(
+            self.popularity(system, name),
+            futures::future::join_all(candidate_futures),
+        )
+        .await;
+        let declared_dependent_count = declared_dependent_count?;
+
+        let resolved: Vec<(String, u64)> = resolved_candidates
+            .into_iter()
+            .filter_map(|(name, dependent_count)| dependent_count.map(|count| (name, count)))
+            .collect();
+
+        evaluate_candidates(name, declared_dependent_count, &resolved)
+    }
+
+    /// Fetches (or serves from the similarity memo) `GetSimilarlyNamedPackages`'s
+    /// `packages[]` for `name` — identity only, no popularity (plan.md §1).
+    async fn similar_packages(
+        &self,
+        system: &'static str,
+        name: &str,
+    ) -> Vec<SimilarPackageCandidate> {
+        let key = SimilarityMemoKey {
+            base: self.base_url.clone(),
+            system,
+            name: name.to_string(),
+        };
+
+        if let Some(entry) = self.similarity.get(&key)
+            && entry.fetched_at.elapsed() < entry.ttl
+        {
+            return entry.candidates.clone();
+        }
+
+        if !self.similarity_in_flight.insert(key.clone()) {
+            return Vec::new();
+        }
+        let _guard = InFlightGuard {
+            set: &self.similarity_in_flight,
+            key: key.clone(),
+        };
+
+        let url = format!(
+            "{}/v3alpha/systems/{system}/packages/{}:similarlyNamedPackages",
+            self.base_url,
+            urlencoding::encode(name),
+        );
+
+        let (candidates, ttl) = match self.get(&url, TYPOSQUAT_CALL_TIMEOUT).await {
+            Ok(bytes) => {
+                match crate::parser::parse_json_checked::<SimilarlyNamedPackagesWire>(&bytes) {
+                    Ok(wire) => {
+                        // Filtered and capped *before* caching (issue #1437 security
+                        // review N2), not just at read time in `typosquat_signal`:
+                        // `GetSimilarlyNamedPackages` documents no upper bound on
+                        // `packages[]` (up to ~30k entries under the 1 MiB body cap), so
+                        // storing the full, uncapped list in the memo would keep that
+                        // worst case resident in memory across every memo entry.
+                        let candidates = wire
+                            .packages
+                            .into_iter()
+                            .map(|p| SimilarPackageCandidate {
+                                name: p.package_key.name,
+                            })
+                            .filter(|candidate| candidate.name != name)
+                            .take(TYPOSQUAT_MAX_CANDIDATES_CHECKED)
+                            .collect();
+                        (candidates, DEPS_DEV_SUCCESS_TTL)
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            "deps.dev similarly-named-packages response parse failed"
+                        );
+                        (Vec::new(), DEPS_DEV_ERROR_TTL)
+                    }
+                }
+            }
+            Err(DepsDevFetchError::NotFound) => (Vec::new(), DEPS_DEV_SUCCESS_TTL),
+            Err(DepsDevFetchError::Failed(e)) => {
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(
+                    status = ?status,
+                    cause,
+                    "deps.dev similarly-named-packages fetch failed"
+                );
+                (Vec::new(), DEPS_DEV_ERROR_TTL)
+            }
+            Err(DepsDevFetchError::TimedOut) => {
+                tracing::debug!(
+                    package = %crate::redact::redact_declaration_key(name),
+                    "deps.dev similarly-named-packages fetch timed out"
+                );
+                (Vec::new(), DEPS_DEV_ERROR_TTL)
+            }
+        };
+
+        self.store_similarity_memo(key, candidates.clone(), ttl);
+        candidates
+    }
+
+    fn store_similarity_memo(
+        &self,
+        key: SimilarityMemoKey,
+        candidates: Vec<SimilarPackageCandidate>,
+        ttl: Duration,
+    ) {
+        if !self.similarity.contains_key(&key) {
+            crate::cache_policy::evict_expired_then_oldest(
+                &self.similarity,
+                MAX_MEMO_ENTRIES,
+                |e| e.fetched_at,
+                |e| e.ttl,
+            );
+        }
+        self.similarity.insert(
+            key,
+            SimilarityMemoEntry {
+                fetched_at: Instant::now(),
+                ttl,
+                candidates,
+            },
+        );
+    }
+
+    /// Resolves (or serves from the popularity memo) `name`'s `GetDependents`-derived
+    /// `dependentCount` for its default version, via `GetPackage` (plan.md §1).
+    async fn popularity(&self, system: &'static str, name: &str) -> Option<u64> {
+        let key = PopularityMemoKey {
+            base: self.base_url.clone(),
+            system,
+            name: name.to_string(),
+        };
+
+        if let Some(entry) = self.popularity.get(&key)
+            && entry.fetched_at.elapsed() < entry.ttl
+        {
+            return entry.dependent_count;
+        }
+
+        if !self.popularity_in_flight.insert(key.clone()) {
+            return None;
+        }
+        let _guard = InFlightGuard {
+            set: &self.popularity_in_flight,
+            key: key.clone(),
+        };
+
+        let (dependent_count, ttl) = self.fetch_popularity(system, name).await;
+        self.store_popularity_memo(key, dependent_count, ttl);
+        dependent_count
+    }
+
+    fn store_popularity_memo(
+        &self,
+        key: PopularityMemoKey,
+        dependent_count: Option<u64>,
+        ttl: Duration,
+    ) {
+        if !self.popularity.contains_key(&key) {
+            crate::cache_policy::evict_expired_then_oldest(
+                &self.popularity,
+                MAX_MEMO_ENTRIES,
+                |e| e.fetched_at,
+                |e| e.ttl,
+            );
+        }
+        self.popularity.insert(
+            key,
+            PopularityMemoEntry {
+                fetched_at: Instant::now(),
+                ttl,
+                dependent_count,
+            },
+        );
+    }
+
+    /// The `GetPackage` -> default version -> `GetDependents` sequence (plan.md §1). Each
+    /// step fails independently to `(None, ..)`, mirroring [`Self::fetch`]'s per-step
+    /// degradation.
+    async fn fetch_popularity(&self, system: &'static str, name: &str) -> (Option<u64>, Duration) {
+        let package_url = format!(
+            "{}/v3alpha/systems/{system}/packages/{}",
+            self.base_url,
+            urlencoding::encode(name),
+        );
+
+        let default_version = match self.get(&package_url, TYPOSQUAT_CALL_TIMEOUT).await {
+            Ok(bytes) => match crate::parser::parse_json_checked::<GetPackageWire>(&bytes) {
+                Ok(package) => match package.versions.into_iter().find(|v| v.is_default) {
+                    Some(v) => v.version_key.version,
+                    None => return (None, DEPS_DEV_SUCCESS_TTL),
+                },
+                Err(e) => {
+                    tracing::debug!(error = %e, "deps.dev package response parse failed");
+                    return (None, DEPS_DEV_ERROR_TTL);
+                }
+            },
+            Err(DepsDevFetchError::NotFound) => return (None, DEPS_DEV_SUCCESS_TTL),
+            Err(DepsDevFetchError::Failed(e)) => {
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(status = ?status, cause, "deps.dev package fetch failed");
+                return (None, DEPS_DEV_ERROR_TTL);
+            }
+            Err(DepsDevFetchError::TimedOut) => {
+                tracing::debug!(
+                    package = %crate::redact::redact_declaration_key(name),
+                    "deps.dev package fetch timed out"
+                );
+                return (None, DEPS_DEV_ERROR_TTL);
+            }
+        };
+
+        let dependents_url = format!(
+            "{}/v3alpha/systems/{system}/packages/{}/versions/{}:dependents",
+            self.base_url,
+            urlencoding::encode(name),
+            urlencoding::encode(&default_version),
+        );
+
+        match self.get(&dependents_url, TYPOSQUAT_CALL_TIMEOUT).await {
+            Ok(bytes) => match crate::parser::parse_json_checked::<DependentsWire>(&bytes) {
+                Ok(wire) => (Some(wire.dependent_count), DEPS_DEV_SUCCESS_TTL),
+                Err(e) => {
+                    tracing::debug!(error = %e, "deps.dev dependents response parse failed");
+                    (None, DEPS_DEV_ERROR_TTL)
+                }
+            },
+            // Error TTL, not success (impl-critic addendum): unlike `GetPackage`'s own 404
+            // (a genuine "package doesn't exist"), a 404 here can be a transient race — the
+            // package's default version changed between the `GetPackage` call above and
+            // this one — not authoritative absence, so a short retry window is correct.
+            Err(DepsDevFetchError::NotFound) => (None, DEPS_DEV_ERROR_TTL),
+            Err(DepsDevFetchError::Failed(e)) => {
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(status = ?status, cause, "deps.dev dependents fetch failed");
+                (None, DEPS_DEV_ERROR_TTL)
+            }
+            Err(DepsDevFetchError::TimedOut) => {
+                tracing::debug!(
+                    package = %crate::redact::redact_declaration_key(name),
+                    "deps.dev dependents fetch timed out"
+                );
+                (None, DEPS_DEV_ERROR_TTL)
+            }
+        }
     }
 }
 
@@ -584,7 +962,6 @@ mod tests {
 
     const EXPRESS_PROJECT: &str = r#"{"scorecard": {"overallScore": 8.5}}"#;
 
-    #[cfg(feature = "lsp-responses")]
     #[test]
     fn deps_dev_system_covers_seven_ecosystems() {
         assert_eq!(deps_dev_system(EcosystemId::Npm), Some("npm"));
@@ -596,7 +973,6 @@ mod tests {
         assert_eq!(deps_dev_system(EcosystemId::NuGet), Some("nuget"));
     }
 
-    #[cfg(feature = "lsp-responses")]
     #[test]
     fn deps_dev_system_excludes_uncovered_ecosystems() {
         assert_eq!(deps_dev_system(EcosystemId::Composer), None);
@@ -1424,6 +1800,612 @@ mod tests {
             client.projects.len() <= MAX_MEMO_ENTRIES,
             "projects memo must stay bounded at MAX_MEMO_ENTRIES, got {}",
             client.projects.len()
+        );
+    }
+
+    /// Live-verified evidence pair (plan.md §1): `crossenv` (3 dependents) vs `cross-env`
+    /// (900 dependents) — a ~300x ratio, well past both the 50x threshold and the
+    /// 50-dependent floor.
+    #[tokio::test]
+    async fn typosquat_signal_positive_case_fires_above_threshold() {
+        let (mut server, client) = mock_client().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "crossenv"}, "packages": [{"packageKey": {"name": "cross-env"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let _declared_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/crossenv")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _declared_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 3}"#)
+            .create_async()
+            .await;
+        let _candidate_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/cross-env")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "7.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _candidate_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/cross-env/versions/7.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 900}"#)
+            .create_async()
+            .await;
+
+        let signal = client
+            .typosquat_signal("npm", "crossenv")
+            .await
+            .expect("300x ratio must fire");
+        assert_eq!(signal.declared_name, "crossenv");
+        assert_eq!(signal.suspected_name, "cross-env");
+        assert_eq!(signal.declared_dependent_count, 3);
+        assert_eq!(signal.suspected_dependent_count, 900);
+    }
+
+    /// Negative counterpart: a legitimate similarly-named pair whose ratio never clears
+    /// `TYPOSQUAT_RATIO_THRESHOLD` must not fire (spec NFR-003).
+    #[tokio::test]
+    async fn typosquat_signal_negative_case_below_threshold_returns_none() {
+        let (mut server, client) = mock_client().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/coffeescript:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "coffeescript"}, "packages": [{"packageKey": {"name": "coffee-script"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let _declared_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/coffeescript")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "2.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _declared_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/coffeescript/versions/2.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 1213}"#)
+            .create_async()
+            .await;
+        let _candidate_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/coffee-script")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _candidate_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/coffee-script/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 8377}"#)
+            .create_async()
+            .await;
+
+        let signal = client.typosquat_signal("npm", "coffeescript").await;
+        assert!(
+            signal.is_none(),
+            "a ~6.9x ratio must stay well under the 50x threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn typosquat_signal_404_on_similarity_returns_none_no_further_calls() {
+        let (mut server, client) = mock_client().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/missing:similarlyNamedPackages",
+            )
+            .with_status(404)
+            .create_async()
+            .await;
+        let package_call = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/v3alpha/systems/npm/packages/missing$".into()),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let signal = client.typosquat_signal("npm", "missing").await;
+        assert!(signal.is_none());
+        package_call.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn typosquat_signal_timeout_on_similarity_returns_none() {
+        // Sleeps past `TYPOSQUAT_CALL_TIMEOUT` (3s, not `DEPS_DEV_CALL_TIMEOUT`'s 400ms —
+        // see that constant's doc for why the typosquat client uses a more generous
+        // per-call budget, issue #1437 impl-critic S4).
+        let (mut server, client) = mock_client().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/slow:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body_from_request(|_req| {
+                std::thread::sleep(Duration::from_millis(3200));
+                br#"{"packageKey": {"name": "slow"}, "packages": []}"#.to_vec()
+            })
+            .create_async()
+            .await;
+
+        let signal = client.typosquat_signal("npm", "slow").await;
+        assert!(signal.is_none());
+    }
+
+    #[tokio::test]
+    async fn typosquat_signal_malformed_json_on_similarity_returns_none() {
+        let (mut server, client) = mock_client().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/broken:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body("not json")
+            .create_async()
+            .await;
+
+        let signal = client.typosquat_signal("npm", "broken").await;
+        assert!(signal.is_none());
+    }
+
+    /// Impl-critic addendum: a 404 from `GetDependents` can be a transient default-version
+    /// race (the package's default version changed between the `GetPackage` call and this
+    /// one), not authoritative absence like a `GetPackage` 404 — it must memoize the short
+    /// [`DEPS_DEV_ERROR_TTL`], not the 1h [`DEPS_DEV_SUCCESS_TTL`], so a retry happens soon.
+    #[tokio::test]
+    async fn typosquat_signal_dependents_404_memoizes_error_ttl_not_success_ttl() {
+        let (mut server, client) = mock_client().await;
+        let _package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/racy")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/racy/versions/1.0.0:dependents",
+            )
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let dependent_count = client.popularity("npm", "racy").await;
+        assert!(dependent_count.is_none());
+
+        let key = PopularityMemoKey {
+            base: client.base_url.clone(),
+            system: "npm",
+            name: "racy".to_string(),
+        };
+        let entry_ttl = client
+            .popularity
+            .get(&key)
+            .expect("popularity memo entry expected")
+            .ttl;
+        assert_eq!(
+            entry_ttl, DEPS_DEV_ERROR_TTL,
+            "a GetDependents 404 must memoize the short error TTL, not the 1h success TTL \
+             a genuine GetPackage 404 (authoritative absence) uses"
+        );
+    }
+
+    #[tokio::test]
+    async fn typosquat_signal_empty_packages_returns_none_no_popularity_calls() {
+        let (mut server, client) = mock_client().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/lonely:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(r#"{"packageKey": {"name": "lonely"}, "packages": []}"#)
+            .create_async()
+            .await;
+        let package_call = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/v3alpha/systems/npm/packages/lonely$".into()),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let signal = client.typosquat_signal("npm", "lonely").await;
+        assert!(signal.is_none());
+        package_call.assert_async().await;
+    }
+
+    /// FR-006, at the client-integration level: a candidate that exactly matches the
+    /// declared package's own name must never be treated as its own suspect, even if
+    /// `GetSimilarlyNamedPackages` echoes it back.
+    #[tokio::test]
+    async fn typosquat_signal_excludes_self_match_candidate() {
+        // `Self::similar_packages` filters a self-match out *before* caching (issue #1437
+        // security review N2), so with the response's only candidate being a self-match,
+        // the candidate list is empty by the time `typosquat_signal` sees it — it returns
+        // `None` before ever resolving the declared package's own popularity, hence
+        // `.expect(0)` on both package/dependents mocks below (not `.expect(1)`: with
+        // filtering this early, resolving the declared package's popularity would be
+        // wasted work with no candidate left to compare it against). The pure-gate
+        // regression guard for FR-006 itself is
+        // `typosquat::tests::evaluate_candidates_excludes_exact_name_match`.
+        let (mut server, client) = mock_client().await;
+        let similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/self-echo:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "self-echo"}, "packages": [{"packageKey": {"name": "self-echo"}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let declared_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/self-echo")
+            .expect(0)
+            .create_async()
+            .await;
+        let declared_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/self-echo/versions/1.0.0:dependents",
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let signal = client.typosquat_signal("npm", "self-echo").await;
+        assert!(signal.is_none());
+        similarity.assert_async().await;
+        declared_package.assert_async().await;
+        declared_dependents.assert_async().await;
+    }
+
+    /// Issue #1437 security review M1: `GetSimilarlyNamedPackages` documents no upper bound
+    /// on `packages[]`. A 20-candidate response must still only cost
+    /// `TYPOSQUAT_MAX_CANDIDATES_CHECKED` (5) candidate-popularity resolutions (10 requests:
+    /// `GetPackage` + `GetDependents` per candidate), not 20.
+    #[tokio::test]
+    async fn typosquat_signal_caps_candidates_checked_at_five() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut server, client) = mock_client().await;
+        let candidates_json: String = (0..20)
+            .map(|i| format!(r#"{{"packageKey": {{"name": "cand-{i}"}}}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/tiny:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"packageKey": {{"name": "tiny"}}, "packages": [{candidates_json}]}}"#
+            ))
+            .create_async()
+            .await;
+        let _declared_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/tiny")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _declared_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/tiny/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 1}"#)
+            .create_async()
+            .await;
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let package_call_count = Arc::clone(&call_count);
+        let _candidate_packages = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(r"^/v3alpha/systems/npm/packages/cand-\d+$".into()),
+            )
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                package_call_count.fetch_add(1, Ordering::SeqCst);
+                br#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#
+                    .to_vec()
+            })
+            .create_async()
+            .await;
+        let dependents_call_count = Arc::clone(&call_count);
+        let _candidate_dependents = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    r"^/v3alpha/systems/npm/packages/cand-\d+/versions/1\.0\.0:dependents$".into(),
+                ),
+            )
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                dependents_call_count.fetch_add(1, Ordering::SeqCst);
+                br#"{"dependentCount": 1000}"#.to_vec()
+            })
+            .create_async()
+            .await;
+
+        let signal = client.typosquat_signal("npm", "tiny").await;
+        assert!(
+            signal.is_some(),
+            "at least one of the capped candidates should still qualify"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2 * TYPOSQUAT_MAX_CANDIDATES_CHECKED,
+            "only TYPOSQUAT_MAX_CANDIDATES_CHECKED candidates should ever be resolved, \
+             regardless of how many packages[] entries the response carries"
+        );
+    }
+
+    /// Issue #1437 security review N2: the similarity *memo* itself must hold only the
+    /// filtered, capped set, not the full `packages[]` list `GetSimilarlyNamedPackages` can
+    /// return (up to ~30k entries under the 1 MiB body cap) — otherwise a large response
+    /// would sit resident in memory for the entire memo TTL regardless of the read-time cap
+    /// in `typosquat_signal`.
+    #[tokio::test]
+    async fn similar_packages_memo_stores_filtered_and_capped_candidates() {
+        let (mut server, client) = mock_client().await;
+        let mut candidates_json: Vec<String> = (0..20)
+            .map(|i| format!(r#"{{"packageKey": {{"name": "cand-{i}"}}}}"#))
+            .collect();
+        // A self-match mixed in among the 20 — must be filtered, not just excluded from the
+        // ratio gate later.
+        candidates_json.push(r#"{"packageKey": {"name": "tiny"}}"#.to_string());
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/tiny:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(format!(
+                r#"{{"packageKey": {{"name": "tiny"}}, "packages": [{}]}}"#,
+                candidates_json.join(",")
+            ))
+            .create_async()
+            .await;
+
+        let candidates = client.similar_packages("npm", "tiny").await;
+
+        assert_eq!(
+            candidates.len(),
+            TYPOSQUAT_MAX_CANDIDATES_CHECKED,
+            "the returned (and thus cached) list must already be capped"
+        );
+        assert!(
+            candidates.iter().all(|c| c.name != "tiny"),
+            "the self-match must be filtered before caching, not just before the ratio gate"
+        );
+
+        let key = SimilarityMemoKey {
+            base: client.base_url.clone(),
+            system: "npm",
+            name: "tiny".to_string(),
+        };
+        let memo_len = client
+            .similarity
+            .get(&key)
+            .expect("similarity memo entry expected")
+            .candidates
+            .len();
+        assert_eq!(
+            memo_len, TYPOSQUAT_MAX_CANDIDATES_CHECKED,
+            "the memo entry itself must hold only the capped set, not the full 21-entry \
+             response"
+        );
+    }
+
+    #[tokio::test]
+    async fn typosquat_signal_second_call_within_ttl_issues_zero_requests() {
+        let (mut server, client) = mock_client().await;
+        let similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "crossenv"}, "packages": [{"packageKey": {"name": "cross-env"}}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let declared_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/crossenv")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let declared_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 3}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let candidate_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/cross-env")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "7.0.0"}, "isDefault": true}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let candidate_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/cross-env/versions/7.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 900}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        client.typosquat_signal("npm", "crossenv").await;
+        client.typosquat_signal("npm", "crossenv").await;
+
+        similarity.assert_async().await;
+        declared_package.assert_async().await;
+        declared_dependents.assert_async().await;
+        candidate_package.assert_async().await;
+        candidate_dependents.assert_async().await;
+    }
+
+    /// Issue #1437: the in-flight dedup on `Self::popularity` — two declared packages that
+    /// happen to share a candidate (a realistic shape: a popular package like `lodash` is a
+    /// typosquat target for more than one misspelling in the same document) resolved
+    /// concurrently via `fetch_typosquat_signals`'s fan-out must issue exactly one
+    /// `GetPackage` request for that shared candidate, mirroring
+    /// `trust_signal_concurrent_calls_for_same_key_issue_one_request`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typosquat_signal_concurrent_calls_share_one_candidate_popularity_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut server, client) = mock_client().await;
+        let client = Arc::new(client);
+        let call_count = Arc::new(AtomicUsize::new(0));
+
+        let _similarity_a = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/pkg-a:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "pkg-a"}, "packages": [{"packageKey": {"name": "popular-candidate"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let _similarity_b = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/pkg-b:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "pkg-b"}, "packages": [{"packageKey": {"name": "popular-candidate"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let _package_a = server
+            .mock("GET", "/v3alpha/systems/npm/packages/pkg-a")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _package_b = server
+            .mock("GET", "/v3alpha/systems/npm/packages/pkg-b")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _dependents_a = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/pkg-a/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 1}"#)
+            .create_async()
+            .await;
+        let _dependents_b = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/pkg-b/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 1}"#)
+            .create_async()
+            .await;
+        let call_count_clone = Arc::clone(&call_count);
+        let _candidate_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/popular-candidate")
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(50));
+                br#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#
+                    .to_vec()
+            })
+            .create_async()
+            .await;
+        let _candidate_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/popular-candidate/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 900}"#)
+            .create_async()
+            .await;
+
+        let (a, b) = tokio::join!(
+            {
+                let client = Arc::clone(&client);
+                async move { client.typosquat_signal("npm", "pkg-a").await }
+            },
+            {
+                let client = Arc::clone(&client);
+                async move { client.typosquat_signal("npm", "pkg-b").await }
+            }
+        );
+        // At least one of the two concurrent calls must see the real, non-degraded
+        // candidate popularity — the other may legitimately degrade to `None` if it lost
+        // the in-flight race (mirroring `trust_signal`'s own `a.is_some() || b.is_some()`
+        // assertion for the identical mechanism).
+        assert!(a.is_some() || b.is_some());
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "exactly one of the two concurrent calls must fetch the shared candidate's \
+             GetPackage; the other must see the in-flight claim and degrade to None rather \
+             than duplicate the request"
         );
     }
 }

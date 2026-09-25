@@ -1260,6 +1260,13 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// using `self.formatter()`. `versions.license_source` is attached by the caller
     /// (`deps-lsp::handlers::diagnostics`), not here — see [`Self::generate_hover`]'s doc
     /// for why (issue #688 critic M1).
+    ///
+    /// The typosquat-suspect diagnostic (issue #1437) needs no special handling from an
+    /// override: it is evaluated directly inside `generate_diagnostics_from_cache` itself,
+    /// reading `versions.typosquat_prefetch` — a background pre-fetch merged in by the
+    /// caller, the same way `versions.license_prefetch` already is — so every override that
+    /// calls `generate_diagnostics_from_cache` (this default impl included) gets it
+    /// automatically, with no `.await` on this path (NFR-002).
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResult,

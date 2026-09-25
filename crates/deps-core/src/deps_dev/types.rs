@@ -71,6 +71,66 @@ pub(super) struct DepsDevScorecardWire {
     pub(super) overall_score: Option<f32>,
 }
 
+/// Parsed subset of `GET /v3alpha/systems/{system}/packages/{name}:similarlyNamedPackages`
+/// (issue #1437, spec 071) — identity only, no popularity field (live-verified 2026-09-25;
+/// see `deps_dev::typosquat`'s module doc for how popularity is resolved separately).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SimilarlyNamedPackagesWire {
+    #[serde(default)]
+    pub(super) packages: Vec<SimilarPackageWire>,
+}
+
+/// One `packages[]` entry of [`SimilarlyNamedPackagesWire`].
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct SimilarPackageWire {
+    pub(super) package_key: SimilarPackageKeyWire,
+}
+
+/// The candidate's own `packageKey.name` — a distinct wire shape from [`ProjectKey`], whose
+/// `id` is a *project* key (e.g. `github.com/expressjs/express`), not a package name.
+#[derive(Deserialize)]
+pub(super) struct SimilarPackageKeyWire {
+    pub(super) name: String,
+}
+
+/// Parsed subset of `GET /v3alpha/systems/{system}/packages/{name}` (issue #1437) — only
+/// what is needed to find the package's default version.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct GetPackageWire {
+    #[serde(default)]
+    pub(super) versions: Vec<PackageVersionWire>,
+}
+
+/// One `versions[]` entry of [`GetPackageWire`] — only the fields needed to find the
+/// default version.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PackageVersionWire {
+    pub(super) version_key: VersionKeyWire,
+    #[serde(default)]
+    pub(super) is_default: bool,
+}
+
+/// The `versionKey.version` string of one [`PackageVersionWire`] entry.
+#[derive(Deserialize)]
+pub(super) struct VersionKeyWire {
+    pub(super) version: String,
+}
+
+/// Parsed subset of
+/// `GET /v3alpha/systems/{system}/packages/{name}/versions/{version}:dependents` (issue
+/// #1437) — the only popularity-shaped metric deps.dev v3alpha exposes for an arbitrary
+/// package (plan.md §1).
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DependentsWire {
+    #[serde(default)]
+    pub(super) dependent_count: u64,
+}
+
 /// The three-state SLSA/attestation provenance verdict for one resolved version (FR-004).
 ///
 /// [`Self::Verified`] and [`Self::Unverified`] are both only reachable when the

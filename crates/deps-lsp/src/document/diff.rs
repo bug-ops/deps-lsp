@@ -62,6 +62,10 @@ pub(crate) fn preserve_cache(new_state: &mut DocumentState, old_state: &Document
     // license would flicker off on every keystroke until `run_license_prefetch`'s next
     // background pass re-populates it.
     new_state.licenses.clone_from(&old_state.licenses);
+    // Same rationale again (issue #1437): without this, the typosquat diagnostic would
+    // flicker off on every keystroke until `run_typosquat_prefetch`'s next background pass
+    // re-populates it.
+    new_state.typosquats.clone_from(&old_state.typosquats);
 }
 
 /// Drops previously cached version and fetch-failure data ahead of a forced re-fetch

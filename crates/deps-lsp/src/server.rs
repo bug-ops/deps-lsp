@@ -3,6 +3,7 @@ use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, ResolvedVersionMove, ServerState,
     change_task_triggers, handle_document_change, handle_document_open, reload_resolved_versions,
     rescan_after_resolved_version_change, run_license_prefetch,
+    trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -708,6 +709,9 @@ impl LanguageServer for Backend {
             // site (push and pull) reads the same resolved policy.
             self.state
                 .set_license_policy(config.policy.license_policy.to_policy());
+            // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
+            self.state
+                .set_typosquat_enabled(config.policy.typosquat.enabled);
             *self.config.write().await = config;
         }
 
@@ -859,6 +863,18 @@ impl LanguageServer for Backend {
         let cold_start_rate_limit_ms = config.cold_start.rate_limit_ms;
         // #660/#661 critic C1: see the mirroring call after the config swap below.
         let license_policy = config.policy.license_policy.to_policy();
+        // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
+        let typosquat_enabled = config.policy.typosquat.enabled;
+        // Issue #1437 M1: read *before* the flag is overwritten below, so the enable
+        // transition can be detected. `fetch_timeout_secs` bounds the trigger's own
+        // pre-fetch spawn (an internal tuning value, read once here like every other
+        // background task's timeout); the *republish* that follows a successful pre-fetch
+        // re-reads `self.config` live instead (impl-critic M1) — by the time
+        // `trigger_typosquat_prefetch_for_open_documents` is called below, `self.config`
+        // already holds this new value (the write guard has landed), so passing it directly
+        // needs no separate snapshot here.
+        let was_typosquat_enabled = self.state.is_typosquat_enabled();
+        let typosquat_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
 
         // Diff old vs new for parse-affecting changes (#592) under one write-guard
         // acquisition: `DepsConfig` has no `Clone`, so the diff must read the
@@ -907,6 +923,20 @@ impl LanguageServer for Backend {
         // #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics call site
         // (push and pull) reads the same resolved policy.
         self.state.set_license_policy(license_policy);
+        // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
+        self.state.set_typosquat_enabled(typosquat_enabled);
+        // Issue #1437 M1: an already-open document otherwise only picks up the signal on
+        // its next edit or reopen — trigger it immediately on the disabled->enabled
+        // transition specifically (not on every `did_change_configuration`, which would
+        // needlessly re-fetch on every unrelated setting change while already enabled).
+        if typosquat_enabled && !was_typosquat_enabled {
+            trigger_typosquat_prefetch_for_open_documents(
+                &self.state,
+                &self.client,
+                Arc::clone(&self.config),
+                typosquat_trigger_fetch_timeout_secs,
+            );
+        }
 
         match scope {
             Some(scope) => {
@@ -3444,6 +3474,33 @@ mod tests {
             assert_eq!(mirrored.deny, vec!["GPL-3.0".to_string()]);
         }
 
+        /// Issue #1437, mirroring `test_initialize_applies_valid_license_policy`: proves the
+        /// real JSON -> `parse_config` -> `TyposquatConfig` deserializer path, and that
+        /// `initialize` mirrors the parsed flag onto `ServerState` (not just `Backend::config`).
+        #[tokio::test]
+        async fn test_initialize_applies_valid_typosquat_config() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            assert!(
+                !backend.state.is_typosquat_enabled(),
+                "must default to disabled before any config is applied"
+            );
+
+            let result = backend
+                .initialize(InitializeParams {
+                    initialization_options: Some(serde_json::json!({
+                        "typosquat": { "enabled": true }
+                    })),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(result.is_ok());
+            assert!(backend.config.read().await.policy.typosquat.enabled);
+            assert!(backend.state.is_typosquat_enabled());
+        }
+
         /// Tester gap: an invalid SPDX entry must be dropped (with a warning) rather than
         /// rejecting the whole `initializationOptions` payload — `deserialize_spdx_list`
         /// filters at deserialize time, not `deny_unknown_fields`-style hard rejection.
@@ -3590,6 +3647,24 @@ mod tests {
                 mirrored.deny,
                 vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()]
             );
+        }
+
+        /// Issue #1437, mirroring `initialize_tests::test_initialize_applies_valid_typosquat_config`:
+        /// proves `workspace/didChangeConfiguration` reaches the same `parse_config` ->
+        /// `TyposquatConfig` deserializer path and mirrors the result onto `ServerState`.
+        #[tokio::test]
+        async fn test_did_change_configuration_applies_valid_typosquat_config() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "typosquat": { "enabled": true } }),
+                })
+                .await;
+
+            assert!(backend.config.read().await.policy.typosquat.enabled);
+            assert!(backend.state.is_typosquat_enabled());
         }
 
         /// Issue #483 (critic M6a): the primary UX of the flag — a live
