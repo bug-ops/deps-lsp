@@ -47,5 +47,5 @@ pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_docum
 pub use loader::load_document_from_disk;
 pub(crate) use osv_scan::{rescan_after_resolved_version_change, run_license_prefetch};
 pub(crate) use resolved::RefetchPolicy;
-pub(crate) use state::CLIENT_REFRESH_TIMEOUT;
+pub(crate) use state::{CLIENT_REFRESH_TIMEOUT, spawn_supervised};
 pub use state::{ColdStartLimiter, DocumentState, LoadingState, ServerState};

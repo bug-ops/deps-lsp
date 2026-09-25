@@ -2,7 +2,7 @@ use crate::config::DepsConfig;
 use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, ResolvedVersionMove, ServerState,
     change_task_triggers, handle_document_change, handle_document_open, reload_resolved_versions,
-    rescan_after_resolved_version_change, run_license_prefetch,
+    rescan_after_resolved_version_change, run_license_prefetch, spawn_supervised,
     trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
@@ -40,25 +40,6 @@ mod commands {
     /// returns no edits, so the command is simply always a no-op for an ecosystem with
     /// no mutable-ref pin concept, rather than needing its own feature gate.
     pub(super) const PIN_ALL_TO_SHA: &str = deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID;
-}
-
-/// Spawns `fut` as a detached background task, then spawns a second task that awaits it and
-/// calls `on_panic` if it panicked — the shared shape behind every "detached background work
-/// whose panic must not vanish silently" spawn in this file (issue #1399 code review:
-/// previously duplicated between `handle_lockfile_change`'s rescan and
-/// `did_change_configuration`'s reparse worker). `fut`'s success path is unaffected: this
-/// only ever observes a [`tokio::task::JoinError`] from a genuine panic, never cancellation
-/// (`fut` is never aborted by anything here) or `fut`'s own return value.
-fn spawn_supervised<F>(fut: F, on_panic: impl FnOnce(tokio::task::JoinError) + Send + 'static)
-where
-    F: std::future::Future<Output = ()> + Send + 'static,
-{
-    let worker = tokio::spawn(fut);
-    tokio::spawn(async move {
-        if let Err(e) = worker.await {
-            on_panic(e);
-        }
-    });
 }
 
 /// Parses a [`DepsConfig`] from a raw JSON settings payload (client
@@ -935,7 +916,8 @@ impl LanguageServer for Backend {
                 &self.client,
                 Arc::clone(&self.config),
                 typosquat_trigger_fetch_timeout_secs,
-            );
+            )
+            .await;
         }
 
         match scope {

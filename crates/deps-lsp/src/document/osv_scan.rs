@@ -7,7 +7,7 @@ use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower_lsp_server::ls_types::Uri;
@@ -333,6 +333,19 @@ const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
 /// background task running indefinitely.
 const TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 
+/// The declared dependency name set of `parse_result` — [`run_typosquat_prefetch`]'s staleness
+/// unit (issue #1455 critic S1): its result depends only on declared package *names*
+/// (`SimilarityMemoKey`/`PopularityMemoKey` are package-level, with no version dimension at
+/// all — plan.md §3), so this is what "has the document moved on" must mean for it, not full
+/// manifest text.
+pub(crate) fn declared_names(parse_result: &dyn deps_core::ParseResult) -> HashSet<PackageName> {
+    parse_result
+        .dependencies()
+        .into_iter()
+        .map(|dep| dep.name().clone())
+        .collect()
+}
+
 /// Background pre-fetch of a typosquat-suspect signal per direct dependency (issue #1437,
 /// spec 071), gated on [`ServerState::is_typosquat_enabled`] and `network.offline` — both
 /// checked here, before the document guard is even taken, so a disabled/offline server does
@@ -341,15 +354,18 @@ const TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 /// dispatch, which goes through `deps_core::lsp_helpers::fetch_typosquat_signals` —
 /// ecosystem-coverage and public-registry-source gating live there, not here, the same
 /// division of responsibility `run_license_prefetch` has with `deps_engine::classify::license`),
-/// and the eventual commit is guarded against a stale write by re-checking `doc.content`
-/// against the snapshot taken before the fetch started.
+/// and the eventual commit is guarded against a stale write by re-checking the declared
+/// dependency [`declared_names`] against the snapshot taken before the fetch started (issue
+/// #1455 critic S1 — previously this compared full `doc.content`, which discarded an
+/// already-correct, already-computed result for a version-only or whitespace-only edit that
+/// changed nothing this signal actually depends on).
 ///
-/// Deliberately checks `content` only, **not** `resolved_versions_generation` too (issue
-/// #1437 code-review Important finding, correcting this function's original design, which
-/// copied [`run_license_prefetch`]'s two-part guard verbatim): a typosquat signal depends
-/// only on declared package *names* — `SimilarityMemoKey`/`PopularityMemoKey` are
+/// Deliberately checks the declared name set only, **not** `resolved_versions_generation` too
+/// (issue #1437 code-review Important finding, correcting this function's original design,
+/// which copied [`run_license_prefetch`]'s two-part guard verbatim): a typosquat signal
+/// depends only on declared package *names* — `SimilarityMemoKey`/`PopularityMemoKey` are
 /// package-level, with no version dimension (plan.md §3) — so a lock-file-only change (which
-/// bumps `resolved_versions_generation` without touching `content`, e.g. a concurrent
+/// bumps `resolved_versions_generation` without touching declared names, e.g. a concurrent
 /// `cargo build`/`npm install` racing this fetch) has nothing to do with this signal's own
 /// invariants; checking it too would discard an already-correct, already-computed result for
 /// an unrelated reason. `run_license_prefetch`'s own generation check remains correct for
@@ -375,7 +391,7 @@ const TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 /// returns `true`.
 ///
 /// Returns whether a non-empty result was actually merged — `false` covers every early-out
-/// (disabled, offline, no document, no parse result, timeout, stale-content drop) *and* the
+/// (disabled, offline, no document, no parse result, timeout, stale-names drop) *and* the
 /// case where the fetch genuinely found nothing, so a caller can skip a pointless republish
 /// whose diagnostic set would be identical to the one already published.
 pub(crate) async fn run_typosquat_prefetch(
@@ -388,22 +404,25 @@ pub(crate) async fn run_typosquat_prefetch(
         return false;
     }
 
-    // Issue #1437 code-review Important finding: unlike `run_license_prefetch`, this
-    // pre-fetch's result depends only on declared package *names* — `SimilarityMemoKey`/
-    // `PopularityMemoKey` are package-level, with no version dimension at all (plan.md §3)
-    // — so `content` alone is the right staleness guard. Also checking
-    // `resolved_versions_generation` (which bumps on a lock-file-only change, e.g. a
-    // concurrent `cargo build`/`npm install`, without touching `content`) would discard an
-    // already-correct, already-computed typosquat result for a reason that has nothing to
+    // Issue #1455 critic S1: snapshots the declared *name set*, not full `content` — a
+    // version-only or whitespace-only edit racing this pre-fetch must not discard an
+    // already-correct, already-computed typosquat result, since the result cannot possibly
+    // differ for it (see `declared_names`' doc). The previous `content`-based guard treated
+    // any edit as invalidating, which combined with `document::lifecycle`'s per-edit
+    // `typosquat_names_changed` gate to leave a document with no typosquat diagnostic at all
+    // until some *later*, unrelated name-changing edit happened to re-trigger a check. Also
+    // checking `resolved_versions_generation` (which bumps on a lock-file-only change, e.g. a
+    // concurrent `cargo build`/`npm install`, without touching declared names) would discard
+    // an already-correct, already-computed typosquat result for a reason that has nothing to
     // do with this signal's own invariants.
-    let (content_snapshot, parse_result): (String, Arc<dyn deps_core::ParseResult>) = {
+    let (names_snapshot, parse_result): (HashSet<PackageName>, Arc<dyn deps_core::ParseResult>) = {
         let Some(doc) = state.get_document(&uri) else {
             return false;
         };
         let Some(parse_result) = doc.parse_result_arc() else {
             return false;
         };
-        (doc.content.clone(), parse_result)
+        (declared_names(parse_result.as_ref()), parse_result)
     };
 
     let timeout_duration =
@@ -432,9 +451,11 @@ pub(crate) async fn run_typosquat_prefetch(
     }
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
-        if doc.content != content_snapshot {
+        let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+        if current_names != names_snapshot {
             tracing::debug!(
-                "dropping stale typosquat pre-fetch result: document content changed mid-fetch"
+                "dropping stale typosquat pre-fetch result: declared dependency names changed \
+                 mid-fetch"
             );
             return false;
         }
@@ -1520,6 +1541,12 @@ mod tests {
         // mockito-backed) and `handlers::diagnostics::tests::
         // test_generate_diagnostics_internal_typosquat_prefetch_is_synchronous` (the
         // same mocked-resolution-then-merge shape, exercised via `merge_typosquats`
-        // directly rather than through this function's own content/generation guard).
+        // directly rather than through this function's own name-set staleness guard).
+        // Same limitation for the fix in issue #1455 critic S1: a dedicated "a version-only
+        // edit racing a completed fetch must not discard it" test would need the same
+        // `state.deps_dev` injection this module has never had — `declared_names`' own
+        // doc/callers and `document::lifecycle`'s `test_name_added_by_aborted_predecessor_
+        // edit_is_still_checked_by_successor` (the companion S1(b) fix) are the closest
+        // coverage available without it.
     }
 }

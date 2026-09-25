@@ -185,7 +185,7 @@ pub struct DocumentState {
     ///   new network calls" scope.
     /// - **Tier-3 pre-fetch**: `document::osv_scan::run_license_prefetch` (Dart, Swift,
     ///   Gradle, Deno only — see that function's docs), via [`Self::merge_licenses`] (round
-    ///   3 finding #2: a plain [`Self::update_licenses`] full replace would drop a
+    ///   3 finding #2: a plain `update_licenses` full replace would drop a
     ///   dependency's previously-cached, still-valid license whenever *any other*
     ///   dependency's fetch transiently failed this round), from a dedicated
     ///   per-ecosystem background fetch, mirroring [`Self::vulnerabilities`]'s
@@ -208,6 +208,21 @@ pub struct DocumentState {
     /// document edits by `preserve_cache` so the diagnostic doesn't flicker off on every
     /// keystroke.
     pub typosquats: HashMap<PackageName, TyposquatSignal>,
+    /// The declared dependency name set as of the last typosquat pre-fetch this document
+    /// actually spawned (issue #1455 batch item 1, critic S1) — compared against the
+    /// *current* declared name set by `document::lifecycle`'s debounced-edit gate, instead of
+    /// that edit's own local `DependencyDiff`. A per-edit diff alone misses a name added by an
+    /// edit whose own change task got aborted (superseded by the very next debounced edit)
+    /// before ever reaching the pre-fetch spawn — the added name would then never be checked,
+    /// since the *next* edit's own diff shows no name change either. Comparing against this
+    /// persisted set self-corrects across any number of such aborted edits: whatever the
+    /// document's true current names are, they either already match what was last actually
+    /// checked, or they don't and a re-check is due, independent of which specific edit's diff
+    /// would have flagged it. Carried across edits by `preserve_cache`, same as
+    /// [`Self::typosquats`], and reset to empty on a fresh `DocumentState` (a cold-open/reopen
+    /// document that has never been checked has nothing to compare against, so its first check
+    /// is unconditional — matching the open-path pre-fetch's own unconditional spawn).
+    pub(crate) typosquat_checked_names: std::collections::HashSet<PackageName>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -238,6 +253,7 @@ impl Clone for DocumentState {
             outcomes: self.outcomes.clone(),
             licenses: self.licenses.clone(),
             typosquats: self.typosquats.clone(),
+            typosquat_checked_names: self.typosquat_checked_names.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -357,6 +373,10 @@ impl std::fmt::Debug for DocumentState {
             .field("vulnerabilities_count", &self.vulnerabilities.len())
             .field("licenses_count", &self.licenses.len())
             .field("typosquats_count", &self.typosquats.len())
+            .field(
+                "typosquat_checked_names_count",
+                &self.typosquat_checked_names.len(),
+            )
             .field("yanked_versions_count", &self.outcomes.yanked_count())
             .field("deprecations_count", &self.outcomes.deprecation_count())
             .field("fetch_failed_count", &self.outcomes.fetch_failure_count())
@@ -389,6 +409,7 @@ impl DocumentState {
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
+            typosquat_checked_names: std::collections::HashSet::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -413,6 +434,7 @@ impl DocumentState {
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
+            typosquat_checked_names: std::collections::HashSet::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -517,18 +539,21 @@ impl DocumentState {
     /// replaced with exactly `licenses`, the same "one background task owns the whole
     /// map" contract [`Self::update_vulnerabilities`] has for `vulnerabilities`.
     ///
-    /// Not currently called from `document::lifecycle` (round 3 finding #2 moved the
-    /// tier-3 pre-fetch's own commit to [`Self::merge_licenses`] instead, since a
-    /// full-replace there would drop a dependency's previously-cached, still-valid
-    /// license whenever any *other* dependency's fetch transiently failed this round).
-    /// Kept as a tested public primitive for a caller that genuinely owns the entire map
-    /// and needs a real replace (e.g. clearing every entry for a document being reset).
+    /// `#[cfg(test)]` (issue #1455 batch item 5): round 3 finding #2 moved the tier-3
+    /// pre-fetch's own commit to [`Self::merge_licenses`] instead, since a full-replace there
+    /// would drop a dependency's previously-cached, still-valid license whenever any *other*
+    /// dependency's fetch transiently failed this round — no production caller ever needed
+    /// this full-replace primitive after that move, so it stays only for
+    /// `license_race_safety_tests`, which exercises [`Self::merge_licenses`]'s
+    /// non-clobbering contract against it.
+    #[cfg(test)]
     pub fn update_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
         self.licenses = licenses;
     }
 
     /// Merges license findings into [`Self::licenses`] without disturbing existing
-    /// entries — unlike [`Self::update_licenses`], which replaces the map wholesale.
+    /// entries — unlike `update_licenses` (test-only, see that method's doc), which replaces
+    /// the map wholesale.
     ///
     /// Both of [`Self::licenses`]' populating sources use this: the tier-1 backfill
     /// (`document::fetch::merge_registry_fetch_result`, for every ecosystem) and the
@@ -555,13 +580,6 @@ impl DocumentState {
         self.licenses.extend(licenses);
     }
 
-    /// Full-replace update of [`Self::typosquats`] — mirrors [`Self::update_licenses`]'s
-    /// exact rationale and "kept as a tested public primitive, not currently called from
-    /// `document::lifecycle`" status.
-    pub fn update_typosquats(&mut self, typosquats: HashMap<PackageName, TyposquatSignal>) {
-        self.typosquats = typosquats;
-    }
-
     /// Merges typosquat findings into [`Self::typosquats`] without disturbing existing
     /// entries — mirrors [`Self::merge_licenses`]'s exact rationale: a dependency whose
     /// resolution transiently fails this round must not lose a previous round's
@@ -586,6 +604,23 @@ impl DocumentState {
     /// security-wise (a dependency whose source switched to private).
     pub fn merge_typosquats(&mut self, typosquats: HashMap<PackageName, TyposquatSignal>) {
         self.typosquats.extend(typosquats);
+    }
+
+    /// Updates [`Self::typosquat_checked_names`] to `current` and reports whether it actually
+    /// differed from the previous value (issue #1455 batch item 1, critic S1) — the debounced-
+    /// edit typosquat pre-fetch gate calls this once per edit, spawning a pre-fetch only when
+    /// it returns `true`. Always updates, even when unchanged (a no-op clone in that case), so
+    /// the call site never needs a separate write.
+    pub(crate) fn refresh_typosquat_checked_names(
+        &mut self,
+        current: std::collections::HashSet<PackageName>,
+    ) -> bool {
+        if self.typosquat_checked_names == current {
+            false
+        } else {
+            self.typosquat_checked_names = current;
+            true
+        }
     }
 
     /// Evicts every name in `names` from [`Self::licenses`] — called ahead of a resolved
@@ -762,6 +797,39 @@ impl DocumentState {
     }
 }
 
+/// Spawns `fut` as a detached background task, then spawns a second task that awaits it and
+/// calls `on_panic` if it panicked — the shared shape behind every "detached background work
+/// whose panic must not vanish silently" spawn in this crate (issue #1399 code review:
+/// previously duplicated between `server::handle_lockfile_change`'s rescan and
+/// `did_change_configuration`'s reparse worker; issue #1455 batch item 1 moved it here, out of
+/// `server.rs`, so `document::lifecycle`'s typosquat pre-fetch spawn could reuse it too). `fut`'s
+/// success path is unaffected: this only ever observes a [`tokio::task::JoinError`] from a
+/// genuine panic, never `fut`'s own return value.
+///
+/// Returns `fut`'s own [`tokio::task::AbortHandle`] (not the supervisor's), so a caller can
+/// cancel a superseded run of `fut` directly — the supervisor task's own `on_panic` branch
+/// checks [`tokio::task::JoinError::is_cancelled`] and treats a cancelled (not panicked) `fut`
+/// as a no-op, mirroring [`ServerState::spawn_background_task`]'s identical "superseding a
+/// task is not a panic" distinction.
+pub(crate) fn spawn_supervised<F>(
+    fut: F,
+    on_panic: impl FnOnce(tokio::task::JoinError) + Send + 'static,
+) -> tokio::task::AbortHandle
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let worker = tokio::spawn(fut);
+    let abort_handle = worker.abort_handle();
+    tokio::spawn(async move {
+        if let Err(e) = worker.await
+            && !e.is_cancelled()
+        {
+            on_panic(e);
+        }
+    });
+    abort_handle
+}
+
 /// Global LSP server state.
 ///
 /// Manages all open documents, HTTP cache, lock file cache, and background
@@ -863,6 +931,26 @@ pub struct ServerState {
     /// before acting on a panic (issue #632 critic S3 — see
     /// [`Self::is_current_background_task`]).
     tasks: tokio::sync::RwLock<HashMap<Uri, (tokio::task::Id, tokio::task::AbortHandle)>>,
+    /// Typosquat pre-fetch task handles, keyed by URI, paired with the spawn-order
+    /// [`Self::next_typosquat_task_generation`] draw for each one (issue #1455 batch item 1,
+    /// critic M2 — see [`Self::track_typosquat_task`] for why the generation is needed).
+    ///
+    /// A separate map from [`Self::tasks`] rather than reusing it: `tasks` is a single slot
+    /// per URI, owned by the open/change path's own registry-fetch task
+    /// (`run_document_open_background_task`/`run_document_change_task`), and the typosquat
+    /// pre-fetch is deliberately *not* installed there (see
+    /// `document::lifecycle::spawn_typosquat_prefetch_and_republish`'s own doc) since it must
+    /// outlive that outer task rather than being aborted alongside it. This map instead lets
+    /// a superseding pre-fetch spawn (a newer edit, or `did_close`) cancel the *previous*
+    /// pre-fetch specifically, before it burns up to ~10s of deps.dev calls for a result
+    /// `document::osv_scan::run_typosquat_prefetch`'s own name-set staleness guard would
+    /// discard at commit time anyway.
+    typosquat_tasks: tokio::sync::RwLock<HashMap<Uri, (u64, tokio::task::AbortHandle)>>,
+    /// Monotonic source for [`Self::track_typosquat_task`]'s generation ordering (issue #1455
+    /// critic M2). A single server-wide counter, not per-URI: it only needs to order two
+    /// spawn *decisions* relative to each other, which a shared sequence does just as well as
+    /// a per-URI one, with no extra bookkeeping.
+    typosquat_task_generation: AtomicU64,
     /// Whether the client advertised `window.workDoneProgress` support during
     /// `initialize`. Set once, read from spawned lifecycle tasks that have no
     /// direct access to `ClientCapabilities` (see `RegistryProgress::start` call
@@ -972,6 +1060,8 @@ impl ServerState {
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
+            typosquat_tasks: tokio::sync::RwLock::new(HashMap::new()),
+            typosquat_task_generation: AtomicU64::new(0),
             progress_supported: AtomicBool::new(false),
             inlay_hint_refresh_supported: AtomicBool::new(false),
             code_lens_refresh_supported: AtomicBool::new(false),
@@ -1459,6 +1549,76 @@ impl ServerState {
         let mut tasks = self.tasks.write().await;
         if let Some((_, task)) = tasks.remove(uri) {
             task.abort();
+        }
+        drop(tasks);
+        self.abort_typosquat_task(uri).await;
+    }
+
+    /// Draws the next value from [`Self::typosquat_task_generation`] (issue #1455 critic M2)
+    /// — callers draw this *synchronously*, right before spawning a typosquat pre-fetch task
+    /// (no `.await` in between), so it reflects true spawn-decision order regardless of
+    /// whatever order the corresponding [`Self::track_typosquat_task`] calls later happen to
+    /// acquire [`Self::typosquat_tasks`]'s write lock in.
+    pub(crate) fn next_typosquat_task_generation(&self) -> u64 {
+        self.typosquat_task_generation
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Registers `handle` as `uri`'s current typosquat pre-fetch task if `generation` is at
+    /// least as new as whatever is currently registered, aborting the loser — either the
+    /// previously-registered task (this call wins), or `handle` itself (this call loses)
+    /// (issue #1455 batch item 1, tightened for critic M2).
+    ///
+    /// `generation` (from [`Self::next_typosquat_task_generation`]) — not insertion order —
+    /// decides the winner: two pre-fetches for the same URI can be decided concurrently (an
+    /// edit racing a `policy.typosquat.enabled` transition, say), and nothing guarantees the
+    /// *later*-decided one also wins the [`Self::typosquat_tasks`] write-lock race first. Registering
+    /// by raw insertion order alone could let an objectively older spawn survive over a newer
+    /// one purely because its `track_typosquat_task` call happened to acquire the lock first —
+    /// exactly mirroring why [`Self::is_current_background_task`] compares [`tokio::task::Id`]
+    /// rather than trusting call order for the analogous main-background-task registry.
+    pub(crate) async fn track_typosquat_task(
+        &self,
+        uri: Uri,
+        generation: u64,
+        handle: tokio::task::AbortHandle,
+    ) {
+        let mut tasks = self.typosquat_tasks.write().await;
+        if let Some((existing_generation, _)) = tasks.get(&uri)
+            && *existing_generation > generation
+        {
+            drop(tasks);
+            handle.abort();
+            return;
+        }
+        let previous = tasks.insert(uri, (generation, handle));
+        drop(tasks);
+        if let Some((_, old)) = previous {
+            old.abort();
+        }
+    }
+
+    /// The [`tokio::task::Id`] of `uri`'s currently-tracked typosquat pre-fetch task, if any —
+    /// test-only observability for [`Self::track_typosquat_task`]'s "did a new pre-fetch get
+    /// spawned and registered" contract (issue #1455 batch item 1): a caller compares this
+    /// across two events to tell whether the tracked task was replaced (a new spawn) or left
+    /// alone (the gate correctly skipped a redundant spawn).
+    #[cfg(test)]
+    pub(crate) async fn typosquat_task_id(&self, uri: &Uri) -> Option<tokio::task::Id> {
+        self.typosquat_tasks
+            .read()
+            .await
+            .get(uri)
+            .map(|(_, handle)| handle.id())
+    }
+
+    /// Aborts and forgets `uri`'s currently-registered typosquat pre-fetch task, if any
+    /// (issue #1455 batch item 1) — called on `did_close` so a closed document's pre-fetch
+    /// doesn't keep running for a document no longer open in the editor.
+    pub(crate) async fn abort_typosquat_task(&self, uri: &Uri) {
+        let removed = self.typosquat_tasks.write().await.remove(uri);
+        if let Some((_, handle)) = removed {
+            handle.abort();
         }
     }
 
@@ -2123,6 +2283,90 @@ mod tests {
         let uri =
             crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
         state.cancel_background_task(&uri).await;
+    }
+
+    /// Issue #1455 batch item 1: `cancel_background_task` (the `did_close` path) must also
+    /// abort a tracked typosquat pre-fetch, not just the main per-URI background task —
+    /// otherwise a closed document's pre-fetch would keep running to completion for a
+    /// document no longer open in the editor.
+    #[tokio::test]
+    async fn test_cancel_background_task_aborts_tracked_typosquat_task() {
+        let state = Arc::new(ServerState::new());
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
+
+        let worker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let handle = worker.abort_handle();
+        let generation = state.next_typosquat_task_generation();
+        state
+            .track_typosquat_task(uri.clone(), generation, handle)
+            .await;
+
+        state.cancel_background_task(&uri).await;
+
+        assert!(
+            state.typosquat_task_id(&uri).await.is_none(),
+            "the typosquat task entry must be removed on did_close"
+        );
+        assert!(
+            poll_until(Duration::from_secs(1), || worker.is_finished()).await,
+            "the underlying typosquat pre-fetch task must actually be aborted, not merely \
+             forgotten"
+        );
+    }
+
+    /// Issue #1455 critic M2: a newer-generation task must win even if its
+    /// `track_typosquat_task` call happens to acquire the write lock *before* an
+    /// older-generation task's own call — mirroring `is_current_background_task`'s
+    /// `tokio::task::Id`-based ordering rather than trusting call/registration order, since
+    /// nothing guarantees the two calls' async scheduling matches their spawn-decision order.
+    #[tokio::test]
+    async fn test_track_typosquat_task_orders_by_generation_not_registration_order() {
+        let state = Arc::new(ServerState::new());
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
+
+        // Two spawn decisions: `older` is decided first (lower generation), `newer` second
+        // (higher generation) — but `newer` is *registered* first, simulating its
+        // `track_typosquat_task` call winning the write-lock race despite being decided
+        // later... no, despite `older` being decided first. The generation, not registration
+        // order, must decide the winner.
+        let older_generation = state.next_typosquat_task_generation();
+        let newer_generation = state.next_typosquat_task_generation();
+        assert!(newer_generation > older_generation);
+
+        let newer_worker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let newer_handle = newer_worker.abort_handle();
+        state
+            .track_typosquat_task(uri.clone(), newer_generation, newer_handle)
+            .await;
+
+        let older_worker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let older_handle = older_worker.abort_handle();
+        state
+            .track_typosquat_task(uri.clone(), older_generation, older_handle)
+            .await;
+
+        assert_eq!(
+            state.typosquat_task_id(&uri).await,
+            Some(newer_worker.id()),
+            "the newer-generation task must remain registered even though the \
+             older-generation task's own track_typosquat_task call ran second"
+        );
+        assert!(
+            poll_until(Duration::from_secs(1), || older_worker.is_finished()).await,
+            "the older-generation task (a registration-order loser) must be aborted"
+        );
+        assert!(
+            !newer_worker.is_finished(),
+            "the newer-generation task (the rightful winner) must not be aborted"
+        );
     }
 
     /// Polls every 5ms until `condition` returns true or `timeout` elapses (issue #632

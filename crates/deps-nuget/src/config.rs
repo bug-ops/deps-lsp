@@ -49,7 +49,8 @@ use base64::Engine;
 use deps_core::config_trust::{self, EnvVarSyntax};
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
-    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, ValidatedRegistryUrl,
+    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, RejectionOutcome,
+    ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
@@ -152,8 +153,9 @@ impl BlockedHostReason for NuGetFeedUrlError {
 /// future variant added to [`NuGetFeedUrlError`] must be classified here explicitly rather than
 /// silently falling into a generic bucket or `None`.
 ///
-/// `BlockedHost` returns `None` — already covered by [`BlockedHostReason`] above. `Disabled`,
-/// `UnsupportedProtocolVersion`, and `LocalFeedUnsupported` also return `None`: each is an
+/// `BlockedHost` returns [`RejectionOutcome::HandledByBlockedHostPath`] — already covered by
+/// [`BlockedHostReason`] above. `Disabled`, `UnsupportedProtocolVersion`, and
+/// `LocalFeedUnsupported` return [`RejectionOutcome::IntentionallySilent`]: each is an
 /// intentional, expected config state this module already logs at `debug!` rather than `warn!`
 /// (see `resolve_source_entry`'s and `fail_closed`'s own debug!/warn! split), so surfacing an
 /// editor diagnostic for them would contradict that deliberate "this is not a misconfiguration"
@@ -167,19 +169,23 @@ impl BlockedHostReason for NuGetFeedUrlError {
 /// claim credentials are "never read" even though NuGet's own user-profile binding, issue #576,
 /// does read and attempt to bind them), and `EncryptedCredentialUnsupported` for a DPAPI-
 /// encrypted `<Password>` — this last one is the *default* outcome of `dotnet nuget add source
-/// -u -p` on Windows, so leaving it `None` would silently drop the most common private-feed
-/// setup with zero editor trace, exactly the class of gap #1442 exists to close.
+/// -u -p` on Windows, so leaving it silent would drop the most common private-feed setup with
+/// zero editor trace, exactly the class of gap #1442 exists to close.
 impl RegistryRejectionClassifier for NuGetFeedUrlError {
-    fn rejection_reason(&self) -> Option<RegistryRejectionReason> {
+    fn rejection_reason(&self) -> RejectionOutcome {
         match self {
             Self::Url(e) => e.rejection_reason(),
-            Self::HasCredentials => Some(RegistryRejectionReason::HasCredentials),
-            Self::UndefinedEnvVar => Some(RegistryRejectionReason::UndefinedEnvVar),
+            Self::HasCredentials => {
+                RejectionOutcome::Reject(RegistryRejectionReason::HasCredentials)
+            }
+            Self::UndefinedEnvVar => {
+                RejectionOutcome::Reject(RegistryRejectionReason::UndefinedEnvVar)
+            }
             Self::EncryptedPasswordUnsupported => {
-                Some(RegistryRejectionReason::EncryptedCredentialUnsupported)
+                RejectionOutcome::Reject(RegistryRejectionReason::EncryptedCredentialUnsupported)
             }
             Self::Disabled | Self::UnsupportedProtocolVersion(_) | Self::LocalFeedUnsupported => {
-                None
+                RejectionOutcome::IntentionallySilent
             }
         }
     }
@@ -3231,6 +3237,50 @@ mod tests {
             RegistryRejectionReason::EncryptedCredentialUnsupported
         );
         assert_eq!(occurrence.declaration_key, "source:CorpFeed");
+    }
+
+    /// Issue #1455 batch item 4: a direct test of [`NuGetFeedUrlError::rejection_reason`]'s
+    /// exhaustive match, rather than only exercising it transitively through
+    /// `rejected_reason_for`'s `is_empty()`/`only_rejected` assertions above — those observe
+    /// [`InvalidEntry::rejection_reason`]'s wrapper, which maps *both*
+    /// `RejectionOutcome::IntentionallySilent` and `RejectionOutcome::HandledByBlockedHostPath`
+    /// to the same `None`, so a mix-up between the two (or a new variant silently falling into
+    /// the wrong bucket) would not fail any of those higher-level tests.
+    #[test]
+    fn test_nuget_feed_url_error_rejection_reason_variants() {
+        assert_eq!(
+            NuGetFeedUrlError::Disabled.rejection_reason(),
+            RejectionOutcome::IntentionallySilent
+        );
+        assert_eq!(
+            NuGetFeedUrlError::UnsupportedProtocolVersion("2".to_string()).rejection_reason(),
+            RejectionOutcome::IntentionallySilent
+        );
+        assert_eq!(
+            NuGetFeedUrlError::LocalFeedUnsupported.rejection_reason(),
+            RejectionOutcome::IntentionallySilent
+        );
+        assert_eq!(
+            NuGetFeedUrlError::HasCredentials.rejection_reason(),
+            RejectionOutcome::Reject(RegistryRejectionReason::HasCredentials)
+        );
+        assert_eq!(
+            NuGetFeedUrlError::UndefinedEnvVar.rejection_reason(),
+            RejectionOutcome::Reject(RegistryRejectionReason::UndefinedEnvVar)
+        );
+        assert_eq!(
+            NuGetFeedUrlError::EncryptedPasswordUnsupported.rejection_reason(),
+            RejectionOutcome::Reject(RegistryRejectionReason::EncryptedCredentialUnsupported)
+        );
+        assert_eq!(
+            NuGetFeedUrlError::Url(IndexUrlError::BlockedHost {
+                class: HostClass::Loopback
+            })
+            .rejection_reason(),
+            RejectionOutcome::HandledByBlockedHostPath,
+            "the Url(BlockedHost) delegation must reach HandledByBlockedHostPath, not fall into \
+             IntentionallySilent alongside Disabled/UnsupportedProtocolVersion/LocalFeedUnsupported"
+        );
     }
 
     /// #1442 code review S2: an unset `%ENV_VAR%` inside a matched user-profile credential must

@@ -66,6 +66,13 @@ pub(crate) fn preserve_cache(new_state: &mut DocumentState, old_state: &Document
     // flicker off on every keystroke until `run_typosquat_prefetch`'s next background pass
     // re-populates it.
     new_state.typosquats.clone_from(&old_state.typosquats);
+    // Issue #1455 critic S1: must travel with `typosquats` — without this, every rebuilt
+    // `DocumentState` would reset to an empty "last checked" set, making the debounced-edit
+    // gate see every edit as a name change and re-spawn a pre-fetch on every keystroke,
+    // defeating the gate entirely.
+    new_state
+        .typosquat_checked_names
+        .clone_from(&old_state.typosquat_checked_names);
 }
 
 /// Drops previously cached version and fetch-failure data ahead of a forced re-fetch
