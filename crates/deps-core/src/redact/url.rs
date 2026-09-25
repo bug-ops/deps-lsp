@@ -4149,8 +4149,11 @@ mod tests {
             ),
             "https://dl.cloudsmith.io/***/acme/repo/python/simple/"
         );
+        // No `_` in the body: gitleaks' own `gitlab-cicd-job-token` default rule requires
+        // `glcbt-[0-9a-zA-Z]{1,5}_[0-9a-zA-Z_-]{20}`, which a fixture with an underscore here
+        // would satisfy and gitleaks would then flag as a real leaked secret in CI.
         assert_eq!(
-            url_for_tracing("https://gitlab.example.com/glcbt-64_AbCdEfGh1234567890xyzW/x"),
+            url_for_tracing("https://gitlab.example.com/glcbt-AbCdEfGh1234567890xyzWQR/x"),
             "https://gitlab.example.com/***/x"
         );
     }
