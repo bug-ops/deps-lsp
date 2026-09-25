@@ -611,8 +611,14 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
     {
         // Same registry-delegated pick hover's `live_latest_idx` uses (see
         // `prepare_version_display_items`'s doc comment) — not a re-derived `is_stable()` scan.
-        let latest_idx =
-            registry.select_latest_matching(registry_versions, &crate::existence_wildcard_req());
+        // Threads `parse_result`'s own `SelectionContext` (e.g. Composer's
+        // `minimum-stability`, #1433) so this action never disagrees with hover/diagnostics
+        // about what "latest" means for the same dependency.
+        let latest_idx = registry.select_latest_matching_with_context(
+            registry_versions,
+            &crate::existence_wildcard_req(),
+            &parse_result.selection_context(),
+        );
         let display_items =
             prepare_version_display_items(registry_versions, dep.name(), latest_idx);
         for item in display_items {

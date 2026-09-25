@@ -495,7 +495,7 @@ impl deps_core::Registry for GitlabCiRegistry {
         name: &'a PackageName,
         source: &'a deps_core::parser::DependencySource,
         req: &'a deps_core::VersionReq,
-        _minimum_stability: Option<&'a str>,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             let versions: Vec<Box<dyn deps_core::Version>> = self
@@ -637,7 +637,7 @@ mod tests {
 
         let req = deps_core::VersionReq::new("*");
         match registry
-            .get_latest_matching_from(&name, &source, &req, None)
+            .get_latest_matching_from(&name, &source, &req, &deps_core::SelectionContext::none())
             .await
         {
             Err(e) => assert!(matches!(e, DepsError::PackageNotFound { .. })),

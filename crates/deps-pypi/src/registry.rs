@@ -765,7 +765,7 @@ impl deps_core::Registry for PypiRegistry {
         name: &'a deps_core::PackageName,
         source: &'a DependencySource,
         req: &'a deps_core::VersionReq,
-        _minimum_stability: Option<&'a str>,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<
         'a,
         deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
@@ -2647,7 +2647,7 @@ mod tests {
             &PackageName::new("pkg"),
             &source,
             &deps_core::VersionReq::new(">=1.0.0,<2.0.0"),
-            None,
+            &deps_core::SelectionContext::none(),
         )
         .await
         .unwrap();
@@ -2743,7 +2743,7 @@ mod tests {
             &PackageName::new("pkg"),
             &source,
             &deps_core::VersionReq::new("*"),
-            None,
+            &deps_core::SelectionContext::none(),
         )
         .await;
         assert_matches!(result.err(), Some(DepsError::PackageNotFound { .. }));

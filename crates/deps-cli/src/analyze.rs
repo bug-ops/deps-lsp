@@ -15,12 +15,11 @@ use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
 };
 use deps_engine::classify::fetch::{
-    apply_fetch_outcomes, composer_minimum_stability, dedup_dependencies_by_source,
-    fetch_latest_versions_parallel,
+    apply_fetch_outcomes, fetch_latest_versions_parallel, prepare_fetch,
 };
 use deps_engine::classify::license::prefetch_tier3_licenses;
 use deps_engine::classify::osv::build_scan_targets;
-use deps_engine::classify::resolved::{collect_in_use_versions, load_resolved_versions};
+use deps_engine::classify::resolved::load_resolved_versions;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -210,27 +209,29 @@ pub async fn analyze_manifest(
             .await
             .into_maps();
 
-    let (dep_sources, collided_names) =
-        dedup_dependencies_by_source(parse_result.as_ref(), formatter);
-    let in_use = collect_in_use_versions(
+    let prep = prepare_fetch(
         parse_result.as_ref(),
-        &resolved_versions,
-        &resolved_version_candidates,
         formatter,
         ecosystem_id,
+        &resolved_versions,
+        &resolved_version_candidates,
     );
-    let minimum_stability = composer_minimum_stability(parse_result.as_ref());
-    let attempted_names: Vec<PackageName> = dep_sources.keys().cloned().collect();
+    let collided_names = prep.collided_names;
+    let attempted_names: Vec<PackageName> = prep
+        .dep_sources
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
 
     let fetch_result = fetch_latest_versions_parallel(
         ecosystem.registry(),
-        dep_sources.into_iter().collect(),
-        &in_use,
+        prep.dep_sources,
+        &prep.in_use,
         None,
         ctx.policy.freshness.to_settings(),
         ctx.policy.cache.fetch_timeout_secs,
         ctx.policy.cache.max_concurrent_fetches,
-        minimum_stability.as_deref(),
+        &prep.selection_context,
     )
     .await;
     // `failed_count` also counts not-found lookups, which aren't evidence of an unreachable

@@ -38,14 +38,43 @@ pub struct ComposerParseResult {
     pub dependency_truncation: Option<(usize, usize)>,
 }
 
-deps_core::impl_parse_result!(
-    ComposerParseResult,
-    ComposerDependency {
-        dependencies: dependencies,
-        uri: uri,
-        dependency_truncation: dependency_truncation,
+// Hand-written rather than `deps_core::impl_parse_result!`: that macro's optional fields
+// (`workspace_root`, `dependency_truncation`, `blocked_registries`) are all plain
+// field-to-getter passthroughs, but `selection_context` wraps `minimum_stability` in
+// `SelectionContext::with_composer_minimum_stability` (#1433) — Composer is the only
+// implementor today, so baking that one-ecosystem shape into the shared macro would be
+// premature generalization rather than DRY.
+impl deps_core::ParseResult for ComposerParseResult {
+    fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+        self.dependencies
+            .iter()
+            .map(|d| d as &dyn deps_core::Dependency)
+            .collect()
     }
-);
+
+    fn workspace_root(&self) -> Option<&std::path::Path> {
+        None
+    }
+
+    fn uri(&self) -> &Url {
+        &self.uri
+    }
+
+    fn dependency_truncation(&self) -> Option<(usize, usize)> {
+        self.dependency_truncation
+    }
+
+    /// Surfaces [`Self::minimum_stability`] so hover, completion, and code actions can no
+    /// longer disagree with diagnostics about what "latest" means for the same dependency
+    /// (#1433) — see [`deps_core::SelectionContext`]'s own doc.
+    fn selection_context(&self) -> deps_core::SelectionContext {
+        deps_core::SelectionContext::with_composer_minimum_stability(self.minimum_stability.clone())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
 
 /// Returns true if the package is a platform requirement (not a Packagist package).
 ///
@@ -1409,6 +1438,37 @@ mod tests {
         let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
         let result = parse_composer_json(json, &test_uri()).unwrap();
         assert_eq!(result.minimum_stability, None);
+    }
+
+    /// #1433: `ParseResult::selection_context()` surfaces the parsed `minimum-stability`
+    /// through the shared `SelectionContext` type — the same value hover/completion/code
+    /// actions now read to agree with diagnostics about "latest".
+    #[test]
+    fn test_selection_context_carries_minimum_stability() {
+        use deps_core::ParseResult;
+
+        let json = r#"{
+  "minimum-stability": "alpha",
+  "require": {
+    "symfony/console": "^6.0"
+  }
+}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(
+            result.selection_context().minimum_stability(),
+            Some("alpha")
+        );
+    }
+
+    /// #1433: a manifest with no `minimum-stability` field surfaces an empty
+    /// `SelectionContext`, matching `minimum_stability`'s own `None` default.
+    #[test]
+    fn test_selection_context_none_when_minimum_stability_absent() {
+        use deps_core::ParseResult;
+
+        let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
+        let result = parse_composer_json(json, &test_uri()).unwrap();
+        assert_eq!(result.selection_context().minimum_stability(), None);
     }
 
     #[test]
