@@ -958,6 +958,21 @@ pub enum RegistryRejectionReason {
     /// `${VAR}` expansion was attempted where it is not permitted (e.g. a project-tier
     /// `.npmrc` value, issue #1420).
     EnvVarExpansionNotPermitted,
+    /// The source has credentials configured elsewhere in its ecosystem's own config (e.g.
+    /// NuGet's `<packageSourceCredentials>`, issue #1442) that this source cannot use — two
+    /// distinct shapes share this one reason, deliberately, since neither is more actionable
+    /// than the other for the user: a credential this ecosystem categorically never reads for
+    /// this declaration (e.g. NuGet's repo-tier `<packageSourceCredentials>`, FR-009 — no
+    /// binding is ever attempted), or one it *did* read and attempt to bind but failed (a
+    /// missing value, an unresolvable/ambiguous binding — see NuGet's own user-profile binding,
+    /// issue #576) for a reason not covered by a more specific variant below. Never phrase this
+    /// reason's text as "never read"/"could not be resolved" — both would misdescribe one of
+    /// the two shapes.
+    HasCredentials,
+    /// The source's credential is encrypted in a way this server cannot decrypt (e.g. NuGet's
+    /// DPAPI-encrypted `<Password>`, issue #1442) — permanently out of scope, not a transient
+    /// binding failure, so kept distinct from [`Self::HasCredentials`].
+    EncryptedCredentialUnsupported,
 }
 
 impl std::fmt::Display for RegistryRejectionReason {
@@ -971,6 +986,10 @@ impl std::fmt::Display for RegistryRejectionReason {
             Self::UndefinedEnvVar => "references an undefined environment variable",
             Self::EnvVarExpansionNotPermitted => {
                 "uses environment-variable expansion, which is not permitted for this entry"
+            }
+            Self::HasCredentials => "has credentials that cannot be used",
+            Self::EncryptedCredentialUnsupported => {
+                "uses an encrypted credential, which is not supported"
             }
         })
     }

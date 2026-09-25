@@ -60,6 +60,15 @@ pub struct NuGetParseResult {
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
+    /// Dependency lines whose `NuGet.Config` `<packageSources>`/`<packageSourceMapping>`
+    /// resolution was rejected for a reason other than a policy-blocked host (#1442, mirrors
+    /// `deps_npm::parser::NpmParseResult::rejected_registries`) — an invalid URL, a non-https
+    /// scheme, embedded userinfo, or a source with unread credentials, where the declaration
+    /// key (from [`crate::config::NuGetConfig::rejected_reason_for`]) is the source's own
+    /// declared `<add key>` name, matching [`Self::blocked_registries`]'s own key scheme.
+    /// Surfaced by [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`Self::rejected_registries`]'s trait override as an informational diagnostic.
+    pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796).
     pub dependency_truncation: Option<(usize, usize)>,
@@ -72,6 +81,7 @@ deps_core::impl_parse_result!(
         uri: uri,
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
+        rejected_registries: rejected_registries,
     }
 );
 
@@ -140,6 +150,7 @@ pub fn parse_packages_config(content: &str, doc_uri: &Url) -> Result<NuGetParseR
         uri: doc_uri.clone(),
         resolved_chains: Vec::new(),
         blocked_registries: Vec::new(),
+        rejected_registries: Vec::new(),
         dependency_truncation: budget.truncation(),
     })
 }
@@ -283,6 +294,7 @@ fn parse_reference_elements(
         uri: doc_uri.clone(),
         resolved_chains: Vec::new(),
         blocked_registries: Vec::new(),
+        rejected_registries: Vec::new(),
         dependency_truncation: budget.truncation(),
     })
 }
