@@ -28,6 +28,9 @@ install and keep in sync.
   surface as diagnostics and quick fixes, not just as a separate CI step you find out about later.
 - **Supply-chain trust signal** — OpenSSF Scorecard and SLSA/attestation provenance in hover, so
   you can judge a dependency's health before pulling it in.
+- **Typosquat detection** *(opt-in)* — flags a declared dependency whose name deps.dev reports as
+  suspiciously similar to a much more popular package, across Cargo, npm, PyPI, Go, Bundler,
+  Maven, and NuGet.
 - **Lock-file aware** — Reads the version you actually have installed, not just the range you
   wrote, across every ecosystem that has a lock file.
 - **One-click fixes** — Code actions to bump a version, resolve an unsatisfiable range, or patch a

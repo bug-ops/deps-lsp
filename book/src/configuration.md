@@ -36,6 +36,7 @@ control, see [Conventions](cross-ecosystem/conventions.md).
 | `supply_chain` | `enabled` | `true` | Show the [OpenSSF Scorecard/build-provenance hover line](cross-ecosystem/yanked-and-vulnerabilities.md#supply-chain-trust-signal-issue-543), backed by deps.dev requests; `false` disables the requests and the section entirely |
 | `license_policy` | `allow` | `[]` | SPDX identifiers a dependency's license must include at least one of, when non-empty; produces a WARNING diagnostic otherwise. Invalid entries are dropped with a logged warning, not rejected. See [License Policy Diagnostic](cross-ecosystem/licensing.md#license-policy-diagnostic-issue-661) |
 | `license_policy` | `deny` | `[]` | SPDX identifiers a dependency's license must not include any of; produces an ERROR diagnostic when matched (wins over `allow`). Invalid entries are dropped with a logged warning, not rejected. See [License Policy Diagnostic](cross-ecosystem/licensing.md#license-policy-diagnostic-issue-661) |
+| `typosquat` | `enabled` | `false` | Whether the [typosquat-similarity diagnostic](cross-ecosystem/typosquat-detection.md) runs at all — opt-in, backed by deps.dev's v3alpha `GetSimilarlyNamedPackages`/`GetDependents` endpoints |
 
 ## Full Example
 
@@ -91,6 +92,9 @@ control, see [Conventions](cross-ecosystem/conventions.md).
   "license_policy": {
     "allow": [],
     "deny": []
+  },
+  "typosquat": {
+    "enabled": false
   }
 }
 ```

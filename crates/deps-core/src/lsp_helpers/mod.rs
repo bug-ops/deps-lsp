@@ -10,7 +10,7 @@ use crate::osv::{ScanOutcome, VulnerabilityMap};
 use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
-    LicenseSource, PackageName, RemovalStatus,
+    LicenseSource, PackageName, RemovalStatus, TyposquatSignal,
 };
 
 #[cfg(feature = "lsp-responses")]
@@ -46,10 +46,11 @@ pub use code_lenses::{
 };
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    MAX_DIAGNOSTIC_VALUE_CHARS, UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless,
-    generate_diagnostics_from_cache, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
-    requirement_is_unsatisfiable, sanitize_advisory_text_for_diagnostic,
-    sanitize_and_truncate_for_diagnostic, truncate_for_diagnostic,
+    MAX_DIAGNOSTIC_VALUE_CHARS, TYPOSQUAT_DIAGNOSTIC_CODE, UNSATISFIABLE_DIAGNOSTIC_CODE,
+    compile_requirement_unless, fetch_typosquat_signals, generate_diagnostics_from_cache,
+    redact_name_for_diagnostic, redact_requirement_for_diagnostic, requirement_is_unsatisfiable,
+    sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
+    truncate_for_diagnostic,
 };
 // `pub(crate)` (not `pub`, matching the constant's own visibility) so `completion.rs` can
 // share this bound with `inlay_hints`/`hover` rather than declaring a duplicate cap.
@@ -625,6 +626,23 @@ pub struct VersionData<'a> {
     /// only ones `license_prefetch` covers; this field and the rule are otherwise
     /// ecosystem-agnostic and need no change as `license_prefetch`'s coverage widens.
     pub license_policy: Option<&'a LicensePolicy>,
+    /// Background-pre-fetched typosquat-suspect signal per declared dependency (issue
+    /// #1437, spec 071), keyed by raw (unnormalized) package name — mirrors
+    /// [`Self::license_prefetch`]'s exact shape and rationale (NFR-002: this must never be
+    /// an inline `.await` on the diagnostics-generation path, so it is resolved ahead of
+    /// time by a document-lifecycle background task,
+    /// `deps-lsp::document::osv_scan::run_typosquat_prefetch`, and merely read
+    /// synchronously here — see that function's doc). Consumed directly inside
+    /// [`generate_diagnostics_from_cache`] itself (not gated behind
+    /// `Ecosystem::generate_diagnostics`'s default impl), the same way
+    /// [`Self::license_prefetch`] is, so every ecosystem's `generate_diagnostics`
+    /// override — not just the shared default — picks up the diagnostic automatically
+    /// (issue #1437 security-review finding: an override that calls
+    /// [`generate_diagnostics_from_cache`] directly, as `deps-npm`'s catalog-diagnostics
+    /// override does, must never be able to silently bypass this). `None` when the feature
+    /// is disabled, the ecosystem isn't deps.dev-covered, offline, or no dependency in the
+    /// document cleared the ratio gate.
+    pub typosquat_prefetch: Option<&'a HashMap<PackageName, TyposquatSignal>>,
 }
 
 impl<'a> VersionData<'a> {
@@ -661,6 +679,7 @@ impl<'a> VersionData<'a> {
             license_prefetch: None,
             license_source: None,
             license_policy: None,
+            typosquat_prefetch: None,
         }
     }
 
@@ -855,6 +874,29 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub const fn with_license_policy(mut self, policy: &'a LicensePolicy) -> Self {
         self.license_policy = Some(policy);
+        self
+    }
+
+    /// Attaches background-pre-fetched typosquat signals. See [`Self::typosquat_prefetch`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let typosquat = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_typosquat_prefetch(&typosquat);
+    /// assert!(versions.typosquat_prefetch.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_typosquat_prefetch(
+        mut self,
+        typosquat_prefetch: &'a HashMap<PackageName, TyposquatSignal>,
+    ) -> Self {
+        self.typosquat_prefetch = Some(typosquat_prefetch);
         self
     }
 }

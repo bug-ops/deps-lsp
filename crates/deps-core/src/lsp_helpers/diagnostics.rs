@@ -1,5 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
+use futures::stream::{self, StreamExt};
+
+use crate::deps_dev::deps_dev_system;
 use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severity};
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
@@ -8,9 +12,10 @@ use crate::osv::{ScanOutcome, SkipReason, diagnostic_severity_for};
 use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
-    BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, FetchFailure, PackageName,
-    ParseResult, PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus,
-    VersionReq, format_relative_age, is_within_cooldown,
+    BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
+    EcosystemId, FetchFailure, PackageName, ParseResult, PublishTime, RegistryOccurrence,
+    RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal, VersionReq, format_relative_age,
+    is_within_cooldown,
 };
 
 use super::{
@@ -30,6 +35,10 @@ pub const UNSATISFIABLE_DIAGNOSTIC_CODE: &str = "unsatisfiable-requirement";
 /// Stable [`Diagnostic::code`] set on the license-policy-violation diagnostic (issue #661,
 /// spec 010 Phase 2). See `apply_license_policy_rule`.
 pub const LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE: &str = "license-policy-violation";
+
+/// Stable [`Diagnostic::code`] set on the typosquat-suspect diagnostic (issue #1437, spec
+/// 071). See `apply_typosquat_rule`.
+pub const TYPOSQUAT_DIAGNOSTIC_CODE: &str = "typosquat-suspect";
 
 /// Shared upper bound on an attacker-controlled fragment interpolated into a diagnostic
 /// or hover message before truncation (issue #1278).
@@ -915,6 +924,7 @@ pub fn generate_diagnostics_from_cache(
         // finding must never be hidden by an unrelated "latest" lookup failure (FR-007/US-004).
         apply_vulnerability_rule(&mut diagnostics, &ctx, vuln_keys.as_ref());
         apply_license_policy_rule(&mut diagnostics, &ctx);
+        apply_typosquat_rule(&mut diagnostics, &ctx);
         let deprecation_found = apply_deprecation_rule(&mut diagnostics, &ctx);
         let in_use_yanked_emitted =
             apply_in_use_yanked_rule(&mut diagnostics, &ctx, deprecation_found);
@@ -1659,6 +1669,144 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
         .with_severity(severity)
         .with_code(LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE),
     );
+}
+
+/// R2b — typosquat-suspect declared-dependency signal (issue #1437, spec 071).
+///
+/// Reads `ctx.versions.typosquat_prefetch`, a background pre-fetch
+/// (`deps-lsp::document::osv_scan::run_typosquat_prefetch`) merged into `VersionData`
+/// before this pipeline runs — see that field's doc for why this lives directly inside
+/// [`generate_diagnostics_from_cache`] rather than behind `Ecosystem::generate_diagnostics`'s
+/// default impl (issue #1437 security-review finding: an ecosystem override that calls
+/// this function directly, as `deps-npm`'s catalog-diagnostics override does, must not be
+/// able to bypass the typosquat signal, exactly the same "picked up automatically by every
+/// caller" contract [`apply_license_policy_rule`] already has via `license_prefetch`). Keyed
+/// by raw (unnormalized) declared package name. A dependency with no entry — the feature
+/// disabled, the ecosystem not deps.dev-covered, offline, or no candidate clearing the ratio
+/// gate — is silently skipped (NFR-003 graceful degradation), mirroring
+/// [`apply_license_policy_rule`].
+/// Emits: at most one [`Severity::Hint`] diagnostic ([`TYPOSQUAT_DIAGNOSTIC_CODE`]) naming
+/// the suspected intended package — deliberately the weakest severity in this pipeline (spec
+/// FR-004: a *possible* mistake, not a confirmed vulnerability).
+/// Suppressed by: `ctx.formatter.source_is_public_registry_content(&ctx.dep.source())`
+/// re-checked here (issue #1437 impl-critic N1), not just trusted from prefetch time — a
+/// dependency whose source switched from a public registry to path/git/an alternate
+/// registry *after* the background prefetch resolved a signal for it must not keep
+/// rendering that now-stale hint for a since-privatized dependency; this check is free (no
+/// network call, just re-derives from the dependency's current, already-parsed source).
+/// Suppresses: nothing.
+fn apply_typosquat_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>) {
+    let Some(signal) = ctx
+        .versions
+        .typosquat_prefetch
+        .and_then(|signals| signals.get(ctx.dep.name()))
+    else {
+        return;
+    };
+    if !ctx
+        .formatter
+        .source_is_public_registry_content(&ctx.dep.source())
+    {
+        return;
+    }
+
+    diagnostics.push(
+        Diagnostic::new(
+            ctx.dep.name_range(),
+            format!(
+                "{} has far fewer dependents ({}) than the similarly named {} ({}) — double-\
+                 check this isn't a typo or a typosquat",
+                redact_name_for_diagnostic(ctx.dep.name()),
+                signal.declared_dependent_count,
+                redact_name_for_diagnostic(&PackageName::new(signal.suspected_name.as_str())),
+                signal.suspected_dependent_count,
+            ),
+        )
+        .with_severity(Severity::Hint)
+        .with_code(TYPOSQUAT_DIAGNOSTIC_CODE),
+    );
+}
+
+/// Bounds how many concurrent per-dependency typosquat fetches [`fetch_typosquat_signals`]
+/// issues at once — a background, opt-in signal (issue #1437), not on any latency-critical
+/// path, mirroring `deps-lsp::document::osv_scan::LICENSE_PREFETCH_CONCURRENCY`'s reasoning.
+const TYPOSQUAT_FETCH_CONCURRENCY: usize = 8;
+
+/// Resolves a [`TyposquatSignal`] for every distinct direct dependency name declared in
+/// `parse_result` (issue #1437, spec 071), keyed by that raw (unnormalized) name.
+///
+/// **Not** called from this diagnostics pipeline itself (NFR-002: diagnostics generation
+/// must never `.await` a deps.dev fan-out inline) — the sole caller is
+/// `deps-lsp::document::osv_scan::run_typosquat_prefetch`, a background document-lifecycle
+/// task that merges the result into `deps-lsp`'s own `DocumentState::typosquats` map,
+/// from which [`VersionData::typosquat_prefetch`] is populated synchronously before
+/// [`generate_diagnostics_from_cache`] runs — see that field's doc for the full picture and
+/// why this design (not an inline await behind `Ecosystem::generate_diagnostics`) is also
+/// what makes the signal automatically reach every ecosystem's `generate_diagnostics`
+/// override, not just ecosystems that remember to opt in. `pub`, not `pub(crate)`: called
+/// from outside this crate (`deps-lsp`).
+///
+/// Zero HTTP requests when `client` is `None` (FR-009: `policy.typosquat.enabled` is
+/// `false`), `offline` is set, or `ecosystem_id` is one of the seven ecosystems
+/// `deps_dev_system` doesn't cover (FR-002) — all checked before any dependency name is
+/// even collected.
+///
+/// `formatter.source_is_public_registry_content(&dep.source())` gates each dependency
+/// individually (security review finding, issue #1437): a private/internal/git/path
+/// dependency's name must never be sent to deps.dev, mirroring
+/// `crate::lsp_helpers::hover`'s `spawn_trust_signal_fetch` — deliberately the stricter
+/// `source_is_public_registry_content`, not the weaker `EcosystemFormatter::can_resolve_source`
+/// some ecosystems widen to cover any *resolvable* (not necessarily public) registry.
+pub async fn fetch_typosquat_signals(
+    ecosystem_id: EcosystemId,
+    parse_result: &dyn ParseResult,
+    formatter: &dyn EcosystemFormatter,
+    offline: bool,
+    client: Option<&Arc<DepsDevClient>>,
+) -> HashMap<PackageName, TyposquatSignal> {
+    let mut signals = HashMap::new();
+
+    let Some(client) = client else {
+        return signals;
+    };
+    if offline {
+        return signals;
+    }
+    let Some(system) = deps_dev_system(ecosystem_id) else {
+        return signals;
+    };
+
+    let mut seen = HashSet::new();
+    let names: Vec<PackageName> = parse_result
+        .dependencies()
+        .into_iter()
+        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
+        .map(|dep| dep.name().clone())
+        .filter(|name| seen.insert(name.clone()))
+        .collect();
+
+    if names.is_empty() {
+        return signals;
+    }
+
+    let resolved = stream::iter(names)
+        .map(|name| {
+            let client = Arc::clone(client);
+            async move {
+                let signal = client.typosquat_signal(system, name.as_str()).await;
+                (name, signal)
+            }
+        })
+        .buffer_unordered(TYPOSQUAT_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await;
+
+    for (name, signal) in resolved {
+        if let Some(signal) = signal {
+            signals.insert(name, signal);
+        }
+    }
+    signals
 }
 
 /// R3 — package-level deprecation finding (#205, I4).
@@ -9460,6 +9608,410 @@ mod tests {
                 "expected the entry list to be capped with a '(+N more)' suffix, got: {:?}",
                 diagnostics[0].message()
             );
+        }
+    }
+
+    // apply_typosquat_rule / fetch_typosquat_signals tests (issue #1437, spec 071)
+    mod typosquat_tests {
+        use super::*;
+        use crate::deps_dev::DepsDevClient;
+        use crate::position::{Position, Range};
+        use crate::{EcosystemId, HttpCache, TyposquatSignal};
+
+        fn single_dep_parse_result(name: &str) -> MockParseResult {
+            MockParseResult {
+                deps: vec![MockDep {
+                    name: name.into(),
+                    version_req: "1.0.0".into(),
+                    version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+                }],
+                uri: crate::test_util::test_uri("/test/package.json"),
+            }
+        }
+
+        fn crossenv_signal() -> TyposquatSignal {
+            TyposquatSignal {
+                declared_name: "crossenv".to_string(),
+                suspected_name: "cross-env".to_string(),
+                declared_dependent_count: 3,
+                suspected_dependent_count: 900,
+            }
+        }
+
+        /// A dependency sourced from a git repository, not a registry — for exercising the
+        /// `source_is_public_registry_content` gate (issue #1437 security-review finding).
+        struct MockGitSourceDep {
+            name: PackageName,
+            name_range: Range,
+        }
+
+        impl Dependency for MockGitSourceDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                self.name_range
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                None
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Git {
+                    url: "https://example.com/private/repo.git".to_string(),
+                    rev: None,
+                }
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        #[test]
+        fn no_signal_entry_produces_no_diagnostic() {
+            let formatter = MOCK_FORMATTER;
+            let parse_result = single_dep_parse_result("serde");
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("serde"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let typosquat: HashMap<PackageName, TyposquatSignal> = HashMap::new();
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_typosquat_prefetch(&typosquat),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "an empty typosquat map must produce no diagnostic, got: {diagnostics:?}"
+            );
+        }
+
+        #[test]
+        fn no_typosquat_field_attached_produces_no_diagnostic() {
+            let formatter = MOCK_FORMATTER;
+            let parse_result = single_dep_parse_result("crossenv");
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("crossenv"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                diagnostics.is_empty(),
+                "VersionData::typosquat left None must produce no diagnostic, got: {diagnostics:?}"
+            );
+        }
+
+        #[test]
+        fn matching_signal_produces_hint_diagnostic() {
+            let formatter = MOCK_FORMATTER;
+            let parse_result = single_dep_parse_result("crossenv");
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::from("crossenv"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            let resolved_versions = HashMap::new();
+            let mut typosquat: HashMap<PackageName, TyposquatSignal> = HashMap::new();
+            typosquat.insert(PackageName::from("crossenv"), crossenv_signal());
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_typosquat_prefetch(&typosquat),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].severity, Some(Severity::Hint));
+            assert_eq!(diagnostics[0].code(), Some(TYPOSQUAT_DIAGNOSTIC_CODE));
+            assert!(diagnostics[0].message().contains("cross-env"));
+        }
+
+        /// Issue #1437 impl-critic N1: a stale prefetched signal for a dependency whose
+        /// source has since switched to git/path/an alternate registry must not render —
+        /// `apply_typosquat_rule` re-checks `source_is_public_registry_content` against the
+        /// dependency's *current* source, not just trusting that the prefetch-time gate
+        /// (`fetch_typosquat_signals`) already filtered it out at resolution time.
+        #[test]
+        fn matching_signal_for_now_private_source_does_not_render() {
+            let formatter = MOCK_FORMATTER;
+            let parse_result = MockMixedParseResult {
+                deps: vec![Box::new(MockGitSourceDep {
+                    name: PackageName::from("crossenv"),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 8)),
+                })],
+                uri: crate::test_util::test_uri("/test/package.json"),
+            };
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let mut typosquat: HashMap<PackageName, TyposquatSignal> = HashMap::new();
+            typosquat.insert(PackageName::from("crossenv"), crossenv_signal());
+
+            let diagnostics = generate_diagnostics_from_cache(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions)
+                    .with_typosquat_prefetch(&typosquat),
+                &formatter,
+                parse_result.uri(),
+                crate::freshness::FreshnessSettings::default(),
+                DiagnosticSeverities::default(),
+                PublishTime::now(),
+            );
+
+            assert!(
+                !diagnostics
+                    .iter()
+                    .any(|d| d.code() == Some(TYPOSQUAT_DIAGNOSTIC_CODE)),
+                "a stale signal for a now-git-sourced dependency must not render, got: \
+                 {diagnostics:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn fetch_typosquat_signals_no_client_issues_zero_requests() {
+            let mut server = mockito::Server::new_async().await;
+            let package_call = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+
+            let parse_result = single_dep_parse_result("crossenv");
+            let signals = fetch_typosquat_signals(
+                EcosystemId::Npm,
+                &parse_result,
+                &MOCK_FORMATTER,
+                false,
+                None,
+            )
+            .await;
+
+            assert!(signals.is_empty());
+            package_call.assert_async().await;
+            drop(server);
+        }
+
+        /// Issue #1437 security review L1/impl-critic S3: offline must gate before any
+        /// dependency name is even collected, mirroring `hover::spawn_trust_signal_fetch`'s
+        /// `versions.offline` check.
+        #[tokio::test]
+        async fn fetch_typosquat_signals_offline_issues_zero_requests() {
+            let mut server = mockito::Server::new_async().await;
+            let package_call = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let client = Arc::new(DepsDevClient::for_test(
+                Arc::new(HttpCache::new()),
+                server.url(),
+            ));
+
+            let parse_result = single_dep_parse_result("crossenv");
+            let signals = fetch_typosquat_signals(
+                EcosystemId::Npm,
+                &parse_result,
+                &MOCK_FORMATTER,
+                true,
+                Some(&client),
+            )
+            .await;
+
+            assert!(signals.is_empty());
+            package_call.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn fetch_typosquat_signals_unsupported_ecosystem_issues_zero_requests() {
+            let mut server = mockito::Server::new_async().await;
+            let package_call = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let client = Arc::new(DepsDevClient::for_test(
+                Arc::new(HttpCache::new()),
+                server.url(),
+            ));
+
+            let parse_result = single_dep_parse_result("crossenv");
+            let signals = fetch_typosquat_signals(
+                EcosystemId::Deno,
+                &parse_result,
+                &MOCK_FORMATTER,
+                false,
+                Some(&client),
+            )
+            .await;
+
+            assert!(signals.is_empty());
+            package_call.assert_async().await;
+        }
+
+        #[tokio::test]
+        async fn fetch_typosquat_signals_resolves_positive_case() {
+            let mut server = mockito::Server::new_async().await;
+            let _similarity = server
+                .mock(
+                    "GET",
+                    "/v3alpha/systems/npm/packages/crossenv:similarlyNamedPackages",
+                )
+                .with_status(200)
+                .with_body(
+                    r#"{"packageKey": {"name": "crossenv"}, "packages": [{"packageKey": {"name": "cross-env"}}]}"#,
+                )
+                .create_async()
+                .await;
+            let _declared_package = server
+                .mock("GET", "/v3alpha/systems/npm/packages/crossenv")
+                .with_status(200)
+                .with_body(
+                    r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#,
+                )
+                .create_async()
+                .await;
+            let _declared_dependents = server
+                .mock(
+                    "GET",
+                    "/v3alpha/systems/npm/packages/crossenv/versions/1.0.0:dependents",
+                )
+                .with_status(200)
+                .with_body(r#"{"dependentCount": 3}"#)
+                .create_async()
+                .await;
+            let _candidate_package = server
+                .mock("GET", "/v3alpha/systems/npm/packages/cross-env")
+                .with_status(200)
+                .with_body(
+                    r#"{"versions": [{"versionKey": {"version": "7.0.0"}, "isDefault": true}]}"#,
+                )
+                .create_async()
+                .await;
+            let _candidate_dependents = server
+                .mock(
+                    "GET",
+                    "/v3alpha/systems/npm/packages/cross-env/versions/7.0.0:dependents",
+                )
+                .with_status(200)
+                .with_body(r#"{"dependentCount": 900}"#)
+                .create_async()
+                .await;
+            let client = Arc::new(DepsDevClient::for_test(
+                Arc::new(HttpCache::new()),
+                server.url(),
+            ));
+
+            let parse_result = single_dep_parse_result("crossenv");
+            let signals = fetch_typosquat_signals(
+                EcosystemId::Npm,
+                &parse_result,
+                &MOCK_FORMATTER,
+                false,
+                Some(&client),
+            )
+            .await;
+
+            let signal = signals
+                .get(&PackageName::from("crossenv"))
+                .expect("signal expected");
+            assert_eq!(signal.suspected_name, "cross-env");
+        }
+
+        #[tokio::test]
+        async fn fetch_typosquat_signals_empty_parse_result_issues_zero_requests() {
+            let mut server = mockito::Server::new_async().await;
+            let package_call = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let client = Arc::new(DepsDevClient::for_test(
+                Arc::new(HttpCache::new()),
+                server.url(),
+            ));
+            let parse_result = MockParseResult {
+                deps: vec![],
+                uri: crate::test_util::test_uri("/test/package.json"),
+            };
+
+            let signals = fetch_typosquat_signals(
+                EcosystemId::Npm,
+                &parse_result,
+                &MOCK_FORMATTER,
+                false,
+                Some(&client),
+            )
+            .await;
+
+            assert!(signals.is_empty());
+            package_call.assert_async().await;
+        }
+
+        /// Issue #1437 security-review finding: a dependency whose source is not
+        /// public-registry content (a private/git/path dependency, or an
+        /// `AlternateRegistry` that doesn't mirror the public registry) must never have its
+        /// name sent to deps.dev — mirrors `hover::spawn_trust_signal_fetch`'s identical
+        /// gate on `source_is_public_registry_content`.
+        #[tokio::test]
+        async fn fetch_typosquat_signals_non_public_registry_source_issues_zero_requests() {
+            let mut server = mockito::Server::new_async().await;
+            let package_call = server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let client = Arc::new(DepsDevClient::for_test(
+                Arc::new(HttpCache::new()),
+                server.url(),
+            ));
+            let parse_result = MockMixedParseResult {
+                deps: vec![Box::new(MockGitSourceDep {
+                    name: PackageName::from("private-pkg"),
+                    name_range: Range::new(Position::new(0, 0), Position::new(0, 11)),
+                })],
+                uri: crate::test_util::test_uri("/test/package.json"),
+            };
+
+            let signals = fetch_typosquat_signals(
+                EcosystemId::Npm,
+                &parse_result,
+                &MOCK_FORMATTER,
+                false,
+                Some(&client),
+            )
+            .await;
+
+            assert!(signals.is_empty());
+            package_call.assert_async().await;
         }
     }
 }

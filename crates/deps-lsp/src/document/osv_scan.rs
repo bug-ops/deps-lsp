@@ -325,6 +325,125 @@ pub(crate) async fn run_license_prefetch(
 /// `deps-lsp`'s own tuning choice, not a shared default.
 const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
 
+/// Ceiling on the typosquat pre-fetch's overall timeout, independent of the configured
+/// `fetch_timeout_secs` (issue #1437 impl-critic S4/perf NFR-002) — mirrors
+/// [`OSV_SCAN_TIMEOUT_CEILING_SECS`]'s exact rationale, bounding one document's whole
+/// pre-fetch fan-out (not any single deps.dev call, which has its own, separate
+/// `deps_core::deps_dev`-internal timeout) so a pathological manifest can't leave this
+/// background task running indefinitely.
+const TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
+
+/// Background pre-fetch of a typosquat-suspect signal per direct dependency (issue #1437,
+/// spec 071), gated on [`ServerState::is_typosquat_enabled`] and `network.offline` — both
+/// checked here, before the document guard is even taken, so a disabled/offline server does
+/// zero work per document lifecycle event. Mirrors [`run_license_prefetch`]'s shape closely:
+/// target collection happens while holding the document guard (dropped before the network
+/// dispatch, which goes through `deps_core::lsp_helpers::fetch_typosquat_signals` —
+/// ecosystem-coverage and public-registry-source gating live there, not here, the same
+/// division of responsibility `run_license_prefetch` has with `deps_engine::classify::license`),
+/// and the eventual commit is guarded against a stale write by re-checking `doc.content`
+/// against the snapshot taken before the fetch started.
+///
+/// Deliberately checks `content` only, **not** `resolved_versions_generation` too (issue
+/// #1437 code-review Important finding, correcting this function's original design, which
+/// copied [`run_license_prefetch`]'s two-part guard verbatim): a typosquat signal depends
+/// only on declared package *names* — `SimilarityMemoKey`/`PopularityMemoKey` are
+/// package-level, with no version dimension (plan.md §3) — so a lock-file-only change (which
+/// bumps `resolved_versions_generation` without touching `content`, e.g. a concurrent
+/// `cargo build`/`npm install` racing this fetch) has nothing to do with this signal's own
+/// invariants; checking it too would discard an already-correct, already-computed result for
+/// an unrelated reason. `run_license_prefetch`'s own generation check remains correct for
+/// *its* signal, which genuinely does depend on the resolved version.
+///
+/// **Not** called inline from diagnostics generation (NFR-002: a cold-cache
+/// `textDocument/diagnostic` request must never block on a per-manifest deps.dev fan-out) —
+/// `deps_core::lsp_helpers::VersionData::typosquat_prefetch` only ever reads whatever this
+/// background task has already committed to [`super::state::DocumentState::typosquats`],
+/// synchronously, with no `.await` on that read path.
+///
+/// **Not** joined before the main diagnostics publish either (issue #1437 impl-critic N2,
+/// correcting this function's own original design, which mirrored
+/// [`run_license_prefetch`]'s join-before-first-publish shape): `run_license_prefetch`'s
+/// join is a deliberate tradeoff justified by its four small tier-3 ecosystems and license
+/// violations needing to appear immediately, but typosquat's fan-out covers all seven major
+/// deps.dev ecosystems and can be far larger, with each dependency costing up to
+/// `2 + 2N` sequential-per-candidate deps.dev round trips — joining that before OSV/outdated
+/// diagnostics (real, non-`Hint`-severity content) would let a best-effort signal violate
+/// NFR-001's "never becomes a reliability liability". Callers
+/// (`document::lifecycle::spawn_typosquat_prefetch_and_republish`) instead let the main
+/// publish proceed on its existing schedule and issue a second, later publish once this
+/// returns `true`.
+///
+/// Returns whether a non-empty result was actually merged — `false` covers every early-out
+/// (disabled, offline, no document, no parse result, timeout, stale-content drop) *and* the
+/// case where the fetch genuinely found nothing, so a caller can skip a pointless republish
+/// whose diagnostic set would be identical to the one already published.
+pub(crate) async fn run_typosquat_prefetch(
+    uri: Uri,
+    state: Arc<ServerState>,
+    ecosystem: Arc<dyn Ecosystem>,
+    fetch_timeout_secs: u64,
+) -> bool {
+    if !state.is_typosquat_enabled() || state.cache.is_offline() {
+        return false;
+    }
+
+    // Issue #1437 code-review Important finding: unlike `run_license_prefetch`, this
+    // pre-fetch's result depends only on declared package *names* — `SimilarityMemoKey`/
+    // `PopularityMemoKey` are package-level, with no version dimension at all (plan.md §3)
+    // — so `content` alone is the right staleness guard. Also checking
+    // `resolved_versions_generation` (which bumps on a lock-file-only change, e.g. a
+    // concurrent `cargo build`/`npm install`, without touching `content`) would discard an
+    // already-correct, already-computed typosquat result for a reason that has nothing to
+    // do with this signal's own invariants.
+    let (content_snapshot, parse_result): (String, Arc<dyn deps_core::ParseResult>) = {
+        let Some(doc) = state.get_document(&uri) else {
+            return false;
+        };
+        let Some(parse_result) = doc.parse_result_arc() else {
+            return false;
+        };
+        (doc.content.clone(), parse_result)
+    };
+
+    let timeout_duration =
+        Duration::from_secs(fetch_timeout_secs.min(TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS));
+    let typosquats = match tokio::time::timeout(
+        timeout_duration,
+        deps_core::lsp_helpers::fetch_typosquat_signals(
+            ecosystem.ecosystem_id(),
+            parse_result.as_ref(),
+            ecosystem.formatter(),
+            false, // already checked `state.cache.is_offline()` above.
+            Some(&state.deps_dev),
+        ),
+    )
+    .await
+    {
+        Ok(typosquats) => typosquats,
+        Err(_) => {
+            tracing::debug!("typosquat pre-fetch timed out");
+            return false;
+        }
+    };
+
+    if typosquats.is_empty() {
+        return false;
+    }
+
+    if let Some(mut doc) = state.documents.get_mut(&uri) {
+        if doc.content != content_snapshot {
+            tracing::debug!(
+                "dropping stale typosquat pre-fetch result: document content changed mid-fetch"
+            );
+            return false;
+        }
+        doc.merge_typosquats(typosquats);
+        return true;
+    }
+    false
+}
+
 /// Phase B: for every dependency phase A flagged [`deps_core::osv::ScanOutcome::Vulnerable`],
 /// checks whether the version currently recommended (the registry's latest,
 /// now that the registry fetch has resolved — critique S1) is itself
@@ -1343,5 +1462,64 @@ mod tests {
                 doc.vulnerabilities
             );
         }
+    }
+
+    /// Issue #1437: `run_typosquat_prefetch`'s own gates, mirroring `license_prefetch_tests`'
+    /// "never touches `DocumentState` at all" style for the disabled/offline no-op cases.
+    #[cfg(feature = "npm")]
+    mod typosquat_prefetch_tests {
+        use super::*;
+
+        /// Default `ServerState` starts with `policy.typosquat.enabled == false` — no
+        /// document inserted for `uri` at all, so if the enabled-gate didn't short-circuit
+        /// first, `state.get_document(&uri)` would return `None` and the function would
+        /// still just return early; this also doubles as a "never panics on a missing
+        /// document" check, same as `run_license_prefetch_no_op_for_non_tier3_ecosystem`.
+        #[tokio::test]
+        async fn run_typosquat_prefetch_no_op_when_disabled() {
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem = state
+                .ecosystem_registry
+                .get(EcosystemId::Npm)
+                .expect("npm ecosystem not found");
+
+            let changed = run_typosquat_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+
+            assert!(!changed);
+            assert_eq!(state.document_count(), 0);
+        }
+
+        /// Same shape as the disabled case, for the offline gate.
+        #[tokio::test]
+        async fn run_typosquat_prefetch_no_op_when_offline() {
+            let state = Arc::new(ServerState::new());
+            state.set_typosquat_enabled(true);
+            state.cache.set_offline(deps_core::NetworkMode::Offline);
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let ecosystem = state
+                .ecosystem_registry
+                .get(EcosystemId::Npm)
+                .expect("npm ecosystem not found");
+
+            let changed = run_typosquat_prefetch(uri, Arc::clone(&state), ecosystem, 5).await;
+
+            assert!(!changed);
+            assert_eq!(state.document_count(), 0);
+        }
+
+        // Note: a full "resolves through a mocked deps.dev server and commits" test
+        // (mirroring `run_license_prefetch`'s live-fetch tests) is not exercised at this
+        // level — `ServerState::deps_dev` is fixed at construction with no test-only
+        // injection point, and `ServerState` carries several module-private fields that
+        // block a struct-update-syntax substitution from a sibling test module. That
+        // resolve-then-merge path is covered at two other levels instead:
+        // `deps_core::deps_dev::tests::typosquat_signal_*` (the HTTP resolution itself,
+        // mockito-backed) and `handlers::diagnostics::tests::
+        // test_generate_diagnostics_internal_typosquat_prefetch_is_synchronous` (the
+        // same mocked-resolution-then-merge shape, exercised via `merge_typosquats`
+        // directly rather than through this function's own content/generation guard).
     }
 }

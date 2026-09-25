@@ -5,7 +5,7 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
-    LicensePolicy, PackageName, PackageVersions, ParseResult,
+    LicensePolicy, PackageName, PackageVersions, ParseResult, TyposquatSignal,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -196,6 +196,18 @@ pub struct DocumentState {
     /// Empty until the relevant fetch completes; carried across document edits by
     /// `preserve_cache` so it doesn't flicker off on every keystroke.
     pub licenses: HashMap<PackageName, Vec<String>>,
+    /// Background-pre-fetched typosquat-suspect signal per declared dependency (issue
+    /// #1437), keyed by raw (unnormalized) package name — mirrors [`Self::licenses`]'s exact
+    /// shape and rationale. Populated by `document::osv_scan::run_typosquat_prefetch`, via
+    /// [`Self::merge_typosquats`] (never a full replace, for the same "one dependency's
+    /// transient failure must not drop another's still-valid signal" reason
+    /// [`Self::merge_licenses`] exists). Read synchronously into
+    /// `deps_core::VersionData::typosquat_prefetch` by `handlers::diagnostics`, never
+    /// fetched inline on the diagnostics-generation path itself (NFR-002). Empty until the
+    /// prefetch completes or when `policy.typosquat.enabled` is `false`; carried across
+    /// document edits by `preserve_cache` so the diagnostic doesn't flicker off on every
+    /// keystroke.
+    pub typosquats: HashMap<PackageName, TyposquatSignal>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -225,6 +237,7 @@ impl Clone for DocumentState {
             vulnerabilities: self.vulnerabilities.clone(),
             outcomes: self.outcomes.clone(),
             licenses: self.licenses.clone(),
+            typosquats: self.typosquats.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -343,6 +356,7 @@ impl std::fmt::Debug for DocumentState {
             )
             .field("vulnerabilities_count", &self.vulnerabilities.len())
             .field("licenses_count", &self.licenses.len())
+            .field("typosquats_count", &self.typosquats.len())
             .field("yanked_versions_count", &self.outcomes.yanked_count())
             .field("deprecations_count", &self.outcomes.deprecation_count())
             .field("fetch_failed_count", &self.outcomes.fetch_failure_count())
@@ -374,6 +388,7 @@ impl DocumentState {
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
+            typosquats: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -397,6 +412,7 @@ impl DocumentState {
             vulnerabilities: VulnerabilityMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
+            typosquats: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -537,6 +553,39 @@ impl DocumentState {
     /// deliberately never evicts for one — see its own doc.
     pub fn merge_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
         self.licenses.extend(licenses);
+    }
+
+    /// Full-replace update of [`Self::typosquats`] — mirrors [`Self::update_licenses`]'s
+    /// exact rationale and "kept as a tested public primitive, not currently called from
+    /// `document::lifecycle`" status.
+    pub fn update_typosquats(&mut self, typosquats: HashMap<PackageName, TyposquatSignal>) {
+        self.typosquats = typosquats;
+    }
+
+    /// Merges typosquat findings into [`Self::typosquats`] without disturbing existing
+    /// entries — mirrors [`Self::merge_licenses`]'s exact rationale: a dependency whose
+    /// resolution transiently fails this round must not lose a previous round's
+    /// still-valid signal for some *other* dependency. Unlike license data, a typosquat
+    /// signal has no resolved-version dependency at all (it compares declared package
+    /// *names*, never versions), so there is no eviction counterpart to
+    /// [`Self::evict_licenses`] — a genuinely removed dependency's entry is reclaimed by
+    /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop, same as
+    /// [`Self::licenses`].
+    ///
+    /// **Known, accepted limitation (issue #1437 impl-critic D2):** a still-declared
+    /// dependency's entry is *not* automatically cleared if a later pre-fetch resolves no
+    /// signal for it (a candidate's popularity ratio can drift below the threshold between
+    /// runs) — [`HashMap::extend`] only inserts/overwrites keys present in `typosquats`, it
+    /// never removes a key merely absent from it. A `None` result is not itself
+    /// representable in this map (only a `Some` ever gets inserted), so a stale positive
+    /// persists until the dependency is edited/removed or the document closes, not
+    /// "refreshed away" by the next successful pre-fetch as an earlier revision of this
+    /// comment claimed. This is accepted for a `Severity::Hint`-level, opt-in signal — see
+    /// spec 071's Agent Boundaries and `apply_typosquat_rule`'s own per-dependency-source
+    /// re-check, which *does* actively clear the one staleness case that matters
+    /// security-wise (a dependency whose source switched to private).
+    pub fn merge_typosquats(&mut self, typosquats: HashMap<PackageName, TyposquatSignal>) {
+        self.typosquats.extend(typosquats);
     }
 
     /// Evicts every name in `names` from [`Self::licenses`] — called ahead of a resolved
@@ -785,6 +834,17 @@ pub struct ServerState {
     /// `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.license_policy`.
     pub license_policy: RwLock<Arc<LicensePolicy>>,
+    /// Live-updatable `policy.typosquat.enabled` setting (issue #1437), mirroring
+    /// `license_policy`'s own rationale: read unconditionally by
+    /// `handlers::diagnostics::generate_diagnostics_internal` on every diagnostics
+    /// generation call — both the pull path and every push-path background refresh — rather
+    /// than threaded as a caller-supplied parameter, since diagnostics has multiple
+    /// producers all replacing the same client-visible diagnostic set. A plain `AtomicBool`,
+    /// not `RwLock<Arc<..>>` like `license_policy`: this is a single opt-in/opt-out flag,
+    /// not a structured value. Defaults to `false` (disabled) until
+    /// `Backend::initialize`/`did_change_configuration` first parses
+    /// `initializationOptions.typosquat`.
+    pub typosquat_enabled: AtomicBool,
     /// Ecosystem ids `crate::register_ecosystems` actually threaded the live
     /// `registry_policy` handle into (issue #592 security M1) — the single source of truth
     /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
@@ -908,6 +968,7 @@ impl ServerState {
             nuget_user_profile_sources,
             gitlab_instance_host,
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
+            typosquat_enabled: AtomicBool::new(false),
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
@@ -1003,6 +1064,23 @@ impl ServerState {
             .license_policy
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(policy);
+    }
+
+    /// Returns whether the typosquat-similarity diagnostic is currently enabled (issue
+    /// #1437). Read by every diagnostics-generation call site — see
+    /// [`Self::typosquat_enabled`]'s field doc.
+    pub fn is_typosquat_enabled(&self) -> bool {
+        self.typosquat_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Replaces the active `policy.typosquat.enabled` flag (issue #1437).
+    ///
+    /// Called from `Backend::initialize`/`did_change_configuration` once the new
+    /// `DepsConfig` is parsed, so every subsequent diagnostics generation call picks up the
+    /// new setting without any call site needing a signature change (mirrors
+    /// [`Self::set_license_policy`]).
+    pub fn set_typosquat_enabled(&self, enabled: bool) {
+        self.typosquat_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Unions `scope` into the pending coalesced reparse and bumps the generation counter

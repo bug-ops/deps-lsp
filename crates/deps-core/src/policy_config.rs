@@ -11,11 +11,12 @@ use serde::Deserialize;
 /// principle 1).
 ///
 /// Every section struct below (`DiagnosticsConfig`, `CacheConfig`, `FreshnessConfig`,
-/// `SupplyChainConfig`, `RegistriesConfig`, `NetworkConfig`, `LicensePolicyConfig`) is
+/// `SupplyChainConfig`, `RegistriesConfig`, `NetworkConfig`, `LicensePolicyConfig`,
+/// `TyposquatConfig`) is
 /// `#[non_exhaustive]`, matching `deps-core`'s general convention (issue #1064) — a field added
 /// to any of them no longer breaks every downstream crate that names the struct's full literal
 /// shape. `PolicyConfig` itself deliberately stays exhaustive: issue #1064/FR-006 scopes this to
-/// the 7 leaf structs specifically, since `PolicyConfig`'s own fields only change when a whole
+/// the 8 leaf structs specifically, since `PolicyConfig`'s own fields only change when a whole
 /// new policy *section* is added — a much rarer, more architecturally significant event than a
 /// field added to an existing section.
 ///
@@ -61,6 +62,9 @@ pub struct PolicyConfig {
     /// License policy (allow/deny list) settings.
     #[serde(default)]
     pub license_policy: LicensePolicyConfig,
+    /// Typosquat-similarity diagnostic settings (issue #1437).
+    #[serde(default)]
+    pub typosquat: TyposquatConfig,
 }
 
 /// Which leaf fields differ between two [`PolicyConfig`] snapshots, at the exact granularity
@@ -76,7 +80,7 @@ pub struct PolicyConfig {
 /// # The E0027 mechanism this design relies on (issue #1064, NFR-004)
 ///
 /// [`PolicyConfig::diff`] destructures every section of [`PolicyConfig`] exhaustively — no `..`
-/// rest pattern at any level — so a field added to any of the 7 policy section structs without
+/// rest pattern at any level — so a field added to any of the 8 policy section structs without
 /// also naming it in that destructuring fails to compile (rustc E0027), exactly as
 /// `deps-lsp::config::reparse_scope` used to enforce directly before issue #592's guarantee
 /// moved here. The doctest below only illustrates that underlying Rust language mechanism on a
@@ -115,9 +119,9 @@ impl PolicyConfig {
     /// Reports which leaf fields differ between `old` and `new`.
     ///
     /// Exhaustively destructures both snapshots' sections — no `..` rest pattern at any
-    /// level — so a field added to any of the 7 section structs forces an explicit decision
+    /// level — so a field added to any of the 8 section structs forces an explicit decision
     /// here (see [`PolicyConfigDiff`]'s compile-time guarantee). `diagnostics`, `cache`,
-    /// `freshness`, `supply_chain`, `network`, and `license_policy` are destructured
+    /// `freshness`, `supply_chain`, `network`, `license_policy`, and `typosquat` are destructured
     /// field-by-field purely to force that decision — as of today, none of their leaf fields
     /// are parse-affecting (a config change there is picked up the next time diagnostics/hover
     /// are requested, without invalidating already-parsed document state), so no field of
@@ -150,6 +154,7 @@ impl PolicyConfig {
             registries: new_registries,
             network: new_network,
             license_policy: new_license_policy,
+            typosquat: new_typosquat,
         } = new;
 
         // Not parse-affecting: exhaustive `_` bindings (never `..`) force a decision when a
@@ -177,6 +182,7 @@ impl PolicyConfig {
         let SupplyChainConfig { enabled: _ } = new_supply_chain;
         let NetworkConfig { offline: _ } = new_network;
         let LicensePolicyConfig { allow: _, deny: _ } = new_license_policy;
+        let TyposquatConfig { enabled: _ } = new_typosquat;
 
         // Parse-affecting: each leaf field of `registries` is individually diffed.
         let RegistriesConfig {
@@ -1232,6 +1238,60 @@ impl LicensePolicyConfig {
     #[must_use]
     pub fn to_policy(&self) -> crate::LicensePolicy {
         crate::LicensePolicy::new(self.allow.clone(), self.deny.clone())
+    }
+}
+
+/// Configuration for the typosquat-similarity diagnostic (issue #1437, spec 071).
+///
+/// Controls whether a declared dependency is checked against deps.dev's
+/// `GetSimilarlyNamedPackages` endpoint for a much-more-popular, similarly-named package —
+/// a possible sign of a typo or a typosquat. Ships **disabled by default**: unlike
+/// `supply_chain`/`diagnostics.vulnerabilities_enabled` (both opt-out), this signal is built
+/// on an undocumented, v3alpha (no stability guarantee) similarity algorithm, so spec 071
+/// §9 resolves it as opt-in only at launch, with default-on deferred to a separate future
+/// issue once the endpoint has shown stability across releases.
+///
+/// # Defaults
+///
+/// - `enabled`: `false`
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::TyposquatConfig;
+///
+/// let config = TyposquatConfig::default();
+/// assert!(!config.enabled);
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct TyposquatConfig {
+    /// Whether the typosquat-similarity diagnostic runs at all.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl TyposquatConfig {
+    /// Builds the default (disabled) configuration (mirrors [`Self::default`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::TyposquatConfig;
+    ///
+    /// let config = TyposquatConfig::new();
+    /// assert!(!config.enabled);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { enabled: false }
+    }
+
+    /// Overrides [`Self::enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
     }
 }
 

@@ -270,6 +270,7 @@ pub(crate) async fn generate_diagnostics_internal(
             doc.vulnerabilities.clone(),
             doc.outcomes.clone(),
             doc.licenses.clone(),
+            doc.typosquats.clone(),
         ))
     }) else {
         tracing::warn!("Document not found for diagnostics: {:?}", uri);
@@ -286,6 +287,7 @@ pub(crate) async fn generate_diagnostics_internal(
         vulnerabilities,
         outcomes,
         licenses,
+        typosquats,
     )) = extracted
     else {
         return vec![];
@@ -302,6 +304,23 @@ pub(crate) async fn generate_diagnostics_internal(
     };
 
     let policy = state.license_policy();
+    // Issue #1437 security review N1 (impl-critic extended scope): `doc.typosquats` can
+    // still hold signals resolved while the feature was enabled and online — a live
+    // `did_change_configuration` disabling it, or a transition to offline, must stop
+    // rendering them immediately (FR-009/NFR-001), not just stop refreshing them (the
+    // background prefetch already self-guards on both checks, so it never repopulates the
+    // map once disabled/offline, but a *previously* populated map must not keep being
+    // attached here either). An empty map is attached instead of `doc.typosquats` in
+    // either case, rather than reading the field at all. (A dependency whose *source*
+    // changes to private is handled separately, at read time, by
+    // `apply_typosquat_rule`'s own re-check — that's a per-dependency concern this
+    // document-wide gate can't express.)
+    let empty_typosquats = std::collections::HashMap::new();
+    let typosquat_prefetch = if state.is_typosquat_enabled() && !offline {
+        &typosquats
+    } else {
+        &empty_typosquats
+    };
     let version_data = VersionData::new(&cached_versions, &resolved_versions)
         .with_resolved_version_candidates(&resolved_version_candidates)
         .with_vulnerabilities(&vulnerabilities)
@@ -310,7 +329,8 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_offline(offline)
         .with_license_source(ecosystem.license_source())
         .with_license_policy(&policy)
-        .with_license_prefetch(&licenses);
+        .with_license_prefetch(&licenses)
+        .with_typosquat_prefetch(typosquat_prefetch);
 
     let domain_diagnostics = ecosystem
         .generate_diagnostics(
@@ -334,6 +354,76 @@ mod tests {
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
     use deps_core::EcosystemId;
+
+    /// Resolves a real `crossenv`/`cross-env` typosquat signal through a mocked deps.dev
+    /// server, for tests that need a genuine signal without hand-constructing
+    /// `TyposquatSignal` (it's `#[non_exhaustive]`, deliberately not publicly constructible)
+    /// and without re-deriving the mock setup at every call site.
+    async fn resolve_test_crossenv_typosquat_signal(
+        ecosystem: &dyn deps_core::Ecosystem,
+        parse_result: &dyn deps_core::ParseResult,
+    ) -> std::collections::HashMap<deps_core::PackageName, deps_core::TyposquatSignal> {
+        let mut server = mockito::Server::new_async().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "crossenv"}, "packages": [{"packageKey": {"name": "cross-env"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let _declared_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/crossenv")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _declared_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 3}"#)
+            .create_async()
+            .await;
+        let _candidate_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/cross-env")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "7.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _candidate_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/cross-env/versions/7.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 900}"#)
+            .create_async()
+            .await;
+
+        let mocked_deps_dev = Arc::new(deps_core::DepsDevClient::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        ));
+        let typosquats = deps_core::lsp_helpers::fetch_typosquat_signals(
+            deps_core::EcosystemId::Npm,
+            parse_result,
+            ecosystem.formatter(),
+            false,
+            Some(&mocked_deps_dev),
+        )
+        .await;
+        assert!(
+            !typosquats.is_empty(),
+            "pre-fetch must have resolved a signal"
+        );
+        typosquats
+    }
 
     #[test]
     fn test_loading_ceiling_small_manifest_hits_floor() {
@@ -378,6 +468,214 @@ mod tests {
         assert_eq!(loading_ceiling(300, 300, 1), MAX_LOADING_CEILING);
         // Defaults (C=20, T=10s) with a very large manifest also hits the cap.
         assert_eq!(loading_ceiling(10, 2000, 20), MAX_LOADING_CEILING);
+    }
+
+    /// Issue #1437 NFR-002 (perf-review finding): diagnostics generation must never
+    /// `.await` a deps.dev fan-out inline — `VersionData::typosquat_prefetch` is read
+    /// synchronously from `DocumentState::typosquats`, populated ahead of time by a
+    /// background prefetch (`document::osv_scan::run_typosquat_prefetch`), never fetched
+    /// on this path. Proven here by enabling the feature, populating `doc.typosquats`
+    /// directly (bypassing the prefetch entirely, simulating "prefetch already
+    /// completed"), and wrapping the call in a deliberately tiny timeout: if a future
+    /// regression reintroduced an inline deps.dev `.await` here, this would either hang
+    /// against the real `https://api.deps.dev` `state.deps_dev` still points at (never
+    /// otherwise reached in this test) or blow well past the timeout.
+    #[tokio::test]
+    async fn test_generate_diagnostics_internal_typosquat_prefetch_is_synchronous() {
+        use crate::document::DocumentState;
+
+        // See the comment in `test_unknown_package_uses_configured_severity` on why this
+        // guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        state.set_typosquat_enabled(true);
+        let url = deps_core::test_util::test_uri("/test/package.json");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Npm)
+            .unwrap();
+        let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#.to_string();
+        let parse_result = ecosystem
+            .parse_manifest(&content, &url)
+            .await
+            .expect("Failed to parse manifest");
+
+        // Resolved through a mocked server, the same way
+        // `document::osv_scan::run_typosquat_prefetch` resolves it in production — the
+        // network round trip happens here, in setup, *before* the timed call below, never
+        // inside `generate_diagnostics_internal` itself.
+        let typosquats =
+            resolve_test_crossenv_typosquat_signal(ecosystem.as_ref(), parse_result.as_ref()).await;
+
+        let mut doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
+        let mut cached = std::collections::HashMap::new();
+        cached.insert(
+            "crossenv".into(),
+            deps_core::PackageVersions::latest_only("1.0.0"),
+        );
+        doc_state.update_cached_versions(cached);
+        doc_state.set_loaded();
+        doc_state.merge_typosquats(typosquats);
+        state.update_document(uri.clone(), doc_state);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            generate_diagnostics_internal(
+                Arc::clone(&state),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+                false,
+                MIN_LOADING_CEILING,
+            ),
+        )
+        .await
+        .expect(
+            "generate_diagnostics_internal must never block on a deps.dev fan-out \
+             (NFR-002) — it timed out, which means the typosquat prefetch is (again) \
+             being awaited inline on this path",
+        );
+
+        assert!(
+            result.iter().any(|d| matches!(
+                &d.code,
+                Some(tower_lsp_server::ls_types::NumberOrString::String(code))
+                    if code == deps_core::lsp_helpers::TYPOSQUAT_DIAGNOSTIC_CODE
+            )),
+            "expected a typosquat diagnostic from the pre-populated `doc.typosquats` map, \
+             got: {result:?}"
+        );
+    }
+
+    /// Issue #1437 security review N1: a live `did_change_configuration` disabling
+    /// `policy.typosquat.enabled` must stop the diagnostic from rendering immediately
+    /// (FR-009), not just stop the background prefetch from refreshing it — a signal
+    /// resolved *while the feature was enabled* must not keep appearing in `doc.typosquats`
+    /// after it's turned off, simulated here by disabling only *after* populating the map
+    /// directly (bypassing the prefetch, which would itself never repopulate once
+    /// disabled — this test isolates the read-side half of the fix).
+    #[tokio::test]
+    async fn test_generate_diagnostics_internal_typosquat_disabled_suppresses_stale_signal() {
+        use crate::document::DocumentState;
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        state.set_typosquat_enabled(true);
+        let url = deps_core::test_util::test_uri("/test/package.json");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Npm)
+            .unwrap();
+        let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#.to_string();
+        let parse_result = ecosystem
+            .parse_manifest(&content, &url)
+            .await
+            .expect("Failed to parse manifest");
+
+        let typosquats =
+            resolve_test_crossenv_typosquat_signal(ecosystem.as_ref(), parse_result.as_ref()).await;
+
+        let mut doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
+        let mut cached = std::collections::HashMap::new();
+        cached.insert(
+            "crossenv".into(),
+            deps_core::PackageVersions::latest_only("1.0.0"),
+        );
+        doc_state.update_cached_versions(cached);
+        doc_state.set_loaded();
+        doc_state.merge_typosquats(typosquats);
+        state.update_document(uri.clone(), doc_state);
+
+        // Disabled *after* the (simulated-stale) signal already landed in `doc.typosquats`.
+        state.set_typosquat_enabled(false);
+
+        let result = generate_diagnostics_internal(
+            Arc::clone(&state),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+            false,
+            MIN_LOADING_CEILING,
+        )
+        .await;
+
+        assert!(
+            !result.iter().any(|d| matches!(
+                &d.code,
+                Some(tower_lsp_server::ls_types::NumberOrString::String(code))
+                    if code == deps_core::lsp_helpers::TYPOSQUAT_DIAGNOSTIC_CODE
+            )),
+            "a stale `doc.typosquats` entry must not render once the feature is disabled, \
+             got: {result:?}"
+        );
+    }
+
+    /// Issue #1437 impl-critic N1 (extending security's N1 to the offline case): a stale
+    /// `doc.typosquats` entry — resolved while online — must also stop rendering the moment
+    /// the server goes offline, same rationale as the disabled case above, checked via the
+    /// `offline` parameter `generate_diagnostics_internal` already threads through (still
+    /// enabled the whole time, unlike the sibling test).
+    #[tokio::test]
+    async fn test_generate_diagnostics_internal_offline_suppresses_stale_signal() {
+        use crate::document::DocumentState;
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        state.set_typosquat_enabled(true);
+        let url = deps_core::test_util::test_uri("/test/package.json");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Npm)
+            .unwrap();
+        let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#.to_string();
+        let parse_result = ecosystem
+            .parse_manifest(&content, &url)
+            .await
+            .expect("Failed to parse manifest");
+
+        let typosquats =
+            resolve_test_crossenv_typosquat_signal(ecosystem.as_ref(), parse_result.as_ref()).await;
+
+        let mut doc_state =
+            DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result);
+        let mut cached = std::collections::HashMap::new();
+        cached.insert(
+            "crossenv".into(),
+            deps_core::PackageVersions::latest_only("1.0.0"),
+        );
+        doc_state.update_cached_versions(cached);
+        doc_state.set_loaded();
+        doc_state.merge_typosquats(typosquats);
+        state.update_document(uri.clone(), doc_state);
+
+        // `policy.typosquat.enabled` stays `true` — only `offline` (the argument
+        // `generate_diagnostics_internal` already threads through) flips.
+        let result = generate_diagnostics_internal(
+            Arc::clone(&state),
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::DiagnosticSeverities::default(),
+            true,
+            MIN_LOADING_CEILING,
+        )
+        .await;
+
+        assert!(
+            !result.iter().any(|d| matches!(
+                &d.code,
+                Some(tower_lsp_server::ls_types::NumberOrString::String(code))
+                    if code == deps_core::lsp_helpers::TYPOSQUAT_DIAGNOSTIC_CODE
+            )),
+            "a stale `doc.typosquats` entry must not render while offline, got: {result:?}"
+        );
     }
 
     #[tokio::test]

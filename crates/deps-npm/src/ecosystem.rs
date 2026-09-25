@@ -228,6 +228,13 @@ impl Ecosystem for NpmEcosystem {
     /// FR-005/FR-006) to the shared default's output — additive, since the base pass never
     /// evaluates a catalog dependency's outdated/unsatisfiable/yanked status once
     /// `version_req` is `None` (the module's totality invariant closes that off structurally).
+    ///
+    /// Delegates to `deps_core::lsp_helpers::generate_diagnostics_from_cache` directly, same
+    /// as the shared default — the typosquat-suspect diagnostic (issue #1437) needs no
+    /// special handling here: it is evaluated inside that shared function itself, from
+    /// `versions.typosquat_prefetch` (a background pre-fetch merged in by
+    /// `deps-lsp::handlers::diagnostics`, the same way `versions.license_prefetch` already
+    /// is), so this override picks it up automatically with no `.await` on this path.
     fn generate_diagnostics<'a>(
         &'a self,
         parse_result: &'a dyn ParseResultTrait,
@@ -1129,6 +1136,117 @@ mod tests {
             .await;
 
         assert!(diagnostics.is_empty());
+    }
+
+    /// Issue #1437 security-review regression: this override previously called
+    /// `deps_core::lsp_helpers::generate_diagnostics_from_cache` directly while the
+    /// typosquat diagnostic lived behind `Ecosystem::generate_diagnostics`'s default-impl
+    /// wrapper, so this override silently never fired it — npm is the flagship ecosystem
+    /// for this feature (every empirical pair in spec 071's plan.md evidence table is npm).
+    /// Now that the diagnostic is evaluated directly inside `generate_diagnostics_from_cache`
+    /// from `VersionData::typosquat_prefetch` (NFR-002: no inline deps.dev `.await` on this
+    /// path), this proves it fires end-to-end through npm's *real* `generate_diagnostics`
+    /// override given a pre-resolved signal, exactly the shape
+    /// `deps-lsp::document::osv_scan::run_typosquat_prefetch` hands every ecosystem.
+    #[tokio::test]
+    async fn test_generate_diagnostics_typosquat_signal_fires_through_npm_override() {
+        // See the comment in `test_package_name_completion_context_has_real_range` on why
+        // this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let mut server = mockito::Server::new_async().await;
+        let _similarity = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv:similarlyNamedPackages",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"packageKey": {"name": "crossenv"}, "packages": [{"packageKey": {"name": "cross-env"}}]}"#,
+            )
+            .create_async()
+            .await;
+        let _declared_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/crossenv")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "1.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _declared_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/crossenv/versions/1.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 3}"#)
+            .create_async()
+            .await;
+        let _candidate_package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/cross-env")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": "7.0.0"}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let _candidate_dependents = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/cross-env/versions/7.0.0:dependents",
+            )
+            .with_status(200)
+            .with_body(r#"{"dependentCount": 900}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NpmEcosystem::new(Arc::clone(&cache));
+        let uri = deps_core::test_util::test_uri("/test/package.json");
+        let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#;
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            pkg("crossenv"),
+            deps_core::lsp_helpers::PackageVersions::latest_only("1.0.0"),
+        );
+        let resolved_versions = HashMap::new();
+
+        // Resolves the map the same way `deps-lsp::document::osv_scan::run_typosquat_prefetch`
+        // does in production (issue #1437 NFR-002: a background pre-fetch, not an inline
+        // await on this test's own `generate_diagnostics` call below).
+        let deps_dev = Arc::new(deps_core::DepsDevClient::for_test(cache, server.url()));
+        let typosquat = deps_core::lsp_helpers::fetch_typosquat_signals(
+            deps_core::EcosystemId::Npm,
+            parse_result.as_ref(),
+            ecosystem.formatter(),
+            false,
+            Some(&deps_dev),
+        )
+        .await;
+        assert!(
+            !typosquat.is_empty(),
+            "pre-fetch must have resolved a signal"
+        );
+
+        let versions = VersionData::new(&cached_versions, &resolved_versions)
+            .with_ecosystem(deps_core::EcosystemId::Npm)
+            .with_typosquat_prefetch(&typosquat);
+
+        let diagnostics = ecosystem
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                versions,
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.code() == Some(deps_core::lsp_helpers::TYPOSQUAT_DIAGNOSTIC_CODE)),
+            "expected a typosquat diagnostic through npm's real generate_diagnostics \
+             override, got: {diagnostics:?}"
+        );
     }
 
     /// #1038: was a live-registry round-trip against [`UNKNOWN_PACKAGE`] asserting only

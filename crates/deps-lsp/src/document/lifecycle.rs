@@ -10,6 +10,7 @@ use super::fetch::{
 use super::loader::{MAX_FILE_SIZE, load_document_from_disk};
 use super::osv_scan::{
     OsvScanResult, run_license_prefetch, run_osv_phase_b_and_commit, run_osv_scan_phase_a,
+    run_typosquat_prefetch,
 };
 use super::resolved::RefetchPolicy;
 use super::state::{DocumentState, ServerState};
@@ -152,6 +153,7 @@ pub async fn handle_document_open(
             Arc::clone(&state),
             Arc::clone(&ecosystem),
             client.clone(),
+            Arc::clone(&config),
             diagnostics_snapshot,
             vulnerabilities_enabled,
         )
@@ -179,6 +181,7 @@ async fn run_document_open_background_task(
     state: Arc<ServerState>,
     ecosystem: Arc<dyn Ecosystem>,
     client: Client,
+    config: Arc<RwLock<DepsConfig>>,
     diagnostics_snapshot: diagnostics::DiagnosticsSnapshot,
     vulnerabilities_enabled: bool,
 ) {
@@ -268,6 +271,18 @@ async fn run_document_open_background_task(
             diagnostics_snapshot.fetch_timeout_secs,
         )
         .instrument(tracing::Span::current()),
+    );
+
+    // Typosquat pre-fetch (issue #1437) — unlike `license_task` above, deliberately *not*
+    // joined before this function's diagnostics publish (impl-critic N2). See
+    // `spawn_typosquat_prefetch_and_republish`'s own doc for why.
+    spawn_typosquat_prefetch_and_republish(
+        uri.clone(),
+        Arc::clone(&state),
+        client.clone(),
+        Arc::clone(&ecosystem),
+        Arc::clone(&config),
+        diagnostics_snapshot.fetch_timeout_secs,
     );
 
     // Collect dependency names+sources, the in-use-version map (§4.6), and the manifest's own
@@ -471,7 +486,9 @@ async fn run_document_open_background_task(
     }
 
     // Join the tier-3 license pre-fetch too (round 3 finding #3), for the same reason:
-    // its commit must land before this publish, not after.
+    // its commit must land before this publish, not after. The typosquat pre-fetch,
+    // spawned above via `spawn_typosquat_prefetch_and_republish`, is deliberately *not*
+    // joined here (impl-critic N2) — it republishes on its own once it resolves.
     await_license_prefetch(Some(license_task)).await;
 
     // Publish diagnostics (may be slower, runs after hints are already visible)
@@ -648,6 +665,9 @@ fn commit_parsed_document(
         // removed while staying open accumulated an ever-growing set of orphaned license
         // entries never reclaimed until the document closed.
         doc_state.licenses.remove(removed_dep);
+        // Raw-`dep.name()`-keyed, same as `licenses` above (issue #1437) — same orphaned-entry
+        // reclaim rationale.
+        doc_state.typosquats.remove(removed_dep);
         let removed_normalized_name = formatter.normalize_package_name(removed_dep);
         doc_state
             .vulnerabilities
@@ -867,6 +887,7 @@ pub(crate) async fn handle_document_change_guarded(
                 vulnerabilities_enabled,
                 refetch,
             },
+            Arc::clone(&config),
             needs_osv_rescan,
             deps_to_fetch,
         )
@@ -960,6 +981,14 @@ pub(crate) fn change_task_triggers(
 /// been committed: reloads lock-file-resolved versions, then runs the OSV rescan
 /// concurrently with any registry fetch the diff calls for, and finally publishes the
 /// resulting diagnostics.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "issue #1437 added `live_config` alongside the pre-existing, already-bundled \
+              `config: ChangeTaskConfig` — it must stay a separate parameter (not folded into \
+              that struct) specifically so `ChangeTaskConfig`'s own \"the task never needs to \
+              hold the config lock itself\" property keeps holding for every other read in \
+              this task; bundling it in would just relocate, not reduce, the parameter list"
+)]
 #[tracing::instrument(skip_all, fields(uri = ?uri, ecosystem = ecosystem.id()))]
 async fn run_document_change_task(
     uri: Uri,
@@ -967,6 +996,13 @@ async fn run_document_change_task(
     ecosystem: Arc<dyn Ecosystem>,
     client: Client,
     config: ChangeTaskConfig,
+    // Issue #1437 impl-critic M1: the *live* config handle, threaded through separately
+    // from the already-snapshotted `config: ChangeTaskConfig` above — needed only so
+    // `spawn_typosquat_prefetch_and_republish`'s eventual republish (up to ~10s later) can
+    // re-read current settings rather than this task's own spawn-time snapshot. Every other
+    // use in this task deliberately reads only `config: ChangeTaskConfig`, preserving that
+    // struct's own "the task never needs to hold the config lock itself" property.
+    live_config: Arc<RwLock<DepsConfig>>,
     needs_osv_rescan: bool,
     deps_to_fetch: Vec<PackageName>,
 ) {
@@ -1093,6 +1129,29 @@ async fn run_document_change_task(
         )
     });
 
+    // Typosquat pre-fetch (issue #1437), spawned unconditionally (unlike `license_task`
+    // above, this has no cheap "did dependency names change" pre-check comparable to
+    // `needs_license_refresh` at this call site) — self-guards internally
+    // (`ServerState::is_typosquat_enabled`/offline), so this is a no-op spawn for the common
+    // (disabled) case, same as the open-path spawn. Deliberately *not* joined before either
+    // of this function's diagnostics publishes below (impl-critic N2) — see
+    // `spawn_typosquat_prefetch_and_republish`'s own doc for why.
+    spawn_typosquat_prefetch_and_republish(
+        uri.clone(),
+        Arc::clone(&state),
+        client.clone(),
+        Arc::clone(&ecosystem),
+        Arc::clone(&live_config),
+        config.diagnostics.fetch_timeout_secs,
+    );
+
+    // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
+    // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty
+    // and this early-return skips the fetch — existing dependencies keep their
+    // `cached_versions` computed under the *previous* stability floor until the document
+    // is closed and reopened. Not fixed here: doing so would mean treating a
+    // `minimum_stability` change as its own full-refetch trigger in the diff above, a
+    // separate concern from #424's parse+thread scope.
     if deps_to_fetch.is_empty() {
         tracing::debug!("no added or version-changed dependencies, skipping registry fetch");
 
@@ -1256,6 +1315,99 @@ async fn await_license_prefetch(task: Option<JoinHandle<()>>) {
     };
     if let Err(e) = task.await {
         tracing::warn!("license pre-fetch task failed: {e}");
+    }
+}
+
+/// Spawns [`run_typosquat_prefetch`] fully detached — never joined before the caller's own
+/// diagnostics publish (issue #1437 impl-critic N2, correcting an earlier design that
+/// mirrored [`await_license_prefetch`]'s join-before-publish shape for typosquat too).
+///
+/// `run_license_prefetch`'s join is a deliberate tradeoff: it only ever touches four small
+/// tier-3 ecosystems, and a license-policy violation is judged important enough to justify
+/// briefly delaying the first diagnostics publish for it. Typosquat has neither property —
+/// it fans out across all seven major deps.dev ecosystems, each dependency can cost up to
+/// `2 + 2N` sequential-per-candidate deps.dev round trips, and the resulting diagnostic is
+/// an opt-in, best-effort `Severity::Hint`. Gating real OSV/outdated diagnostics on it would
+/// violate spec 071 NFR-001 ("never becomes a reliability liability"). So this spawns the
+/// pre-fetch, and — only if it actually commits a non-empty result — issues its own
+/// follow-up `publish_document_diagnostics` call once it resolves, rather than blocking the
+/// publish the caller was already about to make.
+///
+/// `fetch_timeout_secs` bounds the pre-fetch itself and is taken as the caller's spawn-time
+/// value (matching every other background task's timeout parameter — an internal tuning
+/// value, not something a live setting change needs to affect retroactively). `config` is
+/// re-read for the *republish* only, right before `publish_document_diagnostics` (issue
+/// #1437 impl-critic M1): the pre-fetch can take up to ~10s, and reusing a spawn-time
+/// `DiagnosticsSnapshot` for that call would show the user's severity/freshness/offline
+/// settings as they were when the prefetch *started*, not as they are by the time it
+/// actually publishes.
+fn spawn_typosquat_prefetch_and_republish(
+    uri: Uri,
+    state: Arc<ServerState>,
+    client: Client,
+    ecosystem: Arc<dyn Ecosystem>,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    tokio::spawn(
+        async move {
+            let changed = run_typosquat_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                ecosystem,
+                fetch_timeout_secs,
+            )
+            .await;
+            if changed {
+                let snapshot = {
+                    let cfg = config.read().await;
+                    diagnostics::DiagnosticsSnapshot::from_config(&cfg)
+                };
+                let dep_count = diagnostics::document_dependency_count(&state, &uri);
+                diagnostics::publish_document_diagnostics(
+                    &state, &client, &uri, &snapshot, dep_count,
+                )
+                .await;
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+}
+
+/// Triggers the typosquat pre-fetch for every currently open document (issue #1437 M1) —
+/// intended to be called once, from `Backend::did_change_configuration`, exactly when
+/// `policy.typosquat.enabled` transitions from `false` to `true`, so an already-open
+/// document picks up the signal immediately instead of waiting for its next edit or
+/// reopen. Fires-and-forgets one [`spawn_typosquat_prefetch_and_republish`] per document —
+/// this function itself returns as soon as every per-document task is spawned, without
+/// waiting for any of them to resolve. A document whose ecosystem has since been
+/// unregistered (should not happen in practice) is silently skipped rather than panicking.
+pub(crate) fn trigger_typosquat_prefetch_for_open_documents(
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    let uris: Vec<Uri> = state
+        .documents
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    for uri in uris {
+        let Some(ecosystem_id) = state.with_document(&uri, |doc| doc.ecosystem) else {
+            continue;
+        };
+        let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_id) else {
+            continue;
+        };
+        spawn_typosquat_prefetch_and_republish(
+            uri,
+            Arc::clone(state),
+            client.clone(),
+            ecosystem,
+            Arc::clone(&config),
+            fetch_timeout_secs,
+        );
     }
 }
 
