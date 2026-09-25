@@ -168,22 +168,19 @@ impl GradleEcosystem {
                     deps_core::completion::DeclarationScope::Unchecked,
                 )
             }
-            // Plugin version literals (see `is_plugin_version_literal_position`) are narrowly
-            // suppressed here; every other completion in these manifest kinds still reaches
-            // `detect_dsl_context` below.
+            // `settings.gradle(.kts)`/`build.gradle(.kts)` also declare plugins
+            // (`id(...) version "..."`); a plugin id or version literal has no colon and, before
+            // issue #1447's fix, was misdetected as a `Package` context, issuing a registry
+            // *search* on the typed text (issues #1436/#1441/#1446). `detect_dsl_context`'s
+            // `Package` arm now gates on a call-shape check for every manifest kind that reaches
+            // it — `id`/`kotlin`/`version` are positively-excluded call words (see
+            // `NON_DEPENDENCY_CALL_WORDS`), so that gate alone withholds completion here; no
+            // Settings/Build-specific suppression is needed on top of it (previously
+            // `is_plugin_version_literal_position`, removed as redundant).
             crate::parser::GradleManifestKind::KotlinBuild
             | crate::parser::GradleManifestKind::GroovyBuild
             | crate::parser::GradleManifestKind::Settings => {
-                if is_plugin_version_literal_position(before_cursor) {
-                    (
-                        GradleCompletionContext::None,
-                        "",
-                        Range::default(),
-                        deps_core::completion::DeclarationScope::Unchecked,
-                    )
-                } else {
-                    detect_dsl_context(before_cursor, line, col_idx, position.line)
-                }
+                detect_dsl_context(before_cursor, line, col_idx, position.line)
             }
             crate::parser::GradleManifestKind::Other => (
                 GradleCompletionContext::None,
@@ -193,39 +190,6 @@ impl GradleEcosystem {
             ),
         }
     }
-}
-
-/// Whether `before_cursor` ends inside an open string literal immediately preceded (past
-/// whitespace and an optional method-call `(`) by the bare `version` keyword — both the
-/// infix form `id("x") version "1.<cursor>"` and the method-call form
-/// `id("x").version("1.<cursor>"` — the plugin version-literal shape `detect_dsl_context`'s
-/// colon-count heuristic misreads as a `Package` context (issues #1436 and #1441, see
-/// [`GradleEcosystem::detect_completion_context`]'s `KotlinBuild`/`GroovyBuild`/`Settings`
-/// arm).
-///
-/// Boundary-checked (`strip_suffix("version")` alone would also match `myversion`/
-/// `compileVersion`-style identifiers) so this only fires for the standalone `version` keyword,
-/// not a longer identifier that happens to end with it.
-// `open.open` is `quote_scan::last_string_literal`'s own byte offset of an ASCII `'"'`/`'\''`
-// token — always a char boundary, same guarantee `detect_dsl_context` relies on for its
-// identical `open_pos` slicing above.
-#[cfg(feature = "lsp-responses")]
-#[allow(clippy::string_slice)]
-fn is_plugin_version_literal_position(before_cursor: &str) -> bool {
-    let Some(open) = quote_scan::last_string_literal(before_cursor, ScanSyntax::Groovy)
-        .filter(|span| span.close.is_none())
-    else {
-        return false;
-    };
-    let mut before = before_cursor[..open.open].trim_end();
-    if let Some(stripped) = before.strip_suffix('(') {
-        before = stripped.trim_end();
-    }
-    let Some(before_version) = before.strip_suffix("version") else {
-        return false;
-    };
-    before_version.is_empty()
-        || !before_version.ends_with(|c: char| c.is_alphanumeric() || c == '_')
 }
 
 /// Builds an LSP [`Range`] on `line_idx` from a pair of byte offsets into `line`,
@@ -245,26 +209,31 @@ fn byte_range(line: &str, line_idx: u32, start_byte: usize, end_byte: usize) -> 
     )
 }
 
-/// Determines whether the string literal opening at byte offset `open_pos` on `line` sits
-/// inside a recognized Gradle dependency-configuration call (`implementation(...)`,
-/// `api(...)`, `implementation(platform(...))`, `compile platform('...')`, ...), by walking
-/// backward from `open_pos` over the call syntax `crate::parser::groovy`/`crate::parser::kotlin`'s
-/// own regexes accept (issue #1191).
+/// Restricts [`detect_dsl_context`]'s `Version`-arm same-line pass-2 fallback (see
+/// [`deps_core::completion::literal_version_dependency_in_scope`]'s doc) to this literal's own
+/// declaration, using [`resolve_call_word`]'s shared call-shape walk (issue #1191, generalized
+/// for #1447).
 ///
-/// The walk strips, in order and repeating whitespace at every step: an optional `(`, an
-/// optional `platform`/`enforcedPlatform` keyword, and another optional `(` — covering both
-/// the direct-call (`implementation("g:a:v")`) and platform-wrapped
-/// (`implementation(platform("g:a:v"))`, or the without-parens Groovy form
-/// `implementation platform('g:a:v')`) shapes. What remains is checked as the trailing
-/// `[A-Za-z0-9_]+` configuration word — but only when at least one whitespace-or-`(`
-/// separator was actually consumed before it, so a literal with nothing call-shaped before it
-/// (e.g. line-start indentation only) is never mistaken for a bare configuration word.
+/// Deliberately does **not** share its own classification with the `Package` arm's gate
+/// ([`package_completion_gate`]) despite sharing that walk — the two arms have different
+/// failure costs (a missed `Package` denial only costs a stray registry search on text the user
+/// typed; wrongly admitting a `Version` pass-2 candidate silently offers a *different*
+/// package's versions, issue #1191's misattribution class), so `Version`'s own scope check
+/// stays strict (default-deny on anything not positively recognized) while `Package`'s gate is
+/// default-allow (see [`PackageGate`]'s doc).
 ///
-/// Returns [`DeclarationScope::Outside`] when no separator was consumed, no word is found, or
-/// the word is not [`crate::parser::is_dependency_configuration`] — e.g. `println("...")` or
-/// an unrecognized call. Otherwise returns [`DeclarationScope::Within`] spanning from the
-/// configuration word's start to `value_end` (the same end-of-literal-or-cursor bound the
-/// `Version` arm of [`detect_dsl_context`] already computes).
+/// Returns [`DeclarationScope::Outside`] when the resolved word is empty or not
+/// [`crate::parser::is_dependency_configuration`] — e.g. `println("...")` or an unrecognized
+/// call — or when [`resolve_call_word`] finds a bare assignment with no call word at all.
+/// Otherwise returns [`DeclarationScope::Within`] spanning from `open_pos` (the current
+/// literal's own start, **not** the configuration word's start — impl-critic S2 on #1447: a
+/// span starting at the word extends across any earlier, already-closed vararg sibling this
+/// literal shares a call with, e.g. `implementation "a:b:1.0", "c:d:<cursor>` — so pass 2's
+/// `position_in_range(anchor, span)` check would wrongly admit the sibling `a:b`'s own anchor,
+/// fetching the wrong package's versions) to `value_end` (the same end-of-literal-or-cursor
+/// bound the `Version` arm of [`detect_dsl_context`] already computes). Every real anchor for
+/// *this* literal's own declaration (its `version_range`/`name_range` start) necessarily falls
+/// after `open_pos`, so narrowing the span start this way never rejects a legitimate rescue.
 ///
 /// The word scan is ASCII-only (`[A-Za-z0-9_]`), unlike the parsers' Unicode `\w+`: a
 /// non-ASCII custom source-set name (e.g. `kaptDébug`) degrades to pre-#1191 behavior for
@@ -280,43 +249,263 @@ fn dsl_declaration_scope(
 ) -> deps_core::completion::DeclarationScope {
     use deps_core::completion::DeclarationScope;
 
-    let mut rest = line[..open_pos].trim_end();
-    let mut consumed_separator = rest.len() != line[..open_pos].len();
+    let blanked = quote_scan::blank_comments(&line[..open_pos], ScanSyntax::Groovy);
+    let code = CodeSpans::new(&blanked, ScanSyntax::Groovy);
 
-    if let Some(stripped) = rest.strip_suffix('(') {
-        consumed_separator = true;
-        rest = stripped.trim_end();
-    }
-
-    if let Some(stripped) = rest
-        .strip_suffix("platform")
-        .or_else(|| rest.strip_suffix("enforcedPlatform"))
-    {
-        consumed_separator = true;
-        rest = stripped.trim_end();
-
-        if let Some(stripped) = rest.strip_suffix('(') {
-            consumed_separator = true;
-            rest = stripped.trim_end();
-        }
-    }
-
-    if !consumed_separator {
-        return DeclarationScope::Outside;
-    }
-
-    let word_start = rest
-        .char_indices()
-        .rev()
-        .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_'))
-        .map_or(0, |(i, c)| i + c.len_utf8());
-    let word = &rest[word_start..];
+    let word = match resolve_call_word(&blanked, &code) {
+        CallWordResolution::Word(word) => word,
+        CallWordResolution::Assignment => "",
+    };
 
     if word.is_empty() || !crate::parser::is_dependency_configuration(word) {
         return DeclarationScope::Outside;
     }
 
-    DeclarationScope::Within(byte_range(line, line_idx, word_start, value_end).into())
+    DeclarationScope::Within(byte_range(line, line_idx, open_pos, value_end).into())
+}
+
+/// Finds the byte offset of the `(` in `text` that has no matching `)` between it and `text`'s
+/// end — the paren directly enclosing whatever expression sits at the end of `text` — by
+/// scanning backward and tracking paren balance, skipping any `(`/`)` that `code` (built over
+/// the same `text`) marks as sitting inside a string literal.
+///
+/// Returns `None` when every paren in `text` is already balanced: either there is no call at
+/// all (a paren-less call), or the nearest call's parens are already fully closed before
+/// `text`'s end (e.g. `id("x") version ` — `id(...)` is a separate, already-closed call, not an
+/// enclosing one).
+#[cfg(feature = "lsp-responses")]
+fn enclosing_open_paren(text: &str, code: &CodeSpans<'_>) -> Option<usize> {
+    let mut depth: i32 = 0;
+    for (i, c) in text.char_indices().rev() {
+        if !code.is_code_byte(i) {
+            continue;
+        }
+        match c {
+            ')' => depth += 1,
+            '(' if depth == 0 => return Some(i),
+            '(' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Extracts the identifier word immediately before `paren_pos` in `blanked` — the call name
+/// governing whatever sits inside that paren — after stripping one optional
+/// `platform`/`enforcedPlatform` wrapper keyword and its own enclosing `(`, covering
+/// `implementation(platform("g:a:v"))`.
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn call_word_before_paren(blanked: &str, paren_pos: usize) -> &str {
+    let mut rest = blanked[..paren_pos].trim_end();
+    if let Some(stripped) = rest
+        .strip_suffix("platform")
+        .or_else(|| rest.strip_suffix("enforcedPlatform"))
+    {
+        rest = stripped.trim_end();
+        if let Some(stripped) = rest.strip_suffix('(') {
+            rest = stripped.trim_end();
+        }
+    }
+    word_before(rest)
+}
+
+/// Extracts the trailing ASCII `[A-Za-z0-9_]+` identifier word `rest` ends with (empty if
+/// `rest` doesn't end in one).
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn word_before(rest: &str) -> &str {
+    let word_start = rest
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '_'))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    &rest[word_start..]
+}
+
+/// Upper bound on the sibling arguments [`skip_vararg_siblings`] walks over in one call.
+///
+/// Each accepted sibling costs a fresh [`quote_scan::last_string_literal`] scan of the
+/// remaining text, so an uncapped walk on a crafted line with an unrealistic sibling count is
+/// `O(line length²)` (issue #1447 impl-critic S3 — live-reproduced as a completion-handler hang
+/// on a single ~100 KB line with ~20k comma-separated arguments). Capping bounds total work to
+/// `O(MAX_VARARG_SIBLINGS * line length)` regardless of how many siblings a crafted line
+/// claims; no real Gradle dependency declaration has anywhere near this many comma-separated
+/// coordinates in one call.
+#[cfg(feature = "lsp-responses")]
+const MAX_VARARG_SIBLINGS: usize = 32;
+
+/// Walks `rest` backward over up to [`MAX_VARARG_SIBLINGS`] already-closed, comma-separated
+/// sibling arguments — Gradle Groovy's vararg form of a dependency-configuration call,
+/// `implementation "a:b:1.0", "c:d:2.0<cursor>` — returning what remains before the first
+/// non-sibling boundary, and whether at least one `,` was actually consumed.
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn skip_vararg_siblings(mut rest: &str) -> (&str, bool) {
+    let mut consumed = false;
+    for _ in 0..MAX_VARARG_SIBLINGS {
+        let Some(stripped) = rest.strip_suffix(',') else {
+            break;
+        };
+        consumed = true;
+        rest = stripped.trim_end();
+        let Some(sibling) = quote_scan::last_string_literal(rest, ScanSyntax::Groovy) else {
+            break;
+        };
+        if sibling.close != Some(rest.len()) {
+            break;
+        }
+        rest = rest[..sibling.open].trim_end();
+    }
+    (rest, consumed)
+}
+
+/// What [`resolve_call_word`] found governing an open string literal: either an identifier
+/// word (checked by each caller against its own criteria — [`crate::parser::is_dependency_configuration`]
+/// for [`dsl_declaration_scope`], [`NON_DEPENDENCY_CALL_WORDS`] for [`package_completion_gate`]),
+/// or a bare assignment with no call word at all.
+#[cfg(feature = "lsp-responses")]
+enum CallWordResolution<'a> {
+    /// An identifier word (possibly empty, meaning nothing identifier-shaped precedes the
+    /// resolved call/position at all — e.g. Kotlin's string-invoke syntax
+    /// `"implementation"(...)`, or a multi-line call whose `(` sits on an earlier line, outside
+    /// `blanked`'s single-line scope) sits immediately before the resolved call.
+    Word(&'a str),
+    /// No call word to check at all: a trailing `=` with nothing but whitespace before it (a
+    /// project-metadata assignment, e.g. `group = "<cursor>`) — only reachable when there's no
+    /// enclosing paren.
+    Assignment,
+}
+
+/// Resolves what call, if any, governs the string literal opening at `open_pos` on `line` —
+/// finding its nearest enclosing, syntactically unmatched `(` (issue #1191, generalized for
+/// #1447) if any, else a Groovy without-parens call's own configuration word (including its
+/// vararg form).
+///
+/// Shared by both [`dsl_declaration_scope`] (the `Version` arm's pass-2 restrictor) and
+/// [`package_completion_gate`] (the `Package` arm's gate) — the two differ only in how they
+/// classify this walk's result (see each caller's own doc), not in how the result is found;
+/// issue #1447 exists specifically because a shared-logic gap let the two arms drift apart
+/// before, so this one walk is the single place either arm's call-shape detection can change.
+///
+/// [`enclosing_open_paren`] finds the call's own `(` by paren balance alone, so it doesn't need
+/// to understand what sits between it and the literal — a ternary (`cond ? "a" : "b"`), an
+/// Elvis operator (`value ?: "b"`), or any other expression nested inside the same argument
+/// list all resolve identically, unlike a purely left-to-right token walk that would have to
+/// special-case each such operator. Once found, the word immediately before that `(` is
+/// checked directly, after stripping one optional `platform`/`enforcedPlatform` wrapper keyword
+/// and its own `(` — covering `implementation(platform("g:a:v"))`. A literal with **no**
+/// enclosing `(` at all falls back to [`skip_vararg_siblings`] plus a word scan instead, for
+/// Groovy's without-parens call syntax (`implementation "g:a:v"`, including its vararg form),
+/// or [`CallWordResolution::Assignment`] when that fallback text ends in a bare `=`. Comments
+/// preceding the literal (e.g. `implementation /* … */ "g:a:v"`) are blanked via
+/// [`quote_scan::blank_comments`] first, so a `(`/`)` inside one is never mistaken for real
+/// call syntax and a trailing `*/` is never mistaken for the end of a bare word.
+#[cfg(feature = "lsp-responses")]
+fn resolve_call_word<'a>(blanked: &'a str, code: &CodeSpans<'a>) -> CallWordResolution<'a> {
+    if let Some(paren_pos) = enclosing_open_paren(blanked, code) {
+        return CallWordResolution::Word(call_word_before_paren(blanked, paren_pos));
+    }
+    let trimmed = blanked.trim_end();
+    if trimmed.ends_with('=') {
+        return CallWordResolution::Assignment;
+    }
+    let (rest, _consumed) = skip_vararg_siblings(trimmed);
+    CallWordResolution::Word(word_before(rest))
+}
+
+/// Outcome of [`detect_dsl_context`]'s `Package` arm gate (issue #1447): whether an open string
+/// literal's colon-shaped position (0 or 1 colons typed so far) is still allowed to trigger a
+/// Package-name registry search.
+///
+/// Default-**allow**, unlike [`dsl_declaration_scope`]'s default-deny: a wrongly-withheld
+/// `Package` completion silently breaks a real, working feature (impl-critic S1 —
+/// live-verified regressions on `library(...)` in `settings.gradle.kts`, a multi-line
+/// `implementation(\n    "g:a:v"\n)` call, Kotlin's string-invoke syntax
+/// `"implementation"("g:a:v")`, and custom/plugin-registered configurations this crate's
+/// [`crate::parser::is_dependency_configuration`] doesn't know about), whereas a
+/// wrongly-*granted* one only issues an extra Maven Central search against text the user
+/// already typed — issue #1447 asks to suppress specific, positively-identified false-positive
+/// shapes ([`NON_DEPENDENCY_CALL_WORDS`]), not every literal this heuristic can't positively
+/// recognize as a real dependency call.
+#[cfg(feature = "lsp-responses")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PackageGate {
+    /// Not positively excluded — [`crate::parser::is_dependency_configuration`] matched, or
+    /// nothing conclusive was found at all (an unrecognized/custom configuration word, a
+    /// helper call, Kotlin's string-invoke syntax, or a literal whose enclosing call isn't
+    /// visible on this single line — see [`CallWordResolution::Word`]'s doc).
+    Allowed,
+    /// Positively recognized as something that is never a dependency coordinate — see
+    /// [`NON_DEPENDENCY_CALL_WORDS`] and [`CallWordResolution::Assignment`].
+    Excluded,
+}
+
+/// Call/assignment words that, immediately before an open paren (or, for a bare `=`, with no
+/// paren at all), positively identify a Gradle DSL position that is never a dependency
+/// coordinate: a plugin id (`id(...)`), a Kotlin-DSL plugin shorthand (`kotlin(...)`), a
+/// repository URL builder (`uri(...)`), a plugin version literal/call
+/// (`version`/`version(...)`), a project reference/file-collection helper
+/// (`project(...)`/`files(...)`), `settings.gradle(.kts)` project inclusion
+/// (`include`/`includeBuild` — the highest-traffic false-positive shape, present in essentially
+/// every settings file), Android Gradle Plugin project metadata (`namespace`/`applicationId`),
+/// a repository declaration (`url`/`maven`), or a same-class false positive to #1191's
+/// `println("a:b:1.0")` example (`println`).
+///
+/// **Not an allowlist**: any word not in this set (and not
+/// [`crate::parser::is_dependency_configuration`]) is [`PackageGate::Allowed`], not denied —
+/// see that variant's and [`PackageGate`]'s own doc for why a positive-exclusion list, however
+/// extended (issue #1447 impl-critic M1 follow-up added `include`/`includeBuild`/`namespace`/
+/// `applicationId`/`url`/`maven`/`println` to the four issue-reported words), can never be
+/// exhaustive by design.
+#[cfg(feature = "lsp-responses")]
+const NON_DEPENDENCY_CALL_WORDS: &[&str] = &[
+    "id",
+    "kotlin",
+    "uri",
+    "version",
+    "project",
+    "files",
+    "include",
+    "includeBuild",
+    "namespace",
+    "applicationId",
+    "url",
+    "maven",
+    "println",
+];
+
+#[cfg(feature = "lsp-responses")]
+fn classify_word(word: &str) -> PackageGate {
+    if !word.is_empty()
+        && !crate::parser::is_dependency_configuration(word)
+        && NON_DEPENDENCY_CALL_WORDS.contains(&word)
+    {
+        PackageGate::Excluded
+    } else {
+        PackageGate::Allowed
+    }
+}
+
+/// Classifies the call/position governing the string literal opening at `open_pos` on `line`,
+/// for [`detect_dsl_context`]'s `Package` arm gate (issue #1447), via [`resolve_call_word`]'s
+/// shared call-shape walk. See [`PackageGate`]'s doc for the default-allow-unless-positively-
+/// excluded policy this implements.
+// `open_pos` is always the byte offset of a literal's opening quote, from
+// `quote_scan::last_string_literal` — always a char boundary (same guarantee
+// `detect_dsl_context` and `dsl_declaration_scope` rely on for identical slicing).
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn package_completion_gate(line: &str, open_pos: usize) -> PackageGate {
+    let blanked = quote_scan::blank_comments(&line[..open_pos], ScanSyntax::Groovy);
+    let code = CodeSpans::new(&blanked, ScanSyntax::Groovy);
+
+    match resolve_call_word(&blanked, &code) {
+        // A project-metadata assignment (`group = "<cursor>`) is positively excluded, not just
+        // an unrecognized word, since it never has a call word to check at all.
+        CallWordResolution::Assignment => PackageGate::Excluded,
+        CallWordResolution::Word(word) => classify_word(word),
+    }
 }
 
 /// Finds the byte offset (relative to `before_cursor`) where the current inline-table
@@ -563,6 +752,26 @@ fn detect_dsl_context<'a>(
                 .nth(1)
                 .map_or(scan_limit_rel, |(i, _)| i);
             let value_end = (open_pos + 1 + end_rel).max(cursor);
+
+            // A colon count of 0 or 1 alone can't distinguish a partial dependency coordinate
+            // from any other open string literal (a plugin id/shorthand argument, a project
+            // metadata assignment, a URL) — gated on `package_completion_gate`'s
+            // default-allow-unless-positively-excluded classification (issue #1447; see its
+            // doc, and `PackageGate`'s, for why this differs from `dsl_declaration_scope`'s
+            // stricter default-deny). Matched exhaustively, not compared with `==`, so a future
+            // `PackageGate` variant forces this call site to be revisited at compile time.
+            match package_completion_gate(line, open_pos) {
+                PackageGate::Excluded => {
+                    return (
+                        GradleCompletionContext::None,
+                        "",
+                        Range::default(),
+                        deps_core::completion::DeclarationScope::Unchecked,
+                    );
+                }
+                PackageGate::Allowed => {}
+            }
+
             let range = byte_range(line, line_idx, open_pos + 1, value_end);
             (
                 GradleCompletionContext::Package,
@@ -1378,6 +1587,264 @@ dependencies {
         let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
         assert_eq!(t, GradleCompletionContext::Version);
         assert_eq!(v, "1.0");
+    }
+
+    // #1447: the `Package` arm's colon-count heuristic (0 or 1 colons) alone can't
+    // distinguish a partial dependency coordinate from any other open string literal — these
+    // four are the exact false-positive shapes reported on the issue, none of which is a
+    // partial `group`/`group:artifact` coordinate. All must now resolve to `None` rather than
+    // issuing a stray Maven Central search on the typed text.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_plugin_id_argument_is_not_package() {
+        // id("com.exa|
+        let line = r#"id("com.exa"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_kotlin_dsl_shorthand_argument_is_not_package() {
+        // kotlin("jv|
+        let line = r#"kotlin("jv"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_project_metadata_assignment_is_not_package() {
+        // group = "|
+        let line = r#"group = ""#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_repository_url_argument_is_not_package() {
+        // url = uri("https:|
+        let line = r#"url = uri("https:"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    /// impl-critic S1/M1 follow-up: `include(":ap<cursor>")` — the highest-traffic
+    /// false-positive shape, present in essentially every `settings.gradle(.kts)` — must not
+    /// issue a registry search on the typed project-path prefix.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_settings_include_argument_is_not_package() {
+        let content = r#"include(":ap"#;
+        let uri = deps_core::test_util::test_uri("/project/settings.gradle.kts");
+        let position = Position::new(0, u32::try_from(content.len()).unwrap());
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(t, GradleCompletionContext::None);
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    // #1447: a compact coordinate wrapped in real parens must still resolve, not just the
+    // paren-less form already covered by
+    // `test_detect_dsl_context_escaped_quote_in_earlier_group_does_not_block_completion` —
+    // proves `enclosing_open_paren` finds the call's own `(` directly, without needing the
+    // comma-walk fallback at all.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_parenthesized_vararg_second_argument_is_package() {
+        // implementation("a:b:1.0", "c|
+        let line = r#"implementation("a:b:1.0", "c"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "c");
+    }
+
+    // Regressions for impl-critic S1 on #1447: the `Package` gate is default-allow, so these
+    // shapes — none of which is a positively-excluded call word — must resolve to `Package`,
+    // not be silently withheld just because this heuristic can't positively recognize them.
+
+    /// The enclosing `(` sits on an earlier line; `detect_completion_context` only scans the
+    /// cursor's own line, so neither `enclosing_open_paren` nor a call word is visible here at
+    /// all — must classify as `Indeterminate` (allow), not `Excluded` (deny).
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_multiline_call_package_is_allowed() {
+        // implementation(
+        //     "com.google.guava:gua|
+        let content =
+            "dependencies {\n    implementation(\n        \"com.google.guava:gua\n    )\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle.kts");
+        let line = content.lines().nth(2).expect("line 2 exists");
+        let position = Position::new(2, u32::try_from(line.len()).unwrap());
+
+        let (t, v, _range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::Package,
+            "a multi-line call's literal must still get Package completion"
+        );
+        assert_eq!(v, "com.google.guava:gua");
+    }
+
+    /// `library(...)` (a Settings-kind version-catalog-builder call) is not a recognized
+    /// dependency-configuration word, but it's not positively excluded either — documented on
+    /// main (#1436) as "verified live, still completable".
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_settings_library_call_package_is_allowed() {
+        // library("guava", "com.google.guava:gua|
+        let content = r#"library("guava", "com.google.guava:gua"#;
+        let uri = deps_core::test_util::test_uri("/project/settings.gradle.kts");
+        let position = Position::new(0, u32::try_from(content.len()).unwrap());
+
+        let (t, v, _range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.google.guava:gua");
+    }
+
+    /// Kotlin's string-invoke call syntax (`"implementation"(...)`, the standard
+    /// `subprojects {}`/`allprojects {}` pattern) has a closing quote, not an identifier
+    /// character, immediately before its `(` — the word scan finds nothing, not a real word.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_kotlin_string_invoke_package_is_allowed() {
+        // "implementation"("com.google.guava:gua|
+        let line = r#""implementation"("com.google.guava:gua"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.google.guava:gua");
+    }
+
+    /// A plugin-registered configuration this crate's `is_dependency_configuration` doesn't
+    /// know about (e.g. the Android Gradle Plugin's `coreLibraryDesugaring`) must still get
+    /// Package completion.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_custom_configuration_package_is_allowed() {
+        // coreLibraryDesugaring("com.android.tools:de|
+        let line = r#"coreLibraryDesugaring("com.android.tools:de"#;
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "com.android.tools:de");
+    }
+
+    /// impl-critic S1 addendum: the `io.spring.dependency-management` plugin's own DSL
+    /// (`dependencyManagement { dependencies { dependency '...' } }`) uses the paren-less,
+    /// singular `dependency` call — not a recognized `is_dependency_configuration` word, and
+    /// not positively excluded either.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_dsl_context_spring_dependency_management_package_is_allowed() {
+        // dependency 'org.springframework:spring-co|
+        let line = r"dependency 'org.springframework:spring-co";
+        let col = line.len();
+        let before = &line[..col];
+        let (t, v, _range, _scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(t, GradleCompletionContext::Package);
+        assert_eq!(v, "org.springframework:spring-co");
+    }
+
+    /// Regression for impl-critic S2 on #1447: `dsl_declaration_scope`'s `Within` span used to
+    /// start at the configuration word, extending across an earlier, already-closed vararg
+    /// sibling — pass 2's anchor-containment check then wrongly admitted that sibling. The
+    /// parser's own DSL regexes require an identifier word directly before the quote, so they
+    /// only ever capture the FIRST comma-separated argument as a real `GradleDependency`; the
+    /// second sibling here is deliberately never parsed, forcing pass 1 to miss and pass 2 to
+    /// be what's under test. Same-family libraries sharing a version prefix
+    /// (`io.ktor:ktor-client-core` / `-cio`) make the misattribution realistic.
+    #[cfg(feature = "lsp-responses")]
+    #[tokio::test]
+    async fn test_literal_version_dependency_vararg_sibling_not_misattributed() {
+        let eco = GradleEcosystem::new(make_cache());
+        let content = "dependencies { implementation \"io.ktor:ktor-client-core:2.3.0\", \"io.ktor:ktor-client-cio:2.3.0\" }\n";
+        let uri = deps_core::test_util::test_uri("/project/build.gradle");
+        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+        assert_eq!(
+            parse_result.dependencies().len(),
+            1,
+            "only the first vararg argument parses as a real dependency: {content}"
+        );
+        assert_eq!(
+            parse_result.dependencies()[0].name().as_str(),
+            "io.ktor:ktor-client-core"
+        );
+
+        let line = content.lines().next().unwrap();
+        let col = line.rfind("2.3.0").unwrap() + 3; // mid-version, inside the unparsed sibling
+        let before = &line[..col];
+        let (ctx, _, range, scope) = detect_dsl_context(before, line, col, 0);
+        assert_eq!(ctx, GradleCompletionContext::Version);
+
+        let position = Position::new(0, u32::try_from(col).unwrap());
+        let resolved = deps_core::completion::literal_version_dependency_in_scope(
+            parse_result.as_ref(),
+            position,
+            content,
+            range,
+            scope,
+        );
+        assert!(
+            resolved.is_none(),
+            "must not misattribute the unparsed vararg sibling to the earlier, already-parsed \
+             ktor-client-core dependency: got {:?}",
+            resolved.map(|d| d.name().as_str().to_string())
+        );
+    }
+
+    /// Regression for impl-critic S3 on #1447: an uncapped comma-walk re-scans the whole
+    /// remaining text per sibling (`O(line length^2)`), live-reproduced as a completion-handler
+    /// hang on a crafted ~100 KB line with ~20k siblings. `skip_vararg_siblings` bounds this to
+    /// `MAX_VARARG_SIBLINGS` iterations, so it must both complete quickly and correctly decline
+    /// to walk all the way back to the call word when the sibling count exceeds the cap.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_skip_vararg_siblings_bounded_for_crafted_input() {
+        let mut rest = String::from("implementation ");
+        for _ in 0..5_000 {
+            rest.push_str("\"a\", ");
+        }
+        let rest = rest.trim_end();
+
+        let start = std::time::Instant::now();
+        let (remaining, consumed) = skip_vararg_siblings(rest);
+        let elapsed = start.elapsed();
+
+        assert!(consumed, "at least one sibling comma must be consumed");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "must not hang on a crafted line with an unrealistic sibling count: took {elapsed:?}"
+        );
+        assert_ne!(
+            remaining, "implementation",
+            "capped at MAX_VARARG_SIBLINGS, so 5000 siblings must not all be walked over"
+        );
     }
 
     #[cfg(feature = "lsp-responses")]
