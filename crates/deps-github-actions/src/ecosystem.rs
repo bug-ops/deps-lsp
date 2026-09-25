@@ -1423,7 +1423,7 @@ mod tests {
     /// `VersionData` and cannot know a `PinStyle::Tag` step still has a real "Pin to commit
     /// SHA" quickfix available via the ecosystem-private `TagIndex`. Seeding the index
     /// directly simulates a fetch that succeeded before the session went offline;
-    /// `cache.set_offline(true)` then makes the live fetch this call attempts fail without
+    /// `cache.set_offline(NetworkMode::Offline)` then makes the live fetch this call attempts fail without
     /// touching the network (mirroring `HttpCache`'s real offline-cold behavior), so
     /// `VersionData` carries no signal of its own and only the post-hoc restore can produce
     /// the footer.
@@ -1431,7 +1431,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index() {
         let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(true);
+        cache.set_offline(deps_core::NetworkMode::Offline);
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v4\n";
@@ -1474,7 +1474,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_hover_footer_stays_omitted_offline_for_tag_pin_without_tag_index() {
         let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(true);
+        cache.set_offline(deps_core::NetworkMode::Offline);
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: actions/checkout@v4\n";
@@ -1582,7 +1582,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_hover_footer_not_restored_offline_for_quoted_tag_pin() {
         let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(true);
+        cache.set_offline(deps_core::NetworkMode::Offline);
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
@@ -1628,7 +1628,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_hover_footer_not_restored_offline_for_flow_mapping_tag_pin() {
         let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(true);
+        cache.set_offline(deps_core::NetworkMode::Offline);
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
@@ -1998,7 +1998,7 @@ mod tests {
         // Offline: the shared hover helper otherwise drives a live registry fetch, which is
         // irrelevant here and would outlive the test as a leaked background task.
         let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(true);
+        cache.set_offline(deps_core::NetworkMode::Offline);
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/action.yml");
         let content = "name: My Action\n\

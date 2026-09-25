@@ -1,6 +1,6 @@
 //! Human-readable table output (FR-006): findings grouped by file, then severity.
 
-use super::severity_str;
+use super::{DryRun, severity_str};
 use crate::report::CheckReport;
 use deps_core::diagnostic::Severity;
 use std::collections::BTreeMap;
@@ -91,19 +91,23 @@ fn severity_rank(severity: Severity) -> u8 {
 /// # Examples
 ///
 /// ```
+/// use deps_cli::format::DryRun;
 /// use deps_cli::format::table::render_update;
 /// use deps_cli::update::UpdatePlan;
 ///
-/// assert_eq!(render_update(&UpdatePlan::default(), false), "No eligible updates.\n");
 /// assert_eq!(
-///     render_update(&UpdatePlan::default(), true),
+///     render_update(&UpdatePlan::default(), DryRun::No),
+///     "No eligible updates.\n"
+/// );
+/// assert_eq!(
+///     render_update(&UpdatePlan::default(), DryRun::Yes),
 ///     "(dry run — no changes written)\nNo eligible updates.\n"
 /// );
 /// ```
 #[must_use]
-pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: bool) -> String {
+pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: DryRun) -> String {
     let mut out = String::new();
-    if dry_run {
+    if dry_run == DryRun::Yes {
         let _ = writeln!(out, "(dry run — no changes written)");
     }
     if plan.items.is_empty() {
@@ -255,7 +259,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
-        let table = render_update(&plan, false);
+        let table = render_update(&plan, DryRun::No);
         assert!(table.contains("serde"));
         assert!(table.contains("1.0.0"));
         assert!(table.contains("1.2.0"));
@@ -268,7 +272,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
-        let table = render_update(&plan, true);
+        let table = render_update(&plan, DryRun::Yes);
         assert!(table.starts_with("(dry run"));
     }
 
@@ -278,7 +282,7 @@ mod tests {
     /// is emitted unconditionally regardless of item count).
     #[test]
     fn test_render_update_empty_plan_still_includes_dry_run_note() {
-        let table = render_update(&crate::update::UpdatePlan::default(), true);
+        let table = render_update(&crate::update::UpdatePlan::default(), DryRun::Yes);
         assert!(table.starts_with("(dry run"));
         assert!(table.contains("No eligible updates."));
     }

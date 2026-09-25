@@ -142,7 +142,6 @@ impl GradleEcosystem {
         Range,
         deps_core::completion::DeclarationScope,
     ) {
-        let path = uri.path().to_string();
         let lines: Vec<&str> = content.lines().collect();
         let line_idx = position.line as usize;
 
@@ -158,26 +157,79 @@ impl GradleEcosystem {
             .unwrap_or(line.len());
         let before_cursor = &line[..col_idx];
 
-        if path.ends_with("libs.versions.toml") {
-            let (ctx, value, range) =
-                detect_catalog_context(before_cursor, line, col_idx, position.line);
-            (
-                ctx,
-                value,
-                range,
-                deps_core::completion::DeclarationScope::Unchecked,
-            )
-        } else if path.ends_with(".gradle.kts") || path.ends_with(".gradle") {
-            detect_dsl_context(before_cursor, line, col_idx, position.line)
-        } else {
-            (
+        match crate::parser::GradleManifestKind::from_uri(uri) {
+            crate::parser::GradleManifestKind::Catalog => {
+                let (ctx, value, range) =
+                    detect_catalog_context(before_cursor, line, col_idx, position.line);
+                (
+                    ctx,
+                    value,
+                    range,
+                    deps_core::completion::DeclarationScope::Unchecked,
+                )
+            }
+            crate::parser::GradleManifestKind::KotlinBuild
+            | crate::parser::GradleManifestKind::GroovyBuild => {
+                detect_dsl_context(before_cursor, line, col_idx, position.line)
+            }
+            // `settings.gradle(.kts)` also declares plugins (`id(...) version "..."`), a shape
+            // `detect_dsl_context` doesn't know about: a plugin version literal has no colon,
+            // so it was misdetected as a `Package` context and completion issued a registry
+            // *search* on the typed version prefix (verified live, issue #1436). Narrowly
+            // suppressed only at that exact position — not every Settings-kind completion —
+            // since `dependencyResolutionManagement { versionCatalogs { create("libs") {
+            // library("a", "g:a:<cursor>") } } }`'s real compact-coordinate literal is still
+            // completable through the same `detect_dsl_context` call every other Settings
+            // position uses (also verified live).
+            crate::parser::GradleManifestKind::Settings => {
+                if is_plugin_version_literal_position(before_cursor) {
+                    (
+                        GradleCompletionContext::None,
+                        "",
+                        Range::default(),
+                        deps_core::completion::DeclarationScope::Unchecked,
+                    )
+                } else {
+                    detect_dsl_context(before_cursor, line, col_idx, position.line)
+                }
+            }
+            crate::parser::GradleManifestKind::Other => (
                 GradleCompletionContext::None,
                 "",
                 Range::default(),
                 deps_core::completion::DeclarationScope::Unchecked,
-            )
+            ),
         }
     }
+}
+
+/// Whether `before_cursor` ends inside an open string literal immediately preceded (past
+/// whitespace) by the bare `version` keyword — `id("x") version "1.<cursor>"`, the plugin
+/// version-literal shape `detect_dsl_context`'s colon-count heuristic misreads as a `Package`
+/// context (issue #1436, see [`GradleEcosystem::detect_completion_context`]'s Settings arm).
+///
+/// Boundary-checked (`strip_suffix("version")` alone would also match `myversion`/
+/// `compileVersion`-style identifiers) so this only fires for the standalone `version` keyword,
+/// not a longer identifier that happens to end with it.
+// `open.open` is `quote_scan::last_string_literal`'s own byte offset of an ASCII `'"'`/`'\''`
+// token — always a char boundary, same guarantee `detect_dsl_context` relies on for its
+// identical `open_pos` slicing above.
+#[cfg(feature = "lsp-responses")]
+#[allow(clippy::string_slice)]
+fn is_plugin_version_literal_position(before_cursor: &str) -> bool {
+    let Some(open) = quote_scan::last_string_literal(before_cursor, ScanSyntax::Groovy)
+        .filter(|span| span.close.is_none())
+    else {
+        return false;
+    };
+    let Some(before_version) = before_cursor[..open.open]
+        .trim_end()
+        .strip_suffix("version")
+    else {
+        return false;
+    };
+    before_version.is_empty()
+        || !before_version.ends_with(|c: char| c.is_alphanumeric() || c == '_')
 }
 
 /// Builds an LSP [`Range`] on `line_idx` from a pair of byte offsets into `line`,
@@ -1400,6 +1452,58 @@ dependencies {
             range,
             Range::new(Position::new(0, 16), Position::new(0, 26))
         );
+    }
+
+    /// Regression test for the live-verified bug fixed alongside issue #1436: a cursor inside
+    /// a `settings.gradle.kts` plugin's version literal (`id("x") version "1.<cursor>"`) has
+    /// no colon, so before this fix `detect_dsl_context` (shared with `build.gradle(.kts)`)
+    /// misdetected it as a `Package` context and completion issued a stray registry search on
+    /// the typed version text. Must now resolve to `None` — not silently regress back to
+    /// `Package`.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_settings_plugin_version_literal_is_none() {
+        let content = "pluginManagement {\n    plugins {\n        id(\"com.example.plugin\") version \"1.2.3\"\n    }\n}\n";
+        let uri = deps_core::test_util::test_uri("/project/settings.gradle.kts");
+        let line = content.lines().nth(2).expect("line 2 exists");
+        // Cursor inside "1.2.3", right after "1.2" (UTF-16 units == byte offset, ASCII line).
+        let col =
+            u32::try_from(line.find("1.2.3\"").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(2, col);
+
+        let (t, v, range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::None,
+            "plugin version literal must not be misdetected as Package"
+        );
+        assert_eq!(v, "");
+        assert_eq!(range, Range::default());
+    }
+
+    /// Companion to the regression test above (issue #1436 Q1): the Settings-kind suppression
+    /// must be scoped to the plugin-version-literal shape specifically, not every completion in
+    /// a `settings.gradle.kts` file — a compact `group:artifact:version` coordinate elsewhere on
+    /// the same kind of file (e.g. inside `versionCatalogs { create("libs") { library(...) } }`)
+    /// still reaches the same DSL detection every `build.gradle(.kts)` position uses.
+    #[cfg(feature = "lsp-responses")]
+    #[test]
+    fn test_detect_completion_context_settings_compact_coordinate_still_detected() {
+        let content = "library(\"guava\", \"com.google.guava:guava:31.1\")\n";
+        let uri = deps_core::test_util::test_uri("/project/settings.gradle.kts");
+        let col =
+            u32::try_from(content.find("31.1\"").expect("version literal present")).unwrap() + 3;
+        let position = Position::new(0, col);
+
+        let (t, v, _range, _scope) =
+            GradleEcosystem::detect_completion_context(content, position, &uri);
+        assert_eq!(
+            t,
+            GradleCompletionContext::Version,
+            "a real compact coordinate's version segment must still be detected in a Settings-kind file"
+        );
+        assert_eq!(v, "31.");
     }
 
     #[cfg(feature = "lsp-responses")]

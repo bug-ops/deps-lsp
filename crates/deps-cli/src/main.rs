@@ -12,14 +12,14 @@ use deps_cli::MAX_MANIFEST_FILE_SIZE;
 use deps_cli::analyze::analyze_manifest;
 use deps_cli::cli::{Cli, Command, OutputFormat, UpdateArgs, UpdateOutputFormat};
 use deps_cli::config::{self, CliConfig};
-use deps_cli::exit::exit_code;
+use deps_cli::exit::{ExecutionOutcome, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
 use deps_cli::update::ignore::IgnoreRules;
 use deps_cli::update::{self, UpdatePlan};
 use deps_cli::{format, walk};
 use deps_core::osv::OsvClient;
 use deps_core::policy_config::PolicyConfig;
-use deps_core::{EcosystemRegistry, HttpCache};
+use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -72,7 +72,7 @@ fn build_runtime_handles(policy: &PolicyConfig) -> RuntimeHandles {
     )));
     // FR-013/SC-004: offline gate lives at the shared cache, so callers degrade to
     // cached-only data without their own per-call short-circuit.
-    cache.set_offline(policy.network.offline);
+    cache.set_offline(NetworkMode::from_offline_flag(policy.network.offline));
     let ecosystem_registry = EcosystemRegistry::new();
     let _workspace_registry_ecosystems =
         register_ecosystems(&ecosystem_registry, Arc::clone(&cache), &ecosystem_runtime);
@@ -92,7 +92,11 @@ fn run_check_command(
     let walk_paths = args.walk_paths();
     let default_config_dir = config_default_dir(&walk_paths);
     let cli_config = match config::load(args.config.as_deref(), &default_config_dir) {
-        Ok(config) => config::apply_overrides(config, args.offline, args.cooldown),
+        Ok(config) => config::apply_overrides(
+            config,
+            NetworkMode::from_offline_flag(args.offline),
+            args.cooldown,
+        ),
         Err(error) => {
             eprintln!("deps-cli: {error}");
             return ExitCode::from(2);
@@ -131,7 +135,14 @@ fn run_check_command(
     };
     print!("{rendered}");
 
-    ExitCode::from(u8::try_from(exit_code(&report, &fail_on, had_execution_error)).unwrap_or(2))
+    ExitCode::from(
+        u8::try_from(exit_code(
+            &report,
+            &fail_on,
+            ExecutionOutcome::from_had_execution_error(had_execution_error),
+        ))
+        .unwrap_or(2),
+    )
 }
 
 /// Builds the shared runtime handles, walks `paths`, and classifies every discovered
@@ -303,7 +314,11 @@ fn load_update_config(explicit_path: Option<&Path>) -> Result<CliConfig, config:
 
 fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> ExitCode {
     let cli_config = match load_update_config(args.config.as_deref()) {
-        Ok(config) => config::apply_overrides(config, args.offline, args.cooldown),
+        Ok(config) => config::apply_overrides(
+            config,
+            NetworkMode::from_offline_flag(args.offline),
+            args.cooldown,
+        ),
         Err(error) => {
             eprintln!("deps-cli: {error}");
             return ExitCode::from(2);
@@ -347,9 +362,14 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
     match runtime.block_on(run_update(args, policy, ignore_config)) {
         Ok(plan) => {
             let rendered = match args.format {
-                UpdateOutputFormat::Table => format::table::render_update(&plan, args.dry_run),
+                UpdateOutputFormat::Table => {
+                    format::table::render_update(&plan, format::DryRun::from_flag(args.dry_run))
+                }
                 UpdateOutputFormat::Json => {
-                    match format::json::render_update(&plan, args.dry_run) {
+                    match format::json::render_update(
+                        &plan,
+                        format::DryRun::from_flag(args.dry_run),
+                    ) {
                         Ok(json) => json,
                         Err(error) => {
                             eprintln!("deps-cli: failed to render JSON report: {error}");
@@ -508,8 +528,13 @@ async fn run_update(
     // `applied` outcome always matches what actually gets written.
     update::dedup_applied_items(&mut plan.items);
 
-    update::apply_plan(&plan, &manifest.path, &content, args.dry_run)
-        .map_err(|error| error.to_string())?;
+    update::apply_plan(
+        &plan,
+        &manifest.path,
+        &content,
+        format::DryRun::from_flag(args.dry_run),
+    )
+    .map_err(|error| error.to_string())?;
 
     Ok(plan)
 }

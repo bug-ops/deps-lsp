@@ -378,8 +378,12 @@ pub fn fuzz_parse_config(content: &str) {
 /// `--offline`'s presence forces `network.offline = true` (a bare on/off flag has no way to
 /// express "explicitly false", so absence never overrides a `deps.toml`-configured `true`
 /// back to `false`); `--cooldown`, when given, replaces `freshness.cooldown_secs` outright.
-pub fn apply_overrides(mut config: CliConfig, offline: bool, cooldown: Option<u64>) -> CliConfig {
-    if offline {
+pub fn apply_overrides(
+    mut config: CliConfig,
+    offline: deps_core::NetworkMode,
+    cooldown: Option<u64>,
+) -> CliConfig {
+    if offline == deps_core::NetworkMode::Offline {
         config.policy.network.offline = true;
     }
     if let Some(cooldown_secs) = cooldown {
@@ -737,7 +741,7 @@ b = 2
 
     #[test]
     fn test_apply_overrides_offline_flag_forces_true() {
-        let config = apply_overrides(CliConfig::default(), true, None);
+        let config = apply_overrides(CliConfig::default(), deps_core::NetworkMode::Offline, None);
         assert!(config.policy.network.offline);
     }
 
@@ -745,7 +749,7 @@ b = 2
     fn test_apply_overrides_offline_absent_keeps_file_value() {
         let mut base = CliConfig::default();
         base.policy.network.offline = true;
-        let config = apply_overrides(base, false, None);
+        let config = apply_overrides(base, deps_core::NetworkMode::Online, None);
         assert!(
             config.policy.network.offline,
             "absent flag must not clear a file-set true"
@@ -756,7 +760,7 @@ b = 2
     fn test_apply_overrides_cooldown_replaces_file_value() {
         let mut base = CliConfig::default();
         base.policy.freshness.cooldown_secs = 999;
-        let config = apply_overrides(base, false, Some(42));
+        let config = apply_overrides(base, deps_core::NetworkMode::Online, Some(42));
         assert_eq!(config.policy.freshness.cooldown_secs, 42);
     }
 
@@ -764,7 +768,7 @@ b = 2
     fn test_apply_overrides_no_cooldown_keeps_file_value() {
         let mut base = CliConfig::default();
         base.policy.freshness.cooldown_secs = 999;
-        let config = apply_overrides(base, false, None);
+        let config = apply_overrides(base, deps_core::NetworkMode::Online, None);
         assert_eq!(config.policy.freshness.cooldown_secs, 999);
     }
 
