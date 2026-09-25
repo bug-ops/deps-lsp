@@ -1397,6 +1397,7 @@ mod tests {
     use deps_engine::classify::fetch::FetchResult;
     // Only the cargo-gated tests below sleep or time out on a bare `Duration`
     // (go_tests imports its own `tokio::time::Duration` locally instead).
+    #[cfg(feature = "cargo")]
     use std::collections::HashSet;
     #[cfg(feature = "cargo")]
     use std::time::Duration;
