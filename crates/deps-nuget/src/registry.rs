@@ -1251,7 +1251,7 @@ impl deps_core::Registry for NuGetRegistry {
         name: &'a deps_core::PackageName,
         source: &'a DependencySource,
         req: &'a deps_core::VersionReq,
-        _minimum_stability: Option<&'a str>,
+        _selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
             match source {

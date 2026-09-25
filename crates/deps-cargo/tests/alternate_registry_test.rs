@@ -32,7 +32,7 @@ use deps_cargo::config::{ConfigFileCache, IndexTrust};
 use deps_cargo::{CargoConfig, CargoRegistry, DependencySource};
 use deps_core::freshness::FreshnessSettings;
 use deps_core::net_policy::RegistryAccessPolicy;
-use deps_core::{HttpCache, PackageName, Registry, VersionReq};
+use deps_core::{HttpCache, PackageName, Registry, SelectionContext, VersionReq};
 use std::sync::Arc;
 
 const SPARSE_ENTRY: &str =
@@ -109,7 +109,7 @@ async fn test_get_latest_matching_from_routes_to_alternate_index() {
     let name = PackageName::new("internal-crate");
     let req = VersionReq::new("^1.0");
     let latest = registry
-        .get_latest_matching_from(&name, &source, &req, None)
+        .get_latest_matching_from(&name, &source, &req, &SelectionContext::none())
         .await
         .expect("alternate registry fetch must succeed");
 
@@ -151,7 +151,7 @@ async fn test_get_latest_matching_from_on_empty_list_routes_to_alternate_index()
     let name = PackageName::new("internal-crate");
     let req = VersionReq::new("*");
     let latest = registry
-        .get_latest_matching_from(&name, &source, &req, None)
+        .get_latest_matching_from(&name, &source, &req, &SelectionContext::none())
         .await
         .expect("an empty alternate-index list must not be an error");
 

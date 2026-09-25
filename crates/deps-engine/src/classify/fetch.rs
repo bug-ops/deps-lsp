@@ -133,36 +133,97 @@ pub fn dedup_dependencies_by_source(
     (by_name, collided)
 }
 
-/// Composer's own `minimum-stability` manifest setting, when `parse_result` is a parsed
-/// `composer.json` (#424 S1).
+/// Inputs [`fetch_latest_versions_parallel`] needs, derived from a parsed manifest.
 ///
-/// Downcasts via [`deps_core::ParseResult::as_any`] rather than widening the generic
-/// `ParseResult`/`Registry` traits with an ecosystem-specific field: every other ecosystem has
-/// no equivalent manifest-level stability floor, so this stays local to the one call site
-/// (`fetch_latest_versions_parallel`'s caller) that needs to bridge a Composer-specific
-/// manifest value into the generic `Registry::*_with_context` trait hook.
+/// Which sources to fetch (deduped, collision-free — see [`dedup_dependencies_by_source`]), each
+/// dependency's currently in-use version(s), and the manifest's own
+/// [`deps_core::SelectionContext`] (e.g. Composer's `minimum-stability`, #1433).
 ///
-/// Gated on `deps-engine`'s own `composer` feature (T013/N1): under Cargo's workspace
-/// feature-unification, enabling `composer` for *any* crate in the build graph (e.g. another
-/// adapter, or a `--all-features` build) activates it here too, even for a `deps-lsp` build
-/// that itself passed `--no-default-features` and never asked for Composer support. This is a
-/// deliberate, documented behavior change from the pre-move code (where this function lived
-/// directly in `deps-lsp` and was gated only by that one crate's own feature selection), not
-/// an oversight — the alternative (duplicating this function per adapter) would reintroduce
-/// exactly the drift this extraction exists to close.
-#[cfg(feature = "composer")]
-pub fn composer_minimum_stability(parse_result: &dyn deps_core::ParseResult) -> Option<String> {
-    parse_result
-        .as_any()
-        .downcast_ref::<crate::setup::ComposerParseResult>()
-        .and_then(|r| r.minimum_stability.clone())
+/// Built by [`prepare_fetch`], which consolidates three independently hand-rolled copies of
+/// this exact dedup -> in-use -> selection-context sequence (`deps-lsp`'s
+/// `document/lifecycle.rs` and `document/fetch.rs`, `deps-cli`'s `analyze.rs`) so the LSP and
+/// CLI fetch-preparation paths can no longer drift apart (#1433).
+#[non_exhaustive]
+pub struct FetchPreparation {
+    /// Ready to hand to [`fetch_latest_versions_parallel`] as-is, or filtered further by a
+    /// caller that only wants to fetch a subset (e.g. `deps-lsp`'s
+    /// `fetch_registry_versions_for_change`, which fetches only added/version-changed
+    /// dependencies).
+    pub dep_sources: DepSources,
+    /// `dep_name -> [in_use_version, ...]`, from [`crate::classify::resolved::collect_in_use_versions`].
+    pub in_use: HashMap<PackageName, Vec<String>>,
+    /// The manifest's own [`deps_core::SelectionContext`], from
+    /// [`deps_core::ParseResult::selection_context`].
+    pub selection_context: deps_core::SelectionContext,
+    /// Names dropped by [`dedup_dependencies_by_source`]'s collision gate — must be merged
+    /// into `DocumentState::outcomes`' fetch-failure channel by the caller (spec FR-011).
+    pub collided_names: HashSet<PackageName>,
 }
 
-/// No-op when the `composer` feature is disabled — `crate::setup::ComposerParseResult` does not
-/// exist in that build, so `parse_result` can never downcast to it.
-#[cfg(not(feature = "composer"))]
-pub fn composer_minimum_stability(_parse_result: &dyn deps_core::ParseResult) -> Option<String> {
-    None
+/// Builds a [`FetchPreparation`] from a parsed manifest and its resolved lock-file state.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::test_util::stub_parse_result_with_dependencies;
+/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_engine::classify::fetch::prepare_fetch;
+/// use std::collections::HashMap;
+///
+/// struct SimpleFormatter;
+/// impl PackageNaming for SimpleFormatter {}
+/// impl PackageRendering for SimpleFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for SimpleFormatter {}
+/// impl DiagnosticMessages for SimpleFormatter {}
+/// impl DiagnosticPolicy for SimpleFormatter {}
+/// impl SourcePolicy for SimpleFormatter {}
+/// impl OsvNaming for SimpleFormatter {}
+///
+/// let parsed = stub_parse_result_with_dependencies(2);
+/// let prep = prepare_fetch(
+///     parsed.as_ref(),
+///     &SimpleFormatter,
+///     EcosystemId::Cargo,
+///     &HashMap::new(),
+///     &HashMap::new(),
+/// );
+///
+/// assert_eq!(prep.dep_sources.len(), 2);
+/// assert!(prep.selection_context.minimum_stability().is_none());
+/// ```
+pub fn prepare_fetch(
+    parse_result: &dyn deps_core::ParseResult,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem: deps_core::EcosystemId,
+    resolved_versions: &HashMap<PackageName, ConcreteVersion>,
+    resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
+) -> FetchPreparation {
+    let (sources_map, collided_names) = dedup_dependencies_by_source(parse_result, formatter);
+    let dep_sources: DepSources = sources_map.into_iter().collect();
+    let in_use = crate::classify::resolved::collect_in_use_versions(
+        parse_result,
+        resolved_versions,
+        resolved_version_candidates,
+        formatter,
+        ecosystem,
+    );
+    FetchPreparation {
+        dep_sources,
+        in_use,
+        selection_context: parse_result.selection_context(),
+        collided_names,
+    }
 }
 
 /// Result of parallel version fetching.
@@ -328,7 +389,9 @@ impl FetchResult {
 ///
 /// ```
 /// use deps_core::parser::DependencySource;
-/// use deps_core::{ConcreteVersion, Metadata, PackageName, Registry, Version, VersionReq};
+/// use deps_core::{
+///     ConcreteVersion, Metadata, PackageName, Registry, SelectionContext, Version, VersionReq,
+/// };
 /// use deps_engine::classify::fetch::fetch_latest_versions_parallel;
 /// use std::any::Any;
 /// use std::collections::HashMap;
@@ -397,7 +460,7 @@ impl FetchResult {
 ///         deps_core::freshness::FreshnessSettings::default(),
 ///         5,
 ///         10,
-///         None,
+///         &SelectionContext::none(),
 ///     )
 ///     .await;
 ///
@@ -421,7 +484,7 @@ pub async fn fetch_latest_versions_parallel(
     freshness: deps_core::freshness::FreshnessSettings,
     timeout_secs: u64,
     max_concurrent: usize,
-    minimum_stability: Option<&str>,
+    selection_context: &deps_core::SelectionContext,
 ) -> FetchResult {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
@@ -462,7 +525,7 @@ pub async fn fetch_latest_versions_parallel(
                     wildcard_req,
                     freshness,
                     timeout,
-                    minimum_stability,
+                    selection_context,
                     check_yanked,
                     &fetched,
                     &failed,
@@ -576,7 +639,7 @@ async fn fetch_and_classify_package(
     wildcard_req: &VersionReq,
     freshness: deps_core::freshness::FreshnessSettings,
     timeout: Duration,
-    minimum_stability: Option<&str>,
+    selection_context: &deps_core::SelectionContext,
     check_yanked: bool,
     fetched: &std::sync::atomic::AtomicUsize,
     failed: &std::sync::atomic::AtomicUsize,
@@ -632,7 +695,7 @@ async fn fetch_and_classify_package(
             // task. `_with_context` so a registry with manifest-level stability state
             // (Composer's `minimum-stability`, #424 S1) can apply it.
             let resolved = if let Some(v) = registry
-                .select_latest_matching_with_context(&versions, wildcard_req, minimum_stability)
+                .select_latest_matching_with_context(&versions, wildcard_req, selection_context)
                 .and_then(|idx| versions.get(idx))
             {
                 let latest = v.version_string().clone();
@@ -655,7 +718,7 @@ async fn fetch_and_classify_package(
                         &name,
                         &source,
                         wildcard_req,
-                        minimum_stability,
+                        selection_context,
                     ),
                 )
                 .await;
@@ -924,6 +987,7 @@ pub fn apply_fetch_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::SelectionContext;
     use deps_core::parser::DependencySource;
 
     /// Pairs every name with the plain `Registry` source — the shape every pre-existing
@@ -1271,7 +1335,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -1351,7 +1415,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
         let elapsed = start.elapsed();
@@ -1450,7 +1514,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             20,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -1520,7 +1584,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 0,
-                None,
+                &SelectionContext::none(),
             ),
         )
         .await
@@ -1647,7 +1711,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -1767,7 +1831,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -1898,7 +1962,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2012,7 +2076,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2133,7 +2197,7 @@ mod tests {
             FreshnessSettings::default(),
             10,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2220,12 +2284,12 @@ mod tests {
                 &self,
                 versions: &[Box<dyn Version>],
                 _req: &deps_core::VersionReq,
-                minimum_stability: Option<&str>,
+                selection_context: &SelectionContext,
             ) -> Option<usize> {
                 self.seen_minimum_stability
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .push(minimum_stability.map(str::to_string));
+                    .push(selection_context.minimum_stability().map(str::to_string));
                 if versions.is_empty() { None } else { Some(0) }
             }
 
@@ -2247,7 +2311,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
-            Some("beta"),
+            &SelectionContext::with_composer_minimum_stability(Some("beta".to_string())),
         )
         .await;
 
@@ -2319,13 +2383,13 @@ mod tests {
                 &'a self,
                 _name: &'a deps_core::PackageName,
                 _req: &'a deps_core::VersionReq,
-                minimum_stability: Option<&'a str>,
+                selection_context: &'a SelectionContext,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 self.seen_minimum_stability
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .push(minimum_stability.map(str::to_string));
+                    .push(selection_context.minimum_stability().map(str::to_string));
                 Box::pin(async move {
                     Ok(Some(Box::new(MockVersion {
                         version: "2.0.0-beta1".into(),
@@ -2360,7 +2424,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             10,
             10,
-            Some("beta"),
+            &SelectionContext::with_composer_minimum_stability(Some("beta".to_string())),
         )
         .await;
 
@@ -2457,7 +2521,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2535,7 +2599,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2648,7 +2712,7 @@ mod tests {
                     deps_core::freshness::FreshnessSettings::default(),
                     5,
                     10,
-                    None,
+                    &SelectionContext::none(),
                 )
                 .await;
                 assert_eq!(result.failed_count, 1);
@@ -2741,7 +2805,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2811,7 +2875,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2897,7 +2961,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -2976,7 +3040,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -3050,7 +3114,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -3132,7 +3196,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -3212,7 +3276,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -3291,7 +3355,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             1,
             10,
-            None,
+            &SelectionContext::none(),
         )
         .await;
 
@@ -3313,12 +3377,12 @@ mod tests {
     mod composer_tests {
         use super::*;
 
-        /// #424 S1: `composer_minimum_stability` must extract the manifest's
-        /// `minimum-stability` field via the real `deps_composer::parser::parse_composer_json`
-        /// → `ComposerParseResult` → `deps_core::ParseResult` downcast path, not just a
-        /// hand-built fixture — this is the actual production call path from the fetch task.
+        /// #1433: `prepare_fetch` must surface the manifest's `minimum-stability` field via
+        /// the real `deps_composer::parser::parse_composer_json` -> `ComposerParseResult` ->
+        /// `deps_core::ParseResult::selection_context` path, not just a hand-built fixture —
+        /// this is the actual production call path from the fetch task.
         #[tokio::test]
-        async fn test_composer_minimum_stability_extracts_from_real_parse_result() {
+        async fn test_prepare_fetch_selection_context_extracts_from_real_parse_result() {
             let json = r#"{
   "minimum-stability": "beta",
   "require": {
@@ -3327,52 +3391,37 @@ mod tests {
 }"#;
             let uri = deps_core::test_util::test_uri("/test/composer.json");
             let parse_result = crate::setup::parse_composer_json(json, &uri).unwrap();
+            let formatter = deps_composer::ComposerFormatter;
 
-            assert_eq!(
-                composer_minimum_stability(&parse_result as &dyn deps_core::ParseResult),
-                Some("beta".to_string())
+            let prep = prepare_fetch(
+                &parse_result as &dyn deps_core::ParseResult,
+                &formatter,
+                deps_core::EcosystemId::Composer,
+                &HashMap::new(),
+                &HashMap::new(),
             );
+
+            assert_eq!(prep.selection_context.minimum_stability(), Some("beta"));
         }
 
-        /// #424 S1: a `composer.json` with no `minimum-stability` field extracts to `None`,
-        /// not a fabricated `"stable"`.
+        /// #1433: a `composer.json` with no `minimum-stability` field surfaces an empty
+        /// `SelectionContext`, not a fabricated `"stable"`.
         #[tokio::test]
-        async fn test_composer_minimum_stability_none_when_absent() {
+        async fn test_prepare_fetch_selection_context_none_when_absent() {
             let json = r#"{"require": {"symfony/console": "^6.0"}}"#;
             let uri = deps_core::test_util::test_uri("/test/composer.json");
             let parse_result = crate::setup::parse_composer_json(json, &uri).unwrap();
+            let formatter = deps_composer::ComposerFormatter;
 
-            assert_eq!(
-                composer_minimum_stability(&parse_result as &dyn deps_core::ParseResult),
-                None
+            let prep = prepare_fetch(
+                &parse_result as &dyn deps_core::ParseResult,
+                &formatter,
+                deps_core::EcosystemId::Composer,
+                &HashMap::new(),
+                &HashMap::new(),
             );
-        }
 
-        /// #424 S1: a non-Composer `ParseResult` (the downcast target type mismatches) must
-        /// extract to `None` rather than panicking — this is what every other ecosystem's
-        /// document hits on every fetch cycle.
-        #[test]
-        fn test_composer_minimum_stability_none_for_non_composer_parse_result() {
-            struct OtherParseResult;
-            impl deps_core::ParseResult for OtherParseResult {
-                fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-                    vec![]
-                }
-                fn workspace_root(&self) -> Option<&std::path::Path> {
-                    None
-                }
-                fn uri(&self) -> &url::Url {
-                    unimplemented!("not exercised by this test")
-                }
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
-                }
-            }
-
-            assert_eq!(
-                composer_minimum_stability(&OtherParseResult as &dyn deps_core::ParseResult),
-                None
-            );
+            assert_eq!(prep.selection_context.minimum_stability(), None);
         }
     }
     mod yanked_check_tests {
@@ -3525,7 +3574,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3553,7 +3602,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3579,7 +3628,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3613,7 +3662,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3647,7 +3696,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3681,7 +3730,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3717,7 +3766,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3769,7 +3818,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3803,7 +3852,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3837,7 +3886,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3882,7 +3931,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -3911,7 +3960,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 1,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -4019,7 +4068,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 
@@ -4044,7 +4093,7 @@ mod tests {
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &SelectionContext::none(),
             )
             .await;
 

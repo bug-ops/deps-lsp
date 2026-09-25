@@ -1,8 +1,8 @@
 //! Registry fetch orchestration: fans a document-change diff out to the classification
 //! layer's concurrent fetch, then merges the result back into `DocumentState`.
 //!
-//! The pure fetch/classify decisions themselves (`dedup_dependencies_by_source`,
-//! `composer_minimum_stability`, `fetch_latest_versions_parallel`, `fetch_and_classify_package`)
+//! The pure fetch/classify decisions themselves (`prepare_fetch`, `dedup_dependencies_by_source`,
+//! `fetch_latest_versions_parallel`, `fetch_and_classify_package`)
 //! live in `deps_engine::classify::fetch` (issue #1059) — this module owns only what depends on
 //! `ServerState`/`DocumentState`/`Client`: marking a document loading, opening an LSP progress
 //! notification, and merging a completed fetch's result back into document state.
@@ -18,10 +18,8 @@ use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
 };
 use deps_engine::classify::fetch::{
-    DepSources, FetchResult, apply_fetch_outcomes, composer_minimum_stability,
-    dedup_dependencies_by_source, fetch_latest_versions_parallel,
+    DepSources, FetchResult, apply_fetch_outcomes, fetch_latest_versions_parallel, prepare_fetch,
 };
-use deps_engine::classify::resolved::collect_in_use_versions;
 use std::collections::{HashMap, HashSet};
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
@@ -113,39 +111,48 @@ pub(crate) async fn fetch_registry_versions_for_change(
         (None, None)
     };
 
-    // Build the in-use-version map (§4.6) and the added/changed dependencies' resolved
-    // sources (spec FR-001/FR-011) from the freshly-committed parse result and the
-    // resolved versions just loaded above.
-    let (in_use, minimum_stability, dep_sources, collided_names): (
+    // Build the in-use-version map (§4.6), the manifest's own `SelectionContext` (#1433),
+    // and the added/changed dependencies' resolved sources (spec FR-001/FR-011) from the
+    // freshly-committed parse result and the resolved versions just loaded above.
+    let (in_use, selection_context, dep_sources, collided_names): (
         HashMap<PackageName, Vec<String>>,
-        Option<String>,
+        deps_core::SelectionContext,
         DepSources,
         HashSet<PackageName>,
     ) = match state.get_document(uri) {
         Some(doc) => match doc.parse_result() {
             Some(pr) => {
-                let (sources, collided_names) =
-                    dedup_dependencies_by_source(pr, ecosystem.formatter());
-                let dep_sources = deps_to_fetch
-                    .iter()
-                    .filter_map(|name| sources.get(name).map(|s| (name.clone(), s.clone())))
-                    .collect();
+                let mut prep = prepare_fetch(
+                    pr,
+                    ecosystem.formatter(),
+                    ecosystem.ecosystem_id(),
+                    resolved_versions,
+                    resolved_version_candidates,
+                );
+                // This call only fetches the added/version-changed subset the caller's diff
+                // determined, unlike `prepare_fetch`'s default full-manifest set.
+                let to_fetch: HashSet<&PackageName> = deps_to_fetch.iter().collect();
+                prep.dep_sources.retain(|(name, _)| to_fetch.contains(name));
                 (
-                    collect_in_use_versions(
-                        pr,
-                        resolved_versions,
-                        resolved_version_candidates,
-                        ecosystem.formatter(),
-                        ecosystem.ecosystem_id(),
-                    ),
-                    composer_minimum_stability(pr),
-                    dep_sources,
-                    collided_names,
+                    prep.in_use,
+                    prep.selection_context,
+                    prep.dep_sources,
+                    prep.collided_names,
                 )
             }
-            None => (HashMap::new(), None, Vec::new(), HashSet::new()),
+            None => (
+                HashMap::new(),
+                deps_core::SelectionContext::none(),
+                Vec::new(),
+                HashSet::new(),
+            ),
         },
-        None => (HashMap::new(), None, Vec::new(), HashSet::new()),
+        None => (
+            HashMap::new(),
+            deps_core::SelectionContext::none(),
+            Vec::new(),
+            HashSet::new(),
+        ),
     };
 
     // Captured before `dep_sources` is moved into the call below: every raw name a
@@ -166,7 +173,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
         freshness_settings,
         fetch_timeout_secs,
         max_concurrent_fetches,
-        minimum_stability.as_deref(),
+        &selection_context,
     )
     .await;
 
@@ -374,7 +381,7 @@ mod tests {
             deps_core::freshness::FreshnessSettings::default(),
             5,
             10,
-            None,
+            &deps_core::SelectionContext::none(),
         )
         .await;
 
@@ -461,6 +468,7 @@ dependencies = ["requests>=2.0.0"]
     mod pypi_yanked_key_guard_tests {
         use super::*;
         use deps_core::{DiagnosticSeverities, Metadata, Version, VersionData};
+        use deps_engine::classify::resolved::collect_in_use_versions;
         use std::any::Any;
 
         #[derive(Debug, Clone)]
@@ -603,7 +611,7 @@ dependencies = ["requests>=2.0.0"]
                 deps_core::freshness::FreshnessSettings::default(),
                 5,
                 10,
-                None,
+                &deps_core::SelectionContext::none(),
             )
             .await;
 

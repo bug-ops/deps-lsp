@@ -37,14 +37,16 @@ unless overridden; a wildcard/existence-check requirement still resolves a prere
 package instead of reporting no version found. The effective stability floor is now manifest-
 and dependency-aware: a per-dependency `@stability` flag (`^1.0@beta`) or a directly-pinned
 prerelease version overrides the manifest's own `composer.json` `minimum-stability` field,
-which in turn overrides the `stable` default — reflected in the live "outdated" diagnostic,
-not just available as a library-level API. Separator-less and dot/underscore-separated
-prerelease suffixes (`1.0.0RC1`, `2.6.3.alpha`) classify consistently regardless of `v`/`V`
-prefix.
+which in turn overrides the `stable` default — reflected consistently across diagnostics,
+hover, completion, and code actions, via a shared `SelectionContext` rather than a
+diagnostics-only path. Editing `minimum-stability` in an already-open document forces a full
+re-fetch, so the other surfaces don't keep showing a stale "latest" behind the new stability
+floor. Separator-less and dot/underscore-separated prerelease suffixes (`1.0.0RC1`,
+`2.6.3.alpha`) classify consistently regardless of `v`/`V` prefix.
 
-**Known limitation**: editing `minimum-stability` alone in an already-open document does not
-refresh already-fetched dependencies' cached "latest" version until the document is closed and
-reopened.
+Composer's update code actions and completion also preserve the requirement's own `v`-prefix
+style instead of forcing the raw Packagist tag's prefix onto an unprefixed requirement (or vice
+versa).
 
 See [Dart](dart.md#version-comparison) for the equivalent fix in that ecosystem, which shares
 the same underlying `compare_versions` bug class and was corrected in the same change.

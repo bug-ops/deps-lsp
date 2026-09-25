@@ -193,7 +193,7 @@ fn self_closing_version_probe_range(tag_span: LspRange) -> LspRange {
 )]
 async fn complete_self_closing_version(
     registry: &dyn Registry,
-    formatter: &dyn deps_core::lsp_helpers::SourcePolicy,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     parse_result: &dyn ParseResultTrait,
     position: Position,
     content: &str,

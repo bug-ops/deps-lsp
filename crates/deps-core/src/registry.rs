@@ -238,26 +238,25 @@ pub trait Registry: Send + Sync {
 
     /// Like [`get_latest_matching`](Self::get_latest_matching), but lets a registry whose
     /// "latest matching" selection can be refined by ecosystem-specific manifest state (e.g.
-    /// Composer's `minimum-stability` field, #424) read it, alongside `req`.
+    /// Composer's `minimum-stability` field, #424/#1433) read it, alongside `req`.
     ///
-    /// `minimum_stability` is an opaque, ecosystem-defined string (Composer's own stability
-    /// keyword: `"dev"`, `"alpha"`, `"beta"`, `"RC"`, or `"stable"`) rather than a shared type,
-    /// mirroring [`get_versions_with`](Self::get_versions_with)'s
+    /// `selection_context` is the caller's [`crate::SelectionContext`] — opaque and
+    /// ecosystem-owned (see that type's own doc), mirroring [`get_versions_with`](Self::get_versions_with)'s
     /// [`FreshnessSettings`](crate::freshness::FreshnessSettings) precedent for "an optional
-    /// extra parameter most registries ignore" — except here even the *shape* of the extra
-    /// context is ecosystem-specific, so no shared DTO is introduced for it; only the one
-    /// registry that understands the string overrides this method.
+    /// extra parameter most registries ignore"; only the one registry that understands its
+    /// contents (`PackagistRegistry`, via [`crate::SelectionContext::minimum_stability`])
+    /// overrides this method.
     ///
     /// Default: forwards to [`get_latest_matching`](Self::get_latest_matching), ignoring
-    /// `minimum_stability`. This keeps every registry with no manifest-level stability
+    /// `selection_context`. This keeps every registry with no manifest-level stability
     /// concept unchanged.
     fn get_latest_matching_with_context<'a>(
         &'a self,
         name: &'a PackageName,
         req: &'a VersionReq,
-        minimum_stability: Option<&'a str>,
+        selection_context: &'a crate::SelectionContext,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
-        let _ = minimum_stability;
+        let _ = selection_context;
         self.get_latest_matching(name, req)
     }
 
@@ -279,10 +278,10 @@ pub trait Registry: Send + Sync {
         name: &'a PackageName,
         source: &'a DependencySource,
         req: &'a VersionReq,
-        minimum_stability: Option<&'a str>,
+        selection_context: &'a crate::SelectionContext,
     ) -> BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         let _ = source;
-        self.get_latest_matching_with_context(name, req, minimum_stability)
+        self.get_latest_matching_with_context(name, req, selection_context)
     }
 
     /// Searches for packages by name or keywords.
@@ -367,20 +366,20 @@ pub trait Registry: Send + Sync {
 
     /// Like [`select_latest_matching`](Self::select_latest_matching), but lets a registry
     /// whose selection can be refined by ecosystem-specific manifest state (e.g. Composer's
-    /// `minimum-stability` field, #424) read it, alongside `versions` and `req`. See
+    /// `minimum-stability` field, #424/#1433) read it, alongside `versions` and `req`. See
     /// [`get_latest_matching_with_context`](Self::get_latest_matching_with_context) for why
-    /// `minimum_stability` is an opaque per-ecosystem string rather than a shared type.
+    /// `selection_context` is [`crate::SelectionContext`] rather than a shared, typed DTO.
     ///
     /// Default: forwards to [`select_latest_matching`](Self::select_latest_matching), ignoring
-    /// `minimum_stability`. This keeps every registry with no manifest-level stability concept
+    /// `selection_context`. This keeps every registry with no manifest-level stability concept
     /// unchanged.
     fn select_latest_matching_with_context(
         &self,
         versions: &[Box<dyn Version>],
         req: &VersionReq,
-        minimum_stability: Option<&str>,
+        selection_context: &crate::SelectionContext,
     ) -> Option<usize> {
-        let _ = minimum_stability;
+        let _ = selection_context;
         self.select_latest_matching(versions, req)
     }
 

@@ -184,13 +184,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     //
     // `live_latest_idx`, not raw index 0, since the list sorts purely by version number and a
     // pre-release could sort first without being "latest stable". Delegated to
-    // `Registry::select_latest_matching` — the same call `lifecycle.rs`'s background fetch
-    // uses, so the two never disagree (e.g. npm's #338 non-deprecated preference, #347/#348
-    // S1's label). Recorded as an index so the "Recent versions" marker matches by position.
+    // `Registry::select_latest_matching_with_context`, threading `parse_result`'s own
+    // `SelectionContext` (e.g. Composer's `minimum-stability`, #1433) — the same call
+    // `lifecycle.rs`'s background fetch uses, so the two never disagree (e.g. npm's #338
+    // non-deprecated preference, #347/#348 S1's label). Recorded as an index so the "Recent
+    // versions" marker matches by position.
     let wildcard_req = crate::existence_wildcard_req();
-    let live_latest_idx = available_versions
-        .as_ref()
-        .and_then(|v| registry.select_latest_matching(v, &wildcard_req));
+    let selection_context = parse_result.selection_context();
+    let live_latest_idx = available_versions.as_ref().and_then(|v| {
+        registry.select_latest_matching_with_context(v, &wildcard_req, &selection_context)
+    });
     // #373: a non-empty live list can still leave `live_latest_idx` `None` — e.g. Go's
     // `/@v/list` never enumerates pseudo-versions, so an untagged module's all-pre-release
     // history fails the list-based pick. Mirrors `lifecycle.rs`'s own fallback: a second call
@@ -202,7 +205,12 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     {
         match tokio::time::timeout(
             HOVER_FALLBACK_TIMEOUT,
-            registry.get_latest_matching_from(dep.name(), &dep_source, &wildcard_req, None),
+            registry.get_latest_matching_from(
+                dep.name(),
+                &dep_source,
+                &wildcard_req,
+                &selection_context,
+            ),
         )
         .await
         {

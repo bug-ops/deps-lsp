@@ -637,7 +637,7 @@ impl Registry for DenoRegistry {
         name: &'a PackageName,
         source: &'a deps_core::DependencySource,
         req: &'a VersionReq,
-        minimum_stability: Option<&'a str>,
+        selection_context: &'a deps_core::SelectionContext,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn Version>>>> {
         Box::pin(async move {
             match split_scheme(name.as_str()) {
@@ -648,7 +648,7 @@ impl Registry for DenoRegistry {
                         &bare,
                         source,
                         req,
-                        minimum_stability,
+                        selection_context,
                     )
                     .await
                 }
@@ -1480,7 +1480,7 @@ mod tests {
             &PackageName::new("npm:@myorg/internal-lib"),
             &source,
             &VersionReq::new("*"),
-            None,
+            &deps_core::SelectionContext::none(),
         )
         .await
         .unwrap();

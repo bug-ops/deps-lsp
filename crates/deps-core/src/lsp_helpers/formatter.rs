@@ -118,6 +118,32 @@ pub trait PackageRendering: Send + Sync {
         self.format_version_replacing(version, current)
     }
 
+    /// Adjusts a candidate version's presentation before a completion item's
+    /// `insert_text`/`text_edit` splices it into the manifest, given `typed_prefix` — the
+    /// text already typed before the cursor (possibly empty).
+    ///
+    /// Default: identity (`version.to_string()`) — completion has always inserted the
+    /// registry's version string verbatim, and this default keeps that behavior unchanged
+    /// for every ecosystem with no completion-time presentation concern of its own.
+    ///
+    /// Deliberately **not** [`format_version_replacing`](Self::format_version_replacing):
+    /// that method's `current` parameter means "the full existing declared requirement
+    /// text" (needed to reconstruct e.g. PyPI's `==X`-preserving rewrite from a complete
+    /// pin) — `typed_prefix` is only the partially-typed text before the cursor, never a
+    /// complete requirement, so an override reusing `format_version_replacing`'s contract
+    /// here would corrupt a PyPI-style completion (issue #1435 S3: this was tried and
+    /// reverted after it broke exactly that case). Override this method directly instead,
+    /// for a narrower concern — e.g. `deps-composer`'s `ComposerFormatter` overrides it to
+    /// preserve the typed prefix's `v`-style against Packagist's raw, unstripped tag text.
+    fn format_version_for_completion(
+        &self,
+        version: &ConcreteVersion,
+        typed_prefix: &str,
+    ) -> String {
+        let _ = typed_prefix;
+        version.to_string()
+    }
+
     /// Get package URL for hover markdown.
     fn package_url(&self, name: &PackageName) -> String;
 
