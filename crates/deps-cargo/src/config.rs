@@ -43,7 +43,7 @@ use toml_span::value::Table;
 use deps_core::net_policy::{
     HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
 };
-use deps_core::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
+use deps_core::{DEFAULT_MAX_CACHED_FILES, EcosystemId, MtimeFileCache};
 
 /// A registry bearer-token credential, redacted everywhere except the one call site that
 /// formats it into an `Authorization` header.
@@ -219,7 +219,7 @@ impl RegistryIndex {
             IndexTrust::Trusted => PolicyGate::Skip,
             IndexTrust::WorkspaceDeclared => PolicyGate::Enforce(policy),
         };
-        let url = validate_index_url(stripped, stripped, "cargo", gate)?;
+        let url = validate_index_url(stripped, stripped, EcosystemId::Cargo, gate)?;
         Ok(Self { url, trust })
     }
 

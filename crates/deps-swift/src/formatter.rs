@@ -549,10 +549,9 @@ mod tests {
         // `format_version_for_text_edit` must itself satisfy the
         // requirement text that edit produces.
         let fmt = SwiftFormatter;
-        let osv_version = "1.2.3";
-        let native = fmt.osv_version_to_native(osv_version);
-        assert_eq!(native, osv_version);
-        let native = ConcreteVersion::new(native);
+        let osv_version = deps_core::osv::OsvVersion::new("1.2.3");
+        let native = fmt.osv_version_to_native(&osv_version);
+        assert_eq!(native, osv_version.as_str());
         let edit_text = fmt.format_version_for_text_edit(&native);
         assert!(fmt.version_satisfies_requirement(&native, &edit_text));
     }
@@ -717,7 +716,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let manifest = r#".package(url: "https://github.com/apple/swift-nio", from: "\(v)")"#;
@@ -739,7 +738,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["2.40.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("2.40.0")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -779,7 +778,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let manifest = r#".package(url: "https://github.com/apple/swift-argument-parser", from: "{{ ap_version }}")"#;
@@ -800,7 +799,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["1.3.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("1.3.0")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {

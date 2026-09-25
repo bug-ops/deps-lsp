@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::EcosystemId;
 use crate::cache::HttpCache;
 
 /// Base URL for the GitHub REST API.
@@ -464,10 +465,16 @@ pub use crate::pagination::page_has_more;
 /// still had more pages available (`page_has_more(page_len)`).
 ///
 /// A thin, GitHub-specific wrapper over [`crate::pagination::warn_if_pagination_truncated`]
-/// (provider `"GitHub"`, cap [`MAX_TAG_PAGES`]) kept so every existing call site's warning
-/// text stays byte-identical after the #472/GitLab-CI-plan §4.4 extraction. `ecosystem`
-/// names the caller (e.g. `"Swift"`, `"GitHub Actions"`) in the warning text.
-pub fn warn_if_pagination_truncated(ecosystem: &str, name: &str, page: u32, page_len: usize) {
+/// (provider `"GitHub"`, cap [`MAX_TAG_PAGES`]), kept so every call site shares the same
+/// pagination-truncation shape instead of re-deriving it (#472/GitLab-CI-plan §4.4). `ecosystem`
+/// names the caller (e.g. [`EcosystemId::Swift`], [`EcosystemId::GithubActions`]) in the
+/// warning text and tracing field.
+pub fn warn_if_pagination_truncated(
+    ecosystem: EcosystemId,
+    name: &str,
+    page: u32,
+    page_len: usize,
+) {
     crate::pagination::warn_if_pagination_truncated(
         "GitHub",
         ecosystem,
@@ -512,7 +519,7 @@ pub fn warn_if_pagination_truncated(ecosystem: &str, name: &str, page: u32, page
 /// dropped), or the error from [`parse_tags_page`] when a page's body is a GitHub error
 /// object.
 pub async fn paginate_tags<F, Fut>(
-    ecosystem: &str,
+    ecosystem: EcosystemId,
     name: &str,
     fetch_page: F,
 ) -> Result<Vec<GithubTag>>
@@ -768,6 +775,7 @@ impl ReleaseDatesCache {
     /// network-free, so it doubles as a runnable example:
     ///
     /// ```
+    /// use deps_core::EcosystemId;
     /// use deps_core::HttpCache;
     /// use deps_core::github::{GithubTagsClient, ReleaseDatesCache};
     /// use std::sync::Arc;
@@ -776,19 +784,21 @@ impl ReleaseDatesCache {
     /// # async fn main() {
     /// let cache = ReleaseDatesCache::new();
     /// let github = GithubTagsClient::new(Arc::new(HttpCache::new()));
-    /// let dates = cache.fetch(&github, "not-a-valid-owner-repo", "Example").await;
+    /// let dates = cache
+    ///     .fetch(&github, "not-a-valid-owner-repo", EcosystemId::Swift)
+    ///     .await;
     /// assert!(dates.is_empty());
     /// # }
     /// ```
     #[tracing::instrument(
         skip(self, github),
-        fields(name = %crate::redact::redact_declaration_key(name), ecosystem = ecosystem)
+        fields(name = %crate::redact::redact_declaration_key(name), %ecosystem)
     )]
     pub async fn fetch(
         &self,
         github: &GithubTagsClient,
         name: &str,
-        ecosystem: &'static str,
+        ecosystem: EcosystemId,
     ) -> Arc<HashMap<String, PublishTime>> {
         if validate_owner_repo(name).is_err() {
             return Arc::new(HashMap::new());
@@ -959,10 +969,10 @@ mod tests {
     #[test]
     fn test_pagination_warns_when_truncated_at_cap() {
         let output = capture_tracing_output(|| {
-            warn_if_pagination_truncated("Swift", "owner/repo", MAX_TAG_PAGES, 100);
+            warn_if_pagination_truncated(EcosystemId::Swift, "owner/repo", MAX_TAG_PAGES, 100);
         });
         assert!(output.contains("owner/repo"), "output was: {output}");
-        assert!(output.contains("Swift"), "output was: {output}");
+        assert!(output.contains("swift"), "output was: {output}");
         assert!(output.contains("cap"), "output was: {output}");
     }
 
@@ -970,7 +980,7 @@ mod tests {
     #[test]
     fn test_pagination_silent_when_under_cap() {
         let output = capture_tracing_output(|| {
-            warn_if_pagination_truncated("Swift", "owner/repo", MAX_TAG_PAGES - 1, 100);
+            warn_if_pagination_truncated(EcosystemId::Swift, "owner/repo", MAX_TAG_PAGES - 1, 100);
         });
         assert!(output.is_empty(), "output was: {output}");
     }
@@ -979,7 +989,7 @@ mod tests {
     #[test]
     fn test_pagination_silent_when_last_page_at_cap_is_partial() {
         let output = capture_tracing_output(|| {
-            warn_if_pagination_truncated("Swift", "owner/repo", MAX_TAG_PAGES, 42);
+            warn_if_pagination_truncated(EcosystemId::Swift, "owner/repo", MAX_TAG_PAGES, 42);
         });
         assert!(output.is_empty(), "output was: {output}");
     }
@@ -997,7 +1007,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
 
         let calls = AtomicU32::new(0);
-        let result = paginate_tags("Swift", "owner/repo", |page| {
+        let result = paginate_tags(EcosystemId::Swift, "owner/repo", |page| {
             calls.fetch_add(1, Ordering::SeqCst);
             async move {
                 match page {
@@ -1029,7 +1039,7 @@ mod tests {
         let calls = AtomicU32::new(0);
         let mut tags = Vec::new();
         let output = capture_tracing_output_async(async {
-            let result = paginate_tags("Swift", "owner/repo", |page| {
+            let result = paginate_tags(EcosystemId::Swift, "owner/repo", |page| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async move {
                     match page {
@@ -1079,7 +1089,7 @@ mod tests {
         // If `paginate_tags` used `buffer_unordered` instead of ordered `buffered`, output
         // would follow completion order (6,5,4,3,2) instead of page order — `deps-github-
         // actions`'s tag-to-SHA "first tag wins" dedup depends on the latter.
-        let result = paginate_tags("Swift", "owner/repo", |page| async move {
+        let result = paginate_tags(EcosystemId::Swift, "owner/repo", |page| async move {
             match page {
                 1 => Ok(named_page("page1", 100)),
                 2 => {
@@ -1130,7 +1140,7 @@ mod tests {
         // Page 4 errors while pages 5-6 (later in page order, but faster to resolve) are
         // still in flight. The error returned must be page 4's own, not silently swapped
         // for a sibling's outcome or swallowed into an `Ok` with a truncated result.
-        let err = paginate_tags("Swift", "owner/repo", |page| async move {
+        let err = paginate_tags(EcosystemId::Swift, "owner/repo", |page| async move {
             match page {
                 1..=3 => Ok(tags_page_json(100)),
                 4 => Err(DepsError::CacheError("boom from page 4".to_string())),
@@ -1157,7 +1167,7 @@ mod tests {
 
         let calls = AtomicU32::new(0);
         let output = capture_tracing_output_async(async {
-            let result = paginate_tags("Swift", "owner/repo", |_page| {
+            let result = paginate_tags(EcosystemId::Swift, "owner/repo", |_page| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 async move { Ok(tags_page_json(100)) }
             })
@@ -1582,7 +1592,9 @@ mod tests {
     async fn test_fetch_validate_owner_repo_rejection_issues_zero_requests() {
         let cache = ReleaseDatesCache::new();
         let github = untokened_client();
-        let dates = cache.fetch(&github, "../../etc/passwd", "Test").await;
+        let dates = cache
+            .fetch(&github, "../../etc/passwd", EcosystemId::Swift)
+            .await;
         assert!(dates.is_empty());
         // Nothing stored: a validation failure is cheaper to re-check than to memoize
         // (#223 M6), and this also proves no fetch-and-store path ran.
@@ -1609,7 +1621,7 @@ mod tests {
         );
 
         let output = capture_tracing_output_async(async {
-            let dates = cache.fetch(&github, "owner/repo", "Test").await;
+            let dates = cache.fetch(&github, "owner/repo", EcosystemId::Swift).await;
             assert_eq!(dates.get("9.9.9").copied(), Some(published));
         })
         .await;
@@ -1637,7 +1649,7 @@ mod tests {
         );
 
         let output = capture_tracing_output_async(async {
-            let dates = cache.fetch(&github, "owner/repo", "Test").await;
+            let dates = cache.fetch(&github, "owner/repo", EcosystemId::Swift).await;
             assert!(dates.is_empty());
         })
         .await;
@@ -1664,7 +1676,7 @@ mod tests {
         );
 
         let output = capture_tracing_output_async(async {
-            let dates = cache.fetch(&github, "owner/repo", "Test").await;
+            let dates = cache.fetch(&github, "owner/repo", EcosystemId::Swift).await;
             assert!(dates.is_empty());
         })
         .await;
@@ -1694,7 +1706,7 @@ mod tests {
         );
 
         let output = capture_tracing_output_async(async {
-            let dates = cache.fetch(&github, "owner/repo", "Test").await;
+            let dates = cache.fetch(&github, "owner/repo", EcosystemId::Swift).await;
             assert!(dates.is_empty());
         })
         .await;
@@ -1711,8 +1723,12 @@ mod tests {
         let github = untokened_client();
 
         let output = capture_tracing_output_async(async {
-            let _ = cache.fetch(&github, "owner/repo-a", "Test").await;
-            let _ = cache.fetch(&github, "owner/repo-b", "Test").await;
+            let _ = cache
+                .fetch(&github, "owner/repo-a", EcosystemId::Swift)
+                .await;
+            let _ = cache
+                .fetch(&github, "owner/repo-b", EcosystemId::Swift)
+                .await;
         })
         .await;
 
@@ -1722,7 +1738,7 @@ mod tests {
             "the skip message must fire at most once per cache instance: {output}"
         );
         assert!(
-            output.contains("Test release dates are unavailable"),
+            output.contains("swift release dates are unavailable"),
             "{output}"
         );
     }
@@ -1756,7 +1772,7 @@ mod tests {
             GithubTagsClient::for_test(Arc::new(HttpCache::new()), "http://127.0.0.1:1", false);
         let output = capture_tracing_output_async(async {
             let dates = cache
-                .fetch(&other_origin_client, "owner/repo", "Test")
+                .fetch(&other_origin_client, "owner/repo", EcosystemId::Swift)
                 .await;
             assert!(dates.is_empty());
         })

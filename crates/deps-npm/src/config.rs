@@ -48,7 +48,7 @@ use deps_core::net_policy::{
     RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{BlockedSourceClass, PackageName};
+use deps_core::{BlockedSourceClass, EcosystemId, PackageName};
 
 /// Why a candidate `registry=`/`@scope:registry=` value failed [`NpmRegistryIndex::new`]'s
 /// validation, or why expansion of a `${VAR}` placeholder inside it failed (FR-007).
@@ -110,7 +110,7 @@ pub enum NpmRegistryIndexKind {}
 impl deps_core::net_policy::private::Sealed for NpmRegistryIndexKind {}
 
 impl RegistryUrlKind for NpmRegistryIndexKind {
-    const ECOSYSTEM: &'static str = "npm";
+    const ECOSYSTEM: EcosystemId = EcosystemId::Npm;
     const REJECT_QUERY_FRAGMENT: bool = false;
     type Error = NpmRegistryIndexError;
 }

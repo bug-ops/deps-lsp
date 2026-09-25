@@ -7,11 +7,134 @@
 //! (see `architecture.md` §6).
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::ConcreteVersion;
 use crate::lsp_helpers::is_safe_version_string;
+
+/// A version string in OSV.dev's own wire spelling — distinct from [`ConcreteVersion`], the
+/// ecosystem-native spelling, so the two can never be silently swapped at a call site
+/// (issue #1423).
+///
+/// The two spellings coincide for every ecosystem except Go, where OSV's SEMVER ranges never
+/// carry the mandatory `v` prefix `go.mod` requires — [`crate::lsp_helpers::OsvNaming::osv_version`]
+/// and [`crate::lsp_helpers::OsvNaming::osv_version_to_native`] are the only sanctioned
+/// conversions between the two.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::OsvVersion;
+///
+/// let version = OsvVersion::new("1.2.3");
+/// assert_eq!(version.as_str(), "1.2.3");
+/// assert_eq!(version, "1.2.3");
+/// ```
+///
+/// `PartialOrd`/`Ord` are derived (raw byte-string order, unlike sibling newtypes such as
+/// [`ConcreteVersion`] or `VulnKey`, which derive neither) only because
+/// [`crate::osv::OsvClient`]'s `query_cache` key tuple includes an `OsvVersion` and its
+/// `Ord`-bounded eviction heap (`cache_policy::evict_oldest_batch`) needs *some* total order to
+/// break ties, not a version-semantic one. Never use this ordering to compare two versions —
+/// go through `compare_version_strings` (or an ecosystem's own parser) for that.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OsvVersion(String);
+
+impl OsvVersion {
+    /// Wraps `value` as an `OsvVersion`, unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvVersion;
+    ///
+    /// let version = OsvVersion::new(String::from("1.0.0"));
+    /// assert_eq!(version.as_str(), "1.0.0");
+    /// ```
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the OSV wire version as a string slice.
+    ///
+    /// Kept `pub` (not narrowed to `pub(crate)`) because a real ecosystem's own
+    /// [`crate::lsp_helpers::OsvNaming`] override lives in a *different* crate
+    /// (`deps-go::formatter::GoFormatter`) and needs the raw wire text to compute its native
+    /// spelling — the same reason [`ConcreteVersion::as_str`] stays `pub`. This does not
+    /// reopen the swap risk [`OsvVersion`] exists to close: the type-level distinction
+    /// prevents a wire value from being passed where a native one is expected (or vice versa)
+    /// at a function boundary; `as_str` only lets already-correctly-typed code read the bytes
+    /// it already has, the same escape hatch every string newtype in this crate exposes
+    /// (`ConcreteVersion`, `PackageName`, `RedactedUrl`, ...).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvVersion;
+    ///
+    /// let version = OsvVersion::new("4.5.6");
+    /// assert_eq!(version.as_str(), "4.5.6");
+    /// ```
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the `OsvVersion`, returning the wrapped `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvVersion;
+    ///
+    /// let version = OsvVersion::new("4.5.6");
+    /// let owned: String = version.into_string();
+    /// assert_eq!(owned, "4.5.6");
+    /// ```
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for OsvVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<String> for OsvVersion {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for OsvVersion {
+    fn from(value: &str) -> Self {
+        Self(value.to_string())
+    }
+}
+
+impl AsRef<str> for OsvVersion {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for OsvVersion {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for OsvVersion {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
 
 /// One dependency to query against OSV.
 ///
@@ -34,14 +157,15 @@ use crate::lsp_helpers::is_safe_version_string;
 /// # Examples
 ///
 /// ```
-/// use deps_core::osv::ScanTarget;
+/// use deps_core::ConcreteVersion;
+/// use deps_core::osv::{OsvVersion, ScanTarget};
 /// use deps_core::test_util::vuln_key;
 ///
 /// let target = ScanTarget::new(
 ///     vuln_key("time"),
 ///     "time".to_string(),
-///     "0.1.43".to_string(),
-///     "0.1.43".to_string(),
+///     OsvVersion::new("0.1.43"),
+///     ConcreteVersion::new("0.1.43"),
 /// );
 /// assert_eq!(target.key.as_str(), target.osv_name);
 /// ```
@@ -59,12 +183,12 @@ pub struct ScanTarget {
     /// `EcosystemFormatter::osv_version`. Never surface this to the user —
     /// use [`Self::display_version`] instead.
     #[raw]
-    pub version: String,
+    pub version: OsvVersion,
     /// The same version in the ecosystem's native spelling (pre-`osv_version`
     /// rewrite), for callers that need to display it back to the user rather
     /// than send it to OSV.
     #[raw]
-    pub display_version: String,
+    pub display_version: ConcreteVersion,
 }
 
 impl ScanTarget {
@@ -72,6 +196,10 @@ impl ScanTarget {
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// Prefer [`Self::from_native`] when `version` is simply `display_version` rewritten via
+    /// [`crate::lsp_helpers::OsvNaming::osv_version`] — the common production shape — so the
+    /// pair is derived rather than hand-rolled at every call site.
     ///
     /// # Arguments
     ///
@@ -84,7 +212,12 @@ impl ScanTarget {
     /// * `display_version` - The same version in the ecosystem's native spelling, for
     ///   surfacing back to the user instead of `version`
     #[must_use]
-    pub fn new(key: VulnKey, osv_name: String, version: String, display_version: String) -> Self {
+    pub fn new(
+        key: VulnKey,
+        osv_name: String,
+        version: OsvVersion,
+        display_version: ConcreteVersion,
+    ) -> Self {
         Self {
             key,
             osv_name,
@@ -92,11 +225,47 @@ impl ScanTarget {
             display_version,
         }
     }
+
+    /// Constructs a `ScanTarget` from a native (ecosystem-spelled) version, deriving the wire
+    /// `version` field via `naming.osv_version(&native)` — so a caller no longer hand-rolls the
+    /// `(formatter.osv_version(&v), v)` pair [`Self::new`] would otherwise require.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::lsp_helpers::OsvNaming;
+    /// use deps_core::osv::ScanTarget;
+    /// use deps_core::test_util::vuln_key;
+    ///
+    /// struct DefaultFormatter;
+    /// impl OsvNaming for DefaultFormatter {}
+    ///
+    /// let target = ScanTarget::from_native(
+    ///     vuln_key("time"),
+    ///     "time".to_string(),
+    ///     ConcreteVersion::new("0.1.43"),
+    ///     &DefaultFormatter,
+    /// );
+    /// assert_eq!(target.version, "0.1.43");
+    /// assert_eq!(target.display_version, "0.1.43");
+    /// ```
+    #[must_use]
+    pub fn from_native(
+        key: VulnKey,
+        osv_name: String,
+        native: ConcreteVersion,
+        naming: &dyn crate::lsp_helpers::OsvNaming,
+    ) -> Self {
+        let version = naming.osv_version(&native);
+        Self::new(key, osv_name, version, native)
+    }
 }
 
 #[cfg(test)]
 mod scan_target_debug_redaction_tests {
-    use super::{ScanTarget, VulnKey};
+    use super::{OsvVersion, ScanTarget, VulnKey};
+    use crate::ConcreteVersion;
 
     crate::debug_redaction_conformance!(
         test_scan_target_debug_redacts_credentials,
@@ -104,8 +273,8 @@ mod scan_target_debug_redaction_tests {
         ScanTarget {
             key: VulnKey(crate::conformance::CREDENTIAL_PROBE_KEY.into()),
             osv_name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
-            version: "1.0.0".to_string(),
-            display_version: "1.0.0".to_string(),
+            version: OsvVersion::new("1.0.0"),
+            display_version: ConcreteVersion::new("1.0.0"),
         },
     );
 }
@@ -162,7 +331,7 @@ pub enum VulnSeverity {
 /// # Examples
 ///
 /// ```
-/// use deps_core::osv::{Advisory, VulnSeverity};
+/// use deps_core::osv::{Advisory, OsvVersion, VulnSeverity};
 ///
 /// let advisory = Advisory::new(
 ///     "RUSTSEC-2020-0071".to_string(),
@@ -172,8 +341,8 @@ pub enum VulnSeverity {
 /// .expect("valid osv id")
 /// .with_summary("Potential segfault in the time crate".to_string())
 /// .with_aliases(vec!["CVE-2020-26235".to_string()])
-/// .with_fixed_versions(vec!["0.2.23".to_string()]);
-/// assert_eq!(advisory.fixed_versions.last(), Some(&"0.2.23".to_string()));
+/// .with_fixed_versions(vec![OsvVersion::new("0.2.23")]);
+/// assert_eq!(advisory.fixed_versions.last(), Some(&OsvVersion::new("0.2.23")));
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,10 +359,12 @@ pub struct Advisory {
     pub severity: VulnSeverity,
     /// Raw CVSS vector string, shown verbatim in hover but never parsed.
     pub cvss_vector: Option<String>,
-    /// All `fixed` events found in the record's ranges, ascending. May be
-    /// empty if OSV recorded no fix. The highest entry is the one to surface
-    /// as "the fix" — see `architecture.md` §6 for why the *first* one is not.
-    pub fixed_versions: Vec<String>,
+    /// All `fixed` events found in the record's ranges, ascending, in OSV's wire spelling —
+    /// convert via [`crate::lsp_helpers::OsvNaming::osv_version_to_native`] before showing one
+    /// to the user or using it in a manifest edit/registry lookup. May be empty if OSV
+    /// recorded no fix. The highest entry is the one to surface as "the fix" — see
+    /// `architecture.md` §6 for why the *first* one is not.
+    pub fixed_versions: Vec<OsvVersion>,
     /// `https://osv.dev/vulnerability/{id}`, always derived from [`Self::id`] via
     /// [`validated_osv_url`]. Private (not `pub`) rather than a plain field — see
     /// [`Self::new`]'s doc for why (#1271). Read via [`Self::url()`].
@@ -232,7 +403,7 @@ impl Advisory {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::osv::{Advisory, VulnSeverity};
+    /// use deps_core::osv::{Advisory, OsvVersion, VulnSeverity};
     ///
     /// let advisory = Advisory::new(
     ///     "RUSTSEC-2020-0071".to_string(),
@@ -240,8 +411,8 @@ impl Advisory {
     ///     VulnSeverity::High,
     /// )
     /// .expect("valid osv id")
-    /// .with_fixed_versions(vec!["0.2.23".to_string()]);
-    /// assert_eq!(advisory.fixed_versions.last(), Some(&"0.2.23".to_string()));
+    /// .with_fixed_versions(vec![OsvVersion::new("0.2.23")]);
+    /// assert_eq!(advisory.fixed_versions.last(), Some(&OsvVersion::new("0.2.23")));
     /// ```
     #[must_use]
     pub fn new(id: String, modified: String, severity: VulnSeverity) -> Option<Self> {
@@ -306,7 +477,7 @@ impl Advisory {
 
     /// Attaches the `fixed` events found in the record's ranges. See [`Self::fixed_versions`].
     #[must_use]
-    pub fn with_fixed_versions(mut self, fixed_versions: Vec<String>) -> Self {
+    pub fn with_fixed_versions(mut self, fixed_versions: Vec<OsvVersion>) -> Self {
         self.fixed_versions = fixed_versions;
         self
     }
@@ -541,7 +712,7 @@ pub struct FixRecommendation {
     /// The highest [`Advisory::fixed_versions`] entry across the advisories
     /// named in `advisory_ids` — the lowest version that resolves everything
     /// this recommendation actually claims to fix.
-    pub version: String,
+    pub version: OsvVersion,
     /// Advisory ids this recommendation actually resolves, sorted by
     /// severity descending (worst first) and tied by id — the order a
     /// title should list them in.
@@ -604,7 +775,9 @@ impl DependencyVulnerabilities {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+    /// use deps_core::osv::{
+    ///     Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+    /// };
     /// use std::sync::Arc;
     ///
     /// fn advisory(id: &str, fixed: &str) -> Arc<Advisory> {
@@ -615,7 +788,7 @@ impl DependencyVulnerabilities {
     ///             VulnSeverity::High,
     ///         )
     ///         .expect("valid osv id")
-    ///         .with_fixed_versions(vec![fixed.to_string()]),
+    ///         .with_fixed_versions(vec![OsvVersion::new(fixed)]),
     ///     )
     /// }
     ///
@@ -652,7 +825,7 @@ impl DependencyVulnerabilities {
         let version = claimed
             .iter()
             .filter_map(|a| a.fixed_versions.last())
-            .max_by(|a, b| super::compare_version_strings(a, b))?
+            .max_by(|a, b| super::compare_version_strings(a.as_str(), b.as_str()))?
             .clone();
 
         claimed.sort_by(|a, b| {
@@ -1450,7 +1623,7 @@ impl OsvVulnRecord {
             aliases: self.aliases,
             severity,
             cvss_vector,
-            fixed_versions,
+            fixed_versions: fixed_versions.into_iter().map(OsvVersion::new).collect(),
             url,
         })
     }
@@ -1468,7 +1641,11 @@ mod recommended_fix_tests {
             aliases: vec![],
             severity,
             cvss_vector: None,
-            fixed_versions: fixed_versions.iter().map(ToString::to_string).collect(),
+            fixed_versions: fixed_versions
+                .iter()
+                .copied()
+                .map(OsvVersion::new)
+                .collect(),
             url: String::new(),
         })
     }
@@ -1744,7 +1921,7 @@ mod osv_version_validation_tests {
             .into_advisory("pkg", "crates.io")
             .expect("valid id, should still resolve");
 
-        assert_eq!(advisory.fixed_versions, vec!["1.0.0".to_string()]);
+        assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
     }
 
     #[test]
@@ -1753,7 +1930,7 @@ mod osv_version_validation_tests {
         let record = record_with_fixed(&["1.0.0", &long_version]);
         let advisory = record.into_advisory("pkg", "crates.io").unwrap();
 
-        assert_eq!(advisory.fixed_versions, vec!["1.0.0".to_string()]);
+        assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
     }
 
     #[test]

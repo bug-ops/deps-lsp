@@ -411,7 +411,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v3\n";
@@ -431,7 +431,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["v4".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("v4")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -1048,8 +1048,8 @@ mod tests {
     #[test]
     fn test_osv_version_strips_v_prefix() {
         let fmt = formatter();
-        assert_eq!(fmt.osv_version("v4.2.0"), "4.2.0");
-        assert_eq!(fmt.osv_version("4.2.0"), "4.2.0");
+        assert_eq!(fmt.osv_version(&ConcreteVersion::new("v4.2.0")), "4.2.0");
+        assert_eq!(fmt.osv_version(&ConcreteVersion::new("4.2.0")), "4.2.0");
     }
 
     #[test]
@@ -1151,7 +1151,7 @@ mod tests {
     fn test_plan_vulnerability_fix_still_remediates_sha_pin() {
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let fmt = formatter();
@@ -1182,7 +1182,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["v5.0.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("v5.0.0")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -1438,7 +1438,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4.<%= py %>\n";
@@ -1465,7 +1465,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["v5".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("v5")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {

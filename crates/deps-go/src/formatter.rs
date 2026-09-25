@@ -166,21 +166,23 @@ impl SourcePolicy for GoFormatter {
 }
 
 impl OsvNaming for GoFormatter {
-    fn osv_version_to_native(&self, version: &str) -> String {
+    fn osv_version_to_native(&self, version: &deps_core::osv::OsvVersion) -> ConcreteVersion {
         // OSV's `fixed` events for Go are plain semver (`0.3.7`), never
         // carrying the `v` prefix Go module versions require in go.mod.
+        let version = version.as_str();
         if version.starts_with('v') {
-            version.to_string()
+            ConcreteVersion::new(version)
         } else {
-            format!("v{version}")
+            ConcreteVersion::new(format!("v{version}"))
         }
     }
 
-    fn osv_version(&self, version: &str) -> String {
+    fn osv_version(&self, version: &ConcreteVersion) -> deps_core::osv::OsvVersion {
         // Go module versions always carry a mandatory "v" prefix
         // (golang.org/x/mod/module convention), but OSV.dev's SEMVER range
         // matching forbids it — strip it before sending on the wire.
-        version.strip_prefix('v').unwrap_or(version).to_string()
+        let version = version.as_str();
+        deps_core::osv::OsvVersion::new(version.strip_prefix('v').unwrap_or(version))
     }
 }
 
@@ -275,23 +277,32 @@ mod tests {
     fn test_osv_version_to_native_prepends_v_prefix() {
         let formatter = GoFormatter;
 
-        assert_eq!(formatter.osv_version_to_native("0.3.7"), "v0.3.7");
+        assert_eq!(
+            formatter.osv_version_to_native(&deps_core::osv::OsvVersion::new("0.3.7")),
+            ConcreteVersion::new("v0.3.7")
+        );
         // Already-prefixed input (should not occur in practice, but must
         // not be double-prefixed) round-trips unchanged.
-        assert_eq!(formatter.osv_version_to_native("v0.3.7"), "v0.3.7");
+        assert_eq!(
+            formatter.osv_version_to_native(&deps_core::osv::OsvVersion::new("v0.3.7")),
+            ConcreteVersion::new("v0.3.7")
+        );
     }
 
     #[test]
     fn test_osv_version_strips_v_prefix() {
         let formatter = GoFormatter;
 
-        assert_eq!(formatter.osv_version("v1.2.3"), "1.2.3");
         assert_eq!(
-            formatter.osv_version("v0.0.0-20191109021931-daa7c04131f5"),
+            formatter.osv_version(&ConcreteVersion::new("v1.2.3")),
+            "1.2.3"
+        );
+        assert_eq!(
+            formatter.osv_version(&ConcreteVersion::new("v0.0.0-20191109021931-daa7c04131f5")),
             "0.0.0-20191109021931-daa7c04131f5"
         );
         assert_eq!(
-            formatter.osv_version("v2.0.0+incompatible"),
+            formatter.osv_version(&ConcreteVersion::new("v2.0.0+incompatible")),
             "2.0.0+incompatible"
         );
     }
@@ -302,7 +313,10 @@ mod tests {
 
         // A version without the "v" prefix (should not normally occur for
         // Go, but the transform must be a no-op rather than corrupt it).
-        assert_eq!(formatter.osv_version("1.2.3"), "1.2.3");
+        assert_eq!(
+            formatter.osv_version(&ConcreteVersion::new("1.2.3")),
+            "1.2.3"
+        );
     }
 
     #[test]

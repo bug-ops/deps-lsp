@@ -22,6 +22,10 @@ use crate::{ConcreteVersion, Dependency, PackageName};
 ///   reports the manifest requirement itself as the resolved version, mirroring `GoFormatter`.
 /// - [`with_alternate_registry_resolution`](Self::with_alternate_registry_resolution): widens
 ///   [`SourcePolicy::can_resolve_source`] to accept `AlternateRegistry` sources.
+/// - [`with_go_style_osv_version_to_native`](Self::with_go_style_osv_version_to_native):
+///   [`OsvNaming::osv_version_to_native`] adds back a `v` prefix, mirroring `GoFormatter`'s
+///   override — a non-identity `OsvNaming` double for tests that must fail if OSV's wire
+///   spelling leaks into a native-namespace rendering unconverted.
 ///
 /// Public-API `///` doctests that illustrate implementing [`EcosystemFormatter`](crate::lsp_helpers::EcosystemFormatter)
 /// from scratch (e.g. `deps_engine::classify::resolved::collect_in_use_versions`'s example)
@@ -79,6 +83,7 @@ pub struct StubFormatter {
     package_url_prefix: &'static str,
     manifest_requirement_as_resolved_version: bool,
     alternate_registry_resolution: bool,
+    go_style_osv_version_to_native: bool,
 }
 
 impl StubFormatter {
@@ -96,6 +101,7 @@ impl StubFormatter {
             package_url_prefix: "https://example.com/",
             manifest_requirement_as_resolved_version: false,
             alternate_registry_resolution: false,
+            go_style_osv_version_to_native: false,
         }
     }
 
@@ -135,6 +141,15 @@ impl StubFormatter {
     #[must_use]
     pub const fn with_alternate_registry_resolution(mut self) -> Self {
         self.alternate_registry_resolution = true;
+        self
+    }
+
+    /// [`OsvNaming::osv_version_to_native`] adds back a `v` prefix instead of the identity
+    /// default, mirroring `GoFormatter`'s override — the wire and native spellings genuinely
+    /// diverge, so a caller that forgets the conversion produces a visibly wrong version.
+    #[must_use]
+    pub const fn with_go_style_osv_version_to_native(mut self) -> Self {
+        self.go_style_osv_version_to_native = true;
         self
     }
 }
@@ -186,7 +201,20 @@ impl SourcePolicy for StubFormatter {
     }
 }
 
-impl OsvNaming for StubFormatter {}
+impl OsvNaming for StubFormatter {
+    fn osv_version_to_native(&self, version: &crate::osv::OsvVersion) -> ConcreteVersion {
+        let version = version.as_str();
+        if self.go_style_osv_version_to_native {
+            if version.starts_with('v') {
+                ConcreteVersion::new(version)
+            } else {
+                ConcreteVersion::new(format!("v{version}"))
+            }
+        } else {
+            ConcreteVersion::new(version)
+        }
+    }
+}
 
 #[cfg(all(test, feature = "test-util"))]
 mod tests {

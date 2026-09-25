@@ -5,6 +5,7 @@
 //! concurrency/ordering/error-mapping behavior instead of forking it.
 //! [`crate::github::paginate_tags`] is now a thin delegation to [`paginate_pages`].
 
+use crate::EcosystemId;
 use crate::error::Result;
 use bytes::Bytes;
 use std::future::Future;
@@ -27,14 +28,16 @@ pub const fn page_has_more(page_len: usize) -> bool {
 ///
 /// Without this, hitting the safety ceiling on a pathological repo/project is
 /// indistinguishable in logs from "there is genuinely no matching version" — this makes
-/// truncation diagnosable. `provider` names the upstream API (`"GitHub"`, `"GitLab"`);
-/// `ecosystem` names the caller ecosystem (e.g. `"Swift"`, `"GitHub Actions"`, `"GitLab
-/// CI"`); `noun` names what is being paginated (`"tags"`, `"releases"`) in the warning text
+/// truncation diagnosable. `provider` names the upstream API (`"GitHub"`, `"GitLab"`) — a
+/// human-facing display name with no [`EcosystemId`] equivalent, so it stays a plain
+/// `&'static str`. `ecosystem` names the caller ecosystem and is logged as a structured
+/// `%ecosystem` field, matching every other ecosystem-labeled `tracing` call in this crate
+/// (#1425); `noun` names what is being paginated (`"tags"`, `"releases"`) in the warning text
 /// — a caller pagintating a non-tags endpoint (e.g. GitLab CI's `/releases`) must not have
 /// its warning hardcode "tags" pagination.
 pub fn warn_if_pagination_truncated(
     provider: &str,
-    ecosystem: &str,
+    ecosystem: EcosystemId,
     noun: &str,
     name: &str,
     page: u32,
@@ -46,6 +49,7 @@ pub fn warn_if_pagination_truncated(
         tracing::warn!(
             package = %name,
             pages_fetched = max_pages,
+            %ecosystem,
             "{ecosystem} {noun} pagination for '{name}' stopped at the {max_pages}-page cap \
              while {provider} reported more pages available; the fetched version list may be \
              truncated"
@@ -83,7 +87,7 @@ pub fn warn_if_pagination_truncated(
 /// dropped), or the error from `parse_page` when a page's body cannot be parsed.
 pub async fn paginate_pages<T, F, Fut, P>(
     provider: &str,
-    ecosystem: &str,
+    ecosystem: EcosystemId,
     noun: &str,
     name: &str,
     max_pages: u32,
@@ -173,7 +177,15 @@ mod tests {
     #[tokio::test]
     async fn test_warn_if_pagination_truncated_uses_passed_max_pages_not_a_constant() {
         let output = capture_tracing_output_async(async {
-            warn_if_pagination_truncated("GitLab", "GitLab CI", "tags", "org/repo", 3, 100, 3);
+            warn_if_pagination_truncated(
+                "GitLab",
+                EcosystemId::GitlabCi,
+                "tags",
+                "org/repo",
+                3,
+                100,
+                3,
+            );
         })
         .await;
         assert!(output.contains("org/repo"), "output was: {output}");
@@ -181,7 +193,15 @@ mod tests {
         assert!(output.contains('3'), "output was: {output}");
 
         let silent = capture_tracing_output_async(async {
-            warn_if_pagination_truncated("GitLab", "GitLab CI", "tags", "org/repo", 2, 100, 3);
+            warn_if_pagination_truncated(
+                "GitLab",
+                EcosystemId::GitlabCi,
+                "tags",
+                "org/repo",
+                2,
+                100,
+                3,
+            );
         })
         .await;
         assert!(
@@ -210,7 +230,7 @@ mod tests {
         let calls = AtomicU32::new(0);
         let result = paginate_pages(
             "GitLab",
-            "GitLab CI",
+            EcosystemId::GitlabCi,
             "tags",
             "org/repo",
             30,
@@ -236,7 +256,7 @@ mod tests {
     async fn test_paginate_pages_stops_after_partial_page_at_custom_cap() {
         let result = paginate_pages(
             "GitLab",
-            "GitLab CI",
+            EcosystemId::GitlabCi,
             "tags",
             "org/repo",
             5,

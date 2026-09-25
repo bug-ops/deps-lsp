@@ -8,6 +8,7 @@
 //!   which is both the host `project:` includes resolve against when set, and the *only*
 //!   host `GITLAB_TOKEN` may ever be attached to (replacing, not extending, `gitlab.com`).
 
+use deps_core::EcosystemId;
 use deps_core::net_policy::{
     HostClass, IndexUrlError, PolicyGate, RedactedUrl, RegistryAccessPolicy,
     WorkspaceRegistryAccess, validate_index_url,
@@ -73,7 +74,12 @@ impl GitlabHost {
             return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));
         }
         let candidate = format!("https://{raw}");
-        let url = validate_index_url(&candidate, raw, "gitlab-ci", PolicyGate::Enforce(policy))?;
+        let url = validate_index_url(
+            &candidate,
+            raw,
+            EcosystemId::GitlabCi,
+            PolicyGate::Enforce(policy),
+        )?;
         let raw_lowercased = raw.to_ascii_lowercase();
         if url.host_str() != Some(raw_lowercased.as_str()) {
             return Err(IndexUrlError::InvalidUrl(RedactedUrl::new(raw)));

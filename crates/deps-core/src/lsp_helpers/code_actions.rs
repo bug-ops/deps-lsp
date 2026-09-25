@@ -662,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_combines_advisories_sharing_the_highest_fix() {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -685,7 +685,7 @@ mod tests {
                                 VulnSeverity::High,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["1.1.0".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("1.1.0")]),
                         ),
                         std::sync::Arc::new(
                             Advisory::new(
@@ -694,7 +694,7 @@ mod tests {
                                 VulnSeverity::Critical,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                         ),
                     ],
                     2,
@@ -747,7 +747,7 @@ mod tests {
         // [A1]}`, not `CandidateClean`, since A1 (fixed only at 3.0.0) still applies at F=1.2.0
         // — this must still present as a fix for A2, the honest #216 partial-fix contract.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -770,7 +770,7 @@ mod tests {
                                 VulnSeverity::High,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["3.0.0".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("3.0.0")]),
                         ),
                         std::sync::Arc::new(
                             Advisory::new(
@@ -779,7 +779,7 @@ mod tests {
                                 VulnSeverity::Medium,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                         ),
                     ],
                     2,
@@ -822,7 +822,7 @@ mod tests {
         // `..._subtracted_advisory` test above exercises), so F is computed from A2 alone —
         // still presented as a fix for A2, the honest #216 partial-fix contract.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -853,7 +853,7 @@ mod tests {
                                 VulnSeverity::Medium,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                         ),
                     ],
                     2,
@@ -895,7 +895,7 @@ mod tests {
         // advisory must always suppress the fix — not #216's honest partial-fix case, exactly
         // the gap #462 closes.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -917,7 +917,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -959,7 +959,7 @@ mod tests {
         // says — this must suppress the action even though the id is known, distinguishing
         // it from the `..._subtracted_advisory` test's honest-partial-fix case.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -981,7 +981,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -1026,7 +1026,7 @@ mod tests {
         // known and unclaimed, but `total_known: 2` proves an unreported advisory exists, so
         // this must still be rejected rather than trusting a partial list as exhaustive.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1049,7 +1049,7 @@ mod tests {
                                 VulnSeverity::High,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["1.2.0".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                         ),
                         std::sync::Arc::new(
                             Advisory::new(
@@ -1101,7 +1101,7 @@ mod tests {
         // ran yet" and "verification timed out" — either way, an unverified F must never be
         // offered as a fix, the fail-safe default (no "unverified" qualifier, just omission).
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1123,7 +1123,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -1156,7 +1156,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_drops_yanked_fix_target() {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1178,7 +1178,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["2.0.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("2.0.0")]),
                     )],
                     1,
                 ),
@@ -1218,7 +1218,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_no_op_edit_is_skipped() {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1241,7 +1241,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -1277,7 +1277,7 @@ mod tests {
         // would miss this and offer a no-op edit; the guard must compare
         // against the formatted text instead.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1299,7 +1299,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -1449,7 +1449,7 @@ mod tests {
         // external, untrusted data — a manifest-structural character in it must
         // never reach a `TextEdit` via the vulnerability quickfix.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1471,7 +1471,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0\", \"evil\": \"true".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0\", \"evil\": \"true")]),
                     )],
                     1,
                 ),
@@ -1509,7 +1509,7 @@ mod tests {
         // `log4j-core` appears twice — one vulnerable, one patched — the quickfix must appear
         // only at the vulnerable occurrence's position.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use tower_lsp_server::ls_types::{Position, Range};
 
@@ -1573,7 +1573,7 @@ mod tests {
                             VulnSeverity::Critical,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["2.17.1".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("2.17.1")]),
                     )],
                     1,
                 ),
@@ -1632,7 +1632,7 @@ mod tests {
         // registry also offers "1.2.9" — a different raw version that formats to the
         // same "==1.2" text — which must be skipped.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1654,7 +1654,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.5".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.5")]),
                     )],
                     1,
                 ),
@@ -1758,7 +1758,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_lockfile_hit_gets_title_suffix() {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1780,7 +1780,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.0.2".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.0.2")]),
                     )],
                     1,
                 ),
@@ -1821,7 +1821,7 @@ mod tests {
         // `registry.get_versions` call, but this test exercises the early
         // return on `Err` specifically, which no prior test reached.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1843,7 +1843,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -1887,7 +1887,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_generate_code_actions_fix_action_dropped_on_registry_timeout() {
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1909,7 +1909,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -1955,7 +1955,7 @@ mod tests {
         // duplicated, and no plain item may claim `is_preferred` once a fix
         // action exists.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -1977,7 +1977,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.2.0".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
                     )],
                     1,
                 ),
@@ -2314,7 +2314,7 @@ mod tests {
         // proved the vulnerability-fix action's `TextEdit` actually goes through such an
         // override rather than the default delegation — the same bug class #216 caught.
         use crate::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use std::collections::HashMap;
 
@@ -2337,7 +2337,7 @@ mod tests {
                             VulnSeverity::High,
                         )
                         .expect("valid osv id")
-                        .with_fixed_versions(vec!["1.0.2".to_string()]),
+                        .with_fixed_versions(vec![OsvVersion::new("1.0.2")]),
                     )],
                     1,
                 ),
@@ -2596,7 +2596,8 @@ mod tests {
             // test here uses an empty `VersionData`, which would pass regardless; this one
             // carries a real OSV hit so a reordering regression fails here.
             use crate::osv::{
-                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+                Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus,
+                VulnSeverity,
             };
 
             let content = "1.0.0 extra";
@@ -2623,7 +2624,7 @@ mod tests {
                                 VulnSeverity::High,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["2.0.0".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("2.0.0")]),
                         )],
                         1,
                     ),
@@ -3287,7 +3288,8 @@ mod tests {
         #[tokio::test]
         async fn test_vuln_and_unsat_fix_coexist_with_vuln_preferred() {
             use crate::osv::{
-                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+                Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus,
+                VulnSeverity,
             };
 
             let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -3308,7 +3310,7 @@ mod tests {
                                 VulnSeverity::High,
                             )
                             .expect("valid osv id")
-                            .with_fixed_versions(vec!["5.5.5".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("5.5.5")]),
                         )],
                         1,
                     ),
@@ -3369,7 +3371,8 @@ mod tests {
             // Plan §1.4: when both fixes would write byte-identical text, the vuln
             // fix (richer title) wins and the unsat fix is dropped.
             use crate::osv::{
-                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+                Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus,
+                VulnSeverity,
             };
 
             let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -3391,7 +3394,7 @@ mod tests {
                             )
                             .expect("valid osv id")
                             // Same target as the unsat fix's cached `latest` below.
-                            .with_fixed_versions(vec!["9.9.9".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("9.9.9")]),
                         )],
                         1,
                     ),
@@ -3430,7 +3433,8 @@ mod tests {
             // check, or collision-first would drop the unsat action for "colliding" with a
             // vuln fix the yank filter was about to drop anyway, leaving neither.
             use crate::osv::{
-                Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+                Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus,
+                VulnSeverity,
             };
 
             let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -3454,7 +3458,7 @@ mod tests {
                             // Different raw version than the unsat fix's cached
                             // `latest` ("9.9.9") below, but `CollidingTextFormatter`
                             // rewrites both to the same "9.9.9" text.
-                            .with_fixed_versions(vec!["9.9.5".to_string()]),
+                            .with_fixed_versions(vec![OsvVersion::new("9.9.5")]),
                         )],
                         1,
                     ),

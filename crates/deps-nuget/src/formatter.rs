@@ -495,10 +495,9 @@ mod tests {
         // the version it hands to `format_version_for_text_edit` must
         // itself satisfy the requirement text that edit produces.
         let f = NuGetFormatter;
-        let osv_version = "12.0.1";
-        let native = f.osv_version_to_native(osv_version);
-        assert_eq!(native, osv_version);
-        let native = ConcreteVersion::new(native);
+        let osv_version = deps_core::osv::OsvVersion::new("12.0.1");
+        let native = f.osv_version_to_native(&osv_version);
+        assert_eq!(native, osv_version.as_str());
         let edit_text = f.format_version_for_text_edit(&native);
         assert!(f.version_satisfies_requirement(&native, &edit_text));
     }
@@ -655,7 +654,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let xml = r#"<Project><ItemGroup><PackageReference Include="AutoMapper" Version="$(AutoMapperVersion)" /></ItemGroup></Project>"#;
@@ -675,7 +674,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["1.2.0".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -813,7 +812,7 @@ mod tests {
     fn test_plan_vulnerability_fix_bare_floor_still_plans_the_edit() {
         use deps_core::edit::plan_vulnerability_fix;
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
         use deps_core::parser::DependencySource;
         use deps_core::position::{Position, Range};
@@ -836,7 +835,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["1.0.2".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("1.0.2")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
@@ -868,7 +867,7 @@ mod tests {
         use deps_core::ParseResult;
         use deps_core::edit::{VulnFixSkip, plan_vulnerability_fix};
         use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity,
+            Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
         };
 
         let xml = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="{{ nj_version }}" /></ItemGroup></Project>"#;
@@ -889,7 +888,7 @@ mod tests {
                 VulnSeverity::High,
             )
             .expect("valid osv id")
-            .with_fixed_versions(vec!["13.0.4".to_string()]),
+            .with_fixed_versions(vec![OsvVersion::new("13.0.4")]),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {

@@ -773,7 +773,9 @@ pub async fn assert_unresolved_requirements_never_rewritten(
     content: &str,
     reachable: bool,
 ) {
-    use crate::osv::{Advisory, Capped, DependencyVulnerabilities, UpgradeStatus, VulnSeverity};
+    use crate::osv::{
+        Advisory, Capped, DependencyVulnerabilities, OsvVersion, UpgradeStatus, VulnSeverity,
+    };
 
     let uri = crate::test_util::test_uri(&format!("/test/{manifest_name}"));
     let parse_result = eco
@@ -865,7 +867,7 @@ pub async fn assert_unresolved_requirements_never_rewritten(
         let current = req.as_str();
 
         for target in ["0.0.1", "999.0.0"] {
-            let native = formatter.osv_version_to_native(target);
+            let native = formatter.osv_version_to_native(&OsvVersion::new(target));
             let advisory = std::sync::Arc::new(
                 Advisory::new(
                     "GHSA-1354-conformance".to_string(),
@@ -873,11 +875,11 @@ pub async fn assert_unresolved_requirements_never_rewritten(
                     VulnSeverity::High,
                 )
                 .expect("valid osv id")
-                .with_fixed_versions(vec![target.to_string()]),
+                .with_fixed_versions(vec![OsvVersion::new(target)]),
             );
             let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
                 .with_fix_target_status(UpgradeStatus::CandidateClean {
-                    version: native.clone(),
+                    version: native.to_string(),
                 });
 
             let planned = crate::edit::plan_vulnerability_fix(
@@ -908,9 +910,8 @@ pub async fn assert_unresolved_requirements_never_rewritten(
             // `format_version_replacing`/`format_version_replacing_for` no-op guards this used
             // to assert against directly are gone; the placeholder gate now lives upstream of
             // both methods).
-            let native_concrete = ConcreteVersion::new(native);
             assert_eq!(
-                crate::edit::replacement_text(formatter, *dep, &native_concrete, current),
+                crate::edit::replacement_text(formatter, *dep, &native, current),
                 None,
                 "edit::replacement_text must be None for an unresolved requirement {current:?} \
                  (dependency {:?}) even when called directly, independent of the \

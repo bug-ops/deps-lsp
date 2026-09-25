@@ -51,7 +51,7 @@ use deps_core::net_policy::{
     RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{BlockedSourceClass, PackageName};
+use deps_core::{BlockedSourceClass, EcosystemId, PackageName};
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use zeroize::Zeroizing;
@@ -153,7 +153,7 @@ pub enum NuGetFeedKind {}
 impl deps_core::net_policy::private::Sealed for NuGetFeedKind {}
 
 impl RegistryUrlKind for NuGetFeedKind {
-    const ECOSYSTEM: &'static str = "nuget";
+    const ECOSYSTEM: EcosystemId = EcosystemId::NuGet;
     const REJECT_QUERY_FRAGMENT: bool = false;
     type Error = NuGetFeedUrlError;
 }
