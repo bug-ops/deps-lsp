@@ -41,7 +41,8 @@ use std::sync::Arc;
 use toml_span::value::Table;
 
 use deps_core::net_policy::{
-    HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, validate_index_url,
+    HostClass, PolicyGate, RedactedUrl, RegistryAccessPolicy, RegistryRejectionClassifier,
+    RegistryRejectionReason, validate_index_url,
 };
 use deps_core::{DEFAULT_MAX_CACHED_FILES, EcosystemId, MtimeFileCache};
 
@@ -293,6 +294,12 @@ pub struct CargoConfig {
     /// validation failure. Surfaced by `crate::parser::resolve_alternate_registries` as a
     /// positional diagnostic on the offending dependency's line.
     blocked: HashMap<String, HostClass>,
+    /// Aliases whose `.cargo/config.toml` `[registries.<name>] index = ...` entry failed
+    /// validation for a reason other than a policy-blocked host (#1453, mirrors
+    /// [`Self::blocked`]) — an invalid URL, a non-https scheme, or embedded userinfo.
+    /// Surfaced by `crate::parser::resolve_alternate_registries` the same way
+    /// [`Self::blocked`] is.
+    rejected: HashMap<String, RegistryRejectionReason>,
 }
 
 impl CargoConfig {
@@ -307,6 +314,14 @@ impl CargoConfig {
     #[must_use]
     pub(crate) fn blocked_class(&self, alias: &str) -> Option<HostClass> {
         self.blocked.get(alias).copied()
+    }
+
+    /// [`Self::blocked_class`]'s counterpart for every rejection reason other than a
+    /// policy-blocked host (#1453) — why `alias`'s `[registries.<name>] index = ...` entry
+    /// failed validation, if that (and specifically that) is why it did not resolve.
+    #[must_use]
+    pub(crate) fn rejected_reason(&self, alias: &str) -> Option<RegistryRejectionReason> {
+        self.rejected.get(alias).copied()
     }
 }
 
@@ -774,6 +789,7 @@ fn resolve_registries(
 
     let mut registries = HashMap::new();
     let mut blocked = HashMap::new();
+    let mut rejected = HashMap::new();
     for alias in referenced_aliases {
         if let Some(entry) = tiers.workspace.iter().find_map(|file| match &file.tier {
             CachedTier::Workspace(map) => map.get(alias).map(|raw_index| (raw_index, file)),
@@ -795,27 +811,52 @@ fn resolve_registries(
                     blocked.insert(alias.clone(), class);
                 }
                 Err(error) => {
+                    if let Some(reason) = error.rejection_reason() {
+                        rejected.insert(alias.clone(), reason);
+                    }
                     tracing::warn!(alias, %error, "registry index failed validation");
                 }
             }
             continue;
         }
 
-        if let Some(entry) = resolve_cargo_home_tier(
+        match resolve_cargo_home_tier(
             alias,
             tiers.cargo_home.as_deref(),
             !env_collided.contains(alias.as_str()),
             policy,
             env,
         ) {
-            registries.insert(alias.clone(), entry);
+            CargoHomeResolution::Resolved(entry) => {
+                registries.insert(alias.clone(), entry);
+            }
+            CargoHomeResolution::Rejected(reason) => {
+                rejected.insert(alias.clone(), reason);
+            }
+            CargoHomeResolution::Absent => {}
         }
     }
 
     CargoConfig {
         registries,
         blocked,
+        rejected,
     }
+}
+
+/// Outcome of [`resolve_cargo_home_tier`].
+enum CargoHomeResolution {
+    /// Resolved to a usable index (possibly with a credential).
+    Resolved(ResolvedRegistryEntry),
+    /// A `CARGO_REGISTRIES_*_INDEX` override or `$CARGO_HOME/config.toml` entry existed but
+    /// failed validation for a reason other than a policy-blocked host (#1453 S1). Unlike the
+    /// workspace tier, `BlockedHost` can never be the reason here — [`IndexTrust::Trusted`]
+    /// skips the policy gate entirely — but `InvalidUrl`/`NotHttps`/`UserInfoPresent` still
+    /// apply, and this tier used to drop such an entry silently with only a
+    /// `tracing::warn!`, exactly the #1453 shape for a workspace-tier entry.
+    Rejected(RegistryRejectionReason),
+    /// No entry at all — the ordinary "alias not configured in this tier" outcome.
+    Absent,
 }
 
 /// Resolves one alias against the `$CARGO_HOME` tier: an environment-variable override
@@ -826,12 +867,17 @@ fn resolve_cargo_home_tier(
     env_allowed: bool,
     policy: &RegistryAccessPolicy,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Option<ResolvedRegistryEntry> {
+) -> CargoHomeResolution {
     let cargo_home_map = cargo_home_file.and_then(|file| match &file.tier {
         CachedTier::CargoHome(map) => Some(map),
         CachedTier::Workspace(_) => None,
     });
 
+    // #1453 S1: an invalid env override still falls through to the file tier exactly as
+    // before — only remembered here so a rejection can be reported if the file tier also
+    // yields nothing usable (a valid file-tier entry silently wins, matching the pre-#1453
+    // "env override failed, fall back" behavior).
+    let mut env_rejection = None;
     if env_allowed && let Some(index_override) = env(&env_var_name(alias, "INDEX")) {
         match RegistryIndex::new(&index_override, IndexTrust::Trusted, policy) {
             Ok(index) => {
@@ -842,7 +888,7 @@ fn resolve_cargo_home_tier(
                             .and_then(|map| map.get(alias))
                             .and_then(|(_, token)| token.clone())
                     });
-                return Some(ResolvedRegistryEntry {
+                return CargoHomeResolution::Resolved(ResolvedRegistryEntry {
                     index,
                     auth,
                     provenance: Provenance::CargoHome,
@@ -850,23 +896,33 @@ fn resolve_cargo_home_tier(
             }
             Err(error) => {
                 tracing::warn!(alias, %error, "CARGO_REGISTRIES_*_INDEX environment override failed validation");
+                env_rejection = error.rejection_reason();
             }
         }
     }
 
-    let (raw_index, mut auth) = cargo_home_map.and_then(|map| map.get(alias)).cloned()?;
+    let Some((raw_index, mut auth)) = cargo_home_map.and_then(|map| map.get(alias)).cloned() else {
+        return env_rejection.map_or(CargoHomeResolution::Absent, CargoHomeResolution::Rejected);
+    };
     if env_allowed && let Some(token_override) = env(&env_var_name(alias, "TOKEN")) {
         auth = Some(AuthToken::new(token_override));
     }
     match RegistryIndex::new(&raw_index, IndexTrust::Trusted, policy) {
-        Ok(index) => Some(ResolvedRegistryEntry {
+        Ok(index) => CargoHomeResolution::Resolved(ResolvedRegistryEntry {
             index,
             auth,
             provenance: Provenance::CargoHome,
         }),
         Err(error) => {
             tracing::warn!(alias, %error, "registry index failed validation");
-            None
+            // #1453 code-review finding 3: when the env override *and* the file-tier entry
+            // are both invalid, prefer the env override's own reason — it was the first
+            // (and, per this function's own precedence, the intended) value for this alias;
+            // reporting the file-tier's unrelated failure instead would misattribute why the
+            // env override the user actually set didn't take effect.
+            env_rejection
+                .or_else(|| error.rejection_reason())
+                .map_or(CargoHomeResolution::Absent, CargoHomeResolution::Rejected)
         }
     }
 }
@@ -1421,6 +1477,140 @@ token = "secret-token"
         assert_eq!(entry.provenance, Provenance::CargoHome);
     }
 
+    /// #1453 impl-critic S1: a `$CARGO_HOME/config.toml` `[registries.<name>] index = ...`
+    /// entry that fails validation for a non-blocked-host reason must populate
+    /// `CargoConfig::rejected` exactly like a workspace-tier entry does — `IndexTrust::Trusted`
+    /// only skips the policy gate, not the scheme/userinfo/URL-shape checks
+    /// `validate_index_url` still applies.
+    #[test]
+    fn test_resolve_cargo_home_file_entry_rejected_populates_rejected() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registries.my-corp]\nindex = \"http://insecure.example\"\n",
+        )
+        .unwrap();
+
+        let aliases: HashSet<String> = std::iter::once("my-corp".to_string()).collect();
+        let cache = ConfigFileCache::new();
+        let policy = all_policy();
+        let (config, _) = resolve(
+            &aliases,
+            &[],
+            Some(&cargo_home.path().join("config.toml")),
+            &cache,
+            &policy,
+        );
+
+        assert!(config.get("my-corp").is_none());
+        assert_eq!(
+            config.rejected_reason("my-corp"),
+            Some(RegistryRejectionReason::NotHttps)
+        );
+    }
+
+    /// #1453 impl-critic S1: an invalid `CARGO_REGISTRIES_*_INDEX` env override must not be
+    /// reported as a rejection when the file-tier fallback resolves to a valid entry — the
+    /// env override silently loses to the working fallback exactly as before, so nothing new
+    /// should surface as a diagnostic for this case.
+    #[test]
+    fn test_resolve_env_var_index_override_rejected_falls_back_silently_to_valid_file_entry() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registries.my-corp]\nindex = \"sparse+https://real.example\"\n",
+        )
+        .unwrap();
+
+        let env = |name: &str| {
+            (name == "CARGO_REGISTRIES_MY_CORP_INDEX").then(|| "not-a-valid-url".to_string())
+        };
+
+        let aliases: HashSet<String> = std::iter::once("my-corp".to_string()).collect();
+        let cache = ConfigFileCache::new();
+        let policy = all_policy();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[],
+            Some(&cargo_home.path().join("config.toml")),
+            &cache,
+            &policy,
+            &env,
+        );
+
+        let entry = config.get("my-corp").unwrap();
+        assert_eq!(entry.index.as_str(), "https://real.example/");
+        assert_eq!(config.rejected_reason("my-corp"), None);
+    }
+
+    /// #1453 impl-critic S1: an invalid `CARGO_REGISTRIES_*_INDEX` env override with no
+    /// file-tier fallback at all must populate `CargoConfig::rejected` — previously this
+    /// silently dropped the alias with only a `tracing::warn!`.
+    #[test]
+    fn test_resolve_env_var_index_override_rejected_with_no_file_entry_populates_rejected() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let env = |name: &str| {
+            (name == "CARGO_REGISTRIES_MY_CORP_INDEX")
+                .then(|| "sparse+https://user:pass@index.mycorp.dev".to_string())
+        };
+
+        let aliases: HashSet<String> = std::iter::once("my-corp".to_string()).collect();
+        let cache = ConfigFileCache::new();
+        let policy = all_policy();
+        let (config, _) = resolve_with_env(&aliases, &[], None, &cache, &policy, &env);
+
+        assert!(config.get("my-corp").is_none());
+        assert_eq!(
+            config.rejected_reason("my-corp"),
+            Some(RegistryRejectionReason::UserInfoPresent)
+        );
+    }
+
+    /// #1453 code-review finding 3: when *both* the `CARGO_REGISTRIES_*_INDEX` env override
+    /// and the `$CARGO_HOME/config.toml` file-tier entry are independently invalid, the env
+    /// override's own reason must be reported — not silently discarded in favor of the
+    /// unrelated file-tier failure.
+    #[test]
+    fn test_resolve_env_and_file_both_rejected_prefers_env_reason() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let cargo_home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            cargo_home.path().join("config.toml"),
+            "[registries.my-corp]\nindex = \"http://insecure.example\"\n",
+        )
+        .unwrap();
+
+        let env = |name: &str| {
+            (name == "CARGO_REGISTRIES_MY_CORP_INDEX")
+                .then(|| "sparse+https://user:pass@index.mycorp.dev".to_string())
+        };
+
+        let aliases: HashSet<String> = std::iter::once("my-corp".to_string()).collect();
+        let cache = ConfigFileCache::new();
+        let policy = all_policy();
+        let (config, _) = resolve_with_env(
+            &aliases,
+            &[],
+            Some(&cargo_home.path().join("config.toml")),
+            &cache,
+            &policy,
+            &env,
+        );
+
+        assert!(config.get("my-corp").is_none());
+        assert_eq!(
+            config.rejected_reason("my-corp"),
+            Some(RegistryRejectionReason::UserInfoPresent),
+            "the env override's own reason must survive, not the unrelated file entry's"
+        );
+    }
+
     #[test]
     fn test_resolve_unconfigured_alias_stays_unresolved() {
         // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
@@ -1533,6 +1723,7 @@ token = "secret-token"
                 },
                 section: CargoDependencySection::Dependencies,
                 package: None,
+                custom_registry_origin: None,
             },
             CargoDependency {
                 name: "b".into(),
@@ -1544,6 +1735,7 @@ token = "secret-token"
                 source: DependencySource::Registry,
                 section: CargoDependencySection::Dependencies,
                 package: None,
+                custom_registry_origin: None,
             },
         ];
 

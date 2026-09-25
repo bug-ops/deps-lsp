@@ -56,6 +56,26 @@ pub struct CargoDependency {
     /// the only workspace-inheritance lookup key), so honoring it here would
     /// resolve `Dependency::name()` to a value Cargo itself ignores.
     pub package: Option<deps_core::PackageName>,
+    /// Which manifest field produced [`Self::source`]'s [`DependencySource::CustomRegistry`]
+    /// value, if any — `None` for every other source variant.
+    ///
+    /// `registry = "<alias>"` and `registry-index = "<url>"` both collapse into the same
+    /// `CustomRegistry { url }` shape, so this is the only way `resolve_alternate_registries`
+    /// can tell, *per dependency*, whether a raw value is a bare alias name (which must stay
+    /// silent when unconfigured, spec FR-003) or a literal index URL (which must always
+    /// surface a rejection diagnostic when malformed, #1453) — a raw-value-keyed side channel
+    /// alone can't distinguish the two when two different dependencies happen to declare the
+    /// identical string through different fields (#1453 impl-critic M1).
+    pub(crate) custom_registry_origin: Option<CustomRegistryOrigin>,
+}
+
+/// See [`CargoDependency::custom_registry_origin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CustomRegistryOrigin {
+    /// Declared via `registry = "<alias>"`.
+    Alias,
+    /// Declared via `registry-index = "<url>"`.
+    LiteralIndex,
 }
 
 /// Section in Cargo.toml where a dependency is declared.

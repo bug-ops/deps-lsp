@@ -497,6 +497,7 @@ mod tests {
             source: DependencySource::Registry,
             section: CargoDependencySection::Dependencies,
             package: None,
+            custom_registry_origin: None,
         }
     }
 

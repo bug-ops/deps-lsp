@@ -32,8 +32,10 @@
 use crate::config::{
     AuthToken, ConfigFileCache, IndexTrust, RegistryIndex, RegistryIndexError, SourceReplacement,
 };
-use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
-use deps_core::net_policy::RegistryAccessPolicy;
+use crate::types::{
+    CargoDependency, CargoDependencySection, CustomRegistryOrigin, DependencySource,
+};
+use deps_core::net_policy::{RegistryAccessPolicy, RegistryRejectionClassifier};
 use deps_core::position::Range;
 use deps_core::{DepsError, Result};
 use std::collections::{HashMap, HashSet};
@@ -81,6 +83,15 @@ pub struct CargoParseResult {
     /// via [`Self::blocked_registries`]'s trait override as an informational diagnostic, so
     /// the block never degrades silently.
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
+    /// Dependency lines whose `registry`/`registry-index` resolution was rejected for a
+    /// reason other than a policy-blocked host (#1453, mirrors [`Self::blocked_registries`])
+    /// — an invalid URL, a non-https scheme, or embedded userinfo, for a literal
+    /// `registry-index` value or a `registry = "<alias>"` resolving via `.cargo/config.toml`,
+    /// `$CARGO_HOME/config.toml`, or a `CARGO_REGISTRIES_<NAME>_INDEX` override. Surfaced via
+    /// [`Self::rejected_registries`]'s trait override as a `WARNING`-severity diagnostic
+    /// (unlike [`Self::blocked_registries`]'s `INFORMATION` — a rejection, not merely a
+    /// block), so it never degrades silently to only a `tracing::warn!`.
+    pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -248,7 +259,7 @@ pub fn parse_cargo_toml_with_context(
 
     let discovery = discover_workspace(doc_uri)?;
 
-    let (resolved_registries, blocked_registries) =
+    let (resolved_registries, blocked_registries, rejected_registries) =
         resolve_alternate_registries(&mut dependencies, &discovery.config_paths, ctx);
 
     Ok(CargoParseResult {
@@ -256,6 +267,7 @@ pub fn parse_cargo_toml_with_context(
         workspace_root: discovery.workspace_root,
         uri: doc_uri.clone(),
         blocked_registries,
+        rejected_registries,
         resolved_registries,
         dependency_truncation: budget.truncation(),
     })
@@ -267,10 +279,13 @@ fn get_val<'a>(table: &'a Table<'a>, key: &str) -> Option<&'a Value<'a>> {
 
 /// Return type of [`resolve_alternate_registries`]: the newly-resolved `(index, auth)`
 /// pairs to register into the shared `CargoRegistry` router, alongside every dependency
-/// line whose registry-index resolution was blocked by policy (spec #443, plan-1b §1.7).
+/// line whose registry-index resolution was blocked by policy (spec #443, plan-1b §1.7) and
+/// every dependency line whose registry-index resolution was rejected for any other reason
+/// (#1453).
 type AlternateRegistryResolution = (
     Vec<(RegistryIndex, Option<AuthToken>)>,
     Vec<deps_core::BlockedRegistryOccurrence>,
+    Vec<deps_core::RejectedRegistryOccurrence>,
 );
 
 /// Rewrites every `DependencySource::CustomRegistry` entry in `dependencies` into a
@@ -310,6 +325,36 @@ fn resolve_alternate_registries(
             _ => None,
         })
         .collect();
+    // Raw values at least one dependency declared via a literal `registry-index` field, and
+    // (separately) via a `registry = "<alias>"` field (#1453 impl-critic M3/code-review
+    // finding 2) — used only to decide whether the alias loop's generic "stays unresolved"
+    // WARN below would be genuinely redundant for that string, never to attribute a
+    // rejection reason itself (that stays strictly per-dependency via
+    // `dep.custom_registry_origin`, see M1's note above). Both sets are needed, not just
+    // `literal_declared_values` alone: the WARN is only truly redundant when *every*
+    // dependency sharing that raw string is `LiteralIndex`-origin — if even one dependency
+    // declared the identical string via the `registry` alias field, suppressing the WARN
+    // would silently drop that dependency's own, independent alias-resolution failure with
+    // no trace at all (worse than the pre-#1453 baseline for that dependency).
+    let literal_declared_values: HashSet<&str> = dependencies
+        .iter()
+        .filter_map(|dep| match (&dep.source, dep.custom_registry_origin) {
+            (
+                DependencySource::CustomRegistry { url },
+                Some(CustomRegistryOrigin::LiteralIndex),
+            ) => Some(url.as_str()),
+            _ => None,
+        })
+        .collect();
+    let alias_declared_values: HashSet<&str> = dependencies
+        .iter()
+        .filter_map(|dep| match (&dep.source, dep.custom_registry_origin) {
+            (DependencySource::CustomRegistry { url }, Some(CustomRegistryOrigin::Alias)) => {
+                Some(url.as_str())
+            }
+            _ => None,
+        })
+        .collect();
 
     let mut aliases: HashSet<String> = HashSet::new();
     // Maps each raw `CustomRegistry.url` value that resolved to its concrete index, so the
@@ -319,6 +364,17 @@ fn resolve_alternate_registries(
     // pass below can surface an informational diagnostic on the exact dependency line.
     let mut blocked_by_raw_value: HashMap<String, deps_core::net_policy::HostClass> =
         HashMap::new();
+    // Raw values that failed the literal-`registry-index`-URL parse attempt for a reason
+    // other than a blocked host (#1453) — an invalid URL, a non-https scheme, or embedded
+    // userinfo. Deliberately kept separate from `rejected_by_alias` below (#1453 impl-critic
+    // M1): the *same* raw string can be declared as a literal `registry-index` by one
+    // dependency and as a `registry = "<alias>"` by a different one, and only a dependency
+    // whose own `custom_registry_origin` is `LiteralIndex` may ever be reported from this
+    // map — the rewrite pass below enforces that per-dependency, not by value alone.
+    let mut rejected_by_literal_value: HashMap<
+        String,
+        deps_core::net_policy::RegistryRejectionReason,
+    > = HashMap::new();
     let mut newly_resolved: Vec<(RegistryIndex, Option<AuthToken>)> = Vec::new();
 
     for value in &raw_values {
@@ -334,7 +390,15 @@ fn resolve_alternate_registries(
             Err(RegistryIndexError::BlockedHost { class }) => {
                 blocked_by_raw_value.insert(value.clone(), class);
             }
-            Err(_) => {
+            Err(error) => {
+                // `value` may just as well be a genuine alias (e.g. "my-corp"), which never
+                // parses as a URL and so always reaches this arm too — recorded
+                // unconditionally here, but only ever looked up below for a dependency whose
+                // own field was actually `registry-index` (see `rejected_by_literal_value`'s
+                // own doc).
+                if let Some(reason) = error.rejection_reason() {
+                    rejected_by_literal_value.insert(value.clone(), reason);
+                }
                 aliases.insert(value.clone());
             }
         }
@@ -349,13 +413,42 @@ fn resolve_alternate_registries(
         &ctx.policy,
     );
 
+    // A `.cargo/config.toml`/`$CARGO_HOME` alias resolution's own rejection (#1453) — kept
+    // separate from `rejected_by_literal_value` for the same M1 reason: this map is only
+    // ever looked up for an `Alias`-origin dependency below.
+    let mut rejected_by_alias: HashMap<String, deps_core::net_policy::RegistryRejectionReason> =
+        HashMap::new();
     for alias in &aliases {
         if let Some(entry) = config.get(alias) {
             resolved_by_raw_value.insert(alias.clone(), entry.index.clone());
             newly_resolved.push((entry.index.clone(), entry.auth.clone()));
         } else if let Some(class) = config.blocked_class(alias) {
             blocked_by_raw_value.insert(alias.clone(), class);
-        } else {
+        } else if let Some(reason) = config.rejected_reason(alias) {
+            // The alias matched a `.cargo/config.toml`/`$CARGO_HOME` `[registries.<name>]
+            // index = ...` entry, but that entry's own index value failed validation
+            // (#1453) — unlike the literal-`registry-index` case above, there is no
+            // alias-vs-literal ambiguity here: an alias that resolves to a config entry at
+            // all is never "just unconfigured", so this can always surface as a diagnostic.
+            rejected_by_alias.insert(alias.clone(), reason);
+        } else if !(rejected_by_literal_value.contains_key(alias)
+            && literal_declared_values.contains(alias.as_str())
+            && !alias_declared_values.contains(alias.as_str()))
+        {
+            // #1453 impl-critic M3 / code-review finding 2: skip this generic "stays
+            // unresolved" WARN only when `alias` (a) already has a recorded rejection
+            // reason, (b) is declared via a literal `registry-index` field by at least one
+            // dependency, AND (c) is declared via the `registry` alias field by *no*
+            // dependency — i.e. only when every dependency sharing this exact raw string
+            // already gets the structured diagnostic instead, so this WARN would be pure
+            // redundant noise. Both (b) and (c) are required: gating on (a) alone would
+            // suppress this WARN for ordinary unconfigured aliases too (a bare alias name
+            // fails the literal-URL parse attempt the same way a malformed `registry-index`
+            // does, spec FR-003's silent case); gating on (a)+(b) alone (dropping (c)) would
+            // silently drop this WARN for an `Alias`-origin dependency that happens to share
+            // its unconfigured value with a different, literal-origin dependency's own
+            // diagnostic — that dependency's own fallback failure must still be observable.
+            //
             // `alias` is the raw manifest value, which may itself carry `user:pass@` or a
             // query-string credential — redact with `RedactedUrl`, not `redact_userinfo`
             // alone, which keeps the query string (#767).
@@ -384,6 +477,7 @@ fn resolve_alternate_registries(
     }
 
     let mut blocked_registries = Vec::new();
+    let mut rejected_registries = Vec::new();
     for dep in dependencies.iter_mut() {
         if let DependencySource::CustomRegistry { url } = &dep.source {
             if let Some(index) = resolved_by_raw_value.get(url) {
@@ -398,11 +492,29 @@ fn resolve_alternate_registries(
                     raw_value: url.clone(),
                     declaration_key: url.clone(),
                 });
+            } else {
+                // #1453 impl-critic M1: which map (if either) may report a rejection for
+                // `url` depends on *this dependency's own* declared field, not on `url`
+                // alone — a different dependency may share the identical raw string through
+                // the other field.
+                let reason = match dep.custom_registry_origin {
+                    Some(CustomRegistryOrigin::LiteralIndex) => rejected_by_literal_value.get(url),
+                    Some(CustomRegistryOrigin::Alias) => rejected_by_alias.get(url),
+                    None => None,
+                };
+                if let Some(reason) = reason {
+                    rejected_registries.push(deps_core::RejectedRegistryOccurrence {
+                        range: dep.name_range,
+                        reason: *reason,
+                        raw_value: url.clone(),
+                        declaration_key: url.clone(),
+                    });
+                }
             }
         }
     }
 
-    (newly_resolved, blocked_registries)
+    (newly_resolved, blocked_registries, rejected_registries)
 }
 
 /// Parses the `dependencies`, `dev-dependencies`, and `build-dependencies` tables
@@ -486,6 +598,7 @@ fn parse_dependencies_section(
             source: DependencySource::Registry,
             section,
             package: None,
+            custom_registry_origin: None,
         };
 
         if let Some(s) = value.as_str() {
@@ -583,6 +696,7 @@ fn parse_table_dependency(
                     dep.source = DependencySource::CustomRegistry {
                         url: name.to_string(),
                     };
+                    dep.custom_registry_origin = Some(CustomRegistryOrigin::Alias);
                 }
             }
             // Direct-URL spelling of `registry` above — Cargo's built-in public index URLs
@@ -594,6 +708,7 @@ fn parse_table_dependency(
                     dep.source = DependencySource::CustomRegistry {
                         url: url.to_string(),
                     };
+                    dep.custom_registry_origin = Some(CustomRegistryOrigin::LiteralIndex);
                 }
             }
             _ => {}
@@ -760,6 +875,7 @@ deps_core::impl_parse_result!(
         workspace_root: workspace_root,
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
+        rejected_registries: rejected_registries,
     }
 );
 
@@ -1274,18 +1390,219 @@ internal-crate = { version = "1.0", registry-index = "https://169.254.169.254/in
         assert_eq!(occurrence.declaration_key, occurrence.raw_value);
     }
 
-    /// #536: a `registry-index` value carrying literal `user:pass@` userinfo fails
-    /// `RegistryIndex::new` with `UserInfoPresent`, so `resolve_alternate_registries` falls
-    /// through to alias resolution (spec: an `InvalidUrl`/`UserInfoPresent` literal is
-    /// treated as a possible `.cargo/config.toml` alias name). When that "alias" then fails
-    /// to resolve too, the unresolved-alias `tracing::warn!` must never log the raw,
-    /// credential-bearing value — it must be redacted first (see
-    /// `deps_core::net_policy::RedactedUrl`, not `redact_userinfo` alone, which preserves
-    /// the query string — a code-review follow-up on #767, matching the #529 precedent
-    /// already applied to `validate_index_url`'s own error `Display`), and this covers both
-    /// a userinfo credential and a query-string one in the same value.
+    /// #1453: a literal `registry-index` URL carrying userinfo fails `RegistryIndex::new`
+    /// with `UserInfoPresent`. Unlike a bare alias name, a userinfo-bearing value can only
+    /// be a malformed literal index — so it must populate `rejected_registries`, not just
+    /// the `tracing::warn!` the alias-fallback path also emits (see
+    /// `test_parse_registry_index_userinfo_alias_fallback_redacts_credential_in_log` below).
     #[test]
-    fn test_parse_registry_index_userinfo_alias_fallback_redacts_credential_in_log() {
+    fn test_parse_registry_index_userinfo_populates_rejected_registries() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let toml = r#"[dependencies]
+tokio = { version = "1", registry-index = "sparse+https://user:pass@index.crates.io/" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+
+        assert_eq!(result.rejected_registries.len(), 1);
+        let occurrence = &result.rejected_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::UserInfoPresent
+        );
+        assert_eq!(
+            occurrence.raw_value,
+            "sparse+https://user:pass@index.crates.io/"
+        );
+        assert_eq!(occurrence.declaration_key, occurrence.raw_value);
+        assert!(result.blocked_registries.is_empty());
+
+        // #969-style trait-method assertion: `deps_core::impl_parse_result!` generates this
+        // override; a regression that silently dropped the `rejected_registries:` arm would
+        // fall back to the trait's empty-`Vec` default while the struct field (asserted
+        // above) stayed populated, so a field-only assertion would not catch it.
+        let via_trait = deps_core::ParseResult::rejected_registries(&result);
+        assert_eq!(via_trait.len(), 1);
+        assert_eq!(via_trait[0].raw_value, occurrence.raw_value);
+    }
+
+    /// #1453's exact reproduction (cycle-086 fixture): a literal `registry-index` value that
+    /// doesn't parse as a URL at all must also surface, not silently drop to only a
+    /// `tracing::warn!` because it also looks like an alias attempt.
+    #[test]
+    fn test_parse_registry_index_malformed_url_populates_rejected_registries() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let toml = r#"[dependencies]
+anyhow = { version = "1", registry-index = "not-a-valid-url" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+
+        assert_eq!(result.rejected_registries.len(), 1);
+        let occurrence = &result.rejected_registries[0];
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::InvalidUrl
+        );
+        assert_eq!(occurrence.raw_value, "not-a-valid-url");
+    }
+
+    /// #1453: a non-https literal `registry-index` URL — the `NotHttps` counterpart to
+    /// `test_parse_registry_index_invalid_url_stays_custom_registry`, additionally asserting
+    /// the rejection now surfaces as a diagnostic rather than only leaving the dependency
+    /// unresolved.
+    #[test]
+    fn test_parse_registry_index_non_https_populates_rejected_registries() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry-index = "http://insecure.mycorp.com/index" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+
+        assert_eq!(result.rejected_registries.len(), 1);
+        let occurrence = &result.rejected_registries[0];
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::NotHttps
+        );
+        assert_eq!(occurrence.raw_value, "http://insecure.mycorp.com/index");
+    }
+
+    /// #1453: the alias path's `rejected_registries` counterpart to
+    /// `test_parse_custom_registry_alias_blocked_by_policy_populates_blocked_registries` — a
+    /// `registry = "<alias>"` reference whose `.cargo/config.toml` `[registries.<name>]
+    /// index = ...` entry itself fails validation for a non-blocked-host reason. Unlike an
+    /// unconfigured alias (no matching entry at all), a matching-but-invalid entry is never
+    /// ambiguous with "just not configured yet", so it always surfaces.
+    #[test]
+    fn test_parse_custom_registry_alias_rejected_by_config_index_populates_rejected_registries() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registries.my-corp]\nindex = \"http://insecure.mycorp.com/index\"\n",
+        )
+        .unwrap();
+
+        let manifest_path = root.path().join("Cargo.toml");
+        let manifest_content =
+            "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"my-corp\" }\n";
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+
+        let ctx = CargoParseContext::default();
+        let result = parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
+
+        assert_eq!(result.rejected_registries.len(), 1);
+        let occurrence = &result.rejected_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::NotHttps
+        );
+        assert_eq!(occurrence.raw_value, "my-corp");
+        assert_eq!(occurrence.declaration_key, occurrence.raw_value);
+        assert!(result.blocked_registries.is_empty());
+    }
+
+    /// #1453 regression guard: an unconfigured `registry = "<alias>"` reference — no
+    /// `.cargo/config.toml` entry matches it anywhere — must stay silent (spec FR-003's
+    /// pre-existing behavior), never misreported as a rejected registry-index. Every bare
+    /// alias fails `RegistryIndex::new`'s literal-URL attempt the same way a genuinely
+    /// malformed `registry-index` value would (both classify as `InvalidUrl`), so this test
+    /// guards specifically against conflating the two.
+    #[test]
+    fn test_parse_custom_registry_alias_unresolved_without_config_does_not_populate_rejected_registries()
+     {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry = "my-corp" }"#;
+        let result = parse_cargo_toml(toml, &test_url()).unwrap();
+        assert!(result.rejected_registries.is_empty());
+        assert!(result.blocked_registries.is_empty());
+    }
+
+    /// #1453 code-review: a bare, alias-shaped `registry-index` value (not URL-shaped at all)
+    /// must still fall through to `.cargo/config.toml` alias resolution and resolve silently
+    /// when it actually matches an entry there — this deliberately mirrors an alias name
+    /// coinciding with a value someone typed into `registry-index` by mistake. Confirms the
+    /// literal-vs-alias origin split (#1453 impl-critic M1) never blocks the pre-existing
+    /// alias-fallback safety net from succeeding when a real match exists.
+    #[test]
+    fn test_parse_registry_index_alias_shaped_value_still_resolves_via_matching_config() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".cargo")).unwrap();
+        std::fs::write(
+            root.path().join(".cargo/config.toml"),
+            "[registries.my-corp]\nindex = \"sparse+https://real.example\"\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("Cargo.toml");
+        let manifest_content = "[dependencies]\ninternal-crate = { version = \"1.0\", registry-index = \"my-corp\" }\n";
+        std::fs::write(&manifest_path, manifest_content).unwrap();
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+        let ctx = CargoParseContext::default();
+        let result = parse_cargo_toml_with_context(manifest_content, &uri, &ctx).unwrap();
+
+        assert!(result.rejected_registries.is_empty());
+        match &result.dependencies[0].source {
+            DependencySource::AlternateRegistry { index, .. } => {
+                assert_eq!(index, "https://real.example/");
+            }
+            other => panic!("expected AlternateRegistry, got {other:?}"),
+        }
+    }
+
+    /// #1453 code-review finding 2: when two dependencies happen to declare the *identical*
+    /// raw string — one via a literal `registry-index` (which gets its own
+    /// `rejected_registries` diagnostic), the other via `registry = "<alias>"` (which finds
+    /// no matching `.cargo/config.toml` entry at all) — the second dependency's silent
+    /// fallback failure must still be observable via the "stays unresolved" WARN. The WARN
+    /// classification is deduplicated per raw *value* (not per dependency, since
+    /// `.cargo/config.toml` resolution itself is per-value), so suppressing it just because
+    /// *some* dependency sharing that value already has a diagnostic would silently drop the
+    /// alias-origin dependency's own, independent trace — this asserts it does not.
+    #[test]
+    fn test_parse_shared_raw_value_across_origins_keeps_alias_fallback_warn() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let toml = r#"[dependencies]
+a = { version = "1.0", registry-index = "my-corp" }
+b = { version = "1.0", registry = "my-corp" }"#;
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = parse_cargo_toml(toml, &test_url()).unwrap();
+            assert_eq!(result.dependencies.len(), 2);
+            // Only the literal-`registry-index` dependency (`a`) gets a diagnostic — `b`'s
+            // alias lookup found no matching entry at all, which stays silent per FR-003.
+            assert_eq!(result.rejected_registries.len(), 1);
+            assert_eq!(result.rejected_registries[0].raw_value, "my-corp");
+        });
+
+        assert!(
+            log.contains("stays unresolved"),
+            "the alias-origin dependency's own fallback failure must still be logged even \
+             though a different, literal-origin dependency sharing the same raw value already \
+             got a diagnostic: {log:?}"
+        );
+    }
+
+    /// #536/#767/#1453: a `registry-index` value carrying literal `user:pass@` userinfo
+    /// fails `RegistryIndex::new` with `UserInfoPresent`, so it now surfaces as a structured
+    /// `rejected_registries` diagnostic rather than falling through to a bare
+    /// `tracing::warn!` — redaction of the diagnostic's own `raw_value`/`declaration_key`
+    /// fields is covered separately by `#[redact(url)]`/`#[redact(key)]` on
+    /// `RejectedRegistryOccurrence` (see `deps_core::ecosystem`'s doc), so this test's
+    /// concern is whether the raw credential still reaches tracing output at all — it must
+    /// not, and (#1453 impl-critic M3) it no longer does: the alias-fallback lookup for this
+    /// exact value never gets far enough to log anything, since the literal-index rejection
+    /// already explains it.
+    #[test]
+    fn test_parse_registry_index_userinfo_rejection_never_logs_credential() {
         // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
         let _guard = deps_core::fs_probe::snapshot_guard();
         let toml = r#"[dependencies]
@@ -1300,8 +1617,49 @@ internal-crate = { version = "1.0", registry-index = "sparse+https://user:hunter
                     DependencySource::CustomRegistry { url }
                         if url == "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value"
                 ),
-                "a userinfo-bearing index that fails alias resolution must stay unresolved"
+                "a userinfo-bearing index must stay unresolved"
             );
+            assert_eq!(result.rejected_registries.len(), 1);
+        });
+
+        assert!(
+            !log.contains("hunter2"),
+            "tracing output leaked the credential: {log:?}"
+        );
+        assert!(
+            !log.contains("user:"),
+            "tracing output leaked the username: {log:?}"
+        );
+        assert!(
+            !log.contains("super-secret-value"),
+            "tracing output leaked the query-string credential: {log:?}"
+        );
+    }
+
+    /// #536/#767's original alias-fallback-WARN-redaction concern, kept alive against a
+    /// `registry = "<alias>"` value that is itself credential-shaped and has no matching
+    /// `.cargo/config.toml` entry — unlike the literal-`registry-index` shape above (#1453
+    /// impl-critic M3), a genuinely unconfigured alias still reaches the unresolved-alias
+    /// `tracing::warn!`, so that log line's redaction must still be exercised.
+    #[test]
+    fn test_parse_custom_registry_alias_credential_shaped_name_redacts_in_log() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let toml = r#"[dependencies]
+internal-crate = { version = "1.0", registry = "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value" }"#;
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = parse_cargo_toml(toml, &test_url()).unwrap();
+            assert_eq!(result.dependencies.len(), 1);
+            assert!(
+                matches!(
+                    &result.dependencies[0].source,
+                    DependencySource::CustomRegistry { url }
+                        if url == "sparse+https://user:hunter2@index.crates.io/?token=super-secret-value"
+                ),
+                "an unconfigured alias must stay unresolved"
+            );
+            assert!(result.rejected_registries.is_empty());
         });
 
         assert!(
