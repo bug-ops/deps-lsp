@@ -5,7 +5,7 @@
 //! a per-host rate-limit gate (spec §9.3).
 
 use dashmap::DashMap;
-use deps_core::error::{DepsError, Result};
+use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use deps_core::github::normalize_tag;
 use deps_core::rate_limit::RateLimitGate;
 use deps_core::registry::{CapResult, KeyShape, register_capped};
@@ -285,8 +285,12 @@ impl GitlabCiRegistry {
             // this gate. Swapped for `gitlab_rate_limit_error_verified()` (critic N2), not
             // passed through unchanged: the registry-neutral message `deps_core::cache` built
             // has no `GITLAB_TOKEN` remedy, which would make a *confirmed* rate limit strictly
-            // less helpful than the unverified guess below gives — `verified: true` is kept.
-            DepsError::RateLimited { verified: true, .. } => {
+            // less helpful than the unverified guess below gives —
+            // `verified: RateLimitEvidence::Confirmed` is kept.
+            DepsError::RateLimited {
+                verified: RateLimitEvidence::Confirmed,
+                ..
+            } => {
                 self.rate_limit_gate(origin).trip_verified();
                 gitlab_rate_limit_error_verified()
             }
@@ -988,7 +992,13 @@ mod tests {
                 status: 429,
             },
         );
-        assert!(matches!(err, DepsError::RateLimited { .. }));
+        assert!(matches!(
+            err,
+            DepsError::RateLimited {
+                verified: RateLimitEvidence::Inferred,
+                ..
+            }
+        ));
         assert!(registry.rate_limit_gate("https://gitlab.com").is_tripped());
     }
 
@@ -1003,14 +1013,14 @@ mod tests {
             "org/proj",
             DepsError::rate_limited(
                 "registry rate limit exceeded (confirmed by the response)",
-                true,
+                RateLimitEvidence::Confirmed,
             ),
         );
         match err {
             DepsError::RateLimited {
                 message, verified, ..
             } => {
-                assert!(verified);
+                assert_eq!(verified, RateLimitEvidence::Confirmed);
                 assert!(message.contains("GITLAB_TOKEN"), "message: {message}");
             }
             other => panic!("expected RateLimited, got {other:?}"),
@@ -1019,15 +1029,15 @@ mod tests {
     }
 
     /// #1295 critic N3: once the gate is tripped by a *confirmed* rate limit, a later call
-    /// short-circuited by that same gate must still report `verified: true` — not degrade to
-    /// the unverified guess, mirroring the `deps-github-actions` S3 fix.
+    /// short-circuited by that same gate must still report `verified: RateLimitEvidence::Confirmed`
+    /// — not degrade to the unverified guess, mirroring the `deps-github-actions` S3 fix.
     #[tokio::test]
     async fn test_fetch_route_replays_verified_state_on_short_circuit() {
         let registry = GitlabCiRegistry::new(test_client());
         registry.map_error(
             "https://gitlab.com",
             "org/proj",
-            DepsError::rate_limited("confirmed", true),
+            DepsError::rate_limited("confirmed", RateLimitEvidence::Confirmed),
         );
         assert!(registry.rate_limit_gate("https://gitlab.com").is_tripped());
 
@@ -1038,8 +1048,14 @@ mod tests {
         // not classify cleanly as a verified `RateLimited`.
         let err = registry.fetch_route(&name, &r).await.unwrap_err();
         assert!(
-            matches!(err, DepsError::RateLimited { verified: true, .. }),
-            "expected the short-circuit to replay verified: true, got {err:?}"
+            matches!(
+                err,
+                DepsError::RateLimited {
+                    verified: RateLimitEvidence::Confirmed,
+                    ..
+                }
+            ),
+            "expected the short-circuit to replay verified: RateLimitEvidence::Confirmed, got {err:?}"
         );
     }
 

@@ -2,6 +2,18 @@ use thiserror::Error;
 
 use crate::redact::{RedactedName, RedactedUrl};
 
+/// Whether a [`DepsError::RateLimited`] classification is backed by explicit server evidence
+/// or merely inferred from a status code and request context alone (#1295).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RateLimitEvidence {
+    /// Backed by explicit server evidence, e.g. a confirmed `X-RateLimit-Remaining: 0`
+    /// response header (checked in `crate::cache`).
+    Confirmed,
+    /// Inferred from a status code and request context alone — could be an
+    /// abuse-detection false positive, a secondary rate limit, or an access-restricted repo.
+    Inferred,
+}
+
 /// Reconstructs the "{status} {reason}" text `reqwest::StatusCode`'s `Display`
 /// produces, since `HttpStatus` stores a bare `u16` for structural matching
 /// and loses the canonical reason phrase otherwise.
@@ -227,10 +239,10 @@ pub enum DepsError {
         /// context alone (#1295). An unauthenticated GitHub 403 with no such evidence —
         /// which could be an abuse-detection false positive, a secondary rate limit, or an
         /// access-restricted repo — still gets classified as `RateLimited` for its actionable
-        /// hint, but with `verified: false`, so a caller like
+        /// hint, but with `verified: RateLimitEvidence::Inferred`, so a caller like
         /// `test_util::unwrap_or_skip_github_rate_limit` can tell a confirmed exhaustion apart
         /// from an assumed one instead of silently treating both as the same expected case.
-        verified: bool,
+        verified: RateLimitEvidence,
         /// The HTTP status this classification was built from, when known (#1295 critic N1).
         /// `Some(403)`/`Some(429)` for a `crate::cache`-classified confirmed rate limit —
         /// `None` for a canned, inference-only construction (e.g.
@@ -422,19 +434,19 @@ impl DepsError {
     /// literal, not just an exhaustive match) — an ecosystem crate with its own rate-limit
     /// classification distinct from `crate::github`'s (e.g. `deps-gitlab-ci`) uses this
     /// instead. `message` must be a pre-vetted, IP-free, actionable hint (see the variant's own
-    /// doc); `verified` should be `true` only when the caller has confirmed genuine exhaustion
-    /// from explicit server evidence, not merely inferred it.
+    /// doc); `verified` should be [`RateLimitEvidence::Confirmed`] only when the caller has
+    /// confirmed genuine exhaustion from explicit server evidence, not merely inferred it.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::DepsError;
+    /// use deps_core::{DepsError, RateLimitEvidence};
     ///
-    /// let err = DepsError::rate_limited("set MY_TOKEN to increase the limit", false);
-    /// assert!(matches!(err, DepsError::RateLimited { verified: false, .. }));
+    /// let err = DepsError::rate_limited("set MY_TOKEN to increase the limit", RateLimitEvidence::Inferred);
+    /// assert!(matches!(err, DepsError::RateLimited { verified: RateLimitEvidence::Inferred, .. }));
     /// ```
     #[must_use]
-    pub fn rate_limited(message: impl Into<String>, verified: bool) -> Self {
+    pub fn rate_limited(message: impl Into<String>, verified: RateLimitEvidence) -> Self {
         Self::RateLimited {
             message: message.into(),
             verified,
@@ -537,8 +549,9 @@ impl DepsError {
     ///
     /// ```
     /// use deps_core::error::{DepsError, FetchFailure};
+    /// use deps_core::RateLimitEvidence;
     ///
-    /// let rate_limited = DepsError::rate_limited("set GITHUB_TOKEN", true);
+    /// let rate_limited = DepsError::rate_limited("set GITHUB_TOKEN", RateLimitEvidence::Confirmed);
     /// assert_eq!(
     ///     rate_limited.fetch_failure(),
     ///     FetchFailure::Actionable("set GITHUB_TOKEN".into())
@@ -638,9 +651,13 @@ impl DepsError {
             // Split by `verified` (#1295 critic S2): a human triaging logs can tell a
             // confirmed rate limit apart from an unverified guess at this label alone,
             // without needing to also inspect the message text.
-            Self::RateLimited { verified: true, .. } => (None, "rate-limited"),
             Self::RateLimited {
-                verified: false, ..
+                verified: RateLimitEvidence::Confirmed,
+                ..
+            } => (None, "rate-limited"),
+            Self::RateLimited {
+                verified: RateLimitEvidence::Inferred,
+                ..
             } => (None, "rate-limited-unverified"),
             Self::ApiResponse { .. } => (None, "api-response"),
             Self::PackageNotFound { .. } => (None, "not-found"),
@@ -825,7 +842,7 @@ mod tests {
         assert_eq!(
             DepsError::RateLimited {
                 message: "set GITHUB_TOKEN".into(),
-                verified: true,
+                verified: RateLimitEvidence::Confirmed,
                 source_status: Some(403),
             }
             .safe_tracing_summary(),
@@ -834,7 +851,7 @@ mod tests {
         assert_eq!(
             DepsError::RateLimited {
                 message: "set GITHUB_TOKEN".into(),
-                verified: false,
+                verified: RateLimitEvidence::Inferred,
                 source_status: None,
             }
             .safe_tracing_summary(),
@@ -1299,7 +1316,7 @@ mod tests {
             );
         }
 
-        for verified in [true, false] {
+        for verified in [RateLimitEvidence::Confirmed, RateLimitEvidence::Inferred] {
             let rate_limited = DepsError::RateLimited {
                 message: "set GITHUB_TOKEN to increase the rate limit".into(),
                 verified,
@@ -1308,7 +1325,7 @@ mod tests {
             assert_eq!(
                 rate_limited.fetch_failure(),
                 FetchFailure::Actionable("set GITHUB_TOKEN to increase the rate limit".into()),
-                "verified={verified}"
+                "verified={verified:?}"
             );
         }
 

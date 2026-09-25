@@ -9,7 +9,7 @@
 use bytes::Bytes;
 use dashmap::DashSet;
 use deps_core::cache::HttpCache;
-use deps_core::error::{DepsError, Result};
+use deps_core::error::{DepsError, RateLimitEvidence, Result};
 use reqwest::header::HeaderName;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -65,16 +65,17 @@ const GITLAB_RATE_LIMIT_MESSAGE: &str = "GitLab API rate limit exceeded or authe
 /// with no `GITLAB_TOKEN` configured (spec FR-014).
 ///
 /// Inferred from a bare status code, like `deps_core::github::github_rate_limit_error` before
-/// #1295 — this crate has the same unverified-403 ambiguity, out of scope here (`verified:
-/// false`). Use [`gitlab_rate_limit_error_verified`] instead when the response already
-/// confirmed exhaustion.
+/// #1295 — this crate has the same unverified-403 ambiguity, out of scope here
+/// (`verified: RateLimitEvidence::Inferred`). Use [`gitlab_rate_limit_error_verified`] instead
+/// when the response already confirmed exhaustion.
 #[must_use]
 pub fn gitlab_rate_limit_error() -> DepsError {
     // `DepsError::rate_limited`, not a struct literal: `RateLimited` is `#[non_exhaustive]`.
-    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, false)
+    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, RateLimitEvidence::Inferred)
 }
 
-/// Same message as [`gitlab_rate_limit_error`], but `verified: true` (#1295 critic N2).
+/// Same message as [`gitlab_rate_limit_error`], but `verified: RateLimitEvidence::Confirmed`
+/// (#1295 critic N2).
 ///
 /// `crate::registry::GitlabCiRegistry::map_error` uses this instead of passing the
 /// `deps_core::cache`-classified error through with its registry-neutral message, so a
@@ -82,7 +83,7 @@ pub fn gitlab_rate_limit_error() -> DepsError {
 /// helpful generic message than the unverified guess gives.
 #[must_use]
 pub fn gitlab_rate_limit_error_verified() -> DepsError {
-    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, true)
+    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, RateLimitEvidence::Confirmed)
 }
 
 /// GitLab tags API response item (`GET /projects/:id/repository/tags`).

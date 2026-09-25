@@ -7,7 +7,7 @@
 //! capped to keep memory use predictable under long-running LSP sessions.
 
 use crate::cache_policy::CACHE_EVICTION_PERCENTAGE;
-use crate::error::{DepsError, Result};
+use crate::error::{DepsError, RateLimitEvidence, Result};
 use crate::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
 use crate::redact::RedactedUrl;
 use bytes::{Bytes, BytesMut};
@@ -58,6 +58,62 @@ const MAX_CACHEABLE_ENTRY_BYTES: usize = MAX_CACHE_BYTES / 8;
 
 /// HTTP request timeout in seconds.
 const HTTP_TIMEOUT_SECS: u64 = 30;
+
+/// Whether [`HttpCache`] may issue outbound network requests (issue #483).
+///
+/// Passed to [`HttpCache::set_offline`]. `Offline` also overrides
+/// [`CacheMode`] to behave as [`CacheMode::Enabled`] — see that method's docs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    /// Outbound registry requests are attempted normally.
+    Online,
+    /// All outbound requests are blocked; only cached/warm entries are served.
+    Offline,
+}
+
+impl NetworkMode {
+    /// Builds a `NetworkMode` from a `network.offline` config/CLI flag (`true` means
+    /// [`Self::Offline`]).
+    ///
+    /// The single, explicitly named conversion point from that boundary's `bool`
+    /// representation (issue #1436 S1) — deliberately not a `From<bool>` impl, which would
+    /// let any unrelated `bool` (e.g. a `cache.enabled` flag transposed at the call site)
+    /// silently convert too, defeating the point of typing this API in the first place.
+    #[must_use]
+    pub fn from_offline_flag(offline: bool) -> Self {
+        if offline { Self::Offline } else { Self::Online }
+    }
+}
+
+/// Whether [`HttpCache`] uses its entry-map cache to serve warm entries (issue #482).
+///
+/// Passed to [`HttpCache::set_cache_enabled`]. See that method's docs for the override
+/// [`NetworkMode::Offline`] has on this value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMode {
+    /// The entry map is consulted and populated as usual.
+    Enabled,
+    /// The entry map is bypassed entirely, except while [`NetworkMode::Offline`] overrides
+    /// this to behave as `Enabled`.
+    Disabled,
+}
+
+impl CacheMode {
+    /// Builds a `CacheMode` from a `cache.enabled` config/CLI flag (`true` means
+    /// [`Self::Enabled`]).
+    ///
+    /// The single, explicitly named conversion point from that boundary's `bool`
+    /// representation — see [`NetworkMode::from_offline_flag`]'s doc for why this is a named
+    /// constructor rather than a `From<bool>` impl.
+    #[must_use]
+    pub fn from_enabled_flag(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
 
 /// Maximum decompressed response body size accepted from a single request.
 ///
@@ -222,7 +278,8 @@ fn confirmed_rate_limit_exhaustion(status: StatusCode, headers: &header::HeaderM
 /// assume a GitHub-specific remedy (`GITHUB_TOKEN`) applies to whichever registry actually
 /// sent the confirming evidence. A GitHub-aware caller
 /// (`crate::github::classify_tags_fetch_error`) swaps in the GitHub-specific hint on top of
-/// this while keeping `verified: true`; `deps-gitlab-ci` does the equivalent for its own gate.
+/// this while keeping `verified: RateLimitEvidence::Confirmed`; `deps-gitlab-ci` does the
+/// equivalent for its own gate.
 const CONFIRMED_RATE_LIMIT_MESSAGE: &str =
     "registry rate limit exceeded (confirmed by the response)";
 
@@ -235,7 +292,7 @@ fn http_status_error(url: &str, status: StatusCode, headers: &header::HeaderMap)
     if confirmed_rate_limit_exhaustion(status, headers) {
         return DepsError::RateLimited {
             message: CONFIRMED_RATE_LIMIT_MESSAGE.to_string(),
-            verified: true,
+            verified: RateLimitEvidence::Confirmed,
             source_status: Some(status.as_u16()),
         };
     }
@@ -1011,15 +1068,16 @@ impl HttpCache {
     /// Sets whether outbound network requests are permitted (issue #483).
     ///
     /// Enforced by `Self::ensure_online` (private) at every one of this module's 4 send sites —
-    /// effective for every call after this returns. While `value` is `true`, this also
-    /// overrides `cache_enabled` (see [`Self::set_cache_enabled`]) to behave as `true` on
-    /// both the read and write path in `get_cached_with_headers_via`: without this, a
-    /// warm entry fetched before going offline could never have been stored in the first
-    /// place if caching was disabled, leaving the offline warm-cache path with nothing to
-    /// serve — the exact combination `cache.enabled: false` + `network.offline: true` is
-    /// meant to survive.
-    pub fn set_offline(&self, value: bool) {
-        self.offline.store(value, Ordering::Relaxed);
+    /// effective for every call after this returns. While `mode` is [`NetworkMode::Offline`],
+    /// this also overrides `cache_enabled` (see [`Self::set_cache_enabled`]) to behave as
+    /// [`CacheMode::Enabled`] on both the read and write path in `get_cached_with_headers_via`:
+    /// without this, a warm entry fetched before going offline could never have been stored in
+    /// the first place if caching was disabled, leaving the offline warm-cache path with
+    /// nothing to serve — the exact combination `cache.enabled: false` + `network.offline: true`
+    /// is meant to survive.
+    pub fn set_offline(&self, mode: NetworkMode) {
+        self.offline
+            .store(mode == NetworkMode::Offline, Ordering::Relaxed);
     }
 
     /// Returns whether outbound network requests are currently blocked.
@@ -1030,8 +1088,9 @@ impl HttpCache {
 
     /// Sets whether the entry-map cache is used (issue #482). See [`Self::set_offline`]'s
     /// docs for the override `offline` has on this flag while set.
-    pub fn set_cache_enabled(&self, value: bool) {
-        self.cache_enabled.store(value, Ordering::Relaxed);
+    pub fn set_cache_enabled(&self, mode: CacheMode) {
+        self.cache_enabled
+            .store(mode == CacheMode::Enabled, Ordering::Relaxed);
     }
 
     /// Returns `Err(DepsError::Offline)` when `network.offline` is set, without making any
@@ -3159,7 +3218,7 @@ mod tests {
 
         match result {
             Err(DepsError::RateLimited { verified, .. }) => {
-                assert!(verified, "expected verified: true");
+                assert_eq!(verified, RateLimitEvidence::Confirmed);
             }
             other => panic!("expected RateLimited, got {other:?}"),
         }
@@ -3609,29 +3668,9 @@ mod tests {
     #[cfg(feature = "test-util")]
     #[tokio::test]
     async fn test_get_cached_span_url_field_redacts_query_string_token() {
-        use tracing_subscriber::fmt::format::FmtSpan;
-
-        #[derive(Clone)]
-        struct TestWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for TestWriter {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(data);
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
-            type Writer = Self;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
-
         let url = "https://npm.internal/pkg?token=super-secret-value".to_string();
         let cache = HttpCache::new();
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
         cache.entries.insert(
             url.clone(),
             CachedResponse {
@@ -3642,23 +3681,12 @@ mod tests {
             },
         );
 
-        // TODO(critic): migrate onto deps_core::test_util capture helpers once they expose
-        // span events (#1006).
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(TestWriter(std::sync::Arc::clone(&buf)))
-            .with_span_events(FmtSpan::NEW)
-            .without_time()
-            .with_target(false)
-            .finish();
+        let output = crate::test_util::capture_tracing_span_fields_async(async {
+            let result: Bytes = cache.get_cached(&url).await.unwrap();
+            assert_eq!(result.as_ref(), b"cached");
+        })
+        .await;
 
-        let guard = tracing::subscriber::set_default(subscriber);
-        let result: Bytes = cache.get_cached(&url).await.unwrap();
-        drop(guard);
-
-        assert_eq!(result.as_ref(), b"cached");
-
-        let output = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
         assert!(
             !output.contains("super-secret-value"),
             "leaked token into span output: {output:?}"
@@ -4073,7 +4101,7 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
 
         let result: Result<Bytes> = cache.get_cached(&url).await;
         match result {
@@ -4097,7 +4125,7 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
 
         let body = serde_json::json!({ "queries": [] });
         let result: Result<Bytes> = cache.post_json(&url, &body).await;
@@ -4117,7 +4145,7 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
 
         let result: Result<Bytes> = cache.get_transport_only(&url).await;
         assert_matches!(result, Err(DepsError::Offline { .. }));
@@ -4146,7 +4174,7 @@ mod tests {
                 fetched_at: Instant::now(),
             },
         );
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
 
         let result: Bytes = cache.get_cached(&url).await.unwrap();
         assert_eq!(result.as_ref(), b"warm cached body");
@@ -4166,7 +4194,7 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        cache.set_cache_enabled(false);
+        cache.set_cache_enabled(CacheMode::Disabled);
 
         let first: Bytes = cache.get_cached(&url).await.unwrap();
         let second: Bytes = cache.get_cached(&url).await.unwrap();
@@ -4196,8 +4224,8 @@ mod tests {
             .await;
 
         let cache = HttpCache::new();
-        cache.set_cache_enabled(false);
-        cache.set_offline(true);
+        cache.set_cache_enabled(CacheMode::Disabled);
+        cache.set_offline(NetworkMode::Offline);
 
         let result: Result<Bytes> = cache.get_cached(&url).await;
         assert_matches!(result, Err(DepsError::Offline { .. }));
@@ -4224,8 +4252,8 @@ mod tests {
         let first: Bytes = cache.get_cached(&url).await.unwrap();
         assert_eq!(first.as_ref(), b"fetched while online");
 
-        cache.set_cache_enabled(false);
-        cache.set_offline(true);
+        cache.set_cache_enabled(CacheMode::Disabled);
+        cache.set_offline(NetworkMode::Offline);
 
         let second: Bytes = cache.get_cached(&url).await.unwrap();
         assert_eq!(
@@ -4255,7 +4283,7 @@ mod tests {
         let online: Bytes = cache.get_cached(&url).await.unwrap();
         assert_eq!(online.as_ref(), b"fetched while online");
 
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
 
         let offline: Bytes = cache.get_cached(&url).await.unwrap();
         assert_eq!(offline.as_ref(), b"fetched while online");
@@ -4283,11 +4311,11 @@ mod tests {
         assert_eq!(online.as_ref(), b"fetched while online");
         mock.assert_async().await;
 
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
         let offline: Bytes = cache.get_cached(&url).await.unwrap();
         assert_eq!(offline.as_ref(), b"fetched while online");
 
-        cache.set_offline(false);
+        cache.set_offline(NetworkMode::Online);
         drop(mock);
         let revalidate = server
             .mock("GET", "/api/data")
@@ -4324,7 +4352,7 @@ mod tests {
         let online: Bytes = cache.get_cached_workspace(&url).await.unwrap();
         assert_eq!(online.as_ref(), b"workspace fetch");
 
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
         let offline: Bytes = cache.get_cached_workspace(&url).await.unwrap();
         assert_eq!(offline.as_ref(), b"workspace fetch");
         mock.assert_async().await;
@@ -4350,7 +4378,7 @@ mod tests {
             .unwrap();
         assert_eq!(online.as_ref(), b"trusted-origin fetch");
 
-        cache.set_offline(true);
+        cache.set_offline(NetworkMode::Offline);
         let offline: Bytes = cache
             .get_cached_trusted_origin(&url, &trusted_origin)
             .await
@@ -4624,7 +4652,13 @@ mod tests {
             .await;
 
         assert!(
-            matches!(result, Err(DepsError::RateLimited { verified: true, .. })),
+            matches!(
+                result,
+                Err(DepsError::RateLimited {
+                    verified: RateLimitEvidence::Confirmed,
+                    ..
+                })
+            ),
             "expected the confirmed-evidence 403 to surface as verified RateLimited: {result:?}"
         );
         assert_eq!(

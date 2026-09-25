@@ -2154,7 +2154,7 @@ mod tests {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
         let cache = Arc::new(HttpCache::new());
-        cache.set_offline(true);
+        cache.set_offline(deps_core::NetworkMode::Offline);
         let registry = NpmRegistry::with_public_base_for_test(cache, base);
 
         let mock = server

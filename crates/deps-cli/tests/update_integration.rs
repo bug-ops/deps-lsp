@@ -24,6 +24,7 @@
 
 #![allow(clippy::expect_used)]
 
+use deps_cli::format::DryRun;
 #[cfg(unix)]
 use deps_cli::update::ApplyError;
 use deps_cli::update::{Outcome, PlannedUpdateItem, UpdatePlan, apply_plan};
@@ -252,7 +253,7 @@ fn test_apply_plan_refuses_a_symlinked_manifest_path() {
         Range::new(Position::new(0, 9), Position::new(0, 14)),
         "1.2.0",
     );
-    let result = apply_plan(&plan, &link, original, false);
+    let result = apply_plan(&plan, &link, original, DryRun::No);
 
     assert!(
         matches!(result, Err(ApplyError::Write { .. })),
@@ -286,7 +287,7 @@ fn test_apply_plan_writes_through_a_real_manifest_path() {
         Range::new(Position::new(0, 9), Position::new(0, 14)),
         "1.2.0",
     );
-    apply_plan(&plan, &path, original, false).expect("apply_plan must succeed");
+    apply_plan(&plan, &path, original, DryRun::No).expect("apply_plan must succeed");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("read manifest"),
@@ -309,7 +310,7 @@ fn test_apply_plan_dry_run_leaves_the_manifest_byte_for_byte_intact() {
         Range::new(Position::new(0, 9), Position::new(0, 14)),
         "1.2.0",
     );
-    apply_plan(&plan, &path, original, true).expect("apply_plan must succeed under dry_run");
+    apply_plan(&plan, &path, original, DryRun::Yes).expect("apply_plan must succeed under dry_run");
 
     assert_eq!(
         std::fs::read_to_string(&path).expect("read manifest"),

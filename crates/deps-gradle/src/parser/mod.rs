@@ -174,6 +174,42 @@ fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Op
     }
 }
 
+/// Which Gradle manifest shape a URI's basename identifies (issue #1436), so the parser and
+/// `ecosystem::GradleEcosystem::detect_completion_context` dispatch from the same
+/// classification instead of independently re-deriving (and potentially diverging on) it from
+/// the raw URI string — mirrors `deps_pypi::ecosystem::PypiManifestKind`'s `from_uri` pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GradleManifestKind {
+    /// `libs.versions.toml` version catalog.
+    Catalog,
+    /// `settings.gradle`/`settings.gradle.kts`: plugin-management declarations, not the
+    /// dependency-coordinate DSL `build.gradle(.kts)` uses.
+    Settings,
+    /// `build.gradle.kts` (Kotlin DSL).
+    KotlinBuild,
+    /// `build.gradle` (Groovy DSL).
+    GroovyBuild,
+    /// Not a recognized Gradle manifest shape.
+    Other,
+}
+
+impl GradleManifestKind {
+    pub(crate) fn from_uri(uri: &Url) -> Self {
+        let path = uri.path();
+        if path.ends_with("libs.versions.toml") {
+            Self::Catalog
+        } else if path.ends_with("settings.gradle.kts") || path.ends_with("settings.gradle") {
+            Self::Settings
+        } else if path.ends_with(".gradle.kts") {
+            Self::KotlinBuild
+        } else if path.ends_with(".gradle") {
+            Self::GroovyBuild
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Parses a Gradle file, dispatching to the catalog/settings/Kotlin-DSL/Groovy-DSL
 /// parser based on its filename, then resolves `$var`/`${var}` property references
 /// for build files.
@@ -183,24 +219,25 @@ fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Op
 /// Returns an error if the file's dedicated parser fails (e.g. malformed TOML for
 /// a version catalog).
 pub fn parse_gradle(content: &str, uri: &Url) -> Result<GradleParseResult> {
-    let path = uri.path().to_string();
-    let mut result = if path.ends_with("libs.versions.toml") {
-        catalog::parse_version_catalog(content, uri)?
-    } else if path.ends_with("settings.gradle.kts") || path.ends_with("settings.gradle") {
-        settings::parse_settings(content, uri)?
-    } else if path.ends_with(".gradle.kts") {
-        kotlin::parse_kotlin_dsl(content, uri)?
-    } else if path.ends_with(".gradle") {
-        groovy::parse_groovy_dsl(content, uri)?
-    } else {
-        return Ok(GradleParseResult {
-            dependencies: vec![],
-            uri: uri.clone(),
-            dependency_truncation: None,
-        });
+    let kind = GradleManifestKind::from_uri(uri);
+    let mut result = match kind {
+        GradleManifestKind::Catalog => catalog::parse_version_catalog(content, uri)?,
+        GradleManifestKind::Settings => settings::parse_settings(content, uri)?,
+        GradleManifestKind::KotlinBuild => kotlin::parse_kotlin_dsl(content, uri)?,
+        GradleManifestKind::GroovyBuild => groovy::parse_groovy_dsl(content, uri)?,
+        GradleManifestKind::Other => {
+            return Ok(GradleParseResult {
+                dependencies: vec![],
+                uri: uri.clone(),
+                dependency_truncation: None,
+            });
+        }
     };
 
-    if path.ends_with("build.gradle.kts") || path.ends_with("build.gradle") {
+    if matches!(
+        kind,
+        GradleManifestKind::KotlinBuild | GradleManifestKind::GroovyBuild
+    ) {
         // Directory derived via `resolve_manifest_file_path` (#1090), not the raw `uri.path()`
         // string used for dispatch above: that string has no scheme/host check, so joining it
         // straight onto `load_gradle_properties` would let a non-file:/remote-host URI read a

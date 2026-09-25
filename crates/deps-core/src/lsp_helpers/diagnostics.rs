@@ -9,7 +9,8 @@ use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, FetchFailure, PackageName,
-    ParseResult, PublishTime, RemovalStatus, VersionReq, format_relative_age, is_within_cooldown,
+    ParseResult, PublishTime, RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus,
+    VersionReq, format_relative_age, is_within_cooldown,
 };
 
 use super::{
@@ -887,7 +888,7 @@ pub fn generate_diagnostics_from_cache(
         uri,
         vuln_keys.as_ref(),
     );
-    blocked_registry_diagnostics(&mut diagnostics, parse_result, &deps);
+    blocked_and_rejected_registry_diagnostics(&mut diagnostics, parse_result, &deps);
 
     for dep in deps {
         // Critic S1 (#905): a synthetic `name_range()` has no real document position, and every
@@ -1276,76 +1277,145 @@ fn skip_reason_notice(
     );
 }
 
-/// R1 — blocked-registry notices (#443/plan-1b §1.7).
+/// R1/R1b — blocked- and rejected-registry notices (#443/plan-1b §1.7, #1438).
 ///
-/// A registry index blocked by `registries.workspace_registries` must not degrade silently.
-/// Independent of the dependency loop below: a blocked dependency never reaches
-/// version resolution, so it would otherwise leave no trace at all in the editor.
+/// A registry index blocked by `registries.workspace_registries`, or a registry-config entry
+/// rejected for any other reason (malformed URL, non-https, embedded userinfo, undefined
+/// `${VAR}`, ...), must not degrade silently. Independent of the dependency loop below: an
+/// affected dependency never reaches version resolution, so it would otherwise leave no trace
+/// at all in the editor.
 ///
-/// Reads: `parse_result.blocked_registries()`.
-/// Emits: one [`Severity::Information`] per **distinct declaration key**, anchored
-/// at the first affected dependency's range — message truncated at
-/// [`MAX_DIAGNOSTIC_VALUE_CHARS`]. Every *other* dependency sharing that
-/// declaration key survives via `related_information` on that same diagnostic, up to
-/// [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] named individually plus a trailing "+N more" entry
-/// beyond that (#944 M8/S2; see [`push_collapsed_blocked_registries`]) rather than being
-/// silently dropped. Pushed after R0, before any per-dependency diagnostic.
-/// Suppressed by: nothing. Suppresses: nothing.
+/// Reads: `parse_result.blocked_registries()` and `parse_result.rejected_registries()` —
+/// independent data sources (an ecosystem's own config layer guarantees no dependency is ever
+/// reported by both, see [`crate::net_policy::RegistryRejectionClassifier`]'s doc), each run
+/// through [`declaration_grouped_registry_diagnostics`] separately so the two mechanisms never
+/// interact. `dependency_names` is built at most once here (#1438 code review finding 3;
+/// #1242/#1246's original "skip the redaction pass when nothing to report" optimization now
+/// covers both paths together, not just the blocked one) and shared by both.
 ///
-/// Grouped by declaration key, not by `(host class, raw value)` (#925 S2, then corrected by a
-/// later code-review pass): a config-global declaration (e.g. a single blocked npm `.npmrc`
+/// Emits: one diagnostic per **distinct declaration key** per path ([`Severity::Information`]
+/// for a block, [`Severity::Warning`] for a rejection), anchored at the first affected
+/// dependency's range — message truncated at [`MAX_DIAGNOSTIC_VALUE_CHARS`]. Every *other*
+/// dependency sharing that declaration key survives via `related_information` on that same
+/// diagnostic, up to [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] named individually plus a trailing
+/// "+N more" entry beyond that (#944 M8/S2), rather than being silently dropped. Pushed after
+/// R0, before any per-dependency diagnostic. Suppressed by: nothing. Suppresses: nothing.
+///
+/// Grouped by declaration key, not by `(class/reason, raw value)` (#925 S2, then corrected by
+/// a later code-review pass): a config-global declaration (e.g. a single blocked npm `.npmrc`
 /// top-level `registry=` line, or one `NuGet.Config` `<add key>` source) applies identically
 /// to every dependency it affects, so pushing one entry per *dependency* — as each ecosystem's
-/// `ParseResult::blocked_registries()` does — can fan out to as many identical `INFORMATION`
-/// diagnostics as dependencies affected (up to [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`]) for
-/// one underlying declaration. Grouping by `(host class, raw value)` instead of the
-/// declaration key looked equivalent but was not: two *independently* declared sources that
-/// merely happen to share a raw value and host class (e.g. an npm top-level `registry=` and an
-/// unrelated `@scope:registry=`, both blocked to the same URL) would silently collapse to one
-/// diagnostic, leaving every dependency routed through the second declaration with no
-/// diagnostic at all — see [`ParseResult::blocked_registries`]'s own doc for why the key must
-/// identify the declaration, never the value.
-fn blocked_registry_diagnostics(
+/// `ParseResult` override does — can fan out to as many identical diagnostics as dependencies
+/// affected (up to [`crate::MAX_DEPENDENCIES_PER_DOCUMENT`]) for one underlying declaration.
+/// Grouping by value instead of the declaration key looked equivalent but was not: two
+/// *independently* declared sources that merely happen to share a raw value (e.g. an npm
+/// top-level `registry=` and an unrelated `@scope:registry=`, both routed to the same URL)
+/// would silently collapse to one diagnostic, leaving every dependency routed through the
+/// second declaration with no diagnostic at all — see [`ParseResult::blocked_registries`]'s
+/// own doc for why the key must identify the declaration, never the value.
+fn blocked_and_rejected_registry_diagnostics(
     diagnostics: &mut Vec<Diagnostic>,
     parse_result: &dyn ParseResult,
     deps: &[&dyn Dependency],
 ) {
-    // #944 M3: `HashMap` grouping keeps this O(n); `order` preserves first-seen declaration-key
-    // order so output stays deterministic independent of `HashMap` iteration order.
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<BlockedRegistryOccurrence>> = HashMap::new();
-    for occurrence in parse_result.blocked_registries() {
-        groups
-            .entry(occurrence.declaration_key.clone())
-            .or_insert_with(|| {
-                order.push(occurrence.declaration_key.clone());
-                Vec::new()
-            })
-            .push(occurrence);
-    }
-    if order.is_empty() {
-        // #1242/#1246 perf follow-up: nothing is blocked (the common case) — skip building
+    let blocked = parse_result.blocked_registries();
+    let rejected = parse_result.rejected_registries();
+    if blocked.is_empty() && rejected.is_empty() {
+        // #1242/#1246 perf follow-up: nothing to report (the common case) — skip building
         // `dependency_names` below, which would otherwise redact every dependency's name
-        // unconditionally for a map no diagnostic will ever read.
+        // unconditionally for a map neither path would read.
         return;
     }
 
-    // Built once, not per sibling occurrence (#944 M3), for `related_information` naming;
-    // keyed on `Range` to match `BlockedRegistryOccurrence::range`'s type (#1071 S2). Redacted
-    // via `redact_name_for_diagnostic` (#1242, #1246): this name reaches the same client-visible
-    // `related_information` text as `FetchFailureEntry.name`.
+    // Built once, not per sibling occurrence nor per path (#944 M3, #1438 code review finding
+    // 3), for `related_information` naming; keyed on `Range` to match
+    // `RegistryOccurrence::range`'s type (#1071 S2). Redacted via `redact_name_for_diagnostic`
+    // (#1242, #1246): this name reaches the same client-visible `related_information` text as
+    // `FetchFailureEntry.name`.
     let dependency_names: HashMap<Range, String> = deps
         .iter()
         .map(|dep| (dep.name_range(), redact_name_for_diagnostic(dep.name())))
         .collect();
+    let uri = parse_result.uri();
+
+    if !blocked.is_empty() {
+        declaration_grouped_registry_diagnostics(
+            diagnostics,
+            blocked,
+            uri,
+            &dependency_names,
+            build_blocked_registry_diagnostic,
+            |name| match name {
+                Some(name) => format!("'{name}' also blocked by the same registry policy"),
+                None => "also blocked by the same registry policy".to_string(),
+            },
+            |remaining| {
+                format!(
+                    "and {remaining} more dependencies also blocked by the same registry policy"
+                )
+            },
+        );
+    }
+    if !rejected.is_empty() {
+        declaration_grouped_registry_diagnostics(
+            diagnostics,
+            rejected,
+            uri,
+            &dependency_names,
+            build_rejected_registry_diagnostic,
+            |name| match name {
+                Some(name) => format!("'{name}' also rejected by the same registry entry"),
+                None => "also rejected by the same registry entry".to_string(),
+            },
+            |remaining| {
+                format!(
+                    "and {remaining} more dependencies also rejected by the same registry entry"
+                )
+            },
+        );
+    }
+}
+
+/// Groups `occurrences` by declaration key and pushes one collapsed diagnostic per group —
+/// the algorithm shared by [`blocked_and_rejected_registry_diagnostics`]'s two call sites
+/// (#1438 code review finding 4: previously two near-identical ~60-line copies, one per
+/// occurrence type). `build_diagnostic` renders one occurrence; `sibling_message`/
+/// `remaining_message` render a collapsed group's `related_information` text, the one place
+/// the two callers' wording genuinely differs.
+fn declaration_grouped_registry_diagnostics<O: RegistryOccurrence>(
+    diagnostics: &mut Vec<Diagnostic>,
+    occurrences: Vec<O>,
+    uri: &url::Url,
+    dependency_names: &HashMap<Range, String>,
+    build_diagnostic: impl Fn(&O) -> Diagnostic,
+    sibling_message: impl Fn(Option<&str>) -> String,
+    remaining_message: impl Fn(usize) -> String,
+) {
+    // #944 M3: `HashMap` grouping keeps this O(n); `order` preserves first-seen declaration-key
+    // order so output stays deterministic independent of `HashMap` iteration order.
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<O>> = HashMap::new();
+    for occurrence in occurrences {
+        let key = occurrence.declaration_key().to_string();
+        groups
+            .entry(key.clone())
+            .or_insert_with(|| {
+                order.push(key.clone());
+                Vec::new()
+            })
+            .push(occurrence);
+    }
 
     for key in order {
         if let Some(entries) = groups.remove(&key) {
-            push_collapsed_blocked_registries(
+            push_collapsed_registry_diagnostics(
                 diagnostics,
                 entries,
-                parse_result.uri(),
-                &dependency_names,
+                uri,
+                dependency_names,
+                &build_diagnostic,
+                &sibling_message,
+                &remaining_message,
             );
         }
     }
@@ -1379,17 +1449,41 @@ fn build_blocked_registry_diagnostic(occurrence: &BlockedRegistryOccurrence) -> 
     .with_severity(Severity::Information)
 }
 
-/// R1 collapse (#944 M8, capped per S2): mirrors [`push_collapsed_fetch_failures`]'s pattern so
-/// two dependencies sharing one blocked declaration both stay discoverable, instead of the
-/// second silently losing its diagnostic to dedup. `0` -> nothing. `1` -> the single diagnostic
-/// verbatim. `n >= 2` -> one diagnostic anchored at the first occurrence's own range, with
+/// Builds the [`Diagnostic`] for one [`RejectedRegistryOccurrence`], anchored at its own
+/// range — mirrors [`build_blocked_registry_diagnostic`]'s shape.
+fn build_rejected_registry_diagnostic(occurrence: &RejectedRegistryOccurrence) -> Diagnostic {
+    let redacted_value = RedactedUrl::new(&occurrence.raw_value).into_inner();
+    let redacted_key = redact_declaration_key(&occurrence.declaration_key);
+    Diagnostic::new(
+        occurrence.range,
+        format!(
+            "registry entry \"{}\" rejected: {} (declaration: {})",
+            sanitize_and_truncate_for_diagnostic(&redacted_value, MAX_DIAGNOSTIC_VALUE_CHARS),
+            occurrence.reason,
+            sanitize_and_truncate_for_diagnostic(&redacted_key, MAX_DIAGNOSTIC_VALUE_CHARS),
+        ),
+    )
+    // impl-critic M1 (#1438 code review): `Warning`, not `Information` like the sibling
+    // `BlockedHost` diagnostic — every reason here is an unintended misconfiguration leaving
+    // the dependency unchecked, not `BlockedHost`'s deliberate policy decision.
+    .with_severity(Severity::Warning)
+}
+
+/// R1/R1b collapse (#944 M8, capped per S2; genericized over [`RegistryOccurrence`] by #1438
+/// code review finding 4): mirrors [`push_collapsed_fetch_failures`]'s pattern so two
+/// dependencies sharing one declaration both stay discoverable, instead of the second silently
+/// losing its diagnostic to dedup. `0` -> nothing. `1` -> the single diagnostic verbatim.
+/// `n >= 2` -> one diagnostic anchored at the first occurrence's own range, with
 /// `related_information` naming up to [`MAX_BLOCKED_REGISTRY_RELATED_INFO`] other affected
 /// dependencies at their own range, plus a trailing "+N more" entry beyond that cap.
-fn push_collapsed_blocked_registries(
+fn push_collapsed_registry_diagnostics<O: RegistryOccurrence>(
     diagnostics: &mut Vec<Diagnostic>,
-    entries: Vec<BlockedRegistryOccurrence>,
+    entries: Vec<O>,
     uri: &url::Url,
     dependency_names: &HashMap<Range, String>,
+    build_diagnostic: &impl Fn(&O) -> Diagnostic,
+    sibling_message: &impl Fn(Option<&str>) -> String,
+    remaining_message: &impl Fn(usize) -> String,
 ) {
     #[expect(
         clippy::indexing_slicing,
@@ -1398,9 +1492,9 @@ fn push_collapsed_blocked_registries(
     )]
     match entries.len() {
         0 => {}
-        1 => diagnostics.extend(entries.iter().map(build_blocked_registry_diagnostic)),
+        1 => diagnostics.extend(entries.iter().map(build_diagnostic)),
         _ => {
-            let diagnostic = build_blocked_registry_diagnostic(&entries[0]);
+            let diagnostic = build_diagnostic(&entries[0]);
             let siblings = &entries[1..];
             let shown = siblings.len().min(MAX_BLOCKED_REGISTRY_RELATED_INFO);
             #[expect(
@@ -1411,13 +1505,9 @@ fn push_collapsed_blocked_registries(
             let mut related_information: Vec<RelatedInformation> = siblings[..shown]
                 .iter()
                 .map(|occurrence| {
-                    let message = match dependency_names.get(&occurrence.range) {
-                        Some(name) => {
-                            format!("'{name}' also blocked by the same registry policy")
-                        }
-                        None => "also blocked by the same registry policy".to_string(),
-                    };
-                    RelatedInformation::new(uri.clone(), occurrence.range, message)
+                    let range = occurrence.range();
+                    let name = dependency_names.get(&range).map(String::as_str);
+                    RelatedInformation::new(uri.clone(), range, sibling_message(name))
                 })
                 .collect();
             let remaining = siblings.len() - shown;
@@ -1425,10 +1515,7 @@ fn push_collapsed_blocked_registries(
                 related_information.push(RelatedInformation::new(
                     uri.clone(),
                     diagnostic.range,
-                    format!(
-                        "and {remaining} more dependencies also blocked by the same registry \
-                         policy"
-                    ),
+                    remaining_message(remaining),
                 ));
             }
             diagnostics.push(diagnostic.with_related_information(related_information));
@@ -3525,6 +3612,257 @@ mod tests {
         let blocked_diagnostic = blocked_diagnostic_for(declaration_key, raw_value);
         assert!(!blocked_diagnostic.message().contains('\u{202E}'));
         assert!(blocked_diagnostic.message().contains("index.mycorp.dev"));
+    }
+
+    /// Mirrors [`blocked_diagnostic_for`] for [`RejectedRegistryOccurrence`] (#1438): builds a
+    /// single dependency with one rejected-registry occurrence and returns the resulting
+    /// diagnostic.
+    fn rejected_diagnostic_for(
+        declaration_key: &str,
+        raw_value: &str,
+        reason: crate::net_policy::RegistryRejectionReason,
+    ) -> Diagnostic {
+        struct RejectedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: url::Url,
+            rejected: Vec<RejectedRegistryOccurrence>,
+        }
+
+        impl ParseResult for RejectedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
+                self.rejected.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let name_range = Range::new(Position::new(0, 0), Position::new(0, 14));
+        let formatter = MOCK_FORMATTER;
+        let parse_result = RejectedRegistryParseResult {
+            deps: vec![MockDep {
+                name: "internal-crate".into(),
+                version_req: "1.0.0".into(),
+                version_range: Range::new(Position::new(0, 20), Position::new(0, 25)),
+                name_range,
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+            rejected: vec![RejectedRegistryOccurrence {
+                range: name_range,
+                reason,
+                raw_value: raw_value.to_string(),
+                declaration_key: declaration_key.to_string(),
+            }],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+        diagnostics
+            .into_iter()
+            .find(|d| d.message().contains("rejected:"))
+            .expect("expected a rejected-registry diagnostic")
+    }
+
+    /// #1438: a registry-config entry rejected for a reason *other* than a policy-blocked
+    /// host — previously invisible (no diagnostic, no hover data, only a `tracing::warn!`) —
+    /// must now surface a `WARNING` diagnostic naming the reason.
+    #[test]
+    fn test_generate_diagnostics_from_cache_emits_rejected_registry_diagnostic() {
+        let rejected_diagnostic = rejected_diagnostic_for(
+            "top-level",
+            "https://evil.example.com/${GITHUB_TOKEN}",
+            crate::net_policy::RegistryRejectionReason::EnvVarExpansionNotPermitted,
+        );
+        assert_eq!(
+            rejected_diagnostic.range,
+            Range::new(Position::new(0, 0), Position::new(0, 14))
+        );
+        assert_eq!(rejected_diagnostic.severity, Some(Severity::Warning));
+        assert!(rejected_diagnostic.message().contains("evil.example.com"));
+        assert!(
+            rejected_diagnostic
+                .message()
+                .contains("environment-variable expansion")
+        );
+        assert!(
+            rejected_diagnostic
+                .message()
+                .contains("declaration: top-level")
+        );
+    }
+
+    /// #1438: every non-`BlockedHost` rejection reason must produce a distinguishable message.
+    #[test]
+    fn test_generate_diagnostics_from_cache_rejected_registry_message_names_every_reason() {
+        use crate::net_policy::RegistryRejectionReason;
+
+        for (reason, expected_fragment) in [
+            (RegistryRejectionReason::InvalidUrl, "not a valid URL"),
+            (RegistryRejectionReason::NotHttps, "does not use https"),
+            (
+                RegistryRejectionReason::UserInfoPresent,
+                "embedded credentials",
+            ),
+            (
+                RegistryRejectionReason::UndefinedEnvVar,
+                "undefined environment variable",
+            ),
+            (
+                RegistryRejectionReason::EnvVarExpansionNotPermitted,
+                "environment-variable expansion",
+            ),
+        ] {
+            let rejected_diagnostic =
+                rejected_diagnostic_for("top-level", "https://example.com", reason);
+            assert!(
+                rejected_diagnostic.message().contains(expected_fragment),
+                "reason {reason:?} must produce a message containing {expected_fragment:?}, \
+                 got: {rejected_diagnostic:?}"
+            );
+        }
+    }
+
+    /// impl-critic M2 (#1438 code review): `InvalidUrl`'s `raw_value` is arbitrary, non-URL
+    /// `.npmrc` text — unlike every other reason, it never passed `url::Url::parse`, so it's
+    /// not confirmed to have real URL structure. `RedactedUrl`'s redaction is not solely
+    /// URL-structure-gated, though: `mask_token_segments`'s colon-less fallback
+    /// (`redact/url.rs`) scans *any* text with no `:` at all for a token-shaped piece via
+    /// [`crate::redact::url`]'s `PathPiece` rule (>=16 alphanumeric bytes mixing
+    /// upper/lower/digit), so a bare credential-shaped string reaching `InvalidUrl` is still
+    /// masked before it reaches this diagnostic — verifying that here, rather than
+    /// special-casing `InvalidUrl` to omit `raw_value` outright.
+    #[test]
+    fn test_generate_diagnostics_from_cache_rejected_registry_invalid_url_masks_bare_token_shaped_value()
+     {
+        let rejected_diagnostic = rejected_diagnostic_for(
+            "top-level",
+            "AbCdEfGh12345678",
+            crate::net_policy::RegistryRejectionReason::InvalidUrl,
+        );
+        assert!(
+            !rejected_diagnostic.message().contains("AbCdEfGh12345678"),
+            "a bare token-shaped .npmrc value must never reach the diagnostic unmasked, \
+             got: {rejected_diagnostic:?}"
+        );
+        assert!(
+            rejected_diagnostic.message().contains("***"),
+            "expected the token-shaped value to be masked, got: {rejected_diagnostic:?}"
+        );
+    }
+
+    /// #1438: two dependencies whose `.npmrc` resolution shares one rejected declaration
+    /// (e.g. both routed through the same blocked top-level `registry=`) must collapse to one
+    /// diagnostic with `related_information`, mirroring
+    /// [`test_generate_diagnostics_from_cache_dedups_by_declaration_key_not_by_value`]'s
+    /// blocked-registry precedent.
+    #[test]
+    fn test_generate_diagnostics_from_cache_rejected_registry_dedups_by_declaration_key() {
+        use crate::net_policy::RegistryRejectionReason;
+
+        struct RejectedRegistryParseResult {
+            deps: Vec<MockDep>,
+            uri: url::Url,
+            rejected: Vec<RejectedRegistryOccurrence>,
+        }
+
+        impl ParseResult for RejectedRegistryParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
+                self.rejected.clone()
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let range_a = Range::new(Position::new(0, 0), Position::new(0, 4));
+        let range_b = Range::new(Position::new(1, 0), Position::new(1, 4));
+        let formatter = MOCK_FORMATTER;
+        let parse_result = RejectedRegistryParseResult {
+            deps: vec![
+                MockDep {
+                    name: "dep-a".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: range_a,
+                    name_range: range_a,
+                },
+                MockDep {
+                    name: "dep-b".into(),
+                    version_req: "1.0.0".into(),
+                    version_range: range_b,
+                    name_range: range_b,
+                },
+            ],
+            uri: crate::test_util::test_uri("/test/package.json"),
+            rejected: vec![
+                RejectedRegistryOccurrence {
+                    range: range_a,
+                    reason: RegistryRejectionReason::InvalidUrl,
+                    raw_value: "not-a-url".to_string(),
+                    declaration_key: "top-level".to_string(),
+                },
+                RejectedRegistryOccurrence {
+                    range: range_b,
+                    reason: RegistryRejectionReason::InvalidUrl,
+                    raw_value: "not-a-url".to_string(),
+                    declaration_key: "top-level".to_string(),
+                },
+            ],
+        };
+
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+        let rejected: Vec<&Diagnostic> = diagnostics
+            .iter()
+            .filter(|d| d.message().contains("rejected:"))
+            .collect();
+        assert_eq!(
+            rejected.len(),
+            1,
+            "two entries sharing one declaration key must collapse to one diagnostic, \
+             got: {diagnostics:?}"
+        );
+        assert_eq!(rejected[0].range, range_a);
+        let related = rejected[0]
+            .related_information
+            .as_ref()
+            .expect("second dependency must survive via related_information");
+        assert_eq!(related.len(), 1);
     }
 
     /// #1263: a bidirectional-override embedded in the manifest-declared requirement, or in

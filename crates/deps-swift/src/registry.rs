@@ -682,14 +682,18 @@ mod tests {
         assert!(
             matches!(
                 err,
-                deps_core::DepsError::RateLimited { verified: true, .. }
+                deps_core::DepsError::RateLimited {
+                    verified: deps_core::RateLimitEvidence::Confirmed,
+                    ..
+                }
             ),
             "expected verified RateLimited, got {err:?}"
         );
     }
 
     /// An unconfirmed no-token 403 still classifies as `RateLimited` for its actionable hint,
-    /// but `verified: false` — distinguishable from the confirmed case above (#1295).
+    /// but `verified: RateLimitEvidence::Inferred` — distinguishable from the confirmed case
+    /// above (#1295).
     #[tokio::test]
     async fn test_get_versions_403_without_evidence_is_unverified_rate_limited() {
         let mut server = mockito::Server::new_async().await;
@@ -707,7 +711,7 @@ mod tests {
             matches!(
                 err,
                 deps_core::DepsError::RateLimited {
-                    verified: false,
+                    verified: deps_core::RateLimitEvidence::Inferred,
                     ..
                 }
             ),

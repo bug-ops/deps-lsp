@@ -492,10 +492,11 @@ pub fn dedup_applied_items(items: &mut [PlannedUpdateItem]) {
 ///
 /// Always re-reads and byte-compares `path` against `original_content` before writing (FR-019)
 /// — even under `dry_run`, so a `--dry-run` report never claims success for a plan a following
-/// real run would actually reject. `dry_run = true` skips the [`deps_core::fs_probe::write_atomic`]
-/// call itself; so does a plan whose edits would produce byte-identical content (no `Applied`
-/// items, or all-no-op edits) — skipping an unnecessary rewrite avoids churning the file's
-/// mtime/inode for file watchers and rebuild systems (critic finding M3).
+/// real run would actually reject. [`crate::format::DryRun::Yes`] skips the
+/// [`deps_core::fs_probe::write_atomic`] call itself; so does a plan whose edits would produce
+/// byte-identical content (no `Applied` items, or all-no-op edits) — skipping an unnecessary
+/// rewrite avoids churning the file's mtime/inode for file watchers and rebuild systems (critic
+/// finding M3).
 ///
 /// # Errors
 ///
@@ -506,7 +507,7 @@ pub fn apply_plan(
     plan: &UpdatePlan,
     path: &std::path::Path,
     original_content: &str,
-    dry_run: bool,
+    dry_run: crate::format::DryRun,
 ) -> Result<(), ApplyError> {
     // Defensive: `dedup_applied_items` should already have run over `plan` before this is
     // called, so this is normally a no-op — kept as a safety net, not the primary mechanism.
@@ -524,7 +525,7 @@ pub fn apply_plan(
         });
     }
 
-    if dry_run || new_content == original_content {
+    if dry_run == crate::format::DryRun::Yes || new_content == original_content {
         return Ok(());
     }
 
@@ -902,7 +903,12 @@ mod tests {
             }],
         };
 
-        let result = apply_plan(&plan, &path, "serde = \"1.0.0\"\n", false);
+        let result = apply_plan(
+            &plan,
+            &path,
+            "serde = \"1.0.0\"\n",
+            crate::format::DryRun::No,
+        );
         assert!(matches!(result, Err(ApplyError::StaleManifest { .. })));
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
@@ -930,7 +936,13 @@ mod tests {
             }],
         };
 
-        apply_plan(&plan, &path, "serde = \"1.0.0\"\n", true).unwrap();
+        apply_plan(
+            &plan,
+            &path,
+            "serde = \"1.0.0\"\n",
+            crate::format::DryRun::Yes,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "serde = \"1.0.0\"\n"
@@ -957,7 +969,13 @@ mod tests {
             }],
         };
 
-        apply_plan(&plan, &path, "serde = \"1.0.0\"\n", false).unwrap();
+        apply_plan(
+            &plan,
+            &path,
+            "serde = \"1.0.0\"\n",
+            crate::format::DryRun::No,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "serde = \"1.2.0\"\n"
@@ -981,7 +999,13 @@ mod tests {
             }],
         };
 
-        apply_plan(&plan, &path, "serde = \"1.0.0\"\n", false).unwrap();
+        apply_plan(
+            &plan,
+            &path,
+            "serde = \"1.0.0\"\n",
+            crate::format::DryRun::No,
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "serde = \"1.0.0\"\n"

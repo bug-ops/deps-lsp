@@ -517,6 +517,19 @@ macro_rules! __impl_parse_result_blocked_registries {
     };
 }
 
+/// Emits [`impl_parse_result!`]'s `rejected_registries` method body, or nothing when the
+/// field is omitted (the trait default applies) — not part of the public macro API.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __impl_parse_result_rejected_registries {
+    () => {};
+    ($field:ident) => {
+        fn rejected_registries(&self) -> Vec<$crate::ecosystem::RejectedRegistryOccurrence> {
+            self.$field.clone()
+        }
+    };
+}
+
 /// Implement `ParseResult` trait for a struct.
 ///
 /// # Arguments
@@ -534,10 +547,15 @@ macro_rules! __impl_parse_result_blocked_registries {
 ///   [`ecosystem::ParseResult::blocked_registries`](crate::ecosystem::ParseResult::blocked_registries)
 ///   override (#925, #969), read via `.clone()` — omit when the ecosystem enforces no
 ///   configurable-registry reachability policy (the trait default empty `Vec` applies).
+/// * `rejected_registries` - Optional: field name for the `Vec<RejectedRegistryOccurrence>`
+///   [`ecosystem::ParseResult::rejected_registries`](crate::ecosystem::ParseResult::rejected_registries)
+///   override (#1438), read via `.clone()` — omit when the ecosystem produces no
+///   `InvalidEntry`-based rejections beyond the blocked-host case (the trait default empty
+///   `Vec` applies).
 ///
 /// All optional fields are given in the fixed order shown above — `workspace_root`, then
-/// `dependency_truncation`, then `blocked_registries` — any subset may be omitted, but a
-/// present field cannot appear out of order.
+/// `dependency_truncation`, then `blocked_registries`, then `rejected_registries` — any
+/// subset may be omitted, but a present field cannot appear out of order.
 ///
 /// # Examples
 ///
@@ -579,6 +597,7 @@ macro_rules! impl_parse_result {
         $(, workspace_root: $workspace_root:ident)?
         $(, dependency_truncation: $dependency_truncation:ident)?
         $(, blocked_registries: $blocked_registries:ident)?
+        $(, rejected_registries: $rejected_registries:ident)?
         $(,)?
     }) => {
         impl $crate::ecosystem::ParseResult for $type {
@@ -598,6 +617,8 @@ macro_rules! impl_parse_result {
             $crate::__impl_parse_result_dependency_truncation!($($dependency_truncation)?);
 
             $crate::__impl_parse_result_blocked_registries!($($blocked_registries)?);
+
+            $crate::__impl_parse_result_rejected_registries!($($rejected_registries)?);
 
             fn as_any(&self) -> &dyn ::std::any::Any {
                 self

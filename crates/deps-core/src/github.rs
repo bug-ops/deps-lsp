@@ -9,7 +9,7 @@
 //! owner/repo validation, auth-header setup, the tags-pagination loop, and page parsing —
 //! live here, so the two crates cannot silently diverge on this shared behavior (#472).
 
-use crate::error::{DepsError, Result};
+use crate::error::{DepsError, RateLimitEvidence, Result};
 use crate::freshness::PublishTime;
 use crate::lsp_helpers::{is_dot_segment, warn_rejected_value};
 use bytes::Bytes;
@@ -110,13 +110,13 @@ pub fn validate_owner_repo(name: &str) -> Result<()> {
     )))
 }
 
-/// Message for a *confirmed* rate limit (`verified: true`, #1295): the response itself
+/// Message for a *confirmed* rate limit (`verified: RateLimitEvidence::Confirmed`, #1295): the response itself
 /// confirmed exhaustion (`X-RateLimit-Remaining: 0` or `Retry-After` — see
 /// `crate::cache::confirmed_rate_limit_exhaustion`).
 const GITHUB_RATE_LIMIT_MESSAGE_VERIFIED: &str = "GitHub API rate limit exceeded. Set GITHUB_TOKEN to increase the limit \
      (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)";
 
-/// Message for an *inferred* rate limit (`verified: false`, #1295): a 403 with no token and
+/// Message for an *inferred* rate limit (`verified: RateLimitEvidence::Inferred`, #1295): a 403 with no token and
 /// no corroborating response evidence — usually the rate limit, but not confirmed. Distinct
 /// text from [`GITHUB_RATE_LIMIT_MESSAGE_VERIFIED`] (critic S2) so a human triaging a real
 /// regression — e.g. via `safe_tracing_summary`'s `"rate-limited-unverified"` label, or this
@@ -131,19 +131,19 @@ const GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED: &str = "GitHub API request forbidden
 /// (60 req/h per IP, vs 5000 req/h with a token).
 ///
 /// Inferred from a 403 status and the absence of a token alone, with no corroborating
-/// response evidence — `verified: false` (#1295). Use [`github_rate_limit_error_verified`]
-/// instead when the response already confirmed exhaustion.
+/// response evidence — `verified: RateLimitEvidence::Inferred` (#1295). Use
+/// [`github_rate_limit_error_verified`] instead when the response already confirmed exhaustion.
 #[must_use]
 pub fn github_rate_limit_error() -> DepsError {
     DepsError::RateLimited {
         message: GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED.into(),
-        verified: false,
+        verified: RateLimitEvidence::Inferred,
         // No live response at this canned, inference-only construction site (#1295 N1).
         source_status: None,
     }
 }
 
-/// The actionable error for a *confirmed* rate limit (`verified: true`, #1295).
+/// The actionable error for a *confirmed* rate limit (`verified: RateLimitEvidence::Confirmed`, #1295).
 ///
 /// `crate::cache` already established, via response evidence, that the request was rejected
 /// for genuine rate-limit exhaustion.
@@ -156,7 +156,7 @@ pub fn github_rate_limit_error() -> DepsError {
 pub fn github_rate_limit_error_verified() -> DepsError {
     DepsError::RateLimited {
         message: GITHUB_RATE_LIMIT_MESSAGE_VERIFIED.into(),
-        verified: true,
+        verified: RateLimitEvidence::Confirmed,
         // Reconstructed fresh (see `classify_tags_fetch_error`'s enrichment arm) rather than
         // carrying forward whatever `source_status` the incoming error had — this constructor
         // is also called from `deps-github-actions`'s gate-replay path, which has no live
@@ -202,7 +202,10 @@ pub fn classify_tags_fetch_error(
     has_token: bool,
 ) -> DepsError {
     match &e {
-        DepsError::RateLimited { verified: true, .. } => github_rate_limit_error_verified(),
+        DepsError::RateLimited {
+            verified: RateLimitEvidence::Confirmed,
+            ..
+        } => github_rate_limit_error_verified(),
         DepsError::HttpStatus { status: 403, .. } if !has_token => github_rate_limit_error(),
         DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
             package: name.to_string().into(),
@@ -1219,13 +1222,14 @@ mod tests {
     // --- classify_tags_fetch_error (#1295) ---
 
     /// Critic S1/S2: an already-verified `RateLimited` from `crate::cache`'s registry-neutral
-    /// check gets the GitHub-specific remedy swapped in, keeping `verified: true` — and the
-    /// resulting message is distinct from the unverified one (S2).
+    /// check gets the GitHub-specific remedy swapped in, keeping
+    /// `verified: RateLimitEvidence::Confirmed` — and the resulting message is distinct from
+    /// the unverified one (S2).
     #[test]
     fn test_classify_tags_fetch_error_enriches_verified_rate_limit_with_github_hint() {
         let generic = DepsError::RateLimited {
             message: "registry rate limit exceeded (confirmed by the response)".into(),
-            verified: true,
+            verified: RateLimitEvidence::Confirmed,
             source_status: Some(403),
         };
         let classified = classify_tags_fetch_error(generic, "owner/repo", "GitHub", false);
@@ -1233,7 +1237,7 @@ mod tests {
             DepsError::RateLimited {
                 message, verified, ..
             } => {
-                assert!(verified);
+                assert_eq!(verified, RateLimitEvidence::Confirmed);
                 assert!(message.contains("GITHUB_TOKEN"));
                 assert_ne!(message, GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED);
             }
@@ -1251,7 +1255,7 @@ mod tests {
         assert!(matches!(
             classified,
             DepsError::RateLimited {
-                verified: false,
+                verified: RateLimitEvidence::Inferred,
                 ..
             }
         ));

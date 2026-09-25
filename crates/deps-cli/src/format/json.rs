@@ -5,7 +5,7 @@
 //! principle 8) — bump it, and document the bump in `CHANGELOG.md` as `Breaking`, whenever
 //! a field is renamed or removed (adding a new optional field is not itself a bump).
 
-use super::severity_str;
+use super::{DryRun, severity_str};
 use crate::report::CheckReport;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -162,16 +162,20 @@ pub struct UpdateItemDocument {
 /// # Examples
 ///
 /// ```
+/// use deps_cli::format::DryRun;
 /// use deps_cli::format::json::{UPDATE_SCHEMA_VERSION, update_to_document};
 /// use deps_cli::update::UpdatePlan;
 ///
-/// let document = update_to_document(&UpdatePlan::default(), false);
+/// let document = update_to_document(&UpdatePlan::default(), DryRun::No);
 /// assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
 /// assert!(!document.dry_run);
 /// assert!(document.items.is_empty());
 /// ```
 #[must_use]
-pub fn update_to_document(plan: &crate::update::UpdatePlan, dry_run: bool) -> UpdateReportDocument {
+pub fn update_to_document(
+    plan: &crate::update::UpdatePlan,
+    dry_run: DryRun,
+) -> UpdateReportDocument {
     // Security-S3: same sanitizer `format::table::render_update` routes `name`/`current`
     // through — a JSON consumer that prints these fields verbatim gets the same protection.
     let items = plan
@@ -189,7 +193,7 @@ pub fn update_to_document(plan: &crate::update::UpdatePlan, dry_run: bool) -> Up
 
     UpdateReportDocument {
         schema_version: UPDATE_SCHEMA_VERSION,
-        dry_run,
+        dry_run: dry_run == DryRun::Yes,
         items,
     }
 }
@@ -202,7 +206,7 @@ pub fn update_to_document(plan: &crate::update::UpdatePlan, dry_run: bool) -> Up
 /// happen for the plain-data shape this module builds.
 pub fn render_update(
     plan: &crate::update::UpdatePlan,
-    dry_run: bool,
+    dry_run: DryRun,
 ) -> Result<String, serde_json::Error> {
     serde_json::to_string_pretty(&update_to_document(plan, dry_run))
 }
@@ -318,7 +322,7 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
-        let document = update_to_document(&plan, true);
+        let document = update_to_document(&plan, DryRun::Yes);
         assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
         assert!(document.dry_run);
         assert_eq!(document.items.len(), 1);
@@ -335,9 +339,9 @@ mod tests {
         let plan = crate::update::UpdatePlan {
             items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
         };
-        let rendered = render_update(&plan, false).expect("render must succeed");
+        let rendered = render_update(&plan, DryRun::No).expect("render must succeed");
         let parsed: UpdateReportDocument =
             serde_json::from_str(&rendered).expect("must round-trip");
-        assert_eq!(parsed, update_to_document(&plan, false));
+        assert_eq!(parsed, update_to_document(&plan, DryRun::No));
     }
 }

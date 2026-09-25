@@ -31,12 +31,12 @@
 // (`offline_context`/`run_pipeline`) every test here calls.
 #![allow(clippy::expect_used)]
 
-use deps_cli::exit::{EXIT_CLEAN, exit_code};
+use deps_cli::exit::{EXIT_CLEAN, ExecutionOutcome, exit_code};
 use deps_cli::report::{CheckContext, CheckReport, FailOnPolicy, check_manifest};
 use deps_cli::{format, walk};
 use deps_core::osv::OsvClient;
 use deps_core::policy_config::{LicensePolicyConfig, PolicyConfig};
-use deps_core::{EcosystemRegistry, HttpCache};
+use deps_core::{EcosystemRegistry, HttpCache, NetworkMode};
 use deps_engine::setup::{EcosystemRuntime, register_ecosystems};
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,7 +47,7 @@ fn offline_context() -> (EcosystemRegistry, CheckContext) {
     let policy = PolicyConfig::default();
     let runtime = EcosystemRuntime::from_policy(&policy);
     let cache = Arc::new(HttpCache::with_policy(Arc::clone(&runtime.policy)));
-    cache.set_offline(true);
+    cache.set_offline(NetworkMode::Offline);
     assert!(
         cache.is_offline(),
         "test setup bug: HttpCache must actually be offline before this helper is trusted"
@@ -106,7 +106,7 @@ async fn run_pipeline(dir: &std::path::Path) -> (CheckReport, bool) {
 /// timing heuristic (spec 062 review S6):
 ///
 /// 1. `offline_context`'s own assertion proves *this crate's* wiring actually calls
-///    `HttpCache::set_offline(true)` — the exact class of bug this PR's own history hit once
+///    `HttpCache::set_offline(NetworkMode::Offline)` — the exact class of bug this PR's own history hit once
 ///    (the original implementation gated only the OSV scan and forgot the registry fetch
 ///    path entirely).
 /// 2. `HttpCache::ensure_online` — the shared gate every one of `deps-core`'s 4 send sites
@@ -150,7 +150,11 @@ async fn test_empty_directory_produces_no_findings_and_clean_exit() {
     assert!(report.findings.is_empty());
     assert!(!had_error);
     assert_eq!(
-        exit_code(&report, &FailOnPolicy::default_categories(), had_error),
+        exit_code(
+            &report,
+            &FailOnPolicy::default_categories(),
+            ExecutionOutcome::from_had_execution_error(had_error)
+        ),
         EXIT_CLEAN
     );
 }

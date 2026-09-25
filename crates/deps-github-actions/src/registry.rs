@@ -9,7 +9,9 @@ use deps_core::github::{
     validate_owner_repo,
 };
 use deps_core::rate_limit::RateLimitGate;
-use deps_core::{DepsError, EcosystemId, HttpCache, PackageName, PublishTime, Result};
+use deps_core::{
+    DepsError, EcosystemId, HttpCache, PackageName, PublishTime, RateLimitEvidence, Result,
+};
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -196,9 +198,13 @@ impl GithubActionsRegistry {
             self.github.has_token(),
         );
         match classified {
-            DepsError::RateLimited { verified: true, .. } => self.rate_limit.trip_verified(),
             DepsError::RateLimited {
-                verified: false, ..
+                verified: RateLimitEvidence::Confirmed,
+                ..
+            } => self.rate_limit.trip_verified(),
+            DepsError::RateLimited {
+                verified: RateLimitEvidence::Inferred,
+                ..
             } => self.rate_limit.trip(),
             _ => {}
         }
@@ -821,7 +827,7 @@ mod tests {
 
     /// #1295 critic S3 regression test: once the gate is tripped by a *confirmed-evidence*
     /// 403, every subsequent short-circuited call within the cooldown window must keep
-    /// reporting `verified: true` — not silently degrade to the unverified guess, which would
+    /// reporting `verified: RateLimitEvidence::Confirmed` — not silently degrade to the unverified guess, which would
     /// make `test_util::unwrap_or_skip_github_rate_limit` panic instead of skip for every
     /// package after the first in a multi-package live test run (regressing #1297).
     #[tokio::test]
@@ -840,13 +846,22 @@ mod tests {
 
         let registry = mock_registry(&server.url(), false);
         let first_err = registry.get_versions("owner/repo").await.unwrap_err();
-        assert_matches!(first_err, DepsError::RateLimited { verified: true, .. });
+        assert_matches!(
+            first_err,
+            DepsError::RateLimited {
+                verified: RateLimitEvidence::Confirmed,
+                ..
+            }
+        );
         assert!(registry.rate_limit.is_tripped());
 
         let second_err = registry.get_versions("owner/repo").await.unwrap_err();
         assert_matches!(
             second_err,
-            DepsError::RateLimited { verified: true, .. },
+            DepsError::RateLimited {
+                verified: RateLimitEvidence::Confirmed,
+                ..
+            },
             "short-circuited call must replay the verified trip, not degrade to unverified"
         );
         mock.assert_async().await;
@@ -978,7 +993,13 @@ mod tests {
 
         let registry = mock_registry(&server.url(), true);
         let err = registry.get_versions("owner/repo").await.unwrap_err();
-        assert_matches!(err, DepsError::RateLimited { verified: true, .. });
+        assert_matches!(
+            err,
+            DepsError::RateLimited {
+                verified: RateLimitEvidence::Confirmed,
+                ..
+            }
+        );
         assert!(registry.rate_limit.is_tripped());
     }
 

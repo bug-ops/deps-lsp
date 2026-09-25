@@ -32,7 +32,9 @@
 use std::any::Any;
 use std::path::Path;
 
-use crate::ecosystem::{BlockedRegistryOccurrence, Dependency, ParseResult};
+use crate::ecosystem::{
+    BlockedRegistryOccurrence, Dependency, ParseResult, RejectedRegistryOccurrence,
+};
 
 /// Maximum number of dependencies [`ParseResult::dependencies`] returns for one open
 /// document, enforced by [`cap_dependencies`].
@@ -195,6 +197,10 @@ impl ParseResult for DependencyCappedParseResult {
         self.inner.blocked_registries()
     }
 
+    fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
+        self.inner.rejected_registries()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self.inner.as_any()
     }
@@ -251,6 +257,107 @@ mod tests {
             .map(|d| d.name().as_str().to_string())
             .collect();
         assert_eq!(names, vec!["dep-0", "dep-1"]);
+    }
+
+    /// impl-critic S2 (#1438 code review): `DependencyCappedParseResult` must forward every
+    /// `ParseResult` override on `inner`, not just `dependencies()`/`dependency_truncation()`
+    /// — a method the wrapper doesn't explicitly forward silently falls back to the trait's
+    /// own default instead of `inner`'s override, the same bug class as #969. Exercises both
+    /// `blocked_registries()` (already forwarded) and `rejected_registries()` (the gap this
+    /// finding reported) together, so a future third occurrence-forwarding method added here
+    /// without its own forward fails this test too.
+    #[test]
+    fn cap_dependencies_forwards_blocked_and_rejected_registries() {
+        use crate::net_policy::{HostClass, RegistryRejectionReason};
+        use crate::position::{Position, Range};
+
+        struct StubDependency {
+            name: crate::PackageName,
+        }
+
+        impl Dependency for StubDependency {
+            fn name(&self) -> &crate::PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::default()
+            }
+            fn version_requirement(&self) -> Option<&crate::VersionReq> {
+                None
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct StubWithOccurrences {
+            deps: Vec<StubDependency>,
+            uri: url::Url,
+            blocked: Vec<BlockedRegistryOccurrence>,
+            rejected: Vec<RejectedRegistryOccurrence>,
+        }
+
+        impl ParseResult for StubWithOccurrences {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn blocked_registries(&self) -> Vec<BlockedRegistryOccurrence> {
+                self.blocked.clone()
+            }
+            fn rejected_registries(&self) -> Vec<RejectedRegistryOccurrence> {
+                self.rejected.clone()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let range = Range::new(Position::new(0, 0), Position::new(0, 4));
+        let inner: Box<dyn ParseResult> = Box::new(StubWithOccurrences {
+            deps: (0..12)
+                .map(|i| StubDependency {
+                    name: crate::PackageName::new(format!("dep-{i}")),
+                })
+                .collect(),
+            uri: crate::test_util::test_uri("/project/manifest.toml"),
+            blocked: vec![BlockedRegistryOccurrence {
+                range,
+                class: HostClass::CloudMetadata,
+                raw_value: "https://169.254.169.254".to_string(),
+                declaration_key: "top-level".to_string(),
+            }],
+            rejected: vec![RejectedRegistryOccurrence {
+                range,
+                reason: RegistryRejectionReason::InvalidUrl,
+                raw_value: "not-a-valid-url".to_string(),
+                declaration_key: "top-level".to_string(),
+            }],
+        });
+        let capped = cap_dependencies(inner, 10);
+
+        assert_eq!(
+            capped.blocked_registries().len(),
+            1,
+            "blocked_registries() must survive the cap wrapper"
+        );
+        assert_eq!(
+            capped.rejected_registries().len(),
+            1,
+            "rejected_registries() must survive the cap wrapper, not silently fall back to \
+             the trait's empty-Vec default"
+        );
     }
 
     #[test]
