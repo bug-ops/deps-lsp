@@ -426,6 +426,13 @@ pub struct ParseResult {
     /// [`Self::blocked_registries`]'s trait override as an informational diagnostic, so the
     /// block never degrades silently.
     pub blocked_registries: Vec<deps_core::BlockedRegistryOccurrence>,
+    /// Dependency lines whose `--index-url`/Poetry `source =`/uv `index =` resolution was
+    /// rejected for a reason other than a policy-blocked host (#1438) — an invalid URL,
+    /// non-https, or userinfo-carrying entry, keyed by the same declaration-key convention as
+    /// [`Self::blocked_registries`]. Surfaced by
+    /// [`deps_core::lsp_helpers::generate_diagnostics_from_cache`] via
+    /// [`Self::rejected_registries`]'s trait override as a diagnostic.
+    pub rejected_registries: Vec<deps_core::RejectedRegistryOccurrence>,
     /// `Some((kept, total))` once the manifest declared more dependencies than
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT` (#796), read by
     /// [`deps_core::ParseResult::dependency_truncation`]'s override below.
@@ -440,6 +447,7 @@ deps_core::impl_parse_result!(
         workspace_root: workspace_root,
         dependency_truncation: dependency_truncation,
         blocked_registries: blocked_registries,
+        rejected_registries: rejected_registries,
     }
 );
 

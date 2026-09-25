@@ -723,9 +723,9 @@ pub fn collect_update_candidates(
             continue;
         }
 
-        // TODO(critic): intentionally not calling `dependency_version_range_is_literal`
-        // (#919) — empty-requirement semantics differ (edit: nothing to update; completion:
-        // everything to offer).
+        // Intentionally not calling `dependency_version_range_is_literal` (#919) —
+        // empty-requirement semantics differ (edit: nothing to update; completion: everything
+        // to offer).
         let slice = slice_for_range(content, &line_offsets, version_range);
         let literal_target = dep
             .version_literal()

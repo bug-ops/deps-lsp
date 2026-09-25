@@ -11,6 +11,35 @@ pub const EXIT_POLICY_VIOLATION: i32 = 1;
 /// occurred (a malformed `deps.toml`, an unreadable explicitly-given manifest path, ...).
 pub const EXIT_EXECUTION_ERROR: i32 = 2;
 
+/// Whether a `check` run's execution hit a registry/parse failure independent of any
+/// `--fail-on` policy violation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionOutcome {
+    /// No execution-level registry/parse failure occurred.
+    Clean,
+    /// A registry required by a non-offline run was unreachable, or another execution error
+    /// occurred (a malformed `deps.toml`, an unreadable explicitly-given manifest path, ...).
+    Failed,
+}
+
+impl ExecutionOutcome {
+    /// Builds an `ExecutionOutcome` from the accumulated execution-error flag (`true` means
+    /// [`Self::Failed`]).
+    ///
+    /// The single, explicitly named conversion point from that boundary's `bool`
+    /// representation (issue #1436 S1) — deliberately not a `From<bool>` impl; see
+    /// `deps_core::cache::NetworkMode::from_offline_flag`'s doc for why an ambient blanket
+    /// impl defeats the point of typing this API.
+    #[must_use]
+    pub fn from_had_execution_error(had_execution_error: bool) -> Self {
+        if had_execution_error {
+            Self::Failed
+        } else {
+            Self::Clean
+        }
+    }
+}
+
 /// Computes the process exit code for a completed `check` run.
 ///
 /// A real policy violation (T021) always reports as `1`, even when `had_execution_error` is
@@ -26,20 +55,24 @@ pub const EXIT_EXECUTION_ERROR: i32 = 2;
 /// # Examples
 ///
 /// ```
-/// use deps_cli::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, exit_code};
+/// use deps_cli::exit::{EXIT_CLEAN, EXIT_EXECUTION_ERROR, EXIT_POLICY_VIOLATION, ExecutionOutcome, exit_code};
 /// use deps_cli::report::{CheckReport, FailOnPolicy};
 ///
 /// let clean = CheckReport::default();
 /// let policy = FailOnPolicy::default_categories();
-/// assert_eq!(exit_code(&clean, &policy, false), EXIT_CLEAN);
-/// assert_eq!(exit_code(&clean, &policy, true), EXIT_EXECUTION_ERROR);
+/// assert_eq!(exit_code(&clean, &policy, ExecutionOutcome::Clean), EXIT_CLEAN);
+/// assert_eq!(exit_code(&clean, &policy, ExecutionOutcome::Failed), EXIT_EXECUTION_ERROR);
 /// ```
 #[must_use]
-pub fn exit_code(report: &CheckReport, policy: &FailOnPolicy, had_execution_error: bool) -> i32 {
+pub fn exit_code(
+    report: &CheckReport,
+    policy: &FailOnPolicy,
+    had_execution_error: ExecutionOutcome,
+) -> i32 {
     if policy.matches(&report.findings) {
         return EXIT_POLICY_VIOLATION;
     }
-    if had_execution_error {
+    if had_execution_error == ExecutionOutcome::Failed {
         return EXIT_EXECUTION_ERROR;
     }
     EXIT_CLEAN
@@ -121,7 +154,10 @@ mod tests {
     fn test_exit_code_clean_report_is_zero() {
         let report = CheckReport::default();
         let policy = FailOnPolicy::default_categories();
-        assert_eq!(exit_code(&report, &policy, false), EXIT_CLEAN);
+        assert_eq!(
+            exit_code(&report, &policy, ExecutionOutcome::Clean),
+            EXIT_CLEAN
+        );
     }
 
     #[test]
@@ -130,7 +166,10 @@ mod tests {
             findings: vec![finding(Category::Vulnerable)],
         };
         let policy = FailOnPolicy::default_categories();
-        assert_eq!(exit_code(&report, &policy, false), EXIT_POLICY_VIOLATION);
+        assert_eq!(
+            exit_code(&report, &policy, ExecutionOutcome::Clean),
+            EXIT_POLICY_VIOLATION
+        );
     }
 
     #[test]
@@ -139,14 +178,20 @@ mod tests {
             findings: vec![finding(Category::Outdated)],
         };
         let policy = FailOnPolicy::default_categories();
-        assert_eq!(exit_code(&report, &policy, false), EXIT_CLEAN);
+        assert_eq!(
+            exit_code(&report, &policy, ExecutionOutcome::Clean),
+            EXIT_CLEAN
+        );
     }
 
     #[test]
     fn test_exit_code_execution_error_is_two() {
         let report = CheckReport::default();
         let policy = FailOnPolicy::default_categories();
-        assert_eq!(exit_code(&report, &policy, true), EXIT_EXECUTION_ERROR);
+        assert_eq!(
+            exit_code(&report, &policy, ExecutionOutcome::Failed),
+            EXIT_EXECUTION_ERROR
+        );
     }
 
     #[test]
@@ -155,7 +200,10 @@ mod tests {
             findings: vec![finding(Category::Outdated)],
         };
         let policy = FailOnPolicy::default_categories();
-        assert_eq!(exit_code(&report, &policy, true), EXIT_EXECUTION_ERROR);
+        assert_eq!(
+            exit_code(&report, &policy, ExecutionOutcome::Failed),
+            EXIT_EXECUTION_ERROR
+        );
     }
 
     /// Regression test for S3 (spec 062 review): a real policy violation must win over an
@@ -166,7 +214,10 @@ mod tests {
             findings: vec![finding(Category::Vulnerable)],
         };
         let policy = FailOnPolicy::default_categories();
-        assert_eq!(exit_code(&report, &policy, true), EXIT_POLICY_VIOLATION);
+        assert_eq!(
+            exit_code(&report, &policy, ExecutionOutcome::Failed),
+            EXIT_POLICY_VIOLATION
+        );
     }
 
     // --- update_exit_code (spec 068, S3) ---

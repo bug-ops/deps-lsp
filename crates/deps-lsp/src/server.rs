@@ -689,10 +689,16 @@ impl LanguageServer for Backend {
                 // The write below is a single infallible assignment, so this lock can never
                 // actually be poisoned; recover rather than propagate, for defense in depth.
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
-            self.state.cache.set_offline(config.policy.network.offline);
             self.state
                 .cache
-                .set_cache_enabled(config.policy.cache.enabled);
+                .set_offline(deps_core::NetworkMode::from_offline_flag(
+                    config.policy.network.offline,
+                ));
+            self.state
+                .cache
+                .set_cache_enabled(deps_core::CacheMode::from_enabled_flag(
+                    config.policy.cache.enabled,
+                ));
             self.state
                 .cold_start_limiter
                 .set_min_interval(std::time::Duration::from_millis(
@@ -889,8 +895,12 @@ impl LanguageServer for Backend {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
         // Must land before either refresh notification below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
-        self.state.cache.set_offline(offline);
-        self.state.cache.set_cache_enabled(cache_enabled);
+        self.state
+            .cache
+            .set_offline(deps_core::NetworkMode::from_offline_flag(offline));
+        self.state
+            .cache
+            .set_cache_enabled(deps_core::CacheMode::from_enabled_flag(cache_enabled));
         self.state
             .cold_start_limiter
             .set_min_interval(std::time::Duration::from_millis(cold_start_rate_limit_ms));

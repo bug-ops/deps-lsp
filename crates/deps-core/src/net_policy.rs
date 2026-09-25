@@ -935,6 +935,70 @@ impl BlockedHostReason for IndexUrlError {
     }
 }
 
+/// A registry/index entry rejected for a reason other than a policy-blocked host (#1438).
+///
+/// [`BlockedHostReason`]/[`HostClass`] already give a policy-blocked host its own diagnostic
+/// path (`crate::BlockedRegistryOccurrence`) — every *other* validation-failure reason an
+/// `InvalidEntry`-based ecosystem config can produce (a malformed URL, a non-https scheme,
+/// embedded userinfo, an undefined `${VAR}`, ...) had no equivalent: the affected dependency
+/// was simply dropped from the fetch queue with only a `tracing::warn!`, invisible to the
+/// editor user. This is that path's classification, deliberately excluding the blocked-host
+/// case (`rejection_reason` returns `None` for it) so the two mechanisms never double-report
+/// the same rejection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistryRejectionReason {
+    /// The value did not parse as a URL at all.
+    InvalidUrl,
+    /// The URL's scheme is not `https`.
+    NotHttps,
+    /// The URL carried a `user:pass@`/`user@` component.
+    UserInfoPresent,
+    /// A `${VAR}` placeholder named an environment variable that is not set.
+    UndefinedEnvVar,
+    /// `${VAR}` expansion was attempted where it is not permitted (e.g. a project-tier
+    /// `.npmrc` value, issue #1420).
+    EnvVarExpansionNotPermitted,
+}
+
+impl std::fmt::Display for RegistryRejectionReason {
+    /// A human-readable label for this reason, used in user-facing diagnostics — never the
+    /// `{:?}` derive, which renders the Rust identifier rather than prose.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidUrl => "not a valid URL",
+            Self::NotHttps => "does not use https",
+            Self::UserInfoPresent => "contains embedded credentials",
+            Self::UndefinedEnvVar => "references an undefined environment variable",
+            Self::EnvVarExpansionNotPermitted => {
+                "uses environment-variable expansion, which is not permitted for this entry"
+            }
+        })
+    }
+}
+
+/// Whether an ecosystem's own validation-failure reason names a rejection other than a
+/// policy-blocked host — the shared half of [`InvalidEntry::rejection_reason`].
+///
+/// A separate trait from [`BlockedHostReason`] rather than folding into it (#1438): the
+/// blocked-host case already has its own diagnostic path, so this trait's `None` arm for that
+/// case is not "unclassified", it is "handled elsewhere".
+pub trait RegistryRejectionClassifier {
+    /// `Some(reason)` for every rejection reason except a policy-blocked host, which returns
+    /// `None` — see this trait's own doc for why.
+    fn rejection_reason(&self) -> Option<RegistryRejectionReason>;
+}
+
+impl RegistryRejectionClassifier for IndexUrlError {
+    fn rejection_reason(&self) -> Option<RegistryRejectionReason> {
+        match self {
+            Self::InvalidUrl(_) => Some(RegistryRejectionReason::InvalidUrl),
+            Self::NotHttps(_) => Some(RegistryRejectionReason::NotHttps),
+            Self::UserInfoPresent => Some(RegistryRejectionReason::UserInfoPresent),
+            Self::BlockedHost { .. } => None,
+        }
+    }
+}
+
 /// A present-but-unusable registry/index entry — an invalid URL, a policy-blocked host, or any
 /// other reason `E` names.
 ///
@@ -1043,6 +1107,41 @@ impl<E: BlockedHostReason> InvalidEntry<E> {
         self.reason
             .blocked_host_class()
             .map(|class| (class, self.raw.to_string()))
+    }
+}
+
+impl<E: RegistryRejectionClassifier> InvalidEntry<E> {
+    /// `Some((reason, raw))` iff this entry was rejected for a reason other than a
+    /// policy-blocked host (#1438) — the shared half of an ecosystem's own
+    /// `rejected_reason_for` helper, mirroring [`Self::blocked_class`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{HostClass, IndexUrlError, InvalidEntry, RedactedUrl, RegistryRejectionReason};
+    ///
+    /// let rejected = InvalidEntry::new(
+    ///     RedactedUrl::new("https://example.com"),
+    ///     IndexUrlError::UserInfoPresent,
+    /// );
+    /// assert_eq!(
+    ///     rejected.rejection_reason(),
+    ///     Some((RegistryRejectionReason::UserInfoPresent, "https://example.com".to_string()))
+    /// );
+    ///
+    /// // The blocked-host case is already covered by `Self::blocked_class` — this method
+    /// // returns `None` for it, so the two mechanisms never double-report.
+    /// let blocked = InvalidEntry::new(
+    ///     RedactedUrl::new("https://127.0.0.1"),
+    ///     IndexUrlError::BlockedHost { class: HostClass::Loopback },
+    /// );
+    /// assert!(blocked.rejection_reason().is_none());
+    /// ```
+    #[must_use]
+    pub fn rejection_reason(&self) -> Option<(RegistryRejectionReason, String)> {
+        self.reason
+            .rejection_reason()
+            .map(|reason| (reason, self.raw.to_string()))
     }
 }
 

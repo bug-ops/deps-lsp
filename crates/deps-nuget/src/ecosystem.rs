@@ -128,15 +128,39 @@ impl NuGetEcosystem {
     /// all share the `PackageReference` MSBuild schema, so anything not matching one of the
     /// two fixed filenames falls through to the project-file parser.
     fn parse_by_filename(content: &str, uri: &Url) -> Result<NuGetParseResult> {
+        match NuGetManifestKind::from_uri(uri) {
+            NuGetManifestKind::DirectoryPackagesProps => {
+                crate::parser::parse_directory_packages_props(content, uri)
+            }
+            NuGetManifestKind::PackagesConfig => crate::parser::parse_packages_config(content, uri),
+            NuGetManifestKind::ProjectFile => crate::parser::parse_project_file(content, uri),
+        }
+    }
+}
+
+/// Which NuGet manifest shape a URI's basename identifies (issue #1436), so `parse_by_filename`
+/// dispatches from a typed classification instead of a lowercased string match — mirrors
+/// `deps_pypi::ecosystem::PypiManifestKind`'s `from_uri` pattern.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NuGetManifestKind {
+    /// `Directory.Packages.props` central package management file.
+    DirectoryPackagesProps,
+    /// Legacy `packages.config`.
+    PackagesConfig,
+    /// `.csproj`/`.fsproj`/`.vbproj`, or anything else not matching the two fixed filenames
+    /// above — all share the `PackageReference` MSBuild schema.
+    ProjectFile,
+}
+
+impl NuGetManifestKind {
+    fn from_uri(uri: &Url) -> Self {
         let path = uri.path();
         let filename = path.rsplit('/').next().unwrap_or(path);
 
         match filename.to_lowercase().as_str() {
-            "directory.packages.props" => {
-                crate::parser::parse_directory_packages_props(content, uri)
-            }
-            "packages.config" => crate::parser::parse_packages_config(content, uri),
-            _ => crate::parser::parse_project_file(content, uri),
+            "directory.packages.props" => Self::DirectoryPackagesProps,
+            "packages.config" => Self::PackagesConfig,
+            _ => Self::ProjectFile,
         }
     }
 }

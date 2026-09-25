@@ -1018,6 +1018,7 @@ mod tests {
             }],
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         }
     }
@@ -1606,6 +1607,7 @@ mod tests {
             document_links: Vec::new(),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         }
     }
@@ -1768,6 +1770,7 @@ mod tests {
             document_links: Vec::new(),
             resolved_chains: Vec::new(),
             blocked_registries: Vec::new(),
+            rejected_registries: Vec::new(),
             dependency_truncation: None,
         };
 

@@ -34,7 +34,6 @@
 
 use std::collections::HashMap;
 
-use deps_core::BlockedSourceClass;
 use deps_core::EcosystemId;
 #[cfg(test)]
 use deps_core::net_policy::HostClass;
@@ -42,6 +41,7 @@ use deps_core::net_policy::{
     RedactedUrl, RegistryAccessPolicy, RegistryUrlKind, ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
+use deps_core::{BlockedSourceClass, RejectedSourceClass};
 
 /// Why a candidate index URL failed [`PypiIndexUrl::new`]'s validation.
 ///
@@ -495,6 +495,51 @@ impl PypiIndexConfig {
         })
     }
 
+    /// [`Self::blocked_class_for`]'s counterpart for every rejection reason *other* than a
+    /// policy-blocked host (#1438) — same branching (named source, then explicit primary,
+    /// then uv's `tail_hop`), same declaration-key convention, but reports an invalid URL,
+    /// non-https, or userinfo-carrying entry. `None` for every other outcome (no override, a
+    /// valid entry, or a blocked-host rejection, which [`Self::blocked_class_for`] already
+    /// reports).
+    #[must_use]
+    pub fn rejected_reason_for(&self, named_source: Option<&str>) -> Option<RejectedSourceClass> {
+        if let Some(name) = named_source {
+            let (reason, raw_value) = self
+                .named_sources
+                .get(name)?
+                .as_ref()
+                .err()
+                .and_then(InvalidEntry::rejection_reason)?;
+            return Some(RejectedSourceClass {
+                reason,
+                raw_value,
+                declaration_key: format!("named:{name}"),
+            });
+        }
+        if let Some(result) = &self.primary {
+            let (reason, raw_value) = result
+                .as_ref()
+                .err()
+                .and_then(InvalidEntry::rejection_reason)?;
+            return Some(RejectedSourceClass {
+                reason,
+                raw_value,
+                declaration_key: "primary".to_string(),
+            });
+        }
+        let (reason, raw_value) = self
+            .tail_hop
+            .as_ref()?
+            .as_ref()
+            .err()
+            .and_then(InvalidEntry::rejection_reason)?;
+        Some(RejectedSourceClass {
+            reason,
+            raw_value,
+            declaration_key: "uv-tail".to_string(),
+        })
+    }
+
     /// Every chain this config implies, ready for registration — FR-005(a)/(b) resolved to
     /// concrete hop lists, plus one single-hop chain per valid named source. Empty when the
     /// file declares nothing (US-004) or when every case-(b) hop turned out invalid with no
@@ -874,6 +919,53 @@ mod tests {
         config.set_primary("https://pypi.mycorp.example/simple", &policy);
         assert_eq!(config.blocked_class_for(None), None);
         assert_eq!(PypiIndexConfig::new().blocked_class_for(None), None);
+    }
+
+    /// #1438: `rejected_reason_for` is [`PypiIndexConfig::blocked_class_for`]'s counterpart
+    /// for every non-`BlockedHost` rejection reason — an invalid explicit primary previously
+    /// had no equivalent reporting at all, and the affected dependency silently resolved to
+    /// `CustomRegistry` with no diagnostic trace (mirrors `deps_npm`'s
+    /// `test_rejected_reason_for_top_level_override_invalid_url`).
+    #[test]
+    fn test_rejected_reason_for_primary_invalid_url() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("not-a-valid-url", &policy);
+
+        let occurrence = config
+            .rejected_reason_for(None)
+            .expect("rejected primary must be reported");
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::InvalidUrl
+        );
+        assert_eq!(occurrence.raw_value, "not-a-valid-url");
+        assert_eq!(occurrence.declaration_key, "primary");
+        assert_eq!(
+            config.blocked_class_for(None),
+            None,
+            "a non-blocked-host rejection must never also report via blocked_class_for"
+        );
+    }
+
+    /// A blocked-host rejection is already covered by
+    /// [`PypiIndexConfig::blocked_class_for`] — the two mechanisms must never double-report.
+    #[test]
+    fn test_rejected_reason_for_none_when_blocked_host() {
+        let policy = off_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("https://127.0.0.1:9999/simple", &policy);
+        assert_eq!(config.rejected_reason_for(None), None);
+    }
+
+    /// A valid (non-rejected) entry, or no entry at all, must never be reported as rejected.
+    #[test]
+    fn test_rejected_reason_for_none_when_valid() {
+        let policy = all_policy();
+        let mut config = PypiIndexConfig::new();
+        config.set_primary("https://pypi.mycorp.example/simple", &policy);
+        assert_eq!(config.rejected_reason_for(None), None);
+        assert_eq!(PypiIndexConfig::new().rejected_reason_for(None), None);
     }
 
     /// An invalid extra is dropped, not escalated to `CustomRegistry` — the primary still

@@ -221,12 +221,13 @@ pub mod yaml_walk;
 #[cfg(feature = "lsp-responses")]
 pub use tower_lsp_server;
 
-pub use cache::{BodyLimit, CachedResponse, HttpCache};
+pub use cache::{BodyLimit, CacheMode, CachedResponse, HttpCache, NetworkMode};
 pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{DepsDevClient, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, Dependency, Ecosystem, EcosystemConfig,
-    EcosystemId, LicenseSource, ParseResult, parse_manifest_blocking,
+    EcosystemId, LicenseSource, ParseResult, RegistryOccurrence, RejectedRegistryOccurrence,
+    RejectedSourceClass, parse_manifest_blocking,
 };
 pub use ecosystem_registry::EcosystemRegistry;
 pub use edit::{
@@ -235,7 +236,7 @@ pub use edit::{
     dedup_overlapping_edits, plan_verified_fix, plan_vulnerability_fix, resolve_recommended_fix,
     resolve_verified_fix,
 };
-pub use error::{DepsError, FetchFailure, Result};
+pub use error::{DepsError, FetchFailure, RateLimitEvidence, Result};
 pub use freshness::{
     DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
 };

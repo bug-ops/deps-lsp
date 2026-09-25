@@ -110,6 +110,27 @@ struct PackageEntry {
     dependencies: HashMap<String, String>,
 }
 
+/// Which npm lockfile shape a resolved lockfile path identifies (issue #1436), so
+/// [`NpmLockParser::parse_lockfile`] dispatches from a typed classification instead of a bare
+/// filename string comparison.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NpmLockfileKind {
+    /// `package-lock.json` (npm's own lockfile format, v2/v3).
+    PackageLockJson,
+    /// `pnpm-lock.yaml`.
+    PnpmLock,
+}
+
+impl NpmLockfileKind {
+    fn from_path(path: &Path) -> Self {
+        if path.file_name().and_then(|n| n.to_str()) == Some("pnpm-lock.yaml") {
+            Self::PnpmLock
+        } else {
+            Self::PackageLockJson
+        }
+    }
+}
+
 impl LockFileProvider for NpmLockParser {
     fn locate_lockfile(&self, manifest_uri: &Url) -> Option<PathBuf> {
         locate_lockfile_for_manifest(manifest_uri, Self::LOCKFILE_NAMES)
@@ -121,10 +142,9 @@ impl LockFileProvider for NpmLockParser {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResolvedPackages>> + Send + 'a>>
     {
         Box::pin(async move {
-            if lockfile_path.file_name().and_then(|n| n.to_str()) == Some("pnpm-lock.yaml") {
-                parse_pnpm_lock(lockfile_path).await
-            } else {
-                parse_package_lock_json(lockfile_path).await
+            match NpmLockfileKind::from_path(lockfile_path) {
+                NpmLockfileKind::PnpmLock => parse_pnpm_lock(lockfile_path).await,
+                NpmLockfileKind::PackageLockJson => parse_package_lock_json(lockfile_path).await,
             }
         })
     }

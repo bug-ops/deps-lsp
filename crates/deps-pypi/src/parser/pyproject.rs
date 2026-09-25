@@ -5,9 +5,9 @@ use super::{ParseResult, PypiParser, normalize_marker_string, span_start, span_t
 use crate::config::PypiIndexConfig;
 use crate::error::Result;
 use crate::types::{PypiDependency, PypiDependencySection, PypiDependencySource};
-use deps_core::BlockedRegistryOccurrence;
 use deps_core::lsp_helpers::LineOffsetTable;
 use deps_core::net_policy::RegistryAccessPolicy;
+use deps_core::{BlockedRegistryOccurrence, RejectedRegistryOccurrence};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use toml_span::value::{Table, Value};
@@ -29,6 +29,9 @@ struct IndexContext<'a> {
     /// several independent `parse_*` helpers (PEP 621/735, Poetry, build-system requires) that
     /// each only see their own local `Vec<PypiDependency>`, not one shared result accumulator.
     blocked_registries: RefCell<Vec<BlockedRegistryOccurrence>>,
+    /// [`Self::blocked_registries`]'s counterpart for every rejection reason *other* than a
+    /// policy-blocked host (#1438).
+    rejected_registries: RefCell<Vec<RejectedRegistryOccurrence>>,
 }
 
 impl IndexContext<'_> {
@@ -46,6 +49,10 @@ impl IndexContext<'_> {
         dep.source = self.config.resolve_source_for(named);
         if let Some(classification) = self.config.blocked_class_for(named) {
             self.blocked_registries
+                .borrow_mut()
+                .push(classification.into_occurrence(dep.name_range));
+        } else if let Some(classification) = self.config.rejected_reason_for(named) {
+            self.rejected_registries
                 .borrow_mut()
                 .push(classification.into_occurrence(dep.name_range));
         }
@@ -115,6 +122,7 @@ impl PypiParser {
                     document_links: Vec::new(),
                     resolved_chains: Vec::new(),
                     blocked_registries: Vec::new(),
+                    rejected_registries: Vec::new(),
                     dependency_truncation: budget.truncation(),
                 });
             }
@@ -140,6 +148,7 @@ impl PypiParser {
             config: &config,
             uv_named_by_dep: &uv_named_by_dep,
             blocked_registries: RefCell::new(Vec::new()),
+            rejected_registries: RefCell::new(Vec::new()),
         };
 
         // PEP 517/518
@@ -207,6 +216,7 @@ impl PypiParser {
             document_links: Vec::new(),
             resolved_chains: config.resolved_chains(),
             blocked_registries: ctx.blocked_registries.into_inner(),
+            rejected_registries: ctx.rejected_registries.into_inner(),
             dependency_truncation: budget.truncation(),
         })
     }
@@ -633,6 +643,10 @@ impl PypiParser {
                 ctx.blocked_registries
                     .borrow_mut()
                     .push(classification.into_occurrence(name_range));
+            } else if let Some(classification) = ctx.config.rejected_reason_for(None) {
+                ctx.rejected_registries
+                    .borrow_mut()
+                    .push(classification.into_occurrence(name_range));
             }
             return Ok(PypiDependency {
                 name: name.into(),
@@ -703,6 +717,10 @@ impl PypiParser {
                 let source_name = table.get("source").and_then(|s| s.as_str());
                 if let Some(classification) = ctx.config.blocked_class_for(source_name) {
                     ctx.blocked_registries
+                        .borrow_mut()
+                        .push(classification.into_occurrence(name_range));
+                } else if let Some(classification) = ctx.config.rejected_reason_for(source_name) {
+                    ctx.rejected_registries
                         .borrow_mut()
                         .push(classification.into_occurrence(name_range));
                 }
@@ -2566,6 +2584,50 @@ requests = "^2.28.0"
         let via_trait = deps_core::ParseResult::blocked_registries(&result);
         assert_eq!(via_trait.len(), 1);
         assert_eq!(via_trait[0].raw_value, "https://169.254.169.254/simple");
+    }
+
+    /// #1438: a Poetry primary source rejected for a reason *other* than a blocked host (an
+    /// invalid URL here) must populate `ParseResult::rejected_registries`, mirroring
+    /// `test_poetry_primary_source_blocked_by_policy_populates_blocked_registries` above.
+    #[test]
+    fn test_poetry_primary_source_invalid_populates_rejected_registries() {
+        let content = r#"
+[[tool.poetry.source]]
+name = "internal"
+url = "not-a-valid-url"
+
+[tool.poetry.dependencies]
+requests = "^2.28.0"
+"#;
+        let result = parse_with_all_policy(content);
+        let dep = result
+            .dependencies
+            .iter()
+            .find(|d| d.name == "requests")
+            .unwrap();
+        assert_eq!(
+            dep.source,
+            PypiDependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            }
+        );
+        assert!(
+            result.blocked_registries.is_empty(),
+            "this is not a BlockedHost rejection, so blocked_registries must stay empty"
+        );
+        assert_eq!(result.rejected_registries.len(), 1);
+        let occurrence = &result.rejected_registries[0];
+        assert_eq!(occurrence.range, dep.name_range);
+        assert_eq!(
+            occurrence.reason,
+            deps_core::net_policy::RegistryRejectionReason::InvalidUrl
+        );
+        assert_eq!(occurrence.raw_value, "not-a-valid-url");
+        assert_eq!(occurrence.declaration_key, "primary");
+
+        let via_trait = deps_core::ParseResult::rejected_registries(&result);
+        assert_eq!(via_trait.len(), 1);
+        assert_eq!(via_trait[0].raw_value, "not-a-valid-url");
     }
 
     /// Validator finding S3: two primary-priority Poetry sources must not silently pick an

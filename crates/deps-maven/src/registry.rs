@@ -1629,7 +1629,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_offline_does_not_poison_recent_failures() {
         let cache = Arc::new(HttpCache::new());
-        cache.set_offline(true);
+        cache.set_offline(deps_core::NetworkMode::Offline);
         let registry = MavenCentralRegistry::new(cache);
 
         let err = registry.search("guava", 20).await.unwrap_err();

@@ -584,6 +584,86 @@ pub async fn capture_tracing_output_async_at(
     tracing_capture::capture_async_at(max_level, fut).await
 }
 
+/// Captures a `#[tracing::instrument]` span's recorded field values during `fut`, via
+/// `FmtSpan::NEW` on a scoped subscriber installed only for the call's duration.
+///
+/// Unlike [`capture_tracing_output_async`]/[`capture_tracing_output_async_at`], which share
+/// one process-wide subscriber specifically to dodge #1006's `Interest`-caching flake, this
+/// installs a fresh `tracing::subscriber::set_default` per call — a separate helper, not
+/// `FmtSpan::NEW` turned on for that shared subscriber, which would make every *other*
+/// `capture_tracing_output*` caller in the process newly see every entered span's field
+/// values too, risking an unrelated, pre-existing secret-in-span-field leak surfacing as a
+/// spurious failure elsewhere instead of being caught by that span's own test.
+///
+/// **Requires `cargo nextest`** (`.claude/rules/testing.md`), which gives each test its own
+/// process. A per-call scoped subscriber like this one reintroduces #1006's exact flake under
+/// a shared-process runner (plain `cargo test`, or any harness that runs multiple tests on one
+/// process/thread pool): an untraced sibling test's dispatcher can contribute
+/// `Interest::never()` for this span's callsite before this call's own subscriber installs,
+/// permanently poisoning it for the rest of that process. Do not call this from a test binary
+/// or harness that is not guaranteed to run under nextest's per-test-process isolation.
+///
+/// Same single-OS-thread requirement as [`capture_tracing_output_async`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::test_util::capture_tracing_span_fields_async;
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() {
+/// #[tracing::instrument(fields(value = 42))]
+/// async fn traced() {}
+///
+/// let output = capture_tracing_span_fields_async(traced()).await;
+/// assert!(output.contains("traced"));
+/// assert!(output.contains("42"));
+/// # }
+/// ```
+#[cfg(feature = "test-util")]
+pub async fn capture_tracing_span_fields_async(
+    fut: impl std::future::Future<Output = ()>,
+) -> String {
+    use tracing_subscriber::fmt::format::FmtSpan;
+
+    #[derive(Clone)]
+    struct BufWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for BufWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BufWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(BufWriter(std::sync::Arc::clone(&buf)))
+        .with_span_events(FmtSpan::NEW)
+        .without_time()
+        .with_target(false)
+        .finish();
+
+    let guard = tracing::subscriber::set_default(subscriber);
+    fut.await;
+    drop(guard);
+
+    let captured = buf.lock().unwrap().clone();
+    String::from_utf8(captured).expect("tracing output is valid utf8")
+}
+
 /// Minimal [`crate::Dependency`] fixture used by [`stub_parse_result_with_dependencies`] —
 /// only carries a name, since dependency-count-ceiling tests (#796) don't need version
 /// requirements, ranges, or a real source.
@@ -685,15 +765,16 @@ fn is_configured_token(token: Option<String>) -> bool {
 /// included in the skip notice and any panic message, to identify which test emitted them when
 /// run with `--no-fail-fast`.
 ///
-/// #1295 fix: `RateLimited { verified: true, .. }` is produced only when `crate::cache`
-/// confirmed genuine exhaustion via the response's `X-RateLimit-Remaining: 0` (primary limit)
-/// or a `Retry-After` header (secondary limit, which does not always zero out `remaining` —
-/// critic S4) on a 403/429. Real GitHub API responses carry at least one of these on a true
-/// rate limit, so a live unauthenticated run reliably gets `verified: true` on that path. An
-/// unauthenticated 403 with neither signal still classifies as `RateLimited`, but with
-/// `verified: false` — it falls through to the panic arm below instead of being silently
-/// skipped, since it could be an abuse-detection false positive, an access-restricted repo, or
-/// a genuine regression.
+/// #1295 fix: `RateLimited { verified: RateLimitEvidence::Confirmed, .. }` is produced only
+/// when `crate::cache` confirmed genuine exhaustion via the response's
+/// `X-RateLimit-Remaining: 0` (primary limit) or a `Retry-After` header (secondary limit, which
+/// does not always zero out `remaining` — critic S4) on a 403/429. Real GitHub API responses
+/// carry at least one of these on a true rate limit, so a live unauthenticated run reliably
+/// gets `verified: RateLimitEvidence::Confirmed` on that path. An unauthenticated 403 with
+/// neither signal still classifies as `RateLimited`, but with
+/// `verified: RateLimitEvidence::Inferred` — it falls through to the panic arm below instead of
+/// being silently skipped, since it could be an abuse-detection false positive, an
+/// access-restricted repo, or a genuine regression.
 ///
 /// # Panics
 ///
@@ -732,7 +813,7 @@ fn rate_limit_skip_decision<T>(
         Ok(value) => Some(value),
         Err(crate::DepsError::RateLimited {
             message,
-            verified: true,
+            verified: crate::RateLimitEvidence::Confirmed,
             ..
         }) if !token_configured => {
             eprintln!(
@@ -819,6 +900,7 @@ pub fn stub_parse_result_with_dependencies(count: usize) -> Box<dyn crate::Parse
 mod tests {
     use super::capture_tracing_output;
     use super::{is_configured_token, rate_limit_skip_decision};
+    use crate::RateLimitEvidence;
 
     #[test]
     fn is_configured_token_rejects_missing_and_empty() {
@@ -831,7 +913,7 @@ mod tests {
     fn rate_limit_skip_decision_skips_on_verified_rate_limit_without_token() {
         let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
             message: "rate limited".to_string(),
-            verified: true,
+            verified: RateLimitEvidence::Confirmed,
             source_status: Some(403),
         });
         assert_eq!(rate_limit_skip_decision(result, "unit-test", false), None);
@@ -845,7 +927,7 @@ mod tests {
     fn rate_limit_skip_decision_panics_on_unverified_rate_limit_without_token() {
         let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
             message: "rate limited".to_string(),
-            verified: false,
+            verified: RateLimitEvidence::Inferred,
             source_status: None,
         });
         let _ = rate_limit_skip_decision(result, "unit-test", false);
@@ -865,7 +947,7 @@ mod tests {
     fn rate_limit_skip_decision_panics_on_rate_limit_with_token_configured() {
         let result: Result<u32, crate::DepsError> = Err(crate::DepsError::RateLimited {
             message: "rate limited".to_string(),
-            verified: true,
+            verified: RateLimitEvidence::Confirmed,
             source_status: Some(403),
         });
         let _ = rate_limit_skip_decision(result, "unit-test", true);
