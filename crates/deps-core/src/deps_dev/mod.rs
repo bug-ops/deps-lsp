@@ -49,6 +49,7 @@ use typosquat::{SimilarPackageCandidate, TYPOSQUAT_MAX_CANDIDATES_CHECKED, evalu
 use crate::EcosystemId;
 use crate::cache::{BodyLimit, HttpCache};
 use crate::error::DepsError;
+use crate::lsp_helpers::{is_dot_segment, warn_rejected_value};
 
 const DEPS_DEV_API: &str = "https://api.deps.dev";
 
@@ -263,10 +264,7 @@ fn is_valid_project_key(key: &str) -> bool {
     if !(2..=4).contains(&segments.len()) || segments.iter().any(|s| s.is_empty()) {
         return false;
     }
-    if segments
-        .iter()
-        .any(|s| crate::lsp_helpers::is_dot_segment(s))
-    {
+    if segments.iter().any(|s| is_dot_segment(s)) {
         return false;
     }
     #[expect(
@@ -515,6 +513,19 @@ impl DepsDevClient {
         name: &str,
         version: &str,
     ) -> (Option<SupplyChainTrustSignal>, Duration) {
+        if is_dot_segment(name) {
+            warn_rejected_value("is_dot_segment", "deps.dev trust-signal request URL", name);
+            return (None, DEPS_DEV_SUCCESS_TTL);
+        }
+        if is_dot_segment(version) {
+            warn_rejected_value(
+                "is_dot_segment",
+                "deps.dev trust-signal request URL",
+                version,
+            );
+            return (None, DEPS_DEV_SUCCESS_TTL);
+        }
+
         let version_url = format!(
             "{}/v3/systems/{system}/packages/{}/versions/{}",
             self.base_url,
@@ -693,6 +704,15 @@ impl DepsDevClient {
         system: &'static str,
         name: &str,
     ) -> Vec<SimilarPackageCandidate> {
+        if is_dot_segment(name) {
+            warn_rejected_value(
+                "is_dot_segment",
+                "deps.dev similarly-named-packages request URL",
+                name,
+            );
+            return Vec::new();
+        }
+
         let key = SimilarityMemoKey {
             base: self.base_url.clone(),
             system,
@@ -852,6 +872,11 @@ impl DepsDevClient {
     /// step fails independently to `(None, ..)`, mirroring [`Self::fetch`]'s per-step
     /// degradation.
     async fn fetch_popularity(&self, system: &'static str, name: &str) -> (Option<u64>, Duration) {
+        if is_dot_segment(name) {
+            warn_rejected_value("is_dot_segment", "deps.dev package request URL", name);
+            return (None, DEPS_DEV_SUCCESS_TTL);
+        }
+
         let package_url = format!(
             "{}/v3alpha/systems/{system}/packages/{}",
             self.base_url,
@@ -883,6 +908,15 @@ impl DepsDevClient {
                 return (None, DEPS_DEV_ERROR_TTL);
             }
         };
+
+        if is_dot_segment(&default_version) {
+            warn_rejected_value(
+                "is_dot_segment",
+                "deps.dev dependents request URL",
+                &default_version,
+            );
+            return (None, DEPS_DEV_SUCCESS_TTL);
+        }
 
         let dependents_url = format!(
             "{}/v3alpha/systems/{system}/packages/{}/versions/{}:dependents",
@@ -1424,6 +1458,39 @@ mod tests {
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
         project.assert_async().await;
+    }
+
+    /// #1452: `name` of exactly `.`/`..` must be rejected before it reaches the
+    /// `/v3/systems/{system}/packages/{name}/versions/{v}` fetch, mirroring every other
+    /// registry client's `is_dot_segment` fetch-sink guard (#341/#349/#365).
+    #[tokio::test]
+    async fn trust_signal_dot_segment_name_rejected_before_request() {
+        let (mut server, client) = mock_client().await;
+        let call = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        assert!(client.trust_signal("npm", ".", "1.0.0").await.is_none());
+        assert!(client.trust_signal("npm", "..", "1.0.0").await.is_none());
+        call.assert_async().await;
+    }
+
+    /// #1452: `version` of exactly `.`/`..` must be rejected the same way — it interpolates
+    /// into the same request path as `name`.
+    #[tokio::test]
+    async fn trust_signal_dot_segment_version_rejected_before_request() {
+        let (mut server, client) = mock_client().await;
+        let call = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        assert!(client.trust_signal("npm", "left-pad", ".").await.is_none());
+        assert!(client.trust_signal("npm", "left-pad", "..").await.is_none());
+        call.assert_async().await;
     }
 
     #[tokio::test]
@@ -1980,6 +2047,54 @@ mod tests {
         assert!(signal.is_none());
     }
 
+    /// #1452 review M1: `fetch_popularity`'s *name* guard, reached via `popularity`, is
+    /// the only guard `typosquat_signal` (mod.rs) exercises with a server-supplied (not
+    /// declared) name — `typosquat_signal` feeds `candidate.name` from
+    /// `GetSimilarlyNamedPackages`'s response straight into `popularity`, so a declared
+    /// dot-segment name never reaches it (`similar_packages`'s own guard stops that
+    /// earlier), but a malicious candidate name from the response can.
+    #[tokio::test]
+    async fn popularity_dot_segment_name_rejected_before_request() {
+        let (mut server, client) = mock_client().await;
+        let call = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        assert!(client.popularity("npm", ".").await.is_none());
+        assert!(client.popularity("npm", "..").await.is_none());
+        call.assert_async().await;
+    }
+
+    /// #1452: `GetPackage`'s server-supplied default version can itself be a `.`/`..`
+    /// segment — it must be rejected before it reaches the
+    /// `.../versions/{v}:dependents` fetch, the same as a caller-supplied dot-segment name.
+    #[tokio::test]
+    async fn popularity_dot_segment_default_version_rejected_before_dependents_request() {
+        let (mut server, client) = mock_client().await;
+        let _package = server
+            .mock("GET", "/v3alpha/systems/npm/packages/evil")
+            .with_status(200)
+            .with_body(r#"{"versions": [{"versionKey": {"version": ".."}, "isDefault": true}]}"#)
+            .create_async()
+            .await;
+        let dependents_call = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    r"^/v3alpha/systems/npm/packages/evil/versions/.*:dependents$".into(),
+                ),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+
+        let dependent_count = client.popularity("npm", "evil").await;
+        assert!(dependent_count.is_none());
+        dependents_call.assert_async().await;
+    }
+
     /// Impl-critic addendum: a 404 from `GetDependents` can be a transient default-version
     /// race (the package's default version changed between the `GetPackage` call and this
     /// one), not authoritative absence like a `GetPackage` 404 — it must memoize the short
@@ -2178,6 +2293,22 @@ mod tests {
             "only TYPOSQUAT_MAX_CANDIDATES_CHECKED candidates should ever be resolved, \
              regardless of how many packages[] entries the response carries"
         );
+    }
+
+    /// #1452: `name` of exactly `.`/`..` must be rejected before it reaches the
+    /// `.../packages/{name}:similarlyNamedPackages` fetch.
+    #[tokio::test]
+    async fn similar_packages_dot_segment_name_rejected_before_request() {
+        let (mut server, client) = mock_client().await;
+        let call = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        assert!(client.similar_packages("npm", ".").await.is_empty());
+        assert!(client.similar_packages("npm", "..").await.is_empty());
+        call.assert_async().await;
     }
 
     /// Issue #1437 security review N2: the similarity *memo* itself must hold only the
