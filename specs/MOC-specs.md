@@ -19,7 +19,7 @@ status: moc
 
 | ID | Feature | Phase | Status |
 |----|---------|-------|--------|
-| 071 | [[071-typosquat-similarity-diagnostic/spec\|Typosquat detection via deps.dev's GetSimilarlyNamedPackages endpoint]] | plan | draft — research/parity, P2 (reassessed from P3: Snyk/Socket.dev both have typosquatting detection, see competitive-parity.md); no open `[NEEDS CLARIFICATION]` items — plan.md resolves popularity source (GetDependents, live-verified ratio threshold 50x), v3alpha opt-in posture, Hint-severity diagnostic channel, and config surface; ready for `/sdd tasks` |
+| 071 | [[071-typosquat-similarity-diagnostic/spec\|Typosquat detection via deps.dev's GetSimilarlyNamedPackages endpoint]] | plan | implemented — PR #1451 open (issue #1437), pending review/merge |
 | 008 | [[008-codelens-update-all-outdated/spec\|CodeLens support for "update all outdated dependencies" action]] | specify | draft — research/parity, P2, 7 open `[NEEDS CLARIFICATION]` items |
 | 067 | [[067-redaction-enforcement-guardrails/spec\|Redaction Enforcement Guardrails: RedactingDebug derive + non-exhaustive ParseError construction]] | tasks | in review — testing-infra/security, P4, PR #1328 open (issues #1238/#1250); migration batch reduced 9→2 types during implementation, rest tracked in #1325 |
 | 015 | [[015-lsp-3-18-diagnostic-markup-tooltip-gap/spec\|LSP 3.18 diagnostic markup / command-tooltip support blocked by ls-types 0.0.6]] | specify | draft — research/dependency-gap, P4, 3 open `[NEEDS CLARIFICATION]` items, blocked on upstream — no `/sdd plan` (issue #308) |
