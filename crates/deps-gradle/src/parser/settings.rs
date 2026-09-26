@@ -25,7 +25,7 @@ static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
 #[allow(clippy::string_slice)]
 fn find_plugin_name_range(line: &str, line_idx: u32, plugin_id: &str) -> Range {
     if let Some(col) = line.find(plugin_id) {
-        let col_u32 = deps_core::completion::byte_to_utf16_offset(line, col);
+        let col_u32 = deps_core::lsp_helpers::byte_to_utf16_offset(line, col);
         let end_u32 = col_u32 + saturating_utf16_len(plugin_id);
         Range::new(
             Position::new(line_idx, col_u32),
@@ -45,7 +45,7 @@ fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range 
         let after_kw = &line[kw_pos + "version".len()..];
         if let Some(rel) = after_kw.find(version) {
             let abs_start = kw_pos + "version".len() + rel;
-            let col_start = deps_core::completion::byte_to_utf16_offset(line, abs_start);
+            let col_start = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
             let col_end = col_start + saturating_utf16_len(version);
             return Range::new(
                 Position::new(line_idx, col_start),

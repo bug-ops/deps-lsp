@@ -710,10 +710,10 @@ pub(crate) fn apply_repository_content_restrictions(
 }
 
 /// The UTF-16 length of a short string (a matched substring, not a whole line), saturating
-/// like [`deps_core::completion::byte_to_utf16_offset`] itself.
+/// like [`deps_core::lsp_helpers::byte_to_utf16_offset`] itself.
 ///
 /// A range's end position is `start + this length`, computed this way instead of a second
-/// [`deps_core::completion::byte_to_utf16_offset`] call on the whole line at the end byte
+/// [`deps_core::lsp_helpers::byte_to_utf16_offset`] call on the whole line at the end byte
 /// offset — that call is `O(end)` (it re-encodes the line's entire prefix from byte 0), so
 /// calling it twice per match would redundantly redo the first call's work. `s` is always the
 /// short matched text itself here, so this stays `O(match length)`.
@@ -742,7 +742,7 @@ pub(crate) fn find_name_range(
     let search = format!("{group_id}:{artifact_id}");
     if let Some(rel) = scoped.find(&search) {
         let abs_start = match_start + rel;
-        let col_u32 = deps_core::completion::byte_to_utf16_offset(line, abs_start);
+        let col_u32 = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
         let end_u32 = col_u32 + saturating_utf16_len(&search);
         Range::new(
             Position::new(line_idx, col_u32),
@@ -781,7 +781,7 @@ pub(crate) fn find_version_range(
         let after_colon = &scoped[colon_pos + 1..];
         if let Some(rel) = after_colon.find(version) {
             let abs_start = match_start + colon_pos + 1 + rel;
-            let col_start = deps_core::completion::byte_to_utf16_offset(line, abs_start);
+            let col_start = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
             let col_end = col_start + saturating_utf16_len(version);
             return Range::new(
                 Position::new(line_idx, col_start),

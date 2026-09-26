@@ -727,7 +727,12 @@ impl DocumentState {
     /// time (e.g. exceeding a timeout ceiling) without a real sleep, by supplying `since`
     /// directly instead of always using `Instant::now()` — the only sanctioned way to set an
     /// arbitrary loading start instant; a test must not write [`Self::load_phase`] directly.
-    #[cfg(test)]
+    ///
+    /// `#[cfg(all(test, feature = "cargo"))]`, not just `#[cfg(test)]`: its sole caller
+    /// (`server.rs`'s `test_handle_lockfile_change_computes_ceiling_per_uri`) is itself gated
+    /// on the `cargo` feature, so a Feature Matrix build with `cargo` off would otherwise
+    /// leave this with zero callers and fail `-D warnings` on `dead_code`.
+    #[cfg(all(test, feature = "cargo"))]
     pub(crate) fn set_loading_since(&mut self, since: Instant) {
         self.load_phase = LoadPhase::Loading { since };
     }
