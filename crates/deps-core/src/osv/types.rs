@@ -1185,7 +1185,10 @@ impl AsRef<str> for VulnKey {
 
 impl std::fmt::Display for VulnKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        // Sanitizes only for rendering (CWE-117, #1501) — the stored string is left untouched
+        // so the `\u{0}` name/signature separator `vulnerability_keys` relies on for
+        // disambiguation keeps working as a `HashMap` key.
+        f.write_str(&crate::redact::sanitize_invisible(&self.0))
     }
 }
 
@@ -1503,6 +1506,42 @@ pub fn vulnerability_keys(
         })
         .collect();
     VulnKeys(map)
+}
+
+#[cfg(test)]
+mod vuln_key_display_tests {
+    use super::VulnKey;
+
+    /// #1501: a manifest-controlled dependency name reaching `VulnKey` must not be able to
+    /// forge a fake log line via `\n`/`\r` when rendered at a `tracing::warn!(dep = %key, ...)`
+    /// call site — `tracing-subscriber` 0.3.23 escapes ESC/C1 on its own but not `\n`/`\r`.
+    #[test]
+    fn display_sanitizes_newlines_and_carriage_returns() {
+        let key = VulnKey::from_name("evil\nWARN forged log line\r\n".to_string());
+        let rendered = key.to_string();
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\r'));
+    }
+
+    /// #1501 impl-critic M2: the stored string itself must stay untouched by `Display`
+    /// sanitization, since `vulnerability_keys` embeds a raw `\u{0}` separator in it for
+    /// name/signature disambiguation and that byte must keep surviving as a distinct
+    /// `HashMap` key. Pinned on `Display`'s actual rendered output (not just `Eq`, which
+    /// would pass identically even if sanitization ran at construction instead of at
+    /// render time).
+    #[test]
+    fn display_sanitizes_render_but_not_the_stored_disambiguation_separator() {
+        let key = VulnKey::from_name("pkg\u{0}v:1.0".to_string());
+
+        // Stored identity — what `Hash`/`Eq`, and thus `HashMap` lookups, key off of —
+        // still carries the raw `\u{0}` separator.
+        assert!(key.as_str().contains('\u{0}'));
+
+        // `Display` sanitizes it away when rendering (e.g. for a `tracing` field).
+        let rendered = key.to_string();
+        assert!(!rendered.contains('\u{0}'));
+        assert_eq!(rendered, "pkg v:1.0");
+    }
 }
 
 // ---- OSV wire types (private) -------------------------------------------

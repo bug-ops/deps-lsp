@@ -617,7 +617,7 @@ pub fn normalize_pom_license_names_checked(raw: &[String]) -> (Vec<String>, bool
         if ids.is_empty() {
             all_matched = false;
             tracing::debug!(
-                license = %name,
+                license = %crate::redact::sanitize_invisible(name),
                 "license policy: gradle POM license name did not normalize to a known SPDX identifier"
             );
         }
@@ -1289,6 +1289,34 @@ mod tests {
             normalize_pom_license_names_checked(&["Some Bespoke Corporate License".to_string()]);
         assert!(ids.is_empty());
         assert!(!all_matched);
+    }
+
+    /// #1501: a POM's registry-controlled license `<name>` that fails to normalize is logged
+    /// at `debug!` verbatim — a `\n`/`\r` in it must not forge a fake log line (CWE-117).
+    #[test]
+    fn normalize_names_checked_sanitizes_control_chars_in_log() {
+        let raw = vec!["Evil\nWARN forged log line\r".to_string()];
+
+        let log = crate::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let (ids, all_matched) = normalize_pom_license_names_checked(&raw);
+            assert!(ids.is_empty());
+            assert!(!all_matched);
+        });
+
+        assert!(
+            log.contains("Evil"),
+            "expected the license name to still be logged: {log:?}"
+        );
+        assert_eq!(
+            log.trim_end_matches('\n').matches('\n').count(),
+            0,
+            "a control character in the license name must not split the log into extra lines: \
+             {log:?}"
+        );
+        assert!(
+            !log.contains('\r'),
+            "carriage return must not survive into the log: {log:?}"
+        );
     }
 
     /// Review nitpick: `normalize_pom_license_names` must stay a thin wrapper over the
