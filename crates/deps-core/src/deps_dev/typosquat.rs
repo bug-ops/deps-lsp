@@ -16,11 +16,17 @@ pub(super) struct SimilarPackageCandidate {
 /// Resolved, ratio-gated outcome for one declared dependency (spec §5).
 ///
 /// Output-only: constructed internally by `evaluate_candidates`, never by external code.
+///
+/// Carries no `declared_name` field (issue #1455 batch item 2, removed after a #1437 review):
+/// every caller already keys its `TyposquatSignal` by the declared package's `PackageName`
+/// (`HashMap<PackageName, TyposquatSignal>` in `deps-lsp::DocumentState::typosquats` and
+/// `lsp_helpers::diagnostics::fetch_typosquat_signals`'s return type), and the sole diagnostic
+/// renderer, `lsp_helpers::diagnostics::apply_typosquat_rule`, already builds its message from
+/// the dependency it's iterating (`ctx.dep.name()`), never from this struct — a `declared_name`
+/// field here would only ever duplicate its own map key with no reader.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 pub struct TyposquatSignal {
-    /// The declared dependency's own name, exactly as queried.
-    pub declared_name: String,
     /// The candidate deps.dev reports as similarly named and materially more popular.
     pub suspected_name: String,
     /// `GetDependents` `dependentCount` for the declared package's default version.
@@ -76,7 +82,6 @@ pub(super) fn evaluate_candidates(
         })
         .max_by_key(|(_, count)| *count)
         .map(|(name, count)| TyposquatSignal {
-            declared_name: declared_name.to_string(),
             suspected_name: name.clone(),
             declared_dependent_count,
             suspected_dependent_count: *count,
@@ -98,7 +103,6 @@ mod tests {
         let candidates = [("popular".to_string(), 50)];
         let signal = evaluate_candidates("tiny", 1, &candidates).expect("must fire at exactly 50x");
         assert_eq!(signal.suspected_name, "popular");
-        assert_eq!(signal.declared_name, "tiny");
         assert_eq!(signal.declared_dependent_count, 1);
         assert_eq!(signal.suspected_dependent_count, 50);
     }

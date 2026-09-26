@@ -396,7 +396,7 @@ fn resolve_alternate_registries(
                 // unconditionally here, but only ever looked up below for a dependency whose
                 // own field was actually `registry-index` (see `rejected_by_literal_value`'s
                 // own doc).
-                if let Some(reason) = error.rejection_reason() {
+                if let Some(reason) = error.rejection_reason().into_reason() {
                     rejected_by_literal_value.insert(value.clone(), reason);
                 }
                 aliases.insert(value.clone());

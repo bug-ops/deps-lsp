@@ -943,8 +943,8 @@ impl BlockedHostReason for IndexUrlError {
 /// embedded userinfo, an undefined `${VAR}`, ...) had no equivalent: the affected dependency
 /// was simply dropped from the fetch queue with only a `tracing::warn!`, invisible to the
 /// editor user. This is that path's classification, deliberately excluding the blocked-host
-/// case (`rejection_reason` returns `None` for it) so the two mechanisms never double-report
-/// the same rejection.
+/// case (`rejection_reason` returns [`RejectionOutcome::HandledByBlockedHostPath`] for it) so
+/// the two mechanisms never double-report the same rejection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegistryRejectionReason {
     /// The value did not parse as a URL at all.
@@ -995,25 +995,75 @@ impl std::fmt::Display for RegistryRejectionReason {
     }
 }
 
+/// Three-state outcome of classifying a registry-entry rejection (issue #1455 batch item 4).
+///
+/// Before this type existed, [`RegistryRejectionClassifier::rejection_reason`] returned
+/// `Option<RegistryRejectionReason>` and used `None` for two semantically different cases —
+/// [`Self::HandledByBlockedHostPath`] (the trait's original, documented meaning) and
+/// [`Self::IntentionallySilent`] (a rejection reason some ecosystem deliberately never
+/// surfaces as a diagnostic, e.g. NuGet's `Disabled`/`UnsupportedProtocolVersion`/
+/// `LocalFeedUnsupported`) — collapsing a real distinction the doc comment never actually
+/// allowed for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionOutcome {
+    /// A rejection reason that should surface as its own diagnostic.
+    Reject(RegistryRejectionReason),
+    /// A policy-blocked host — already reported through [`BlockedHostReason`]'s own
+    /// diagnostic path, so [`InvalidEntry::rejection_reason`] must not double-report it.
+    HandledByBlockedHostPath,
+    /// Deliberately silent: this rejection reason is never surfaced as a diagnostic, by
+    /// design (not merely "not yet classified").
+    IntentionallySilent,
+}
+
+impl RejectionOutcome {
+    /// Extracts the [`RegistryRejectionReason`] a caller should report, collapsing
+    /// [`Self::HandledByBlockedHostPath`] and [`Self::IntentionallySilent`] to `None` — both
+    /// mean "do not surface a reason here", just for different reasons.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::net_policy::{RegistryRejectionReason, RejectionOutcome};
+    ///
+    /// assert_eq!(
+    ///     RejectionOutcome::Reject(RegistryRejectionReason::NotHttps).into_reason(),
+    ///     Some(RegistryRejectionReason::NotHttps)
+    /// );
+    /// assert!(RejectionOutcome::HandledByBlockedHostPath.into_reason().is_none());
+    /// assert!(RejectionOutcome::IntentionallySilent.into_reason().is_none());
+    /// ```
+    #[must_use]
+    pub const fn into_reason(self) -> Option<RegistryRejectionReason> {
+        match self {
+            Self::Reject(reason) => Some(reason),
+            Self::HandledByBlockedHostPath | Self::IntentionallySilent => None,
+        }
+    }
+}
+
 /// Whether an ecosystem's own validation-failure reason names a rejection other than a
 /// policy-blocked host — the shared half of [`InvalidEntry::rejection_reason`].
 ///
 /// A separate trait from [`BlockedHostReason`] rather than folding into it (#1438): the
-/// blocked-host case already has its own diagnostic path, so this trait's `None` arm for that
-/// case is not "unclassified", it is "handled elsewhere".
+/// blocked-host case already has its own diagnostic path, so this trait's
+/// [`RejectionOutcome::HandledByBlockedHostPath`] arm for that case is not "unclassified", it
+/// is "handled elsewhere" — see [`RejectionOutcome`]'s own doc for the third,
+/// [`RejectionOutcome::IntentionallySilent`] arm this trait also distinguishes.
 pub trait RegistryRejectionClassifier {
-    /// `Some(reason)` for every rejection reason except a policy-blocked host, which returns
-    /// `None` — see this trait's own doc for why.
-    fn rejection_reason(&self) -> Option<RegistryRejectionReason>;
+    /// Classifies this rejection reason into one of [`RejectionOutcome`]'s three states.
+    fn rejection_reason(&self) -> RejectionOutcome;
 }
 
 impl RegistryRejectionClassifier for IndexUrlError {
-    fn rejection_reason(&self) -> Option<RegistryRejectionReason> {
+    fn rejection_reason(&self) -> RejectionOutcome {
         match self {
-            Self::InvalidUrl(_) => Some(RegistryRejectionReason::InvalidUrl),
-            Self::NotHttps(_) => Some(RegistryRejectionReason::NotHttps),
-            Self::UserInfoPresent => Some(RegistryRejectionReason::UserInfoPresent),
-            Self::BlockedHost { .. } => None,
+            Self::InvalidUrl(_) => RejectionOutcome::Reject(RegistryRejectionReason::InvalidUrl),
+            Self::NotHttps(_) => RejectionOutcome::Reject(RegistryRejectionReason::NotHttps),
+            Self::UserInfoPresent => {
+                RejectionOutcome::Reject(RegistryRejectionReason::UserInfoPresent)
+            }
+            Self::BlockedHost { .. } => RejectionOutcome::HandledByBlockedHostPath,
         }
     }
 }
@@ -1160,6 +1210,7 @@ impl<E: RegistryRejectionClassifier> InvalidEntry<E> {
     pub fn rejection_reason(&self) -> Option<(RegistryRejectionReason, String)> {
         self.reason
             .rejection_reason()
+            .into_reason()
             .map(|reason| (reason, self.raw.to_string()))
     }
 }
@@ -1179,6 +1230,38 @@ mod tests {
             &url::Url::parse(candidate).unwrap(),
             &url::Url::parse(trusted).unwrap(),
         )
+    }
+
+    /// Issue #1455 batch item 4: [`IndexUrlError`]'s [`RegistryRejectionClassifier`] impl is the
+    /// shared default every ecosystem's `Url(#[from] IndexUrlError)` variant delegates to
+    /// (`NuGetFeedUrlError::Url`, `NpmRegistryIndexError::Url`, ...) — a direct test here, rather
+    /// than only exercising it transitively through an ecosystem's `rejected_reason_for`, is
+    /// what would catch a `Reject`/`HandledByBlockedHostPath` mix-up: both currently collapse to
+    /// the same observable `None` at `InvalidEntry::rejection_reason`'s wrapper, so a swapped
+    /// mapping would not fail any test that only checks that wrapper's behavior.
+    #[test]
+    fn test_index_url_error_rejection_reason_variants() {
+        assert_eq!(
+            IndexUrlError::InvalidUrl(RedactedUrl::new("not a url")).rejection_reason(),
+            RejectionOutcome::Reject(RegistryRejectionReason::InvalidUrl)
+        );
+        assert_eq!(
+            IndexUrlError::NotHttps("ftp".to_string()).rejection_reason(),
+            RejectionOutcome::Reject(RegistryRejectionReason::NotHttps)
+        );
+        assert_eq!(
+            IndexUrlError::UserInfoPresent.rejection_reason(),
+            RejectionOutcome::Reject(RegistryRejectionReason::UserInfoPresent)
+        );
+        assert_eq!(
+            IndexUrlError::BlockedHost {
+                class: HostClass::Loopback
+            }
+            .rejection_reason(),
+            RejectionOutcome::HandledByBlockedHostPath,
+            "a policy-blocked host must classify as HandledByBlockedHostPath, not IntentionallySilent \
+             or a generic Reject — it already has its own diagnostic path via BlockedHostReason"
+        );
     }
 
     /// Issue #795 S1: a trusted path with no trailing slash (the real `deps-cargo` sparse

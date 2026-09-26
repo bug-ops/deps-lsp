@@ -465,7 +465,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
 /// `tokio::spawn` panics outside a Tokio runtime — every caller of [`generate_hover`]
 /// is `#[tokio::test]`-async or the real LSP server, so this is safe here, but no
 /// doc-test may call it directly. The spawned future captures only owned/`'static`
-/// data (`Arc<DepsDevClient>`, `&'static str`, owned `String`s) so it satisfies
+/// data (`Arc<DepsDevClient>`, a `Copy` `DepsDevSystem`, owned `String`s) so it satisfies
 /// `Send + 'static` with no borrow from `dep`.
 fn spawn_trust_signal_fetch(
     dep: &dyn Dependency,
@@ -1220,6 +1220,7 @@ fn push_license_hover_section(
 mod tests {
     use super::*;
     use crate::RemovalStatus;
+    use crate::deps_dev::DepsDevSystem;
     use crate::lsp_helpers::test_support::*;
     use crate::lsp_helpers::*;
     use crate::position::{Position, Range};
@@ -6345,7 +6346,7 @@ mod tests {
             .await;
 
         let warmed = deps_dev
-            .trust_signal("npm", "express", "4.19.2")
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
             .await
             .expect("the direct, un-delayed call must warm the memo deterministically");
         assert!(warmed.scorecard.is_some(), "fixture includes a scorecard");

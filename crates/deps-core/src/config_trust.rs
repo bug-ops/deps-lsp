@@ -15,7 +15,7 @@
 //! `deps-cargo`'s `Provenance`/`IndexTrust` are intentionally separate from this module (env
 //! overrides, not interpolation) — see that crate's own docs.
 
-// TODO(critic): centralize env-override-by-name trust (cargo CARGO_REGISTRIES_*, future
+// TODO(#1459): centralize env-override-by-name trust (cargo CARGO_REGISTRIES_*, future
 // COMPOSER_AUTH/PIP_INDEX_URL) once a second ecosystem needs it
 
 use zeroize::Zeroizing;

@@ -9,11 +9,11 @@ use super::fetch::{
 };
 use super::loader::{MAX_FILE_SIZE, load_document_from_disk};
 use super::osv_scan::{
-    OsvScanResult, run_license_prefetch, run_osv_phase_b_and_commit, run_osv_scan_phase_a,
-    run_typosquat_prefetch,
+    OsvScanResult, declared_names, run_license_prefetch, run_osv_phase_b_and_commit,
+    run_osv_scan_phase_a, run_typosquat_prefetch,
 };
 use super::resolved::RefetchPolicy;
-use super::state::{DocumentState, ServerState};
+use super::state::{DocumentState, ServerState, spawn_supervised};
 use crate::config::DepsConfig;
 use crate::handlers::diagnostics;
 use crate::progress::RegistryProgress;
@@ -28,7 +28,7 @@ use deps_engine::classify::fetch::{fetch_latest_versions_parallel, prepare_fetch
 use deps_engine::classify::resolved::{
     cached_versions_from_lockfile, dependency_version_map, load_resolved_versions,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
@@ -275,8 +275,20 @@ async fn run_document_open_background_task(
 
     // Typosquat pre-fetch (issue #1437) — unlike `license_task` above, deliberately *not*
     // joined before this function's diagnostics publish (impl-critic N2). See
-    // `spawn_typosquat_prefetch_and_republish`'s own doc for why.
-    spawn_typosquat_prefetch_and_republish(
+    // `spawn_typosquat_prefetch_and_republish`'s own doc for why. Always spawns (the open
+    // path has no previous state to gate against), but still seeds
+    // `DocumentState::typosquat_checked_names` from the just-opened content (issue #1455
+    // critic S1) so the *first* debounced edit afterward compares against a real baseline
+    // instead of an empty one, which would otherwise make that first edit's gate fire even
+    // for a version-only change.
+    if let Some(mut doc) = state.documents.get_mut(&uri) {
+        let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+        doc.refresh_typosquat_checked_names(current_names);
+    }
+    // Drawn synchronously, immediately before spawning (issue #1455 critic M2) — see
+    // `ServerState::next_typosquat_task_generation`'s own doc for why the ordering matters.
+    let typosquat_generation = state.next_typosquat_task_generation();
+    let typosquat_task = spawn_typosquat_prefetch_and_republish(
         uri.clone(),
         Arc::clone(&state),
         client.clone(),
@@ -284,6 +296,9 @@ async fn run_document_open_background_task(
         Arc::clone(&config),
         diagnostics_snapshot.fetch_timeout_secs,
     );
+    state
+        .track_typosquat_task(uri.clone(), typosquat_generation, typosquat_task)
+        .await;
 
     // Collect dependency names+sources, the in-use-version map (§4.6), and the manifest's own
     // `SelectionContext` (#1433) in one pass while holding the reference (can't hold across
@@ -1129,21 +1144,36 @@ async fn run_document_change_task(
         )
     });
 
-    // Typosquat pre-fetch (issue #1437), spawned unconditionally (unlike `license_task`
-    // above, this has no cheap "did dependency names change" pre-check comparable to
-    // `needs_license_refresh` at this call site) — self-guards internally
-    // (`ServerState::is_typosquat_enabled`/offline), so this is a no-op spawn for the common
-    // (disabled) case, same as the open-path spawn. Deliberately *not* joined before either
-    // of this function's diagnostics publishes below (impl-critic N2) — see
-    // `spawn_typosquat_prefetch_and_republish`'s own doc for why.
-    spawn_typosquat_prefetch_and_republish(
-        uri.clone(),
-        Arc::clone(&state),
-        client.clone(),
-        Arc::clone(&ecosystem),
-        Arc::clone(&live_config),
-        config.diagnostics.fetch_timeout_secs,
-    );
+    // Typosquat pre-fetch (issue #1437), gated on the declared name set actually having
+    // drifted from `DocumentState::typosquat_checked_names` (issue #1455 batch item 1,
+    // critic S1 — previously gated on *this edit's own* `DependencyDiff`, which missed a name
+    // added by an edit whose change task got superseded/aborted before ever reaching this
+    // spawn; see `DocumentState::typosquat_checked_names`' own doc). Comparing against the
+    // persisted set self-corrects regardless of how many aborted edits happened in between.
+    // The pre-fetch's result depends only on declared package *names* (see
+    // `run_typosquat_prefetch`'s own doc), so a version-only edit can never change its
+    // outcome. Self-guards internally too (`ServerState::is_typosquat_enabled`/offline), so
+    // this remains a no-op spawn for the common (disabled) case, same as the open-path spawn.
+    // Deliberately *not* joined before either of this function's diagnostics publishes below
+    // (impl-critic N2) — see `spawn_typosquat_prefetch_and_republish`'s own doc for why.
+    let typosquat_names_changed = state.documents.get_mut(&uri).is_some_and(|mut doc| {
+        let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+        doc.refresh_typosquat_checked_names(current_names)
+    });
+    if typosquat_names_changed {
+        let typosquat_generation = state.next_typosquat_task_generation();
+        let typosquat_task = spawn_typosquat_prefetch_and_republish(
+            uri.clone(),
+            Arc::clone(&state),
+            client.clone(),
+            Arc::clone(&ecosystem),
+            Arc::clone(&live_config),
+            config.diagnostics.fetch_timeout_secs,
+        );
+        state
+            .track_typosquat_task(uri.clone(), typosquat_generation, typosquat_task)
+            .await;
+    }
 
     // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
     // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty
@@ -1341,6 +1371,13 @@ async fn await_license_prefetch(task: Option<JoinHandle<()>>) {
 /// `DiagnosticsSnapshot` for that call would show the user's severity/freshness/offline
 /// settings as they were when the prefetch *started*, not as they are by the time it
 /// actually publishes.
+///
+/// Supervised via [`spawn_supervised`] (issue #1455 batch item 1, following #1399's precedent
+/// for detached background work) so a panic surfaces in the logs instead of vanishing
+/// silently, and returns the worker's own [`tokio::task::AbortHandle`] so the caller can
+/// register it with [`ServerState::track_typosquat_task`] — letting a superseding edit or
+/// `did_close` cancel a still-running pre-fetch instead of leaving it to run to completion
+/// only for `run_typosquat_prefetch`'s own content-staleness guard to discard its result.
 fn spawn_typosquat_prefetch_and_republish(
     uri: Uri,
     state: Arc<ServerState>,
@@ -1348,8 +1385,9 @@ fn spawn_typosquat_prefetch_and_republish(
     ecosystem: Arc<dyn Ecosystem>,
     config: Arc<RwLock<DepsConfig>>,
     fetch_timeout_secs: u64,
-) {
-    tokio::spawn(
+) -> tokio::task::AbortHandle {
+    let log_uri = uri.clone();
+    spawn_supervised(
         async move {
             let changed = run_typosquat_prefetch(
                 uri.clone(),
@@ -1371,7 +1409,14 @@ fn spawn_typosquat_prefetch_and_republish(
             }
         }
         .instrument(tracing::Span::current()),
-    );
+        move |e| {
+            tracing::error!(
+                "typosquat pre-fetch for {:?} panicked ({e}); its typosquat diagnostic may be \
+                 stale",
+                log_uri
+            );
+        },
+    )
 }
 
 /// Triggers the typosquat pre-fetch for every currently open document (issue #1437 M1) —
@@ -1382,7 +1427,7 @@ fn spawn_typosquat_prefetch_and_republish(
 /// this function itself returns as soon as every per-document task is spawned, without
 /// waiting for any of them to resolve. A document whose ecosystem has since been
 /// unregistered (should not happen in practice) is silently skipped rather than panicking.
-pub(crate) fn trigger_typosquat_prefetch_for_open_documents(
+pub(crate) async fn trigger_typosquat_prefetch_for_open_documents(
     state: &Arc<ServerState>,
     client: &Client,
     config: Arc<RwLock<DepsConfig>>,
@@ -1400,14 +1445,29 @@ pub(crate) fn trigger_typosquat_prefetch_for_open_documents(
         let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_id) else {
             continue;
         };
-        spawn_typosquat_prefetch_and_republish(
-            uri,
+        // Seeds `DocumentState::typosquat_checked_names` from the current content (issue
+        // #1455 critic S1), mirroring the open path — this call always spawns regardless
+        // (the feature just transitioned on, so every open document needs its first check),
+        // but the *next* debounced edit still needs a real baseline to gate against.
+        if let Some(mut doc) = state.documents.get_mut(&uri) {
+            let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+            doc.refresh_typosquat_checked_names(current_names);
+        }
+        let typosquat_generation = state.next_typosquat_task_generation();
+        let typosquat_task = spawn_typosquat_prefetch_and_republish(
+            uri.clone(),
             Arc::clone(state),
             client.clone(),
             ecosystem,
             Arc::clone(&config),
             fetch_timeout_secs,
         );
+        // Only registers the task handle (issue #1455 batch item 1) — does not await the
+        // pre-fetch itself, preserving this function's own "returns as soon as every
+        // per-document task is spawned" contract.
+        state
+            .track_typosquat_task(uri, typosquat_generation, typosquat_task)
+            .await;
     }
 }
 
@@ -1589,6 +1649,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Issue #1455 critic S1: `DocumentState::refresh_typosquat_checked_names` — the
+    /// debounced-edit typosquat gate's underlying primitive — must fire exactly when the
+    /// declared name set differs from what was last checked, regardless of *why* it differs
+    /// (an add, a remove, or both), and must never fire for an unchanged set even after a
+    /// version-only edit (modeled here as calling it twice with the same set).
+    #[test]
+    fn refresh_typosquat_checked_names_fires_only_on_a_real_set_change() {
+        let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+        let base: HashSet<PackageName> = std::iter::once(PackageName::new("serde")).collect();
+
+        assert!(
+            doc.refresh_typosquat_checked_names(base.clone()),
+            "the very first check (against the empty default) must always fire"
+        );
+
+        assert!(
+            !doc.refresh_typosquat_checked_names(base),
+            "an unchanged name set (e.g. a version-only edit) must not re-fire"
+        );
+
+        let added: HashSet<PackageName> = [PackageName::new("serde"), PackageName::new("tokio")]
+            .into_iter()
+            .collect();
+        assert!(
+            doc.refresh_typosquat_checked_names(added.clone()),
+            "an added name must fire"
+        );
+        assert!(!doc.refresh_typosquat_checked_names(added));
+
+        let removed: HashSet<PackageName> = std::iter::once(PackageName::new("tokio")).collect();
+        assert!(
+            doc.refresh_typosquat_checked_names(removed),
+            "a removed name must also fire"
+        );
     }
 
     /// impl-critic S1 (#1433): a `minimum-stability`-only edit changes no dependency
@@ -3138,6 +3234,188 @@ tokio = "1.0"
                  past the refresh call sites to commit OSV results and diagnostics: {:?}",
                 doc.loading_state
             );
+        }
+
+        /// Issue #1455 batch item 1: a version-only edit must not re-spawn the typosquat
+        /// pre-fetch (`typosquat_names_changed` stays `false`), but an edit that adds a
+        /// dependency name must.
+        #[tokio::test]
+        async fn test_handle_document_change_gates_typosquat_prefetch_on_name_change() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let original_content = r#"[dependencies]
+serde = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content,
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed")
+            .await
+            .expect("initial open's background task must not panic");
+
+            let after_open = state
+                .typosquat_task_id(&uri)
+                .await
+                .expect("open unconditionally spawns and tracks a typosquat pre-fetch");
+
+            // Version-only edit: same dependency set, different version requirement.
+            let version_only_content = r#"[dependencies]
+serde = "1.1"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            handle_document_change(
+                uri.clone(),
+                version_only_content,
+                Some(2),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("normal-sized change should be accepted")
+            .await
+            .expect("background task must not panic");
+
+            assert_eq!(
+                state.typosquat_task_id(&uri).await,
+                Some(after_open),
+                "a version-only edit must not re-spawn the typosquat pre-fetch"
+            );
+
+            // Name-changed edit: adds a new dependency.
+            let name_added_content = r#"[dependencies]
+serde = "1.1"
+tokio = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            handle_document_change(
+                uri.clone(),
+                name_added_content,
+                Some(3),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("normal-sized change should be accepted")
+            .await
+            .expect("background task must not panic");
+
+            assert_ne!(
+                state.typosquat_task_id(&uri).await,
+                Some(after_open),
+                "an edit that adds a dependency name must re-spawn the typosquat pre-fetch"
+            );
+        }
+
+        /// Issue #1455 critic S1(b): a name added by an edit whose own change task is
+        /// superseded/aborted (by the very next debounced edit, before it ever reaches the
+        /// typosquat pre-fetch spawn) must still get checked once names actually settle — the
+        /// ordinary "type a new dependency line, then edit its version" flow. The superseding
+        /// edit's own `DependencyDiff` shows no name change (only the earlier edit's diff
+        /// did), so this only passes if the gate compares against the persisted
+        /// `DocumentState::typosquat_checked_names`, not the superseding edit's local diff.
+        #[tokio::test]
+        async fn test_name_added_by_aborted_predecessor_edit_is_still_checked_by_successor() {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let original_content = r#"[dependencies]
+serde = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content,
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed")
+            .await
+            .expect("initial open's background task must not panic");
+
+            let after_open = state
+                .typosquat_task_id(&uri)
+                .await
+                .expect("open unconditionally spawns and tracks a typosquat pre-fetch");
+
+            // Edit N: adds `tokio`. Installed via `spawn_background_task` (mirroring
+            // `server.rs`'s real `did_change` orchestration) so the next edit can actually
+            // abort it mid-debounce, exactly like a real editor keystroke burst.
+            let name_added_content = r#"[dependencies]
+serde = "1.0"
+tokio = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            let task_n = handle_document_change(
+                uri.clone(),
+                name_added_content,
+                Some(2),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("normal-sized change should be accepted");
+            state.spawn_background_task(uri.clone(), task_n).await;
+
+            // Edit N+1 arrives before N's `DID_CHANGE_DEBOUNCE` (100ms) elapses: version-only
+            // relative to N's already-committed (serde+tokio) state. Installing it aborts N
+            // before N ever reaches its own typosquat pre-fetch spawn.
+            let version_only_content = r#"[dependencies]
+serde = "1.1"
+tokio = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            let task_n_plus_1 = handle_document_change(
+                uri.clone(),
+                version_only_content,
+                Some(3),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("normal-sized change should be accepted");
+            state
+                .spawn_background_task(uri.clone(), task_n_plus_1)
+                .await;
+
+            // Poll for N+1's own background task to finish and (per the fix) still spawn a
+            // typosquat pre-fetch, since `tokio` was never actually checked yet.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if state.typosquat_task_id(&uri).await != Some(after_open) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for the successor edit to spawn a typosquat pre-fetch \
+                     for the name its aborted predecessor added"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
         }
 
         /// Regression guard for issue #1395's bidirectional-generation-race finding

@@ -36,7 +36,9 @@ mod typosquat;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
+use tokio::sync::watch;
 
 use types::{
     DependentsWire, DepsDevProject, DepsDevVersionInfo, GetPackageWire, ProvenanceEntry,
@@ -108,7 +110,7 @@ const DEPS_DEV_BODY_LIMIT: usize = 1024 * 1024;
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct MemoKey {
     base: String,
-    system: &'static str,
+    system: DepsDevSystem,
     name: String,
     version: String,
 }
@@ -153,7 +155,7 @@ struct ProjectMemoEntry {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct SimilarityMemoKey {
     base: String,
-    system: &'static str,
+    system: DepsDevSystem,
     name: String,
 }
 
@@ -170,7 +172,7 @@ struct SimilarityMemoEntry {
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
 struct PopularityMemoKey {
     base: String,
-    system: &'static str,
+    system: DepsDevSystem,
     name: String,
 }
 
@@ -186,19 +188,125 @@ struct PopularityMemoEntry {
 /// Releases an in-flight claim on drop — including on panic — so a claim can
 /// never leak and permanently block later calls for the same key.
 ///
-/// Generic over the memo key type (issue #1437 widened this from a `MemoKey`-only guard so
-/// [`DepsDevClient::similar_packages`]/[`DepsDevClient::popularity`] can reuse the identical
-/// dedup mechanism for [`SimilarityMemoKey`]/[`PopularityMemoKey`] instead of hand-rolling a
-/// second copy).
-struct InFlightGuard<'a, K: std::hash::Hash + Eq> {
-    set: &'a DashSet<K>,
+/// Generic over both the key type and the in-flight map's value type (issue #1454 widened
+/// this from a `DashSet`-only guard to the `DashMap<K, watch::Receiver<..>>` shape
+/// [`coalesce`] uses), so [`DepsDevClient::trust_signal`]/[`DepsDevClient::similar_packages`]/
+/// [`DepsDevClient::popularity`] all share the identical cleanup mechanism instead of
+/// hand-rolling their own.
+struct InFlightGuard<'a, K: std::hash::Hash + Eq, W> {
+    map: &'a DashMap<K, W>,
     key: K,
 }
 
-impl<K: std::hash::Hash + Eq> Drop for InFlightGuard<'_, K> {
+impl<K: std::hash::Hash + Eq, W> Drop for InFlightGuard<'_, K, W> {
     fn drop(&mut self) {
-        self.set.remove(&self.key);
+        self.map.remove(&self.key);
     }
+}
+
+/// A [`coalesce`] watch-channel payload: "leader hasn't finished yet" vs. "leader finished
+/// with `V`". A dedicated enum rather than `Option<V>` (clippy `option_option`): two of
+/// [`coalesce`]'s three callers have `V` itself an `Option` (`Option<SupplyChainTrustSignal>`,
+/// `Option<u64>`), which would otherwise nest as `Option<Option<_>>`.
+#[derive(Debug, Clone)]
+enum Slot<V> {
+    /// The leader's `fetch` has not completed (or panicked) yet.
+    Pending,
+    /// The leader's `fetch` completed with this value.
+    Ready(V),
+}
+
+/// Either claims `key` as the leader (installing a fresh, `Pending` channel) or joins as a
+/// follower of whichever channel the current leader already installed — a plain, synchronous
+/// function so the returned [`dashmap::mapref::entry::Entry`] guard is dropped before
+/// [`coalesce`] ever reaches an `.await` (this workspace's `clippy.toml` denies holding one
+/// across an await point on principle, regardless of whether a given case is provably safe).
+fn claim_or_follow<K, V>(
+    in_flight: &DashMap<K, watch::Receiver<Slot<V>>>,
+    key: K,
+) -> Result<watch::Sender<Slot<V>>, watch::Receiver<Slot<V>>>
+where
+    K: std::hash::Hash + Eq,
+{
+    match in_flight.entry(key) {
+        Entry::Occupied(occupied) => Err(occupied.get().clone()),
+        Entry::Vacant(vacant) => {
+            let (tx, rx) = watch::channel(Slot::Pending);
+            vacant.insert(rx);
+            Ok(tx)
+        }
+    }
+}
+
+/// Bounds how many times [`coalesce`] takes over as a new leader after the previous one was
+/// cancelled before sending (issue #1455 critic S2), so a leader that keeps getting cancelled
+/// (or keeps panicking deterministically) cannot loop forever — the last attempt's caller
+/// either produces a real value or lets a genuine panic propagate to its own task, and every
+/// caller that loses that final round falls back to `V::default()`.
+const MAX_COALESCE_TAKEOVER_ATTEMPTS: u8 = 2;
+
+/// Coalesces concurrent callers for the same in-flight `key`: the first caller (the leader)
+/// runs `fetch` and broadcasts its result to every other concurrent caller for the same key
+/// (the followers) via a [`watch`] channel, instead of a follower returning a default value
+/// immediately (issue #1454) — the pre-existing behavior, which made a typosquat candidate or
+/// declared package that merely lost a concurrent-fetch race silently disappear from the
+/// result instead of being reported once the leader's fetch completed.
+///
+/// A follower whose leader is cancelled — it panics, or the task calling `coalesce` is
+/// `AbortHandle::abort()`-ed by something outside this function (a `tokio::time::timeout`
+/// around the whole call, or a superseding-task abort, e.g. `deps-lsp`'s
+/// `ServerState::track_typosquat_task`) — takes over as the new leader and calls `fetch` itself
+/// instead of silently degrading to `V::default()` (issue #1455 critic S2: the original
+/// panic-only design reintroduced almost exactly the false-negative shape #1454 set out to fix,
+/// since #1455's own new abort paths made leader cancellation routine rather than exotic).
+/// Bounded by
+/// [`MAX_COALESCE_TAKEOVER_ATTEMPTS`]; `in_flight`'s entry for `key` is removed on every path
+/// (including a panic or abort), via [`InFlightGuard`]'s `Drop` impl, so the entry is never
+/// stale by the time a takeover's `claim_or_follow` call runs.
+async fn coalesce<K, V, F, Fut>(
+    in_flight: &DashMap<K, watch::Receiver<Slot<V>>>,
+    key: K,
+    fetch: F,
+) -> V
+where
+    K: std::hash::Hash + Eq + Clone + Send + Sync,
+    V: Clone + Default + Send + Sync,
+    F: Fn() -> Fut + Send,
+    Fut: std::future::Future<Output = V> + Send,
+{
+    for attempt in 0..=MAX_COALESCE_TAKEOVER_ATTEMPTS {
+        match claim_or_follow(in_flight, key.clone()) {
+            Ok(tx) => {
+                let _guard = InFlightGuard {
+                    map: in_flight,
+                    key,
+                };
+                let value = fetch().await;
+                let _ = tx.send(Slot::Ready(value.clone()));
+                return value;
+            }
+            Err(mut rx) => loop {
+                let slot = rx.borrow_and_update().clone();
+                if let Slot::Ready(value) = slot {
+                    return value;
+                }
+                if rx.changed().await.is_err() {
+                    tracing::debug!(
+                        attempt,
+                        "coalesce: in-flight leader was cancelled before completing; taking \
+                         over as leader"
+                    );
+                    break;
+                }
+            },
+        }
+    }
+
+    tracing::debug!(
+        "coalesce: gave up after {} leader-takeover attempts; falling back to a default value",
+        MAX_COALESCE_TAKEOVER_ATTEMPTS + 1
+    );
+    V::default()
 }
 
 /// Maps a deps-lsp [`EcosystemId`] to deps.dev's `system` path segment.
@@ -218,15 +326,15 @@ impl<K: std::hash::Hash + Eq> Drop for InFlightGuard<'_, K> {
 /// feature — diagnostics generation is deliberately available to `deps-cli`, which does not
 /// enable `lsp-responses` (see that feature's own doc comment in `Cargo.toml`).
 #[must_use]
-pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<&'static str> {
+pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<DepsDevSystem> {
     match id {
-        EcosystemId::Npm => Some("npm"),
-        EcosystemId::Cargo => Some("cargo"),
-        EcosystemId::Go => Some("go"),
-        EcosystemId::Maven => Some("maven"),
-        EcosystemId::Pypi => Some("pypi"),
-        EcosystemId::Bundler => Some("rubygems"),
-        EcosystemId::NuGet => Some("nuget"),
+        EcosystemId::Npm => Some(DepsDevSystem::Npm),
+        EcosystemId::Cargo => Some(DepsDevSystem::Cargo),
+        EcosystemId::Go => Some(DepsDevSystem::Go),
+        EcosystemId::Maven => Some(DepsDevSystem::Maven),
+        EcosystemId::Pypi => Some(DepsDevSystem::Pypi),
+        EcosystemId::Bundler => Some(DepsDevSystem::Rubygems),
+        EcosystemId::NuGet => Some(DepsDevSystem::NuGet),
         EcosystemId::Composer
         | EcosystemId::Dart
         | EcosystemId::Swift
@@ -234,6 +342,46 @@ pub(crate) const fn deps_dev_system(id: EcosystemId) -> Option<&'static str> {
         | EcosystemId::Deno
         | EcosystemId::GithubActions
         | EcosystemId::GitlabCi => None,
+    }
+}
+
+/// deps.dev's `system` URL path segment (issue #1455 batch item 2).
+///
+/// Exhaustively covers the seven ecosystems `deps_dev_system` maps to it — replaces a raw
+/// `&'static str` threaded through every deps.dev call site and memo key, so a typo'd or
+/// copy-pasted-wrong system string is a compile error instead of a silently wrong URL or a
+/// memo key that aliases the wrong ecosystem's cache entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DepsDevSystem {
+    /// npm.
+    Npm,
+    /// crates.io, via Cargo.
+    Cargo,
+    /// Go modules.
+    Go,
+    /// Maven Central and other Maven-coordinate repositories.
+    Maven,
+    /// PyPI.
+    Pypi,
+    /// RubyGems, via Bundler — deps.dev's own name for this ecosystem.
+    Rubygems,
+    /// NuGet.
+    NuGet,
+}
+
+impl DepsDevSystem {
+    /// The exact `system` path segment deps.dev's `v3`/`v3alpha` APIs expect.
+    #[must_use]
+    const fn as_path_segment(self) -> &'static str {
+        match self {
+            Self::Npm => "npm",
+            Self::Cargo => "cargo",
+            Self::Go => "go",
+            Self::Maven => "maven",
+            Self::Pypi => "pypi",
+            Self::Rubygems => "rubygems",
+            Self::NuGet => "nuget",
+        }
     }
 }
 
@@ -328,24 +476,34 @@ pub struct DepsDevClient {
     trusted_origin: String,
     memo: DashMap<MemoKey, MemoEntry>,
     projects: DashMap<ProjectKeyMemo, ProjectMemoEntry>,
-    in_flight: DashSet<MemoKey>,
+    /// In-flight claims for [`Self::memo`] — a losing concurrent caller awaits the leader's
+    /// result via [`coalesce`] rather than returning `None` immediately (issue #1454).
+    in_flight: DashMap<MemoKey, watch::Receiver<Slot<Option<SupplyChainTrustSignal>>>>,
     /// Issue #1437: `GetSimilarlyNamedPackages` results, keyed package-level (see
     /// [`SimilarityMemoKey`]).
     similarity: DashMap<SimilarityMemoKey, SimilarityMemoEntry>,
-    /// Issue #1437: in-flight claims for [`Self::similarity`], mirroring [`Self::in_flight`]'s
-    /// dedup rationale — `fetch_typosquat_signals`'s concurrent fan-out across a document's
+    /// In-flight claims for [`Self::similarity`], mirroring [`Self::in_flight`]'s dedup
+    /// rationale — `fetch_typosquat_signals`'s concurrent fan-out across a document's
     /// dependencies can otherwise issue duplicate `GetSimilarlyNamedPackages` requests for two
-    /// dependencies that happen to share a raw name before either write lands in the memo.
-    similarity_in_flight: DashSet<SimilarityMemoKey>,
+    /// dependencies that happen to share a raw name before either write lands in the memo. A
+    /// losing caller awaits the leader's result via [`coalesce`] instead of returning an empty
+    /// `Vec` immediately (issue #1454).
+    similarity_in_flight:
+        DashMap<SimilarityMemoKey, watch::Receiver<Slot<Vec<SimilarPackageCandidate>>>>,
     /// Issue #1437: `GetPackage` + `GetDependents`-derived popularity, keyed package-level
     /// (see [`PopularityMemoKey`]) — shared by every declared dependency and candidate that
     /// resolves the same package name, the same way `projects` is shared across packages
     /// sharing a Scorecard project key.
     popularity: DashMap<PopularityMemoKey, PopularityMemoEntry>,
-    /// Issue #1437: in-flight claims for [`Self::popularity`] — the more valuable of the two
-    /// new dedup sets, since a popular typosquat target (e.g. `lodash`) is exactly the kind of
-    /// candidate multiple concurrently-resolved declared dependencies are likely to share.
-    popularity_in_flight: DashSet<PopularityMemoKey>,
+    /// In-flight claims for [`Self::popularity`] — the more valuable of the two dedup maps,
+    /// since a popular typosquat target (e.g. `lodash`) is exactly the kind of candidate
+    /// multiple concurrently-resolved declared dependencies are likely to share. A losing
+    /// caller awaits the leader's result via [`coalesce`] instead of returning `None`
+    /// immediately (issue #1454) — previously the more damaging of the two typosquat dedup
+    /// maps, since a package-level popularity collision is common enough that
+    /// `typosquat_signal_concurrent_calls_share_one_candidate_popularity_request` used to
+    /// accept one of two real typosquats going unreported.
+    popularity_in_flight: DashMap<PopularityMemoKey, watch::Receiver<Slot<Option<u64>>>>,
 }
 
 /// Manual, non-exhaustive impl: `VersionData` derives `Debug` and holds this behind
@@ -381,11 +539,11 @@ impl DepsDevClient {
             trusted_origin,
             memo: DashMap::new(),
             projects: DashMap::new(),
-            in_flight: DashSet::new(),
+            in_flight: DashMap::new(),
             similarity: DashMap::new(),
-            similarity_in_flight: DashSet::new(),
+            similarity_in_flight: DashMap::new(),
             popularity: DashMap::new(),
-            popularity_in_flight: DashSet::new(),
+            popularity_in_flight: DashMap::new(),
         }
     }
 
@@ -396,13 +554,11 @@ impl DepsDevClient {
     /// Infallible by construction (FR-006) — every failure degrades to
     /// `None`, memoized under the short error TTL so a transient outage
     /// does not re-fire on every hover. A call for a key another concurrent
-    /// call is already fetching returns `None` immediately rather than
-    /// duplicating the fetch (N1) — the caller's own memo read on its next
-    /// call picks up the result once the in-flight fetch completes and
-    /// writes it.
+    /// call is already fetching awaits that leader's result via `coalesce`
+    /// rather than returning `None` immediately (issue #1454).
     pub async fn trust_signal(
         &self,
-        system: &'static str,
+        system: DepsDevSystem,
         name: &str,
         version: &str,
     ) -> Option<SupplyChainTrustSignal> {
@@ -419,17 +575,21 @@ impl DepsDevClient {
             return entry.signal.clone();
         }
 
-        if !self.in_flight.insert(key.clone()) {
-            return None;
-        }
-        let _guard = InFlightGuard {
-            set: &self.in_flight,
-            key: key.clone(),
-        };
-
-        let (signal, ttl) = self.fetch(system, name, version).await;
-        self.store_memo(key, signal.clone(), ttl);
-        signal
+        coalesce(&self.in_flight, key.clone(), || async {
+            // Re-check the memo now that this call has actually won the leader claim (issue
+            // #1455 critic M1): a leader that finished and wrote the memo between the check
+            // above and this call's claim attempt would otherwise cost a wholly avoidable
+            // duplicate fetch.
+            if let Some(entry) = self.memo.get(&key)
+                && entry.fetched_at.elapsed() < entry.ttl
+            {
+                return entry.signal.clone();
+            }
+            let (signal, ttl) = self.fetch(system, name, version).await;
+            self.store_memo(key.clone(), signal.clone(), ttl);
+            signal
+        })
+        .await
     }
 
     fn store_memo(&self, key: MemoKey, signal: Option<SupplyChainTrustSignal>, ttl: Duration) {
@@ -509,7 +669,7 @@ impl DepsDevClient {
     /// already resolved from the version call (spec §6).
     async fn fetch(
         &self,
-        system: &'static str,
+        system: DepsDevSystem,
         name: &str,
         version: &str,
     ) -> (Option<SupplyChainTrustSignal>, Duration) {
@@ -527,8 +687,9 @@ impl DepsDevClient {
         }
 
         let version_url = format!(
-            "{}/v3/systems/{system}/packages/{}/versions/{}",
+            "{}/v3/systems/{}/packages/{}/versions/{}",
             self.base_url,
+            system.as_path_segment(),
             urlencoding::encode(name),
             urlencoding::encode(version),
         );
@@ -658,7 +819,7 @@ impl DepsDevClient {
     /// never checks ecosystem coverage either.
     pub async fn typosquat_signal(
         &self,
-        system: &'static str,
+        system: DepsDevSystem,
         name: &str,
     ) -> Option<TyposquatSignal> {
         let candidates = self.similar_packages(system, name).await;
@@ -701,7 +862,7 @@ impl DepsDevClient {
     /// `packages[]` for `name` — identity only, no popularity (plan.md §1).
     async fn similar_packages(
         &self,
-        system: &'static str,
+        system: DepsDevSystem,
         name: &str,
     ) -> Vec<SimilarPackageCandidate> {
         if is_dot_segment(name) {
@@ -725,71 +886,74 @@ impl DepsDevClient {
             return entry.candidates.clone();
         }
 
-        if !self.similarity_in_flight.insert(key.clone()) {
-            return Vec::new();
-        }
-        let _guard = InFlightGuard {
-            set: &self.similarity_in_flight,
-            key: key.clone(),
-        };
+        coalesce(&self.similarity_in_flight, key.clone(), || async {
+            // Re-check the memo now that this call has actually won the leader claim (issue
+            // #1455 critic M1) — see `trust_signal`'s identical recheck for why.
+            if let Some(entry) = self.similarity.get(&key)
+                && entry.fetched_at.elapsed() < entry.ttl
+            {
+                return entry.candidates.clone();
+            }
+            let url = format!(
+                "{}/v3alpha/systems/{}/packages/{}:similarlyNamedPackages",
+                self.base_url,
+                system.as_path_segment(),
+                urlencoding::encode(name),
+            );
 
-        let url = format!(
-            "{}/v3alpha/systems/{system}/packages/{}:similarlyNamedPackages",
-            self.base_url,
-            urlencoding::encode(name),
-        );
-
-        let (candidates, ttl) = match self.get(&url, TYPOSQUAT_CALL_TIMEOUT).await {
-            Ok(bytes) => {
-                match crate::parser::parse_json_checked::<SimilarlyNamedPackagesWire>(&bytes) {
-                    Ok(wire) => {
-                        // Filtered and capped *before* caching (issue #1437 security
-                        // review N2), not just at read time in `typosquat_signal`:
-                        // `GetSimilarlyNamedPackages` documents no upper bound on
-                        // `packages[]` (up to ~30k entries under the 1 MiB body cap), so
-                        // storing the full, uncapped list in the memo would keep that
-                        // worst case resident in memory across every memo entry.
-                        let candidates = wire
-                            .packages
-                            .into_iter()
-                            .map(|p| SimilarPackageCandidate {
-                                name: p.package_key.name,
-                            })
-                            .filter(|candidate| candidate.name != name)
-                            .take(TYPOSQUAT_MAX_CANDIDATES_CHECKED)
-                            .collect();
-                        (candidates, DEPS_DEV_SUCCESS_TTL)
-                    }
-                    Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            "deps.dev similarly-named-packages response parse failed"
-                        );
-                        (Vec::new(), DEPS_DEV_ERROR_TTL)
+            let (candidates, ttl) = match self.get(&url, TYPOSQUAT_CALL_TIMEOUT).await {
+                Ok(bytes) => {
+                    match crate::parser::parse_json_checked::<SimilarlyNamedPackagesWire>(&bytes) {
+                        Ok(wire) => {
+                            // Filtered and capped *before* caching (issue #1437 security
+                            // review N2), not just at read time in `typosquat_signal`:
+                            // `GetSimilarlyNamedPackages` documents no upper bound on
+                            // `packages[]` (up to ~30k entries under the 1 MiB body cap), so
+                            // storing the full, uncapped list in the memo would keep that
+                            // worst case resident in memory across every memo entry.
+                            let candidates = wire
+                                .packages
+                                .into_iter()
+                                .map(|p| SimilarPackageCandidate {
+                                    name: p.package_key.name,
+                                })
+                                .filter(|candidate| candidate.name != name)
+                                .take(TYPOSQUAT_MAX_CANDIDATES_CHECKED)
+                                .collect();
+                            (candidates, DEPS_DEV_SUCCESS_TTL)
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                error = %e,
+                                "deps.dev similarly-named-packages response parse failed"
+                            );
+                            (Vec::new(), DEPS_DEV_ERROR_TTL)
+                        }
                     }
                 }
-            }
-            Err(DepsDevFetchError::NotFound) => (Vec::new(), DEPS_DEV_SUCCESS_TTL),
-            Err(DepsDevFetchError::Failed(e)) => {
-                let (status, cause) = e.safe_tracing_summary();
-                tracing::debug!(
-                    status = ?status,
-                    cause,
-                    "deps.dev similarly-named-packages fetch failed"
-                );
-                (Vec::new(), DEPS_DEV_ERROR_TTL)
-            }
-            Err(DepsDevFetchError::TimedOut) => {
-                tracing::debug!(
-                    package = %crate::redact::redact_declaration_key(name),
-                    "deps.dev similarly-named-packages fetch timed out"
-                );
-                (Vec::new(), DEPS_DEV_ERROR_TTL)
-            }
-        };
+                Err(DepsDevFetchError::NotFound) => (Vec::new(), DEPS_DEV_SUCCESS_TTL),
+                Err(DepsDevFetchError::Failed(e)) => {
+                    let (status, cause) = e.safe_tracing_summary();
+                    tracing::debug!(
+                        status = ?status,
+                        cause,
+                        "deps.dev similarly-named-packages fetch failed"
+                    );
+                    (Vec::new(), DEPS_DEV_ERROR_TTL)
+                }
+                Err(DepsDevFetchError::TimedOut) => {
+                    tracing::debug!(
+                        package = %crate::redact::redact_declaration_key(name),
+                        "deps.dev similarly-named-packages fetch timed out"
+                    );
+                    (Vec::new(), DEPS_DEV_ERROR_TTL)
+                }
+            };
 
-        self.store_similarity_memo(key, candidates.clone(), ttl);
-        candidates
+            self.store_similarity_memo(key.clone(), candidates.clone(), ttl);
+            candidates
+        })
+        .await
     }
 
     fn store_similarity_memo(
@@ -818,7 +982,7 @@ impl DepsDevClient {
 
     /// Resolves (or serves from the popularity memo) `name`'s `GetDependents`-derived
     /// `dependentCount` for its default version, via `GetPackage` (plan.md §1).
-    async fn popularity(&self, system: &'static str, name: &str) -> Option<u64> {
+    async fn popularity(&self, system: DepsDevSystem, name: &str) -> Option<u64> {
         let key = PopularityMemoKey {
             base: self.base_url.clone(),
             system,
@@ -831,17 +995,19 @@ impl DepsDevClient {
             return entry.dependent_count;
         }
 
-        if !self.popularity_in_flight.insert(key.clone()) {
-            return None;
-        }
-        let _guard = InFlightGuard {
-            set: &self.popularity_in_flight,
-            key: key.clone(),
-        };
-
-        let (dependent_count, ttl) = self.fetch_popularity(system, name).await;
-        self.store_popularity_memo(key, dependent_count, ttl);
-        dependent_count
+        coalesce(&self.popularity_in_flight, key.clone(), || async {
+            // Re-check the memo now that this call has actually won the leader claim (issue
+            // #1455 critic M1) — see `trust_signal`'s identical recheck for why.
+            if let Some(entry) = self.popularity.get(&key)
+                && entry.fetched_at.elapsed() < entry.ttl
+            {
+                return entry.dependent_count;
+            }
+            let (dependent_count, ttl) = self.fetch_popularity(system, name).await;
+            self.store_popularity_memo(key.clone(), dependent_count, ttl);
+            dependent_count
+        })
+        .await
     }
 
     fn store_popularity_memo(
@@ -871,15 +1037,16 @@ impl DepsDevClient {
     /// The `GetPackage` -> default version -> `GetDependents` sequence (plan.md §1). Each
     /// step fails independently to `(None, ..)`, mirroring [`Self::fetch`]'s per-step
     /// degradation.
-    async fn fetch_popularity(&self, system: &'static str, name: &str) -> (Option<u64>, Duration) {
+    async fn fetch_popularity(&self, system: DepsDevSystem, name: &str) -> (Option<u64>, Duration) {
         if is_dot_segment(name) {
             warn_rejected_value("is_dot_segment", "deps.dev package request URL", name);
             return (None, DEPS_DEV_SUCCESS_TTL);
         }
 
         let package_url = format!(
-            "{}/v3alpha/systems/{system}/packages/{}",
+            "{}/v3alpha/systems/{}/packages/{}",
             self.base_url,
+            system.as_path_segment(),
             urlencoding::encode(name),
         );
 
@@ -919,8 +1086,9 @@ impl DepsDevClient {
         }
 
         let dependents_url = format!(
-            "{}/v3alpha/systems/{system}/packages/{}/versions/{}:dependents",
+            "{}/v3alpha/systems/{}/packages/{}/versions/{}:dependents",
             self.base_url,
+            system.as_path_segment(),
             urlencoding::encode(name),
             urlencoding::encode(&default_version),
         );
@@ -998,13 +1166,39 @@ mod tests {
 
     #[test]
     fn deps_dev_system_covers_seven_ecosystems() {
-        assert_eq!(deps_dev_system(EcosystemId::Npm), Some("npm"));
-        assert_eq!(deps_dev_system(EcosystemId::Cargo), Some("cargo"));
-        assert_eq!(deps_dev_system(EcosystemId::Go), Some("go"));
-        assert_eq!(deps_dev_system(EcosystemId::Maven), Some("maven"));
-        assert_eq!(deps_dev_system(EcosystemId::Pypi), Some("pypi"));
-        assert_eq!(deps_dev_system(EcosystemId::Bundler), Some("rubygems"));
-        assert_eq!(deps_dev_system(EcosystemId::NuGet), Some("nuget"));
+        assert_eq!(deps_dev_system(EcosystemId::Npm), Some(DepsDevSystem::Npm));
+        assert_eq!(
+            deps_dev_system(EcosystemId::Cargo),
+            Some(DepsDevSystem::Cargo)
+        );
+        assert_eq!(deps_dev_system(EcosystemId::Go), Some(DepsDevSystem::Go));
+        assert_eq!(
+            deps_dev_system(EcosystemId::Maven),
+            Some(DepsDevSystem::Maven)
+        );
+        assert_eq!(
+            deps_dev_system(EcosystemId::Pypi),
+            Some(DepsDevSystem::Pypi)
+        );
+        assert_eq!(
+            deps_dev_system(EcosystemId::Bundler),
+            Some(DepsDevSystem::Rubygems)
+        );
+        assert_eq!(
+            deps_dev_system(EcosystemId::NuGet),
+            Some(DepsDevSystem::NuGet)
+        );
+    }
+
+    #[test]
+    fn deps_dev_system_as_path_segment_matches_deps_dev_api() {
+        assert_eq!(DepsDevSystem::Npm.as_path_segment(), "npm");
+        assert_eq!(DepsDevSystem::Cargo.as_path_segment(), "cargo");
+        assert_eq!(DepsDevSystem::Go.as_path_segment(), "go");
+        assert_eq!(DepsDevSystem::Maven.as_path_segment(), "maven");
+        assert_eq!(DepsDevSystem::Pypi.as_path_segment(), "pypi");
+        assert_eq!(DepsDevSystem::Rubygems.as_path_segment(), "rubygems");
+        assert_eq!(DepsDevSystem::NuGet.as_path_segment(), "nuget");
     }
 
     #[test]
@@ -1079,7 +1273,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "sigstore", "2.3.1")
+            .trust_signal(DepsDevSystem::Npm, "sigstore", "2.3.1")
             .await
             .expect("signal expected");
         assert_eq!(signal.provenance, Some(ProvenanceStatus::Verified));
@@ -1104,7 +1298,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "sigstore", "2.3.1")
+            .trust_signal(DepsDevSystem::Npm, "sigstore", "2.3.1")
             .await
             .expect("signal expected");
         assert_eq!(
@@ -1126,7 +1320,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "express", "4.19.2")
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
             .await
             .expect("signal expected");
         assert!(signal.licenses.is_empty());
@@ -1153,7 +1347,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "left-pad", "1.0.0")
+            .trust_signal(DepsDevSystem::Npm, "left-pad", "1.0.0")
             .await
             .expect("signal expected");
         let scorecard = signal.scorecard.expect("scorecard expected");
@@ -1170,7 +1364,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.trust_signal("npm", "express", "4.19.2").await;
+        let signal = client
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .await;
         assert!(signal.is_none());
     }
 
@@ -1190,7 +1386,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "sigstore", "2.3.1")
+            .trust_signal(DepsDevSystem::Npm, "sigstore", "2.3.1")
             .await
             .expect("signal expected");
         assert_eq!(signal.provenance, Some(ProvenanceStatus::Verified));
@@ -1214,7 +1410,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "express", "4.19.2")
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
             .await
             .expect("signal expected");
         assert_eq!(signal.provenance, Some(ProvenanceStatus::None));
@@ -1232,7 +1428,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.trust_signal("npm", "express", "4.19.2").await;
+        let signal = client
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .await;
         assert!(signal.is_none());
     }
 
@@ -1246,7 +1444,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.trust_signal("npm", "missing", "1.0.0").await;
+        let signal = client
+            .trust_signal(DepsDevSystem::Npm, "missing", "1.0.0")
+            .await;
         assert!(signal.is_none());
     }
 
@@ -1267,7 +1467,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "express", "4.19.2")
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
@@ -1291,8 +1491,12 @@ mod tests {
             .create_async()
             .await;
 
-        client.trust_signal("npm", "express", "4.19.2").await;
-        client.trust_signal("npm", "express", "4.19.2").await;
+        client
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .await;
+        client
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .await;
 
         version.assert_async().await;
         project.assert_async().await;
@@ -1308,8 +1512,12 @@ mod tests {
             .create_async()
             .await;
 
-        client.trust_signal("npm", "missing", "1.0.0").await;
-        client.trust_signal("npm", "missing", "1.0.0").await;
+        client
+            .trust_signal(DepsDevSystem::Npm, "missing", "1.0.0")
+            .await;
+        client
+            .trust_signal(DepsDevSystem::Npm, "missing", "1.0.0")
+            .await;
 
         version.assert_async().await;
     }
@@ -1345,8 +1553,12 @@ mod tests {
             .create_async()
             .await;
 
-        client.trust_signal("npm", "pkg-a", "1.0.0").await;
-        client.trust_signal("npm", "pkg-b", "1.0.0").await;
+        client
+            .trust_signal(DepsDevSystem::Npm, "pkg-a", "1.0.0")
+            .await;
+        client
+            .trust_signal(DepsDevSystem::Npm, "pkg-b", "1.0.0")
+            .await;
 
         project.assert_async().await;
     }
@@ -1366,7 +1578,7 @@ mod tests {
             .await;
 
         client
-            .trust_signal("go", "golang.org/x/text", "v0.4.0")
+            .trust_signal(DepsDevSystem::Go, "golang.org/x/text", "v0.4.0")
             .await;
 
         version.assert_async().await;
@@ -1386,7 +1598,9 @@ mod tests {
             .create_async()
             .await;
 
-        client.trust_signal("npm", "@types/node", "20.0.0").await;
+        client
+            .trust_signal(DepsDevSystem::Npm, "@types/node", "20.0.0")
+            .await;
 
         version.assert_async().await;
     }
@@ -1406,7 +1620,7 @@ mod tests {
             .await;
 
         client
-            .trust_signal("maven", "com.google.guava:guava", "32.0.0")
+            .trust_signal(DepsDevSystem::Maven, "com.google.guava:guava", "32.0.0")
             .await;
 
         version.assert_async().await;
@@ -1418,7 +1632,7 @@ mod tests {
         client.store_memo(
             MemoKey {
                 base: "https://api.deps.dev".to_string(),
-                system: "npm",
+                system: DepsDevSystem::Npm,
                 name: "a\0b".to_string(),
                 version: "c".to_string(),
             },
@@ -1427,7 +1641,7 @@ mod tests {
         );
         assert!(!client.memo.contains_key(&MemoKey {
             base: "https://api.deps.dev".to_string(),
-            system: "npm",
+            system: DepsDevSystem::Npm,
             name: "a".to_string(),
             version: "b\0c".to_string(),
         }));
@@ -1453,7 +1667,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "evil", "1.0.0")
+            .trust_signal(DepsDevSystem::Npm, "evil", "1.0.0")
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
@@ -1472,8 +1686,18 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.trust_signal("npm", ".", "1.0.0").await.is_none());
-        assert!(client.trust_signal("npm", "..", "1.0.0").await.is_none());
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, ".", "1.0.0")
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, "..", "1.0.0")
+                .await
+                .is_none()
+        );
         call.assert_async().await;
     }
 
@@ -1488,8 +1712,18 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.trust_signal("npm", "left-pad", ".").await.is_none());
-        assert!(client.trust_signal("npm", "left-pad", "..").await.is_none());
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, "left-pad", ".")
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, "left-pad", "..")
+                .await
+                .is_none()
+        );
         call.assert_async().await;
     }
 
@@ -1521,16 +1755,26 @@ mod tests {
         let (a, b) = tokio::join!(
             {
                 let client = Arc::clone(&client);
-                async move { client.trust_signal("npm", "express", "4.19.2").await }
+                async move {
+                    client
+                        .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+                        .await
+                }
             },
             {
                 let client = Arc::clone(&client);
-                async move { client.trust_signal("npm", "express", "4.19.2").await }
+                async move {
+                    client
+                        .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+                        .await
+                }
             }
         );
-        // Exactly one of the two concurrent calls does the fetch; the other
-        // sees the key already claimed and returns `None` immediately.
-        assert!(a.is_some() || b.is_some());
+        // Exactly one of the two concurrent calls does the fetch; the other awaits the
+        // leader's result via `coalesce` instead of returning `None` immediately (issue
+        // #1454), so both must see the real signal.
+        assert!(a.is_some());
+        assert!(b.is_some());
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -1561,10 +1805,11 @@ mod tests {
             .await;
 
         let spawn_client = Arc::clone(&client);
-        let handle =
-            tokio::spawn(
-                async move { spawn_client.trust_signal("npm", "express", "4.19.2").await },
-            );
+        let handle = tokio::spawn(async move {
+            spawn_client
+                .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+                .await
+        });
         // Deliberately much shorter than the mock's 60ms response — this must
         // reliably elapse first.
         let outcome = tokio::time::timeout(Duration::from_millis(5), handle).await;
@@ -1579,7 +1824,9 @@ mod tests {
         // scheduling slack) and write the memo.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
-        let second = client.trust_signal("npm", "express", "4.19.2").await;
+        let second = client
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .await;
         assert!(
             second.is_some(),
             "the memo warmed by the detached task must serve the next call"
@@ -1628,7 +1875,7 @@ mod tests {
 
         // A first (attested), warming the shared project memo.
         let signal_a = client
-            .trust_signal("npm", "pkg-a", "1.0.0")
+            .trust_signal(DepsDevSystem::Npm, "pkg-a", "1.0.0")
             .await
             .expect("signal expected");
         assert!(
@@ -1642,7 +1889,7 @@ mod tests {
         // B second, hitting the now-warm project memo, but with its own
         // (self-reported) relation.
         let signal_b = client
-            .trust_signal("npm", "pkg-b", "1.0.0")
+            .trust_signal(DepsDevSystem::Npm, "pkg-b", "1.0.0")
             .await
             .expect("signal expected");
         assert!(
@@ -1678,14 +1925,14 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "express", "4.19.2")
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
 
         let key = MemoKey {
             base: client.base_url.clone(),
-            system: "npm",
+            system: DepsDevSystem::Npm,
             name: "express".to_string(),
             version: "4.19.2".to_string(),
         };
@@ -1719,7 +1966,7 @@ mod tests {
             .await;
 
         let signal = client
-            .trust_signal("npm", "express", "4.19.2")
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
             .await
             .expect("signal expected (provenance still present)");
         assert!(signal.scorecard.is_none());
@@ -1737,17 +1984,19 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.trust_signal("npm", "express", "4.19.2").await;
+        let signal = client
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .await;
         assert!(signal.is_none());
 
         let key = MemoKey {
             base: client.base_url.clone(),
-            system: "npm",
+            system: DepsDevSystem::Npm,
             name: "express".to_string(),
             version: "4.19.2".to_string(),
         };
         assert!(
-            !client.in_flight.contains(&key),
+            !client.in_flight.contains_key(&key),
             "the in-flight claim must be released after a failed fetch, not just a successful one"
         );
     }
@@ -1765,12 +2014,14 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.trust_signal("npm", "express", "4.19.2").await;
+        let signal = client
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
+            .await;
         assert!(signal.is_none());
 
         let key = MemoKey {
             base: client.base_url.clone(),
-            system: "npm",
+            system: DepsDevSystem::Npm,
             name: "express".to_string(),
             version: "4.19.2".to_string(),
         };
@@ -1791,7 +2042,7 @@ mod tests {
             client.store_memo(
                 MemoKey {
                     base: "https://api.deps.dev".to_string(),
-                    system: "npm",
+                    system: DepsDevSystem::Npm,
                     name: format!("pkg-{i}"),
                     version: "1.0.0".to_string(),
                 },
@@ -1804,7 +2055,7 @@ mod tests {
         client.store_memo(
             MemoKey {
                 base: "https://api.deps.dev".to_string(),
-                system: "npm",
+                system: DepsDevSystem::Npm,
                 name: "overflow".to_string(),
                 version: "1.0.0".to_string(),
             },
@@ -1828,7 +2079,7 @@ mod tests {
     async fn trust_signal_real_npm_express_carries_license() {
         let client = client();
         let signal = client
-            .trust_signal("npm", "express", "4.19.2")
+            .trust_signal(DepsDevSystem::Npm, "express", "4.19.2")
             .await
             .expect("signal expected for a real, well-known package");
         assert!(
@@ -1919,10 +2170,9 @@ mod tests {
             .await;
 
         let signal = client
-            .typosquat_signal("npm", "crossenv")
+            .typosquat_signal(DepsDevSystem::Npm, "crossenv")
             .await
             .expect("300x ratio must fire");
-        assert_eq!(signal.declared_name, "crossenv");
         assert_eq!(signal.suspected_name, "cross-env");
         assert_eq!(signal.declared_dependent_count, 3);
         assert_eq!(signal.suspected_dependent_count, 900);
@@ -1975,7 +2225,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal("npm", "coffeescript").await;
+        let signal = client
+            .typosquat_signal(DepsDevSystem::Npm, "coffeescript")
+            .await;
         assert!(
             signal.is_none(),
             "a ~6.9x ratio must stay well under the 50x threshold"
@@ -2002,7 +2254,7 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal("npm", "missing").await;
+        let signal = client.typosquat_signal(DepsDevSystem::Npm, "missing").await;
         assert!(signal.is_none());
         package_call.assert_async().await;
     }
@@ -2026,7 +2278,7 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal("npm", "slow").await;
+        let signal = client.typosquat_signal(DepsDevSystem::Npm, "slow").await;
         assert!(signal.is_none());
     }
 
@@ -2043,7 +2295,7 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal("npm", "broken").await;
+        let signal = client.typosquat_signal(DepsDevSystem::Npm, "broken").await;
         assert!(signal.is_none());
     }
 
@@ -2062,8 +2314,8 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.popularity("npm", ".").await.is_none());
-        assert!(client.popularity("npm", "..").await.is_none());
+        assert!(client.popularity(DepsDevSystem::Npm, ".").await.is_none());
+        assert!(client.popularity(DepsDevSystem::Npm, "..").await.is_none());
         call.assert_async().await;
     }
 
@@ -2090,7 +2342,7 @@ mod tests {
             .create_async()
             .await;
 
-        let dependent_count = client.popularity("npm", "evil").await;
+        let dependent_count = client.popularity(DepsDevSystem::Npm, "evil").await;
         assert!(dependent_count.is_none());
         dependents_call.assert_async().await;
     }
@@ -2117,12 +2369,12 @@ mod tests {
             .create_async()
             .await;
 
-        let dependent_count = client.popularity("npm", "racy").await;
+        let dependent_count = client.popularity(DepsDevSystem::Npm, "racy").await;
         assert!(dependent_count.is_none());
 
         let key = PopularityMemoKey {
             base: client.base_url.clone(),
-            system: "npm",
+            system: DepsDevSystem::Npm,
             name: "racy".to_string(),
         };
         let entry_ttl = client
@@ -2158,7 +2410,7 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal("npm", "lonely").await;
+        let signal = client.typosquat_signal(DepsDevSystem::Npm, "lonely").await;
         assert!(signal.is_none());
         package_call.assert_async().await;
     }
@@ -2204,7 +2456,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal("npm", "self-echo").await;
+        let signal = client
+            .typosquat_signal(DepsDevSystem::Npm, "self-echo")
+            .await;
         assert!(signal.is_none());
         similarity.assert_async().await;
         declared_package.assert_async().await;
@@ -2282,7 +2536,7 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal("npm", "tiny").await;
+        let signal = client.typosquat_signal(DepsDevSystem::Npm, "tiny").await;
         assert!(
             signal.is_some(),
             "at least one of the capped candidates should still qualify"
@@ -2306,8 +2560,18 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.similar_packages("npm", ".").await.is_empty());
-        assert!(client.similar_packages("npm", "..").await.is_empty());
+        assert!(
+            client
+                .similar_packages(DepsDevSystem::Npm, ".")
+                .await
+                .is_empty()
+        );
+        assert!(
+            client
+                .similar_packages(DepsDevSystem::Npm, "..")
+                .await
+                .is_empty()
+        );
         call.assert_async().await;
     }
 
@@ -2338,7 +2602,7 @@ mod tests {
             .create_async()
             .await;
 
-        let candidates = client.similar_packages("npm", "tiny").await;
+        let candidates = client.similar_packages(DepsDevSystem::Npm, "tiny").await;
 
         assert_eq!(
             candidates.len(),
@@ -2352,7 +2616,7 @@ mod tests {
 
         let key = SimilarityMemoKey {
             base: client.base_url.clone(),
-            system: "npm",
+            system: DepsDevSystem::Npm,
             name: "tiny".to_string(),
         };
         let memo_len = client
@@ -2418,8 +2682,12 @@ mod tests {
             .create_async()
             .await;
 
-        client.typosquat_signal("npm", "crossenv").await;
-        client.typosquat_signal("npm", "crossenv").await;
+        client
+            .typosquat_signal(DepsDevSystem::Npm, "crossenv")
+            .await;
+        client
+            .typosquat_signal(DepsDevSystem::Npm, "crossenv")
+            .await;
 
         similarity.assert_async().await;
         declared_package.assert_async().await;
@@ -2519,24 +2787,107 @@ mod tests {
         let (a, b) = tokio::join!(
             {
                 let client = Arc::clone(&client);
-                async move { client.typosquat_signal("npm", "pkg-a").await }
+                async move { client.typosquat_signal(DepsDevSystem::Npm, "pkg-a").await }
             },
             {
                 let client = Arc::clone(&client);
-                async move { client.typosquat_signal("npm", "pkg-b").await }
+                async move { client.typosquat_signal(DepsDevSystem::Npm, "pkg-b").await }
             }
         );
-        // At least one of the two concurrent calls must see the real, non-degraded
-        // candidate popularity — the other may legitimately degrade to `None` if it lost
-        // the in-flight race (mirroring `trust_signal`'s own `a.is_some() || b.is_some()`
-        // assertion for the identical mechanism).
-        assert!(a.is_some() || b.is_some());
+        // Both concurrent calls must see the real, non-degraded candidate popularity
+        // (issue #1454): the loser of the in-flight race awaits the leader's result via
+        // `coalesce` instead of degrading to `None`.
+        assert!(a.is_some(), "pkg-a must see the real typosquat signal");
+        assert!(b.is_some(), "pkg-b must see the real typosquat signal");
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,
             "exactly one of the two concurrent calls must fetch the shared candidate's \
-             GetPackage; the other must see the in-flight claim and degrade to None rather \
-             than duplicate the request"
+             GetPackage; the other must await that in-flight fetch's result rather than \
+             duplicating the request"
+        );
+    }
+
+    /// Issue #1454 panic-safety, updated for #1455 critic S2's fix: a leader's `fetch`
+    /// panicking must not deadlock or panic a follower awaiting it via [`coalesce`] — the
+    /// follower now takes over as the new leader and recovers the *real* value from its own
+    /// fetch (previously it fell back to `V::default()`, reintroducing #1454's own
+    /// false-negative shape), and the in-flight entry is still cleaned up (via
+    /// [`InFlightGuard`]'s `Drop`) so a later call for the same key is not permanently
+    /// blocked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_leader_panic_lets_follower_take_over_and_recover_real_value() {
+        let map: Arc<DashMap<u32, watch::Receiver<Slot<u32>>>> = Arc::new(DashMap::new());
+
+        let leader_map = Arc::clone(&map);
+        let leader = tokio::spawn(async move {
+            coalesce(&leader_map, 1u32, || async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                panic!("leader fetch panics");
+                #[allow(unreachable_code)]
+                0u32
+            })
+            .await
+        });
+
+        // Give the leader time to claim the in-flight entry before the follower starts.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let follower = coalesce(&map, 1u32, || async { 99u32 }).await;
+
+        assert!(
+            leader.await.is_err(),
+            "the leader's own task must observe the panic"
+        );
+        assert_eq!(
+            follower, 99,
+            "a follower whose leader panicked must take over and recover the real value from \
+             its own fetch, never deadlock, panic itself, or silently degrade to V::default()"
+        );
+        assert!(
+            !map.contains_key(&1u32),
+            "the in-flight entry must be cleaned up after the leader panic and the follower's \
+             own successful takeover"
+        );
+    }
+
+    /// Issue #1455 critic S2: the same recovery as the panic test above, but for a leader
+    /// cancelled by `AbortHandle::abort()` rather than a panic — the routine case #1455 itself
+    /// introduced via `ServerState::track_typosquat_task`'s supersede-and-abort pattern, the
+    /// whole-document `tokio::time::timeout` around `fetch_typosquat_signals`, and `did_close`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesce_aborted_leader_lets_follower_take_over_and_recover_real_value() {
+        let map: Arc<DashMap<u32, watch::Receiver<Slot<u32>>>> = Arc::new(DashMap::new());
+
+        let leader_map = Arc::clone(&map);
+        let leader = tokio::spawn(async move {
+            coalesce(&leader_map, 1u32, || async {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                0u32
+            })
+            .await
+        });
+        // Give the leader time to claim the in-flight entry.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let follower_map = Arc::clone(&map);
+        let follower =
+            tokio::spawn(async move { coalesce(&follower_map, 1u32, || async { 7u32 }).await });
+        // Give the follower time to join (see the Occupied entry and start waiting on
+        // `changed()`) before the leader is cancelled out from under it.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        leader.abort();
+
+        let follower_result = follower.await.expect("follower task must not panic");
+        assert_eq!(
+            follower_result, 7,
+            "a follower whose leader was aborted (not panicked) must take over and recover \
+             the real value from its own fetch, not silently degrade to V::default()"
+        );
+        assert!(
+            !map.contains_key(&1u32),
+            "the in-flight entry must be cleaned up after the leader's abort and the \
+             follower's own successful takeover"
         );
     }
 }

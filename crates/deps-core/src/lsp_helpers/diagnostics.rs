@@ -9632,7 +9632,6 @@ mod tests {
 
         fn crossenv_signal() -> TyposquatSignal {
             TyposquatSignal {
-                declared_name: "crossenv".to_string(),
                 suspected_name: "cross-env".to_string(),
                 declared_dependent_count: 3,
                 suspected_dependent_count: 900,

@@ -54,7 +54,8 @@ use std::sync::Arc;
 use deps_core::config_trust::{self, ConfigTier, EnvVarSyntax};
 use deps_core::net_policy::{
     BlockedHostReason, HostClass, IndexUrlError, RedactedUrl, RegistryAccessPolicy,
-    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, ValidatedRegistryUrl,
+    RegistryRejectionClassifier, RegistryRejectionReason, RegistryUrlKind, RejectionOutcome,
+    ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
@@ -112,12 +113,14 @@ impl BlockedHostReason for NpmRegistryIndexError {
 /// `ExpansionNotAllowedInProjectTier`) silently dropped the affected dependency from the fetch
 /// queue with no trace beyond a `tracing::warn!` (#1438).
 impl RegistryRejectionClassifier for NpmRegistryIndexError {
-    fn rejection_reason(&self) -> Option<RegistryRejectionReason> {
+    fn rejection_reason(&self) -> RejectionOutcome {
         match self {
             Self::Url(e) => e.rejection_reason(),
-            Self::UndefinedEnvVar(_) => Some(RegistryRejectionReason::UndefinedEnvVar),
+            Self::UndefinedEnvVar(_) => {
+                RejectionOutcome::Reject(RegistryRejectionReason::UndefinedEnvVar)
+            }
             Self::ExpansionNotAllowedInProjectTier => {
-                Some(RegistryRejectionReason::EnvVarExpansionNotPermitted)
+                RejectionOutcome::Reject(RegistryRejectionReason::EnvVarExpansionNotPermitted)
             }
         }
     }
