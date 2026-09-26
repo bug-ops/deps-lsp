@@ -72,6 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-core**: `coalesce()` leader-takeover regression tests no longer rely on sleep-based ordering that could silently stop exercising the takeover path under load (resolves #1464) (#1515)
 - **deps-maven**: dependencies resolved from a local `<repositories>/<repository><url>file://...</url>` are now classified as `Path` sources (resolves #1503) (#1508)
 - **deps-core**: unsatisfiable-requirement diagnostics no longer compile the same version requirement twice per call, across all 14 ecosystems (resolves #1494)
 - **deps-deno**: unsatisfiable `npm:`/`jsr:` requirement diagnostics in `deno.json`/`deno.jsonc` now include the pre-release hint, matching `package.json`'s (resolves #1478) (#1492)
