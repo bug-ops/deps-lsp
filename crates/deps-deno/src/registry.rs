@@ -609,16 +609,22 @@ impl Registry for DenoRegistry {
             match split_scheme(name.as_str()) {
                 Some((Scheme::Jsr, rest)) => {
                     let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
-                    let versions = self.jsr.get_versions(scope, pkg).await?;
-                    let parsed_req = node_semver::Range::parse(req.as_str())
+                    // Pre-check before any network call: a malformed requirement must stay
+                    // `Err` (R5c's diagnostic), not silently become `Ok(None)` (R5e, no diagnostic).
+                    node_semver::Range::parse(req.as_str())
                         .map_err(|e| DepsError::InvalidVersionReq(e.to_string()))?;
-                    Ok(versions
+                    let versions: Vec<Box<dyn Version>> = self
+                        .jsr
+                        .get_versions(scope, pkg)
+                        .await?
                         .into_iter()
-                        .find(|v| {
-                            node_semver::Version::parse(&v.version)
-                                .is_ok_and(|ver| parsed_req.satisfies(&ver) && !v.yanked)
-                        })
-                        .map(|v| Box::new(v) as Box<dyn Version>))
+                        .map(|v| Box::new(v) as Box<dyn Version>)
+                        .collect();
+                    // #1493: delegate to the shared matcher instead of a second, drifted
+                    // hand-rolled loop that missed the #338 wildcard-existence fallback.
+                    Ok(self
+                        .select_latest_matching(&versions, req, selection_context)
+                        .and_then(|idx| versions.into_iter().nth(idx)))
                 }
                 Some((Scheme::Npm, rest)) => {
                     let bare = npm_bare_name(name, rest)?;
@@ -1117,6 +1123,108 @@ mod tests {
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version_string(), "1.0.0");
         mock.assert_async().await;
+    }
+
+    // --- #1493: `get_latest_matching`'s `jsr:` branch must route through the shared
+    // `select_latest_matching` matcher instead of a hand-rolled `node_semver::Range` loop ---
+
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_jsr_semver_range_via_mock() {
+        let mut server = mockito::Server::new_async().await;
+        let cache = Arc::new(HttpCache::new());
+        let jsr = JsrRegistry::with_bases(Arc::clone(&cache), server.url(), server.url());
+        let registry = DenoRegistry {
+            jsr,
+            npm: NpmRegistry::new(cache),
+        };
+
+        server
+            .mock("GET", "/@std/fs/meta.json")
+            .with_status(200)
+            .with_body(
+                r#"{"versions": {
+                    "1.0.0": {"createdAt": "2024-01-01T00:00:00Z"},
+                    "2.0.0": {"createdAt": "2025-01-01T00:00:00Z"}
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("jsr:@std/fs"),
+            &VersionReq::new("^1.0.0"),
+            &deps_core::SelectionContext::none(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(latest.unwrap().version_string(), "1.0.0");
+    }
+
+    /// #1493 NFR-001 (the actual bug): a wildcard requirement against an all-yanked JSR
+    /// package must resolve to the newest yanked version instead of `None` — the hand-rolled
+    /// matcher this branch used to have (`!v.yanked` with no #338 existence fallback) returned
+    /// `None` here; the shared `select_latest_matching` matcher does not.
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_jsr_wildcard_all_yanked_returns_newest() {
+        let mut server = mockito::Server::new_async().await;
+        let cache = Arc::new(HttpCache::new());
+        let jsr = JsrRegistry::with_bases(Arc::clone(&cache), server.url(), server.url());
+        let registry = DenoRegistry {
+            jsr,
+            npm: NpmRegistry::new(cache),
+        };
+
+        server
+            .mock("GET", "/@std/fs/meta.json")
+            .with_status(200)
+            .with_body(
+                r#"{"versions": {
+                    "1.0.0": {"yanked": true, "createdAt": "2024-01-01T00:00:00Z"},
+                    "2.0.0": {"yanked": true, "createdAt": "2025-01-01T00:00:00Z"}
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        let latest = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("jsr:@std/fs"),
+            &VersionReq::new("*"),
+            &deps_core::SelectionContext::none(),
+        )
+        .await
+        .unwrap();
+
+        let version = latest.expect("an all-yanked JSR package must still resolve a latest");
+        assert_eq!(version.version_string(), "2.0.0");
+    }
+
+    /// #1493 (impl-critic S1): a malformed requirement must still surface as
+    /// `Err(DepsError::InvalidVersionReq)`, matching npm's own inherent `get_latest_matching`
+    /// — `Ok(None)` here would silently drop the "registry lookup failed" diagnostic a real
+    /// typo'd `jsr:` requirement needs (see `fetch_and_classify_package`'s R5c vs. R5e
+    /// diagnostic-rule split). The pre-check must also short-circuit before any network call,
+    /// which `unreachable_jsr` below proves by construction.
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_jsr_malformed_req_returns_err() {
+        let registry = DenoRegistry {
+            jsr: unreachable_jsr(Arc::new(HttpCache::new())),
+            npm: NpmRegistry::new(Arc::new(HttpCache::new())),
+        };
+
+        let Err(err) = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("jsr:@std/fs"),
+            &VersionReq::new("not-a-valid-range!!"),
+            &deps_core::SelectionContext::none(),
+        )
+        .await
+        else {
+            panic!("expected an error for a malformed jsr: version requirement");
+        };
+        assert_matches!(err, DepsError::InvalidVersionReq(_));
     }
 
     // --- S-L1: dot-prefixed JSR segment must be rejected before building the URL ---
