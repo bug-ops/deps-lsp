@@ -520,6 +520,9 @@ impl NpmRegistry {
     /// Returns an error if:
     /// - HTTP request fails
     /// - Package does not exist
+    /// - `req_str` is longer than [`MAX_REQUIREMENT_LEN`](deps_core::lsp_helpers::MAX_REQUIREMENT_LEN) bytes (rejected before parsing, see
+    ///   [`requirement_len_exceeds_cap`](deps_core::lsp_helpers::requirement_len_exceeds_cap))
+    /// - `req_str` doesn't parse as a valid npm semver range
     ///
     /// # Examples
     ///
@@ -536,12 +539,22 @@ impl NpmRegistry {
     /// assert!(latest.is_some());
     /// # }
     /// ```
-    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), version = ?req_str), level = "debug")]
+    #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name), req_len = req_str.len()), level = "debug")]
     pub async fn get_latest_matching(
         &self,
         name: &str,
         req_str: &str,
     ) -> Result<Option<NpmVersion>> {
+        // Reject before the network fetch below and before `Range::parse` (see
+        // `requirement_len_exceeds_cap`'s docs). Checked first so an oversized requirement
+        // never pays for a full packument fetch it can't use (impl-critic M2).
+        if deps_core::lsp_helpers::requirement_len_exceeds_cap(req_str) {
+            return Err(DepsError::InvalidVersionReq(format!(
+                "version requirement exceeds {} bytes",
+                deps_core::lsp_helpers::MAX_REQUIREMENT_LEN
+            )));
+        }
+
         let versions = self.get_versions(name).await?;
 
         if deps_core::is_existence_wildcard_str(req_str) {
@@ -910,6 +923,9 @@ impl deps_core::Registry for NpmRegistry {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
         let req_str = req.as_str();
+        if deps_core::lsp_helpers::requirement_len_exceeds_cap(req_str) {
+            return None;
+        }
         let parsed_req = node_semver::Range::parse(req_str).ok()?;
         versions.iter().position(|v| {
             node_semver::Version::parse(v.version_string()).is_ok_and(|ver| {
@@ -1539,6 +1555,75 @@ mod tests {
         );
     }
 
+    /// #1490 fixture shared by the oversized-rejection tests below: a *parseable* 257-byte
+    /// (`MAX_REQUIREMENT_LEN + 1`) range (28 `"1.0.0 || "` alternatives plus a trailing
+    /// `"1.0.0"`) — deliberately parseable so a rejection can only be explained by the length
+    /// gate, not an incidental parse failure (impl-critic S2).
+    fn oversized_parseable_range() -> String {
+        let range = format!("{}1.0.0", "1.0.0 || ".repeat(28));
+        assert_eq!(range.len(), deps_core::lsp_helpers::MAX_REQUIREMENT_LEN + 1);
+        assert!(
+            node_semver::Range::parse(&range).is_ok(),
+            "fixture must be parseable so only the length gate explains a rejection"
+        );
+        range
+    }
+
+    /// #1490 fixture shared by the at-cap-still-parses tests below: a valid prerelease range
+    /// of exactly `MAX_REQUIREMENT_LEN` bytes, proving the cap is exclusive (`>`, not `>=`).
+    fn at_cap_range() -> String {
+        let prefix = "1.0.0-";
+        let padding_len = deps_core::lsp_helpers::MAX_REQUIREMENT_LEN - prefix.len();
+        let range = format!("{prefix}{}", "a".repeat(padding_len));
+        assert_eq!(range.len(), deps_core::lsp_helpers::MAX_REQUIREMENT_LEN);
+        range
+    }
+
+    /// #1490 (CWE-400): a requirement longer than `MAX_REQUIREMENT_LEN` must be rejected
+    /// before it ever reaches `node_semver::Range::parse` — matches the existing `.ok()?`
+    /// parse-failure semantics at this call site.
+    #[test]
+    fn test_select_latest_matching_oversized_req_returns_none() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
+            version: "1.0.0".into(),
+            deprecated: false,
+            deprecation: None,
+            published_at: None,
+        })];
+        let oversized = oversized_parseable_range();
+        let req = VersionReq::new(&oversized);
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            None
+        );
+    }
+
+    /// The cap is exclusive: a requirement of exactly `MAX_REQUIREMENT_LEN` bytes must still
+    /// reach `node_semver::Range::parse` and resolve normally.
+    #[test]
+    fn test_select_latest_matching_req_at_length_cap_still_parses() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let at_cap = at_cap_range();
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
+            version: at_cap.clone().into(),
+            deprecated: false,
+            deprecation: None,
+            published_at: None,
+        })];
+        let req = VersionReq::new(&at_cap);
+        assert_eq!(
+            registry.select_latest_matching(&versions, &req, &deps_core::SelectionContext::none()),
+            Some(0)
+        );
+    }
+
     /// B2: `get_latest_matching`'s wildcard branch must agree with
     /// `select_latest_matching`'s on the same prerelease-at-front shape.
     #[tokio::test]
@@ -1564,6 +1649,72 @@ mod tests {
 
         let version = latest.expect("react has a stable version");
         assert_eq!(version.version, "19.1.0");
+    }
+
+    /// #1490 (CWE-400): a requirement longer than `MAX_REQUIREMENT_LEN` must be rejected
+    /// before it ever reaches `node_semver::Range::parse`, which allocates roughly 1.6 KB per
+    /// `||` alternative and so is a resource-exhaustion vector on an unbounded string, and
+    /// before the packument fetch below it, so an oversized requirement never pays for a full
+    /// network round trip it can't use. The error message must state the byte limit, not
+    /// embed the raw oversized value; the mock is set to `expect(0)` and asserted to prove the
+    /// gate fires before the fetch (impl-critic M2).
+    #[tokio::test]
+    async fn test_get_latest_matching_oversized_req_rejected_before_parse() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
+
+        let mock = server
+            .mock("GET", "/react")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(r#"{"versions": {"19.1.0": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let oversized = oversized_parseable_range();
+
+        let err = registry
+            .get_latest_matching("react", &oversized)
+            .await
+            .expect_err("oversized requirement must be rejected");
+
+        let message = err.to_string();
+        assert!(message.contains("256"), "message: {message}");
+        assert!(
+            !message.contains(&oversized),
+            "message must not embed the raw oversized value: {message}"
+        );
+        mock.assert_async().await;
+    }
+
+    /// The cap is exclusive: a requirement of exactly `MAX_REQUIREMENT_LEN` bytes must still
+    /// reach `node_semver::Range::parse` and resolve normally, matching
+    /// `requirement_is_unsatisfiable`'s own `> MAX_REQUIREMENT_LEN` boundary.
+    #[tokio::test]
+    async fn test_get_latest_matching_req_at_length_cap_still_parses() {
+        let at_cap = at_cap_range();
+
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/react")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(format!(r#"{{"versions": {{"{at_cap}": {{}}}}}}"#))
+            .create_async()
+            .await;
+
+        let latest = registry
+            .get_latest_matching("react", &at_cap)
+            .await
+            .unwrap();
+
+        let version = latest.expect("exact-match requirement must resolve at the cap boundary");
+        assert_eq!(version.version, at_cap.as_str());
     }
 
     /// N4: `get_latest_matching` and `select_latest_matching` must agree under `"*"` on

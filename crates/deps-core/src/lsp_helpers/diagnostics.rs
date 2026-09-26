@@ -553,16 +553,38 @@ where
 /// constant (cross-ecosystem consistency rule, workspace `CLAUDE.md`).
 pub const MAX_REQUIREMENT_LEN: usize = 256;
 
-/// Reports whether `requirement`'s string exceeds [`MAX_REQUIREMENT_LEN`] — the same
-/// "unmodellable, so suppressed rather than compiled and scanned" bound
-/// [`requirement_is_unsatisfiable`] and `requirement_matches_only_yanked` already apply before
-/// compiling a requirement, generalized so other call sites that would otherwise hand an
-/// arbitrarily long string to an ecosystem's `compile_requirement`/comparator can suppress
-/// their own verdict the same way instead of duplicating the length check (#1472
-/// defense-in-depth: bounds the one-time parse/scan cost of a pathological requirement string
-/// for every ecosystem, on top of the bundler-specific algorithmic O(n^2) fix).
+/// Reports whether `requirement`'s raw string is longer than [`MAX_REQUIREMENT_LEN`] bytes.
+///
+/// This is the shared CWE-400 bound applied before handing a requirement string to any
+/// ecosystem's range/comparator parser (several, e.g. `node_semver::Range`, allocate roughly
+/// 1.6 KB per `||` alternative, making an unbounded string a resource-exhaustion vector) or to
+/// `compile_requirement`/`requirement_matches_only_yanked` (#1472 defense-in-depth: bounds the
+/// one-time parse/scan cost of a pathological requirement string for every ecosystem, on top
+/// of the bundler-specific algorithmic O(n^2) fix).
+///
+/// `pub` (#1483/#1490): reused outside `deps-core` by ecosystem-specific requirement sources
+/// that reach their own range parser directly, before a [`VersionReq`] exists — e.g.
+/// `deps-npm`'s pnpm `catalog:` resolver and its `npm:` alias/registry range parsing — rather
+/// than duplicating this exact `str::len() > MAX_REQUIREMENT_LEN` comparison inline at each
+/// call site (cross-ecosystem consistency rule, workspace `CLAUDE.md`). `requirement_is_oversized`
+/// is the [`VersionReq`]-typed sibling for call sites that already hold a resolved requirement.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, requirement_len_exceeds_cap};
+///
+/// assert!(!requirement_len_exceeds_cap("^1.0.0"));
+/// assert!(requirement_len_exceeds_cap(&"1".repeat(MAX_REQUIREMENT_LEN + 1)));
+/// ```
+pub fn requirement_len_exceeds_cap(requirement: &str) -> bool {
+    requirement.len() > MAX_REQUIREMENT_LEN
+}
+
+/// [`VersionReq`]-typed sibling of [`requirement_len_exceeds_cap`], for call sites that
+/// already hold a resolved requirement rather than a raw string.
 pub(crate) fn requirement_is_oversized(requirement: &VersionReq) -> bool {
-    requirement.as_str().len() > MAX_REQUIREMENT_LEN
+    requirement_len_exceeds_cap(requirement.as_str())
 }
 
 /// Returns `true` when no published version satisfies `requirement`.
