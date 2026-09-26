@@ -651,7 +651,7 @@ pub struct VersionData<'a> {
     /// Background-pre-fetched deps.dev GOSSIP cooldown/low-usage findings per declared
     /// dependency (issue #1456, spec 072), keyed by raw (unnormalized) package name —
     /// mirrors [`Self::typosquat_prefetch`]'s exact shape and rationale: populated by
-    /// `deps-lsp::document::gossip_prefetch`, via `DocumentState.gossip_findings`, and
+    /// `deps-lsp::document::gossip_prefetch`, via `DocumentState::signals.gossip_findings`, and
     /// merely read synchronously here — never fetched inline on the hover/diagnostics-
     /// generation path itself.
     ///

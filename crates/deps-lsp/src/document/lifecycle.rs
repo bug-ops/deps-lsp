@@ -278,7 +278,7 @@ async fn run_document_open_background_task(
     // joined before this function's diagnostics publish (impl-critic N2). See
     // `spawn_typosquat_prefetch_and_republish`'s own doc for why. Always spawns (the open
     // path has no previous state to gate against), but still seeds
-    // `DocumentState::typosquat_checked_names` from the just-opened content (issue #1455
+    // `PackageSignals::typosquat_checked_names` from the just-opened content (issue #1455
     // critic S1) so the *first* debounced edit afterward compares against a real baseline
     // instead of an empty one, which would otherwise make that first edit's gate fire even
     // for a version-only change.
@@ -418,7 +418,7 @@ async fn run_document_open_background_task(
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.update_cached_versions(fetch_result.versions);
         // Re-key raw -> normalized (§3.1): `FetchResult`'s three fields are
-        // raw-keyed, `DocumentState::outcomes` is normalized.
+        // raw-keyed, `PackageSignals::outcomes` is normalized.
         let formatter = ecosystem.formatter();
         let mut outcomes = DependencyOutcomes::new();
         for (name, d) in fetch_result.deprecations {
@@ -683,7 +683,7 @@ fn commit_parsed_document(
     // and only inserting the new one at the very end of this function left a window in
     // which a concurrent `documents.get_mut` write (e.g.
     // `osv_scan::run_typosquat_prefetch`'s timeout path clearing
-    // `DocumentState::typosquat_checked_names`) could land on the *old* entry after this
+    // `PackageSignals::typosquat_checked_names`) could land on the *old* entry after this
     // function already read it but before it replaces it, silently discarding that write the
     // moment this commit lands. One `Entry` held for the whole read-preserve-prune-write
     // sequence makes it atomic with respect to any other `state.documents` access for this
@@ -693,38 +693,13 @@ fn commit_parsed_document(
         preserve_cache(&mut doc_state, old_doc.get());
     }
 
-    // Prune stale cache entries for removed dependencies. `vulnerabilities`
-    // is keyed by the *normalized* name (unlike `cached_versions`/
-    // `resolved_versions`, which are raw-`dep.name()`-keyed), so pruning it
-    // with the raw name would silently no-op for Composer/Swift/NuGet-style
+    // Prune stale cache entries for removed dependencies. `vulnerabilities`/`outcomes`
+    // are keyed by the *normalized* name (unlike the other maps here, which are
+    // raw-`dep.name()`-keyed) — `PackageSignals::prune_removed` normalizes for those two
+    // internally, so pruning never silently no-ops for Composer/Swift/NuGet-style
     // ecosystems where normalization changes the string (critique M4).
     let formatter = ecosystem.formatter();
-    for removed_dep in &diff.removed {
-        doc_state.cached_versions.remove(removed_dep);
-        doc_state.resolved_versions.remove(removed_dep);
-        // Raw-`dep.name()`-keyed, same as `resolved_versions` above (issue #649) — must be
-        // pruned alongside it so a removed dependency's stale candidates never linger.
-        doc_state.resolved_version_candidates.remove(removed_dep);
-        // Raw-`dep.name()`-keyed, same as `resolved_versions`/`resolved_version_candidates`
-        // above (see `DocumentState::licenses`' doc) — round 3 finding #5: previously
-        // missing from this loop, so a document with dependencies repeatedly added and
-        // removed while staying open accumulated an ever-growing set of orphaned license
-        // entries never reclaimed until the document closed.
-        doc_state.licenses.remove(removed_dep);
-        // Raw-`dep.name()`-keyed, same as `licenses` above (issue #1437) — same orphaned-entry
-        // reclaim rationale.
-        doc_state.typosquats.remove(removed_dep);
-        // Raw-`dep.name()`-keyed, same as `typosquats` above (issue #1456, spec 072) — same
-        // orphaned-entry reclaim rationale.
-        doc_state.gossip_findings.remove(removed_dep);
-        let removed_normalized_name = formatter.normalize_package_name(removed_dep);
-        doc_state
-            .vulnerabilities
-            .retain(|key, _| key.as_str() != removed_normalized_name);
-        doc_state
-            .outcomes
-            .remove(&formatter.normalize_package_name(removed_dep));
-    }
+    doc_state.signals.prune_removed(&diff.removed, formatter);
 
     // A version-only edit (name unchanged, requirement changed) invalidates
     // any yanked finding recorded against the dependency's *old* version —
@@ -742,8 +717,8 @@ fn commit_parsed_document(
     // any less (or more) deprecated, so there is nothing stale to drop here.
     for changed_dep in &diff.version_changed {
         let normalized = formatter.normalize_package_name(changed_dep);
-        doc_state.outcomes.clear_yanked(&normalized);
-        doc_state.outcomes.clear_fetch_failure(&normalized);
+        doc_state.signals.outcomes.clear_yanked(&normalized);
+        doc_state.signals.outcomes.clear_fetch_failure(&normalized);
     }
 
     // Issue #1424 (impl-critic round 2, S2): a manifest edit that changes a dependency's
@@ -752,10 +727,10 @@ fn commit_parsed_document(
     // lock-file-driven eviction never runs for them) and can also race a Dart/Swift
     // lock-file-driven eviction for the same dependency. Same tier-3-only gate and rationale
     // as `document::diff::reload_resolved_versions`'s own license eviction — raw-name-keyed,
-    // like `DocumentState::licenses` itself.
+    // like `PackageSignals::licenses` itself.
     if ecosystem.license_source().requires_dedicated_fetch() {
         for changed_dep in &diff.version_changed {
-            doc_state.licenses.remove(changed_dep);
+            doc_state.signals.licenses.remove(changed_dep);
         }
     }
 
@@ -1109,7 +1084,7 @@ async fn run_document_change_task(
     // `cargo clean`, a VCS checkout mid-edit — `reload_resolved_versions`'s internal
     // comparison already falls back to each dependency's manifest-declared pin and
     // detects this correctly) and skips it entirely on an actual parse failure, so a
-    // transient error never wipes known-good `doc.resolved_versions` or bumps the
+    // transient error never wipes known-good `doc.signals.resolved_versions` or bumps the
     // generation off untrustworthy data (E1 — the exact #1395 M1 failure mode the
     // watcher path's own `lockfile_reload_ok` already guards against).
     let diff_needs_rescan = needs_osv_rescan;
@@ -1188,10 +1163,10 @@ async fn run_document_change_task(
     });
 
     // Typosquat pre-fetch (issue #1437), gated on the declared name set actually having
-    // drifted from `DocumentState::typosquat_checked_names` (issue #1455 batch item 1,
+    // drifted from `PackageSignals::typosquat_checked_names` (issue #1455 batch item 1,
     // critic S1 — previously gated on *this edit's own* `DependencyDiff`, which missed a name
     // added by an edit whose change task got superseded/aborted before ever reaching this
-    // spawn; see `DocumentState::typosquat_checked_names`' own doc). Comparing against the
+    // spawn; see `PackageSignals::typosquat_checked_names`' own doc). Comparing against the
     // persisted set self-corrects regardless of how many aborted edits happened in between.
     // The pre-fetch's result depends only on declared package *names* (see
     // `run_typosquat_prefetch`'s own doc), so a version-only edit can never change its
@@ -1584,7 +1559,7 @@ pub(crate) async fn trigger_typosquat_prefetch_for_open_documents(
         let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_id) else {
             continue;
         };
-        // Seeds `DocumentState::typosquat_checked_names` from the current content (issue
+        // Seeds `PackageSignals::typosquat_checked_names` from the current content (issue
         // #1455 critic S1), mirroring the open path — this call always spawns regardless
         // (the feature just transitioned on, so every open document needs its first check),
         // but the *next* debounced edit still needs a real baseline to gate against.
@@ -1875,7 +1850,7 @@ mod tests {
 
         doc.clear_typosquat_checked_names_if_stale(&snapshot);
         assert!(
-            doc.typosquat_checked_names.is_empty(),
+            doc.signals.typosquat_checked_names.is_empty(),
             "a failed attempt's own snapshot, still current, must be cleared so the next \
              debounced edit retries even without a name/eligibility change"
         );
@@ -1890,7 +1865,7 @@ mod tests {
         doc.refresh_typosquat_checked_names(newer.clone());
         doc.clear_typosquat_checked_names_if_stale(&snapshot);
         assert_eq!(
-            doc.typosquat_checked_names, newer,
+            doc.signals.typosquat_checked_names, newer,
             "clearing must be a no-op once a newer edit has already superseded the stale \
              snapshot"
         );
@@ -2059,6 +2034,7 @@ mod tests {
         let generation_before = state
             .get_document(&uri)
             .unwrap()
+            .signals
             .resolved_versions_generation;
 
         let edited_content =
@@ -2093,6 +2069,7 @@ mod tests {
         let generation_after = state
             .get_document(&uri)
             .unwrap()
+            .signals
             .resolved_versions_generation;
         assert_ne!(
             generation_before, generation_after,
@@ -2273,22 +2250,22 @@ mod tests {
             );
 
             assert!(
-                doc.cached_versions.is_empty(),
+                doc.signals.cached_versions.is_empty(),
                 "cached_versions must be dropped"
             );
             assert_eq!(
-                doc.outcomes.fetch_failure("serde"),
+                doc.signals.outcomes.fetch_failure("serde"),
                 Some(&FetchFailure::NotAttempted),
                 "the stale fetch-failure finding must be replaced with a NotAttempted \
                  placeholder, not left absent (S1: an absent entry surviving into a \
                  concurrent empty-diff commit renders as the misleading 'Unknown package')"
             );
             assert!(
-                doc.outcomes.yanked("other").is_some(),
+                doc.signals.outcomes.yanked("other").is_some(),
                 "a yanked finding on a different package must survive untouched"
             );
             assert_eq!(
-                doc.resolved_versions.len(),
+                doc.signals.resolved_versions.len(),
                 1,
                 "resolved_versions (lockfile-derived, registry-independent) must survive"
             );
@@ -2307,9 +2284,9 @@ mod tests {
 
             drop_cache_for_forced_refetch(&mut doc, &[], &IDENTITY_FORMATTER);
 
-            assert!(doc.cached_versions.is_empty());
+            assert!(doc.signals.cached_versions.is_empty());
             assert!(
-                doc.outcomes.fetch_failure("serde").is_none(),
+                doc.signals.outcomes.fetch_failure("serde").is_none(),
                 "a dependency outside deps_to_fetch must not be given a placeholder"
             );
         }
@@ -2911,9 +2888,11 @@ anyhow = "1.0"
 
         {
             let mut doc = state.documents.get_mut(&uri).unwrap();
-            doc.licenses
+            doc.signals
+                .licenses
                 .insert(PackageName::new("serde"), vec!["MIT".to_string()]);
-            doc.licenses
+            doc.signals
+                .licenses
                 .insert(PackageName::new("anyhow"), vec!["Apache-2.0".to_string()]);
         }
 
@@ -2946,12 +2925,14 @@ anyhow = "1.0"
 
         let doc = state.get_document(&uri).unwrap();
         assert!(
-            !doc.licenses.contains_key(&PackageName::new("anyhow")),
+            !doc.signals
+                .licenses
+                .contains_key(&PackageName::new("anyhow")),
             "removed dependency's license entry must be pruned, got: {:?}",
-            doc.licenses
+            doc.signals.licenses
         );
         assert_eq!(
-            doc.licenses.get(&PackageName::new("serde")),
+            doc.signals.licenses.get(&PackageName::new("serde")),
             Some(&vec!["MIT".to_string()]),
             "surviving dependency's license entry must be preserved"
         );
@@ -3598,7 +3579,7 @@ serde = "1.0"
         /// ordinary "type a new dependency line, then edit its version" flow. The superseding
         /// edit's own `DependencyDiff` shows no name change (only the earlier edit's diff
         /// did), so this only passes if the gate compares against the persisted
-        /// `DocumentState::typosquat_checked_names`, not the superseding edit's local diff.
+        /// `PackageSignals::typosquat_checked_names`, not the superseding edit's local diff.
         #[tokio::test]
         async fn test_name_added_by_aborted_predecessor_edit_is_still_checked_by_successor() {
             use crate::test_utils::test_helpers::create_test_client_and_config;
@@ -3740,6 +3721,7 @@ tokio = "1.0"
             let generation_before = state
                 .get_document(&uri)
                 .unwrap()
+                .signals
                 .resolved_versions_generation;
             assert!(
                 !generation_before.is_initial(),
@@ -3769,6 +3751,7 @@ tokio = "1.0"
             let generation_after = state
                 .get_document(&uri)
                 .unwrap()
+                .signals
                 .resolved_versions_generation;
             assert_eq!(
                 generation_after, generation_before,
@@ -3828,6 +3811,7 @@ tokio = "1.0"
             let generation_before = state
                 .get_document(&uri)
                 .unwrap()
+                .signals
                 .resolved_versions_generation;
             assert!(
                 !generation_before.is_initial(),
@@ -3838,6 +3822,7 @@ tokio = "1.0"
                 state
                     .get_document(&uri)
                     .unwrap()
+                    .signals
                     .resolved_versions
                     .get(&PackageName::new("alpha-dep")),
                 Some(&ConcreteVersion::new("0.1.0")),
@@ -3893,13 +3878,15 @@ tokio = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.resolved_versions.get(&PackageName::new("alpha-dep")),
+                doc.signals
+                    .resolved_versions
+                    .get(&PackageName::new("alpha-dep")),
                 Some(&ConcreteVersion::new("0.2.0")),
                 "the lock-file rewrite must have been picked up by the debounced edit's own \
                  reload — otherwise the generation assertion below would be vacuous"
             );
             assert_ne!(
-                doc.resolved_versions_generation, generation_before,
+                doc.signals.resolved_versions_generation, generation_before,
                 "a debounced edit that changes no dependency itself must still bump \
                  resolved_versions_generation when the lock file moved a resolved version \
                  underneath it (issue #1399)"
@@ -3913,7 +3900,7 @@ tokio = "1.0"
         /// or changes no dependency in the manifest text itself
         /// (`diff_needs_rescan == false`). Before this fix, the trigger computation
         /// (and the map overwrite it sits alongside) were skipped whenever the
-        /// *reloaded* map was empty, so `doc.resolved_versions` stayed stuck on the
+        /// *reloaded* map was empty, so `doc.signals.resolved_versions` stayed stuck on the
         /// stale, now-invalid data forever and `resolved_versions_generation` never
         /// bumped.
         #[tokio::test]
@@ -3962,8 +3949,8 @@ tokio = "1.0"
             let (generation_before, resolved_non_empty_after_open) = state
                 .with_document(&uri, |doc| {
                     (
-                        doc.resolved_versions_generation,
-                        !doc.resolved_versions.is_empty(),
+                        doc.signals.resolved_versions_generation,
+                        !doc.signals.resolved_versions.is_empty(),
                     )
                 })
                 .unwrap();
@@ -4015,8 +4002,8 @@ tokio = "1.0"
             let (resolved_empty_after_edit, generation_after_edit) = state
                 .with_document(&uri, |doc| {
                     (
-                        doc.resolved_versions.is_empty(),
-                        doc.resolved_versions_generation,
+                        doc.signals.resolved_versions.is_empty(),
+                        doc.signals.resolved_versions_generation,
                     )
                 })
                 .unwrap();
@@ -4085,8 +4072,8 @@ tokio = "1.0"
             let (generation_before, resolved_versions_before) = state
                 .with_document(&uri, |doc| {
                     (
-                        doc.resolved_versions_generation,
-                        doc.resolved_versions.clone(),
+                        doc.signals.resolved_versions_generation,
+                        doc.signals.resolved_versions.clone(),
                     )
                 })
                 .unwrap();
@@ -4134,8 +4121,8 @@ tokio = "1.0"
             let (resolved_versions_after, generation_after) = state
                 .with_document(&uri, |doc| {
                     (
-                        doc.resolved_versions.clone(),
-                        doc.resolved_versions_generation,
+                        doc.signals.resolved_versions.clone(),
+                        doc.signals.resolved_versions_generation,
                     )
                 })
                 .unwrap();
@@ -4489,7 +4476,7 @@ github.com/gorilla/mux v1.8.1 h1:hash2=
             for _ in 0..200 {
                 if state
                     .get_document(&uri)
-                    .is_some_and(|doc| doc.resolved_versions.contains_key(&dep_name))
+                    .is_some_and(|doc| doc.signals.resolved_versions.contains_key(&dep_name))
                 {
                     resolved_seen = true;
                     break;
@@ -4503,12 +4490,12 @@ github.com/gorilla/mux v1.8.1 h1:hash2=
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.resolved_versions.get(&dep_name),
+                doc.signals.resolved_versions.get(&dep_name),
                 Some(&ConcreteVersion::new("v1.8.1")),
                 "sanity check: go.sum's last-occurrence-wins parsing does surface the stale version"
             );
             assert!(
-                !doc.cached_versions.contains_key(&dep_name),
+                !doc.signals.cached_versions.contains_key(&dep_name),
                 "S1: a Go `require` dependency's stale go.sum version must not be seeded into \
                  cached_versions (the 'latest' comparison operand) during the cold-open window — \
                  doing so would desync it against the go.mod-accurate resolved value and produce \

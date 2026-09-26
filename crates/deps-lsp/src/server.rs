@@ -283,7 +283,7 @@ impl Backend {
         // on a reload error (`LockfileLoad::into_maps`'s `Failed` fallback) — but, per the
         // `lockfile_reload_ok` gate on `reload_resolved_versions` below (issue #1424
         // impl-critic M1), that empty pair is never actually written into the document on
-        // error, so `doc.resolved_versions` itself survives a transient reload failure
+        // error, so `doc.signals.resolved_versions` itself survives a transient reload failure
         // untouched.
         let load = deps_engine::classify::resolved::parse_known_lockfile(
             &self.state.lockfile_cache,
@@ -1391,7 +1391,10 @@ impl Backend {
         let edits = deps_core::collect_update_all_edits(
             parse_result,
             &doc.content,
-            deps_core::VersionData::new(&doc.cached_versions, &doc.resolved_versions),
+            deps_core::VersionData::new(
+                &doc.signals.cached_versions,
+                &doc.signals.resolved_versions,
+            ),
             ecosystem.formatter(),
         );
         let version = doc.version;
@@ -1512,7 +1515,10 @@ impl Backend {
             return;
         };
 
-        let versions = deps_core::VersionData::new(&doc.cached_versions, &doc.resolved_versions);
+        let versions = deps_core::VersionData::new(
+            &doc.signals.cached_versions,
+            &doc.signals.resolved_versions,
+        );
         let edits = ecosystem.collect_pin_all_to_sha_edits(parse_result, versions);
         let version = doc.version;
         drop(doc);
@@ -2203,7 +2209,7 @@ mod tests {
                 if backend
                     .state
                     .get_document(&deno_uri)
-                    .is_some_and(|d| d.cached_versions.is_empty())
+                    .is_some_and(|d| d.signals.cached_versions.is_empty())
                 {
                     return;
                 }
@@ -2703,7 +2709,8 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if backend.state.get_document(&alpha_uri).is_some_and(|d| {
-                    d.vulnerabilities
+                    d.signals
+                        .vulnerabilities
                         .contains_key(&deps_core::test_util::vuln_key("alpha-dep"))
                 }) {
                     return;
@@ -2717,6 +2724,7 @@ mod tests {
         let alpha_doc = backend.state.get_document(&alpha_uri).unwrap();
         assert_matches!(
             alpha_doc
+                .signals
                 .vulnerabilities
                 .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::NonRegistrySource)),
@@ -2726,7 +2734,7 @@ mod tests {
 
         let beta_doc = backend.state.get_document(&beta_uri).unwrap();
         assert!(
-            beta_doc.vulnerabilities.is_empty(),
+            beta_doc.signals.vulnerabilities.is_empty(),
             "beta-dep's own resolved version was unaffected by the lock file change, so its \
              document must not have been rescanned"
         );
@@ -2784,6 +2792,7 @@ mod tests {
             DocumentState::new_from_parse_result(EcosystemId::Cargo, content.clone(), parse_result);
         // Already resolved, matching the lock file above — the reload is a no-op for this name.
         doc_state
+            .signals
             .resolved_versions
             .insert("alpha-dep".into(), ConcreteVersion::from("0.1.0"));
         // Deliberately WRONG: if the rescan incorrectly ran, phase B would overwrite this
@@ -2794,7 +2803,7 @@ mod tests {
             ScanOutcome::Skipped(SkipReason::UnmappableName),
         );
         doc_state.update_vulnerabilities(stale);
-        let generation_before = doc_state.resolved_versions_generation;
+        let generation_before = doc_state.signals.resolved_versions_generation;
         backend.state.update_document(uri.clone(), doc_state);
 
         backend
@@ -2803,14 +2812,15 @@ mod tests {
 
         let doc = backend.state.get_document(&uri).unwrap();
         assert_matches!(
-            doc.vulnerabilities
+            doc.signals
+                .vulnerabilities
                 .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
             "an unchanged resolved version must not trigger a rescan — the stale marker \
              would have been overwritten with NonRegistrySource if it had"
         );
         assert_eq!(
-            doc.resolved_versions_generation, generation_before,
+            doc.signals.resolved_versions_generation, generation_before,
             "resolved_versions_generation must not bump when no rescan is scheduled to \
              pair with it (critic N2)"
         );
@@ -2864,6 +2874,7 @@ mod tests {
         // A previously-successful resolution/scan, which the reload error's empty-map
         // fallback would otherwise make look like a lost resolution.
         doc_state
+            .signals
             .resolved_versions
             .insert("alpha-dep".into(), ConcreteVersion::from("0.1.0"));
         let mut existing = VulnerabilityMap::new();
@@ -2872,7 +2883,7 @@ mod tests {
             ScanOutcome::Skipped(SkipReason::UnmappableName),
         );
         doc_state.update_vulnerabilities(existing);
-        let generation_before = doc_state.resolved_versions_generation;
+        let generation_before = doc_state.signals.resolved_versions_generation;
         backend.state.update_document(uri.clone(), doc_state);
 
         backend
@@ -2881,21 +2892,22 @@ mod tests {
 
         let doc = backend.state.get_document(&uri).unwrap();
         assert_eq!(
-            doc.resolved_versions.get("alpha-dep"),
+            doc.signals.resolved_versions.get("alpha-dep"),
             Some(&ConcreteVersion::from("0.1.0")),
             "a lock-file reload error must leave previously-resolved versions untouched \
              (issue #1424 impl-critic M1), not wipe them with the reload's empty fallback \
              maps"
         );
         assert_matches!(
-            doc.vulnerabilities
+            doc.signals
+                .vulnerabilities
                 .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
             "a lock-file reload error must not trigger an OSV rescan — the stale marker \
              would have been overwritten if it had"
         );
         assert_eq!(
-            doc.resolved_versions_generation, generation_before,
+            doc.signals.resolved_versions_generation, generation_before,
             "resolved_versions_generation must not bump on a reload error either (critic \
              N2) — a bump here, paired with no rescan, would invalidate an unrelated \
              in-flight scan's staleness guard with nothing to re-trigger a fresh commit"
@@ -2973,14 +2985,16 @@ mod tests {
 
         let doc = backend.state.get_document(&uri).unwrap();
         assert_eq!(
-            doc.resolved_versions
+            doc.signals
+                .resolved_versions
                 .get("alpha-dep")
                 .map(ConcreteVersion::as_str),
             Some("0.1.0"),
             "resolved_versions must still update regardless of vulnerabilities_enabled"
         );
         assert_matches!(
-            doc.vulnerabilities
+            doc.signals
+                .vulnerabilities
                 .get(&deps_core::test_util::vuln_key("alpha-dep")),
             Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
             "vulnerabilities_enabled = false must suppress the rescan even though the \
@@ -4017,11 +4031,11 @@ mod tests {
                     let cargo_cleared = backend
                         .state
                         .get_document(&cargo_uri)
-                        .is_some_and(|d| d.cached_versions.is_empty());
+                        .is_some_and(|d| d.signals.cached_versions.is_empty());
                     let nuget_cleared = backend
                         .state
                         .get_document(&nuget_uri)
-                        .is_some_and(|d| d.cached_versions.is_empty());
+                        .is_some_and(|d| d.signals.cached_versions.is_empty());
                     if cargo_cleared && nuget_cleared {
                         return;
                     }

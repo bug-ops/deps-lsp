@@ -508,8 +508,9 @@ pub struct GossipLowUsage {
     pub alternative_packages: Vec<String>,
 }
 
-/// GOSSIP-sourced findings for one package version (issue #1456, spec 072), stored in
-/// `deps-lsp`'s `DocumentState.gossip_findings` and read from
+/// GOSSIP-sourced findings for one package version (issue #1456, spec 072).
+///
+/// Stored in `deps-lsp`'s `DocumentState::signals.gossip_findings` and read from
 /// [`crate::lsp_helpers::VersionData::gossip_prefetch`].
 ///
 /// [`Self::version`] is the exact version this data applies to — every reader compares it

@@ -7,7 +7,6 @@
 
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
-use deps_core::VersionData;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -58,7 +57,7 @@ pub async fn handle_code_lens(
 
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
-    let Some((ecosystem, parse_result, content, cached_versions, resolved_versions)) = state
+    let Some((ecosystem, parse_result, content, snapshot)) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
 
@@ -70,13 +69,8 @@ pub async fn handle_code_lens(
             }
 
             let parse_result = doc.parse_result_arc()?;
-            Some((
-                ecosystem,
-                parse_result,
-                doc.content.clone(),
-                doc.cached_versions.clone(),
-                doc.resolved_versions.clone(),
-            ))
+            let snapshot = doc.signals.snapshot().finish();
+            Some((ecosystem, parse_result, doc.content.clone(), snapshot))
         })
         .flatten()
     else {
@@ -91,7 +85,7 @@ pub async fn handle_code_lens(
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
     };
-    let versions = VersionData::new(&cached_versions, &resolved_versions).with_offline(offline);
+    let versions = snapshot.version_data().with_offline(offline);
     let mut lenses = ecosystem
         .generate_code_lenses(
             parse_result.as_ref(),

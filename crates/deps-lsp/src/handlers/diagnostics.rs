@@ -1,8 +1,7 @@
 //! Diagnostics handler using ecosystem trait delegation.
 
 use crate::config::{DepsConfig, DiagnosticsConfig};
-use crate::document::{ServerState, ensure_document_loaded};
-use deps_core::VersionData;
+use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -260,38 +259,42 @@ pub(crate) async fn generate_diagnostics_internal(
         }
 
         let parse_result = doc.parse_result_arc()?;
-        Some((
-            ecosystem,
-            doc.ecosystem,
-            parse_result,
-            doc.cached_versions.clone(),
-            doc.resolved_versions.clone(),
-            doc.resolved_version_candidates.clone(),
-            doc.vulnerabilities.clone(),
-            doc.outcomes.clone(),
-            doc.licenses.clone(),
-            doc.typosquats.clone(),
-            doc.gossip_findings.clone(),
-        ))
+        // Issue #1437 security review N1 (impl-critic extended scope) / issue #1456 spec
+        // 072's identical rationale for GOSSIP: a live `did_change_configuration` disabling
+        // either feature, or a transition to offline, must stop rendering a previously-
+        // populated typosquat/gossip map immediately, not just stop refreshing it. Read
+        // here, in the same synchronous closure as the document snapshot itself (both under
+        // the same DashMap shard lock, with no `.await` between them), rather than before
+        // `with_document` or after it returns — this is at least as tight a window against a
+        // concurrent flag flip as the pre-refactor read site (right after releasing this
+        // same lock), and tighter than reading before entering the closure would be.
+        let typosquat_visibility = if state.is_typosquat_enabled() && !offline {
+            PrefetchVisibility::Render
+        } else {
+            PrefetchVisibility::Suppress
+        };
+        let gossip_visibility = if state.is_gossip_enabled() && !offline {
+            PrefetchVisibility::Render
+        } else {
+            PrefetchVisibility::Suppress
+        };
+        let snapshot = doc
+            .signals
+            .snapshot()
+            .with_resolved_version_candidates()
+            .with_vulnerabilities()
+            .with_outcomes()
+            .with_license_prefetch()
+            .with_typosquat_prefetch(typosquat_visibility)
+            .with_gossip_prefetch(gossip_visibility)
+            .finish();
+        Some((ecosystem, doc.ecosystem, parse_result, snapshot))
     }) else {
         tracing::warn!("Document not found for diagnostics: {:?}", uri);
         return vec![];
     };
 
-    let Some((
-        ecosystem,
-        ecosystem_id,
-        parse_result,
-        cached_versions,
-        resolved_versions,
-        resolved_version_candidates,
-        vulnerabilities,
-        outcomes,
-        licenses,
-        typosquats,
-        gossip_findings,
-    )) = extracted
-    else {
+    let Some((ecosystem, ecosystem_id, parse_result, snapshot)) = extracted else {
         return vec![];
     };
 
@@ -306,43 +309,12 @@ pub(crate) async fn generate_diagnostics_internal(
     };
 
     let policy = state.license_policy();
-    // Issue #1437 security review N1 (impl-critic extended scope): `doc.typosquats` can
-    // still hold signals resolved while the feature was enabled and online — a live
-    // `did_change_configuration` disabling it, or a transition to offline, must stop
-    // rendering them immediately (FR-009/NFR-001), not just stop refreshing them (the
-    // background prefetch already self-guards on both checks, so it never repopulates the
-    // map once disabled/offline, but a *previously* populated map must not keep being
-    // attached here either). An empty map is attached instead of `doc.typosquats` in
-    // either case, rather than reading the field at all. (A dependency whose *source*
-    // changes to private is handled separately, at read time, by
-    // `apply_typosquat_rule`'s own re-check — that's a per-dependency concern this
-    // document-wide gate can't express.)
-    let empty_typosquats = std::collections::HashMap::new();
-    let typosquat_prefetch = if state.is_typosquat_enabled() && !offline {
-        &typosquats
-    } else {
-        &empty_typosquats
-    };
-    // Issue #1456, spec 072: same rationale as `typosquat_prefetch` above — a disabled or
-    // offline transition must stop rendering a previously-populated `gossip_findings` map
-    // immediately, not merely stop refreshing it.
-    let empty_gossip = std::collections::HashMap::new();
-    let gossip_prefetch = if state.is_gossip_enabled() && !offline {
-        &gossip_findings
-    } else {
-        &empty_gossip
-    };
-    let version_data = VersionData::new(&cached_versions, &resolved_versions)
-        .with_resolved_version_candidates(&resolved_version_candidates)
-        .with_vulnerabilities(&vulnerabilities)
-        .with_outcomes(&outcomes)
+    let version_data = snapshot
+        .version_data()
         .with_ecosystem(ecosystem_id)
         .with_offline(offline)
         .with_license_source(ecosystem.license_source())
-        .with_license_policy(&policy)
-        .with_license_prefetch(&licenses)
-        .with_typosquat_prefetch(typosquat_prefetch)
-        .with_gossip_prefetch(gossip_prefetch);
+        .with_license_policy(&policy);
 
     let domain_diagnostics = ecosystem
         .generate_diagnostics(
@@ -485,9 +457,9 @@ mod tests {
 
     /// Issue #1437 NFR-002 (perf-review finding): diagnostics generation must never
     /// `.await` a deps.dev fan-out inline — `VersionData::typosquat_prefetch` is read
-    /// synchronously from `DocumentState::typosquats`, populated ahead of time by a
+    /// synchronously from `PackageSignals::typosquats`, populated ahead of time by a
     /// background prefetch (`document::osv_scan::run_typosquat_prefetch`), never fetched
-    /// on this path. Proven here by enabling the feature, populating `doc.typosquats`
+    /// on this path. Proven here by enabling the feature, populating `doc.signals.typosquats`
     /// directly (bypassing the prefetch entirely, simulating "prefetch already
     /// completed"), and wrapping the call in a deliberately tiny timeout: if a future
     /// regression reintroduced an inline deps.dev `.await` here, this would either hang
@@ -559,7 +531,7 @@ mod tests {
                 Some(tower_lsp_server::ls_types::NumberOrString::String(code))
                     if code == deps_core::lsp_helpers::TYPOSQUAT_DIAGNOSTIC_CODE
             )),
-            "expected a typosquat diagnostic from the pre-populated `doc.typosquats` map, \
+            "expected a typosquat diagnostic from the pre-populated `doc.signals.typosquats` map, \
              got: {result:?}"
         );
     }
@@ -567,7 +539,7 @@ mod tests {
     /// Issue #1437 security review N1: a live `did_change_configuration` disabling
     /// `policy.typosquat.enabled` must stop the diagnostic from rendering immediately
     /// (FR-009), not just stop the background prefetch from refreshing it — a signal
-    /// resolved *while the feature was enabled* must not keep appearing in `doc.typosquats`
+    /// resolved *while the feature was enabled* must not keep appearing in `doc.signals.typosquats`
     /// after it's turned off, simulated here by disabling only *after* populating the map
     /// directly (bypassing the prefetch, which would itself never repopulate once
     /// disabled — this test isolates the read-side half of the fix).
@@ -607,7 +579,7 @@ mod tests {
         doc_state.merge_typosquats(typosquats);
         state.update_document(uri.clone(), doc_state);
 
-        // Disabled *after* the (simulated-stale) signal already landed in `doc.typosquats`.
+        // Disabled *after* the (simulated-stale) signal already landed in `doc.signals.typosquats`.
         state.set_typosquat_enabled(false);
 
         let result = generate_diagnostics_internal(
@@ -626,13 +598,13 @@ mod tests {
                 Some(tower_lsp_server::ls_types::NumberOrString::String(code))
                     if code == deps_core::lsp_helpers::TYPOSQUAT_DIAGNOSTIC_CODE
             )),
-            "a stale `doc.typosquats` entry must not render once the feature is disabled, \
+            "a stale `doc.signals.typosquats` entry must not render once the feature is disabled, \
              got: {result:?}"
         );
     }
 
     /// Issue #1437 impl-critic N1 (extending security's N1 to the offline case): a stale
-    /// `doc.typosquats` entry — resolved while online — must also stop rendering the moment
+    /// `doc.signals.typosquats` entry — resolved while online — must also stop rendering the moment
     /// the server goes offline, same rationale as the disabled case above, checked via the
     /// `offline` parameter `generate_diagnostics_internal` already threads through (still
     /// enabled the whole time, unlike the sibling test).
@@ -690,7 +662,7 @@ mod tests {
                 Some(tower_lsp_server::ls_types::NumberOrString::String(code))
                     if code == deps_core::lsp_helpers::TYPOSQUAT_DIAGNOSTIC_CODE
             )),
-            "a stale `doc.typosquats` entry must not render while offline, got: {result:?}"
+            "a stale `doc.signals.typosquats` entry must not render while offline, got: {result:?}"
         );
     }
 
