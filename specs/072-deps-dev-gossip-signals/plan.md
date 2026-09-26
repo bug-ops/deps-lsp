@@ -117,6 +117,35 @@ both introduced by round 3's own fixes:
   all, since it's pure `freshness.rs` reuse) — must still honor the existing `FreshnessSettings.enabled`/
   `cooldown_secs` knobs already threaded into `CompletionRequest`, not bypass them.
 
+**2026-09-26, round 5**: answers from the same critic to two follow-up questions posed alongside round 4
+(about `DocumentState` staleness policy and dropping the per-package concurrency cap), both real gaps not
+yet covered by N1-N6:
+
+- **N7 (staleness/refresh)**: a content-snapshot guard alone doesn't handle a package that goes stale
+  simply by *time passing* while a document sits open and unedited — FR-008's version-mismatch check
+  already correctly falls back to the local heuristic when a new release appears, but nothing then
+  triggers a refetch, so an idle document stays on the 3-day local fallback for that new release
+  indefinitely. A TTL that *drops* the data would just reintroduce N2. **Fix**: (a) store `GossipCooldown`'s
+  `end` as `PublishTime` and evaluate `end > now()` at read time — never a precomputed "is active" bool —
+  so an ended cooldown clears itself with no refetch needed at all; (b) treat an FR-008 version mismatch as
+  a background-refetch trigger, throttled to at most once every 15 minutes per package (deps.dev's own
+  ingestion lag means retrying more often just wastes calls without fresher data); (c) optionally, a soft
+  ~1h staleness age on otherwise-matching data schedules the same background refresh without blocking the
+  current read — this is the backstop for GOSSIP's own indexing lag on a genuinely-new default version that
+  already matches the registry's latest.
+- **N8 (cross-document concurrency)**: dropping the within-document concurrency cap (N3's simplification —
+  one batch call, not a fan-out) is fine, but a burst across *documents* remains real: the
+  `disabled->enabled` config transition fires one batch call per already-open document simultaneously, and
+  so does a cold-start multi-manifest workspace load. **Fix**: a small global `tokio::sync::Semaphore`
+  bounding concurrent `GetFindingsBatch` calls across all documents, mirroring the existing
+  `max_concurrent_fetches` pattern (`document/fetch.rs`) rather than "revisit if it becomes a problem".
+  Additionally: `DEPS_DEV_BODY_LIMIT` (the existing 1MB guard on the GET path, `deps_dev/mod.rs:96`) must
+  apply to **every** paginated page of a `GetFindingsBatch` response, not just the first (page size isn't
+  bounded by the API); and the per-document dependency count is already capped at
+  `MAX_DEPENDENCIES_PER_DOCUMENT = 5000` (`dependency_cap.rs:51`), which composes correctly with
+  `GetFindingsBatch`'s own 5000-item batch limit — no separate cap needed there, just a note that the two
+  numbers happen to already agree.
+
 ## 1. Architecture
 
 ### Approach
@@ -182,6 +211,29 @@ already-open document doesn't wait for its next edit to pick up newly-enabled GO
 The document-level prefetch is filtered through `SourcePolicy::source_is_public_registry_content` (same
 gate typosquat prefetch uses) so git/path dependencies never reach deps.dev.
 
+**Staleness and refresh (N7).** `GossipFindings`/`GossipCooldown` never stores a precomputed "is cooldown
+active" boolean — only `end: PublishTime`, compared against `now()` at every read. This makes an ended
+cooldown self-clear with zero refetch cost. What *does* need an explicit trigger is a genuinely new
+release: when FR-008's version-equality check finds a mismatch (the registry's own latest version differs
+from the cached `defaultVersion`), that mismatch schedules a background refetch for that package — throttled
+to at most once every 15 minutes per package, since deps.dev's own ingestion lag makes more frequent
+retries pointless. A soft ~1h staleness age on otherwise-matching data schedules the same background
+refresh (without blocking the current read, which keeps serving the stored data) as a backstop for GOSSIP's
+own indexing lag on a default version that already matches. None of this is a TTL that *drops* data —
+dropping data on a timer is exactly N2's bug; refetching in the background while continuing to serve what's
+already stored is the actual fix.
+
+**Cross-document concurrency (N8).** Dropping the *within-document* concurrency cap (batch, not fan-out,
+per N3) is fine, but a burst *across* documents is real — the `disabled->enabled` config transition fires
+one batch call per already-open document simultaneously, as does a cold-start multi-manifest workspace
+load. A small global `tokio::sync::Semaphore` bounds concurrent `GetFindingsBatch` calls across all
+documents, mirroring the existing `max_concurrent_fetches` pattern (`document/fetch.rs`) rather than being
+left unbounded. `DEPS_DEV_BODY_LIMIT` (the existing 1MB guard already applied to the GET path,
+`deps_dev/mod.rs:96`) must apply to every paginated page of a batch response, not just the first. A
+document's own dependency count is already capped at `MAX_DEPENDENCIES_PER_DOCUMENT = 5000`
+(`dependency_cap.rs:51`), which happens to already match `GetFindingsBatch`'s own 5000-item limit — no new
+cap needed there.
+
 ### Component Diagram
 
 ```mermaid
@@ -214,6 +266,10 @@ graph TD
 | `GossipConfig` shape | `#[serde(default)]` on `enabled`, `#[non_exhaustive]` on the struct, `PolicyConfigDiff` entry, `ServerState` atomic + trigger-on-enable | M8/M12: `TyposquatConfig`'s exact shape; missing `#[serde(default)]` breaks parsing of a partial section and discards the whole config reload | Copying round 2's snippet as-is — it was missing exactly these details |
 | `low_usage_context` field | Dropped from the wire type until a live finding is observed | M9: an untyped `serde_json::Value` placeholder violates this project's type-safety rule for no benefit — serde already ignores unknown keys safely | Keeping the untyped placeholder "just in case" — rejected |
 | `deps-cli` parity (FR-010) | **Dropped from this issue.** `[gossip]` added to `ignored_sections` (M14) so it's at least a visible warning, not silent. Filed as a separate follow-up issue (P4) | N1 + maintainer decision 2026-09-26: near-zero practical effect, requires new `DepsDevClient` wiring in `deps-engine` that doesn't exist today | Keeping FR-010, limited to `check` only — maintainer chose to drop entirely |
+| Cooldown-active check | `end: PublishTime`, compared to `now()` at read time — never a stored bool | N7: self-clears an ended cooldown with zero refetch; a stored bool would need its own invalidation logic for no benefit | Storing a resolved `is_active: bool` alongside `end` — rejected, redundant and one more thing to keep in sync |
+| Staleness handling | A version-mismatch (FR-008) or ~1h soft age triggers a background refetch (>=15min backoff per package); data is never dropped on a timer | N7: a memo/`DocumentState` TTL that drops data reintroduces N2; refetch-in-background-while-still-serving is the actual fix for "idle document, new release appeared" | A hard TTL eviction (round 2's original design) — this was N2's bug; not repeating it under a different name |
+| Cross-document concurrency | A global `Semaphore` around `GetFindingsBatch`, mirroring `max_concurrent_fetches` | N8: the `disabled->enabled` transition and cold-start multi-manifest loads can fire many simultaneous batch calls across documents even with no within-document fan-out | Leaving it unbounded "to revisit if it becomes a problem" — critic's explicit pushback: cheap to add now, so add it now |
+| Per-page body limit | `DEPS_DEV_BODY_LIMIT` applied to every `nextPageToken` page, not just the first | A paginated batch response's page size isn't bounded by the API itself | Assuming the existing GET-path guard automatically covers a new POST/pagination path — it doesn't (M7) |
 
 ## 2. Project Structure
 
@@ -221,10 +277,15 @@ graph TD
 crates/deps-core/src/
 ├── deps_dev/
 │   ├── mod.rs            # + gossip_findings_batch() (one POST per document, memo-misses only,
-│   │                     #   nextPageToken pagination), gossip_findings_for_version() (hover's live
-│   │                     #   low-usage fetch), GOSSIP_WAIT_BUDGET const, a per-package findings memo +
-│   │                     #   in-flight DashMap/DashSet pair (1h TTL, restores round 2's shape — N5) plus
-│   │                     #   a version-keyed memo entry for the low-usage fetch
+│   │                     #   nextPageToken pagination, DEPS_DEV_BODY_LIMIT enforced per page — N8),
+│   │                     #   gossip_findings_for_version() (hover's live low-usage fetch),
+│   │                     #   GOSSIP_WAIT_BUDGET const, a per-package findings memo + in-flight
+│   │                     #   DashMap/DashSet pair (1h TTL, restores round 2's shape — N5) plus a
+│   │                     #   version-keyed memo entry for the low-usage fetch, a
+│   │                     #   GOSSIP_PREFETCH_SEMAPHORE (tokio::sync::Semaphore, global, mirrors
+│   │                     #   max_concurrent_fetches — N8) bounding concurrent batch calls across
+│   │                     #   documents, and a per-package last-refresh-attempt map with a >=15min
+│   │                     #   backoff for the FR-008-mismatch-triggered background refetch (N7)
 │   └── types.rs          # + GossipFindingsWire (batch response envelope), GossipFindingWire,
 │                         #   GossipFindingType (Cooldown/LowUsage typed, #[serde(other)] catch-all),
 │                         #   GossipCooldownContextWire { end: String }. NO low_usage_context field (M9)
@@ -332,7 +393,10 @@ Public-facing type (stored in `DocumentState`, no `as_any()` downcasting per thi
 
 ```rust
 pub struct GossipCooldown {
-    pub end: PublishTime, // reuse freshness::PublishTime
+    /// Compared against `now()` at every read (`end > now()` means still active) — never
+    /// precompute or store an "is active" bool (N7): this makes an ended cooldown clear itself
+    /// with zero refetch cost.
+    pub end: PublishTime,
     pub risk: GossipRiskLevel,
 }
 
@@ -417,7 +481,7 @@ Internal methods (not an LSP-facing API):
 
 | Method | Scope | Callers | Notes |
 |--------|-------|---------|-------|
-| `gossip_findings_batch(system, [name])` | `GetFindingsBatch` | `gossip_prefetch` (document-lifecycle task) | One call per document, **only for names missing from the per-package memo** (N5); `source_is_public_registry_content`-filtered input; paginates via `nextPageToken`; populates both the memo and the caller's `DocumentState` merge |
+| `gossip_findings_batch(system, [name])` | `GetFindingsBatch` | `gossip_prefetch` (document-lifecycle task) | One call per document, **only for names missing from the per-package memo** (N5); `source_is_public_registry_content`-filtered input; paginates via `nextPageToken` with `DEPS_DEV_BODY_LIMIT` enforced per page (N8); bounded by a global `Semaphore` across documents (N8); populates both the memo and the caller's `DocumentState` merge; a version mismatch found later (FR-008) schedules a follow-up call through this same method, throttled to >=15min per package (N7) |
 | `gossip_findings_for_version(system, name, version)` | version-scoped `GetFindings` | hover's low-usage section only | Spawned beside `spawn_trust_signal_fetch`, awaited at the same join point under `GOSSIP_WAIT_BUDGET`; skipped entirely when `resolve_in_use_version` returns `None` (M5); backed by a version-keyed memo entry so a late response still warms something (N5) |
 
 ## 5. Integration Points
@@ -431,12 +495,16 @@ Internal methods (not an LSP-facing API):
 - No new secrets or auth — both endpoints are public and unauthenticated (confirmed live).
 - No new input-validation surface beyond `deps_dev_system()`'s exhaustive match (fixed origin, not
   user-configurable).
-- **`HttpCache::post_json` gap (M7, new)**: the existing GET path has body-limit and trusted-origin
-  guarantees this POST path does not yet have — implementation must close this gap before shipping the
-  batch call, not assume parity with the GET path.
+- **`HttpCache::post_json` gap (M7)**: the existing GET path has body-limit and trusted-origin guarantees
+  this POST path does not yet have — implementation must close this gap before shipping the batch call.
+  `DEPS_DEV_BODY_LIMIT` must be enforced on **every** `nextPageToken` page of a batch response, not just
+  the first (N8) — page size is not itself bounded by the API.
 - **Privacy (S5/FR-009/NFR-005, unchanged)**: the document-level prefetch discloses every declared
   dependency's name to deps.dev — opt-in (`GossipConfig.enabled`, default `false`), filtered through
   `SourcePolicy::source_is_public_registry_content`.
+- **Availability (N8, new)**: a global `Semaphore` bounds concurrent `GetFindingsBatch` calls across all
+  open documents, so enabling GOSSIP in a large workspace (or a cold-start multi-manifest load) cannot fire
+  an unbounded burst of simultaneous outbound requests.
 
 ## 7. Testing Strategy
 
@@ -451,7 +519,8 @@ Internal methods (not an LSP-facing API):
 | Unit (`policy_config.rs`) | `GossipConfig::default().enabled == false`; a partial `{"gossip":{}}` config parses successfully (regression test for M12's `#[serde(default)]` requirement) |
 | Unit (`deps_dev::mod`, new) | The per-package memo actually dedupes: two `gossip_prefetch` calls for the same package within the TTL window issue exactly one network request (regression test for N5); a hover low-usage response arriving after `GOSSIP_WAIT_BUDGET` still lands in the version-keyed memo (companion to the existing `trust_signal_survives_dropped_join_handle_and_warms_memo` test) |
 | Unit (`deps-cli::config`) | `ignored_sections` includes `"gossip"` when a `[gossip]` section differs from default (M14) |
-| Integration | `crates/deps-lsp` — `gossip_prefetch` checks the memo before POSTing, fires on document open/change and on the disabled→enabled config transition, republishes diagnostics on new data; a document idle longer than the memo's TTL still shows correct GOSSIP-sourced diagnostics on the next unrelated regeneration (regression test for N2, now correctly backed by both storage layers) |
+| Unit (`deps_dev::mod`, new) | A `GossipCooldown` with `end` in the past is treated as inactive purely from the comparison at read time, with no separate stored flag (N7); an FR-008 mismatch schedules exactly one refetch, and a second mismatch within 15 minutes for the same package does not schedule another (N7 backoff); the global `Semaphore` actually caps in-flight `GetFindingsBatch` calls when many documents trigger simultaneously (N8); a paginated response whose second page exceeds `DEPS_DEV_BODY_LIMIT` is rejected the same way an oversized first-page GET response already is (N8) |
+| Integration | `crates/deps-lsp` — `gossip_prefetch` checks the memo before POSTing, fires on document open/change and on the disabled→enabled config transition, republishes diagnostics on new data; a document idle longer than the memo's TTL still shows correct GOSSIP-sourced diagnostics on the next unrelated regeneration (regression test for N2, now correctly backed by both storage layers); a document left open across a real new release (simulated) eventually shows the new release's cooldown status without requiring an edit (N7 end-to-end) |
 | Live/manual (continuous-improvement cycle) | **Must** re-verify against a package flagged `LOW_USAGE` before adding any typed field for it (S3/M9) — hard gate, not optional polish |
 | CI regression | None expected for `FreshnessConfig`/`did_change_configuration` tests (unchanged) |
 
@@ -464,7 +533,11 @@ Internal methods (not an LSP-facing API):
 - One `GetFindingsBatch` POST per document per memo-miss set (not per package) — simpler and cheaper than
   round 2's per-package fan-out; no concurrency cap needed for within-document fan-out since there isn't
   one. Multiple simultaneously-open documents in a large workspace still each check the shared memo before
-  firing their own batch call, so cross-document duplication for shared packages is also avoided.
+  firing their own batch call, so cross-document duplication for shared packages is also avoided — and the
+  new global `Semaphore` (N8) bounds how many of those batch calls can be in flight at once regardless.
+- Idle documents never regress silently: an ended cooldown clears itself at read time (`end > now()`), and
+  a genuinely new release (FR-008 mismatch) schedules its own backoff-throttled refetch (N7) rather than
+  leaving the document stuck on stale data until its next edit.
 - Hover: no live network wait for cooldown (N4 fix) — only the low-usage fetch is live, under its own
   `GOSSIP_WAIT_BUDGET`, at the same point `trust_signal` already awaits, backed by the version-keyed memo
   so a late response isn't wasted (N5).
@@ -499,8 +572,9 @@ of this PR — tracked in a separate follow-up issue (P4, per the maintainer dec
 | `LOW_USAGE` finding schema still unconfirmed | Medium | Medium-high | Hard-gated in Testing Strategy; no typed field added until observed (M9) |
 | `HttpCache::post_json` lacks the GET path's body-limit/trusted-origin guarantees | Medium — a security gap if shipped as-is | Low (caught here, before implementation) | Explicit task to close this gap (§6), not an assumption of parity |
 | Opt-in flag goes undiscovered | Low | Medium | Document alongside spec 071's typosquat flag |
-| A large workspace with many simultaneously-open documents each firing a batch call | Low-medium | Low | The shared per-package memo (N5) absorbs most cross-document duplication for shared packages; revisit if a real load concern still emerges (§8) |
+| A large workspace with many simultaneously-open documents each firing a batch call | Low-medium | Low | The shared per-package memo (N5) absorbs most cross-document duplication for shared packages; the global `Semaphore` (N8) bounds simultaneous in-flight calls regardless — no longer left to "revisit later" |
 | Dropping completion GOSSIP enrichment (N6b) under-delivers relative to earlier plan.md's stated scope | Low — completion still gets a genuine new capability (local cooldown baseline) | N/A (already decided) | Documented as a deliberate engineering-cost/benefit call in §0/§1, not an oversight; revisit only if `#319`'s constraint is relaxed or a signature change becomes acceptable for other reasons |
+| An idle document stays on stale GOSSIP data indefinitely after a new release | Low — N7's refetch trigger closes this | Low (mitigated) | FR-008 mismatch schedules a >=15min-backoff background refetch; a soft ~1h staleness age catches GOSSIP's own indexing-lag edge case too |
 
 ## See Also
 

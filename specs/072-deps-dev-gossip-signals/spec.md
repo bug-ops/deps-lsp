@@ -155,8 +155,9 @@ THEN a coverage-gap analysis exists showing overlap vs. GOSSIP-only vs. OSV-only
 facts and 4 follow-up maintainer decisions, not the original (partly wrong) assumptions.
 
 **Revised again 2026-09-26 (round 3)** after a second critic pass on the round-2 revision found 4 further
-gaps (N1-N4) — see §9's round-3 table. A fourth pass found 2 more (N5-N6) — see §9's round-4 table. FR-010
-is dropped; FR-005, FR-006, and FR-009 are corrected below.
+gaps (N1-N4) — see §9's round-3 table. A fourth pass found 2 more (N5-N6) — see §9's round-4 table. A fifth
+round (N7-N8, staleness/refresh and cross-document concurrency) added FR-011/FR-012 — see §9's round-5
+table. FR-010 is dropped; FR-005, FR-006, and FR-009 are corrected below.
 
 | ID | Requirement | Priority |
 |----|------------|----------|
@@ -170,6 +171,8 @@ is dropped; FR-005, FR-006, and FR-009 are corrected below.
 | FR-008 | WHEN reading GOSSIP data from the per-document cache (FR-006) THE SYSTEM SHALL treat `defaultVersion`'s cooldown/low-usage data as applicable only if its version exactly equals the version being displayed at that call site — named per site: hover's `latest_line`, diagnostics' `package_versions.latest`, completion's own candidate version (critique M13; live-verified canonical version strings for Go/NuGet/PyPI make plain string equality viable). On mismatch, treat as a cache-miss and fall back per FR-002/FR-006 | must |
 | FR-009 | WHEN GOSSIP integration is shipped THE SYSTEM SHALL gate all GOSSIP network calls behind a new opt-in `GossipConfig.enabled` flag (default `false`, structural twin of `TyposquatConfig` — including `#[serde(default)]` on the field and `#[non_exhaustive]` on the struct, critique M12), because the per-document prefetch discloses every declared dependency's name to deps.dev | must |
 | FR-010 | **DROPPED round 3 (critique N1, maintainer decision 2026-09-26).** `deps-cli` GOSSIP integration delivers near-zero practical value (cooldown only changes a diagnostic message's text, not `--fail-on`/exit-code behavior; `update` doesn't use cooldown at all) for a real implementation cost (`deps-cli`/`deps-engine` have no `DepsDevClient` today). Removed from this issue's scope; filed as a separate follow-up issue instead of implemented here | dropped |
+| FR-011 | **NEW round 5 (critique N7).** `GossipCooldown`'s active status SHALL be computed by comparing its stored `end: PublishTime` against the current time at every read — never by storing a precomputed boolean. WHEN a version-equality mismatch (FR-008) is found for a package THE SYSTEM SHALL schedule a background refetch for that package, throttled to no more than once every 15 minutes, so an idle open document does not remain on stale/local-fallback data indefinitely after a new release. A soft ~1-hour staleness age on otherwise-matching data SHOULD schedule the same background refresh without blocking the current read | must |
+| FR-012 | **NEW round 5 (critique N8).** THE SYSTEM SHALL bound concurrent `GetFindingsBatch` calls across all open documents with a global semaphore (mirroring the existing `max_concurrent_fetches` pattern), rather than leaving cross-document bursts (e.g. the disabled→enabled config transition firing one call per open document) unbounded. THE SYSTEM SHALL enforce the existing `DEPS_DEV_BODY_LIMIT` on every paginated page of a batch response, not only the first | must |
 
 ## 4. Non-Functional Requirements
 
@@ -180,6 +183,7 @@ is dropped; FR-005, FR-006, and FR-009 are corrected below.
 | NFR-003 | Maintainability | `freshness.rs`'s pure functions are kept, unmodified, as the fallback layer for all ecosystems and all GOSSIP-unavailable cases — this feature adds new GOSSIP-integration code in front of it, never inside it |
 | NFR-004 | Accuracy | Any GOSSIP-sourced signal presented to the user must be attributable to deps.dev/GOSSIP as its source, distinguishable from the local-heuristic fallback when both could apply (FR-002) |
 | NFR-005 | Privacy | Per FR-009, no dependency name reaches deps.dev's GOSSIP endpoint unless (a) the opt-in flag is enabled, (b) the dependency's source passes `SourcePolicy::source_is_public_registry_content`, and (c) the request is not running offline |
+| NFR-006 | Availability | Per FR-012, GOSSIP network calls are bounded by a global concurrency limit and a per-page body-size limit, so this feature cannot itself cause an outbound-request burst or an unbounded response read regardless of workspace size |
 
 ## 5. Data Model
 
@@ -258,10 +262,11 @@ which the first round never did):
 
 ## 7. Success Criteria
 
-Met (2026-09-25, revised three times on 2026-09-26): all `[NEEDS CLARIFICATION]` items in §9 are resolved.
-Three successive adversarial `rust-critic` passes found, respectively, 4 false premises (round 2), 4 further
-design gaps (round 3), and 2 gaps introduced by round 3's own fixes (round 4) — each corrected via direct
-code verification and live-API testing, not guesswork. Current adopted scope:
+Met (2026-09-25, revised four times on 2026-09-26): all `[NEEDS CLARIFICATION]` items in §9 are resolved.
+Four successive adversarial-review rounds found, respectively, 4 false premises (round 2), 4 further design
+gaps (round 3), 2 gaps introduced by round 3's own fixes (round 4), and 2 remaining staleness/concurrency
+gaps (round 5) — each corrected via direct code verification and live-API testing, not guesswork. Current
+adopted scope:
 
 - **Adopt**: Dynamic Cooldown at hover and diagnostics (`diagnostics.rs:2262`) — the only 2 real existing
   call sites, not 5 as originally assumed (critique C1) — sourced from `VersionData.gossip_prefetch`
@@ -454,6 +459,16 @@ Minor: `[gossip]` in `deps.toml` would be silently accepted with no effect in `d
 dropped — added to `deps-cli`'s existing `ignored_sections` "no effect" warning list (M14). Completion's
 new local baseline must honor the existing `FreshnessSettings.enabled`/`cooldown_secs` knobs already
 threaded into `CompletionRequest`, not bypass them (M15).
+
+### 2026-09-26 critique round 5
+
+Two follow-up questions the team-lead posed alongside round 4 (about `DocumentState` staleness policy and
+dropping the per-package concurrency cap) surfaced 2 more real gaps, neither previously covered:
+
+| # | Finding | Resolution |
+|---|---------|------------|
+| N7 | A content-snapshot guard alone doesn't handle staleness from time passing while a document sits open and unedited. FR-008's version-mismatch check already falls back correctly when a new release appears, but nothing then triggers a refetch — an idle document stays on the local 3-day fallback for that new release indefinitely. A TTL that drops the data would reintroduce N2 | `GossipCooldown.end` is compared to `now()` at every read (never a stored bool) — an ended cooldown self-clears with no refetch. An FR-008 mismatch schedules a background refetch, throttled to ≥15 minutes per package (deps.dev's own ingestion lag). A soft ~1h staleness age is a backstop for GOSSIP's own indexing lag on an already-matching version. None of this drops stored data on a timer (FR-011) |
+| N8 | Dropping the within-document concurrency cap (round 3's batch-not-fan-out simplification) is fine, but cross-*document* bursts remain real: the disabled→enabled config transition fires one batch call per open document simultaneously, as does a cold-start multi-manifest load. Also: a paginated batch response's page size isn't itself bounded, so `DEPS_DEV_BODY_LIMIT` must apply per page, not just to the first | A global `Semaphore` bounds concurrent `GetFindingsBatch` calls across all documents, mirroring the existing `max_concurrent_fetches` pattern, rather than being left unbounded "to revisit later". `DEPS_DEV_BODY_LIMIT` applied to every `nextPageToken` page (FR-012). `MAX_DEPENDENCIES_PER_DOCUMENT` (5000) already composes correctly with `GetFindingsBatch`'s own 5000-item cap — no separate cap needed |
 
 ## 10. See Also
 
