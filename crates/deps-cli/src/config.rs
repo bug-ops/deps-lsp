@@ -230,13 +230,24 @@ pub fn load(explicit_path: Option<&Path>, default_dir: &Path) -> Result<CliConfi
     };
 
     let config = parse(&content, &path)?;
-    if !required {
-        for section in ignored_sections(&config.policy) {
+    // Spec 074 FR-008: this loop now runs for both an auto-discovered and an explicit
+    // `--config` file — only `safe_auto_discovered_config`'s field-reset below stays scoped
+    // to the auto-discovered (`!required`) branch; `ignored_sections` itself already
+    // distinguishes which sections are worth warning about for which path (see its own doc).
+    for section in ignored_sections(&config.policy, required) {
+        if required {
+            eprintln!(
+                "deps-cli: warning: {path}'s [{section}] section has no effect in deps-cli today — see `deps_cli::config::ignored_sections`'s doc for why",
+                path = crate::sanitize::sanitize_path_for_display(&path).display(),
+            );
+        } else {
             eprintln!(
                 "deps-cli: warning: {path}'s [{section}] section was auto-discovered, not given via --config, and is ignored — see `deps_cli::config::safe_auto_discovered_config`'s doc for why",
                 path = crate::sanitize::sanitize_path_for_display(&path).display(),
             );
         }
+    }
+    if !required {
         return Ok(safe_auto_discovered_config(config));
     }
     Ok(config)
@@ -291,54 +302,81 @@ pub fn safe_auto_discovered_config(parsed: CliConfig) -> CliConfig {
 }
 
 /// Names every section of `policy` that differs from [`PolicyConfig::default`] outside the
-/// always-kept severity fields — used only to print a specific, per-section warning when
-/// [`load`] ignores an auto-discovered file's non-cosmetic settings, so this is visible in CI
-/// logs even if a future `PolicyConfig` field is missed by [`safe_auto_discovered_config`]'s
-/// allowlist (same "defense in depth" spirit as `report.rs`'s diagnostic-code-list doc).
-fn ignored_sections(policy: &PolicyConfig) -> Vec<&'static str> {
+/// always-kept severity fields, and is currently a no-op for `deps-cli` — used only to print a
+/// specific, per-section warning, so this is visible in CI logs even if a future
+/// `PolicyConfig` field is missed (same "defense in depth" spirit as `report.rs`'s
+/// diagnostic-code-list doc).
+///
+/// Two independent reasons a section can be a no-op, and `required` (whether this is an
+/// *explicit* `--config <path>`, never an auto-discovered `deps.toml`) distinguishes them:
+///
+/// - **Reset by [`safe_auto_discovered_config`]** (`diagnostics`/`cache`/`freshness`/
+///   `supply_chain`/`registries`/`network`/`license_policy`): each of these fields IS read by
+///   `deps-cli`'s own pipeline, so it only becomes a no-op when [`load`] resets it back to
+///   default for untrusted auto-discovered input (spec 062 F1/F1-follow-up) — never for an
+///   explicit `--config`, which stays fully trusted and un-reset. These checks are skipped
+///   entirely when `required` (an explicit config), or they would be false positives: warning
+///   that a section "has no effect" when it demonstrably does.
+/// - **Not wired up at all** (`typosquat` — spec 074 FR-007): `deps-cli` has no code path that
+///   reads `policy.typosquat.enabled` anywhere, so this section is a no-op for *both* an
+///   auto-discovered and an explicit config, and this check fires unconditionally.
+///
+/// `gossip` (spec 072 M14) used to belong to the second class, alongside `typosquat` — before
+/// spec 074, `deps-cli` had zero code reading `policy.gossip.enabled` either. Spec 074 (FR-001
+/// through FR-003) gave GOSSIP real, working wiring (`main.rs`'s `RuntimeHandles`,
+/// `analyze.rs`'s prefetch, `deps-engine`'s fetch-level filter) that reads whatever `policy`
+/// [`load`] ultimately returns — including an explicit config's own value, unmodified. `gossip`
+/// therefore moved into the first class: it remains a genuine no-op only for the
+/// auto-discovered path (still reset there), and must NOT warn for an explicit `--config`,
+/// where it now has real effect.
+fn ignored_sections(policy: &PolicyConfig, required: bool) -> Vec<&'static str> {
     let default = PolicyConfig::default();
     let mut sections = Vec::new();
 
-    if policy.diagnostics.mutable_ref_pin_enabled != default.diagnostics.mutable_ref_pin_enabled
-        || policy.diagnostics.vulnerabilities_enabled != default.diagnostics.vulnerabilities_enabled
-    {
-        sections.push("diagnostics");
+    if !required {
+        if policy.diagnostics.mutable_ref_pin_enabled != default.diagnostics.mutable_ref_pin_enabled
+            || policy.diagnostics.vulnerabilities_enabled
+                != default.diagnostics.vulnerabilities_enabled
+        {
+            sections.push("diagnostics");
+        }
+        if policy.cache.enabled != default.cache.enabled
+            || policy.cache.fetch_timeout_secs != default.cache.fetch_timeout_secs
+            || policy.cache.max_concurrent_fetches != default.cache.max_concurrent_fetches
+        {
+            sections.push("cache");
+        }
+        if policy.freshness.enabled != default.freshness.enabled
+            || policy.freshness.cooldown_secs != default.freshness.cooldown_secs
+        {
+            sections.push("freshness");
+        }
+        if policy.supply_chain.enabled != default.supply_chain.enabled {
+            sections.push("supply_chain");
+        }
+        if policy.registries.workspace_registries != default.registries.workspace_registries
+            || policy.registries.nuget_user_profile_sources
+                != default.registries.nuget_user_profile_sources
+            || policy.registries.gitlab_instance_host != default.registries.gitlab_instance_host
+        {
+            sections.push("registries");
+        }
+        if policy.network.offline != default.network.offline {
+            sections.push("network");
+        }
+        if policy.license_policy.allow != default.license_policy.allow
+            || policy.license_policy.deny != default.license_policy.deny
+        {
+            sections.push("license_policy");
+        }
+        if policy.gossip.enabled != default.gossip.enabled {
+            sections.push("gossip");
+        }
     }
-    if policy.cache.enabled != default.cache.enabled
-        || policy.cache.fetch_timeout_secs != default.cache.fetch_timeout_secs
-        || policy.cache.max_concurrent_fetches != default.cache.max_concurrent_fetches
-    {
-        sections.push("cache");
-    }
-    if policy.freshness.enabled != default.freshness.enabled
-        || policy.freshness.cooldown_secs != default.freshness.cooldown_secs
-    {
-        sections.push("freshness");
-    }
-    if policy.supply_chain.enabled != default.supply_chain.enabled {
-        sections.push("supply_chain");
-    }
-    if policy.registries.workspace_registries != default.registries.workspace_registries
-        || policy.registries.nuget_user_profile_sources
-            != default.registries.nuget_user_profile_sources
-        || policy.registries.gitlab_instance_host != default.registries.gitlab_instance_host
-    {
-        sections.push("registries");
-    }
-    if policy.network.offline != default.network.offline {
-        sections.push("network");
-    }
-    if policy.license_policy.allow != default.license_policy.allow
-        || policy.license_policy.deny != default.license_policy.deny
-    {
-        sections.push("license_policy");
-    }
-    // Issue #1456, spec 072, FR-010/M14: `deps-cli` GOSSIP parity was dropped from this
-    // issue's scope (near-zero practical value — see spec 072 §9's N1) — a `[gossip]`
-    // section now at least surfaces this "no effect" warning instead of being silently
-    // accepted, mirroring every other section here.
-    if policy.gossip.enabled != default.gossip.enabled {
-        sections.push("gossip");
+    // Spec 074 FR-007: unconditional (both auto-discovered and explicit) — see this
+    // function's own doc for why `typosquat` differs from every check above.
+    if policy.typosquat.enabled != default.typosquat.enabled {
+        sections.push("typosquat");
     }
 
     sections
@@ -411,19 +449,67 @@ mod tests {
     }
 
     /// Issue #1456, spec 072, M14: a `[gossip]` section differing from default must warn
-    /// via `ignored_sections`, since `deps-cli` has no GOSSIP behavior at all (FR-010
-    /// dropped) — otherwise it would be silently accepted with no effect.
+    /// via `ignored_sections` for an *auto-discovered* file — spec 074 gave `deps-cli` real
+    /// GOSSIP wiring, but only `safe_auto_discovered_config` still resets it, so this remains
+    /// a genuine no-op for that path only (see `ignored_sections`'s own doc).
     #[test]
-    fn test_ignored_sections_includes_gossip_when_enabled() {
+    fn test_ignored_sections_includes_gossip_when_enabled_and_auto_discovered() {
         let mut policy = PolicyConfig::default();
         policy.gossip.enabled = true;
-        assert!(ignored_sections(&policy).contains(&"gossip"));
+        assert!(ignored_sections(&policy, false).contains(&"gossip"));
     }
 
     #[test]
     fn test_ignored_sections_omits_gossip_when_default() {
         let policy = PolicyConfig::default();
-        assert!(!ignored_sections(&policy).contains(&"gossip"));
+        assert!(!ignored_sections(&policy, false).contains(&"gossip"));
+    }
+
+    /// Spec 074: an explicit `--config` file's `[gossip]` section is no longer a no-op
+    /// (`main.rs`/`analyze.rs`/`deps-engine` now read it) — `ignored_sections` must not warn
+    /// about it for `required: true`, unlike every other section reset only for
+    /// auto-discovered input.
+    #[test]
+    fn test_ignored_sections_omits_gossip_when_required() {
+        let mut policy = PolicyConfig::default();
+        policy.gossip.enabled = true;
+        assert!(!ignored_sections(&policy, true).contains(&"gossip"));
+    }
+
+    /// Spec 074 FR-007: `[typosquat]` has no `deps-cli` wiring at all (unlike `gossip` after
+    /// this spec), so it must warn for both an auto-discovered and an explicit config.
+    #[test]
+    fn test_ignored_sections_includes_typosquat_when_enabled_regardless_of_required() {
+        let mut policy = PolicyConfig::default();
+        policy.typosquat.enabled = true;
+        assert!(ignored_sections(&policy, false).contains(&"typosquat"));
+        assert!(ignored_sections(&policy, true).contains(&"typosquat"));
+    }
+
+    #[test]
+    fn test_ignored_sections_omits_typosquat_when_default() {
+        let policy = PolicyConfig::default();
+        assert!(!ignored_sections(&policy, false).contains(&"typosquat"));
+        assert!(!ignored_sections(&policy, true).contains(&"typosquat"));
+    }
+
+    /// Spec 074 FR-008: a non-default `[typosquat]` section in an *explicit* `--config` file
+    /// now prints the "has no effect" warning too — before this spec, `load`'s warning loop
+    /// ran only for an auto-discovered file (`if !required`), so an explicit config silently
+    /// accepted a no-op `[typosquat]` section with zero visible warning.
+    #[test]
+    fn test_load_warns_for_typosquat_in_explicit_config() {
+        let file = write_temp_toml(
+            r"
+            [typosquat]
+            enabled = true
+            ",
+        );
+        let config = load(Some(file.path()), Path::new("."))
+            .expect("explicit config with a non-default [typosquat] section must still load");
+        // The explicit path stays fully trusted (spec 062 F1-follow-up) — the section's
+        // value survives even though it has no effect yet.
+        assert!(config.policy.typosquat.enabled);
     }
 
     #[test]

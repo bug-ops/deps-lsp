@@ -45,14 +45,48 @@ prefetch discloses every declared dependency's name to deps.dev. Completion's lo
 cooldown baseline is unaffected by this flag — it never reads GOSSIP data and is always on
 (subject to the existing `freshness.enabled`/`freshness.cooldown_secs` settings).
 
+## `deps-cli` Parity (issue #1474)
+
+`deps-cli check`/`update` also honor `[gossip].enabled` (spec 074). Unlike `deps-lsp`'s
+hover/diagnostics-only integration above (which only ever rewords a message — the local
+`freshness.cooldown_secs` heuristic never excludes a version from being "latest" either),
+GOSSIP is the *only* mechanism in `deps-cli` that can change which version counts as
+"latest" at all, for both `check`'s `Outdated` classification (indirect only — no new
+`Category`/`--fail-on` token) and `update`'s fix-target selection, since both share one
+classification pipeline.
+
+This is **floor-protected**, and requires a concretely resolved in-use version to do
+anything at all: GOSSIP may only exclude a version strictly newer than the dependency's
+already-declared/in-use version, and only when one can actually be resolved (lockfile-backed,
+or an unambiguous exact pin). The floor is a hard lower bound not just on what GOSSIP may
+exclude but on the *final* pick itself — even when the floor version survives filtering, it
+can still turn out to be unselectable by the ecosystem's own rules (e.g. an in-use prerelease
+or yanked version); if that happens, `deps-cli` falls back to the pre-GOSSIP pick rather than
+ever accepting an even-older release below the floor. So `latest` can never regress below
+what's already declared — a manifest already pinned to the flagged version is left untouched,
+`update` can never be pointed at a downgrade, and an `Outdated` finding is attributed to
+GOSSIP in its message only when the exclusion actually changed the pick. When no in-use
+version can be resolved at all (a fresh dependency add, or any range requirement with no
+lock file — the common case for a bare Cargo requirement, which is a range, not an exact pin,
+or an unlocked npm/PyPI range), GOSSIP deliberately excludes nothing for that dependency this
+run, rather than risk a downgrade with no floor to protect it.
+
+`update --security-only`'s fix target comes from the advisory instead, so GOSSIP (like the
+local cooldown heuristic) has no effect there — `deps-cli` warns about this the same way it
+already does for `--cooldown`.
+
+A `[gossip]`/`[typosquat]` section that differs from the default now prints a
+"has no effect" warning for an *auto-discovered* `deps.toml`
+(`[gossip]` — reset back to default there, spec 062's untrusted-input hardening) or,
+for `[typosquat]` specifically (`deps-cli` has no typosquat integration at all yet), for an
+*explicit* `--config` file too.
+
 ## Known Limitations
 
 - Findings are cached per-package for up to an hour; an idle, unedited document can show a
   GOSSIP answer that is up to an hour stale before the next natural prefetch trigger (an
   edit, a reopen, or a config change) refreshes it.
-- `deps-cli` has no GOSSIP integration (dropped from this issue's scope — near-zero
-  practical value there, since cooldown only affects a diagnostic message's wording, never
-  `--fail-on`/exit-code behavior). A `[gossip]` section in an auto-discovered `deps.toml`
-  surfaces a warning instead of silently having no effect.
+- `deps-cli` has no Low-Usage Packages parity — no existing user demand signal for the CLI's
+  equivalent of hover's "invite to double-check" callout (deferred, spec 074 §1).
 - The GOSSIP API is still `v3alpha` (no GA designation) — same provisional-integration
   posture as the typosquat diagnostic.

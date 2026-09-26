@@ -4462,6 +4462,7 @@ mod tests {
                 available: Arc::from(vec!["1.0.0\u{202E}evil".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -5851,6 +5852,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -5908,6 +5910,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 30 * 24 * 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -5973,6 +5976,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6047,6 +6051,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6105,6 +6110,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6152,6 +6158,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6206,6 +6213,7 @@ mod tests {
                 available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6261,6 +6269,7 @@ mod tests {
                 available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -7080,6 +7089,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             m
@@ -7134,6 +7144,7 @@ mod tests {
                     ]),
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             m
@@ -7181,6 +7192,7 @@ mod tests {
                     available: Arc::from(vec!["1.5.0".into(), "1.4.0".into()]),
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             m
@@ -7234,6 +7246,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             m
@@ -7310,6 +7323,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             m
@@ -8946,6 +8960,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9000,6 +9015,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9072,6 +9088,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::AdvisoryDeprecated)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9143,6 +9160,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9221,6 +9239,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9286,6 +9305,7 @@ mod tests {
                     available: Arc::from(vec!["1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9334,6 +9354,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.0.1".into(), "1.0.0".into()]),
                     yanked: Arc::from(vec![("1.0.0".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9431,6 +9452,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -9494,6 +9516,7 @@ mod tests {
                     available: Arc::from(vec!["2.0.0".into(), "1.2.1".into()]),
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
+                    gossip_excluded_version: None,
                 },
             );
             let resolved_versions = HashMap::new();

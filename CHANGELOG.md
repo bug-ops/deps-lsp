@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **fuzz**: new `bundler_lockfile`, `go_lockfile`, `toml_lockfiles` (Cargo/PyPI), `json_lockfiles` (npm/Composer/NuGet/Swift), and `deps_cli_config` targets close the lock-file/config-parser fuzz-coverage gap (resolves #1404) (#1409)
 - **deps-core**: new `config_trust` module centralizes `ConfigTier`/`EnvVarSyntax`/`expand_env_vars`/`process_env`, deduplicating the config-trust-tier and `${VAR}`/`%VAR%` env-var interpolation logic previously implemented independently in deps-npm and deps-nuget (resolves #1434) (#1440)
 - **deps-core, deps-composer**: an unrecognized `composer.json` `minimum-stability` value now surfaces a warning diagnostic instead of silently resolving as `stable` (resolves #1444) (#1450)
+- **deps-cli, deps-engine**: `check`/`update` now honor `[gossip].enabled`, floor-protected against ever excluding an already-in-use version, plus an `ignored_sections`/`[typosquat]` warning-parity fix for explicit `--config` files (resolves #1474) (#1520)
 
 ### Security
 - **deps-lsp, deps-cli, deps-core, deps-cargo, deps-npm, deps-pypi, deps-swift, deps-github-actions**: sink-level and per-site sanitization closes the residual CWE-117 log-forging sinks left open after #1500 (resolves #1505) (#1512)

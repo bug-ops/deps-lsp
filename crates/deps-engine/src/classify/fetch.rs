@@ -529,6 +529,7 @@ impl FetchResult {
 ///         5,
 ///         10,
 ///         &SelectionContext::none(),
+///         None,
 ///     )
 ///     .await;
 ///
@@ -553,6 +554,7 @@ pub async fn fetch_latest_versions_parallel(
     timeout_secs: u64,
     max_concurrent: usize,
     selection_context: &deps_core::SelectionContext,
+    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
 ) -> FetchResult {
     use futures::stream::{self, StreamExt};
     use std::time::Duration;
@@ -580,6 +582,7 @@ pub async fn fetch_latest_versions_parallel(
                     timeout,
                     selection_context,
                     check_yanked,
+                    gossip,
                     &fetched,
                     progress_sender.as_ref(),
                 )
@@ -770,6 +773,7 @@ async fn fetch_and_classify_package(
     timeout: Duration,
     selection_context: &deps_core::SelectionContext,
     check_yanked: bool,
+    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
     fetched: &std::sync::atomic::AtomicUsize,
     progress_sender: Option<&ProgressSender>,
 ) -> PackageOutcome {
@@ -811,21 +815,154 @@ async fn fetch_and_classify_package(
             } else {
                 Arc::from([])
             };
-            // `.get(idx)` not `versions[idx]`: `select_latest_matching` is a public trait
-            // method, so an out-of-tree impl returning a stale index must not panic this
-            // task. `selection_context` is threaded through so a registry with
-            // manifest-level stability state (Composer's `minimum-stability`, #424 S1) can
-            // apply it.
-            let pick = if let Some(v) = registry
-                .select_latest_matching(&versions, wildcard_req, selection_context)
+
+            // Row 2/3 (§4.7, revised under #206) computed eagerly, against the full
+            // unfiltered `versions` list, before the GOSSIP-cooldown filter below consumes
+            // it — see that filter's own comment for why. Multiple occurrences of the same
+            // name (#394) can carry different in-use versions — every one is checked so a
+            // yanked pin on any occurrence is never missed. Filters on `is_flagged()` inside
+            // `find` itself (not a separate `.filter()`) so a response with multiple entries
+            // sharing `iv`'s version string still finds a flagged one if any exists (mirrors
+            // the pre-#205 `.any` scan).
+            let in_use_yanked: Option<(ConcreteVersion, RemovalStatus)> = check_yanked
+                .then(|| {
+                    in_use_versions.iter().find_map(|iv| {
+                        versions
+                            .iter()
+                            .find(|v| {
+                                v.version_string() == iv.as_str() && v.removal_status().is_flagged()
+                            })
+                            .map(|v| (iv.as_str().into(), v.removal_status()))
+                    })
+                })
+                .flatten();
+
+            // GOSSIP-cooldown floor-protected filter (spec 074 FR-003) — history in
+            // specs/074-deps-cli-gossip-parity/spec.md, not restated here.
+            //
+            // Computed first so the common case (not flagged) reuses this index below with
+            // zero extra `select_latest_matching` calls; captured as an owned `ConcreteVersion`
+            // since `Version` has no `clone_box` and `versions` is moved further down.
+            let unfiltered_pick_idx =
+                registry.select_latest_matching(&versions, wildcard_req, selection_context);
+            let unfiltered_pick_version: Option<ConcreteVersion> = unfiltered_pick_idx
                 .and_then(|idx| versions.get(idx))
-            {
+                .map(|v| v.version_string().clone());
+
+            let gossip_finding = gossip.and_then(|g| g.get(&name));
+            // `now` read once per fetch call.
+            let now = deps_core::freshness::PublishTime::now();
+            let is_gossip_cooldown = |version: &ConcreteVersion| {
+                gossip_finding.is_some_and(|finding| {
+                    finding.version.as_str() == version.as_str()
+                        && finding.cooldown.as_ref().is_some_and(|c| c.is_active(now))
+                })
+            };
+            let unfiltered_pick_flagged = unfiltered_pick_version
+                .as_ref()
+                .is_some_and(&is_gossip_cooldown);
+
+            // The resolved pick (or `None`, meaning the `get_latest_matching_from` fallback
+            // below runs) and the FR-005 attribution field.
+            type IndexedVersion = (usize, Box<dyn Version>);
+
+            let (list_pick, gossip_excluded_version): (
+                Option<Box<dyn Version>>,
+                Option<ConcreteVersion>,
+            ) = if unfiltered_pick_flagged {
+                // Protect floor: position of the newest `in_use_versions` entry in `versions`
+                // (newest-first) — `None` if no in-use version resolved (FR-003b: no-op then).
+                let protect_floor = in_use_versions
+                    .iter()
+                    .filter_map(|iv| {
+                        versions
+                            .iter()
+                            .position(|v| v.version_string() == iv.as_str())
+                    })
+                    .min();
+
+                match protect_floor {
+                    None => (
+                        unfiltered_pick_idx.and_then(|idx| versions.into_iter().nth(idx)),
+                        None,
+                    ),
+                    Some(floor) => {
+                        // Keep each candidate's original index alongside it (parallel
+                        // `filtered_indices`/`filtered_versions`, since `select_latest_matching`
+                        // needs a plain slice) so the final pick's position can be checked
+                        // against `floor` (FR-003e) and the unfiltered pick recovered by index,
+                        // not version string (avoids matching the wrong duplicate-string entry).
+                        let mut filtered_indices: Vec<usize> = Vec::new();
+                        let mut filtered_versions: Vec<Box<dyn Version>> = Vec::new();
+                        let mut dropped: Vec<IndexedVersion> = Vec::new();
+                        for (idx, v) in versions.into_iter().enumerate() {
+                            if idx >= floor || !is_gossip_cooldown(v.version_string()) {
+                                filtered_indices.push(idx);
+                                filtered_versions.push(v);
+                            } else {
+                                dropped.push((idx, v));
+                            }
+                        }
+
+                        let filtered_pick_idx = registry.select_latest_matching(
+                            &filtered_versions,
+                            wildcard_req,
+                            selection_context,
+                        );
+                        // Reject a filtered pick older than the floor (FR-003e) — a downgrade.
+                        let pick_at_or_above_floor = filtered_pick_idx
+                            .and_then(|idx| filtered_indices.get(idx))
+                            .is_some_and(|original_idx| *original_idx <= floor);
+
+                        if pick_at_or_above_floor {
+                            let filtered_pick_version = filtered_pick_idx
+                                .and_then(|idx| filtered_versions.get(idx))
+                                .map(|v| v.version_string().clone());
+                            let excluded = (filtered_pick_version != unfiltered_pick_version)
+                                .then(|| unfiltered_pick_version.clone())
+                                .flatten();
+                            (
+                                filtered_pick_idx
+                                    .and_then(|idx| filtered_versions.into_iter().nth(idx)),
+                                excluded,
+                            )
+                        } else {
+                            // No acceptable pick (FR-003d/e) — recover the unfiltered pick by
+                            // its original index (dropped, or defensively filtered_versions).
+                            let recovered = unfiltered_pick_idx.and_then(|target| {
+                                dropped
+                                    .iter()
+                                    .position(|(idx, _)| *idx == target)
+                                    .map(|i| dropped.swap_remove(i).1)
+                                    .or_else(|| {
+                                        filtered_indices
+                                            .iter()
+                                            .position(|idx| *idx == target)
+                                            .map(|i| filtered_versions.swap_remove(i))
+                                    })
+                            });
+                            (recovered, None)
+                        }
+                    }
+                }
+            } else {
+                (
+                    unfiltered_pick_idx.and_then(|idx| versions.into_iter().nth(idx)),
+                    None,
+                )
+            };
+
+            // `selection_context` is threaded through so a registry with manifest-level
+            // stability state (Composer's `minimum-stability`, #424 S1) can apply it — already
+            // accounted for by `list_pick`'s own `select_latest_matching` call(s) above; no
+            // further selection call happens here.
+            let pick = if let Some(v) = list_pick.as_deref() {
                 tracing::debug!(
                     package = %name.for_tracing(),
                     version = %v.version_string(),
                     "fetched"
                 );
-                Pick::resolved(v.as_ref())
+                Pick::resolved(v)
             } else {
                 // The list-based pick found nothing — usually a genuine "no version", but
                 // a registry with an incomplete list endpoint (Go's `/@v/list`, which never
@@ -916,27 +1053,11 @@ async fn fetch_and_classify_package(
                     yanked = Some((latest.clone(), *status));
                 }
 
-                // Row 2/3 (§4.7, revised under #206): `versions` is the full, already-fetched
-                // list — no second registry round trip needed, so this runs for every
-                // dependency with a known in-use version, not just when it differs from
-                // `latest`. A yanked in-use version wins over an already-recorded yanked
-                // `latest` since it's the version the user actually has.
-                //
-                // Multiple occurrences of the same name (#394, e.g. `[dependencies]` +
-                // `[target.*.dependencies]`) can carry different in-use versions — every one
-                // is checked so a yanked pin on any occurrence is never missed. Filters on
-                // `is_flagged()` inside `find` itself (not a separate `.filter()`) so a
-                // response with multiple entries sharing `iv`'s version string still finds a
-                // flagged one if any exists (mirrors the pre-#205 `.any` scan).
-                if let Some((iv, status)) = in_use_versions.iter().find_map(|iv| {
-                    versions
-                        .iter()
-                        .find(|v| {
-                            v.version_string() == iv.as_str() && v.removal_status().is_flagged()
-                        })
-                        .map(|v| (iv, v.removal_status()))
-                }) {
-                    yanked = Some((iv.as_str().into(), status));
+                // A yanked in-use version wins over an already-recorded yanked `latest`
+                // since it's the version the user actually has — see `in_use_yanked`'s own
+                // comment above for why this is computed ahead of the GOSSIP filter.
+                if let Some(iv_yanked) = in_use_yanked {
+                    yanked = Some(iv_yanked);
                 }
             }
 
@@ -964,6 +1085,9 @@ async fn fetch_and_classify_package(
                         PackageVersions::new(version, available).with_yanked(yanked_list);
                     if let Some(published_at) = published_at {
                         versions = versions.with_published_at(published_at);
+                    }
+                    if let Some(excluded) = gossip_excluded_version {
+                        versions = versions.with_gossip_excluded_version(excluded);
                     }
                     PackageStatus::Resolved {
                         versions,
@@ -1454,6 +1578,7 @@ mod tests {
             1,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -1535,6 +1660,7 @@ mod tests {
             1,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
         let elapsed = start.elapsed();
@@ -1636,6 +1762,7 @@ mod tests {
             5,
             20,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -1707,6 +1834,7 @@ mod tests {
                 5,
                 0,
                 &SelectionContext::none(),
+                None,
             ),
         )
         .await
@@ -1836,6 +1964,7 @@ mod tests {
             1,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -1958,6 +2087,7 @@ mod tests {
             10,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -2091,6 +2221,7 @@ mod tests {
             10,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -2207,6 +2338,7 @@ mod tests {
             10,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -2330,6 +2462,7 @@ mod tests {
             10,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -2441,6 +2574,7 @@ mod tests {
             10,
             10,
             &SelectionContext::with_minimum_stability(StabilityFloor::Beta),
+            None,
         )
         .await;
 
@@ -2544,6 +2678,7 @@ mod tests {
             10,
             10,
             &SelectionContext::with_minimum_stability(StabilityFloor::Beta),
+            None,
         )
         .await;
 
@@ -2642,6 +2777,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -2721,6 +2857,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -2836,6 +2973,7 @@ mod tests {
                     5,
                     10,
                     &SelectionContext::none(),
+                    None,
                 )
                 .await;
                 assert_eq!(result.failed_count(), 1);
@@ -2930,6 +3068,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3001,6 +3140,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3088,6 +3228,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3168,6 +3309,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3244,6 +3386,7 @@ mod tests {
             1,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3327,6 +3470,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3408,6 +3552,7 @@ mod tests {
             5,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3488,6 +3633,7 @@ mod tests {
             1,
             10,
             &SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -3713,6 +3859,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -3741,6 +3888,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -3767,6 +3915,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -3801,6 +3950,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -3835,6 +3985,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -3869,6 +4020,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -3905,6 +4057,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4001,6 +4154,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4055,6 +4209,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4089,6 +4244,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4123,6 +4279,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4168,6 +4325,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4197,6 +4355,7 @@ mod tests {
                 1,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4307,6 +4466,7 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
@@ -4332,10 +4492,510 @@ mod tests {
                 5,
                 10,
                 &SelectionContext::none(),
+                None,
             )
             .await;
 
             assert!(result.deprecations.is_empty());
+        }
+    }
+
+    /// Spec 074 FR-003/FR-005: the fetch-level GOSSIP-cooldown filter and its attribution
+    /// field, exercised through the public [`fetch_latest_versions_parallel`] entry point
+    /// rather than the private [`fetch_and_classify_package`] directly.
+    mod gossip_cooldown_filter_tests {
+        use super::*;
+        use deps_core::test_util::stub_gossip_findings;
+        use deps_core::{
+            GossipCooldown, GossipRiskLevel, Metadata, PublishTime, Registry, Version,
+        };
+        use std::any::Any;
+
+        #[derive(Debug)]
+        struct MockVersion {
+            version: ConcreteVersion,
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &ConcreteVersion {
+                &self.version
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Returns a fixed, newest-first version list regardless of the queried package name.
+        ///
+        /// `fallback`, when set, is what `get_latest_matching` (the `get_latest_matching_from`
+        /// registry endpoint the fetch loop falls back to when the list-based pick comes up
+        /// empty) returns — used by the S1-residual test to model deps.dev's cooldown being
+        /// silently bypassed when GOSSIP excludes the sole candidate and no in-use version
+        /// protects it (spec 074 §6's documented, not-fixed residual gap).
+        struct FixedListRegistry {
+            versions: Vec<&'static str>,
+            fallback: Option<&'static str>,
+            /// When set, `select_latest_matching` rejects any version string containing `-`
+            /// (a bare stand-in for a prerelease marker) — mirrors an ecosystem's own
+            /// selection rules refusing to pick a prerelease as "latest" (Go's
+            /// `select_latest_matching_impl`, registry.rs:926), used to model the round-2 S1
+            /// scenario where a floor-filtered candidate set still yields no pick.
+            reject_prerelease: bool,
+            /// Counts calls to `get_latest_matching` (the `get_latest_matching_from` fallback
+            /// endpoint) — used to assert it is never invoked as a consequence of GOSSIP's
+            /// own filtering (round-2 S1 closure).
+            fallback_calls: std::sync::atomic::AtomicUsize,
+        }
+
+        impl FixedListRegistry {
+            fn new(versions: Vec<&'static str>) -> Self {
+                Self {
+                    versions,
+                    fallback: None,
+                    reject_prerelease: false,
+                    fallback_calls: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+
+            fn with_fallback(versions: Vec<&'static str>, fallback: &'static str) -> Self {
+                Self {
+                    versions,
+                    fallback: Some(fallback),
+                    reject_prerelease: false,
+                    fallback_calls: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+
+            fn with_prerelease_rejection(versions: Vec<&'static str>) -> Self {
+                Self {
+                    versions,
+                    fallback: None,
+                    reject_prerelease: true,
+                    fallback_calls: std::sync::atomic::AtomicUsize::new(0),
+                }
+            }
+
+            fn fallback_call_count(&self) -> usize {
+                self.fallback_calls
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+
+        impl Registry for FixedListRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                let versions = self.versions.clone();
+                Box::pin(async move {
+                    Ok(versions
+                        .into_iter()
+                        .map(|v| Box::new(MockVersion { version: v.into() }) as Box<dyn Version>)
+                        .collect())
+                })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+                _selection_context: &'a SelectionContext,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                // Exercised only if the list-based pick finds nothing — not GOSSIP-aware,
+                // exactly like the real `get_latest_matching_from` endpoints this models.
+                self.fallback_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let fallback = self.fallback;
+                Box::pin(async move {
+                    Ok(fallback
+                        .map(|v| Box::new(MockVersion { version: v.into() }) as Box<dyn Version>))
+                })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &VersionReq,
+                _selection_context: &SelectionContext,
+            ) -> Option<usize> {
+                if self.reject_prerelease {
+                    versions
+                        .iter()
+                        .position(|v| !v.version_string().as_str().contains('-'))
+                } else if versions.is_empty() {
+                    None
+                } else {
+                    // Mirrors every real registry's contract: the list is already
+                    // newest-first, so the first surviving entry (post-GOSSIP-filter) is
+                    // "latest".
+                    Some(0)
+                }
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        fn active_cooldown() -> GossipCooldown {
+            GossipCooldown::new(
+                PublishTime::from_unix_secs(i64::MAX / 2),
+                GossipRiskLevel::High,
+            )
+        }
+
+        fn expired_cooldown() -> GossipCooldown {
+            GossipCooldown::new(PublishTime::from_unix_secs(1), GossipRiskLevel::High)
+        }
+
+        async fn fetch_pkg(
+            registry: Arc<FixedListRegistry>,
+            in_use: Vec<&'static str>,
+            gossip: HashMap<PackageName, deps_core::GossipFindings>,
+        ) -> Option<PackageVersions> {
+            let registry: Arc<dyn Registry> = registry;
+            let mut in_use_map = HashMap::new();
+            if !in_use.is_empty() {
+                in_use_map.insert(
+                    PackageName::new("pkg"),
+                    in_use.into_iter().map(String::from).collect(),
+                );
+            }
+            let result = fetch_latest_versions_parallel(
+                registry,
+                with_registry_source(vec![PackageName::new("pkg")]),
+                &in_use_map,
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                5,
+                10,
+                &SelectionContext::none(),
+                Some(&gossip),
+            )
+            .await;
+            result.versions.get(&PackageName::new("pkg")).cloned()
+        }
+
+        /// GOSSIP-only exclusion, floor-protected (round 2): a real in-use version (`1.0.0`)
+        /// provides the protect floor, the newer registry-latest (`2.0.0`) is flagged with an
+        /// active cooldown, so the floor's own version wins, and the attribution field names
+        /// the excluded version (FR-005). The minimal 2-entry complement to
+        /// `safe_intermediate_release_above_the_floor_is_picked`'s 3-entry case.
+        #[tokio::test]
+        async fn active_cooldown_on_the_latest_version_excludes_it() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("2.0.0", Some(active_cooldown())),
+            );
+
+            let versions = fetch_pkg(
+                Arc::new(FixedListRegistry::new(vec!["2.0.0", "1.0.0"])),
+                vec!["1.0.0"],
+                gossip,
+            )
+            .await
+            .expect("pkg must resolve");
+
+            assert_eq!(versions.latest.as_str(), "1.0.0");
+            assert_eq!(
+                versions
+                    .gossip_excluded_version
+                    .as_ref()
+                    .map(ConcreteVersion::as_str),
+                Some("2.0.0")
+            );
+        }
+
+        /// Neither: no GOSSIP finding for this package at all — a no-op.
+        #[tokio::test]
+        async fn no_finding_for_package_is_a_no_op() {
+            let versions = fetch_pkg(
+                Arc::new(FixedListRegistry::new(vec!["2.0.0", "1.0.0"])),
+                vec![],
+                HashMap::new(),
+            )
+            .await
+            .expect("pkg must resolve");
+
+            assert_eq!(versions.latest.as_str(), "2.0.0");
+            assert!(versions.gossip_excluded_version.is_none());
+        }
+
+        /// A finding with no cooldown at all (e.g. only a `low_usage` signal) is a no-op —
+        /// mirrors [`GossipCooldown::is_active`]'s contract of only ever gating on a `Some`
+        /// cooldown.
+        #[tokio::test]
+        async fn finding_without_a_cooldown_is_a_no_op() {
+            let mut gossip = HashMap::new();
+            gossip.insert(PackageName::new("pkg"), stub_gossip_findings("2.0.0", None));
+
+            let versions = fetch_pkg(
+                Arc::new(FixedListRegistry::new(vec!["2.0.0", "1.0.0"])),
+                vec![],
+                gossip,
+            )
+            .await
+            .expect("pkg must resolve");
+
+            assert_eq!(versions.latest.as_str(), "2.0.0");
+            assert!(versions.gossip_excluded_version.is_none());
+        }
+
+        /// An expired cooldown (`end` in the past) is a no-op — `GossipCooldown::is_active`
+        /// returns `false`.
+        #[tokio::test]
+        async fn expired_cooldown_is_a_no_op() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("2.0.0", Some(expired_cooldown())),
+            );
+
+            let versions = fetch_pkg(
+                Arc::new(FixedListRegistry::new(vec!["2.0.0", "1.0.0"])),
+                vec![],
+                gossip,
+            )
+            .await
+            .expect("pkg must resolve");
+
+            assert_eq!(versions.latest.as_str(), "2.0.0");
+            assert!(versions.gossip_excluded_version.is_none());
+        }
+
+        /// Version-string mismatch: GOSSIP's flagged version isn't in this registry's list at
+        /// all (deps.dev's view of "latest" lagging or leading the registry) — treated as no
+        /// signal (spec 074 edge case table), never a fuzzy fallback match.
+        #[tokio::test]
+        async fn version_string_mismatch_is_a_no_op() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("3.0.0", Some(active_cooldown())),
+            );
+
+            let versions = fetch_pkg(
+                Arc::new(FixedListRegistry::new(vec!["2.0.0", "1.0.0"])),
+                vec![],
+                gossip,
+            )
+            .await
+            .expect("pkg must resolve");
+
+            assert_eq!(versions.latest.as_str(), "2.0.0");
+            assert!(versions.gossip_excluded_version.is_none());
+        }
+
+        /// **C1 regression** (spec 074 round-1 critique): the in-use/already-declared version
+        /// is itself the one GOSSIP flags, and it is also the true registry-latest. The
+        /// protect floor covers this version's own position, so the exclusion is fully
+        /// neutralized — the pick must stay exactly what it already was, `deps-cli update`
+        /// must never see a downgrade target, and no attribution is set (nothing was actually
+        /// held back).
+        #[tokio::test]
+        async fn in_use_version_itself_flagged_neutralizes_the_exclusion() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("2.0.0", Some(active_cooldown())),
+            );
+
+            let versions = fetch_pkg(
+                Arc::new(FixedListRegistry::new(vec!["2.0.0", "1.0.0"])),
+                vec!["2.0.0"],
+                gossip,
+            )
+            .await
+            .expect("pkg must resolve");
+
+            assert_eq!(
+                versions.latest.as_str(),
+                "2.0.0",
+                "must never regress below the already-declared/in-use version"
+            );
+            assert!(
+                versions.gossip_excluded_version.is_none(),
+                "the floor neutralized the exclusion — nothing was actually held back"
+            );
+        }
+
+        /// **T2** (spec 074 round-1 edge case table): the in-use version is older and safe,
+        /// but GOSSIP flags only the newest release, while a safe intermediate release exists
+        /// above the protect floor. The flagged release alone is excluded; the safe
+        /// intermediate release is picked, never the in-use version itself (this is forward
+        /// progress, not a no-op).
+        #[tokio::test]
+        async fn safe_intermediate_release_above_the_floor_is_picked() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("3.0.0", Some(active_cooldown())),
+            );
+
+            let versions = fetch_pkg(
+                Arc::new(FixedListRegistry::new(vec!["3.0.0", "2.0.0", "1.0.0"])),
+                vec!["1.0.0"],
+                gossip,
+            )
+            .await
+            .expect("pkg must resolve");
+
+            assert_eq!(
+                versions.latest.as_str(),
+                "2.0.0",
+                "the safe intermediate release must win, not the flagged 3.0.0 nor a regression to the in-use 1.0.0"
+            );
+            assert_eq!(
+                versions
+                    .gossip_excluded_version
+                    .as_ref()
+                    .map(ConcreteVersion::as_str),
+                Some("3.0.0")
+            );
+        }
+
+        /// **C1b** (spec 074 round 2): no in-use version is found in the fetched list at all —
+        /// the common case for a range requirement with no lockfile (a fresh dependency add,
+        /// Cargo's `AlwaysRange` policy, an unlocked npm/PyPI range) — and GOSSIP flags the
+        /// sole list-based candidate. There is no floor to construct any protection from, so
+        /// round 2 makes this a **deliberate no-op**: GOSSIP excludes nothing this fetch, the
+        /// unfiltered pick is used exactly as it would be without this feature, and the
+        /// network fallback (`get_latest_matching_from`) is never even invoked — this
+        /// replaces round 1's "documented residual fallback-bypass" premise, which
+        /// independent re-verification found was actually the common case, not a rare edge.
+        ///
+        /// This test hand-feeds an empty `in_use` to [`fetch_pkg`] rather than going through
+        /// the real `prepare_fetch`/`collect_in_use_versions` path (`classify/resolved.rs`) —
+        /// that upstream function's own, already-existing test suite
+        /// (`collect_in_use_versions_skips_non_concrete_requirement_with_no_lockfile`,
+        /// `classify/osv.rs`) independently proves it returns an empty map for exactly this
+        /// scenario (Cargo `AlwaysRange`, a bare/range requirement, no lockfile). Composed
+        /// together, the two suites cover the full C1b path end to end without needing a
+        /// third, heavier integration test through a real ecosystem parser — flagged in the
+        /// handoff in case an integration test is still wanted for extra confidence.
+        #[tokio::test]
+        async fn no_in_use_version_at_all_is_a_deliberate_no_op() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("2.0.0", Some(active_cooldown())),
+            );
+
+            let registry = Arc::new(FixedListRegistry::with_fallback(vec!["2.0.0"], "2.0.0"));
+            let versions = fetch_pkg(Arc::clone(&registry), vec![], gossip)
+                .await
+                .expect("pkg must resolve from the unfiltered list-based pick");
+
+            assert_eq!(
+                versions.latest.as_str(),
+                "2.0.0",
+                "no floor exists, so GOSSIP must not exclude anything this run"
+            );
+            assert!(
+                versions.gossip_excluded_version.is_none(),
+                "nothing was actually excluded — no attribution"
+            );
+            assert_eq!(
+                registry.fallback_call_count(),
+                0,
+                "the network fallback must never be invoked as a consequence of GOSSIP's own \
+                 filtering when the unfiltered list-based pick already succeeded"
+            );
+        }
+
+        /// **S1, round 2**: a real protect floor exists (in-use `1.0.0-rc.1`), but after
+        /// filtering out the flagged stable release above it, only a prerelease remains —
+        /// which this mock registry's own selection rules (mirroring Go's
+        /// `select_latest_matching_impl` refusing to pick a prerelease as "latest") reject.
+        /// The filtered pick therefore comes back `None` for a reason unrelated to "no floor"
+        /// at all. THE SYSTEM must fall back to the unfiltered pick, set no attribution, and
+        /// never invoke the network fallback on GOSSIP's account.
+        #[tokio::test]
+        async fn floor_exists_but_ecosystem_selection_rejects_the_remainder_is_a_no_op() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("1.0.0", Some(active_cooldown())),
+            );
+
+            let registry = Arc::new(FixedListRegistry::with_prerelease_rejection(vec![
+                "1.0.0",
+                "1.0.0-rc.1",
+            ]));
+            let versions = fetch_pkg(Arc::clone(&registry), vec!["1.0.0-rc.1"], gossip)
+                .await
+                .expect("pkg must resolve via the recovered unfiltered pick");
+
+            assert_eq!(
+                versions.latest.as_str(),
+                "1.0.0",
+                "the ecosystem rejected the filtered remainder (an all-prerelease set), so the \
+                 unfiltered pick must be used instead"
+            );
+            assert!(
+                versions.gossip_excluded_version.is_none(),
+                "nothing was actually excluded from the final pick — no attribution"
+            );
+            assert_eq!(
+                registry.fallback_call_count(),
+                0,
+                "the network fallback must never be invoked as a consequence of GOSSIP's own \
+                 filtering — only when the unfiltered pick itself finds nothing, which it did not"
+            );
+        }
+
+        /// **S4** (spec 074 round 3): the floor itself survives filtering (its own position
+        /// always satisfies `idx >= floor`) but is rejected by the ecosystem's own selection
+        /// rules (an in-use prerelease), and an even-older stable release exists below it. A
+        /// filtered pick that lands there would be a genuine downgrade below the floor —
+        /// distinct from `floor_exists_but_ecosystem_selection_rejects_the_remainder_is_a_no_op`,
+        /// where filtering leaves nothing selectable at all. THE SYSTEM must treat the floor as
+        /// a hard lower bound on the *final* pick, not merely on what gets excluded: recover
+        /// the unfiltered pick instead of ever accepting a pick older than the floor.
+        #[tokio::test]
+        async fn filtered_pick_below_the_floor_is_rejected_in_favor_of_the_unfiltered_pick() {
+            let mut gossip = HashMap::new();
+            gossip.insert(
+                PackageName::new("pkg"),
+                stub_gossip_findings("1.0.0", Some(active_cooldown())),
+            );
+
+            let registry = Arc::new(FixedListRegistry::with_prerelease_rejection(vec![
+                "1.0.0",
+                "1.0.0-rc.1",
+                "0.9.0",
+            ]));
+            let versions = fetch_pkg(Arc::clone(&registry), vec!["1.0.0-rc.1"], gossip)
+                .await
+                .expect("pkg must resolve via the recovered unfiltered pick");
+
+            assert_eq!(
+                versions.latest.as_str(),
+                "1.0.0",
+                "must never regress to 0.9.0 — a downgrade below the floor (1.0.0-rc.1) — even \
+                 though 0.9.0 is a legitimate, ecosystem-selectable filtered pick"
+            );
+            assert!(
+                versions.gossip_excluded_version.is_none(),
+                "no attribution — the recovered pick is identical to the unfiltered one"
+            );
+            assert_eq!(
+                registry.fallback_call_count(),
+                0,
+                "the network fallback must never be invoked as a consequence of GOSSIP's own filtering"
+            );
         }
     }
 }

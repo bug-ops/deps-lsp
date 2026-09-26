@@ -143,6 +143,26 @@ pub struct PackageVersions {
     /// overwrite) without the other. Bundling them here makes that
     /// desync impossible: whoever sets `latest` sets `published_at` too.
     pub published_at: Option<crate::freshness::PublishTime>,
+    /// Set when a version was excluded from being [`Self::latest`] solely because of an
+    /// active GOSSIP cooldown finding whose version was strictly newer than the dependency's
+    /// already-in-use version (`deps-cli` spec 074, FR-003/FR-005's floor-protected filter —
+    /// round 1 correction: there is no local `cooldown_secs`-based exclusion this unions
+    /// with, `freshness.cooldown_secs` only ever rewords a downstream diagnostic message).
+    /// `None` in the common case (GOSSIP disabled, no matching finding, or no active
+    /// cooldown), and in four further no-op cases where nothing was actually held back: the
+    /// protect floor fully neutralized the exclusion because the flagged version was itself
+    /// already in use and still the best available (C1a); no in-use version could be
+    /// resolved at all, so no floor could be constructed and GOSSIP deliberately excludes
+    /// nothing this fetch (C1b — the common case for a range requirement with no lockfile);
+    /// a floor exists but the ecosystem's own selection rules reject every remaining
+    /// candidate above it (S1); or a floor exists and a filtered pick is found, but that
+    /// pick's original (pre-filter) position is older than the floor itself — the floor
+    /// version survived filtering yet was rejected by the ecosystem's own selection rules
+    /// (e.g. an in-use prerelease/yanked version), leaving only an even-older release to be
+    /// picked, which would be a downgrade below the floor (S4). In all four cases the
+    /// unfiltered pick is reused instead. Purely an in-process outcome-reporting field: no
+    /// wire/schema format carries it.
+    pub gossip_excluded_version: Option<ConcreteVersion>,
 }
 
 impl PackageVersions {
@@ -175,6 +195,7 @@ impl PackageVersions {
             available,
             yanked: Arc::from(Vec::new()),
             published_at: None,
+            gossip_excluded_version: None,
         }
     }
 
@@ -189,6 +210,14 @@ impl PackageVersions {
     #[must_use]
     pub const fn with_published_at(mut self, published_at: crate::freshness::PublishTime) -> Self {
         self.published_at = Some(published_at);
+        self
+    }
+
+    /// Attaches the version a GOSSIP cooldown finding excluded from being [`Self::latest`].
+    /// See [`Self::gossip_excluded_version`].
+    #[must_use]
+    pub fn with_gossip_excluded_version(mut self, excluded: ConcreteVersion) -> Self {
+        self.gossip_excluded_version = Some(excluded);
         self
     }
 
@@ -223,6 +252,7 @@ impl PackageVersions {
             available,
             yanked: Arc::from(Vec::new()),
             published_at: None,
+            gossip_excluded_version: None,
         }
     }
 
@@ -247,6 +277,7 @@ impl PackageVersions {
             available: Arc::from(Vec::new()),
             yanked: Arc::from(Vec::new()),
             published_at: None,
+            gossip_excluded_version: None,
         }
     }
 }

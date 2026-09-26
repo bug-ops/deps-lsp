@@ -407,6 +407,8 @@ async fn run_document_open_background_task(
         diagnostics_snapshot.fetch_timeout_secs,
         diagnostics_snapshot.max_concurrent_fetches,
         &selection_context,
+        // deps-lsp surfaces GOSSIP via its own prefetch (spec 072), not this filter (spec 074).
+        None,
     )
     .await;
     drop(fetch_permit);

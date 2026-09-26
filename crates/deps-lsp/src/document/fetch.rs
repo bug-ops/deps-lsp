@@ -176,6 +176,9 @@ pub(crate) async fn fetch_registry_versions_for_change(
         fetch_timeout_secs,
         max_concurrent_fetches,
         &selection_context,
+        // See `lifecycle.rs`'s identical call site — deps-lsp's own GOSSIP surfacing (spec
+        // 072) does not go through this fetch-level filter.
+        None,
     )
     .await;
 
@@ -383,6 +386,7 @@ mod tests {
             5,
             10,
             &deps_core::SelectionContext::none(),
+            None,
         )
         .await;
 
@@ -614,6 +618,7 @@ dependencies = ["requests>=2.0.0"]
                 5,
                 10,
                 &deps_core::SelectionContext::none(),
+                None,
             )
             .await;
 
