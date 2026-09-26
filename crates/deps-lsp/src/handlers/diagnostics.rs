@@ -411,7 +411,7 @@ mod tests {
             Arc::new(deps_core::HttpCache::new()),
             server.url(),
         ));
-        let typosquats = deps_core::lsp_helpers::fetch_typosquat_signals(
+        let outcome = deps_core::lsp_helpers::fetch_typosquat_signals(
             deps_core::EcosystemId::Npm,
             parse_result,
             ecosystem.formatter(),
@@ -420,10 +420,10 @@ mod tests {
         )
         .await;
         assert!(
-            !typosquats.is_empty(),
+            !outcome.signals.is_empty(),
             "pre-fetch must have resolved a signal"
         );
-        typosquats
+        outcome.signals
     }
 
     #[test]

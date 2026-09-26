@@ -13,9 +13,9 @@ use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
-    EcosystemId, FetchFailure, PackageName, ParseResult, PublishTime, RegistryOccurrence,
-    RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal, VersionReq, format_relative_age,
-    is_within_cooldown,
+    EcosystemId, FetchCompleteness, FetchFailure, PackageName, ParseResult, PublishTime,
+    RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal, VersionReq,
+    format_relative_age, is_within_cooldown,
 };
 
 use super::{
@@ -1732,8 +1732,28 @@ fn apply_typosquat_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContext<'_>
 /// path, mirroring `deps-lsp::document::osv_scan::LICENSE_PREFETCH_CONCURRENCY`'s reasoning.
 const TYPOSQUAT_FETCH_CONCURRENCY: usize = 8;
 
+/// [`fetch_typosquat_signals`]'s result: the positive signals found, plus whether every
+/// eligible declared dependency's evaluation actually completed (issue #1463).
+///
+/// A caller deciding whether it may treat this fan-out as a finished check (versus one that
+/// must be retried later, e.g. `deps-lsp::document::osv_scan::run_typosquat_prefetch`'s
+/// debounced-edit gate) needs [`completeness`](Self::completeness) — `signals` alone cannot
+/// distinguish "checked every eligible dependency, none were suspects" from "deps.dev was
+/// unreachable for at least one of them".
+#[derive(Debug, Clone, PartialEq)]
+pub struct TyposquatFetchOutcome {
+    /// The positive signals resolved, keyed by the declared (raw, unnormalized) package name.
+    pub signals: HashMap<PackageName, TyposquatSignal>,
+    /// [`FetchCompleteness::Complete`] only if every eligible dependency's evaluation — every
+    /// deps.dev call it needed — returned a definitive answer, fresh or memoized.
+    pub completeness: FetchCompleteness,
+}
+
 /// Resolves a [`TyposquatSignal`] for every distinct direct dependency name declared in
 /// `parse_result` (issue #1437, spec 071), keyed by that raw (unnormalized) name.
+///
+/// Also reports whether the fan-out actually completed (issue #1463) — see
+/// [`TyposquatFetchOutcome`].
 ///
 /// **Not** called from this diagnostics pipeline itself (NFR-002: diagnostics generation
 /// must never `.await` a deps.dev fan-out inline) — the sole caller is
@@ -1749,7 +1769,8 @@ const TYPOSQUAT_FETCH_CONCURRENCY: usize = 8;
 /// Zero HTTP requests when `client` is `None` (FR-009: `policy.typosquat.enabled` is
 /// `false`), `offline` is set, or `ecosystem_id` is one of the seven ecosystems
 /// `deps_dev_system` doesn't cover (FR-002) — all checked before any dependency name is
-/// even collected.
+/// even collected; each such early-out reports [`FetchCompleteness::Complete`], since none of
+/// them is a transient condition a retry could resolve.
 ///
 /// `formatter.source_is_public_registry_content(&dep.source())` gates each dependency
 /// individually (security review finding, issue #1437): a private/internal/git/path
@@ -1763,17 +1784,20 @@ pub async fn fetch_typosquat_signals(
     formatter: &dyn EcosystemFormatter,
     offline: bool,
     client: Option<&Arc<DepsDevClient>>,
-) -> HashMap<PackageName, TyposquatSignal> {
-    let mut signals = HashMap::new();
+) -> TyposquatFetchOutcome {
+    let complete = TyposquatFetchOutcome {
+        signals: HashMap::new(),
+        completeness: FetchCompleteness::Complete,
+    };
 
     let Some(client) = client else {
-        return signals;
+        return complete;
     };
     if offline {
-        return signals;
+        return complete;
     }
     let Some(system) = deps_dev_system(ecosystem_id) else {
-        return signals;
+        return complete;
     };
 
     let mut seen = HashSet::new();
@@ -1786,27 +1810,33 @@ pub async fn fetch_typosquat_signals(
         .collect();
 
     if names.is_empty() {
-        return signals;
+        return complete;
     }
 
     let resolved = stream::iter(names)
         .map(|name| {
             let client = Arc::clone(client);
             async move {
-                let signal = client.typosquat_signal(system, name.as_str()).await;
-                (name, signal)
+                let (signal, completeness) = client.typosquat_signal(system, name.as_str()).await;
+                (name, signal, completeness)
             }
         })
         .buffer_unordered(TYPOSQUAT_FETCH_CONCURRENCY)
         .collect::<Vec<_>>()
         .await;
 
-    for (name, signal) in resolved {
+    let mut signals = HashMap::new();
+    let mut completeness = FetchCompleteness::Complete;
+    for (name, signal, name_completeness) in resolved {
+        completeness = completeness.combine(name_completeness);
         if let Some(signal) = signal {
             signals.insert(name, signal);
         }
     }
-    signals
+    TyposquatFetchOutcome {
+        signals,
+        completeness,
+    }
 }
 
 /// R3 — package-level deprecation finding (#205, I4).
@@ -9805,7 +9835,7 @@ mod tests {
                 .await;
 
             let parse_result = single_dep_parse_result("crossenv");
-            let signals = fetch_typosquat_signals(
+            let outcome = fetch_typosquat_signals(
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
@@ -9814,7 +9844,8 @@ mod tests {
             )
             .await;
 
-            assert!(signals.is_empty());
+            assert!(outcome.signals.is_empty());
+            assert_eq!(outcome.completeness, FetchCompleteness::Complete);
             package_call.assert_async().await;
             drop(server);
         }
@@ -9836,7 +9867,7 @@ mod tests {
             ));
 
             let parse_result = single_dep_parse_result("crossenv");
-            let signals = fetch_typosquat_signals(
+            let outcome = fetch_typosquat_signals(
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
@@ -9845,7 +9876,8 @@ mod tests {
             )
             .await;
 
-            assert!(signals.is_empty());
+            assert!(outcome.signals.is_empty());
+            assert_eq!(outcome.completeness, FetchCompleteness::Complete);
             package_call.assert_async().await;
         }
 
@@ -9863,7 +9895,7 @@ mod tests {
             ));
 
             let parse_result = single_dep_parse_result("crossenv");
-            let signals = fetch_typosquat_signals(
+            let outcome = fetch_typosquat_signals(
                 EcosystemId::Deno,
                 &parse_result,
                 &MOCK_FORMATTER,
@@ -9872,7 +9904,8 @@ mod tests {
             )
             .await;
 
-            assert!(signals.is_empty());
+            assert!(outcome.signals.is_empty());
+            assert_eq!(outcome.completeness, FetchCompleteness::Complete);
             package_call.assert_async().await;
         }
 
@@ -9930,7 +9963,7 @@ mod tests {
             ));
 
             let parse_result = single_dep_parse_result("crossenv");
-            let signals = fetch_typosquat_signals(
+            let outcome = fetch_typosquat_signals(
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
@@ -9939,7 +9972,9 @@ mod tests {
             )
             .await;
 
-            let signal = signals
+            assert_eq!(outcome.completeness, FetchCompleteness::Complete);
+            let signal = outcome
+                .signals
                 .get(&PackageName::from("crossenv"))
                 .expect("signal expected");
             assert_eq!(signal.suspected_name, "cross-env");
@@ -9962,7 +9997,7 @@ mod tests {
                 uri: crate::test_util::test_uri("/test/package.json"),
             };
 
-            let signals = fetch_typosquat_signals(
+            let outcome = fetch_typosquat_signals(
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
@@ -9971,7 +10006,8 @@ mod tests {
             )
             .await;
 
-            assert!(signals.is_empty());
+            assert!(outcome.signals.is_empty());
+            assert_eq!(outcome.completeness, FetchCompleteness::Complete);
             package_call.assert_async().await;
         }
 
@@ -10000,7 +10036,7 @@ mod tests {
                 uri: crate::test_util::test_uri("/test/package.json"),
             };
 
-            let signals = fetch_typosquat_signals(
+            let outcome = fetch_typosquat_signals(
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
@@ -10009,7 +10045,8 @@ mod tests {
             )
             .await;
 
-            assert!(signals.is_empty());
+            assert!(outcome.signals.is_empty());
+            assert_eq!(outcome.completeness, FetchCompleteness::Complete);
             package_call.assert_async().await;
         }
     }

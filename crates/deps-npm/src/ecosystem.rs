@@ -1213,7 +1213,7 @@ mod tests {
         // does in production (issue #1437 NFR-002: a background pre-fetch, not an inline
         // await on this test's own `generate_diagnostics` call below).
         let deps_dev = Arc::new(deps_core::DepsDevClient::for_test(cache, server.url()));
-        let typosquat = deps_core::lsp_helpers::fetch_typosquat_signals(
+        let typosquat_outcome = deps_core::lsp_helpers::fetch_typosquat_signals(
             deps_core::EcosystemId::Npm,
             parse_result.as_ref(),
             ecosystem.formatter(),
@@ -1222,13 +1222,13 @@ mod tests {
         )
         .await;
         assert!(
-            !typosquat.is_empty(),
+            !typosquat_outcome.signals.is_empty(),
             "pre-fetch must have resolved a signal"
         );
 
         let versions = VersionData::new(&cached_versions, &resolved_versions)
             .with_ecosystem(deps_core::EcosystemId::Npm)
-            .with_typosquat_prefetch(&typosquat);
+            .with_typosquat_prefetch(&typosquat_outcome.signals);
 
         let diagnostics = ecosystem
             .generate_diagnostics(
