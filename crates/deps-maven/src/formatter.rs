@@ -103,6 +103,11 @@ impl RequirementMatcher for MavenMatcher {
             }
         })
     }
+
+    /// Maven's bracket-interval range model is not strict SemVer 2.0.0 (#299) — must not opt in.
+    fn strict_prerelease_exclusion(&self) -> bool {
+        false
+    }
 }
 
 impl PackageNaming for MavenFormatter {

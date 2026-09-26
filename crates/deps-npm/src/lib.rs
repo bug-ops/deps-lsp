@@ -23,7 +23,7 @@ pub mod types;
 pub use catalog::{CatalogOrigin, CatalogOutcome, PnpmWorkspaceCache};
 pub use config::{NpmConfig, NpmConfigCache, NpmParseContext, NpmRegistryIndex};
 pub use ecosystem::NpmEcosystem;
-pub use formatter::NpmFormatter;
+pub use formatter::{NpmFormatter, compile_node_semver_range};
 pub use lockfile::NpmLockParser;
 // Wrappers exposed only under non-default `fuzzing` feature (#727) so `fuzz/`'s pnpm targets
 // can reach the otherwise-private parsers; mirrors deps-gradle's `fuzz_parse_pom_licenses`.

@@ -24,6 +24,12 @@ impl RequirementMatcher for SemverMatcher {
             .ok()
             .map(|v| self.0.matches(&v))
     }
+
+    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
+    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
+    fn strict_prerelease_exclusion(&self) -> bool {
+        true
+    }
 }
 
 use crate::types::SwiftDependency;
@@ -220,13 +226,7 @@ impl DiagnosticMessages for SwiftFormatter {
     }
 }
 
-impl DiagnosticPolicy for SwiftFormatter {
-    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
-    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
-    fn strict_semver_prerelease_exclusion(&self) -> bool {
-        true
-    }
-}
+impl DiagnosticPolicy for SwiftFormatter {}
 
 impl SourcePolicy for SwiftFormatter {}
 
@@ -564,6 +564,16 @@ mod tests {
             .expect("valid semver requirement must compile");
         assert_eq!(matcher.matches(&ConcreteVersion::new("1.9.9")), Some(true));
         assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
+    }
+
+    /// The compiled matcher itself carries `strict_prerelease_exclusion` (#1478).
+    #[test]
+    fn test_compile_requirement_matcher_opts_into_strict_prerelease_exclusion() {
+        let fmt = SwiftFormatter;
+        let matcher = fmt
+            .compile_requirement(&VersionReq::new(">=1.5.0, <2.0.0"))
+            .expect("valid semver requirement must compile");
+        assert!(matcher.strict_prerelease_exclusion());
     }
 
     #[test]

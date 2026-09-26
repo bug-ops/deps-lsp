@@ -75,6 +75,11 @@ impl RequirementMatcher for ComposerMatcher {
     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
         Some(ComposerFormatter.version_satisfies_requirement(version, &self.0))
     }
+
+    /// Composer's requirement grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
+    fn strict_prerelease_exclusion(&self) -> bool {
+        false
+    }
 }
 
 /// Composer-specific LSP formatting.

@@ -2034,6 +2034,10 @@ pub enum RequirementStatus {
 ///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
 ///         Some(version.as_str() == self.0)
 ///     }
+///
+///     fn strict_prerelease_exclusion(&self) -> bool {
+///         false
+///     }
 /// }
 ///
 /// let matcher = ExactMatch("1.0.0".to_string());
@@ -2051,6 +2055,49 @@ pub trait RequirementMatcher: Send + Sync {
     /// [`formatter::RequirementResolution::compile_requirement`]'s job, via returning `None` from that
     /// method instead of constructing a matcher at all.
     fn matches(&self, version: &ConcreteVersion) -> Option<bool>;
+
+    /// Whether this compiled matcher follows strict SemVer 2.0.0 pre-release semantics: a
+    /// pre-release version (`X.Y.Z-pre`) is excluded from matching unless the compiled
+    /// requirement itself pins to the same `X.Y.Z` tuple with a pre-release tag — the rule
+    /// `semver::VersionReq` and `node_semver::Range` both implement.
+    ///
+    /// `matching_prerelease_would_satisfy`'s "requirement is unsatisfiable only because of
+    /// default pre-release exclusion" enrichment (#299) is gated on this, read from the
+    /// already-compiled matcher instance rather than from a separate per-formatter flag
+    /// (#1478) — so a formatter that reuses an existing matcher implementation (e.g.
+    /// `deps-npm`'s shared `compile_node_semver_range`, also used by `deps-deno`) inherits the
+    /// correct answer for free; only a formatter introducing a genuinely new matcher type
+    /// needs to decide this at all, and only in the one place that type is defined.
+    ///
+    /// No default: a new matcher type must decide this explicitly rather than silently
+    /// inheriting `false` by omission (#1478) — the whole point of moving this property off a
+    /// per-formatter flag and onto the matcher type is that the answer can no longer go
+    /// unconsidered. Return `true` only for a matcher whose underlying comparator
+    /// itself implements this exclusion (`deps-cargo`/`deps-swift`'s `semver::VersionReq`
+    /// wrapper, `deps-npm`'s shared `node_semver::Range` wrapper). Maven/NuGet/Composer/
+    /// Gradle/PyPI/Go/Bundler/Dart's own matchers use non-strict, ecosystem-specific range
+    /// models where this premise does not hold — they must return `false`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::lsp_helpers::RequirementMatcher;
+    ///
+    /// struct NonStrictMatcher;
+    /// impl RequirementMatcher for NonStrictMatcher {
+    ///     fn matches(&self, _version: &ConcreteVersion) -> Option<bool> {
+    ///         Some(true)
+    ///     }
+    ///
+    ///     fn strict_prerelease_exclusion(&self) -> bool {
+    ///         false
+    ///     }
+    /// }
+    ///
+    /// assert!(!NonStrictMatcher.strict_prerelease_exclusion());
+    /// ```
+    fn strict_prerelease_exclusion(&self) -> bool;
 }
 
 /// Whether `segment` is exactly `.` or `..`.

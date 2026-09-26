@@ -41,6 +41,12 @@ impl RequirementMatcher for ExactMatcher {
         let version = version.as_str();
         Some(go_version_matches(version, &self.0))
     }
+
+    /// Go modules pin an exact version string; there is no range grammar with SemVer 2.0.0
+    /// pre-release exclusion semantics to opt into (#299).
+    fn strict_prerelease_exclusion(&self) -> bool {
+        false
+    }
 }
 
 /// Formatter for Go module version strings and package URLs.

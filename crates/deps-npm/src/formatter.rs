@@ -5,7 +5,7 @@ use deps_core::lsp_helpers::{
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise npm semver range matcher, compiled once per dependency by
-/// [`NpmFormatter::compile_requirement`].
+/// [`compile_node_semver_range`].
 struct NodeSemverMatcher(node_semver::Range);
 
 impl RequirementMatcher for NodeSemverMatcher {
@@ -15,6 +15,58 @@ impl RequirementMatcher for NodeSemverMatcher {
             .ok()
             .map(|v| self.0.satisfies(&v))
     }
+
+    /// `node_semver::Range::satisfies` excludes pre-releases unless `requirement` itself pins
+    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics
+    /// (#299). Declared once, here, on the matcher type itself: any formatter that reuses
+    /// [`compile_node_semver_range`] (`deps-npm`'s own `NpmFormatter`, and `deps-deno`'s
+    /// `DenoFormatter` for both `npm:` and `jsr:` specifiers) inherits this answer for free,
+    /// with no separate per-formatter flag to keep in sync (#1478).
+    fn strict_prerelease_exclusion(&self) -> bool {
+        true
+    }
+}
+
+/// Compiles `requirement` as a `node_semver::Range`, the grammar npm's registry and JSR both
+/// use for matching.
+///
+/// The single source of truth for `deps-npm`'s own [`NpmFormatter::compile_requirement`] and
+/// `deps-deno`'s `DenoFormatter::compile_requirement` (#1478).
+///
+/// Guards against an unresolved placeholder itself (#1374/#1377): a requirement for which
+/// `deps_core::lsp_helpers::requirement_contains_template_placeholder` says `true` never
+/// reaches `node_semver::Range::parse`, which might otherwise parse a placeholder-shaped
+/// string loosely into an incorrect concrete range instead of failing closed. This internal
+/// guard only ever runs that one shared detector — it is *not* equivalent to
+/// [`RequirementResolution::requirement_is_unresolved`] in general, only for a formatter
+/// whose own override of that method delegates entirely to the shared default (true today of
+/// both `NpmFormatter` and `DenoFormatter`, per each one's own doc comment). A formatter that
+/// overrides `requirement_is_unresolved`/`requirement_is_placeholder` with additional native
+/// placeholder syntax of its own must still call its own `self.requirement_is_unresolved(...)`
+/// before reaching this function — that native syntax is invisible to this guard.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::RequirementMatcher;
+/// use deps_core::{ConcreteVersion, VersionReq};
+/// use deps_npm::compile_node_semver_range;
+///
+/// let matcher = compile_node_semver_range(&VersionReq::new("^1.0.0")).unwrap();
+/// assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+/// assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
+/// assert!(matcher.strict_prerelease_exclusion());
+///
+/// // An unresolved template placeholder never reaches `node_semver::Range::parse`.
+/// assert!(compile_node_semver_range(&VersionReq::new("{{ version }}")).is_none());
+/// ```
+pub fn compile_node_semver_range(requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    if deps_core::lsp_helpers::requirement_contains_template_placeholder(requirement.as_str()) {
+        return None;
+    }
+    node_semver::Range::parse(requirement.as_str())
+        .ok()
+        .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
 }
 
 /// Maximum name length npm's registry accepts.
@@ -137,22 +189,13 @@ impl PackageRendering for NpmFormatter {
 }
 
 impl RequirementResolution for NpmFormatter {
-    /// Compiles `requirement` via `node_semver::Range`, the same crate `deps-npm`'s
-    /// registry uses for matching — precise npm semver range semantics, unlike the
-    /// default `version_satisfies_requirement` heuristic this method deliberately does
-    /// not reuse (see that method's docs).
-    ///
-    /// #1374 hardening: an unresolved placeholder (see
-    /// [`Self::requirement_is_unresolved`]) never reaches `node_semver::Range::parse` —
-    /// returning `None` up front keeps this consistent with `requirement_is_unresolved`
-    /// even for the rare case `node_semver` might otherwise parse loosely.
+    /// Delegates to [`compile_node_semver_range`] — precise npm semver range semantics,
+    /// unlike the default `version_satisfies_requirement` heuristic this method deliberately
+    /// does not reuse (see that method's docs). The unresolved-placeholder guard
+    /// (#1374/#1377) now lives inside `compile_node_semver_range` itself; see its doc for why
+    /// that's safe without an extra `self.requirement_is_unresolved` check here.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        if self.requirement_is_unresolved(requirement) {
-            return None;
-        }
-        node_semver::Range::parse(requirement.as_str())
-            .ok()
-            .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+        compile_node_semver_range(requirement)
     }
 
     // #1370/#1374/#1379/#1391: npm's requirement grammar has no placeholder syntax of its
@@ -172,12 +215,6 @@ impl DiagnosticMessages for NpmFormatter {
 }
 
 impl DiagnosticPolicy for NpmFormatter {
-    /// `node_semver::Range::satisfies` excludes pre-releases unless `requirement` itself pins
-    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
-    fn strict_semver_prerelease_exclusion(&self) -> bool {
-        true
-    }
-
     /// Disables the manifest-requirement-level "requirement satisfiable only by a yanked
     /// version" diagnostic entirely (#436, follow-up to #205's plan.md §6): unconditionally
     /// `false`, for every requirement shape, not only ranges.
@@ -366,6 +403,19 @@ mod tests {
             .expect("valid npm range must compile");
         assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
         assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
+    }
+
+    /// #1478: the matcher itself carries `strict_prerelease_exclusion`, not a separate
+    /// per-formatter flag — proves `deps-npm`'s own compiled matcher opts in; `deps-deno`'s
+    /// equivalent behavior is covered by its own end-to-end diagnostic test, since it reuses
+    /// this exact matcher via `compile_node_semver_range`.
+    #[test]
+    fn test_compile_requirement_matcher_opts_into_strict_prerelease_exclusion() {
+        let formatter = NpmFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new("^1.0.0"))
+            .expect("valid npm range must compile");
+        assert!(matcher.strict_prerelease_exclusion());
     }
 
     #[test]

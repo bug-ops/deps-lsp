@@ -497,6 +497,10 @@ impl DiagnosticSeverities {
 ///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
 ///         Some(version.as_str() == self.0)
 ///     }
+///
+///     fn strict_prerelease_exclusion(&self) -> bool {
+///         false
+///     }
 /// }
 ///
 /// let is_pseudo_version = |r: &str| r.starts_with("v0.0.0-");
@@ -603,6 +607,10 @@ pub(crate) fn requirement_is_oversized(requirement: &VersionReq) -> bool {
 ///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
 ///         Some(version.as_str() == self.0)
 ///     }
+///
+///     fn strict_prerelease_exclusion(&self) -> bool {
+///         false
+///     }
 /// }
 ///
 /// struct ExactFormatter;
@@ -686,8 +694,8 @@ pub fn requirement_is_unsatisfiable(
 /// `None` means `version` is already a stable release, not that it failed to parse — this
 /// is a textual SemVer split, not a validating parse. Callers only rely on it for
 /// strict-SemVer ecosystems (see
-/// [`crate::lsp_helpers::DiagnosticPolicy::strict_semver_prerelease_exclusion`]), whose registries only
-/// publish spec-conformant version strings.
+/// [`crate::lsp_helpers::RequirementMatcher::strict_prerelease_exclusion`]), whose registries
+/// only publish spec-conformant version strings.
 #[expect(
     clippy::string_slice,
     reason = "dash comes from str::find('-'), an ASCII byte, so it is always a char boundary"
@@ -722,30 +730,31 @@ fn requirement_names_prerelease(requirement: &str) -> bool {
 }
 
 /// For strict-SemVer ecosystems (see
-/// [`crate::lsp_helpers::DiagnosticPolicy::strict_semver_prerelease_exclusion`]), finds the newest published,
-/// non-yanked pre-release in `available` whose stable core would satisfy `requirement` —
-/// evidence that `requirement` reads as unsatisfiable only because SemVer's default comparator
-/// excludes pre-releases, not because no compatible version was ever published (#299).
+/// [`crate::lsp_helpers::RequirementMatcher::strict_prerelease_exclusion`]), finds the newest
+/// published, non-yanked pre-release in `available` whose stable core would satisfy
+/// `requirement` — evidence that `requirement` reads as unsatisfiable only because SemVer's
+/// default comparator excludes pre-releases, not because no compatible version was ever
+/// published (#299).
 ///
-/// Returns `None` when the ecosystem hasn't opted in, `requirement` itself already names a
-/// pre-release (see [`requirement_names_prerelease`] — in that shape a non-matching candidate
-/// is rejected by ordering against the requirement's own explicit floor, not by pre-release
-/// exclusion), `requirement` doesn't compile, or no such pre-release exists. `available` is
-/// assumed newest-first (see [`PackageVersions::available`]), so the first match found is the
-/// newest.
+/// Returns `None` when `requirement` doesn't compile, the compiled matcher hasn't opted into
+/// strict pre-release exclusion, `requirement` itself already names a pre-release (see
+/// [`requirement_names_prerelease`] — in that shape a non-matching candidate is rejected by
+/// ordering against the requirement's own explicit floor, not by pre-release exclusion), or no
+/// such pre-release exists. `available` is assumed newest-first (see
+/// [`PackageVersions::available`]), so the first match found is the newest.
 fn matching_prerelease_would_satisfy(
     formatter: &dyn EcosystemFormatter,
     requirement: &VersionReq,
     available: &[ConcreteVersion],
     yanked: &[(ConcreteVersion, RemovalStatus)],
 ) -> Option<String> {
-    if !formatter.strict_semver_prerelease_exclusion() {
-        return None;
-    }
     if requirement_names_prerelease(requirement.as_str()) {
         return None;
     }
     let matcher = formatter.compile_requirement(requirement)?;
+    if !matcher.strict_prerelease_exclusion() {
+        return None;
+    }
     available.iter().find_map(|candidate| {
         let base = semver_prerelease_base(candidate.as_str())?;
         (!yanked.iter().any(|(y, _)| y == candidate)
@@ -4371,6 +4380,10 @@ mod tests {
             fn matches(&self, _version: &ConcreteVersion) -> Option<bool> {
                 Some(false)
             }
+
+            fn strict_prerelease_exclusion(&self) -> bool {
+                false
+            }
         }
         impl PackageNaming for AlwaysUnsatisfiable {}
         impl PackageRendering for AlwaysUnsatisfiable {
@@ -7991,6 +8004,10 @@ mod tests {
             fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
                 (self.0)(version.as_str())
             }
+
+            fn strict_prerelease_exclusion(&self) -> bool {
+                false
+            }
         }
 
         /// A formatter whose `compile_requirement` is `None` (requirement is treated as
@@ -8201,10 +8218,27 @@ mod tests {
     mod matching_prerelease_would_satisfy_tests {
         use super::*;
 
-        /// Same matcher as `StrictSemverFormatter` (defined in the parent `tests` module and
-        /// shared with the `generate_diagnostics_from_cache` end-to-end coverage), but not
-        /// opted into `strict_semver_prerelease_exclusion` — mirrors Maven/NuGet/Composer/
-        /// Gradle, which must never get the enrichment.
+        /// Same underlying `semver::VersionReq` comparator as `StrictSemverFormatter`'s
+        /// `RealSemverMatcher` (defined in the parent `tests` module and shared with the
+        /// `generate_diagnostics_from_cache` end-to-end coverage), but this matcher does not
+        /// override `strict_prerelease_exclusion` — mirrors Maven/NuGet/Composer/Gradle's own
+        /// matchers, none of which override it either, so this formatter must never get the
+        /// enrichment.
+        struct NonStrictSemverMatcher(semver::VersionReq);
+        impl RequirementMatcher for NonStrictSemverMatcher {
+            fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+                version
+                    .as_str()
+                    .parse::<semver::Version>()
+                    .ok()
+                    .map(|v| self.0.matches(&v))
+            }
+
+            fn strict_prerelease_exclusion(&self) -> bool {
+                false
+            }
+        }
+
         struct NonStrictFormatter;
         impl PackageNaming for NonStrictFormatter {}
 
@@ -8227,7 +8261,7 @@ mod tests {
                     .as_str()
                     .parse::<semver::VersionReq>()
                     .ok()
-                    .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+                    .map(|req| Box::new(NonStrictSemverMatcher(req)) as Box<dyn RequirementMatcher>)
             }
         }
 
@@ -8455,6 +8489,10 @@ mod tests {
         impl RequirementMatcher for ClosureMatcher {
             fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
                 (self.0)(version.as_str())
+            }
+
+            fn strict_prerelease_exclusion(&self) -> bool {
+                false
             }
         }
 

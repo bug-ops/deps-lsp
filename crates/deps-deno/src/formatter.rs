@@ -14,21 +14,6 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
-/// Precise `node-semver` range matcher, compiled once per dependency by
-/// [`DenoFormatter::compile_requirement`]. Correct for both `jsr:` and `npm:`
-/// requirements: JSR mandates strict semver, and this is the same grammar/crate
-/// `deps-npm` already uses for `npm:` requirements.
-struct NodeSemverMatcher(node_semver::Range);
-
-impl RequirementMatcher for NodeSemverMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        node_semver::Version::parse(version)
-            .ok()
-            .map(|v| self.0.satisfies(&v))
-    }
-}
-
 /// Conservative cap on a `jsr:` scope/package-name segment's length (S-L1). JSR's own
 /// limits are narrower (32/58); this single cap is all the URL-shape concern below needs —
 /// `validate_package_name` is a diagnostic lint, not a strict mirror of JSR's registration
@@ -117,20 +102,16 @@ impl PackageRendering for DenoFormatter {
 }
 
 impl RequirementResolution for DenoFormatter {
-    /// Compiles `requirement` via `node_semver::Range`, the same crate `deps-npm` uses —
-    /// correct for JSR too, since JSR mandates semver.
-    ///
-    /// #1377 hardening: an unresolved placeholder (see [`Self::requirement_is_unresolved`])
-    /// never reaches `node_semver::Range::parse` — returning `None` up front keeps this
-    /// consistent with `requirement_is_unresolved` even for the rare case `node_semver` might
-    /// otherwise parse loosely.
+    /// Delegates to [`deps_npm::compile_node_semver_range`] — the single shared
+    /// `node_semver::Range` matcher `deps-npm`'s own formatter also uses (#1478) — correct for
+    /// JSR too, since JSR mandates semver. The unresolved-placeholder guard (#1377) lives
+    /// inside that function itself; see its doc for why that's safe without an extra
+    /// `self.requirement_is_unresolved` check here. The returned matcher's
+    /// `RequirementMatcher::strict_prerelease_exclusion` also carries over unchanged, so the
+    /// unsatisfiable-requirement diagnostic's pre-release hint applies to both `npm:` and
+    /// `jsr:` specifiers with no separate flag to declare on this formatter.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        if self.requirement_is_unresolved(requirement) {
-            return None;
-        }
-        node_semver::Range::parse(requirement.as_str())
-            .ok()
-            .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+        deps_npm::compile_node_semver_range(requirement)
     }
 
     // #1370/#1377/#1380/#1391: `deno.json`/`deno.jsonc`'s own import-specifier grammar has no
