@@ -3838,10 +3838,13 @@ mod tests {
             .post_json_limited_trusted_origin(&url, &body, BodyLimit::new(8), &trusted_origin)
             .await;
 
-        match result {
-            Err(DepsError::ResponseTooLarge { .. }) => {}
-            other => panic!("expected ResponseTooLarge, got {other:?}"),
-        }
+        // Assert via `matches!` rather than debug-formatting `result` in a panic message
+        // (#409's established pattern): on the `Ok` arm that value is the raw response
+        // body, which would otherwise be written to the test log by the panic machinery.
+        assert!(
+            matches!(result, Err(DepsError::ResponseTooLarge { .. })),
+            "expected ResponseTooLarge"
+        );
     }
 
     #[tokio::test]
