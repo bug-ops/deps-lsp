@@ -16,8 +16,10 @@ use deps_core::PackageName;
 use deps_core::PackageVersions;
 use deps_core::Registry;
 use deps_core::RemovalStatus;
+use deps_core::Version;
 use deps_core::VersionReq;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -258,14 +260,16 @@ pub struct FetchResult {
     /// version-comparison rule can use — so `generate_diagnostics_from_cache` must
     /// report neither "Registry lookup failed" nor "Unknown package" for it.
     pub no_comparable_versions: HashSet<PackageName>,
-    /// Number of packages whose registry fetch did not succeed, counting both a genuine
-    /// fetch failure (timeout, error — recorded in `fetch_failed` above) and a not-found
-    /// lookup (the registry answered "no such package", never recorded in `fetch_failed`,
-    /// see #267 C1). Only the `fetch_failed` subset produces an inline "Registry lookup
-    /// failed" diagnostic, so this count can exceed `fetch_failed.len()` (#276 S2, #490).
-    pub failed_count: usize,
-    /// First actionable error message (shown to user via `window/showMessage`)
-    pub first_error: Option<String>,
+    /// Toast-ready summary of this round's failures, or `None` when every package either
+    /// resolved or fetched cleanly with no comparable versions. Replaces the previously
+    /// independent `failed_count`/`first_error` field pair (#480, #490): both bugs were
+    /// hand-kept invariants (`failed_count > 0` implies `first_error.is_some()`) rather
+    /// than type-enforced ones. `failure_summary`'s count still counts both a genuine
+    /// fetch failure (recorded in `fetch_failed` above) and a not-found lookup (the
+    /// registry answered "no such package", never recorded in `fetch_failed`, see #267
+    /// C1) — only the `fetch_failed` subset produces an inline "Registry lookup failed"
+    /// diagnostic, so this count can still exceed `fetch_failed.len()` (#276 S2).
+    pub failure_summary: Option<FailureSummary>,
     /// SPDX license identifier(s) for the resolved/"latest" pick, for every package
     /// whose `Version::license` on the already-fetched version-list entry is
     /// non-empty (issue #660/#661 tier-1 backfill) — today, only the native-list
@@ -281,6 +285,53 @@ pub struct FetchResult {
     /// always disjoint per document (one ecosystem per document) but run as
     /// independent, non-ordered background tasks.
     pub licenses: HashMap<PackageName, Vec<String>>,
+}
+
+/// Toast-ready summary of a fetch batch's failures: how many packages did not resolve and
+/// the first actionable failure message, in fetch-completion order.
+///
+/// Replaces [`FetchResult`]'s previously independent `failed_count`/`first_error` field
+/// pair, whose only invariant (a nonzero count implies a message) was kept by convention
+/// rather than the type system — two prior bugs (#480, #490) were both hand-patches on top
+/// of that convention rather than fixes to the underlying representation. A `count` of zero
+/// and a missing message are now unrepresentable: this type only exists as `Some` when at
+/// least one package failed, and its message is always present.
+///
+/// # Examples
+///
+/// ```
+/// use deps_engine::classify::fetch::FailureSummary;
+/// use std::num::NonZeroUsize;
+///
+/// let summary = FailureSummary::new(NonZeroUsize::new(2).unwrap(), "HTTP 503".to_string());
+/// assert_eq!(summary.count(), 2);
+/// assert_eq!(summary.message(), "HTTP 503");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailureSummary {
+    count: NonZeroUsize,
+    message: String,
+}
+
+impl FailureSummary {
+    /// Builds a `FailureSummary` from its already-computed count and message.
+    #[must_use]
+    pub fn new(count: NonZeroUsize, message: String) -> Self {
+        Self { count, message }
+    }
+
+    /// Number of packages whose registry fetch did not succeed this round (see
+    /// [`FetchResult::failure_summary`] for what counts).
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.count.get()
+    }
+
+    /// The first actionable failure message, in fetch-completion order.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
 }
 
 impl FetchResult {
@@ -302,11 +353,10 @@ impl FetchResult {
     ///     HashMap::new(),
     ///     HashMap::new(),
     ///     HashSet::new(),
-    ///     0,
     ///     None,
     ///     HashMap::new(),
     /// );
-    /// assert_eq!(result.failed_count, 0);
+    /// assert_eq!(result.failed_count(), 0);
     /// ```
     ///
     /// Parameters, in declaration order (see each field's own doc above for the full
@@ -315,7 +365,7 @@ impl FetchResult {
     /// `versions` (successful fetches), `yanked_versions` (yank findings),
     /// `deprecations` (package-level deprecation findings), `fetch_failed` (errored/timed-out
     /// packages), `no_comparable_versions` (fetched clean but nothing to compare),
-    /// `failed_count`, `first_error`, `licenses`.
+    /// `failure_summary`, `licenses`.
     #[must_use]
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -324,8 +374,7 @@ impl FetchResult {
         deprecations: HashMap<PackageName, Deprecation>,
         fetch_failed: HashMap<PackageName, FetchFailure>,
         no_comparable_versions: HashSet<PackageName>,
-        failed_count: usize,
-        first_error: Option<String>,
+        failure_summary: Option<FailureSummary>,
         licenses: HashMap<PackageName, Vec<String>>,
     ) -> Self {
         Self {
@@ -334,10 +383,28 @@ impl FetchResult {
             deprecations,
             fetch_failed,
             no_comparable_versions,
-            failed_count,
-            first_error,
+            failure_summary,
             licenses,
         }
+    }
+
+    /// Total packages whose fetch did not succeed this round (mirrors the old
+    /// `failed_count` field). Requires `self` not yet partially moved out of — a caller
+    /// that has already moved another field (e.g. `versions`) out of a owned `FetchResult`
+    /// should read `failure_summary` directly instead, since a partial move blocks any
+    /// further whole-`self` method call.
+    #[must_use]
+    pub fn failed_count(&self) -> usize {
+        self.failure_summary
+            .as_ref()
+            .map_or(0, FailureSummary::count)
+    }
+
+    /// The first actionable failure message for this round (mirrors the old `first_error`
+    /// field). Same partial-move caveat as [`Self::failed_count`].
+    #[must_use]
+    pub fn failure_message(&self) -> Option<&str> {
+        self.failure_summary.as_ref().map(FailureSummary::message)
     }
 }
 
@@ -491,19 +558,6 @@ pub async fn fetch_latest_versions_parallel(
     use std::time::Duration;
 
     let fetched = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let first_error: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
-    // Separate from `first_error` (#480): not-found errors are excluded from
-    // `fetch_failed`, but without this a fast not-found could still win the `first_error`
-    // completion race over a slower, more actionable failure (e.g. a rate limit hit by
-    // 20 other dependencies). Any `fetch_failed`-counted error always wins the toast over
-    // a not-found regardless of finishing order; a not-found-only batch falls back to
-    // `first_error`.
-    //
-    // Derived by folding each task's own `(name, message)` return value in completion
-    // order (see the loop below) rather than written from inside the match arms via a
-    // shared `Arc<Mutex>` like `first_error` — keeps `fetch_failed` and the priority error
-    // in sync by construction instead of via two independently hand-maintained writes (#480).
     let timeout = Duration::from_secs(timeout_secs);
     let wildcard_req = deps_core::VersionReq::new("*");
     let check_yanked = registry.reports_yanked();
@@ -512,8 +566,6 @@ pub async fn fetch_latest_versions_parallel(
         .map(|(name, source)| {
             let registry = Arc::clone(&registry);
             let fetched = Arc::clone(&fetched);
-            let failed = Arc::clone(&failed);
-            let first_error = Arc::clone(&first_error);
             let progress_sender = progress_sender.clone();
             let wildcard_req = &wildcard_req;
             let in_use_versions = in_use.get(&name).cloned().unwrap_or_default();
@@ -529,8 +581,6 @@ pub async fn fetch_latest_versions_parallel(
                     selection_context,
                     check_yanked,
                     &fetched,
-                    &failed,
-                    &first_error,
                     progress_sender.as_ref(),
                 )
                 .await
@@ -549,82 +599,160 @@ pub async fn fetch_latest_versions_parallel(
     let mut deprecations = HashMap::new();
     let mut no_comparable_versions = HashSet::new();
     let mut licenses = HashMap::new();
-    // First actionable failure in completion order — `results` is collected from
-    // `buffer_unordered`, so its order already reflects real finishing order, the same
-    // order a shared `Arc<Mutex>` written from inside each task would have observed.
-    let mut priority_error: Option<String> = None;
-    for (version, yanked, failed_name, deprecation, no_comparable_versions_name, license) in results
+    let mut failed_count: usize = 0;
+    // `fallback_message`'s tie-break among multiple not-found-only packages is completion
+    // order, not the old mutex-write order — a difference only observable in an artificial
+    // race, since every not-found message is interchangeable in the toast anyway (#480).
+    let mut priority_message: Option<String> = None;
+    let mut fallback_message: Option<String> = None;
+    for PackageOutcome {
+        name,
+        status,
+        yanked,
+    } in results
     {
-        if let Some((name, v)) = version {
-            versions.insert(name, v);
+        if let Some(y) = yanked {
+            yanked_versions.insert(name.clone(), y);
         }
-        if let Some((name, v, status)) = yanked {
-            yanked_versions.insert(name, (v, status));
-        }
-        if let Some((name, failure, message)) = failed_name {
-            fetch_failed.insert(name, failure);
-            if priority_error.is_none() {
-                priority_error = Some(message);
+        match status {
+            PackageStatus::Resolved {
+                versions: v,
+                deprecation,
+                license,
+            } => {
+                if let Some(d) = deprecation {
+                    deprecations.insert(name.clone(), d);
+                }
+                if let Some(lic) = license {
+                    licenses.insert(name.clone(), lic);
+                }
+                versions.insert(name, v);
             }
-        }
-        if let Some((name, d)) = deprecation {
-            deprecations.insert(name, d);
-        }
-        if let Some(name) = no_comparable_versions_name {
-            no_comparable_versions.insert(name);
-        }
-        if let Some((name, license)) = license {
-            licenses.insert(name, license);
+            PackageStatus::NoComparableVersions => {
+                no_comparable_versions.insert(name);
+            }
+            PackageStatus::NotFound { message } => {
+                failed_count += 1;
+                if fallback_message.is_none() {
+                    fallback_message = Some(message);
+                }
+            }
+            PackageStatus::Failed { failure, message } => {
+                failed_count += 1;
+                fetch_failed.insert(name, failure);
+                if priority_message.is_none() {
+                    priority_message = Some(message.clone());
+                }
+                if fallback_message.is_none() {
+                    fallback_message = Some(message);
+                }
+            }
         }
     }
 
-    // `priority_error` (an actual fetch failure — rate limit, timeout, outage, ...)
-    // always wins the toast over `first_error` (which may be a not-found race winner);
-    // `first_error` is the fallback only for a batch whose only failures were
-    // not-found (#480).
-    let error_message =
-        priority_error.or_else(|| first_error.lock().unwrap_or_else(|p| p.into_inner()).take());
+    let failure_summary = NonZeroUsize::new(failed_count).map(|count| {
+        #[allow(clippy::expect_used)]
+        let message = priority_message.or(fallback_message).expect(
+            "every branch that increments failed_count also sets fallback_message \
+             in the same match arm",
+        );
+        FailureSummary::new(count, message)
+    });
 
     FetchResult {
         versions,
         yanked_versions,
-        fetch_failed,
         deprecations,
+        fetch_failed,
         no_comparable_versions,
-        failed_count: failed.load(std::sync::atomic::Ordering::Relaxed),
-        first_error: error_message,
+        failure_summary,
         licenses,
     }
 }
 
-/// Per-package outcome returned by [`fetch_and_classify_package`]: the resolved
-/// `(name, PackageVersions)` entry, a yanked finding, a fetch failure, a package-level
-/// deprecation finding, a name whose fetch succeeded with no comparable versions
-/// (#550), and the resolved/"latest" pick's license when the ecosystem's already-fetched
-/// version-list entries carry it (issue #660/#661 tier-1 backfill — see
-/// [`FetchResult::licenses`]) — folded into [`fetch_latest_versions_parallel`]'s
-/// aggregate `FetchResult` once every package in the stream has finished.
+/// One package's terminal registry-fetch status (issue #1470): replaces a 6-tuple of
+/// independent `Option`s whose illegal combinations (e.g. a resolved version alongside a
+/// fetch failure, or `NoComparableVersions` alongside a resolved version) were previously
+/// prevented only by careful match-arm discipline in [`fetch_latest_versions_parallel`]'s
+/// aggregation fold, not by the type system. Exactly one variant applies per package.
 ///
-/// The license entry specifically comes from `select_latest_matching`'s
-/// pick below (critic S1: previously documented here as "the resolved version's
-/// license", which is wrong — this function never reads `resolved_versions` at all, it
-/// picks the latest version matching the requirement/stability floor, same as
-/// `PackageVersions.latest`).
-type PackageFetchOutcome = (
-    Option<(PackageName, PackageVersions)>,
-    Option<(PackageName, ConcreteVersion, RemovalStatus)>,
-    Option<(PackageName, FetchFailure, String)>,
-    Option<(PackageName, Deprecation)>,
-    Option<PackageName>,
-    Option<(PackageName, Vec<String>)>,
-);
+/// The license carried by [`Self::Resolved`] comes from `select_latest_matching`'s pick
+/// (critic S1: previously documented as "the resolved version's license", which was
+/// wrong — this function never reads `resolved_versions` at all, it picks the latest
+/// version matching the requirement/stability floor, same as `PackageVersions.latest`).
+enum PackageStatus {
+    /// The list-based pick (or its `get_latest_matching` fallback) resolved to a usable
+    /// version.
+    Resolved {
+        versions: PackageVersions,
+        /// Package-level deprecation finding (#205), derived from the resolved pick.
+        deprecation: Option<Deprecation>,
+        /// SPDX license identifier(s) (issue #660/#661 tier-1 backfill), `None` when the
+        /// ecosystem's `Version::license` was empty.
+        license: Option<Vec<String>>,
+    },
+    /// Both the list-based pick and the `get_latest_matching` fallback succeeded but found
+    /// nothing comparable (#550), e.g. tags that don't parse as full semver.
+    NoComparableVersions,
+    /// The registry answered "no such package" (#267 C1) — never counted in
+    /// [`FetchResult::fetch_failed`], but still counted toward the batch's failure total.
+    NotFound { message: String },
+    /// The fetch (or its fallback) errored for a reason other than not-found, or timed out.
+    Failed {
+        failure: FetchFailure,
+        message: String,
+    },
+}
+
+/// One package's fetch result: its terminal [`PackageStatus`] plus an independent
+/// in-use-version yank finding, folded into [`fetch_latest_versions_parallel`]'s aggregate
+/// `FetchResult` once every package in the stream has finished.
+///
+/// `yanked` is independent of `status` (not one of its variants) because it is sourced
+/// from the full version list fetched by the *initial* `get_versions_from` round trip
+/// (see the `check_yanked` block in [`fetch_and_classify_package`]), which can succeed even
+/// when the subsequent `get_latest_matching_from` fallback pick fails — so a package can be
+/// both [`PackageStatus::Failed`] and carry a yanked in-use-version finding at once.
+struct PackageOutcome {
+    name: PackageName,
+    status: PackageStatus,
+    yanked: Option<(ConcreteVersion, RemovalStatus)>,
+}
+
+/// The list-based pick's outcome, or the `get_latest_matching` fallback's outcome when the
+/// list-based pick found nothing — an intermediate result [`fetch_and_classify_package`]
+/// uses to run the yanked/deprecation/license extraction once, uniformly, before it settles
+/// on a final [`PackageStatus`].
+enum Pick {
+    Resolved {
+        version: ConcreteVersion,
+        removal_status: RemovalStatus,
+        published_at: Option<deps_core::freshness::PublishTime>,
+        deprecation: Option<Deprecation>,
+        license: Vec<String>,
+    },
+    Unresolved(PackageStatus),
+}
+
+impl Pick {
+    /// Builds [`Self::Resolved`] from a picked `Version`, shared by the list-based pick and
+    /// the `get_latest_matching` fallback pick so the two success arms can't drift.
+    fn resolved(v: &dyn Version) -> Self {
+        Self::Resolved {
+            version: v.version_string().clone(),
+            removal_status: v.removal_status(),
+            published_at: v.published_at(),
+            deprecation: v.deprecation().cloned(),
+            license: v.license().to_vec(),
+        }
+    }
+}
 
 /// Fetches, classifies, and version-selects a single package within
 /// [`fetch_latest_versions_parallel`]'s concurrent stream: one round trip for the full
 /// version list, an in-memory "latest" pick with a `get_latest_matching_from` fallback
-/// when the list-based pick fails on a non-empty list, yanked/deprecation extraction,
-/// and updates to the shared `fetched`/`failed`/`first_error` counters the stream
-/// aggregates across every package.
+/// when the list-based pick fails on a non-empty list, yanked/deprecation extraction, and
+/// an update to the shared `fetched` progress counter.
 #[allow(
     clippy::too_many_arguments,
     reason = "mirrors the per-package async closure this was extracted from — every \
@@ -643,10 +771,8 @@ async fn fetch_and_classify_package(
     selection_context: &deps_core::SelectionContext,
     check_yanked: bool,
     fetched: &std::sync::atomic::AtomicUsize,
-    failed: &std::sync::atomic::AtomicUsize,
-    first_error: &std::sync::Mutex<Option<String>>,
     progress_sender: Option<&ProgressSender>,
-) -> PackageFetchOutcome {
+) -> PackageOutcome {
     // Single round trip: the full version list is fetched once and "latest" is a pure
     // in-memory pick over it, no second registry call. `get_versions_from` (source-aware,
     // spec FR-001) over `get_versions`: populates `published_at` where supported (#339) and
@@ -658,15 +784,9 @@ async fn fetch_and_classify_package(
     )
     .await;
 
-    let mut yanked: Option<(PackageName, ConcreteVersion, RemovalStatus)> = None;
-    let mut failed_name: Option<(PackageName, FetchFailure, String)> = None;
-    let mut deprecation: Option<(PackageName, Deprecation)> = None;
-    let mut license: Option<(PackageName, Vec<String>)> = None;
-    // Set only when the fetch (and its `get_latest_matching` fallback) both
-    // genuinely succeeded yet resolved to no version at all (#550) — see the
-    // `Ok(Ok(None))` fallback arm below.
-    let mut no_comparable_versions = false;
-    let version = match result {
+    let mut yanked: Option<(ConcreteVersion, RemovalStatus)> = None;
+
+    let status = match result {
         Ok(Ok(versions)) => {
             let available: Arc<[ConcreteVersion]> = versions
                 .iter()
@@ -696,19 +816,16 @@ async fn fetch_and_classify_package(
             // task. `selection_context` is threaded through so a registry with
             // manifest-level stability state (Composer's `minimum-stability`, #424 S1) can
             // apply it.
-            let resolved = if let Some(v) = registry
+            let pick = if let Some(v) = registry
                 .select_latest_matching(&versions, wildcard_req, selection_context)
                 .and_then(|idx| versions.get(idx))
             {
-                let latest = v.version_string().clone();
-                tracing::debug!(package = %name.for_tracing(), version = %latest, "fetched");
-                Some((
-                    latest,
-                    v.removal_status(),
-                    v.published_at(),
-                    v.deprecation().cloned(),
-                    v.license().to_vec(),
-                ))
+                tracing::debug!(
+                    package = %name.for_tracing(),
+                    version = %v.version_string(),
+                    "fetched"
+                );
+                Pick::resolved(v.as_ref())
             } else {
                 // The list-based pick found nothing — usually a genuine "no version", but
                 // a registry with an incomplete list endpoint (Go's `/@v/list`, which never
@@ -726,28 +843,19 @@ async fn fetch_and_classify_package(
                 .await;
                 match fallback {
                     Ok(Ok(Some(v))) => {
-                        let latest = v.version_string().clone();
                         tracing::debug!(
                             package = %name.for_tracing(),
-                            version = %latest,
+                            version = %v.version_string(),
                             "fetched via get_latest_matching fallback"
                         );
-                        Some((
-                            latest,
-                            v.removal_status(),
-                            v.published_at(),
-                            v.deprecation().cloned(),
-                            v.license().to_vec(),
-                        ))
+                        Pick::resolved(v.as_ref())
                     }
                     Ok(Ok(None)) => {
                         tracing::debug!(package = %name.for_tracing(), "no version found");
                         // Both the list-based pick and this fallback succeeded and found
                         // nothing — the package exists but has zero comparable versions
-                        // (#550), e.g. tags that don't parse as full semver. Distinct from
-                        // every branch below that sets `failed_name`.
-                        no_comparable_versions = true;
-                        None
+                        // (#550). Distinct from every branch below that produces `Failed`.
+                        Pick::Unresolved(PackageStatus::NoComparableVersions)
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(
@@ -755,20 +863,19 @@ async fn fetch_and_classify_package(
                             error = %e,
                             "fetch fallback failed"
                         );
-                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
-                        if fe.is_none() {
-                            *fe = Some(e.to_string());
+                        // A genuine not-found (the registry was successfully asked and
+                        // said "no such package") is not a fetch failure — only an
+                        // unanswerable request is (#267 C1).
+                        if e.is_not_found() {
+                            Pick::Unresolved(PackageStatus::NotFound {
+                                message: e.to_string(),
+                            })
+                        } else {
+                            Pick::Unresolved(PackageStatus::Failed {
+                                failure: e.fetch_failure(),
+                                message: e.to_string(),
+                            })
                         }
-                        drop(fe);
-                        // A genuine not-found (the registry was
-                        // successfully asked and said "no such
-                        // package") is not a fetch failure — only
-                        // an unanswerable request is (#267 C1).
-                        if !e.is_not_found() {
-                            failed_name = Some((name.clone(), e.fetch_failure(), e.to_string()));
-                        }
-                        None
                     }
                     Err(_) => {
                         tracing::warn!(
@@ -776,29 +883,37 @@ async fn fetch_and_classify_package(
                             "fetch fallback timed out ({}s)",
                             timeout.as_secs()
                         );
-                        failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        failed_name = Some((
-                            name.clone(),
-                            FetchFailure::Transient,
-                            format!(
+                        Pick::Unresolved(PackageStatus::Failed {
+                            failure: FetchFailure::Transient,
+                            message: format!(
                                 "{}: registry request timed out after {}s",
                                 name.for_tracing(),
                                 timeout.as_secs()
                             ),
-                        ));
-                        None
+                        })
                     }
                 }
+            };
+
+            let resolved = match &pick {
+                Pick::Resolved {
+                    version,
+                    removal_status,
+                    published_at,
+                    deprecation,
+                    license,
+                } => Some((version, removal_status, published_at, deprecation, license)),
+                Pick::Unresolved(_) => None,
             };
 
             if check_yanked {
                 // Row 1 (§4.7): the picked "latest" itself yanked — free, already in hand.
                 // Unreachable in production under today's hardcoded wildcard, but stays
                 // correct as a defense-in-depth check.
-                if let Some((latest, status, _, _, _)) = &resolved
+                if let Some((latest, status, _, _, _)) = resolved
                     && status.is_flagged()
                 {
-                    yanked = Some((name.clone(), latest.clone(), *status));
+                    yanked = Some((latest.clone(), *status));
                 }
 
                 // Row 2/3 (§4.7, revised under #206): `versions` is the full, already-fetched
@@ -821,7 +936,7 @@ async fn fetch_and_classify_package(
                         })
                         .map(|v| (iv, v.removal_status()))
                 }) {
-                    yanked = Some((name.clone(), iv.as_str().into(), status));
+                    yanked = Some((iv.as_str().into(), status));
                 }
             }
 
@@ -829,28 +944,35 @@ async fn fetch_and_classify_package(
             // "latest"), covering the fallback branch too, whose `Version` isn't a member
             // of `versions` at all — see `FetchResult::deprecations`'s doc for why this
             // must not scan `versions` instead.
-            if let Some((_, _, _, dep_info, _)) = &resolved
-                && let Some(dep_info) = dep_info
-            {
-                deprecation = Some((name.clone(), dep_info.clone()));
-            }
+            let deprecation = resolved.and_then(|(_, _, _, dep_info, _)| dep_info.clone());
 
-            // #660/#661 tier-1 backfill: extracted from `resolved` before `.map()` consumes
-            // it. Filtered here so a `Some((name, vec![]))` entry — indistinguishable from
-            // "no data" once merged into `DocumentState::signals.licenses` — never gets inserted.
-            license = resolved
-                .as_ref()
+            // #660/#661 tier-1 backfill. Filtered here so an empty license list —
+            // indistinguishable from "no data" once merged into
+            // `DocumentState::signals.licenses` — never gets inserted.
+            let license = resolved
                 .map(|(_, _, _, _, lic)| lic)
                 .filter(|lic| !lic.is_empty())
-                .map(|lic| (name.clone(), lic.clone()));
+                .cloned();
 
-            resolved.map(|(latest, _, published_at, _, _)| {
-                let mut versions = PackageVersions::new(latest, available).with_yanked(yanked_list);
-                if let Some(published_at) = published_at {
-                    versions = versions.with_published_at(published_at);
+            match pick {
+                Pick::Resolved {
+                    version,
+                    published_at,
+                    ..
+                } => {
+                    let mut versions =
+                        PackageVersions::new(version, available).with_yanked(yanked_list);
+                    if let Some(published_at) = published_at {
+                        versions = versions.with_published_at(published_at);
+                    }
+                    PackageStatus::Resolved {
+                        versions,
+                        deprecation,
+                        license,
+                    }
                 }
-                (name.clone(), versions)
-            })
+                Pick::Unresolved(status) => status,
+            }
         }
         Ok(Err(e)) => {
             // Issue #483: while offline, every fetch fails by design — this
@@ -862,33 +984,30 @@ async fn fetch_and_classify_package(
             } else {
                 tracing::warn!(package = %name.for_tracing(), error = %e, "fetch failed");
             }
-            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut fe = first_error.lock().unwrap_or_else(|p| p.into_inner());
-            if fe.is_none() {
-                *fe = Some(e.to_string());
-            }
-            drop(fe);
             // A genuine not-found is not a fetch failure — only an unanswerable request is
             // (#267 C1). Marking it here would report "Registry lookup failed" for a
             // typo'd name instead of "Unknown package", inverting the bug this fixes.
-            if !e.is_not_found() {
-                failed_name = Some((name.clone(), e.fetch_failure(), e.to_string()));
+            if e.is_not_found() {
+                PackageStatus::NotFound {
+                    message: e.to_string(),
+                }
+            } else {
+                PackageStatus::Failed {
+                    failure: e.fetch_failure(),
+                    message: e.to_string(),
+                }
             }
-            None
         }
         Err(_) => {
             tracing::warn!(package = %name.for_tracing(), "fetch timed out ({}s)", timeout.as_secs());
-            failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            failed_name = Some((
-                name.clone(),
-                FetchFailure::Transient,
-                format!(
+            PackageStatus::Failed {
+                failure: FetchFailure::Transient,
+                message: format!(
                     "{}: registry request timed out after {}s",
                     name.for_tracing(),
                     timeout.as_secs()
                 ),
-            ));
-            None
+            }
         }
     };
 
@@ -897,15 +1016,11 @@ async fn fetch_and_classify_package(
         sender.send(count);
     }
 
-    let no_comparable_versions_name = no_comparable_versions.then(|| name.clone());
-    (
-        version,
+    PackageOutcome {
+        name,
+        status,
         yanked,
-        failed_name,
-        deprecation,
-        no_comparable_versions_name,
-        license,
-    )
+    }
 }
 
 /// Re-keys a completed fetch's yanked/fetch-failure findings from raw to normalized package
@@ -1343,7 +1458,7 @@ mod tests {
         .await;
 
         assert!(result.versions.is_empty(), "Slow package should timeout");
-        assert_eq!(result.failed_count, 1, "Should track 1 failed package");
+        assert_eq!(result.failed_count(), 1, "Should track 1 failed package");
         // #267: a timeout is also a fetch failure, not a "not found" — must
         // be recorded the same way as a hard registry error.
         assert_eq!(
@@ -1435,7 +1550,8 @@ mod tests {
             "No versions returned (test registry returns empty)"
         );
         assert_eq!(
-            result.failed_count, 1,
+            result.failed_count(),
+            1,
             "Slow package should be marked as failed"
         );
     }
@@ -2613,7 +2729,8 @@ mod tests {
             "All packages with errors should be omitted from results"
         );
         assert_eq!(
-            result.failed_count, 3,
+            result.failed_count(),
+            3,
             "All 3 packages should be marked as failed"
         );
         // #267: a fetch error must be recorded per-package, not just counted,
@@ -2721,7 +2838,7 @@ mod tests {
                     &SelectionContext::none(),
                 )
                 .await;
-                assert_eq!(result.failed_count, 1);
+                assert_eq!(result.failed_count(), 1);
             })
             .await;
 
@@ -3062,7 +3179,8 @@ mod tests {
              but its not-found error must not"
         );
         assert_eq!(
-            result.failed_count, 2,
+            result.failed_count(),
+            2,
             "both fallback failures count toward failed_count regardless of cause (S2)"
         );
     }
@@ -3134,7 +3252,7 @@ mod tests {
             result.fetch_failed,
             HashMap::from([(PackageName::new("slow-fallback"), FetchFailure::Transient)])
         );
-        assert_eq!(result.failed_count, 1);
+        assert_eq!(result.failed_count(), 1);
     }
 
     #[tokio::test]
@@ -3213,7 +3331,7 @@ mod tests {
         .await;
 
         let err = result
-            .first_error
+            .failure_message()
             .expect("an actionable failure occurred and must be reported");
         assert!(
             err.contains("rate limit exceeded"),
@@ -3298,7 +3416,7 @@ mod tests {
             "not-found errors must never be recorded in fetch_failed"
         );
         let err = result
-            .first_error
+            .failure_message()
             .expect("a not-found-only batch must still fall back to reporting one via first_error");
         assert!(err.contains("not found"), "got: {err}");
     }
@@ -3374,11 +3492,12 @@ mod tests {
         .await;
 
         assert_eq!(
-            result.failed_count, 3,
+            result.failed_count(),
+            3,
             "all 3 packages must count toward failed_count"
         );
         let err = result
-            .first_error
+            .failure_message()
             .expect("a timeout is actionable and must populate first_error, not just failed_count");
         assert!(
             err.contains("timed out"),
@@ -3803,6 +3922,104 @@ mod tests {
             );
         }
 
+        /// Dedicated registry (not the shared `MockRegistry`, whose `latest_fallback` can
+        /// only express `Ok(Some(_))`/`Ok(None)`): the initial `get_versions` fetch succeeds
+        /// with an all-yanked list (forcing the `get_latest_matching` fallback), and that
+        /// fallback then genuinely errors — exercising `PackageOutcome::yanked` being `Some`
+        /// alongside `PackageStatus::Failed` (issue #1470's own doc rationale for keeping the
+        /// two independent, previously untested).
+        struct YankedThenFallbackErrorRegistry;
+
+        impl Registry for YankedThenFallbackErrorRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Ok(vec![Box::new(MockYankVersion {
+                        version: "1.0.0".into(),
+                        yanked: true,
+                    }) as Box<dyn Version>])
+                })
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &VersionReq,
+                _selection_context: &deps_core::SelectionContext,
+            ) -> Option<usize> {
+                versions
+                    .iter()
+                    .position(|v| !v.removal_status().blocks_resolution())
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+                _selection_context: &'a deps_core::SelectionContext,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move {
+                    Err(deps_core::error::DepsError::CacheError(
+                        "mock fallback failure".to_string(),
+                    ))
+                })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
+            {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn reports_yanked(&self) -> bool {
+                true
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        #[tokio::test]
+        async fn fallback_error_does_not_suppress_an_already_found_yanked_in_use_version() {
+            let mut in_use = HashMap::new();
+            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+
+            let result = fetch_latest_versions_parallel(
+                Arc::new(YankedThenFallbackErrorRegistry),
+                vec![(PackageName::new("pkg"), DependencySource::Registry)],
+                &in_use,
+                None,
+                deps_core::freshness::FreshnessSettings::default(),
+                5,
+                10,
+                &SelectionContext::none(),
+            )
+            .await;
+
+            assert!(
+                result.versions.is_empty(),
+                "the fallback errored, so no version was resolved"
+            );
+            assert_eq!(
+                result.yanked_versions.get(&PackageName::new("pkg")),
+                Some(&(ConcreteVersion::new("1.0.0"), RemovalStatus::Yanked)),
+                "the yanked in-use finding must survive even though the fallback pick failed"
+            );
+            assert_eq!(
+                result.fetch_failed.get(&PackageName::new("pkg")),
+                Some(&FetchFailure::Transient)
+            );
+            assert_eq!(result.failed_count(), 1);
+        }
+
         #[tokio::test]
         async fn in_use_checks_every_occurrence_of_a_duplicate_name() {
             // Regression guard for #394: a package can appear more than once
@@ -3955,7 +4172,7 @@ mod tests {
             .await;
 
             assert!(result.yanked_versions.is_empty());
-            assert_eq!(result.failed_count, 1);
+            assert_eq!(result.failed_count(), 1);
             assert!(result.versions.is_empty());
         }
 
@@ -3984,7 +4201,7 @@ mod tests {
             .await;
 
             assert!(result.yanked_versions.is_empty());
-            assert_eq!(result.failed_count, 1);
+            assert_eq!(result.failed_count(), 1);
             assert!(result.versions.is_empty());
         }
     }

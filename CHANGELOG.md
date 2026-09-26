@@ -167,6 +167,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-engine, every ecosystem crate**: `Registry::get_latest_matching`/`select_latest_matching` and the `complete_versions_generic_*` completion helpers now take a required `&SelectionContext` directly, replacing the separate `_with_context` method/helper twins (resolves #1444) (#1450)
 - **deps-core**: `SelectionContext` now holds a typed `Option<StabilityFloor>` instead of `Option<String>` (resolves #1444) (#1450)
 - **deps-composer**: `ComposerParseResult::minimum_stability` is now the `parser::MinimumStability` enum instead of `Option<String>`; stability-ranking helpers in `formatter`/`registry` are retyped onto `StabilityFloor` (resolves #1444) (#1450)
+- **deps-engine**: `FetchResult`'s `failed_count`/`first_error` public fields are removed, replaced by a single `failure_summary: Option<FailureSummary>` field read via the new `failed_count()`/`failure_message()` accessors (or `FailureSummary`'s own `count()`/`message()`); `FetchResult::new`'s arity drops from 8 to 7 parameters (resolves #1470)
 
 ### Changed
 - **deps-core**: extracted typed `CoalescedMemo`/`TtlMemo`/`CallOutcome` (new `deps_dev::memo` module) to replace 6 hand-rolled TTL memos in the deps.dev client, deriving each entry's TTL from its outcome instead of storing it alongside; no behavior change (resolves #1467) (#1491)

@@ -234,8 +234,8 @@ pub async fn analyze_manifest(
         &prep.selection_context,
     )
     .await;
-    // `failed_count` also counts not-found lookups, which aren't evidence of an unreachable
-    // registry — using it here made any repo with one typo'd dependency exit 2 every run.
+    // `fetch_failed` (genuine failures only), not `failure_summary`'s count, which also
+    // includes not-found lookups — using that here made a typo'd dependency exit 2 every run.
     let registry_unreachable = !ctx.policy.network.offline && !fetch_result.fetch_failed.is_empty();
     // Captured before `apply_fetch_outcomes` consumes `fetch_result.fetch_failed` below —
     // `deps-cli update --security-only`'s FR-011 two-signal `Unfixable` rule needs the raw
