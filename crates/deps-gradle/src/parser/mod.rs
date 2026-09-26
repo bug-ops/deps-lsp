@@ -10,6 +10,7 @@ pub mod settings;
 
 use crate::types::GradleDependency;
 use deps_core::Result;
+use deps_core::interpolation::PropertyValue;
 use deps_core::position::{Position, Range};
 use regex::{Captures, Regex};
 use std::collections::HashMap;
@@ -152,7 +153,10 @@ pub struct GradleParseResult {
 /// If a version is a variable reference and the variable is found in `properties`,
 /// the version is replaced with the resolved value. The version_range is kept as-is
 /// (pointing to the variable reference in source).
-pub fn resolve_variables(deps: &mut [GradleDependency], properties: &HashMap<String, String>) {
+pub fn resolve_variables(
+    deps: &mut [GradleDependency],
+    properties: &HashMap<String, PropertyValue>,
+) {
     for dep in deps.iter_mut() {
         if let Some(ref ver) = dep.version_req
             && let Some(resolved) = resolve_variable_ref(ver.as_str(), properties)
@@ -163,15 +167,15 @@ pub fn resolve_variables(deps: &mut [GradleDependency], properties: &HashMap<Str
 }
 
 /// Returns the resolved value if `value` is a `$name` or `${name}` reference. Returns `None` otherwise.
-fn resolve_variable_ref(value: &str, properties: &HashMap<String, String>) -> Option<String> {
+fn resolve_variable_ref(
+    value: &str,
+    properties: &HashMap<String, PropertyValue>,
+) -> Option<String> {
     let trimmed = value.trim();
-    if let Some(name) = trimmed.strip_circumfix("${", '}') {
-        properties.get(name).cloned()
-    } else if let Some(name) = trimmed.strip_prefix('$') {
-        properties.get(name).cloned()
-    } else {
-        None
-    }
+    let name = trimmed
+        .strip_circumfix("${", '}')
+        .or_else(|| trimmed.strip_prefix('$'))?;
+    properties.get(name).map(|v| v.as_str().to_string())
 }
 
 /// Which Gradle manifest shape a URI's basename identifies (issue #1436), so the parser and
@@ -821,8 +825,11 @@ mod tests {
 
     #[test]
     fn test_resolve_variables_dollar_brace() {
-        let props: HashMap<String, String> =
-            [("kotlinVersion".to_string(), "2.1.10".to_string())].into();
+        let props: HashMap<String, PropertyValue> = [(
+            "kotlinVersion".to_string(),
+            PropertyValue::new("2.1.10".to_string()).unwrap(),
+        )]
+        .into();
         let mut deps = vec![GradleDependency {
             group_id: "org.jetbrains.kotlin".into(),
             artifact_id: "kotlin-stdlib".into(),
@@ -839,8 +846,11 @@ mod tests {
 
     #[test]
     fn test_resolve_variables_dollar_plain() {
-        let props: HashMap<String, String> =
-            [("springVersion".to_string(), "3.2.0".to_string())].into();
+        let props: HashMap<String, PropertyValue> = [(
+            "springVersion".to_string(),
+            PropertyValue::new("3.2.0".to_string()).unwrap(),
+        )]
+        .into();
         let mut deps = vec![GradleDependency {
             group_id: "org.springframework.boot".into(),
             artifact_id: "spring-boot-starter".into(),
@@ -857,7 +867,7 @@ mod tests {
 
     #[test]
     fn test_resolve_variables_not_found_keeps_raw() {
-        let props: HashMap<String, String> = HashMap::new();
+        let props: HashMap<String, PropertyValue> = HashMap::new();
         let mut deps = vec![GradleDependency {
             group_id: "com.example".into(),
             artifact_id: "lib".into(),
@@ -874,7 +884,11 @@ mod tests {
 
     #[test]
     fn test_resolve_variables_literal_version_unchanged() {
-        let props: HashMap<String, String> = [("v".to_string(), "9.9.9".to_string())].into();
+        let props: HashMap<String, PropertyValue> = [(
+            "v".to_string(),
+            PropertyValue::new("9.9.9".to_string()).unwrap(),
+        )]
+        .into();
         let mut deps = vec![GradleDependency {
             group_id: "com.example".into(),
             artifact_id: "lib".into(),
@@ -887,6 +901,35 @@ mod tests {
         }];
         resolve_variables(&mut deps, &props);
         assert_eq!(deps[0].version_req, Some("1.2.3".into()));
+    }
+
+    /// #1481: a property value past `MAX_INTERPOLATED_VALUE_BYTES` never enters the map
+    /// (`PropertyValue::new` rejects it at the call site building the map), so a `$name`/
+    /// `${name}` reference to it stays unresolved, same as a genuinely missing property.
+    #[test]
+    fn test_resolve_variables_oversized_value_stays_unresolved() {
+        // Built through the real `parse_properties` insertion path (not a hand-built empty
+        // map, which would be indistinguishable from `test_resolve_variables_not_found_keeps_raw`
+        // and prove nothing about the drop actually happening) — critic M1 follow-up.
+        let oversized = "x".repeat(deps_core::interpolation::MAX_INTERPOLATED_VALUE_BYTES + 1);
+        let props = properties::parse_properties(&format!("bigVersion={oversized}"));
+        assert!(
+            !props.contains_key("bigVersion"),
+            "an oversized value must be dropped at insertion, not merely absent"
+        );
+
+        let mut deps = vec![GradleDependency {
+            group_id: "com.example".into(),
+            artifact_id: "lib".into(),
+            name: "com.example:lib".into(),
+            name_range: Range::default(),
+            version_req: Some("${bigVersion}".into()),
+            version_range: None,
+            configuration: "implementation".into(),
+            source: deps_core::parser::DependencySource::Registry,
+        }];
+        resolve_variables(&mut deps, &props);
+        assert_eq!(deps[0].version_req, Some("${bigVersion}".into()));
     }
 
     /// #1090 S1: `parse_gradle` derived the `gradle.properties` search directory from the raw

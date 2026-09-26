@@ -2,20 +2,31 @@
 //!
 //! Provides key-value parsing and directory-walking lookup.
 
+use deps_core::interpolation::PropertyValue;
 use std::collections::HashMap;
 use std::path::Path;
 
 /// Parses a gradle.properties content into key-value pairs.
 ///
-/// Lines starting with `#` or empty lines are ignored.
-/// Each line is split on the first `=`.
-pub fn parse_properties(content: &str) -> HashMap<String, String> {
-    content
+/// Lines starting with `#` or empty lines are ignored. Each line is split on the first `=`.
+/// A value exceeding `deps_core::interpolation::MAX_INTERPOLATED_VALUE_BYTES` is dropped
+/// (#1481) rather than retained unbounded — logged at `debug` with its length only, never
+/// its content.
+pub fn parse_properties(content: &str) -> HashMap<String, PropertyValue> {
+    let mut result = HashMap::new();
+    for (k, v) in content
         .lines()
         .filter(|l| !l.trim_start().starts_with('#') && !l.trim().is_empty())
         .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
-        .collect()
+    {
+        deps_core::interpolation::insert_bounded(
+            &mut result,
+            k.trim().to_string(),
+            v.trim().to_string(),
+            "gradle property",
+        );
+    }
+    result
 }
 
 /// Finds and parses gradle.properties files by walking up from `start_dir`.
@@ -28,7 +39,7 @@ pub fn parse_properties(content: &str) -> HashMap<String, String> {
 /// config-file ancestor walks use (a `gradle.properties` file is a small config file, not a
 /// lock file, so it does not need `deps_core::lockfile::MAX_LOCKFILE_BYTES`'s larger cap) —
 /// so an oversized or maliciously deep ancestor chain cannot force unbounded work (CWE-400).
-pub fn load_gradle_properties(start_dir: &Path) -> HashMap<String, String> {
+pub fn load_gradle_properties(start_dir: &Path) -> HashMap<String, PropertyValue> {
     let mut result = HashMap::new();
     let mut chain = Vec::new();
 
@@ -131,6 +142,29 @@ mod tests {
         assert!(props.is_empty());
     }
 
+    /// #1481: a value past `MAX_INTERPOLATED_VALUE_BYTES` is dropped from the returned map
+    /// rather than retained unbounded.
+    #[test]
+    fn test_parse_drops_oversized_value() {
+        let oversized = "x".repeat(deps_core::interpolation::MAX_INTERPOLATED_VALUE_BYTES + 1);
+        let content = format!("kept=short\nbig={oversized}\n");
+        let props = parse_properties(&content);
+        assert_eq!(props.get("kept").map(PropertyValue::as_str), Some("short"));
+        assert!(!props.contains_key("big"));
+    }
+
+    /// #1481: a value exactly at the cap is kept.
+    #[test]
+    fn test_parse_keeps_value_at_exact_cap() {
+        let at_cap = "x".repeat(deps_core::interpolation::MAX_INTERPOLATED_VALUE_BYTES);
+        let content = format!("big={at_cap}\n");
+        let props = parse_properties(&content);
+        assert_eq!(
+            props.get("big").map(PropertyValue::as_str),
+            Some(at_cap.as_str())
+        );
+    }
+
     /// An oversized `gradle.properties` must be rejected by the capped read rather than
     /// read into memory in full (CWE-400). Uses real `key=value` content padded past the
     /// cap, not a sparse NUL-filled file: an earlier version of this test used
@@ -212,7 +246,7 @@ mod tests {
         let result = load_gradle_properties(&current);
 
         assert_eq!(
-            result.get("atCap").map(String::as_str),
+            result.get("atCap").map(PropertyValue::as_str),
             Some("true"),
             "a gradle.properties exactly at the ancestor depth cap boundary must still be found"
         );
