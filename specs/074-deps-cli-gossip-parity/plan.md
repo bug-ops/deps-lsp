@@ -63,7 +63,7 @@ correction). The filter and precedence rows below replace the original design.
 | Where to filter | Post-filter `versions` in `fetch_and_classify_package`, before `select_latest_matching` (fetch.rs:819) | Zero changes to the `Registry` trait or any of the 14 ecosystem crates — `versions` is already fully in scope at this point | Threading GOSSIP into `Registry::get_versions_from`'s signature — rejected: touches 14 crates for no added benefit, since the exclusion set is a pure list-filter operation independent of how each registry fetches |
 | Prefetch granularity | One `GetFindingsBatch` call per manifest per covered ecosystem (via existing `fetch_gossip_findings_batch`) | Matches deps-lsp's own per-document batching; avoids N per-package calls | Per-package `gossip_findings_for_version` calls — rejected: no batching, defeats the point of `GetFindingsBatch` existing |
 | Filter safety (round 1) | **Floor-protected exclusion**: GOSSIP may only exclude a version strictly newer than the newest version in `in_use_versions`; a version at/older than that floor is never excluded, and the second (filtered) selection pass only runs at all when the first (unfiltered) pick is itself flagged | The naive "always exclude any flagged version" design (round 0) could regress `latest` below an already-declared dependency — proven by critique's C1 (a pinned `foo = "2.0.0"` with an active cooldown on 2.0.0 would resolve `latest` to 1.0.0, and `deps-cli update` would then rewrite the manifest to 1.0.0, a silent downgrade). The floor makes that impossible by construction: the protected version always satisfies the wildcard selection requirement, so it is always available to be picked | Excluding unconditionally (round 0) — rejected, proven unsafe. GOSSIP-overrides-local message-only annotation (never touching `latest`) — considered as the maximally-safe fallback if the floor design proved too complex; not needed once the floor closes the regression, and it would have reproduced the "near-zero practical value" the issue was originally deferred for |
-| Fallback-path (`get_latest_matching_from`) safety | Not filtered directly (would need a `Registry` trait change across 14 crates); instead made **unreachable for GOSSIP reasons whenever an in-use version is known**, since the floor-protected list-based pick can never come up empty in that case | Closes S1 (critique: the fallback could silently return the same flagged version) for the actual regression scenario (an existing dependency) at zero extra engineering cost | Filtering the fallback too — rejected as out of proportion for a P4 issue; the residual gap (no in-use version at all, e.g. a fresh dependency add) is narrow and explicitly documented (spec.md §6) rather than silently left as a surprise |
+| Fallback-path (`get_latest_matching_from`) safety | **Corrected round 2**: not filtered directly (would need a `Registry` trait change across 14 crates); instead made **unreachable for GOSSIP reasons in every case** — whenever the floor-filtered pick fails for *any* reason (no floor, or the ecosystem's own selection rules reject the remainder), fall back to the *unfiltered* pick rather than to the network fallback | Round 1 only closed this when a floor existed; independent re-verification found two live gaps (no floor at all — the common no-lockfile case; and a floor that still yields an empty ecosystem-level selection, e.g. Go rejecting an all-prerelease remainder). Falling back to the already-known unfiltered pick instead of a network call closes both, still with zero `Registry` trait changes | Filtering the fallback via a trait change — rejected, unnecessary once "fall back to the unfiltered pick" is recognized as sufficient in every case |
 | Attribution | Additive field on `PackageVersions` (`gossip_excluded_version`), set **only when the filtered pick's version differs from the unfiltered pick's** | Lets `table`/`json`/`sarif` renderers explain *why* a version changed, without a schema/wire format change to any GOSSIP type. Comparing final picks (not list membership) also means the floor-neutralized case (C1) correctly sets no attribution — nothing was actually held back | Setting the field whenever the unfiltered pick was merely flagged (round 0) — rejected: produces a misleading "GOSSIP excluded version X" message even when X is still the version actually used (floor-neutralized case) |
 
 ## 2. Project Structure
@@ -178,17 +178,38 @@ let (selectable_versions, gossip_excluded_version): (Vec<Box<dyn Version>>, Opti
                     .map(|(_, v)| v)
                     .collect();
 
-                let filtered_pick_version = registry
-                    .select_latest_matching(&filtered, wildcard_req, selection_context)
-                    .and_then(|idx| filtered.get(idx))
-                    .map(|v| v.version_string().clone());
+                // Round 2 correction: round 1 unconditionally used `filtered`/its pick here,
+                // which (a) silently did nothing useful when `protect_floor` is `None` (every
+                // version stays in `filtered`, since the floor guard `*idx >= floor` is
+                // vacuously true for a `None` floor under `Option::is_some_and` — actually a
+                // latent bug in round 1's own sketch: re-verify this against the real
+                // `is_some_and` semantics, since `None.is_some_and(..)` is `false`, meaning a
+                // `None` floor would in fact exclude every flagged version with NO protection at
+                // all — this is exactly independent re-verification's C1b finding) and (b) could
+                // still land on `None` if the ecosystem's own `select_latest_matching_impl`
+                // rejects every remaining candidate for reasons unrelated to GOSSIP (e.g. Go
+                // refusing an all-prerelease remainder — S1's re-verification finding).
+                //
+                // Corrected: only ever use `filtered`'s pick when a floor exists AND that pick
+                // succeeds; otherwise keep the unfiltered list/pick and set no attribution —
+                // never fall through to `get_latest_matching_from` on GOSSIP's account.
+                match protect_floor {
+                    None => (versions, None), // FR-003(b): no floor, deliberate no-op (C1b)
+                    Some(_) => {
+                        let filtered_pick_version = registry
+                            .select_latest_matching(&filtered, wildcard_req, selection_context)
+                            .and_then(|idx| filtered.get(idx))
+                            .map(|v| v.version_string().clone());
 
-                let excluded = if filtered_pick_version.as_deref() == Some(unfiltered_pick.version_string().as_str()) {
-                    None // floor fully neutralized the exclusion — nothing was actually held back
-                } else {
-                    Some(unfiltered_pick.version_string().clone())
-                };
-                (filtered, excluded)
+                        match filtered_pick_version {
+                            None => (versions, None), // FR-003(d): S1, ecosystem rejected the rest
+                            Some(fv) if fv.as_str() == unfiltered_pick.version_string().as_str() => {
+                                (filtered, None) // floor neutralized the exclusion (C1a)
+                            }
+                            Some(_) => (filtered, Some(unfiltered_pick.version_string().clone())),
+                        }
+                    }
+                }
             }
         }
     };
@@ -197,17 +218,22 @@ let (selectable_versions, gossip_excluded_version): (Vec<Box<dyn Version>>, Opti
 Notes for the implementer (this sketch is illustrative — resolve borrow-checker/ownership details
 against the real code, e.g. `unfiltered_pick` borrows from `versions` which is later moved by
 `.into_iter()`; a version-string clone before the move, or restructuring into a helper function
-returning owned data, will be needed):
+returning owned data, will be needed; and **do not reuse round 1's `filtered.into_iter().enumerate()`
+guard literally without re-checking `Option::is_some_and`'s actual behavior on `None` against what
+this description assumes** — verify against a real test before trusting either sketch's exact
+boolean logic):
 
-- The existing pick logic below this block (currently operating on the round-0 `selectable_versions`)
-  is unchanged — it still calls `select_latest_matching(&selectable_versions, ...)` once more to get
-  the actual `Pick`. This is a deliberate small redundancy (the filtered case re-picks a third time)
-  rather than threading the already-computed index through, to keep this diff's control flow close
-  to the existing code shape; an implementer may optimize this away if it's cleaner.
-- `gossip_excluded_version`'s doc comment (in `PackageVersions`, deps-core) must be updated to say
-  "solely because of an active GOSSIP cooldown finding whose version was strictly newer than the
-  dependency's already-in-use version" — not "would have been excluded anyway by local
-  `cooldown_secs`", which round 1 established doesn't exist.
+- Do not call `select_latest_matching(&filtered, ...)` at all when `protect_floor` is `None` — per
+  FR-003(b), skip straight to `(versions, None)` (this also avoids ever constructing `filtered` in
+  that branch, since round 2 found no floor means no useful filtering can happen anyway).
+- The existing pick logic below this block should reuse whichever of `(versions, unfiltered_pick)` /
+  `(filtered, filtered_pick)` this block already resolved — the developer's actual round-1
+  implementation already fixed round 1's own draft-sketch flaw here (threading the index instead of
+  re-calling `select_latest_matching` a third time), so this round 2 correction should compose with
+  that fix, not undo it.
+- `gossip_excluded_version`'s doc comment (in `PackageVersions`, deps-core) must state all three
+  no-attribution cases: floor-neutralized (C1a), no-floor-no-op (C1b), and ecosystem-rejected-filtered-set
+  (S1) — not just the round-1 framing.
 
 ## 4. API Design
 
@@ -230,7 +256,7 @@ Not applicable — no HTTP-facing API changes. Internal function signatures only
 
 | Level | Framework | What to Test | Coverage Target |
 |-------|-----------|-------------|-----------------|
-| Unit | `cargo nextest` | **Revised round 1**: `fetch_and_classify_package`'s floor-protected filter — (a) no GOSSIP data (no-op, zero extra `select_latest_matching` calls), (b) pick not flagged (no-op), (c) pick flagged + safe intermediate version above the floor exists (exclusion applies, attribution set to the flagged version), (d) pick flagged AND is itself the in-use version — **C1 regression test**: floor neutralizes the exclusion, final pick unchanged, no attribution, no downgrade, (e) pick flagged, no in-use version found at all — **S1 residual test**: asserts the existing (unfixed) fallback-bypass behavior explicitly, so a future change can't silently alter it without the test flagging it | All 5 branches, especially (d)/(e) |
+| Unit | `cargo nextest` | **Revised round 2**: `fetch_and_classify_package`'s filter — (a) no GOSSIP data (no-op), (b) pick not flagged (no-op), (c) pick flagged + safe intermediate version above a real floor (exclusion applies, attribution set), (d) pick flagged AND is itself the in-use version — **C1a**: floor neutralizes, no attribution, no downgrade, (e) pick flagged, **no in-use version found at all** — **C1b (round 2)**: asserted as a genuine no-op (not "still broken"), (f) pick flagged, a floor exists, but the ecosystem's own selection rules reject every remaining candidate above it — **S1 (round 2)**: unfiltered pick used, no attribution, `get_latest_matching_from` not invoked. Must go through the real `in_use_versions`/`prepare_fetch` path in at least one test, not only a hand-constructed map, per independent re-verification's finding that round-1's own tests bypassed this | All 6 branches, especially (d)/(e)/(f) |
 | Unit | `cargo nextest` | `ignored_sections` now includes `typosquat`; `load()` warns for both `required=true` and `required=false` while `safe_auto_discovered_config` reset stays `required=false`-only | Existing `test_ignored_sections_*` pattern (config.rs:413-427) extended |
 | Integration | `cargo nextest` (mockito) | `deps-cli check`/`update` end-to-end against a mocked GOSSIP `GetFindingsBatch` response with an active `COOLDOWN` finding on the registry-latest version | At least one covered ecosystem (npm) |
 | Live | manual (`.local/testing/`) | Real `deps-cli check` against a package with a live GOSSIP-flagged cooldown (e.g. a recently-published npm package), `[gossip].enabled = true` | Per `.claude/rules/continuous-improvement.md`'s live-testing gate before PR |
