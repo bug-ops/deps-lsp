@@ -759,6 +759,121 @@ where
     abort_handle
 }
 
+/// Whether [`SupersedingTaskRegistry::track`] actively cancels the task it supersedes/loses to,
+/// or only stops tracking it (issue #1476 finding #4, critic S1).
+///
+/// [`Self::Cancel`] is safe only when the tracked future's own network dispatch is immune to
+/// being killed mid-flight while holding some *other* claim an external system relies on —
+/// typosquat's memos are [`deps_core::deps_dev`]-style `CoalescedMemo`s with follower takeover on a
+/// dropped leader, so an abort there can never strand a claim. GOSSIP's
+/// `DepsDevClient::gossip_findings_batch` instead uses skip-and-defer in-flight claims with no
+/// takeover: aborting an in-flight batch call is asynchronous (the claim-releasing guards drop
+/// only once the runtime actually schedules the cancellation), so a superseding prefetch's own
+/// synchronous claim check can still see every name claimed by the task that is *about* to be
+/// aborted, see `claimed.is_empty()`, and return with nothing — while the original task is then
+/// killed before it ever writes the memo. The document loses its GOSSIP data until a later,
+/// unrelated edit happens to retrigger a prefetch. [`Self::Replace`] avoids this entirely by
+/// never aborting either side of a supersession — only [`SupersedingTaskRegistry::abort`]
+/// (`did_close`) may still cancel whichever task is currently tracked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Supersession {
+    /// Abort the loser — either the previously-registered task (this call wins) or `handle`
+    /// itself (this call loses).
+    Cancel,
+    /// Never abort either side of a supersession; a superseded task keeps running to its own
+    /// completion, untracked. Only [`SupersedingTaskRegistry::abort`] can still cancel whichever
+    /// task ends up tracked.
+    Replace,
+}
+
+/// Tracks, per document `Uri`, the currently-running background pre-fetch task of one kind
+/// (typosquat, GOSSIP, ...) — either letting a newer spawn cancel an older one
+/// ([`Supersession::Cancel`]), or merely replacing which one is considered "current" for
+/// [`Self::abort`]'s purposes without ever cancelling either side ([`Supersession::Replace`]).
+///
+/// Generalizes what `ServerState::track_typosquat_task` used to implement as its own
+/// hand-written map/counter pair (issue #1476 finding #4): [`ServerState`] now holds one
+/// instance of this type per pre-fetch kind rather than duplicating the map, the generation
+/// counter, and the track/abort logic for each new kind added.
+struct SupersedingTaskRegistry {
+    tasks: tokio::sync::RwLock<HashMap<Uri, (u64, tokio::task::AbortHandle)>>,
+    generation: AtomicU64,
+}
+
+impl SupersedingTaskRegistry {
+    fn new() -> Self {
+        Self {
+            tasks: tokio::sync::RwLock::new(HashMap::new()),
+            generation: AtomicU64::new(0),
+        }
+    }
+
+    /// Draws the next generation value — callers draw this *synchronously*, right before
+    /// spawning a pre-fetch task (no `.await` in between), so it reflects true spawn-decision
+    /// order regardless of whatever order the corresponding [`Self::track`] calls later happen
+    /// to acquire [`Self::tasks`]'s write lock in.
+    fn next_generation(&self) -> u64 {
+        self.generation.fetch_add(1, Ordering::Relaxed)
+    }
+
+    /// Registers `handle` as `uri`'s current task if `generation` is at least as new as
+    /// whatever is currently registered — the loser is either the previously-registered task
+    /// (this call wins) or `handle` itself (this call loses), and `supersession` decides
+    /// whether that loser is actively aborted ([`Supersession::Cancel`]) or simply left to run
+    /// untracked to its own completion ([`Supersession::Replace`]).
+    ///
+    /// `generation` — not insertion order — decides the winner: two pre-fetches for the same
+    /// `uri` can be decided concurrently, and nothing guarantees the *later*-decided one also
+    /// wins the write-lock race first.
+    async fn track(
+        &self,
+        uri: Uri,
+        generation: u64,
+        handle: tokio::task::AbortHandle,
+        supersession: Supersession,
+    ) {
+        let mut tasks = self.tasks.write().await;
+        if let Some((existing_generation, _)) = tasks.get(&uri)
+            && *existing_generation > generation
+        {
+            drop(tasks);
+            if supersession == Supersession::Cancel {
+                handle.abort();
+            }
+            return;
+        }
+        let previous = tasks.insert(uri, (generation, handle));
+        drop(tasks);
+        if let Some((_, old)) = previous
+            && supersession == Supersession::Cancel
+        {
+            old.abort();
+        }
+    }
+
+    /// Aborts and forgets `uri`'s currently-registered task, if any — the only cancellation
+    /// path a [`Supersession::Replace`] registry ever exercises.
+    async fn abort(&self, uri: &Uri) {
+        let removed = self.tasks.write().await.remove(uri);
+        if let Some((_, handle)) = removed {
+            handle.abort();
+        }
+    }
+
+    /// Test-only observability for [`Self::track`]'s "did a new pre-fetch get spawned and
+    /// registered" contract: a caller compares this across two events to tell whether the
+    /// tracked task was replaced (a new spawn) or left alone (the gate correctly skipped a
+    /// redundant spawn).
+    #[cfg(test)]
+    async fn task_id(&self, uri: &Uri) -> Option<tokio::task::Id> {
+        self.tasks
+            .read()
+            .await
+            .get(uri)
+            .map(|(_, handle)| handle.id())
+    }
+}
+
 /// Global LSP server state.
 ///
 /// Manages all open documents, HTTP cache, lock file cache, and background
@@ -865,26 +980,26 @@ pub struct ServerState {
     /// before acting on a panic (issue #632 critic S3 — see
     /// [`Self::is_current_background_task`]).
     tasks: tokio::sync::RwLock<HashMap<Uri, (tokio::task::Id, tokio::task::AbortHandle)>>,
-    /// Typosquat pre-fetch task handles, keyed by URI, paired with the spawn-order
-    /// [`Self::next_typosquat_task_generation`] draw for each one (issue #1455 batch item 1,
-    /// critic M2 — see [`Self::track_typosquat_task`] for why the generation is needed).
+    /// Typosquat pre-fetch task handles, keyed by URI (issue #1455 batch item 1, critic M2 —
+    /// see [`SupersedingTaskRegistry`] for the generation-ordered supersession this provides).
     ///
-    /// A separate map from [`Self::tasks`] rather than reusing it: `tasks` is a single slot
-    /// per URI, owned by the open/change path's own registry-fetch task
+    /// A separate registry from [`Self::tasks`] rather than reusing it: `tasks` is a single
+    /// slot per URI, owned by the open/change path's own registry-fetch task
     /// (`run_document_open_background_task`/`run_document_change_task`), and the typosquat
     /// pre-fetch is deliberately *not* installed there (see
     /// `document::lifecycle::spawn_typosquat_prefetch_and_republish`'s own doc) since it must
-    /// outlive that outer task rather than being aborted alongside it. This map instead lets
-    /// a superseding pre-fetch spawn (a newer edit, or `did_close`) cancel the *previous*
+    /// outlive that outer task rather than being aborted alongside it. This registry instead
+    /// lets a superseding pre-fetch spawn (a newer edit, or `did_close`) cancel the *previous*
     /// pre-fetch specifically, before it burns up to ~10s of deps.dev calls for a result
     /// `document::typosquat::run_typosquat_prefetch`'s own name-set staleness guard would
     /// discard at commit time anyway.
-    typosquat_tasks: tokio::sync::RwLock<HashMap<Uri, (u64, tokio::task::AbortHandle)>>,
-    /// Monotonic source for [`Self::track_typosquat_task`]'s generation ordering (issue #1455
-    /// critic M2). A single server-wide counter, not per-URI: it only needs to order two
-    /// spawn *decisions* relative to each other, which a shared sequence does just as well as
-    /// a per-URI one, with no extra bookkeeping.
-    typosquat_task_generation: AtomicU64,
+    typosquat_tasks: SupersedingTaskRegistry,
+    /// GOSSIP pre-fetch task handles, keyed by URI (issue #1476 finding #4) — otherwise mirrors
+    /// [`Self::typosquat_tasks`]'s rationale for
+    /// `document::lifecycle::spawn_gossip_prefetch_and_republish`, but tracked with
+    /// [`Supersession::Replace`] rather than [`Supersession::Cancel`] (critic S1): see
+    /// [`Supersession`]'s own doc for why cancelling a superseded GOSSIP prefetch is unsafe.
+    gossip_tasks: SupersedingTaskRegistry,
     /// Whether the client advertised `window.workDoneProgress` support during
     /// `initialize`. Set once, read from spawned lifecycle tasks that have no
     /// direct access to `ClientCapabilities` (see `RegistryProgress::start` call
@@ -995,8 +1110,8 @@ impl ServerState {
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
-            typosquat_tasks: tokio::sync::RwLock::new(HashMap::new()),
-            typosquat_task_generation: AtomicU64::new(0),
+            typosquat_tasks: SupersedingTaskRegistry::new(),
+            gossip_tasks: SupersedingTaskRegistry::new(),
             progress_supported: AtomicBool::new(false),
             inlay_hint_refresh_supported: AtomicBool::new(false),
             code_lens_refresh_supported: AtomicBool::new(false),
@@ -1481,74 +1596,76 @@ impl ServerState {
         }
         drop(tasks);
         self.abort_typosquat_task(uri).await;
+        self.abort_gossip_task(uri).await;
     }
 
-    /// Draws the next value from [`Self::typosquat_task_generation`] (issue #1455 critic M2)
-    /// — callers draw this *synchronously*, right before spawning a typosquat pre-fetch task
-    /// (no `.await` in between), so it reflects true spawn-decision order regardless of
-    /// whatever order the corresponding [`Self::track_typosquat_task`] calls later happen to
-    /// acquire [`Self::typosquat_tasks`]'s write lock in.
+    /// Draws the next generation value for a typosquat pre-fetch spawn decision (issue #1455
+    /// critic M2) — see [`SupersedingTaskRegistry::next_generation`].
     pub(crate) fn next_typosquat_task_generation(&self) -> u64 {
-        self.typosquat_task_generation
-            .fetch_add(1, Ordering::Relaxed)
+        self.typosquat_tasks.next_generation()
     }
 
-    /// Registers `handle` as `uri`'s current typosquat pre-fetch task if `generation` is at
-    /// least as new as whatever is currently registered, aborting the loser — either the
-    /// previously-registered task (this call wins), or `handle` itself (this call loses)
-    /// (issue #1455 batch item 1, tightened for critic M2).
-    ///
-    /// `generation` (from [`Self::next_typosquat_task_generation`]) — not insertion order —
-    /// decides the winner: two pre-fetches for the same URI can be decided concurrently (an
-    /// edit racing a `policy.typosquat.enabled` transition, say), and nothing guarantees the
-    /// *later*-decided one also wins the [`Self::typosquat_tasks`] write-lock race first. Registering
-    /// by raw insertion order alone could let an objectively older spawn survive over a newer
-    /// one purely because its `track_typosquat_task` call happened to acquire the lock first —
-    /// exactly mirroring why [`Self::is_current_background_task`] compares [`tokio::task::Id`]
-    /// rather than trusting call order for the analogous main-background-task registry.
+    /// Registers `handle` as `uri`'s current typosquat pre-fetch task, cancelling whichever
+    /// task it supersedes/loses to (issue #1455 batch item 1, tightened for critic M2) — see
+    /// [`SupersedingTaskRegistry::track`].
     pub(crate) async fn track_typosquat_task(
         &self,
         uri: Uri,
         generation: u64,
         handle: tokio::task::AbortHandle,
     ) {
-        let mut tasks = self.typosquat_tasks.write().await;
-        if let Some((existing_generation, _)) = tasks.get(&uri)
-            && *existing_generation > generation
-        {
-            drop(tasks);
-            handle.abort();
-            return;
-        }
-        let previous = tasks.insert(uri, (generation, handle));
-        drop(tasks);
-        if let Some((_, old)) = previous {
-            old.abort();
-        }
+        self.typosquat_tasks
+            .track(uri, generation, handle, Supersession::Cancel)
+            .await;
     }
 
-    /// The [`tokio::task::Id`] of `uri`'s currently-tracked typosquat pre-fetch task, if any —
-    /// test-only observability for [`Self::track_typosquat_task`]'s "did a new pre-fetch get
-    /// spawned and registered" contract (issue #1455 batch item 1): a caller compares this
-    /// across two events to tell whether the tracked task was replaced (a new spawn) or left
-    /// alone (the gate correctly skipped a redundant spawn).
+    /// Test-only observability for [`Self::track_typosquat_task`] — see
+    /// [`SupersedingTaskRegistry::task_id`].
     #[cfg(test)]
     pub(crate) async fn typosquat_task_id(&self, uri: &Uri) -> Option<tokio::task::Id> {
-        self.typosquat_tasks
-            .read()
-            .await
-            .get(uri)
-            .map(|(_, handle)| handle.id())
+        self.typosquat_tasks.task_id(uri).await
     }
 
     /// Aborts and forgets `uri`'s currently-registered typosquat pre-fetch task, if any
     /// (issue #1455 batch item 1) — called on `did_close` so a closed document's pre-fetch
     /// doesn't keep running for a document no longer open in the editor.
     pub(crate) async fn abort_typosquat_task(&self, uri: &Uri) {
-        let removed = self.typosquat_tasks.write().await.remove(uri);
-        if let Some((_, handle)) = removed {
-            handle.abort();
-        }
+        self.typosquat_tasks.abort(uri).await;
+    }
+
+    /// Draws the next generation value for a GOSSIP pre-fetch spawn decision (issue #1476
+    /// finding #4) — mirrors [`Self::next_typosquat_task_generation`].
+    pub(crate) fn next_gossip_task_generation(&self) -> u64 {
+        self.gossip_tasks.next_generation()
+    }
+
+    /// Registers `handle` as `uri`'s current GOSSIP pre-fetch task (issue #1476 finding #4) —
+    /// unlike [`Self::track_typosquat_task`], never cancels the task it supersedes/loses to
+    /// (critic S1): see [`Supersession`]'s own doc for why an in-flight GOSSIP prefetch must
+    /// never be aborted by a mere supersession.
+    pub(crate) async fn track_gossip_task(
+        &self,
+        uri: Uri,
+        generation: u64,
+        handle: tokio::task::AbortHandle,
+    ) {
+        self.gossip_tasks
+            .track(uri, generation, handle, Supersession::Replace)
+            .await;
+    }
+
+    /// Aborts and forgets `uri`'s currently-registered GOSSIP pre-fetch task, if any (issue
+    /// #1476 finding #4) — mirrors [`Self::abort_typosquat_task`]; this remains the only way a
+    /// GOSSIP prefetch task tracked here is ever cancelled.
+    pub(crate) async fn abort_gossip_task(&self, uri: &Uri) {
+        self.gossip_tasks.abort(uri).await;
+    }
+
+    /// Test-only observability for [`Self::track_gossip_task`] — mirrors
+    /// [`Self::typosquat_task_id`].
+    #[cfg(test)]
+    pub(crate) async fn gossip_task_id(&self, uri: &Uri) -> Option<tokio::task::Id> {
+        self.gossip_tasks.task_id(uri).await
     }
 
     /// Returns the number of open documents.
@@ -2246,6 +2363,39 @@ mod tests {
         );
     }
 
+    /// Issue #1476 finding #4 (tester-flagged coverage gap): mirrors
+    /// `test_cancel_background_task_aborts_tracked_typosquat_task` for the GOSSIP registry —
+    /// `did_close` must abort a tracked GOSSIP pre-fetch too, exactly like typosquat's, even
+    /// though (unlike typosquat) a mere *supersession* must not (see
+    /// `test_track_gossip_task_does_not_abort_superseded_predecessor` for that half).
+    #[tokio::test]
+    async fn test_cancel_background_task_aborts_tracked_gossip_task() {
+        let state = Arc::new(ServerState::new());
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
+
+        let worker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let handle = worker.abort_handle();
+        let generation = state.next_gossip_task_generation();
+        state
+            .track_gossip_task(uri.clone(), generation, handle)
+            .await;
+
+        state.cancel_background_task(&uri).await;
+
+        assert!(
+            state.gossip_task_id(&uri).await.is_none(),
+            "the GOSSIP task entry must be removed on did_close"
+        );
+        assert!(
+            poll_until(Duration::from_secs(1), || worker.is_finished()).await,
+            "the underlying GOSSIP pre-fetch task must actually be aborted on did_close, not \
+             merely forgotten"
+        );
+    }
+
     /// Issue #1455 critic M2: a newer-generation task must win even if its
     /// `track_typosquat_task` call happens to acquire the write lock *before* an
     /// older-generation task's own call — mirroring `is_current_background_task`'s
@@ -2295,6 +2445,70 @@ mod tests {
         assert!(
             !newer_worker.is_finished(),
             "the newer-generation task (the rightful winner) must not be aborted"
+        );
+    }
+
+    /// Issue #1476 critic S1 (blocking): unlike typosquat, a GOSSIP prefetch superseded by a
+    /// newer one must NOT be aborted — `DepsDevClient::gossip_findings_batch`'s skip-and-defer
+    /// in-flight claims have no follower takeover, so killing an in-flight batch call here can
+    /// strand a superseding call's own claim check (it would see every name still claimed and
+    /// return nothing) while the original call is cancelled before ever writing the memo,
+    /// losing the document's GOSSIP data until an unrelated later edit. `track_gossip_task`
+    /// must only ever cancel via `abort_gossip_task` (`did_close`), never via supersession.
+    #[tokio::test]
+    async fn test_track_gossip_task_does_not_abort_superseded_predecessor() {
+        let state = Arc::new(ServerState::new());
+        let uri =
+            crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
+
+        let older_generation = state.next_gossip_task_generation();
+        let newer_generation = state.next_gossip_task_generation();
+
+        // `is_finished()` alone can't tell "ran to natural completion" apart from "was
+        // aborted" (both make it true) — this flag is only ever set from *inside* the future,
+        // after its `sleep` returns, so it stays `false` if the task is aborted mid-sleep.
+        let older_completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let older_completed_flag = Arc::clone(&older_completed);
+        let older_worker = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            older_completed_flag.store(true, Ordering::Relaxed);
+        });
+        let older_handle = older_worker.abort_handle();
+        state
+            .track_gossip_task(uri.clone(), older_generation, older_handle)
+            .await;
+
+        let newer_worker = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+        let newer_handle = newer_worker.abort_handle();
+        state
+            .track_gossip_task(uri.clone(), newer_generation, newer_handle)
+            .await;
+
+        assert_eq!(
+            state.gossip_task_id(&uri).await,
+            Some(newer_worker.id()),
+            "the newer-generation task becomes the tracked one for did_close purposes"
+        );
+        assert!(
+            poll_until(Duration::from_secs(1), || older_worker.is_finished()).await,
+            "the superseded task must still run to its own natural completion, not be aborted"
+        );
+        assert!(
+            older_completed.load(Ordering::Relaxed),
+            "the superseded task must have actually reached the end of its own future, proving \
+             it was not aborted mid-flight"
+        );
+        assert!(
+            !newer_worker.is_finished(),
+            "the newly-tracked task must be unaffected"
+        );
+
+        state.cancel_background_task(&uri).await;
+        assert!(
+            poll_until(Duration::from_secs(1), || newer_worker.is_finished()).await,
+            "did_close must still be able to cancel whichever task ends up tracked"
         );
     }
 

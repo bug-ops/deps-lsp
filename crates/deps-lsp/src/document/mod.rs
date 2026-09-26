@@ -16,6 +16,7 @@ mod gossip_prefetch;
 mod lifecycle;
 mod loader;
 mod osv_scan;
+mod prefetch_support;
 mod typosquat;
 // Every snapshot test inside is gated on one of these ecosystem features; with none
 // enabled, the module's shared fixtures/helpers would otherwise be dead code.

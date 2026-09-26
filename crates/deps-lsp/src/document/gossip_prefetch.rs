@@ -10,7 +10,6 @@ use crate::handlers::diagnostics;
 use deps_core::{Ecosystem, GossipFindings, PackageName};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
@@ -59,20 +58,18 @@ pub(crate) async fn run_gossip_prefetch(
         return false;
     }
 
-    let (content_snapshot, parse_result): (String, Arc<dyn deps_core::ParseResult>) = {
-        let Some(doc) = state.get_document(&uri) else {
-            return false;
-        };
-        let Some(parse_result) = doc.parse_result_arc() else {
-            return false;
-        };
-        (doc.content.clone(), parse_result)
+    let Some((content_snapshot, parse_result)) =
+        super::prefetch_support::document_prefetch_snapshot(&state, &uri, |doc, _| {
+            doc.content.clone()
+        })
+    else {
+        return false;
     };
 
-    let timeout_duration =
-        Duration::from_secs(fetch_timeout_secs.min(GOSSIP_PREFETCH_TIMEOUT_CEILING_SECS));
-    let findings = match tokio::time::timeout(
-        timeout_duration,
+    let Some(findings) = super::prefetch_support::bounded_prefetch_fetch(
+        fetch_timeout_secs,
+        GOSSIP_PREFETCH_TIMEOUT_CEILING_SECS,
+        "GOSSIP",
         deps_core::lsp_helpers::fetch_gossip_findings_batch(
             ecosystem.ecosystem_id(),
             parse_result.as_ref(),
@@ -82,12 +79,8 @@ pub(crate) async fn run_gossip_prefetch(
         ),
     )
     .await
-    {
-        Ok(findings) => findings,
-        Err(_) => {
-            tracing::debug!("GOSSIP pre-fetch timed out");
-            return false;
-        }
+    else {
+        return false;
     };
 
     if findings.is_empty() {
@@ -813,5 +806,104 @@ mod tests {
         // Give a wrongly-spawned refetch a chance to run before asserting the call count.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         batch.assert_async().await;
+    }
+
+    /// Issue #1476 critic S1 (blocking) regression: a superseding GOSSIP prefetch (P2) racing
+    /// an in-flight one (P1) via `ServerState::track_gossip_task` must not cause P1's result to
+    /// be lost. Before the fix, tracking P2 aborted P1 while P1 still held its
+    /// `DepsDevClient::gossip_findings_batch` in-flight claim (the abort is asynchronous, so a
+    /// synchronous claim check right after would still see the name claimed) — P1 got killed
+    /// before ever writing the memo, and the document lost its GOSSIP data until an unrelated
+    /// later edit. P1 must instead run to its own completion and merge its findings regardless
+    /// of P2 superseding it.
+    #[tokio::test]
+    async fn run_gossip_prefetch_survives_a_superseding_registration_mid_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body_from_request(|_req| {
+                // Long enough for the test to register a superseding P2 after P1 has started
+                // but before P1's own fetch returns.
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                br#"{"responses":[
+                    {"request":{"packageKey":{"system":"NPM","name":"vite"}},
+                     "findings":{"packageKey":{"system":"NPM","name":"vite"},
+                         "recommendedVersions":[],
+                         "defaultVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.4.0"},
+                             "isDefault":true,
+                             "findings":[{"type":"COOLDOWN","risk":"RISK_HIGH",
+                                 "cooldownContext":{"end":"2026-10-09T12:26:19Z"}}]},
+                         "packageFindings":[]}}
+                ],"nextPageToken":""}"#
+                    .to_vec()
+            })
+            .create_async()
+            .await;
+
+        let mocked_deps_dev = Arc::new(deps_core::DepsDevClient::for_test(
+            Arc::new(deps_core::HttpCache::new()),
+            server.url(),
+        ));
+        let mut state = ServerState::new();
+        state.deps_dev = mocked_deps_dev;
+        state.set_gossip_enabled(true);
+        let state = Arc::new(state);
+
+        let uri = crate::lsp_types_interop::to_lsp_uri(&test_uri("/test/package.json"));
+        let domain_uri = crate::lsp_types_interop::from_lsp_uri(&uri).expect("valid uri");
+        let ecosystem = state
+            .ecosystem_registry
+            .get(EcosystemId::Npm)
+            .expect("npm ecosystem not found");
+
+        let content = r#"{"dependencies":{"vite":"^8.0.0"}}"#.to_string();
+        let parse_result = ecosystem
+            .parse_manifest(&content, &domain_uri)
+            .await
+            .expect("manifest must parse");
+        state.documents.insert(
+            uri.clone(),
+            DocumentState::new_from_parse_result(EcosystemId::Npm, content, parse_result),
+        );
+
+        // P1: the in-flight prefetch, tracked at the older generation.
+        let p1_generation = state.next_gossip_task_generation();
+        let p1_state = Arc::clone(&state);
+        let p1_ecosystem = Arc::clone(&ecosystem);
+        let p1_uri = uri.clone();
+        let p1 =
+            tokio::spawn(
+                async move { run_gossip_prefetch(p1_uri, p1_state, p1_ecosystem, 5).await },
+            );
+        state
+            .track_gossip_task(uri.clone(), p1_generation, p1.abort_handle())
+            .await;
+
+        // Let P1 start (and claim its in-flight names) before P2 supersedes it.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // P2: a superseding registration racing P1's still-in-flight fetch.
+        let p2_generation = state.next_gossip_task_generation();
+        let p2 = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        state
+            .track_gossip_task(uri.clone(), p2_generation, p2.abort_handle())
+            .await;
+
+        let changed = p1.await.expect("P1 must not panic or be aborted");
+        assert!(
+            changed,
+            "P1 must still complete and report a merged change despite P2 superseding it"
+        );
+
+        let doc = state.get_document(&uri).expect("document must still exist");
+        assert!(
+            doc.signals
+                .gossip_findings
+                .contains_key(&PackageName::new("vite")),
+            "P1's findings must be merged despite P2 superseding it mid-fetch"
+        );
     }
 }

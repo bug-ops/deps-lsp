@@ -1883,39 +1883,13 @@ impl HttpCache {
     /// status, `DepsError::RegistryError` if the request fails, or
     /// `DepsError::ResponseTooLarge` if the response body exceeds the
     /// configured size cap.
-    #[tracing::instrument(
-        skip(self, body),
-        fields(url = %RedactedUrl::new(url))
-    )]
     pub async fn post_json<T: Serialize + Sync + ?Sized>(
         &self,
         url: &str,
         body: &T,
     ) -> Result<Bytes> {
-        self.ensure_online(url)?;
-        ensure_https(url)?;
-
-        let response = self
-            .baseline
-            .client
-            .post(url)
-            .json(body)
-            .send()
+        self.post_json_via(url, body, BodyLimit::DEFAULT, &self.baseline.client)
             .await
-            .map_err(|e| DepsError::RegistryError {
-                package: RedactedUrl::new(url),
-                source: e.into(),
-            })?;
-
-        if !response.status().is_success() {
-            return Err(http_status_error(
-                url,
-                response.status(),
-                response.headers(),
-            ));
-        }
-
-        read_body_capped(url, response, BodyLimit::DEFAULT).await
     }
 
     /// Same as [`Self::post_json`], but additionally takes an explicit [`BodyLimit`]
@@ -1941,20 +1915,44 @@ impl HttpCache {
         limit: BodyLimit,
         trusted_origin: &str,
     ) -> Result<Bytes> {
+        let transport = self.transport_for_origin(trusted_origin);
+        self.post_json_via(url, body, limit, &transport.client)
+            .await
+    }
+
+    /// Shared POST body for [`Self::post_json`] and [`Self::post_json_limited_trusted_origin`]
+    /// — mirrors [`Self::transport_only_via`]'s role on the GET path exactly: both public POST
+    /// methods differ only in which `client` (origin-pinned or not) and [`BodyLimit`] they pass
+    /// in, so this is the single place that sends the request, checks the status, and reads the
+    /// capped body.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::post_json`].
+    #[tracing::instrument(
+        skip(self, body, client),
+        fields(url = %RedactedUrl::new(url))
+    )]
+    async fn post_json_via<T: Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+        limit: BodyLimit,
+        client: &Client,
+    ) -> Result<Bytes> {
         self.ensure_online(url)?;
         ensure_https(url)?;
 
-        let transport = self.transport_for_origin(trusted_origin);
-        let response = transport
-            .client
-            .post(url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| DepsError::RegistryError {
-                package: RedactedUrl::new(url),
-                source: e.into(),
-            })?;
+        let response =
+            client
+                .post(url)
+                .json(body)
+                .send()
+                .await
+                .map_err(|e| DepsError::RegistryError {
+                    package: RedactedUrl::new(url),
+                    source: e.into(),
+                })?;
 
         if !response.status().is_success() {
             return Err(http_status_error(
