@@ -583,6 +583,10 @@ mod tests {
         assert_eq!(signals.typosquat_checked_names, checked_before);
     }
 
+    // `ResolvedGeneration::is_initial` is itself gated on `feature = "cargo"` (see its own doc
+    // comment) since every call site was a cargo-fixture test; mirror that gate here or a
+    // `--no-default-features` build (the CI feature-matrix `baseline` job) fails to compile.
+    #[cfg(feature = "cargo")]
     #[test]
     fn default_generation_starts_at_initial() {
         assert!(
