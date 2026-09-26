@@ -8,29 +8,9 @@ use deps_core::VersionReq;
 use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_semver_requirement,
     requirement_contains_template_placeholder, warn_rejected_value,
 };
-
-/// Precise semver `VersionReq` matcher, compiled once per dependency by
-/// [`SwiftFormatter::compile_requirement`] — the same crate `version_satisfies_requirement`
-/// uses, but with the compile step (and its failure) split out from the per-candidate check.
-struct SemverMatcher(semver::VersionReq);
-
-impl RequirementMatcher for SemverMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        semver::Version::parse(version)
-            .ok()
-            .map(|v| self.0.matches(&v))
-    }
-
-    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
-    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
-    fn strict_prerelease_exclusion(&self) -> bool {
-        true
-    }
-}
 
 use crate::types::SwiftDependency;
 
@@ -177,12 +157,13 @@ impl RequirementResolution for SwiftFormatter {
         req.matches(&ver)
     }
 
-    /// Compiles `requirement` via `semver::VersionReq`, the same crate
-    /// `version_satisfies_requirement` uses. `None` on parse failure is the fallible-parse
-    /// shape of `compile_requirement`'s "undecidable" contract (see
-    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`]) — Swift's registry client follows GitHub
-    /// tags pagination to build `available`, so a `None` here is purely "this requirement
-    /// string doesn't parse as semver," not a gap in what pagination could return.
+    /// Delegates to [`compile_semver_requirement`] — the same `semver::VersionReq` crate
+    /// `version_satisfies_requirement` uses, shared with `deps-cargo` (#1495). `None` on parse
+    /// failure is the fallible-parse shape of `compile_requirement`'s "undecidable" contract
+    /// (see [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`]) — Swift's
+    /// registry client follows GitHub tags pagination to build `available`, so a `None` here is
+    /// purely "this requirement string doesn't parse as semver," not a gap in what pagination
+    /// could return.
     ///
     /// #1354: an unresolved interpolation (see [`Self::requirement_is_unresolved`]) is
     /// checked explicitly first rather than relying on `semver::VersionReq::parse` to keep
@@ -192,11 +173,7 @@ impl RequirementResolution for SwiftFormatter {
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
-        requirement
-            .as_str()
-            .parse::<semver::VersionReq>()
-            .ok()
-            .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+        compile_semver_requirement(requirement)
     }
 
     /// #1354: an unexpanded Swift string-interpolation placeholder (`\(...)`) inside a

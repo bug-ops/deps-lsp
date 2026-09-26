@@ -529,21 +529,6 @@ mod tests {
     /// (issue #649 critic finding C1).
     struct CaretFormatter;
 
-    struct SemverMatcher(semver::VersionReq);
-    impl crate::lsp_helpers::RequirementMatcher for SemverMatcher {
-        fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-            version
-                .as_str()
-                .parse::<semver::Version>()
-                .ok()
-                .map(|v| self.0.matches(&v))
-        }
-
-        fn strict_prerelease_exclusion(&self) -> bool {
-            false
-        }
-    }
-
     impl crate::lsp_helpers::PackageNaming for CaretFormatter {}
     impl crate::lsp_helpers::PackageRendering for CaretFormatter {
         fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
@@ -558,13 +543,9 @@ mod tests {
             &self,
             requirement: &crate::VersionReq,
         ) -> Option<Box<dyn crate::lsp_helpers::RequirementMatcher>> {
-            requirement
-                .as_str()
-                .parse::<semver::VersionReq>()
-                .ok()
-                .map(|req| {
-                    Box::new(SemverMatcher(req)) as Box<dyn crate::lsp_helpers::RequirementMatcher>
-                })
+            // Flips strict_prerelease_exclusion() from this module's old local matcher's
+            // `false` to `true` — inert here, since nothing in this test module reads that flag.
+            crate::lsp_helpers::compile_semver_requirement(requirement)
         }
     }
     impl crate::lsp_helpers::DiagnosticMessages for CaretFormatter {}

@@ -11,6 +11,7 @@ use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
     GossipFindings, LicenseSource, PackageName, PublishTime, RemovalStatus, TyposquatSignal,
+    VersionReq,
 };
 
 #[cfg(feature = "lsp-responses")]
@@ -2073,11 +2074,13 @@ pub trait RequirementMatcher: Send + Sync {
     /// No default: a new matcher type must decide this explicitly rather than silently
     /// inheriting `false` by omission (#1478) — the whole point of moving this property off a
     /// per-formatter flag and onto the matcher type is that the answer can no longer go
-    /// unconsidered. Return `true` only for a matcher whose underlying comparator
-    /// itself implements this exclusion (`deps-cargo`/`deps-swift`'s `semver::VersionReq`
-    /// wrapper, `deps-npm`'s shared `node_semver::Range` wrapper). Maven/NuGet/Composer/
-    /// Gradle/PyPI/Go/Bundler/Dart's own matchers use non-strict, ecosystem-specific range
-    /// models where this premise does not hold — they must return `false`.
+    /// unconsidered. Return `true` only for a matcher whose underlying comparator itself
+    /// implements this exclusion ([`compile_semver_requirement`]'s shared `semver::VersionReq`
+    /// wrapper, used by `deps-cargo` and `deps-swift`; `deps-npm`'s shared
+    /// `compile_node_semver_range`/`node_semver::Range` wrapper, used by `deps-npm` and
+    /// `deps-deno`). Maven/NuGet/Composer/Gradle/PyPI/Go/Bundler/Dart's own matchers use
+    /// non-strict, ecosystem-specific range models where this premise does not hold — they must
+    /// return `false`.
     ///
     /// # Examples
     ///
@@ -2099,6 +2102,115 @@ pub trait RequirementMatcher: Send + Sync {
     /// assert!(!NonStrictMatcher.strict_prerelease_exclusion());
     /// ```
     fn strict_prerelease_exclusion(&self) -> bool;
+}
+
+/// Parses `version` as [`semver::Version`] and tests it against `req`, `None` on parse failure.
+/// Shared by [`SemverReqMatcher::matches`] and the test-only `NonStrictSemverMatcher` in
+/// `diagnostics.rs` (identical logic, differing only in `strict_prerelease_exclusion()`).
+pub(crate) fn semver_req_matches(
+    req: &semver::VersionReq,
+    version: &ConcreteVersion,
+) -> Option<bool> {
+    version
+        .as_str()
+        .parse::<semver::Version>()
+        .ok()
+        .map(|v| req.matches(&v))
+}
+
+/// Precise [`semver::VersionReq`] matcher, constructed only through [`compile_semver_requirement`].
+/// Named to avoid shadowing the public `crate::version_matcher::SemverMatcher`.
+struct SemverReqMatcher(semver::VersionReq);
+
+impl RequirementMatcher for SemverReqMatcher {
+    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+        semver_req_matches(&self.0, version)
+    }
+
+    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins to
+    /// the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
+    /// Declared once, here, on the matcher type itself: any formatter that reuses
+    /// [`compile_semver_requirement`] (`deps-cargo`'s `CargoFormatter`, `deps-swift`'s
+    /// `SwiftFormatter`) inherits this answer for free, with no separate per-formatter flag to
+    /// keep in sync (#1478, #1495).
+    fn strict_prerelease_exclusion(&self) -> bool {
+        true
+    }
+}
+
+/// Compiles `requirement` as a plain [`semver::VersionReq`], the range grammar Cargo's registry
+/// and Swift Package Manager's `from:`/closed-range/`upToNextMajor` translations both use for
+/// matching.
+///
+/// The single source of truth for `deps-cargo`'s `CargoFormatter::compile_requirement` and
+/// `deps-swift`'s `SwiftFormatter::compile_requirement` (#1495) — mirroring how #1478 unified
+/// the analogous `node_semver::Range` case into `deps_npm::compile_node_semver_range`.
+///
+/// Unlike that npm/JSR case, this function has no built-in unresolved-placeholder guard: Cargo
+/// and Swift's [`formatter::RequirementResolution::requirement_is_unresolved`] overrides
+/// diverge (Swift additionally rejects its own native `\(...)` string-interpolation syntax), so
+/// each formatter must run its own `self.requirement_is_unresolved(requirement)` guard before
+/// calling this function, rather than the guard being hardcoded here.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{RequirementMatcher, compile_semver_requirement};
+/// use deps_core::{ConcreteVersion, VersionReq};
+///
+/// let matcher = compile_semver_requirement(&VersionReq::new("^1.0.0")).unwrap();
+/// assert_eq!(matcher.matches(&ConcreteVersion::new("1.5.0")), Some(true));
+/// assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
+/// assert!(matcher.strict_prerelease_exclusion());
+///
+/// assert!(compile_semver_requirement(&VersionReq::new("not a semver req")).is_none());
+/// ```
+pub fn compile_semver_requirement(requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    requirement
+        .as_str()
+        .parse::<semver::VersionReq>()
+        .ok()
+        .map(|req| Box::new(SemverReqMatcher(req)) as Box<dyn RequirementMatcher>)
+}
+
+#[cfg(test)]
+mod semver_req_matcher_tests {
+    use super::compile_semver_requirement;
+    use crate::{ConcreteVersion, VersionReq};
+
+    /// #299/#1495: `semver::VersionReq::matches` itself excludes a pre-release candidate unless
+    /// the requirement pins to that exact `X.Y.Z` tuple with a pre-release tag — this is the
+    /// actual behavior `strict_prerelease_exclusion() == true` promises callers, not just a flag
+    /// value. `1.5.0-alpha.1` falls inside `>=1.0.0, <2.0.0`'s stable range but must still be
+    /// rejected, since the requirement never pins to `1.5.0` specifically.
+    #[test]
+    fn matches_rejects_prerelease_candidate_not_pinned_by_requirement() {
+        let matcher = compile_semver_requirement(&VersionReq::new(">=1.0.0, <2.0.0"))
+            .expect("valid semver requirement must compile");
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.5.0")),
+            Some(true),
+            "a stable candidate in range must match"
+        );
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.5.0-alpha.1")),
+            Some(false),
+            "a pre-release candidate must be rejected unless the requirement pins to its exact \
+             X.Y.Z tuple with a pre-release tag"
+        );
+    }
+
+    /// The one documented exception: a requirement that itself pins to the same `X.Y.Z` tuple
+    /// with a pre-release tag does admit that exact pre-release.
+    #[test]
+    fn matches_accepts_prerelease_candidate_pinned_by_requirement() {
+        let matcher = compile_semver_requirement(&VersionReq::new("=1.5.0-alpha.1"))
+            .expect("valid semver requirement must compile");
+        assert_eq!(
+            matcher.matches(&ConcreteVersion::new("1.5.0-alpha.1")),
+            Some(true)
+        );
+    }
 }
 
 /// Whether `segment` is exactly `.` or `..`.
