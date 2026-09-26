@@ -14,71 +14,27 @@ use tower_lsp_server::ls_types::Uri;
 
 /// Preserves cached version data from old document state to new state.
 /// Called during document updates to avoid re-fetching versions for unchanged deps.
+///
+/// Every [`PackageSignals`](super::state::PackageSignals) field travels together, by a
+/// single `clone_from` on the whole sub-struct (issue #1477) — `DocumentState` is rebuilt
+/// from scratch on every edit, not mutated in place, so without this every per-package
+/// signal (cached/resolved versions, OSV results, yanked/deprecation/fetch-failure
+/// outcomes, licenses, typosquat/GOSSIP findings, and the resolved-versions generation
+/// counter that guards `run_osv_phase_b_and_commit`'s staleness check) would flicker off,
+/// reset, or desync from what it guards on every keystroke, until each background
+/// pre-fetch/rescan happened to repopulate it again (issues #649, #660, #1395, #1437,
+/// #1456, #267).
 pub(crate) fn preserve_cache(new_state: &mut DocumentState, old_state: &DocumentState) {
     tracing::trace!(
-        cached = old_state.cached_versions.len(),
-        resolved = old_state.resolved_versions.len(),
-        vulnerabilities = old_state.vulnerabilities.len(),
-        outcomes_yanked = old_state.outcomes.yanked_count(),
-        outcomes_deprecated = old_state.outcomes.deprecation_count(),
-        outcomes_fetch_failed = old_state.outcomes.fetch_failure_count(),
+        cached = old_state.signals.cached_versions.len(),
+        resolved = old_state.signals.resolved_versions.len(),
+        vulnerabilities = old_state.signals.vulnerabilities.len(),
+        outcomes_yanked = old_state.signals.outcomes.yanked_count(),
+        outcomes_deprecated = old_state.signals.outcomes.deprecation_count(),
+        outcomes_fetch_failed = old_state.signals.outcomes.fetch_failure_count(),
         "preserving version cache"
     );
-    new_state
-        .cached_versions
-        .clone_from(&old_state.cached_versions);
-    new_state
-        .resolved_versions
-        .clone_from(&old_state.resolved_versions);
-    // Must travel with `resolved_versions` (issue #649 critic S1): a per-occurrence
-    // resolution that only preserved the collapsed map while resetting this sibling to
-    // empty would silently reintroduce the mis-attribution bug for the ~100ms debounce +
-    // lockfile-reload window on every keystroke, since `resolve_occurrence_version` only
-    // consults the candidates map when it is populated.
-    new_state
-        .resolved_version_candidates
-        .clone_from(&old_state.resolved_version_candidates);
-    // Must also travel with `resolved_versions` (issue #1395 bidirectional-race finding):
-    // `resolved_versions_generation` is a per-document epoch counter guarding
-    // `run_osv_phase_b_and_commit`'s staleness check — resetting it to 0 on every
-    // keystroke-triggered rebuild (DocumentState is rebuilt on every change, not mutated
-    // in place) would desync it from the `resolved_versions` value it's meant to guard,
-    // letting an in-flight scan's stale generation snapshot coincidentally match the
-    // freshly-reset counter and commit over newer data, or a fresh scan's post-bump
-    // generation collide with an unrelated earlier scan's snapshot.
-    new_state.resolved_versions_generation = old_state.resolved_versions_generation;
-    // DocumentState is rebuilt on every change, so without this the OSV scan
-    // result would be wiped on every keystroke — `run_osv_scan` overwrites it
-    // once the (cheap, cache-backed) rescan completes, see §4.
-    new_state
-        .vulnerabilities
-        .clone_from(&old_state.vulnerabilities);
-    // Same rationale as `vulnerabilities` above — without this the yanked/deprecation/
-    // fetch-failure diagnostics would flicker off on every keystroke until the next fetch
-    // (or, for a registry-outage package, flip back to a misleading "Unknown package"
-    // diagnostic until the next fetch cycle re-populates it, #267).
-    new_state.outcomes.clone_from(&old_state.outcomes);
-    // Same rationale again (issue #660): without this, a tier-3 ecosystem's hover
-    // license would flicker off on every keystroke until `run_license_prefetch`'s next
-    // background pass re-populates it.
-    new_state.licenses.clone_from(&old_state.licenses);
-    // Same rationale again (issue #1437): without this, the typosquat diagnostic would
-    // flicker off on every keystroke until `run_typosquat_prefetch`'s next background pass
-    // re-populates it.
-    new_state.typosquats.clone_from(&old_state.typosquats);
-    // Issue #1455 critic S1: must travel with `typosquats` — without this, every rebuilt
-    // `DocumentState` would reset to an empty "last checked" set, making the debounced-edit
-    // gate see every edit as a name change and re-spawn a pre-fetch on every keystroke,
-    // defeating the gate entirely.
-    new_state
-        .typosquat_checked_names
-        .clone_from(&old_state.typosquat_checked_names);
-    // Same rationale again (issue #1456, spec 072): without this, hover's cooldown
-    // callout and diagnostics' GOSSIP-attributed message would flicker off on every
-    // keystroke until `document::gossip_prefetch`'s next background pass re-populates it.
-    new_state
-        .gossip_findings
-        .clone_from(&old_state.gossip_findings);
+    new_state.signals.clone_from(&old_state.signals);
 }
 
 /// Drops previously cached version and fetch-failure data ahead of a forced re-fetch
@@ -108,10 +64,10 @@ pub(crate) fn drop_cache_for_forced_refetch(
     deps_to_fetch: &[PackageName],
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) {
-    doc.cached_versions.clear();
-    doc.outcomes.clear_all_fetch_failures();
+    doc.signals.cached_versions.clear();
+    doc.signals.outcomes.clear_all_fetch_failures();
     for name in deps_to_fetch {
-        doc.outcomes.set_fetch_failure_if_absent(
+        doc.signals.outcomes.set_fetch_failure_if_absent(
             formatter.normalize_package_name(name),
             FetchFailure::NotAttempted,
         );
@@ -220,11 +176,11 @@ impl DependencyDiff {
 /// per-requirement-disambiguated selection moves.
 ///
 /// `old_resolved`/`old_candidates` and `new_resolved`/`new_candidates` are a document's
-/// [`super::state::DocumentState::resolved_versions`]/[`super::state::DocumentState::resolved_version_candidates`]
+/// [`super::state::PackageSignals::resolved_versions`]/[`super::state::PackageSignals::resolved_version_candidates`]
 /// before and after [`super::state::DocumentState::update_resolved_versions`].
 ///
 /// The returned names are also what [`reload_resolved_versions`] evicts from
-/// [`super::state::DocumentState::licenses`] (issue #1424): a dependency whose in-use version
+/// [`super::state::PackageSignals::licenses`] (issue #1424): a dependency whose in-use version
 /// just moved can no longer vouch for its previously cached license.
 pub(crate) fn resolved_versions_changed(
     deps: &[&dyn Dependency],
@@ -292,7 +248,7 @@ pub(crate) fn resolved_versions_changed(
 /// `server::handle_lockfile_change`'s critic M4 "Known limitation" comment for the same class
 /// of tolerated staleness), never violate that invariant.
 ///
-/// Also evicts [`super::state::DocumentState::licenses`] for every dependency whose in-use
+/// Also evicts [`super::state::PackageSignals::licenses`] for every dependency whose in-use
 /// version moved, but only for an ecosystem whose
 /// <code>ecosystem.[license_source](deps_core::Ecosystem::license_source)().[requires_dedicated_fetch](deps_core::LicenseSource::requires_dedicated_fetch)()</code>
 /// is `true` (issue #1424, resolving the prior `TODO(critic)` on
@@ -319,8 +275,8 @@ pub(crate) fn reload_resolved_versions(
                 let deps = parse_result.dependencies();
                 resolved_versions_changed(
                     &deps,
-                    &doc.resolved_versions,
-                    &doc.resolved_version_candidates,
+                    &doc.signals.resolved_versions,
+                    &doc.signals.resolved_version_candidates,
                     resolved_versions,
                     resolved_version_candidates,
                     ecosystem.formatter(),
@@ -393,20 +349,24 @@ tokio = "1.0"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.cached_versions
+                doc.signals
+                    .cached_versions
                     .insert("serde".into(), PackageVersions::latest_only("1.0.210"));
-                doc.cached_versions
+                doc.signals
+                    .cached_versions
                     .insert("tokio".into(), PackageVersions::latest_only("1.40.0"));
-                doc.resolved_versions
+                doc.signals
+                    .resolved_versions
                     .insert("serde".into(), "1.0.195".into());
-                doc.resolved_versions
+                doc.signals
+                    .resolved_versions
                     .insert("tokio".into(), "1.35.0".into());
             }
 
             {
                 let doc = state.get_document(&uri).unwrap();
-                assert_eq!(doc.cached_versions.len(), 2);
-                assert_eq!(doc.resolved_versions.len(), 2);
+                assert_eq!(doc.signals.cached_versions.len(), 2);
+                assert_eq!(doc.signals.resolved_versions.len(), 2);
             }
 
             let content2 = r#"[dependencies]
@@ -430,22 +390,28 @@ tokio = "1.0"
             {
                 let doc = state.get_document(&uri).unwrap();
                 assert_eq!(
-                    doc.cached_versions.len(),
+                    doc.signals.cached_versions.len(),
                     2,
                     "Cached versions should be preserved"
                 );
                 assert_eq!(
-                    doc.cached_versions.get("serde").map(|v| v.latest.as_str()),
+                    doc.signals
+                        .cached_versions
+                        .get("serde")
+                        .map(|v| v.latest.as_str()),
                     Some("1.0.210"),
                     "serde cache preserved"
                 );
                 assert_eq!(
-                    doc.cached_versions.get("tokio").map(|v| v.latest.as_str()),
+                    doc.signals
+                        .cached_versions
+                        .get("tokio")
+                        .map(|v| v.latest.as_str()),
                     Some("1.40.0"),
                     "tokio cache preserved"
                 );
                 assert_eq!(
-                    doc.resolved_versions.len(),
+                    doc.signals.resolved_versions.len(),
                     2,
                     "Resolved versions should be preserved"
                 );
@@ -485,9 +451,11 @@ serde_old = { package = "serde", version = "0.9" }
             // Manually populate the candidates map (simulating a completed lockfile load).
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.resolved_versions
+                doc.signals
+                    .resolved_versions
                     .insert("serde".into(), "1.0.219".into());
-                doc.resolved_version_candidates
+                doc.signals
+                    .resolved_version_candidates
                     .insert("serde".into(), vec!["0.9.15".into(), "1.0.219".into()]);
             }
 
@@ -509,7 +477,7 @@ serde_old = { package = "serde", version = "0.9" }
             }
 
             assert_eq!(
-                doc_state2.resolved_version_candidates.get("serde"),
+                doc_state2.signals.resolved_version_candidates.get("serde"),
                 Some(&vec![
                     ConcreteVersion::from("0.9.15"),
                     ConcreteVersion::from("1.0.219")
@@ -554,7 +522,7 @@ serde = "1.0"
                     HashMap::new(),
                     state.next_resolved_versions_generation(),
                 );
-                doc.resolved_versions_generation
+                doc.signals.resolved_versions_generation
             };
             assert!(
                 !generation_before.is_initial(),
@@ -578,7 +546,7 @@ serde = "1.0"
             }
 
             assert_eq!(
-                doc_state2.resolved_versions_generation, generation_before,
+                doc_state2.signals.resolved_versions_generation, generation_before,
                 "resolved_versions_generation must survive preserve_cache alongside \
                  resolved_versions, not reset to 0 on every rebuild"
             );
@@ -637,7 +605,8 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
-                doc.vulnerabilities
+                doc.signals
+                    .vulnerabilities
                     .get(&deps_core::test_util::vuln_key("time")),
                 Some(ScanOutcome::Clean)
             );
@@ -695,7 +664,7 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.outcomes.yanked("time"),
+                doc.signals.outcomes.yanked("time"),
                 Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }
@@ -755,7 +724,7 @@ time = "0.1.43"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.outcomes.deprecation("time"),
+                doc.signals.outcomes.deprecation("time"),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -825,6 +794,7 @@ serde = "1.0"
             let formatter = ecosystem.formatter();
             for removed_dep in &diff.removed {
                 doc_state2
+                    .signals
                     .outcomes
                     .remove(&formatter.normalize_package_name(removed_dep));
             }
@@ -833,7 +803,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.outcomes.deprecation("time").is_none(),
+                doc.signals.outcomes.deprecation("time").is_none(),
                 "removed dependency's deprecation entry must be pruned"
             );
         }
@@ -868,9 +838,11 @@ serde_old = { package = "serde", version = "0.9" }
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.resolved_versions
+                doc.signals
+                    .resolved_versions
                     .insert("serde".into(), "1.0.219".into());
-                doc.resolved_version_candidates
+                doc.signals
+                    .resolved_version_candidates
                     .insert("serde".into(), vec!["0.9.15".into(), "1.0.219".into()]);
             }
 
@@ -894,13 +866,19 @@ serde_old = { package = "serde", version = "0.9" }
                 preserve_cache(&mut doc_state2, &old_doc);
             }
             for removed_dep in &diff.removed {
-                doc_state2.cached_versions.remove(removed_dep);
-                doc_state2.resolved_versions.remove(removed_dep);
-                doc_state2.resolved_version_candidates.remove(removed_dep);
+                doc_state2.signals.cached_versions.remove(removed_dep);
+                doc_state2.signals.resolved_versions.remove(removed_dep);
+                doc_state2
+                    .signals
+                    .resolved_version_candidates
+                    .remove(removed_dep);
             }
 
             assert!(
-                !doc_state2.resolved_version_candidates.contains_key("serde"),
+                !doc_state2
+                    .signals
+                    .resolved_version_candidates
+                    .contains_key("serde"),
                 "removed dependency's candidates entry must be pruned"
             );
         }
@@ -963,17 +941,17 @@ time = "0.1.43"
             if let Some(old_doc) = state.get_document(&uri) {
                 preserve_cache(&mut doc_state2, &old_doc);
             }
-            doc_state2.outcomes.clear_yanked("time");
+            doc_state2.signals.outcomes.clear_yanked("time");
 
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.outcomes.yanked("time").is_none(),
+                doc.signals.outcomes.yanked("time").is_none(),
                 "the stale version-level yanked finding must be dropped"
             );
             assert_eq!(
-                doc.outcomes.deprecation("time"),
+                doc.signals.outcomes.deprecation("time"),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -1061,23 +1039,23 @@ time = "0.1.43"
             let formatter = ecosystem.formatter();
             for changed_dep in &diff.version_changed {
                 let normalized = formatter.normalize_package_name(changed_dep);
-                doc_state2.outcomes.clear_yanked(&normalized);
-                doc_state2.outcomes.clear_fetch_failure(&normalized);
+                doc_state2.signals.outcomes.clear_yanked(&normalized);
+                doc_state2.signals.outcomes.clear_fetch_failure(&normalized);
             }
 
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.outcomes.yanked("time").is_none(),
+                doc.signals.outcomes.yanked("time").is_none(),
                 "the stale version-level yanked finding must be dropped"
             );
             assert!(
-                doc.outcomes.fetch_failure("time").is_none(),
+                doc.signals.outcomes.fetch_failure("time").is_none(),
                 "the stale fetch-failure finding must be dropped"
             );
             assert_eq!(
-                doc.outcomes.deprecation("time"),
+                doc.signals.outcomes.deprecation("time"),
                 Some(&Deprecation {
                     reason: Some("archived".to_string()),
                     replacement: None,
@@ -1145,6 +1123,7 @@ serde = "1.0"
             let formatter = ecosystem.formatter();
             for removed_dep in &diff.removed {
                 doc_state2
+                    .signals
                     .outcomes
                     .remove(&formatter.normalize_package_name(removed_dep));
             }
@@ -1153,7 +1132,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.outcomes.yanked("time").is_none(),
+                doc.signals.outcomes.yanked("time").is_none(),
                 "removed dependency's yanked entry must be pruned"
             );
         }
@@ -1234,6 +1213,7 @@ time = "=0.1.44"
             let formatter = ecosystem.formatter();
             for changed_dep in &diff.version_changed {
                 doc_state2
+                    .signals
                     .outcomes
                     .clear_yanked(&formatter.normalize_package_name(changed_dep));
             }
@@ -1242,7 +1222,7 @@ time = "=0.1.44"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.outcomes.yanked("time").is_none(),
+                doc.signals.outcomes.yanked("time").is_none(),
                 "stale yanked entry against the OLD version must not survive an in-place edit"
             );
         }
@@ -1309,13 +1289,14 @@ serde = "1.0"
             // carries `fetch_failed` across the edit, not just the final
             // (already-pruned) state below.
             assert!(
-                doc_state2.outcomes.fetch_failure("time").is_some(),
+                doc_state2.signals.outcomes.fetch_failure("time").is_some(),
                 "preserve_cache must carry fetch_failed across an edit"
             );
 
             let formatter = ecosystem.formatter();
             for removed_dep in &diff.removed {
                 doc_state2
+                    .signals
                     .outcomes
                     .remove(&formatter.normalize_package_name(removed_dep));
             }
@@ -1324,7 +1305,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.outcomes.fetch_failure("time").is_none(),
+                doc.signals.outcomes.fetch_failure("time").is_none(),
                 "removed dependency's fetch_failed entry must be pruned"
             );
         }
@@ -1419,7 +1400,7 @@ time = "0.1.43"
             // lockfile in the meantime, nothing here would know.
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.outcomes.yanked("time"),
+                doc.signals.outcomes.yanked("time"),
                 Some(&(ConcreteVersion::new("0.1.43"), RemovalStatus::Yanked))
             );
         }
@@ -1450,7 +1431,7 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.cached_versions.len(),
+                doc.signals.cached_versions.len(),
                 0,
                 "First open should have empty cache"
             );
@@ -1482,7 +1463,8 @@ serde = "1.0"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.cached_versions
+                doc.signals
+                    .cached_versions
                     .insert("serde".into(), PackageVersions::latest_only("1.0.210"));
             }
 
@@ -1507,12 +1489,15 @@ serde = "1.0"
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.cached_versions.len(),
+                doc.signals.cached_versions.len(),
                 1,
                 "Cache should be preserved on parse failure"
             );
             assert_eq!(
-                doc.cached_versions.get("serde").map(|v| v.latest.as_str()),
+                doc.signals
+                    .cached_versions
+                    .get("serde")
+                    .map(|v| v.latest.as_str()),
                 Some("1.0.210")
             );
         }
@@ -1865,15 +1850,15 @@ anyhow = "1.0"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.cached_versions.insert(
+                doc.signals.cached_versions.insert(
                     PackageName::new("serde"),
                     PackageVersions::latest_only("1.0.210"),
                 );
-                doc.cached_versions.insert(
+                doc.signals.cached_versions.insert(
                     PackageName::new("tokio"),
                     PackageVersions::latest_only("1.40.0"),
                 );
-                doc.cached_versions.insert(
+                doc.signals.cached_versions.insert(
                     PackageName::new("anyhow"),
                     PackageVersions::latest_only("1.0.89"),
                 );
@@ -1907,24 +1892,24 @@ tokio = "1.0"
             }
 
             for removed_dep in &diff.removed {
-                doc_state2.cached_versions.remove(removed_dep);
+                doc_state2.signals.cached_versions.remove(removed_dep);
             }
 
             state.update_document(uri.clone(), doc_state2);
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.cached_versions.len(),
+                doc.signals.cached_versions.len(),
                 2,
                 "anyhow should be removed from cache"
             );
-            assert!(doc.cached_versions.contains_key("serde"));
-            assert!(doc.cached_versions.contains_key("tokio"));
-            assert!(!doc.cached_versions.contains_key("anyhow"));
+            assert!(doc.signals.cached_versions.contains_key("serde"));
+            assert!(doc.signals.cached_versions.contains_key("tokio"));
+            assert!(!doc.signals.cached_versions.contains_key("anyhow"));
         }
 
         /// Issue #1424 (impl-critic round 2, S1): for a `RegistryDeclaredSpdx` ecosystem
-        /// (Cargo), a resolved-version move must NOT evict `DocumentState::licenses` — that
+        /// (Cargo), a resolved-version move must NOT evict `PackageSignals::licenses` — that
         /// license source is the registry's latest-matching pick, not tied to the resolved
         /// version, and is never re-fetched on a lock-file-only reload, so evicting it here
         /// would just delete valid, still-displayable data with nothing to repopulate it.
@@ -1953,7 +1938,8 @@ time = "0.1"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.resolved_versions
+                doc.signals
+                    .resolved_versions
                     .insert(PackageName::new("time"), ConcreteVersion::from("0.1.43"));
                 doc.merge_licenses(HashMap::from([(
                     PackageName::new("time"),
@@ -1978,7 +1964,7 @@ time = "0.1"
             assert!(changed, "the version move must be detected");
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.licenses.contains_key(&PackageName::new("time")),
+                doc.signals.licenses.contains_key(&PackageName::new("time")),
                 "Cargo's registry-declared license must survive a resolved-version move, \
                  since it isn't tied to the resolved version and nothing would repopulate \
                  it if evicted here"
@@ -1986,7 +1972,7 @@ time = "0.1"
         }
 
         /// Issue #1424 (impl-critic round 2, S1): for a tier-3, dedicated-fetch ecosystem
-        /// (Dart), a resolved-version move must evict `DocumentState::licenses` for the
+        /// (Dart), a resolved-version move must evict `PackageSignals::licenses` for the
         /// moved dependency, not leave it under its (unversioned) name key — otherwise a
         /// subsequent license re-fetch that fails this round would leave the *previous*
         /// version's license visibly misattributed to the new one (the prior
@@ -2015,7 +2001,8 @@ time = "0.1"
 
             {
                 let mut doc = state.documents.get_mut(&uri).unwrap();
-                doc.resolved_versions
+                doc.signals
+                    .resolved_versions
                     .insert(PackageName::new("http"), ConcreteVersion::from("1.2.0"));
                 doc.merge_licenses(HashMap::from([(
                     PackageName::new("http"),
@@ -2043,7 +2030,7 @@ time = "0.1"
             assert!(changed, "the version move must be detected");
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                !doc.licenses.contains_key(&PackageName::new("http")),
+                !doc.signals.licenses.contains_key(&PackageName::new("http")),
                 "a moved dependency's stale license must be evicted for a tier-3 \
                  (dedicated-fetch) ecosystem, not left misattributed to its new resolved \
                  version"

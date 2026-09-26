@@ -16,6 +16,11 @@ use tower_lsp_server::Client;
 use tower_lsp_server::ls_types::Uri;
 use tracing::Instrument;
 
+mod signals;
+
+pub use signals::PackageSignals;
+pub(crate) use signals::PrefetchVisibility;
+
 /// Upper bound on how long a server-to-client request is allowed to wait for a
 /// reply before being abandoned (issue #493). Used both for the detached
 /// `workspace/*/refresh` requests below (S2: without it, a client that declares
@@ -44,7 +49,7 @@ const FETCH_PERMITS: usize = 4;
 
 pub use deps_core::LoadingState;
 
-/// Opaque, server-global generation token for [`DocumentState::resolved_versions_generation`]
+/// Opaque, server-global generation token for [`PackageSignals::resolved_versions_generation`]
 /// (issue #1398). Its only constructor is [`ServerState::next_resolved_versions_generation`] —
 /// unlike the `u64` it replaces, there is no public or `pub(crate)` way to mint an arbitrary
 /// value, so a call site can no longer pass a literal stand-in (e.g. `1`) that silently defeats
@@ -107,7 +112,7 @@ impl ResolvedGeneration {
 ///     "[dependencies]\nserde = \"1.0\"".into(),
 /// );
 ///
-/// assert!(state.cached_versions.is_empty());
+/// assert!(state.signals.cached_versions.is_empty());
 /// ```
 ///
 /// `#[non_exhaustive]` (issue #854): most fields here are `pub` (needed so handlers across
@@ -121,6 +126,7 @@ impl ResolvedGeneration {
 /// postdate the struct's original shape) so a hypothetical future fully-public version should
 /// not be exhaustively constructed either.
 #[non_exhaustive]
+#[derive(Clone)]
 pub struct DocumentState {
     /// Package ecosystem identifier, exhaustively typed.
     pub ecosystem: EcosystemId,
@@ -129,125 +135,16 @@ pub struct DocumentState {
     /// Parsed result as trait object, wrapped in `Arc` (rather than `Box`) so
     /// [`Self::parse_result_arc`] can hand a caller a cheap owned clone — letting it
     /// release the DashMap shard `Ref` before an `.await` on a registry-bound
-    /// `generate_*` call without deep-cloning ecosystem-specific parse data (#319).
+    /// `generate_*` call without deep-cloning ecosystem-specific parse data (#319). This is
+    /// also why `#[derive(Clone)]` on `DocumentState` itself stays cheap for this field — a
+    /// refcount bump, not a deep copy — despite `DocumentState` being rebuilt (and cloned via
+    /// `preserve_cache`/`ServerState::get_document_clone`) on every document edit. A future
+    /// field added to this struct should keep the same property in mind.
     parse_result: Option<Arc<dyn ParseResult>>,
-    /// Latest known version and full version list per package, fetched together in a
-    /// single registry round trip (see [`PackageVersions`]).
-    pub cached_versions: HashMap<PackageName, PackageVersions>,
-    /// Resolved versions from lock file
-    pub resolved_versions: HashMap<PackageName, ConcreteVersion>,
-    /// Every lock-file-resolved version for a package name with more than one retained
-    /// entry (issue #649), built alongside [`Self::resolved_versions`] by the same lock
-    /// file load. Additive: only names with more than one occurrence get an entry here —
-    /// see [`deps_core::VersionData::resolved_version_candidates`] for the per-occurrence
-    /// disambiguation this enables.
-    pub resolved_version_candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
-    /// Set by every [`Self::update_resolved_versions`] call (issue #1395 critic S3):
-    /// distinguishes two resolved-version snapshots taken at the same [`Self::content`]
-    /// (a lock-file-only reload never changes `content`, so that guard alone cannot order
-    /// two OSV phase-A/B pairs that raced on which one saw the fresher resolved versions).
-    /// [`super::osv_scan::run_osv_scan_phase_a`] snapshots this alongside `content` when it
-    /// builds scan targets, and [`super::osv_scan::run_osv_phase_b_and_commit`]'s staleness
-    /// guard requires an exact match on both before committing. Always drawn from
-    /// `ServerState::next_resolved_versions_generation` (issue #1395 critic M10), never
-    /// incremented from this field's own prior value — see that method's doc for why a
-    /// per-document-instance counter is unsafe across a `did_close`/reopen.
-    pub(crate) resolved_versions_generation: ResolvedGeneration,
-    /// OSV.dev scan results, keyed by normalized package name. Empty until
-    /// the first background scan completes; carried across document edits
-    /// by `preserve_cache` so it is not wiped on every keystroke.
-    pub vulnerabilities: VulnerabilityMap,
-    /// Yanked, deprecation, and fetch-failure findings from the lifecycle's registry
-    /// fetch, keyed by **normalized** package name. This is deliberately a different
-    /// type from `FetchResult`'s raw-keyed triple: the split makes a forgotten
-    /// normalization at a store/merge site a compile error rather than a silent bug for
-    /// ecosystems where normalization changes the name (e.g. PyPI). See
-    /// [`DependencyOutcome`](deps_core::DependencyOutcome) for what each of the three
-    /// channels means. Empty until the first fetch completes; carried across document
-    /// edits by `preserve_cache` so it doesn't flicker off on every keystroke.
-    pub outcomes: DependencyOutcomes,
-    /// License data available *synchronously* for this document's dependencies (issue
-    /// #660/#661), keyed by raw (unnormalized) package name — the map #661's policy
-    /// diagnostics reads, since diagnostics generation is sync/cache-only by design and
-    /// cannot await hover's live per-request fetch. Two disjoint populating sources,
-    /// which can coexist safely because a document has exactly one ecosystem, so only
-    /// one of the two ever contributes real (non-empty) data for it:
-    /// - **Tier-1 backfill**: `document::fetch::merge_registry_fetch_result`, via
-    ///   [`Self::merge_licenses`], from `Version::license()` on the already-fetched
-    ///   version-list entry — today, only Composer's `impl_version!` includes a
-    ///   `license:` field (`deps-composer/src/types.rs`); any ecosystem whose
-    ///   `impl_version!` gains one automatically starts populating this map with no
-    ///   further `fetch.rs` changes. **Not** populated for the deps.dev-routed tier-2
-    ///   ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) — their license is only
-    ///   ever fetched by `trust_signal()`, which is deliberately hover-only (see
-    ///   `VersionData::trust`'s docs); reaching it from here would mean a new deps.dev
-    ///   call on every document open/edit, out of this backfill's "already in hand, no
-    ///   new network calls" scope.
-    /// - **Tier-3 pre-fetch**: `document::osv_scan::run_license_prefetch` (Dart, Swift,
-    ///   Gradle, Deno only — see that function's docs), via [`Self::merge_licenses`] (round
-    ///   3 finding #2: a plain `update_licenses` full replace would drop a
-    ///   dependency's previously-cached, still-valid license whenever *any other*
-    ///   dependency's fetch transiently failed this round), from a dedicated
-    ///   per-ecosystem background fetch, mirroring [`Self::vulnerabilities`]'s
-    ///   background-pre-fetch shape. A genuinely removed dependency's stale entry is
-    ///   reclaimed by `document::lifecycle::commit_parsed_document`'s manifest-diff
-    ///   pruning loop, not by this merge.
-    ///
-    /// Empty until the relevant fetch completes; carried across document edits by
-    /// `preserve_cache` so it doesn't flicker off on every keystroke.
-    pub licenses: HashMap<PackageName, Vec<String>>,
-    /// Background-pre-fetched typosquat-suspect signal per declared dependency (issue
-    /// #1437), keyed by raw (unnormalized) package name — mirrors [`Self::licenses`]'s exact
-    /// shape and rationale. Populated by `document::osv_scan::run_typosquat_prefetch`, via
-    /// [`Self::merge_typosquats`] (never a full replace, for the same "one dependency's
-    /// transient failure must not drop another's still-valid signal" reason
-    /// [`Self::merge_licenses`] exists). Read synchronously into
-    /// `deps_core::VersionData::typosquat_prefetch` by `handlers::diagnostics`, never
-    /// fetched inline on the diagnostics-generation path itself (NFR-002). Empty until the
-    /// prefetch completes or when `policy.typosquat.enabled` is `false`; carried across
-    /// document edits by `preserve_cache` so the diagnostic doesn't flicker off on every
-    /// keystroke.
-    pub typosquats: HashMap<PackageName, TyposquatSignal>,
-    /// The declared (name, source-eligibility) set as of the last typosquat pre-fetch this
-    /// document actually spawned (issue #1455 batch item 1, critic S1; the eligibility half of
-    /// the key added by issue #1462) — compared against the *current* set by
-    /// `document::lifecycle`'s debounced-edit gate, instead of that edit's own local
-    /// `DependencyDiff`. A per-edit diff alone misses a name added by an edit whose own change
-    /// task got aborted (superseded by the very next debounced edit) before ever reaching the
-    /// pre-fetch spawn — the added name would then never be checked, since the *next* edit's
-    /// own diff shows no name change either. Comparing against this persisted set self-corrects
-    /// across any number of such aborted edits: whatever the document's true current
-    /// (name, eligibility) pairs are, they either already match what was last actually checked,
-    /// or they don't and a re-check is due, independent of which specific edit's diff would
-    /// have flagged it. Pairing each name with its
-    /// [`TyposquatSourceEligibility`](super::osv_scan::TyposquatSourceEligibility) closes issue
-    /// #1462's gap: only an eligible dependency is ever sent to deps.dev
-    /// (`deps_core::lsp_helpers::fetch_typosquat_signals` applies the same filter), so a
-    /// name-only key couldn't tell "already checked, still ineligible" apart from "same name,
-    /// newly eligible" when a dependency's source flips (e.g. git -> registry) without its name
-    /// changing. Carried across edits by `preserve_cache`, same as [`Self::typosquats`], and
-    /// reset to empty on a fresh `DocumentState` (a cold-open/reopen document that has never
-    /// been checked has nothing to compare against, so its first check is unconditional —
-    /// matching the open-path pre-fetch's own unconditional spawn).
-    pub(crate) typosquat_checked_names:
-        std::collections::HashSet<(PackageName, super::osv_scan::TyposquatSourceEligibility)>,
-    /// GOSSIP-sourced cooldown/low-usage findings per declared dependency (issue #1456,
-    /// spec 072), keyed by raw (unnormalized) package name — mirrors [`Self::typosquats`]'s
-    /// exact shape and rationale. Populated by `document::gossip_prefetch::run_gossip_prefetch`
-    /// (see [`Self::merge_gossip_findings`]), whose single call per prefetch cycle combines
-    /// the per-package `DepsDevClient` memo's hits with this document's own
-    /// `GetFindingsBatch` results for memo-misses — a name already claimed by another
-    /// concurrent prefetch (elsewhere) is skipped this round rather than joined, so it
-    /// lands here on that *other* prefetch's own commit or this document's next trigger,
-    /// not necessarily this one (security/impl-critic review, corrects an earlier design
-    /// note that claimed a true three-way join). A mid-fetch content change no longer drops
-    /// the whole result (security/impl-critic S1) — the result is filtered down to names
-    /// still declared in the document's current content and merged. Read synchronously into
-    /// `deps_core::VersionData::gossip_prefetch` by `handlers::hover`/`handlers::diagnostics`,
-    /// never fetched inline on either generation path. Empty until the prefetch completes
-    /// or when `policy.gossip.enabled` is `false`; carried across document edits by
-    /// `preserve_cache` so the signal doesn't flicker off on every keystroke.
-    pub gossip_findings: HashMap<PackageName, GossipFindings>,
+    /// Per-package signal state — cached/resolved versions, vulnerabilities, outcomes,
+    /// licenses, typosquat/GOSSIP findings, and the resolved-versions generation counter
+    /// (issue #1477). See [`PackageSignals`] for the individual fields' own docs.
+    pub signals: PackageSignals,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -261,32 +158,6 @@ pub struct DocumentState {
     /// edit whose ranges were computed against a buffer state it has since moved past
     /// (see `handlers::code_lens`).
     pub version: Option<i32>,
-}
-
-impl Clone for DocumentState {
-    fn clone(&self) -> Self {
-        Self {
-            ecosystem: self.ecosystem,
-            content: self.content.clone(),
-            // Cheap: `Arc::clone`, not a deep copy of the parse result.
-            parse_result: self.parse_result.clone(),
-            cached_versions: self.cached_versions.clone(),
-            resolved_versions: self.resolved_versions.clone(),
-            resolved_version_candidates: self.resolved_version_candidates.clone(),
-            resolved_versions_generation: self.resolved_versions_generation,
-            vulnerabilities: self.vulnerabilities.clone(),
-            outcomes: self.outcomes.clone(),
-            licenses: self.licenses.clone(),
-            typosquats: self.typosquats.clone(),
-            typosquat_checked_names: self.typosquat_checked_names.clone(),
-            gossip_findings: self.gossip_findings.clone(),
-            parsed_at: self.parsed_at,
-            loading_state: self.loading_state,
-            // Note: Instant is Copy. Clones share the same loading start time.
-            loading_started_at: self.loading_started_at,
-            version: self.version,
-        }
-    }
 }
 
 /// Tracks recent cold start attempts per URI to prevent DOS.
@@ -386,27 +257,7 @@ impl std::fmt::Debug for DocumentState {
             .field("ecosystem", &format_args!("{}", self.ecosystem))
             .field("content_len", &self.content.len())
             .field("has_parse_result", &self.parse_result.is_some())
-            .field("cached_versions_count", &self.cached_versions.len())
-            .field("resolved_versions_count", &self.resolved_versions.len())
-            .field(
-                "resolved_version_candidates_count",
-                &self.resolved_version_candidates.len(),
-            )
-            .field(
-                "resolved_versions_generation",
-                &self.resolved_versions_generation,
-            )
-            .field("vulnerabilities_count", &self.vulnerabilities.len())
-            .field("licenses_count", &self.licenses.len())
-            .field("typosquats_count", &self.typosquats.len())
-            .field(
-                "typosquat_checked_names_count",
-                &self.typosquat_checked_names.len(),
-            )
-            .field("gossip_findings_count", &self.gossip_findings.len())
-            .field("yanked_versions_count", &self.outcomes.yanked_count())
-            .field("deprecations_count", &self.outcomes.deprecation_count())
-            .field("fetch_failed_count", &self.outcomes.fetch_failure_count())
+            .field("signals", &self.signals)
             .field("parsed_at", &self.parsed_at)
             .field("loading_state", &self.loading_state)
             .field("loading_started_at", &self.loading_started_at)
@@ -416,6 +267,26 @@ impl std::fmt::Debug for DocumentState {
 }
 
 impl DocumentState {
+    /// Shared body for [`Self::new_from_parse_result`]/[`Self::new_without_parse_result`]
+    /// (issue #1477): the two constructors differ only in whether they have a parse result
+    /// to hand, so every other field's initial value lives here once.
+    fn new_inner(
+        ecosystem: EcosystemId,
+        content: String,
+        parse_result: Option<Arc<dyn ParseResult>>,
+    ) -> Self {
+        Self {
+            ecosystem,
+            content,
+            parse_result,
+            signals: PackageSignals::default(),
+            parsed_at: Instant::now(),
+            loading_state: LoadingState::Idle,
+            loading_started_at: None,
+            version: None,
+        }
+    }
+
     /// Creates a new document state using trait objects (new architecture).
     ///
     /// This is the preferred constructor for Phase 3+ implementations.
@@ -424,25 +295,7 @@ impl DocumentState {
         content: String,
         parse_result: Box<dyn ParseResult>,
     ) -> Self {
-        Self {
-            ecosystem,
-            content,
-            parse_result: Some(Arc::from(parse_result)),
-            cached_versions: HashMap::new(),
-            resolved_versions: HashMap::new(),
-            resolved_version_candidates: HashMap::new(),
-            resolved_versions_generation: ResolvedGeneration::INITIAL,
-            vulnerabilities: VulnerabilityMap::new(),
-            outcomes: DependencyOutcomes::new(),
-            licenses: HashMap::new(),
-            typosquats: HashMap::new(),
-            typosquat_checked_names: std::collections::HashSet::new(),
-            gossip_findings: HashMap::new(),
-            parsed_at: Instant::now(),
-            loading_state: LoadingState::Idle,
-            loading_started_at: None,
-            version: None,
-        }
+        Self::new_inner(ecosystem, content, Some(Arc::from(parse_result)))
     }
 
     /// Creates a new document state without a parse result.
@@ -450,25 +303,7 @@ impl DocumentState {
     /// Used when parsing fails but the document should still be stored
     /// to enable fallback completion and other LSP features.
     pub fn new_without_parse_result(ecosystem: EcosystemId, content: String) -> Self {
-        Self {
-            ecosystem,
-            content,
-            parse_result: None,
-            cached_versions: HashMap::new(),
-            resolved_versions: HashMap::new(),
-            resolved_version_candidates: HashMap::new(),
-            resolved_versions_generation: ResolvedGeneration::INITIAL,
-            vulnerabilities: VulnerabilityMap::new(),
-            outcomes: DependencyOutcomes::new(),
-            licenses: HashMap::new(),
-            typosquats: HashMap::new(),
-            typosquat_checked_names: std::collections::HashSet::new(),
-            gossip_findings: HashMap::new(),
-            parsed_at: Instant::now(),
-            loading_state: LoadingState::Idle,
-            loading_started_at: None,
-            version: None,
-        }
+        Self::new_inner(ecosystem, content, None)
     }
 
     /// Gets a reference to the parse result if available.
@@ -488,7 +323,7 @@ impl DocumentState {
 
     /// Updates the cached registry version data (new architecture).
     pub fn update_cached_versions(&mut self, versions: HashMap<PackageName, PackageVersions>) {
-        self.cached_versions = versions;
+        self.signals.cached_versions = versions;
     }
 
     /// Updates the resolved versions from lock file, together with the per-name candidates
@@ -525,8 +360,8 @@ impl DocumentState {
         self.bump_resolved_generation(generation);
     }
 
-    /// Updates [`Self::resolved_versions`]/[`Self::resolved_version_candidates`] without
-    /// bumping [`Self::resolved_versions_generation`] (issue #1395 critic N2 and its
+    /// Updates [`PackageSignals::resolved_versions`]/[`PackageSignals::resolved_version_candidates`] without
+    /// bumping [`PackageSignals::resolved_versions_generation`] (issue #1395 critic N2 and its
     /// bidirectional-race follow-up).
     ///
     /// Used by `handle_lockfile_change` and `document::lifecycle`'s debounced-change/
@@ -546,25 +381,25 @@ impl DocumentState {
         versions: HashMap<PackageName, ConcreteVersion>,
         candidates: HashMap<PackageName, Vec<ConcreteVersion>>,
     ) {
-        self.resolved_versions = versions;
-        self.resolved_version_candidates = candidates;
+        self.signals.resolved_versions = versions;
+        self.signals.resolved_version_candidates = candidates;
     }
 
-    /// Sets [`Self::resolved_versions_generation`] to `generation` (from
+    /// Sets [`PackageSignals::resolved_versions_generation`] to `generation` (from
     /// `ServerState::next_resolved_versions_generation` — see [`ResolvedGeneration`]'s doc),
     /// without touching the resolved-version maps — see
     /// [`Self::set_resolved_versions_without_bump`]'s doc for why this is split out
     /// (issue #1395 critic N2).
     pub(crate) fn bump_resolved_generation(&mut self, generation: ResolvedGeneration) {
-        self.resolved_versions_generation = generation;
+        self.signals.resolved_versions_generation = generation;
     }
 
     /// Updates the OSV.dev scan results.
     pub fn update_vulnerabilities(&mut self, vulnerabilities: VulnerabilityMap) {
-        self.vulnerabilities = vulnerabilities;
+        self.signals.vulnerabilities = vulnerabilities;
     }
 
-    /// Full-replace update of [`Self::licenses`] — every existing entry is discarded and
+    /// Full-replace update of [`PackageSignals::licenses`] — every existing entry is discarded and
     /// replaced with exactly `licenses`, the same "one background task owns the whole
     /// map" contract [`Self::update_vulnerabilities`] has for `vulnerabilities`.
     ///
@@ -577,14 +412,14 @@ impl DocumentState {
     /// non-clobbering contract against it.
     #[cfg(test)]
     pub fn update_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
-        self.licenses = licenses;
+        self.signals.licenses = licenses;
     }
 
-    /// Merges license findings into [`Self::licenses`] without disturbing existing
+    /// Merges license findings into [`PackageSignals::licenses`] without disturbing existing
     /// entries — unlike `update_licenses` (test-only, see that method's doc), which replaces
     /// the map wholesale.
     ///
-    /// Both of [`Self::licenses`]' populating sources use this: the tier-1 backfill
+    /// Both of [`PackageSignals::licenses`]' populating sources use this: the tier-1 backfill
     /// (`document::fetch::merge_registry_fetch_result`, for every ecosystem) and the
     /// tier-3 pre-fetch (`document::osv_scan::run_license_prefetch`, Dart/Swift/
     /// Gradle/Deno only). A tier-3 document's tier-1 call always contributes an empty
@@ -594,8 +429,8 @@ impl DocumentState {
     /// entries the *other* source (or an earlier call from the same source, for a
     /// dependency that failed to refresh this round) already put there. A genuinely
     /// removed dependency's stale entry is reclaimed by
-    /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop, not
-    /// by this merge.
+    /// `PackageSignals::prune_removed` (called from
+    /// `document::lifecycle::commit_parsed_document`), not by this merge.
     ///
     /// This merge is name-keyed, not (name, version)-keyed, so it alone cannot tell a
     /// still-valid cached license from one that belongs to a dependency's *previous*
@@ -606,18 +441,18 @@ impl DocumentState {
     /// the first place (it's the registry's latest-matching pick), so [`Self::evict_licenses`]
     /// deliberately never evicts for one — see its own doc.
     pub fn merge_licenses(&mut self, licenses: HashMap<PackageName, Vec<String>>) {
-        self.licenses.extend(licenses);
+        self.signals.licenses.extend(licenses);
     }
 
-    /// Merges typosquat findings into [`Self::typosquats`] without disturbing existing
+    /// Merges typosquat findings into [`PackageSignals::typosquats`] without disturbing existing
     /// entries — mirrors [`Self::merge_licenses`]'s exact rationale: a dependency whose
     /// resolution transiently fails this round must not lose a previous round's
     /// still-valid signal for some *other* dependency. Unlike license data, a typosquat
     /// signal has no resolved-version dependency at all (it compares declared package
     /// *names*, never versions), so there is no eviction counterpart to
     /// [`Self::evict_licenses`] — a genuinely removed dependency's entry is reclaimed by
-    /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop, same as
-    /// [`Self::licenses`].
+    /// `PackageSignals::prune_removed` (called from `document::lifecycle::commit_parsed_document`),
+    /// same as [`PackageSignals::licenses`].
     ///
     /// **Known, accepted limitation (issue #1437 impl-critic D2):** a still-declared
     /// dependency's entry is *not* automatically cleared if a later pre-fetch resolves no
@@ -632,10 +467,10 @@ impl DocumentState {
     /// re-check, which *does* actively clear the one staleness case that matters
     /// security-wise (a dependency whose source switched to private).
     pub fn merge_typosquats(&mut self, typosquats: HashMap<PackageName, TyposquatSignal>) {
-        self.typosquats.extend(typosquats);
+        self.signals.typosquats.extend(typosquats);
     }
 
-    /// Updates [`Self::typosquat_checked_names`] to `current` and reports whether it actually
+    /// Updates [`PackageSignals::typosquat_checked_names`] to `current` and reports whether it actually
     /// differed from the previous value (issue #1455 batch item 1, critic S1) — the debounced-
     /// edit typosquat pre-fetch gate calls this once per edit, spawning a pre-fetch only when
     /// it returns `true`. Always updates, even when unchanged (a no-op clone in that case), so
@@ -647,15 +482,15 @@ impl DocumentState {
             super::osv_scan::TyposquatSourceEligibility,
         )>,
     ) -> bool {
-        if self.typosquat_checked_names == current {
+        if self.signals.typosquat_checked_names == current {
             false
         } else {
-            self.typosquat_checked_names = current;
+            self.signals.typosquat_checked_names = current;
             true
         }
     }
 
-    /// Reverts [`Self::typosquat_checked_names`] to "not checked" for `stale_snapshot`'s
+    /// Reverts [`PackageSignals::typosquat_checked_names`] to "not checked" for `stale_snapshot`'s
     /// members, but only if it still equals `stale_snapshot` exactly (issue #1463) —
     /// `document::osv_scan::run_typosquat_prefetch`'s timeout path calls this so a prefetch
     /// that never completed doesn't leave the gate believing `stale_snapshot` was actually
@@ -671,12 +506,12 @@ impl DocumentState {
             super::osv_scan::TyposquatSourceEligibility,
         )>,
     ) {
-        if &self.typosquat_checked_names == stale_snapshot {
-            self.typosquat_checked_names.clear();
+        if &self.signals.typosquat_checked_names == stale_snapshot {
+            self.signals.typosquat_checked_names.clear();
         }
     }
 
-    /// Merges GOSSIP findings into [`Self::gossip_findings`] without disturbing existing
+    /// Merges GOSSIP findings into [`PackageSignals::gossip_findings`] without disturbing existing
     /// entries — mirrors [`Self::merge_typosquats`]'s exact additive shape.
     ///
     /// `document::gossip_prefetch::run_gossip_prefetch`'s single call per prefetch cycle
@@ -691,12 +526,12 @@ impl DocumentState {
     /// naturally overwritten the next time that package is re-resolved, mirroring
     /// [`Self::merge_typosquats`]'s identical "no separate eviction needed" reasoning — a
     /// genuinely removed dependency's entry is reclaimed by
-    /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop.
+    /// `PackageSignals::prune_removed` (called from `document::lifecycle::commit_parsed_document`).
     pub fn merge_gossip_findings(&mut self, findings: HashMap<PackageName, GossipFindings>) {
-        self.gossip_findings.extend(findings);
+        self.signals.gossip_findings.extend(findings);
     }
 
-    /// Evicts every name in `names` from [`Self::licenses`] — called ahead of a resolved
+    /// Evicts every name in `names` from [`PackageSignals::licenses`] — called ahead of a resolved
     /// (in-use) version move, before any re-fetch that might repopulate it (issue #1424,
     /// resolving the prior `TODO(critic)` on [`Self::merge_licenses`]).
     ///
@@ -724,18 +559,18 @@ impl DocumentState {
     /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
     /// doc.merge_licenses(HashMap::from([(PackageName::new("foo"), vec!["MIT".to_string()])]));
     /// doc.evict_licenses(&[PackageName::new("foo")]);
-    /// assert!(!doc.licenses.contains_key(&PackageName::new("foo")));
+    /// assert!(!doc.signals.licenses.contains_key(&PackageName::new("foo")));
     /// ```
     pub fn evict_licenses(&mut self, names: &[PackageName]) {
         for name in names {
-            self.licenses.remove(name);
+            self.signals.licenses.remove(name);
         }
     }
 
     /// Replaces the yanked/deprecation/fetch-failure outcome map wholesale (normalized-keyed,
-    /// see [`Self::outcomes`]).
+    /// see [`PackageSignals::outcomes`]).
     pub fn replace_outcomes(&mut self, outcomes: DependencyOutcomes) {
-        self.outcomes = outcomes;
+        self.signals.outcomes = outcomes;
     }
 
     /// Sets the LSP document version from the client's `didOpen`/`didChange`, or clears
@@ -1060,7 +895,7 @@ pub struct ServerState {
     /// Generation counter bumped by [`Self::queue_reparse`], letting a debounce worker
     /// detect it was superseded by a newer config change before draining `pending_reparse`.
     config_generation: AtomicU64,
-    /// Server-global source for [`DocumentState::resolved_versions_generation`] (issue
+    /// Server-global source for [`PackageSignals::resolved_versions_generation`] (issue
     /// #1395 critic M10), drawn via [`Self::next_resolved_versions_generation`]. A
     /// per-document-instance counter that restarts at 0 on every `DocumentState` rebuild
     /// can collide with a stale, `did_close`-surviving OSV rescan's earlier snapshot once
@@ -1304,7 +1139,7 @@ impl ServerState {
         self.config_generation.load(Ordering::SeqCst)
     }
 
-    /// Draws the next server-global `DocumentState::resolved_versions_generation` value
+    /// Draws the next server-global `PackageSignals::resolved_versions_generation` value
     /// (issue #1395 critic M10). Every writer of that field — `update_resolved_versions`
     /// and the `bump_resolved_generation`/`set_resolved_versions_without_bump` pair —
     /// must draw its value from here rather than incrementing the document's own prior
@@ -1615,8 +1450,8 @@ impl ServerState {
                     .filter(|dep| formatter.can_resolve_source(&dep.source()))
                     .map(|dep| dep.name().clone())
                     .filter(|name| {
-                        !doc.cached_versions.contains_key(name)
-                            && !doc.resolved_versions.contains_key(name)
+                        !doc.signals.cached_versions.contains_key(name)
+                            && !doc.signals.resolved_versions.contains_key(name)
                     })
                     .map(|name| formatter.normalize_package_name(&name))
                     .collect()
@@ -1624,7 +1459,7 @@ impl ServerState {
             .unwrap_or_default();
 
         if !not_attempted.is_empty() {
-            let mut outcomes = doc.outcomes.clone();
+            let mut outcomes = doc.signals.outcomes.clone();
             for name in not_attempted {
                 outcomes.set_fetch_failure_if_absent(name, deps_core::FetchFailure::NotAttempted);
             }
@@ -1742,7 +1577,7 @@ mod tests {
     //
     // `update_licenses` (tier-3 pre-fetch, full replace) and `merge_licenses`
     // (tier-1 backfill, additive merge) are two independent background-task writers
-    // into `DocumentState.licenses`. The doc comments on both claim they can never
+    // into `DocumentState.signals.licenses`. The doc comments on both claim they can never
     // clobber each other because at most one of the two ever contributes real
     // (non-empty) data for a given document's single ecosystem — this was previously
     // asserted only in prose, never exercised by a test in either call order.
@@ -1774,12 +1609,12 @@ mod tests {
             )]));
 
             assert_eq!(
-                doc.licenses.get(&tier3_name),
+                doc.signals.licenses.get(&tier3_name),
                 Some(&vec!["BSD-3-Clause".to_string()]),
                 "merge_licenses must not clobber update_licenses' entry"
             );
             assert_eq!(
-                doc.licenses.get(&tier1_name),
+                doc.signals.licenses.get(&tier1_name),
                 Some(&vec!["MIT".to_string()])
             );
         }
@@ -1808,14 +1643,14 @@ mod tests {
             // pass) — so after it runs, only its own entries remain. This is the
             // documented contract, not a bug: for a genuinely tier-3 document, the
             // tier-1 merge above never actually contributes real data in production
-            // (see `DocumentState::licenses`' doc), so this asserts the replace
+            // (see `PackageSignals::licenses`' doc), so this asserts the replace
             // behaves exactly as documented rather than silently merging instead.
-            assert_eq!(doc.licenses.len(), 1);
+            assert_eq!(doc.signals.licenses.len(), 1);
             assert_eq!(
-                doc.licenses.get(&tier3_name),
+                doc.signals.licenses.get(&tier3_name),
                 Some(&vec!["BSD-3-Clause".to_string()])
             );
-            assert!(!doc.licenses.contains_key(&tier1_name));
+            assert!(!doc.signals.licenses.contains_key(&tier1_name));
         }
 
         /// `merge_licenses` called twice for two different packages accumulates
@@ -1833,13 +1668,13 @@ mod tests {
                 vec!["Apache-2.0".to_string()],
             )]));
 
-            assert_eq!(doc.licenses.len(), 2);
+            assert_eq!(doc.signals.licenses.len(), 2);
             assert_eq!(
-                doc.licenses.get(&PackageName::new("pkg-a")),
+                doc.signals.licenses.get(&PackageName::new("pkg-a")),
                 Some(&vec!["MIT".to_string()])
             );
             assert_eq!(
-                doc.licenses.get(&PackageName::new("pkg-b")),
+                doc.signals.licenses.get(&PackageName::new("pkg-b")),
                 Some(&vec!["Apache-2.0".to_string()])
             );
         }
@@ -2868,7 +2703,7 @@ mod tests {
 
             assert_eq!(state.ecosystem, EcosystemId::Cargo);
             assert_eq!(state.content, "test content");
-            assert!(state.cached_versions.is_empty());
+            assert!(state.signals.cached_versions.is_empty());
         }
 
         #[test]
@@ -2940,9 +2775,9 @@ mod tests {
 
             let generation = ServerState::new().next_resolved_versions_generation();
             state.update_resolved_versions(resolved, HashMap::new(), generation);
-            assert_eq!(state.resolved_versions.len(), 1);
+            assert_eq!(state.signals.resolved_versions.len(), 1);
             assert_eq!(
-                state.resolved_versions.get("serde"),
+                state.signals.resolved_versions.get("serde"),
                 Some(&"1.0.195".into())
             );
         }
@@ -2956,7 +2791,7 @@ mod tests {
             cached.insert("serde".into(), PackageVersions::latest_only("1.0.210"));
 
             state.update_cached_versions(cached);
-            assert_eq!(state.cached_versions.len(), 1);
+            assert_eq!(state.signals.cached_versions.len(), 1);
         }
 
         #[test]
