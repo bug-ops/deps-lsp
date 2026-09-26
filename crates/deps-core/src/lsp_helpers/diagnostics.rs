@@ -538,6 +538,18 @@ where
 /// oversized string is never a real requirement, only a corrupted or adversarial one.
 const MAX_REQUIREMENT_LEN: usize = 256;
 
+/// Reports whether `requirement`'s string exceeds [`MAX_REQUIREMENT_LEN`] — the same
+/// "unmodellable, so suppressed rather than compiled and scanned" bound
+/// [`requirement_is_unsatisfiable`] and `requirement_matches_only_yanked` already apply before
+/// compiling a requirement, generalized so other call sites that would otherwise hand an
+/// arbitrarily long string to an ecosystem's `compile_requirement`/comparator can suppress
+/// their own verdict the same way instead of duplicating the length check (#1472
+/// defense-in-depth: bounds the one-time parse/scan cost of a pathological requirement string
+/// for every ecosystem, on top of the bundler-specific algorithmic O(n^2) fix).
+pub(crate) fn requirement_is_oversized(requirement: &VersionReq) -> bool {
+    requirement.as_str().len() > MAX_REQUIREMENT_LEN
+}
+
 /// Returns `true` when no published version satisfies `requirement`.
 ///
 /// `available` must be non-empty, `requirement` must be a concrete (non-empty, resolved,
