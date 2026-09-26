@@ -1003,7 +1003,7 @@ fn resolve_source_chain(tiers: &LoadedTiers, policy: &RegistryAccessPolicy) -> S
     for _hop in 0..MAX_SOURCE_REPLACEMENT_HOPS {
         if !visited.insert(current_id.clone()) {
             tracing::warn!(
-                id = %current_id,
+                id = ?current_id,
                 "[source] replace-with chain is cyclic; leaving crates-io unresolved"
             );
             return SourceReplacement::None;
@@ -2053,6 +2053,42 @@ token = "secret-token"
 
         // 17 hops (crates-io -> hop0 -> ... -> hop16) exceeds MAX_SOURCE_REPLACEMENT_HOPS (16).
         assert_eq!(replacement, SourceReplacement::None);
+    }
+
+    /// #1505 P4: the cyclic `[source] replace-with` chain warning used to interpolate the
+    /// revisited source id raw (`id = %current_id`), letting a manifest-adjacent
+    /// `.cargo/config.toml` with a crafted source table name forge a log line. `id` is now a
+    /// `?`-Debug field.
+    #[test]
+    fn test_source_chain_cyclic_id_logs_sanitized() {
+        // Per `fs_probe::snapshot_guard`'s doc: every fs_probe-touching test here must hold it.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let malicious_id = "bad\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let root = tempfile::tempdir().unwrap();
+        let path = write_config(
+            root.path(),
+            "[source.crates-io]\nreplace-with = \"bad\\r\\n\\u001b[31mERROR deps_lsp: FORGED\"\n\
+             [source.\"bad\\r\\n\\u001b[31mERROR deps_lsp: FORGED\"]\nreplace-with = \"bad\\r\\n\\u001b[31mERROR deps_lsp: FORGED\"\n",
+        );
+
+        let cache = ConfigFileCache::new();
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let (_, replacement) = resolve(&HashSet::new(), &[path], None, &cache, &policy);
+            assert_eq!(replacement, SourceReplacement::None);
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted source id must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_id),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
+        );
     }
 
     #[test]

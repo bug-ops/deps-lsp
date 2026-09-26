@@ -89,7 +89,7 @@ pub fn filter_valid_spdx_ids(ids: Vec<String>) -> Vec<String> {
             let valid = is_syntactically_valid_spdx_id(id);
             if !valid {
                 tracing::warn!(
-                    identifier = %id,
+                    identifier = ?id,
                     "license policy: dropping invalid SPDX identifier"
                 );
             }
@@ -884,6 +884,32 @@ mod tests {
     fn valid_and_invalid_entries_are_partitioned() {
         let cleaned = filter_valid_spdx_ids(vec!["MIT".to_string(), "???".to_string()]);
         assert_eq!(cleaned, vec!["MIT".to_string()]);
+    }
+
+    /// #1505 finding 4: a manifest-declared license identifier that fails the SPDX
+    /// syntax check used to be interpolated raw (`identifier = %id`), letting a crafted
+    /// identifier forge a log line. `identifier` is now a `?`-Debug field, which escapes a
+    /// raw newline instead of emitting a real line break.
+    #[cfg(feature = "test-util")]
+    #[test]
+    fn invalid_identifier_with_control_char_is_dropped_and_log_is_sanitized() {
+        let malicious = "bad id\r\n\x1b[31mERROR deps_lsp: FORGED".to_string();
+
+        let log = crate::test_util::capture_tracing_output(|| {
+            let cleaned = filter_valid_spdx_ids(vec![malicious.clone()]);
+            assert!(cleaned.is_empty());
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted identifier must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious.as_str()),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
+        );
     }
 
     // --- LicensePolicy ---

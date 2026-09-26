@@ -508,8 +508,11 @@ impl PypiRegistry {
         // PEP 440 uses empty string for "any version"
         let normalized_req = if req_str == "*" { "" } else { req_str };
 
-        let specs = VersionSpecifiers::from_str(normalized_req)
-            .map_err(|e| DepsError::InvalidVersionReq(format!("{req_str}: {e}")))?;
+        let specs = VersionSpecifiers::from_str(normalized_req).map_err(|e| {
+            DepsError::InvalidVersionReq(
+                deps_core::redact::sanitize_invisible(&format!("{req_str}: {e}")).into_owned(),
+            )
+        })?;
 
         Ok(versions.into_iter().find(|v| {
             if let Ok(version) = Version::from_str(v.version.as_str()) {
@@ -1751,6 +1754,46 @@ mod tests {
             err,
             DepsError::PackageNotFound { package, registry }
                 if package == "---" && registry == REGISTRY
+        );
+    }
+
+    /// #1505 P2: `pep440_rs`'s `VersionSpecifiersParseError` `Display` is multi-line by
+    /// design (it echoes the offending text plus a caret line), so a manifest-declared
+    /// version requirement containing a raw newline used to survive into
+    /// `DepsError::InvalidVersionReq`'s message unsanitized, forging extra lines wherever the
+    /// error is later logged or shown. The message is now swept via `sanitize_invisible` at
+    /// construction.
+    #[tokio::test]
+    async fn test_get_latest_matching_bad_req_error_message_is_sanitized() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/simple/flask/")
+            .with_status(200)
+            .with_body(r#"{"versions": ["3.0.0"], "files": []}"#)
+            .create_async()
+            .await;
+
+        let cache = Arc::new(HttpCache::new());
+        let registry =
+            PypiRegistry::with_public_base_for_test(cache, format!("{}/simple", server.url()));
+
+        let malicious_req = "not-a-req\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let err = registry
+            .get_latest_matching("flask", malicious_req)
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+
+        assert_eq!(
+            message.lines().count(),
+            1,
+            "a crafted version requirement must not forge extra lines in the error message: \
+             {message:?}"
+        );
+        assert!(
+            !message.contains(malicious_req),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {message:?}"
         );
     }
 

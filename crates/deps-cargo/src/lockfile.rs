@@ -129,7 +129,7 @@ fn parse_cargo_lock(content: String) -> Result<ResolvedPackages> {
         };
 
         let Some(version) = table.get("version").and_then(|v| v.as_str()) else {
-            tracing::warn!("Package '{}' missing version field", name);
+            tracing::warn!(package = ?name, "package missing version field");
             continue;
         };
 
@@ -285,6 +285,34 @@ b = 2
 
         let message = parse_cargo_lock(content).unwrap_err().to_string();
         assert_eq!(message, expected);
+    }
+
+    /// #1505 finding 5: a package name missing its `version` field used to be interpolated
+    /// raw (`"Package '{}' missing version field", name`), letting a crafted name forge a log
+    /// line. `package` is now a `?`-Debug field, which escapes a raw newline instead of
+    /// emitting a real line break.
+    #[test]
+    fn test_1505_missing_version_field_logs_sanitized_package_name() {
+        // TOML's own `\uXXXX` escape (exactly 4 hex digits), not Rust's `\u{...}` syntax.
+        let malicious_name = "bad\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let content =
+            "[[package]]\nname = \"bad\\r\\n\\u001b[31mERROR deps_lsp: FORGED\"\n".to_string();
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let packages = parse_cargo_lock(content).unwrap();
+            assert!(packages.is_empty());
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted package name must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_name),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
+        );
     }
 
     #[test]

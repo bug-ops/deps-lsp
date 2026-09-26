@@ -384,7 +384,7 @@ impl GithubActionsRegistry {
         let req = match semver::VersionReq::parse(normalize_tag(req_str)) {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Failed to parse version req '{}': {}", req_str, e);
+                tracing::warn!(req = ?req_str, error = %e, "failed to parse version req");
                 return Ok(None);
             }
         };
@@ -1035,6 +1035,48 @@ mod tests {
         assert_eq!(
             latest.map(|v| v.version.to_string()),
             Some("v1.0.0".to_string())
+        );
+    }
+
+    /// #1505 finding 3: an unparseable `req_str` used to be interpolated raw into the warn
+    /// message text (`"Failed to parse version req '{}': {}"`), letting a manifest-declared
+    /// version requirement forge a log line. `req` is now a `?`-Debug field, which escapes a
+    /// raw newline to the two-character sequence `\n` rather than emitting a real line break.
+    #[tokio::test]
+    async fn test_1505_get_latest_matching_bad_req_does_not_forge_log_line() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/repos/owner/repo/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name": "v1.0.0", "commit": {{"sha": "{}"}}}}]"#,
+                "a".repeat(40)
+            ))
+            .create_async()
+            .await;
+
+        let registry = mock_registry(&server.url(), false);
+        let malicious_req = "not-a-req\r\n\x1b[31mERROR deps_lsp: FORGED";
+
+        let log = deps_core::test_util::capture_tracing_output_async(async {
+            let result = registry
+                .get_latest_matching("owner/repo", malicious_req)
+                .await
+                .unwrap();
+            assert!(result.is_none());
+        })
+        .await;
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted req_str must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_req),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
         );
     }
 
