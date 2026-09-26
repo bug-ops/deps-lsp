@@ -345,6 +345,12 @@ fn best_candidate_for_requirement<'a>(
     requirement: &crate::VersionReq,
     formatter: &dyn EcosystemFormatter,
 ) -> Option<&'a ConcreteVersion> {
+    // #1472 defense-in-depth: this calls into `compile_requirement` once per candidate, so an
+    // oversized requirement's one-time parse cost multiplies by `candidates.len()` — bail out
+    // before that rather than offering a substitution built from an unmodellable requirement.
+    if super::requirement_is_oversized(requirement) {
+        return None;
+    }
     candidates
         .iter()
         .filter(|v| version_matches_requirement(formatter, v, requirement))
@@ -1118,6 +1124,26 @@ mod tests {
             best_candidate_for_requirement(&candidates, &VersionReq::new("^1.0"), &CaretFormatter);
 
         assert_eq!(result, Some(&ConcreteVersion::from("1.0.5")));
+    }
+
+    /// #1472 defense-in-depth: an oversized requirement must short-circuit to `None` before
+    /// ever calling into `compile_requirement`/`version_satisfies_requirement` per candidate —
+    /// not just fail to match. The candidate here is built to trivially satisfy the heuristic's
+    /// exact-equality branch if the gate were bypassed, proving the gate itself is what decides.
+    #[test]
+    fn best_candidate_for_requirement_oversized_requirement_returns_none() {
+        use crate::VersionReq;
+
+        let oversized = "1".repeat(300);
+        let candidates = vec![ConcreteVersion::from(oversized.as_str())];
+
+        let result = best_candidate_for_requirement(
+            &candidates,
+            &VersionReq::new(oversized),
+            &crate::lsp_helpers::test_support::MOCK_FORMATTER,
+        );
+
+        assert_eq!(result, None);
     }
 
     /// FR-002 end-to-end through `in_use_version`/`resolve_occurrence_version`, not just the

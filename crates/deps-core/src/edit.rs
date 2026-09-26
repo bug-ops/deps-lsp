@@ -11,8 +11,8 @@
 
 use crate::lsp_helpers::{
     EcosystemFormatter, LineOffsetTable, RequirementStatus, VersionData, is_safe_version_string,
-    literal_span_matches, resolve_in_use_version, slice_for_range, strip_whitespace,
-    warn_rejected_value,
+    literal_span_matches, requirement_is_oversized, resolve_in_use_version, slice_for_range,
+    strip_whitespace, warn_rejected_value,
 };
 use crate::{ConcreteVersion, Dependency, ParseResult, VersionReq};
 
@@ -1180,9 +1180,14 @@ pub fn plan_verified_fix(
     }
 
     let fix_concrete = ConcreteVersion::new(version_native);
+    // #1472 defense-in-depth: an oversized requirement is treated as not already resolving to
+    // the fix (same `None -> false` collapse the default `requirement_already_resolves_to`
+    // already applies for an uncompilable requirement) — gated at this call site since NuGet's
+    // override bypasses the default entirely rather than delegating to it.
     let requirement_already_resolves_to_fix =
         dep.version_requirement().is_some_and(|version_req| {
-            formatter.requirement_already_resolves_to(version_req, &fix_concrete)
+            !requirement_is_oversized(version_req)
+                && formatter.requirement_already_resolves_to(version_req, &fix_concrete)
         });
     if requirement_already_resolves_to_fix {
         return Err(VulnFixSkip::RequirementAlreadyResolves);
@@ -1676,6 +1681,34 @@ mod tests {
             let planned =
                 plan_vulnerability_fix(&d, d.version_range, "1", &dv, &StrictSemverFormatter);
             assert_eq!(planned, Err(VulnFixSkip::RequirementAlreadyResolves));
+        }
+
+        /// #1472 defense-in-depth: an oversized requirement must not trip
+        /// `RequirementAlreadyResolves`, even when `requirement_already_resolves_to` would
+        /// otherwise report `true` — proven via `ExactMatchFormatter`'s exact string-equality
+        /// matcher, so an oversized requirement identical to the fix target trivially "already
+        /// resolves" without the gate. With the gate, planning proceeds past that check and
+        /// correctly lands on the plain textual no-op guard instead.
+        #[test]
+        fn test_oversized_requirement_does_not_report_already_resolves() {
+            use crate::lsp_helpers::test_support::ExactMatchFormatter;
+
+            let oversized = "1".repeat(300);
+            let d = dep(
+                "serde",
+                &oversized,
+                range(0, 8, 0, 8 + u32::try_from(oversized.len()).unwrap()),
+            );
+
+            let planned = plan_verified_fix(
+                &d,
+                d.version_range,
+                &oversized,
+                &oversized,
+                &ExactMatchFormatter,
+            );
+
+            assert_eq!(planned, Err(VulnFixSkip::NoOpRewrite));
         }
 
         /// A requirement the comparator confirms does NOT admit the fix target must still
