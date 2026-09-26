@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::package::InvalidPackageName;
 use crate::redact::{RedactedName, RedactedUrl};
 
 /// Whether a [`DepsError::RateLimited`] classification is backed by explicit server evidence
@@ -297,13 +298,31 @@ pub enum DepsError {
         limit: usize,
     },
 
-    /// Deliberately shared between two distinct rejection kinds: malformed version-requirement
-    /// strings (all ecosystems) and malformed Go module paths (`deps-go`, which has no separate
-    /// variant for the latter — see its `validate_module_path`). Nothing in the workspace
-    /// discriminates on this variant beyond rendering its message, so a consumer-specific split
-    /// was deferred (#399).
+    /// A malformed version-requirement string, for any ecosystem.
+    ///
+    /// Previously also carried `deps-go`'s malformed-module-path rejections (#399 deferred
+    /// that split); those now use [`Self::InvalidPackageName`] instead (#1514) — a module path
+    /// is a package identifier, not a version requirement, and consumers that only expect
+    /// version-requirement text (e.g. `GoFormatter::validate_package_name`) previously needed
+    /// a documented `unreachable!()` arm to rule the version-requirement shape back out.
     #[error("invalid version requirement: {0}")]
     InvalidVersionReq(String),
+
+    /// A registry request's target package/module name failed a structural validation gate
+    /// (e.g. empty, oversized, or containing a `.`/`..` path segment) — distinct from
+    /// [`Self::InvalidVersionReq`], which is for a malformed version-requirement string, not a
+    /// malformed name. `deps-go`'s `validate_module_path` is the first caller (#1514).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{DepsError, InvalidPackageName};
+    ///
+    /// let err: DepsError = InvalidPackageName::new("module path is empty").into();
+    /// assert!(matches!(err, DepsError::InvalidPackageName(_)));
+    /// ```
+    #[error("invalid package name: {0}")]
+    InvalidPackageName(#[from] InvalidPackageName),
 
     /// A filesystem I/O operation failed.
     #[error("I/O error: {0}")]
@@ -410,6 +429,9 @@ impl std::fmt::Debug for DepsError {
                 .field("limit", limit)
                 .finish(),
             Self::InvalidVersionReq(req) => f.debug_tuple("InvalidVersionReq").field(req).finish(),
+            Self::InvalidPackageName(err) => {
+                f.debug_tuple("InvalidPackageName").field(err).finish()
+            }
             Self::Io(source) => f.debug_tuple("Io").field(source).finish(),
             Self::Json(source) => f.debug_tuple("Json").field(source).finish(),
             Self::UnsupportedEcosystem(ecosystem) => f
@@ -591,6 +613,7 @@ impl DepsError {
             | Self::ApiResponse { .. }
             | Self::ResponseTooLarge { .. }
             | Self::InvalidVersionReq(_)
+            | Self::InvalidPackageName(_)
             | Self::Io(_)
             | Self::Json(_)
             | Self::UnsupportedEcosystem(_)
@@ -663,6 +686,7 @@ impl DepsError {
             Self::PackageNotFound { .. } => (None, "not-found"),
             Self::ParseError { .. } => (None, "parse-error"),
             Self::InvalidVersionReq(_) => (None, "invalid-version-req"),
+            Self::InvalidPackageName(_) => (None, "invalid-package-name"),
             Self::Io(_) => (None, "io"),
             Self::Json(_) => (None, "json"),
             Self::UnsupportedEcosystem(_) => (None, "unsupported-ecosystem"),

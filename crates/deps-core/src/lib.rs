@@ -177,6 +177,7 @@ pub mod pagination;
 /// Shared manifest-parsing helpers: bounded JSON/TOML/YAML nesting checks and
 /// depth-limited parsing used by every ecosystem's manifest parser.
 pub mod parser;
+pub mod path_segment;
 /// The policy-relevant subset of `deps-lsp`'s configuration.
 ///
 /// Diagnostics severities, cache, freshness, supply-chain, registries, network, license
@@ -294,6 +295,7 @@ pub use parser::{
     check_yaml_nesting_depth, json_depth_error_message, parse_json_checked, parse_toml_checked,
     yaml_scalar_string,
 };
+pub use path_segment::{DotSegmentError, SafePathSegment, SegmentedPathName};
 pub use position::{Position, Range};
 pub use registry::{
     Deprecation, Metadata, Registry, RemovalStatus, Version, classify_default_registry_url,

@@ -191,7 +191,13 @@ impl PartialEq<&str> for PackageName {
 /// only carries *why* a name looks wrong so an LSP diagnostic can say something more
 /// specific than "invalid name".
 ///
+/// Also the payload of [`DepsError::InvalidPackageName`] (#1514): `deps-go`'s
+/// `validate_module_path` returns this type directly, propagated into `DepsError` via
+/// `#[from]`, so a malformed Go module path shares this same "why was the name rejected"
+/// carrier instead of a second, ecosystem-local error type.
+///
 /// [`PackageNaming::validate_package_name`]: crate::lsp_helpers::PackageNaming::validate_package_name
+/// [`DepsError::InvalidPackageName`]: crate::DepsError::InvalidPackageName
 ///
 /// # Examples
 ///

@@ -17,7 +17,7 @@ use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::registry::{KeyShape, register_capped_with_occupied};
 use deps_core::{
     DepsError, EcosystemId, FreshnessSettings, HOVER_RECENT_VERSIONS, HttpCache, PublishTime,
-    Result,
+    Result, SafePathSegment,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -379,23 +379,22 @@ pub fn package_url(name: &str) -> String {
     )
 }
 
-/// Rejects a dot-segment `name` before it would reach [`flat_container_url`]/
+/// Validates a dot-segment `name` before it would reach [`flat_container_url`]/
 /// [`registration_index_url`], as `DepsError::PackageNotFound` — mirroring `deps-npm`'s/
 /// `deps-dart`'s identical guard for the same vulnerability class (#341/#349/#365): a `name`
 /// of exactly `.`/`..`, once lowercased and percent-encoded, is followed by a real `/`
 /// separator before `index.json`, so it forms an exact dot-segment that a URL parser's
 /// dot-segment normalization collapses, escaping the intended `PackageBaseAddress`/
-/// `RegistrationsBaseUrl` prefix.
-fn reject_dot_segment(name: &str) -> Result<()> {
-    if deps_core::is_dot_segment(name) {
-        return Err(deps_core::lsp_helpers::dot_segment_rejection_error(
-            "is_dot_segment",
-            "NuGet flat-container/registration request URL",
-            name,
-            REGISTRY,
-        ));
-    }
-    Ok(())
+/// `RegistrationsBaseUrl` prefix. Both builders take [`SafePathSegment`] rather than a raw
+/// `&str`, so an unchecked `name` cannot reach either sink — this is the only way to construct
+/// one.
+fn safe_name(name: &str) -> Result<SafePathSegment<'_>> {
+    SafePathSegment::checked_or_reject(
+        name,
+        name,
+        "NuGet flat-container/registration request URL",
+        REGISTRY,
+    )
 }
 
 /// Registry client implementing [`deps_core::Registry`] for NuGet, resolving packages
@@ -767,9 +766,8 @@ impl NuGetRegistry {
     /// in `publish_times_from_index` — the page `@id`s the index itself supplies) is
     /// checked against its trusted prefix, since `get_cached_trusted_origin` selects a
     /// redirect-policy-scoped client — it does not itself validate the *initial* request
-    /// URL. That initial URL's safety instead comes from `reject_dot_segment`, which gates
-    /// `name` before `flat_container_url`/`registration_index_url` are ever called (#365
-    /// M5).
+    /// URL. That initial URL's safety instead comes from `safe_name`, which gates `name`
+    /// before `flat_container_url`/`registration_index_url` are ever called (#365 M5).
     ///
     /// # Errors
     ///
@@ -781,9 +779,9 @@ impl NuGetRegistry {
         name: &str,
         freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<NuGetVersion>> {
-        reject_dot_segment(name)?;
+        let name_segment = safe_name(name)?;
         let index = self.service_index().await?;
-        let flat_url = flat_container_url(&index.package_base_address, name);
+        let flat_url = flat_container_url(&index.package_base_address, name_segment);
         let flat_trusted_prefix = format!("{}/", index.package_base_address);
         let registration_base = if freshness.enabled {
             index.registrations_base_url.clone()
@@ -797,7 +795,7 @@ impl NuGetRegistry {
         // here used to document); registration-hive enrichment (publish times, hover-only
         // unlisted markers) is no longer skipped for alternate feeds.
         if let Some(base) = registration_base {
-            let registration_url = registration_index_url(&base, name);
+            let registration_url = registration_index_url(&base, name_segment);
             let registration_trusted_prefix = format!("{base}/");
             let (flat_result, registration_result) = tokio::join!(
                 self.fetch(&flat_url, &flat_trusted_prefix),
@@ -952,12 +950,12 @@ impl NuGetRegistry {
         // Issue #562, FR-012: registration-hive enrichment is no longer skipped for
         // `WorkspaceDeclared`-tier feeds — routed through `Self::fetch` (§3.9) like every
         // other site, closing spec 035's NFR-003(3) residual risk.
-        reject_dot_segment(name)?;
+        let name_segment = safe_name(name)?;
         let index = self.service_index().await?;
         let Some(base) = index.registrations_base_url.clone() else {
             return Ok(HashSet::new());
         };
-        let registration_url = registration_index_url(&base, name);
+        let registration_url = registration_index_url(&base, name_segment);
         let trusted_prefix = format!("{base}/");
         let Ok(body) = self.fetch(&registration_url, &trusted_prefix).await else {
             return Ok(HashSet::new());
@@ -1016,15 +1014,15 @@ impl NuGetRegistry {
 /// collapses dot-segments) or truncate the path at `#`/`?`/control characters, making
 /// deps-lsp silently resolve and display a *different* real package's version data under
 /// an attacker-chosen name.
-pub(crate) fn flat_container_url(base: &str, name: &str) -> String {
-    let lower = name.to_lowercase();
+pub(crate) fn flat_container_url(base: &str, name: SafePathSegment<'_>) -> String {
+    let lower = name.as_str().to_lowercase();
     format!("{base}/{}/index.json", urlencoding::encode(&lower))
 }
 
 /// Builds the registration-hive index URL for `name`. Same lowercasing/encoding rationale
 /// as [`flat_container_url`].
-pub(crate) fn registration_index_url(base: &str, name: &str) -> String {
-    let lower = name.to_lowercase();
+pub(crate) fn registration_index_url(base: &str, name: SafePathSegment<'_>) -> String {
+    let lower = name.as_str().to_lowercase();
     format!("{base}/{}/index.json", urlencoding::encode(&lower))
 }
 
@@ -1434,7 +1432,10 @@ mod tests {
     #[test]
     fn test_flat_container_url_lowercases_and_encodes() {
         assert_eq!(
-            flat_container_url("https://api.nuget.org/v3-flatcontainer", "Newtonsoft.Json"),
+            flat_container_url(
+                "https://api.nuget.org/v3-flatcontainer",
+                SafePathSegment::new("Newtonsoft.Json").unwrap()
+            ),
             "https://api.nuget.org/v3-flatcontainer/newtonsoft.json/index.json"
         );
     }
@@ -1445,7 +1446,7 @@ mod tests {
         // that a URL-parsing layer could collapse across path boundaries.
         let url = flat_container_url(
             "https://api.nuget.org/v3-flatcontainer",
-            "../../../../etc/passwd",
+            SafePathSegment::new("../../../../etc/passwd").unwrap(),
         );
         assert_eq!(
             url,
@@ -1462,18 +1463,27 @@ mod tests {
         // '#'/'?' must not be able to truncate the path and silently resolve as a
         // different, shorter package name.
         assert_eq!(
-            flat_container_url("https://api.nuget.org/v3-flatcontainer", "Foo#x"),
+            flat_container_url(
+                "https://api.nuget.org/v3-flatcontainer",
+                SafePathSegment::new("Foo#x").unwrap()
+            ),
             "https://api.nuget.org/v3-flatcontainer/foo%23x/index.json"
         );
         assert_eq!(
-            flat_container_url("https://api.nuget.org/v3-flatcontainer", "Foo?x=1"),
+            flat_container_url(
+                "https://api.nuget.org/v3-flatcontainer",
+                SafePathSegment::new("Foo?x=1").unwrap()
+            ),
             "https://api.nuget.org/v3-flatcontainer/foo%3Fx%3D1/index.json"
         );
     }
 
     #[test]
     fn test_flat_container_url_encodes_control_characters() {
-        let url = flat_container_url("https://api.nuget.org/v3-flatcontainer", "Foo\tBar");
+        let url = flat_container_url(
+            "https://api.nuget.org/v3-flatcontainer",
+            SafePathSegment::new("Foo\tBar").unwrap(),
+        );
         assert_eq!(
             url,
             "https://api.nuget.org/v3-flatcontainer/foo%09bar/index.json"
@@ -1481,45 +1491,36 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_dot_segment_rejects_bare_dot_dot() {
-        assert!(reject_dot_segment("..").is_err());
+    fn test_safe_name_rejects_bare_dot_dot() {
+        assert!(safe_name("..").is_err());
     }
 
     #[test]
-    fn test_reject_dot_segment_rejects_bare_dot() {
-        assert!(reject_dot_segment(".").is_err());
+    fn test_safe_name_rejects_bare_dot() {
+        assert!(safe_name(".").is_err());
     }
 
     #[test]
-    fn test_reject_dot_segment_accepts_normal_names() {
-        assert!(reject_dot_segment("Newtonsoft.Json").is_ok());
+    fn test_safe_name_accepts_normal_names() {
+        assert!(safe_name("Newtonsoft.Json").is_ok());
     }
 
-    /// Demonstrates the vulnerability `reject_dot_segment` exists to prevent:
-    /// `flat_container_url` alone (with no caller-side guard) builds a URL that, once
-    /// parsed, has already lost the `v3-flatcontainer` path component.
-    #[test]
-    fn test_flat_container_url_bare_dot_dot_normalizes_above_base_prefix() {
-        let url = flat_container_url("https://api.nuget.org/v3-flatcontainer", "..");
-        let parsed = url::Url::parse(&url).unwrap();
-        assert_eq!(
-            parsed.path(),
-            "/index.json",
-            "parsed path: {}",
-            parsed.path()
-        );
-    }
+    // A `flat_container_url("https://api.nuget.org/v3-flatcontainer", "..")` call
+    // demonstrating the vulnerability `safe_name` exists to prevent used to live here — it no
+    // longer compiles: `flat_container_url` only accepts a `SafePathSegment`, which only
+    // `safe_name` can construct, so calling the sink with an unchecked `name` is now a
+    // compile error rather than a runtime-tested invariant.
 
-    /// #365 regression sweep: exercises the real production `reject_dot_segment` gate and
+    /// #365 regression sweep: exercises the real production `safe_name` gate and
     /// `flat_container_url` sink together against the shared adversarial input set,
     /// guarding against a 6th recurrence of the dot-segment defect class in this crate.
     #[test]
     fn test_flat_container_url_dot_segment_sweep() {
         deps_core::test_util::assert_dot_segment_gated_or_contained(
             |seg| {
-                reject_dot_segment(seg)
+                safe_name(seg)
                     .ok()
-                    .map(|()| flat_container_url("https://api.nuget.org/v3-flatcontainer", seg))
+                    .map(|name| flat_container_url("https://api.nuget.org/v3-flatcontainer", name))
             },
             "api.nuget.org",
             "/v3-flatcontainer/",
@@ -1882,7 +1883,7 @@ mod tests {
     /// #365 end-to-end coverage (critic S2): exercises the real production
     /// `get_versions_with` — not a reimplemented gate+sink pair — proving the gate is
     /// actually wired into the call path a real completion/hover/diagnostic request would
-    /// take. No mock is needed: `reject_dot_segment` runs before `service_index()`, so the
+    /// take. No mock is needed: `safe_name` runs before `service_index()`, so the
     /// gate must reject before any network request is issued.
     ///
     /// Asserts the exact `PackageNotFound` variant (gate rejected before any request), not
@@ -2067,21 +2068,24 @@ mod tests {
         assert_eq!(
             registration_index_url(
                 "https://api.nuget.org/v3/registration5-gz-semver2",
-                "Newtonsoft.Json"
+                SafePathSegment::new("Newtonsoft.Json").unwrap()
             ),
             "https://api.nuget.org/v3/registration5-gz-semver2/newtonsoft.json/index.json"
         );
     }
 
-    /// #365 regression sweep: exercises the real production `reject_dot_segment` gate and
+    /// #365 regression sweep: exercises the real production `safe_name` gate and
     /// `registration_index_url` sink together against the shared adversarial input set,
     /// mirroring `test_flat_container_url_dot_segment_sweep` for the sibling sink (#380).
     #[test]
     fn test_registration_index_url_dot_segment_sweep() {
         deps_core::test_util::assert_dot_segment_gated_or_contained(
             |seg| {
-                reject_dot_segment(seg).ok().map(|()| {
-                    registration_index_url("https://api.nuget.org/v3/registration5-gz-semver2", seg)
+                safe_name(seg).ok().map(|name| {
+                    registration_index_url(
+                        "https://api.nuget.org/v3/registration5-gz-semver2",
+                        name,
+                    )
                 })
             },
             "api.nuget.org",

@@ -2561,10 +2561,9 @@ mod tests {
                 content.clone(),
                 parse_result,
             );
-            doc_state.set_loading();
             // Simulate 140s of elapsed loading time without a real sleep: past the small
             // manifest's 120s (floored) ceiling, but short of the large manifest's 150s one.
-            doc_state.loading_started_at = Some(
+            doc_state.set_loading_since(
                 Instant::now()
                     .checked_sub(Duration::from_secs(140))
                     .unwrap(),
@@ -2581,7 +2580,7 @@ mod tests {
                 .state
                 .get_document(&small_uri)
                 .unwrap()
-                .loading_state,
+                .loading_state(),
             deps_core::LoadingState::Failed,
             "the 1-dependency document's 120s (floored) ceiling should have been exceeded \
              by 140s of elapsed loading time"
@@ -2591,7 +2590,7 @@ mod tests {
                 .state
                 .get_document(&large_uri)
                 .unwrap()
-                .loading_state,
+                .loading_state(),
             deps_core::LoadingState::Loading,
             "the 15-dependency document's 150s ceiling should NOT yet be exceeded by 140s \
              of elapsed loading time — if the ceiling were computed once outside the loop \

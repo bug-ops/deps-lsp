@@ -119,7 +119,7 @@ pub use deps_core::parser::DependencySource as PypiDependencySource;
 /// ```
 /// use deps_pypi::types::PypiVersion;
 ///
-/// let version = PypiVersion::new("2.28.2".into(), false);
+/// let version = PypiVersion::available("2.28.2".into());
 ///
 /// assert!(!version.yanked);
 /// assert!(!version.is_prerelease());
@@ -140,30 +140,49 @@ pub struct PypiVersion {
 }
 
 impl PypiVersion {
-    /// Constructs a `PypiVersion` from its required fields, with [`Self::published_at`]
-    /// left `None` — chain [`Self::with_published_at`] to attach it.
+    /// Constructs a non-yanked `PypiVersion`, with [`Self::published_at`] left `None` —
+    /// chain [`Self::with_published_at`] to attach it.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must go through this constructor instead.
-    ///
-    /// # Arguments
-    ///
-    /// * `version` - Version string (PEP 440 compliant)
-    /// * `yanked` - Whether this version has been yanked from PyPI
+    /// this crate, so every other crate must go through this constructor (or
+    /// [`Self::yanked`]) instead. A named constructor pair, rather than a single `new` taking
+    /// a positional `yanked: bool`, so a call site reads unambiguously without checking the
+    /// argument's name.
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_pypi::types::PypiVersion;
     ///
-    /// let version = PypiVersion::new("2.28.2".into(), false);
+    /// let version = PypiVersion::available("2.28.2".into());
     /// assert!(!version.yanked);
     /// ```
     #[must_use]
-    pub const fn new(version: deps_core::ConcreteVersion, yanked: bool) -> Self {
+    pub const fn available(version: deps_core::ConcreteVersion) -> Self {
         Self {
             version,
-            yanked,
+            yanked: false,
+            published_at: None,
+        }
+    }
+
+    /// Constructs a yanked `PypiVersion`, with [`Self::published_at`] left `None` — chain
+    /// [`Self::with_published_at`] to attach it. See [`Self::available`] for the non-yanked
+    /// counterpart.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_pypi::types::PypiVersion;
+    ///
+    /// let version = PypiVersion::yanked("2.28.2".into());
+    /// assert!(version.yanked);
+    /// ```
+    #[must_use]
+    pub const fn yanked(version: deps_core::ConcreteVersion) -> Self {
+        Self {
+            version,
+            yanked: true,
             published_at: None,
         }
     }
@@ -185,10 +204,10 @@ impl PypiVersion {
     /// ```
     /// use deps_pypi::types::PypiVersion;
     ///
-    /// let stable = PypiVersion::new("1.0.0".into(), false);
-    /// let alpha = PypiVersion::new("1.0.0a1".into(), false);
-    /// let beta = PypiVersion::new("1.0.0b2".into(), false);
-    /// let rc = PypiVersion::new("1.0.0rc1".into(), false);
+    /// let stable = PypiVersion::available("1.0.0".into());
+    /// let alpha = PypiVersion::available("1.0.0a1".into());
+    /// let beta = PypiVersion::available("1.0.0b2".into());
+    /// let rc = PypiVersion::available("1.0.0rc1".into());
     ///
     /// assert!(!stable.is_prerelease());
     /// assert!(alpha.is_prerelease());

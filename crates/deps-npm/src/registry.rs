@@ -7,14 +7,13 @@
 //! All HTTP requests are cached aggressively using ETag/Last-Modified headers.
 
 use crate::config::NpmRegistryIndex;
-use crate::types::{NpmPackage, NpmVersion};
+use crate::types::{NpmDeprecation, NpmPackage, NpmVersion};
 use dashmap::DashMap;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, is_dot_segment,
-    lsp_helpers::dot_segment_rejection_error,
-    not_found_or as core_not_found_or,
+    DepsError, EcosystemId, HOVER_RECENT_VERSIONS, HttpCache, PublishTime, Result, SafePathSegment,
+    SegmentedPathName, not_found_or as core_not_found_or,
     parser::DependencySource,
     registry::{KeyShape, register_capped},
 };
@@ -101,9 +100,9 @@ pub const NPMJS_URL: &str = "https://www.npmjs.com/package";
 /// escaped.
 ///
 /// Display link only, never fetched by this process — unlike the packument-fetch URL (see
-/// `get_versions`'s `has_dot_segment` gate), so it is deliberately not gated against a
-/// `.`/`..` segment (see [`deps_core::is_dot_segment`]'s doc for the fetch-sink-vs-display-link
-/// scope split, #379).
+/// `get_versions`'s [`SafePathSegment`] conversion via `safe_name_segments`), so it is
+/// deliberately not gated against a `.`/`..` segment (see [`deps_core::is_dot_segment`]'s doc
+/// for the fetch-sink-vs-display-link scope split, #379).
 pub fn package_url(name: &str) -> String {
     if let Some(rest) = name.strip_prefix('@')
         && let Some((scope, pkg)) = rest.split_once('/')
@@ -117,17 +116,25 @@ pub fn package_url(name: &str) -> String {
     format!("{}/{}", NPMJS_URL, urlencoding::encode(name))
 }
 
-/// Whether `name` (a bare package name, or `@scope/pkg` scoped form) has a path segment
-/// that is exactly `.` or `..` once split the same way [`versions_url`] splits it. See
+/// Splits `name` (a bare package name, or `@scope/pkg` scoped form) into validated
+/// [`SegmentedPathName`] segments before it would reach [`versions_url`], or
+/// `DepsError::PackageNotFound` if either segment is exactly `.`/`..`. See
 /// [`deps_core::lsp_helpers::is_dot_segment`]'s doc for why this must be rejected rather
 /// than encoded (#341).
-fn has_dot_segment(name: &str) -> bool {
+fn safe_name_segments(name: &str) -> Result<SegmentedPathName<'_>> {
+    const CONTEXT: &str = "npm packument request URL";
+    // `SafePathSegment::checked_or_reject` reports the full `name` in its error/log, not just
+    // the rejected sub-segment — a bare ".." tells a reader far less than "@a/.." does about
+    // which declared dependency triggered the rejection.
     if let Some(rest) = name.strip_prefix('@')
         && let Some((scope, pkg)) = rest.split_once('/')
     {
-        return is_dot_segment(scope) || is_dot_segment(pkg);
+        return Ok(SegmentedPathName::Prefixed(
+            SafePathSegment::checked_or_reject(scope, name, CONTEXT, REGISTRY)?,
+            SafePathSegment::checked_or_reject(pkg, name, CONTEXT, REGISTRY)?,
+        ));
     }
-    is_dot_segment(name)
+    SafePathSegment::checked_or_reject(name, name, CONTEXT, REGISTRY).map(SegmentedPathName::Single)
 }
 
 /// Builds the npm registry request URL for a package's version metadata.
@@ -135,18 +142,20 @@ fn has_dot_segment(name: &str) -> bool {
 /// Mirrors `package_url`'s per-segment encoding for scoped packages (`@scope/name`
 /// keeps its `/` structure, with `scope` and `name` each percent-encoded
 /// individually) so a malicious or unusual name can't inject extra path
-/// segments or query syntax into the request.
-fn versions_url(base: &str, name: &str) -> String {
-    if let Some(rest) = name.strip_prefix('@')
-        && let Some((scope, pkg)) = rest.split_once('/')
-    {
-        return format!(
+/// segments or query syntax into the request. Takes [`SegmentedPathName`] rather than a raw
+/// `name: &str` so an unchecked `.`/`..` segment cannot reach this builder — only
+/// [`safe_name_segments`] can construct the argument.
+fn versions_url(base: &str, segments: SegmentedPathName<'_>) -> String {
+    match segments {
+        SegmentedPathName::Prefixed(scope, pkg) => format!(
             "{base}/@{}/{}",
-            urlencoding::encode(scope),
-            urlencoding::encode(pkg)
-        );
+            urlencoding::encode(scope.as_str()),
+            urlencoding::encode(pkg.as_str())
+        ),
+        SegmentedPathName::Single(name) => {
+            format!("{base}/{}", urlencoding::encode(name.as_str()))
+        }
     }
-    format!("{base}/{}", urlencoding::encode(name))
 }
 
 /// Converts a 404 response into `DepsError::PackageNotFound`, passing through
@@ -340,16 +349,7 @@ impl NpmRegistry {
     /// ```
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NpmVersion>> {
-        if has_dot_segment(name) {
-            return Err(dot_segment_rejection_error(
-                "is_dot_segment",
-                "npm packument request URL",
-                name,
-                REGISTRY,
-            ));
-        }
-
-        let url = versions_url(&self.registry_base, name);
+        let url = versions_url(&self.registry_base, safe_name_segments(name)?);
         let headers = [(reqwest::header::ACCEPT, ABBREVIATED_ACCEPT)];
         let data = match self.tier {
             NpmRegistryTier::Public => self.cache.get_cached_with_headers(&url, &headers).await,
@@ -456,7 +456,14 @@ impl NpmRegistry {
         name: &str,
         known_versions: &[String],
     ) -> HashMap<String, PublishTime> {
-        let url = versions_url(&self.registry_base, name);
+        // Only reachable from `get_versions_with`, after `get_versions` already validated
+        // `name` via `safe_name_segments` — an error here is unreachable in practice, but
+        // still degrades to the same "no publish times" outcome as any other fetch failure
+        // rather than panicking.
+        let Ok(segments) = safe_name_segments(name) else {
+            return HashMap::new();
+        };
+        let url = versions_url(&self.registry_base, segments);
         let fetch = self.cache.get_transport_only_with_headers(
             &url,
             &[(reqwest::header::ACCEPT, "application/json")],
@@ -571,7 +578,7 @@ impl NpmRegistry {
 
         Ok(versions.into_iter().find(|v| {
             let version = node_semver::Version::parse(&v.version).ok();
-            version.is_some_and(|ver| req.satisfies(&ver) && !v.deprecated)
+            version.is_some_and(|ver| req.satisfies(&ver) && !v.deprecation.is_deprecated())
         }))
     }
 
@@ -635,23 +642,6 @@ struct VersionMetadata {
     deprecated: Option<String>,
 }
 
-/// Derives a #205 [`Deprecation`](deps_core::Deprecation) payload from npm's free-text
-/// `deprecated` field, or `None` if there is nothing worth telling the user.
-///
-/// M2: an all-whitespace `deprecated` string (`"deprecated": ""` is how a package is
-/// *un*-deprecated in practice) must produce `None`, not a `Deprecation` with a
-/// dangling, empty reason — `removal_status()` above is unaffected (it still treats
-/// `Some("")` as flagged, matching pre-#205 behavior; this is only about the payload
-/// shown to the user). Never populates `replacement`: npm has no structured successor
-/// field, only free text (see [`NpmVersion::deprecation`]'s docs).
-fn deprecation_from_message(message: Option<&str>) -> Option<deps_core::Deprecation> {
-    let reason = message.map(str::trim).filter(|s| !s.is_empty())?;
-    Some(deps_core::Deprecation {
-        reason: Some(reason.to_string()),
-        replacement: None,
-    })
-}
-
 /// Parses JSON response from npm package metadata API.
 fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
     let metadata: PackageMetadata = deps_core::parse_json_checked(data)?;
@@ -664,8 +654,7 @@ fn parse_package_metadata(data: &[u8]) -> Result<Vec<NpmVersion>> {
             Some((
                 NpmVersion {
                     version: version.into(),
-                    deprecated: meta.deprecated.is_some(),
-                    deprecation: deprecation_from_message(meta.deprecated.as_deref()),
+                    deprecation: NpmDeprecation::from_registry_field(meta.deprecated.as_deref()),
                     published_at: None,
                 },
                 parsed,
@@ -1008,7 +997,7 @@ mod tests {
     #[test]
     fn test_versions_url_plain() {
         assert_eq!(
-            versions_url(REGISTRY_BASE, "express"),
+            versions_url(REGISTRY_BASE, safe_name_segments("express").unwrap()),
             "https://registry.npmjs.org/express"
         );
     }
@@ -1016,7 +1005,7 @@ mod tests {
     #[test]
     fn test_versions_url_scoped_preserves_structure() {
         assert_eq!(
-            versions_url(REGISTRY_BASE, "@types/node"),
+            versions_url(REGISTRY_BASE, safe_name_segments("@types/node").unwrap()),
             "https://registry.npmjs.org/@types/node"
         );
     }
@@ -1026,7 +1015,10 @@ mod tests {
         // A raw `/`, `?`, or `#` in an unscoped name must not survive into
         // the path/query, since `get_versions` doesn't normalize `name`
         // before building the request URL.
-        let url = versions_url(REGISTRY_BASE, "evil/../secret?x=1#frag");
+        let url = versions_url(
+            REGISTRY_BASE,
+            safe_name_segments("evil/../secret?x=1#frag").unwrap(),
+        );
         assert!(!url.contains("/../"));
         assert!(!url.contains('?'));
         assert!(!url.contains('#'));
@@ -1034,7 +1026,10 @@ mod tests {
 
     #[test]
     fn test_versions_url_scoped_encodes_malicious_segments() {
-        let url = versions_url(REGISTRY_BASE, "@evil/../secret?x=1#frag");
+        let url = versions_url(
+            REGISTRY_BASE,
+            safe_name_segments("@evil/../secret?x=1#frag").unwrap(),
+        );
         assert!(!url.contains("/../"));
         assert!(!url.contains('?'));
         assert!(!url.contains('#'));
@@ -1042,58 +1037,50 @@ mod tests {
 
     // --- #341: `.`/`..` path segments survive percent-encoding and are collapsed by the
     // URL parser's own dot-segment normalization, which a raw `!url.contains(...)` check
-    // (as used by the tests above) cannot detect. These assert on the *parsed* URL.
+    // (as used by the tests above) cannot detect.
+    //
+    // A `versions_url(REGISTRY_BASE, "@a/..")` call demonstrating the vulnerability
+    // `safe_name_segments` exists to prevent used to live here — it no longer compiles:
+    // `versions_url` only accepts a `SegmentedPathName`, which only `safe_name_segments` can
+    // construct, so calling the sink with an unchecked segment is now a compile error rather
+    // than a runtime-tested invariant.
 
-    /// Demonstrates the vulnerability `has_dot_segment` exists to prevent: `versions_url`
-    /// alone (with no caller-side guard) builds a URL that, once parsed, has already lost
-    /// the package segment — `@a/..` normalizes away to the registry root instead of a
-    /// 404 for a literal package named `..`.
-    #[test]
-    fn test_versions_url_scoped_dot_dot_segment_normalizes_to_registry_root() {
-        let url = versions_url(REGISTRY_BASE, "@a/..");
-        let parsed = url::Url::parse(&url).unwrap();
-        assert_eq!(parsed.path(), "/", "parsed path: {}", parsed.path());
-    }
-
-    #[test]
-    fn test_versions_url_bare_dot_dot_normalizes_to_registry_root() {
-        let url = versions_url(REGISTRY_BASE, "..");
-        let parsed = url::Url::parse(&url).unwrap();
-        assert_eq!(parsed.path(), "/", "parsed path: {}", parsed.path());
-    }
-
-    /// #365 regression sweep: exercises the real production pair (`has_dot_segment` gate +
+    /// #365 regression sweep: exercises the real production pair (`safe_name_segments` gate +
     /// `versions_url` sink) against the shared adversarial input set, guarding against a 6th
     /// recurrence of #341's defect class.
     #[test]
     fn test_versions_url_dot_segment_sweep() {
         deps_core::test_util::assert_dot_segment_gated_or_contained(
-            |seg| (!has_dot_segment(seg)).then(|| versions_url(REGISTRY_BASE, seg)),
+            |seg| {
+                safe_name_segments(seg)
+                    .ok()
+                    .map(|segments| versions_url(REGISTRY_BASE, segments))
+            },
             "registry.npmjs.org",
             "/",
         );
     }
 
     #[test]
-    fn test_has_dot_segment_rejects_scoped_dot_dot_package() {
-        assert!(has_dot_segment("@a/.."));
+    fn test_safe_name_segments_rejects_scoped_dot_dot_package() {
+        assert!(safe_name_segments("@a/..").is_err());
     }
 
     #[test]
-    fn test_has_dot_segment_rejects_scoped_dot_package() {
-        assert!(has_dot_segment("@a/."));
+    fn test_safe_name_segments_rejects_scoped_dot_package() {
+        assert!(safe_name_segments("@a/.").is_err());
     }
 
     #[test]
-    fn test_has_dot_segment_rejects_bare_dot_dot() {
-        assert!(has_dot_segment(".."));
+    fn test_safe_name_segments_rejects_bare_dot_dot() {
+        assert!(safe_name_segments("..").is_err());
     }
 
     #[test]
-    fn test_has_dot_segment_accepts_normal_names() {
-        assert!(!has_dot_segment("express"));
-        assert!(!has_dot_segment("@types/node"));
-        assert!(!has_dot_segment("left-pad"));
+    fn test_safe_name_segments_accepts_normal_names() {
+        assert!(safe_name_segments("express").is_ok());
+        assert!(safe_name_segments("@types/node").is_ok());
+        assert!(safe_name_segments("left-pad").is_ok());
     }
 
     #[tokio::test]
@@ -1137,13 +1124,13 @@ mod tests {
 
         // Sorted newest first
         assert_eq!(versions[0].version, "1.0.2");
-        assert!(!versions[0].deprecated);
+        assert!(!versions[0].deprecation.is_deprecated());
 
         assert_eq!(versions[1].version, "1.0.1");
-        assert!(versions[1].deprecated);
+        assert!(versions[1].deprecation.is_deprecated());
 
         assert_eq!(versions[2].version, "1.0.0");
-        assert!(!versions[2].deprecated);
+        assert!(!versions[2].deprecation.is_deprecated());
     }
 
     #[test]
@@ -1258,23 +1245,23 @@ mod tests {
         let versions = parse_package_metadata(json.as_bytes()).unwrap();
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version, "1.3.0");
-        assert!(versions[0].deprecated);
+        assert!(versions[0].deprecation.is_deprecated());
         assert_eq!(
             versions[0]
                 .deprecation
-                .as_ref()
+                .payload()
                 .and_then(|d| d.reason.as_deref()),
             Some("use String.prototype.padStart()")
         );
         assert_eq!(versions[1].version, "1.2.0");
-        assert!(!versions[1].deprecated);
-        assert!(versions[1].deprecation.is_none());
+        assert!(!versions[1].deprecation.is_deprecated());
+        assert!(versions[1].deprecation.payload().is_none());
     }
 
     /// #205 M2: `"deprecated": ""` is npm's own convention for *un*-deprecating a
     /// package — the `Deprecation` payload must be `None`, not `Some` with a dangling
-    /// empty reason, even though `removal_status()` (unaffected, pre-existing behavior)
-    /// still treats `Some("")` as flagged.
+    /// empty reason, even though `is_deprecated()` (unaffected, pre-existing behavior)
+    /// still treats a present-but-empty field as flagged.
     #[test]
     fn test_parse_abbreviated_packument_empty_string_deprecated_has_no_payload() {
         let json = r#"{
@@ -1286,24 +1273,10 @@ mod tests {
         let versions = parse_package_metadata(json.as_bytes()).unwrap();
         assert_eq!(versions.len(), 1);
         assert!(
-            versions[0].deprecated,
+            versions[0].deprecation.is_deprecated(),
             "removal_status derivation is unaffected"
         );
-        assert!(versions[0].deprecation.is_none());
-    }
-
-    #[test]
-    fn test_deprecation_from_message_trims_and_rejects_empty() {
-        assert_eq!(deprecation_from_message(None), None);
-        assert_eq!(deprecation_from_message(Some("")), None);
-        assert_eq!(deprecation_from_message(Some("   ")), None);
-        assert_eq!(
-            deprecation_from_message(Some("  use foo instead  ")),
-            Some(deps_core::Deprecation {
-                reason: Some("use foo instead".to_string()),
-                replacement: None,
-            })
-        );
+        assert!(versions[0].deprecation.payload().is_none());
     }
 
     #[test]
@@ -1324,7 +1297,7 @@ mod tests {
 }"#;
         let versions = parse_package_metadata(json.as_bytes()).unwrap();
         assert_eq!(versions.len(), 2);
-        assert!(versions.iter().all(|v| v.deprecated));
+        assert!(versions.iter().all(|v| v.deprecation.is_deprecated()));
     }
 
     #[test]
@@ -1410,7 +1383,7 @@ mod tests {
         assert!(latest.is_some());
         let version = latest.unwrap();
         assert!(version.version.as_str().starts_with("4."));
-        assert!(!version.deprecated);
+        assert!(!version.deprecation.is_deprecated());
     }
 
     deps_core::registry_conformance! {
@@ -1420,14 +1393,12 @@ mod tests {
             versions: vec![
                 Box::new(NpmVersion {
                     version: "2.0.0".into(),
-                    deprecated: true,
-                    deprecation: None,
+                    deprecation: NpmDeprecation::Deprecated(None),
                     published_at: None,
                 }),
                 Box::new(NpmVersion {
                     version: "1.0.0".into(),
-                    deprecated: false,
-                    deprecation: None,
+                    deprecation: NpmDeprecation::Active,
                     published_at: None,
                 }),
             ];
@@ -1453,14 +1424,12 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![
             Box::new(NpmVersion {
                 version: "1.3.0".into(),
-                deprecated: true,
-                deprecation: None,
+                deprecation: NpmDeprecation::Deprecated(None),
                 published_at: None,
             }),
             Box::new(NpmVersion {
                 version: "1.2.0".into(),
-                deprecated: true,
-                deprecation: None,
+                deprecation: NpmDeprecation::Deprecated(None),
                 published_at: None,
             }),
         ];
@@ -1481,8 +1450,7 @@ mod tests {
         let registry = NpmRegistry::new(cache);
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
             version: "1.0.0".into(),
-            deprecated: true,
-            deprecation: None,
+            deprecation: NpmDeprecation::Deprecated(None),
             published_at: None,
         })];
         let req = VersionReq::new("");
@@ -1507,14 +1475,12 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![
             Box::new(NpmVersion {
                 version: "19.2.0-canary.1".into(),
-                deprecated: false,
-                deprecation: None,
+                deprecation: NpmDeprecation::Active,
                 published_at: None,
             }),
             Box::new(NpmVersion {
                 version: "19.1.0".into(),
-                deprecated: false,
-                deprecation: None,
+                deprecation: NpmDeprecation::Active,
                 published_at: None,
             }),
         ];
@@ -1537,14 +1503,12 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![
             Box::new(NpmVersion {
                 version: "2.0.0-alpha".into(),
-                deprecated: false,
-                deprecation: None,
+                deprecation: NpmDeprecation::Active,
                 published_at: None,
             }),
             Box::new(NpmVersion {
                 version: "1.0.0-beta".into(),
-                deprecated: false,
-                deprecation: None,
+                deprecation: NpmDeprecation::Active,
                 published_at: None,
             }),
         ];
@@ -1590,8 +1554,7 @@ mod tests {
         let registry = NpmRegistry::new(cache);
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
             version: "1.0.0".into(),
-            deprecated: false,
-            deprecation: None,
+            deprecation: NpmDeprecation::Active,
             published_at: None,
         })];
         let oversized = oversized_parseable_range();
@@ -1613,8 +1576,7 @@ mod tests {
         let at_cap = at_cap_range();
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
             version: at_cap.clone().into(),
-            deprecated: false,
-            deprecation: None,
+            deprecation: NpmDeprecation::Active,
             published_at: None,
         })];
         let req = VersionReq::new(&at_cap);
@@ -1765,8 +1727,11 @@ mod tests {
             .map(|(version, deprecated)| {
                 Box::new(NpmVersion {
                     version: (*version).into(),
-                    deprecated: *deprecated,
-                    deprecation: None,
+                    deprecation: if *deprecated {
+                        NpmDeprecation::Deprecated(None)
+                    } else {
+                        NpmDeprecation::Active
+                    },
                     published_at: None,
                 }) as Box<dyn deps_core::Version>
             })
@@ -1859,7 +1824,7 @@ mod tests {
 
         let version = latest.expect("a prerelease-only, non-deprecated package still exists");
         assert_eq!(version.version, "2.0.0-alpha");
-        assert!(!version.deprecated);
+        assert!(!version.deprecation.is_deprecated());
     }
 
     /// #338 NFR-001: `get_latest_matching` under a wildcard requirement, mirroring the
@@ -1888,9 +1853,9 @@ mod tests {
 
         let version = latest.expect("an all-deprecated package must still resolve a latest");
         assert_eq!(version.version, "1.3.0");
-        assert!(version.deprecated);
+        assert!(version.deprecation.is_deprecated());
         assert!(
-            version.deprecation.is_some(),
+            version.deprecation.payload().is_some(),
             "T3/C1: when every non-prerelease version is deprecated, rung 1 finds \
              nothing and rung 2 returns a deprecated pick — the #205 finding must fire"
         );
@@ -1921,9 +1886,9 @@ mod tests {
 
         let version = latest.expect("widget has a non-deprecated version");
         assert_eq!(version.version, "1.0.0");
-        assert!(!version.deprecated);
+        assert!(!version.deprecation.is_deprecated());
         assert!(
-            version.deprecation.is_none(),
+            version.deprecation.payload().is_none(),
             "T3/C1: a partially-deprecated version list must yield no #205 finding — \
              rung 1 finds the clean 1.0.0 before rung 2 (the all-deprecated fallback) \
              ever runs; a developer expecting 'latest is deprecated' semantics here \
@@ -1934,8 +1899,7 @@ mod tests {
     fn npm_v(s: &str) -> NpmVersion {
         NpmVersion {
             version: s.into(),
-            deprecated: false,
-            deprecation: None,
+            deprecation: NpmDeprecation::Active,
             published_at: None,
         }
     }

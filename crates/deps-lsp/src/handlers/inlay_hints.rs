@@ -59,7 +59,7 @@ pub async fn handle_inlay_hints(
             .snapshot()
             .with_resolved_version_candidates()
             .finish();
-        Some((ecosystem, parse_result, snapshot, doc.loading_state))
+        Some((ecosystem, parse_result, snapshot, doc.loading_state()))
     }) else {
         tracing::warn!("Document not found: {:?}", uri);
         return vec![];

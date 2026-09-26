@@ -2,7 +2,7 @@
 //!
 //! Extracts plugin declarations from `pluginManagement { plugins { } }` blocks.
 
-use crate::parser::{GradleParseResult, utf16_len};
+use crate::parser::{GradleParseResult, saturating_utf16_len};
 use crate::types::GradleDependency;
 use deps_core::Result;
 use deps_core::position::{Position, Range};
@@ -25,8 +25,8 @@ static RE_PLUGIN: LazyLock<Regex> = LazyLock::new(|| {
 #[allow(clippy::string_slice)]
 fn find_plugin_name_range(line: &str, line_idx: u32, plugin_id: &str) -> Range {
     if let Some(col) = line.find(plugin_id) {
-        let col_u32 = utf16_len(&line[..col]) as u32;
-        let end_u32 = col_u32 + utf16_len(plugin_id) as u32;
+        let col_u32 = deps_core::completion::byte_to_utf16_offset(line, col);
+        let end_u32 = col_u32 + saturating_utf16_len(plugin_id);
         Range::new(
             Position::new(line_idx, col_u32),
             Position::new(line_idx, end_u32),
@@ -45,8 +45,8 @@ fn find_plugin_version_range(line: &str, line_idx: u32, version: &str) -> Range 
         let after_kw = &line[kw_pos + "version".len()..];
         if let Some(rel) = after_kw.find(version) {
             let abs_start = kw_pos + "version".len() + rel;
-            let col_start = utf16_len(&line[..abs_start]) as u32;
-            let col_end = col_start + utf16_len(version) as u32;
+            let col_start = deps_core::completion::byte_to_utf16_offset(line, abs_start);
+            let col_end = col_start + saturating_utf16_len(version);
             return Range::new(
                 Position::new(line_idx, col_start),
                 Position::new(line_idx, col_end),

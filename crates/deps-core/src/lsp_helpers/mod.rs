@@ -2578,7 +2578,7 @@ pub fn warn_rejected_value(gate: &str, context: &str, value: &str) {
 /// than the other three's `"is_dot_segment"` before this extraction normalized it. Each
 /// crate keeps its own dot-segment *predicate* and the call to it exactly where it is
 /// today; only this trailing boilerplate is shared. Deliberately does **not** fold in
-/// `deps-go`'s guard, which returns `DepsError::InvalidVersionReq`, not `PackageNotFound`.
+/// `deps-go`'s guard, which returns `DepsError::InvalidPackageName`, not `PackageNotFound`.
 ///
 /// # Examples
 ///

@@ -2,7 +2,7 @@
 
 use crate::types::{DartVersion, PackageInfo};
 use crate::version::compare_versions;
-use deps_core::{HttpCache, Result, is_dot_segment, lsp_helpers::dot_segment_rejection_error};
+use deps_core::{HttpCache, Result, SafePathSegment};
 use serde::Deserialize;
 use std::any::Any;
 use std::sync::Arc;
@@ -26,29 +26,22 @@ pub fn package_url(name: &str) -> String {
 ///
 /// Unlike `package_url` (a display link, never fetched), this is a fetch sink: `name` is
 /// percent-encoded, but a `name` of exactly `.`/`..` survives encoding unchanged (`.` is an
-/// unreserved character) and is only rejected by the caller's [`is_dot_segment`] guard, run
-/// *before* this function — see that predicate's doc for why encoding alone is insufficient
-/// (#349). Takes `base` (rather than reading [`PUB_DEV_API_BASE`] directly) so tests can
-/// point it at a mockito server.
-fn package_metadata_url(base: &str, name: &str) -> String {
-    format!("{base}/packages/{}", urlencoding::encode(name))
+/// unreserved character) and would collapse the `/api/packages/` prefix away if it weren't for
+/// this taking [`SafePathSegment`] rather than a raw `&str` — [`safe_name`] is the only way to
+/// construct one, so an unchecked `name` cannot reach this builder (#349). Takes `base`
+/// (rather than reading [`PUB_DEV_API_BASE`] directly) so tests can point it at a mockito
+/// server.
+fn package_metadata_url(base: &str, name: SafePathSegment<'_>) -> String {
+    format!("{base}/packages/{}", urlencoding::encode(name.as_str()))
 }
 
-/// Rejects a dot-segment `name` before it would reach [`package_metadata_url`], as
-/// `DepsError::PackageNotFound` — mirroring `deps-npm`'s identical guard for the same
-/// vulnerability class (#341/#349): percent-encoding a pub.dev package name does not stop
-/// the URL parser's dot-segment normalization from retargeting the request (`..` escapes
+/// Validates a dot-segment `name` before it would reach [`package_metadata_url`]/
+/// [`score_url`], as `DepsError::PackageNotFound` — mirroring `deps-npm`'s identical guard for
+/// the same vulnerability class (#341/#349): percent-encoding a pub.dev package name does not
+/// stop the URL parser's dot-segment normalization from retargeting the request (`..` escapes
 /// the `/api/packages/` prefix entirely; `.` collapses it to `/api/packages/`).
-fn reject_dot_segment(name: &str) -> Result<()> {
-    if is_dot_segment(name) {
-        return Err(dot_segment_rejection_error(
-            "is_dot_segment",
-            "pub.dev package metadata request URL",
-            name,
-            REGISTRY,
-        ));
-    }
-    Ok(())
+fn safe_name(name: &str) -> Result<SafePathSegment<'_>> {
+    SafePathSegment::checked_or_reject(name, name, "pub.dev package metadata request URL", REGISTRY)
 }
 
 /// pub.dev registry client implementing [`deps_core::Registry`] for Dart/Pub.
@@ -85,8 +78,7 @@ impl PubDevRegistry {
     /// response body fails to parse.
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<DartVersion>> {
-        reject_dot_segment(name)?;
-        let url = package_metadata_url(&self.base, name);
+        let url = package_metadata_url(&self.base, safe_name(name)?);
         let data = self.cache.get_cached(&url).await?;
         parse_versions_response(&data)
     }
@@ -125,10 +117,10 @@ impl PubDevRegistry {
             // search response), exactly as untrusted as a manifest-declared name — routed
             // through the same guard + encoding as `get_versions`/`get_package_metadata` rather
             // than interpolated directly (#349).
-            if reject_dot_segment(&entry.package).is_err() {
+            let Ok(package) = safe_name(&entry.package) else {
                 continue;
-            }
-            let pkg_url = package_metadata_url(&self.base, &entry.package);
+            };
+            let pkg_url = package_metadata_url(&self.base, package);
             if let Ok(pkg_data) = self.cache.get_cached(&pkg_url).await
                 && let Ok(info) = parse_package_info(&pkg_data)
             {
@@ -147,8 +139,7 @@ impl PubDevRegistry {
     /// response body fails to parse.
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_package_metadata(&self, name: &str) -> Result<PackageInfo> {
-        reject_dot_segment(name)?;
-        let url = package_metadata_url(&self.base, name);
+        let url = package_metadata_url(&self.base, safe_name(name)?);
         let data = self.cache.get_cached(&url).await?;
         parse_package_info(&data)
     }
@@ -170,10 +161,10 @@ impl PubDevRegistry {
     /// secondary signal, not core version data.
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_license(&self, name: &str) -> Vec<String> {
-        if reject_dot_segment(name).is_err() {
+        let Ok(name_segment) = safe_name(name) else {
             return Vec::new();
-        }
-        let url = score_url(&self.base, name);
+        };
+        let url = score_url(&self.base, name_segment);
         match self.cache.get_cached(&url).await {
             Ok(data) => parse_score_license(&data),
             Err(e) => {
@@ -191,10 +182,13 @@ impl PubDevRegistry {
 deps_core::impl_get_versions_with_passthrough!(PubDevRegistry, DartVersion);
 
 /// Builds the pub.dev request URL for a package's `/score` response (license detector
-/// tags, likes, download counts). Mirrors [`package_metadata_url`]'s encoding — `name`
-/// must already be dot-segment-checked by the caller.
-fn score_url(base: &str, name: &str) -> String {
-    format!("{base}/packages/{}/score", urlencoding::encode(name))
+/// tags, likes, download counts). Mirrors [`package_metadata_url`]'s encoding and
+/// [`SafePathSegment`] parameter.
+fn score_url(base: &str, name: SafePathSegment<'_>) -> String {
+    format!(
+        "{base}/packages/{}/score",
+        urlencoding::encode(name.as_str())
+    )
 }
 
 /// The subset of pub.dev's `/score` response this client needs.
@@ -642,7 +636,7 @@ mod tests {
     #[test]
     fn test_package_metadata_url_encodes_path_traversal() {
         let name = "../../search";
-        let url = package_metadata_url(PUB_DEV_API_BASE, name);
+        let url = package_metadata_url(PUB_DEV_API_BASE, SafePathSegment::new(name).unwrap());
         let parsed = url::Url::parse(&url).unwrap();
         let segments: Vec<&str> = parsed.path_segments().unwrap().collect();
         assert_eq!(segments.len(), 3, "segments: {segments:?}");
@@ -654,44 +648,38 @@ mod tests {
     // --- S1 (impl-critic): a name of exactly `.`/`..` survives percent-encoding (`.` is
     // an unreserved RFC 3986 character) and is collapsed by the URL parser's dot-segment
     // normalization — identical to #341's npm bug, reachable here via `get_versions`,
-    // `get_package_metadata`, and search's inner per-result fetch. `reject_dot_segment` must
-    // catch it before `package_metadata_url` is ever called. ---
+    // `get_package_metadata`, and search's inner per-result fetch. `safe_name` must catch it
+    // before `package_metadata_url` is ever called — and, since that builder only accepts a
+    // `SafePathSegment`, calling it with an unchecked `".."` is now a compile error rather
+    // than a runtime-tested invariant. ---
 
-    /// Demonstrates the vulnerability `reject_dot_segment` exists to prevent:
-    /// `package_metadata_url` alone (with no caller-side guard) builds a URL that, once
-    /// parsed, has already lost the `packages` path component — `..` normalizes two
-    /// levels up to the bare `/api/` root instead of a 404 for a literal package named
-    /// `..`.
     #[test]
-    fn test_package_metadata_url_dot_dot_normalizes_above_packages_prefix() {
-        let url = package_metadata_url(PUB_DEV_API_BASE, "..");
-        let parsed = url::Url::parse(&url).unwrap();
-        assert_eq!(parsed.path(), "/api/", "parsed path: {}", parsed.path());
+    fn test_safe_name_rejects_bare_dot_dot() {
+        assert!(safe_name("..").is_err());
     }
 
     #[test]
-    fn test_reject_dot_segment_rejects_bare_dot_dot() {
-        assert!(reject_dot_segment("..").is_err());
+    fn test_safe_name_rejects_bare_dot() {
+        assert!(safe_name(".").is_err());
     }
 
     #[test]
-    fn test_reject_dot_segment_rejects_bare_dot() {
-        assert!(reject_dot_segment(".").is_err());
+    fn test_safe_name_accepts_normal_names() {
+        assert!(safe_name("provider").is_ok());
+        assert!(safe_name("../../search").is_ok());
     }
 
-    #[test]
-    fn test_reject_dot_segment_accepts_normal_names() {
-        assert!(reject_dot_segment("provider").is_ok());
-        assert!(reject_dot_segment("../../search").is_ok());
-    }
-
-    /// #365 regression sweep: exercises the real production pair (`is_dot_segment` gate +
+    /// #365 regression sweep: exercises the real production pair (`safe_name` gate +
     /// `package_metadata_url` sink) against the shared adversarial input set, guarding
     /// against a 6th recurrence of #349's defect class.
     #[test]
     fn test_package_metadata_url_dot_segment_sweep() {
         deps_core::test_util::assert_dot_segment_gated_or_contained(
-            |seg| (!is_dot_segment(seg)).then(|| package_metadata_url(PUB_DEV_API_BASE, seg)),
+            |seg| {
+                safe_name(seg)
+                    .ok()
+                    .map(|name| package_metadata_url(PUB_DEV_API_BASE, name))
+            },
             "pub.dev",
             "/api/packages/",
         );
@@ -719,7 +707,7 @@ mod tests {
     // fully unencoded and unguarded, 12 lines below the encoded `get_versions` sink — a
     // missed #349 call site. Covered end-to-end via mockito, matching the guard/encoding
     // now shared with `get_versions`/`get_package_metadata` through `package_metadata_url` and
-    // `reject_dot_segment`. ---
+    // `SafePathSegment`. ---
 
     #[tokio::test]
     async fn test_search_inner_fetch_encodes_malicious_package_name() {

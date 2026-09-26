@@ -73,7 +73,7 @@ pub enum DenoDependencySection {
 /// ```
 /// use deps_deno::types::JsrVersion;
 ///
-/// let version = JsrVersion::new("1.0.24".into(), false);
+/// let version = JsrVersion::available("1.0.24".into());
 ///
 /// assert!(!version.yanked);
 /// ```
@@ -89,30 +89,49 @@ pub struct JsrVersion {
 }
 
 impl JsrVersion {
-    /// Constructs a `JsrVersion` from its required fields, with [`Self::published_at`] left
-    /// `None` — chain [`Self::with_published_at`] to attach it.
+    /// Constructs a non-yanked `JsrVersion`, with [`Self::published_at`] left `None` — chain
+    /// [`Self::with_published_at`] to attach it.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
-    /// this crate, so every other crate must go through this constructor instead.
-    ///
-    /// # Arguments
-    ///
-    /// * `version` - The version string (e.g. `"1.0.24"`)
-    /// * `yanked` - Whether JSR marked this specific version as yanked
+    /// this crate, so every other crate must go through this constructor (or
+    /// [`Self::yanked`]) instead. A named constructor pair, rather than a single `new` taking
+    /// a positional `yanked: bool`, so a call site reads unambiguously without checking the
+    /// argument's name.
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_deno::types::JsrVersion;
     ///
-    /// let version = JsrVersion::new("1.0.24".into(), false);
+    /// let version = JsrVersion::available("1.0.24".into());
     /// assert!(!version.yanked);
     /// ```
     #[must_use]
-    pub const fn new(version: deps_core::ConcreteVersion, yanked: bool) -> Self {
+    pub const fn available(version: deps_core::ConcreteVersion) -> Self {
         Self {
             version,
-            yanked,
+            yanked: false,
+            published_at: None,
+        }
+    }
+
+    /// Constructs a yanked `JsrVersion`, with [`Self::published_at`] left `None` — chain
+    /// [`Self::with_published_at`] to attach it. See [`Self::available`] for the non-yanked
+    /// counterpart.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_deno::types::JsrVersion;
+    ///
+    /// let version = JsrVersion::yanked("1.0.24".into());
+    /// assert!(version.yanked);
+    /// ```
+    #[must_use]
+    pub const fn yanked(version: deps_core::ConcreteVersion) -> Self {
+        Self {
+            version,
+            yanked: true,
             published_at: None,
         }
     }

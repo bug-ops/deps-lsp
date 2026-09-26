@@ -865,8 +865,8 @@ mod tests {
         build: DenoRegistry::new(Arc::new(HttpCache::new()));
         select_latest_matching: {
             versions: vec![
-                Box::new(JsrVersion::new("2.0.0".into(), false)),
-                Box::new(JsrVersion::new("1.0.0".into(), false)),
+                Box::new(JsrVersion::available("2.0.0".into())),
+                Box::new(JsrVersion::available("1.0.0".into())),
             ];
             req: "^1.0.0";
             expected_index: 1;
@@ -1066,7 +1066,7 @@ mod tests {
         );
 
         let versions: Vec<Box<dyn deps_core::Version>> =
-            vec![Box::new(JsrVersion::new("1.0.0".into(), false))];
+            vec![Box::new(JsrVersion::available("1.0.0".into()))];
         SelectionContextCapture::reset();
         let _ = Registry::select_latest_matching(
             &registry,
