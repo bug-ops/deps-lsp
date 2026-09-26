@@ -53,7 +53,7 @@ pub type DepSources = Vec<(PackageName, deps_core::parser::DependencySource)>;
 ///    distinguishable from `deps-cargo`'s own FR-003 unresolved-alias warning.
 ///
 /// Returns `(sources, collided)`: `sources` is ready to fetch as-is; `collided` must be
-/// merged into `DocumentState::outcomes`' fetch-failure channel by the caller so
+/// merged into `DocumentState::signals.outcomes`' fetch-failure channel by the caller so
 /// `generate_diagnostics_from_cache` reports "lookup could not be determined" rather than
 /// a false "Unknown package" for a dependency that was never actually queried.
 ///
@@ -156,7 +156,7 @@ pub struct FetchPreparation {
     /// [`deps_core::ParseResult::selection_context`].
     pub selection_context: deps_core::SelectionContext,
     /// Names dropped by [`dedup_dependencies_by_source`]'s collision gate — must be merged
-    /// into `DocumentState::outcomes`' fetch-failure channel by the caller (spec FR-011).
+    /// into `DocumentState::signals.outcomes`' fetch-failure channel by the caller (spec FR-011).
     pub collided_names: HashSet<PackageName>,
 }
 
@@ -232,7 +232,7 @@ pub struct FetchResult {
     /// Successfully fetched versions (package -> latest + full version list)
     pub versions: HashMap<PackageName, PackageVersions>,
     /// Yanked-version findings, keyed by **raw** package name (unlike
-    /// `DocumentState::outcomes`, which is normalized-keyed — see
+    /// `DocumentState::signals.outcomes`, which is normalized-keyed — see
     /// §3.1 of the design), to (the version string found yanked, its
     /// `RemovalStatus`). The status rides alongside so #205's package-level
     /// deprecation diagnostic can gate its yanked-check suppression on
@@ -275,7 +275,7 @@ pub struct FetchResult {
     /// constructed identically across ~40 call sites throughout the workspace,
     /// including files outside this crate's ownership for this change) —
     /// `merge_registry_fetch_result` merges this map directly into
-    /// `deps-lsp`'s `DocumentState::licenses` instead, the same map the tier-3
+    /// `deps-lsp`'s `DocumentState::signals.licenses` instead, the same map the tier-3
     /// background pre-fetch (`run_license_prefetch`) already populates for
     /// Dart/Swift/Gradle/Deno. A merge (not replace), since the two sources are
     /// always disjoint per document (one ecosystem per document) but run as
@@ -837,7 +837,7 @@ async fn fetch_and_classify_package(
 
             // #660/#661 tier-1 backfill: extracted from `resolved` before `.map()` consumes
             // it. Filtered here so a `Some((name, vec![]))` entry — indistinguishable from
-            // "no data" once merged into `DocumentState::licenses` — never gets inserted.
+            // "no data" once merged into `DocumentState::signals.licenses` — never gets inserted.
             license = resolved
                 .as_ref()
                 .map(|(_, _, _, _, lic)| lic)
@@ -1994,7 +1994,7 @@ mod tests {
     /// already-fetched version-list entry (today, only Composer's `impl_version!`
     /// includes one — `deps-composer/src/types.rs`) must flow into
     /// `FetchResult::licenses`, keyed by package name — this is what
-    /// `merge_registry_fetch_result` then merges into `DocumentState::licenses`,
+    /// `merge_registry_fetch_result` then merges into `DocumentState::signals.licenses`,
     /// letting #661's policy diagnostics see it without a second, ecosystem-specific
     /// fetch. An empty `license()` (every other ecosystem's default) must produce no
     /// entry at all, not an empty-vec one — `merge_licenses` relies on this to never

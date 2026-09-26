@@ -674,7 +674,7 @@ impl DepsError {
 }
 
 /// Outcome of a registry fetch attempt for one dependency, as recorded in
-/// `DocumentState::outcomes` (`deps-lsp`) and rendered by
+/// `DocumentState::signals.outcomes` (`deps-lsp`) and rendered by
 /// [`crate::lsp_helpers::generate_diagnostics_from_cache`] (#478).
 ///
 /// Replaces a bare `HashSet<PackageName>` membership check so the per-dependency diagnostic

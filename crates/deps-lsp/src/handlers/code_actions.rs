@@ -2,7 +2,6 @@
 
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
-use deps_core::VersionData;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -35,30 +34,23 @@ pub async fn handle_code_actions(
     // Release the DashMap shard `Ref` before awaiting `generate_code_actions`'s registry
     // fetch — holding it across the await would block a concurrent `documents.get_mut` on
     // the same shard (#319); `with_document` makes this structural rather than a convention (#333).
-    let Some((
-        ecosystem,
-        ecosystem_id,
-        parse_result,
-        cached_versions,
-        resolved_versions,
-        resolved_version_candidates,
-        vulnerabilities,
-        outcomes,
-        content,
-    )) = state
+    let Some((ecosystem, ecosystem_id, parse_result, content, snapshot)) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
             let parse_result = doc.parse_result_arc()?;
+            let snapshot = doc
+                .signals
+                .snapshot()
+                .with_resolved_version_candidates()
+                .with_vulnerabilities()
+                .with_outcomes()
+                .finish();
             Some((
                 ecosystem,
                 doc.ecosystem,
                 parse_result,
-                doc.cached_versions.clone(),
-                doc.resolved_versions.clone(),
-                doc.resolved_version_candidates.clone(),
-                doc.vulnerabilities.clone(),
-                doc.outcomes.clone(),
                 doc.content.clone(),
+                snapshot,
             ))
         })
         .flatten()
@@ -74,17 +66,16 @@ pub async fn handle_code_actions(
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
     };
+    let version_data = snapshot
+        .version_data()
+        .with_ecosystem(ecosystem_id)
+        .with_offline(offline);
     let mut actions = ecosystem
         .generate_code_actions(
             parse_result.as_ref(),
             position,
             &domain_uri,
-            VersionData::new(&cached_versions, &resolved_versions)
-                .with_resolved_version_candidates(&resolved_version_candidates)
-                .with_vulnerabilities(&vulnerabilities)
-                .with_outcomes(&outcomes)
-                .with_ecosystem(ecosystem_id)
-                .with_offline(offline),
+            version_data,
             &content,
         )
         .await;
@@ -576,7 +567,7 @@ serde = "0.9.0"
                     }),
                 ),
             );
-            doc_state.vulnerabilities = vulnerabilities;
+            doc_state.signals.vulnerabilities = vulnerabilities;
             state.update_document(uri.clone(), doc_state);
 
             let params = CodeActionParams {
@@ -676,7 +667,7 @@ serde = "1.0.0"
                     }),
                 ),
             );
-            doc_state.vulnerabilities = vulnerabilities;
+            doc_state.signals.vulnerabilities = vulnerabilities;
             state.update_document(uri.clone(), doc_state);
 
             let params = CodeActionParams {
@@ -779,7 +770,7 @@ serde = "0.9.0"
                         }),
                 ),
             );
-            doc_state.vulnerabilities = vulnerabilities;
+            doc_state.signals.vulnerabilities = vulnerabilities;
             state.update_document(uri.clone(), doc_state);
 
             // Exactly what `push_vulnerability_diagnostics` would have published: A1-A5 only.
@@ -898,7 +889,7 @@ serde = "0.9.0"
                         }),
                 ),
             );
-            doc_state.vulnerabilities = vulnerabilities;
+            doc_state.signals.vulnerabilities = vulnerabilities;
             state.update_document(uri.clone(), doc_state);
 
             let diagnostics: Vec<Diagnostic> = (1..=5)
@@ -1156,7 +1147,7 @@ serde = "0.9.0"
                     }),
                 ),
             );
-            doc_state.vulnerabilities = vulnerabilities;
+            doc_state.signals.vulnerabilities = vulnerabilities;
             state.update_document(uri.clone(), doc_state);
 
             let params = CodeActionParams {

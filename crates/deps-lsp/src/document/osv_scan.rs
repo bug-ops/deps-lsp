@@ -46,7 +46,7 @@ pub(crate) struct OsvScanResult {
     /// Document content at the moment the scan started, to guard the
     /// eventual write against a cross-generation stale commit (critique M4).
     content_snapshot: String,
-    /// `DocumentState::resolved_versions_generation` at the moment the scan started (issue
+    /// `PackageSignals::resolved_versions_generation` at the moment the scan started (issue
     /// #1395 critic S3) — `content_snapshot` alone cannot order two phase-A/B pairs whose
     /// resolved-version snapshots differ but whose `content` doesn't (a lock-file-only
     /// reload never touches `content`).
@@ -85,8 +85,8 @@ pub(crate) async fn run_osv_scan_phase_a(
         let parse_result = doc.parse_result()?;
         let (targets, skipped) = deps_engine::classify::osv::build_scan_targets(
             parse_result,
-            &doc.resolved_versions,
-            &doc.resolved_version_candidates,
+            &doc.signals.resolved_versions,
+            &doc.signals.resolved_version_candidates,
             ecosystem.formatter(),
             ecosystem_id,
         );
@@ -96,8 +96,8 @@ pub(crate) async fn run_osv_scan_phase_a(
         // occurrence's raw name when its key was disambiguated.
         let vuln_keys = deps_core::osv::vulnerability_keys(
             parse_result,
-            &doc.resolved_versions,
-            Some(&doc.resolved_version_candidates),
+            &doc.signals.resolved_versions,
+            Some(&doc.signals.resolved_version_candidates),
             ecosystem.formatter(),
             ecosystem_id,
         );
@@ -111,7 +111,7 @@ pub(crate) async fn run_osv_scan_phase_a(
             .collect();
         (
             doc.content.clone(),
-            doc.resolved_versions_generation,
+            doc.signals.resolved_versions_generation,
             targets,
             skipped,
             raw_name_by_key,
@@ -211,10 +211,10 @@ pub(crate) async fn rescan_after_resolved_version_change(
 /// ecosystems. Targets are computed synchronously while holding the document guard (mirroring
 /// [`run_osv_scan_phase_a`]'s `build_scan_targets` call), which is dropped before the network
 /// dispatch below ever awaits. This function keeps only what is genuinely `deps-lsp`'s own:
-/// the document snapshot/staleness guard and the additive `DocumentState::licenses` commit.
+/// the document snapshot/staleness guard and the additive `PackageSignals::licenses` commit.
 ///
 /// The commit at the end is staleness-guarded on both `doc.content == content_snapshot`
-/// and `doc.resolved_versions_generation == resolved_generation` (issue #1407, mirroring
+/// and `doc.signals.resolved_versions_generation == resolved_generation` (issue #1407, mirroring
 /// [`run_osv_phase_b_and_commit`]'s identical pair of checks) and merges rather than
 /// replaces (round 3 finding #1/#2). The content check alone is not enough: a
 /// lock-file-only change never touches `content`, so two overlapping lock-file-triggered
@@ -226,8 +226,8 @@ pub(crate) async fn rescan_after_resolved_version_change(
 /// before this point) would drop that dependency's previously-cached, still-valid
 /// license instead of just failing to refresh it. `DocumentState::merge_licenses`'s own
 /// additive contract already provides exactly this — a genuinely *removed* dependency's
-/// stale entry is reclaimed separately, by the manifest-diff pruning loop in
-/// `commit_parsed_document`, not by this function replacing the whole map.
+/// stale entry is reclaimed separately, by `PackageSignals::prune_removed` (called from
+/// `commit_parsed_document`), not by this function replacing the whole map.
 ///
 /// **What version each source actually reflects is per-ecosystem, not uniform** — see
 /// [`deps_engine::classify::license::prefetch_tier3_licenses`]'s doc for the full
@@ -273,14 +273,14 @@ pub(crate) async fn run_license_prefetch(
         };
         let targets = deps_engine::classify::license::tier3_license_targets(
             parse_result,
-            &doc.resolved_versions,
-            &doc.resolved_version_candidates,
+            &doc.signals.resolved_versions,
+            &doc.signals.resolved_version_candidates,
             ecosystem.formatter(),
             ecosystem.ecosystem_id(),
         );
         (
             doc.content.clone(),
-            doc.resolved_versions_generation,
+            doc.signals.resolved_versions_generation,
             targets,
         )
     };
@@ -302,7 +302,7 @@ pub(crate) async fn run_license_prefetch(
             tracing::debug!(
                 "dropping stale tier-3 license pre-fetch result: document content changed mid-fetch"
             );
-        } else if doc.resolved_versions_generation != resolved_generation {
+        } else if doc.signals.resolved_versions_generation != resolved_generation {
             // Issue #1407, mirroring #1395 critic S3: `content` alone can't order two
             // racing pre-fetches whose resolved-version snapshots differ (e.g. two
             // overlapping lock-file-only reloads) — a newer resolved-versions update
@@ -412,7 +412,7 @@ pub(crate) fn declared_names(
 /// **Not** called inline from diagnostics generation (NFR-002: a cold-cache
 /// `textDocument/diagnostic` request must never block on a per-manifest deps.dev fan-out) —
 /// `deps_core::lsp_helpers::VersionData::typosquat_prefetch` only ever reads whatever this
-/// background task has already committed to [`super::state::DocumentState::typosquats`],
+/// background task has already committed to [`super::state::PackageSignals::typosquats`],
 /// synchronously, with no `.await` on that read path.
 ///
 /// **Not** joined before the main diagnostics publish either (issue #1437 impl-critic N2,
@@ -547,10 +547,10 @@ pub(crate) async fn run_typosquat_prefetch(
 /// now that the registry fetch has resolved — critique S1) is itself
 /// affected (B.1), then independently verifies each dependency's recommended
 /// *fix target* F (B.2, #462 — see [`run_osv_fix_target_verification`]),
-/// before committing the result into `DocumentState.vulnerabilities`.
+/// before committing the result into `DocumentState.signals.vulnerabilities`.
 ///
 /// Must be called only *after* the registry fetch has updated
-/// `doc.cached_versions`: calling it concurrently with that fetch (as the
+/// `doc.signals.cached_versions`: calling it concurrently with that fetch (as the
 /// original implementation did, by folding phase B into the same spawned
 /// task as phase A) reads `cached_versions` before it holds the registry's
 /// actual latest version, so hover could report the *already-installed*
@@ -590,7 +590,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         // B.1 (US-002, unchanged by #462): checks the registry's "latest" candidate.
         // `latest_native_by_key` is kept for B.2 below, which needs the same native
         // "latest" string to detect a fix target F that coincides with latest (FR-002)
-        // without re-deriving it from `doc.cached_versions` a second time.
+        // without re-deriving it from `doc.signals.cached_versions` a second time.
         let latest_native_by_key: HashMap<deps_core::osv::VulnKey, String> = {
             let Some(doc) = state.get_document(uri) else {
                 return;
@@ -599,11 +599,12 @@ pub(crate) async fn run_osv_phase_b_and_commit(
                 .iter()
                 .filter_map(|key| {
                     let latest = doc
+                        .signals
                         .cached_versions
                         .get(key.as_str())
                         .or_else(|| {
                             let raw = result.raw_name_by_key.get(key)?;
-                            doc.cached_versions.get(raw.as_str())
+                            doc.signals.cached_versions.get(raw.as_str())
                         })?
                         .latest
                         .clone();
@@ -657,7 +658,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
     if let Some(mut doc) = state.documents.get_mut(uri) {
         if doc.content != result.content_snapshot {
             tracing::debug!("dropping stale OSV scan result: document content changed mid-scan");
-        } else if doc.resolved_versions_generation != result.resolved_generation {
+        } else if doc.signals.resolved_versions_generation != result.resolved_generation {
             // Issue #1395 critic S3: `content` alone can't order two racing phase-A/B
             // pairs whose resolved-version snapshots differ (e.g. a lock-file-only
             // reload racing a slower manifest-edit scan) — a newer `update_resolved_versions`
@@ -837,7 +838,7 @@ mod tests {
         /// Live end-to-end (Registry Integration Gate): a real Dart document, routed
         /// through the real `EcosystemRegistry` (no mock), fetching `http`'s license
         /// from the real pub.dev `/score` endpoint and committing it into
-        /// `DocumentState.licenses`.
+        /// `DocumentState.signals.licenses`.
         #[cfg(feature = "dart")]
         #[tokio::test]
         #[ignore = "hits the real pub.dev API"]
@@ -869,9 +870,9 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.licenses.contains_key(&PackageName::new("http")),
+                doc.signals.licenses.contains_key(&PackageName::new("http")),
                 "expected a pre-fetched license for 'http', got: {:?}",
-                doc.licenses
+                doc.signals.licenses
             );
         }
 
@@ -913,7 +914,7 @@ mod tests {
 
             // Scoped so the `DashMap` shard-lock guard `get_document` returns is dropped
             // before the probe below ever awaits (`clippy::await_holding_invalid_type`).
-            let licenses = state.get_document(&uri).unwrap().licenses.clone();
+            let licenses = state.get_document(&uri).unwrap().signals.licenses.clone();
             let has_license = licenses.contains_key(&PackageName::new("apple/swift-nio"));
             // #1283 S2: `run_license_prefetch` swallows *any* fetch error to "no license
             // populated", so a missing entry alone can't tell an expected rate limit apart
@@ -978,10 +979,11 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.licenses
+                doc.signals
+                    .licenses
                     .contains_key(&PackageName::new("com.squareup.okhttp3:okhttp")),
                 "expected a pre-fetched license for 'com.squareup.okhttp3:okhttp', got: {:?}",
-                doc.licenses
+                doc.signals.licenses
             );
         }
 
@@ -1028,13 +1030,14 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             let license = doc
+                .signals
                 .licenses
                 .get(&PackageName::new("com.google.guava:guava"));
             assert!(
                 license.is_some_and(|l| !l.is_empty()),
                 "expected a pre-fetched license for 'com.google.guava:guava' via its \
                  parent POM, got: {:?}",
-                doc.licenses
+                doc.signals.licenses
             );
         }
 
@@ -1072,9 +1075,11 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.licenses.contains_key(&PackageName::new("jsr:@std/fs")),
+                doc.signals
+                    .licenses
+                    .contains_key(&PackageName::new("jsr:@std/fs")),
                 "expected a pre-fetched license for 'jsr:@std/fs', got: {:?}",
-                doc.licenses
+                doc.signals.licenses
             );
         }
     }
@@ -1294,10 +1299,10 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.licenses.is_empty(),
+                doc.signals.licenses.is_empty(),
                 "an intervening generation bump between snapshot and commit must drop this \
                  pre-fetch's result, even though the fetch itself succeeded: {:?}",
-                doc.licenses
+                doc.signals.licenses
             );
         }
 
@@ -1344,10 +1349,10 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert_eq!(
-                doc.licenses.get(&PackageName::new("dep-0")),
+                doc.signals.licenses.get(&PackageName::new("dep-0")),
                 Some(&vec!["MIT".to_string()]),
                 "no intervening bump occurred, so the fetch's result must commit: {:?}",
-                doc.licenses
+                doc.signals.licenses
             );
         }
     }
@@ -1427,7 +1432,8 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
-                doc.vulnerabilities
+                doc.signals
+                    .vulnerabilities
                     .get(&deps_core::test_util::vuln_key("alpha-dep")),
                 Some(deps_core::osv::ScanOutcome::Skipped(
                     deps_core::osv::SkipReason::NonRegistrySource
@@ -1473,10 +1479,10 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert!(
-                doc.vulnerabilities.is_empty(),
+                doc.signals.vulnerabilities.is_empty(),
                 "a genuine concurrent generation bump must still cause the now-stale scan's \
                  commit to be dropped, proving the guard itself still functions: {:?}",
-                doc.vulnerabilities
+                doc.signals.vulnerabilities
             );
         }
 
@@ -1552,12 +1558,13 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
-                doc.vulnerabilities
+                doc.signals
+                    .vulnerabilities
                     .get(&deps_core::test_util::vuln_key("alpha-dep")),
                 Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
                 "R1's stale commit (snapshotted against the closed document instance) must \
                  not overwrite the freshly-reopened instance's own result — got: {:?}",
-                doc.vulnerabilities
+                doc.signals.vulnerabilities
             );
         }
     }
@@ -1682,7 +1689,7 @@ mod tests {
 
             let doc = state.get_document(&uri).expect("document still present");
             assert!(
-                doc.typosquat_checked_names.is_empty(),
+                doc.signals.typosquat_checked_names.is_empty(),
                 "issue #1463: a degraded (non-timeout) deps.dev failure must clear the gate \
                  so the next debounced edit retries even without a name/eligibility change"
             );
