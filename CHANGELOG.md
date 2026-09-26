@@ -69,6 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-deno**: unsatisfiable `npm:`/`jsr:` requirement diagnostics in `deno.json`/`deno.jsonc` now include the pre-release hint, matching `package.json`'s (resolves #1478) (#1492)
+- **deps-deno**: `jsr:` version matching now routes through the same shared matcher as `npm:`, fixing a wildcard requirement against an all-yanked JSR package incorrectly resolving to no match (resolves #1493)
 - **deps-maven, deps-gradle**: fix deps-gradle license fetch and deps-maven's Google-group routing to resolve androidx/Firebase POMs via Google Maven instead of 404ing against Maven Central (resolves #1479) (#1485)
 - **deps-maven, deps-gradle**: `Package` completion for a `group:partial-artifact` prefix (e.g. `com.google.guava:gua`) now returns real Maven Central matches instead of 0 results — Solr's `q` param is now a proper field-query (`g:<group> AND a:<artifact-prefix>*`) instead of the raw, colon-bearing prefix that Maven Central's Solr endpoint rejected with `HTTP 400` (resolves #1457) (#1460)
 - **deps-cargo**: a `registry-index`/`.cargo/config.toml`/`$CARGO_HOME/config.toml`/`CARGO_REGISTRIES_*_INDEX` value rejected for a reason other than a policy-blocked host (invalid URL, non-https, embedded userinfo) now surfaces a warning diagnostic via `rejected_registries()`, matching npm/PyPI/Go/NuGet (resolves #1453)
