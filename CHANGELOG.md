@@ -127,6 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: the dependency-count-ceiling wrapper now forwards `selection_context`/`invalid_minimum_stability`, fixing lost `minimum-stability` enforcement on a capped `composer.json` (resolves #1444) (#1450)
 
 ### Breaking
+- **deps-core**: `FetchCompleteness` no longer implements `Default` — completeness is now always derived from a call's outcome, never defaulted (#1467)
 - **deps-core**: `DepsDevClient::trust_signal`/`typosquat_signal`'s `system` parameter is now the typed `DepsDevSystem` enum instead of `&'static str` (resolves #1455) (#1465)
 - **deps-core**: `TyposquatSignal` no longer has a `declared_name` field — every caller already keys its `TyposquatSignal` map by `PackageName` and the one diagnostic renderer never read it (resolves #1455) (#1465)
 - **deps-core**: `RegistryRejectionClassifier::rejection_reason` now returns the three-state `RejectionOutcome` enum instead of `Option<RegistryRejectionReason>`, distinguishing "already reported via the blocked-host path" from "intentionally never surfaced" (resolves #1455) (#1465)
@@ -161,6 +162,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-composer**: `ComposerParseResult::minimum_stability` is now the `parser::MinimumStability` enum instead of `Option<String>`; stability-ranking helpers in `formatter`/`registry` are retyped onto `StabilityFloor` (resolves #1444) (#1450)
 
 ### Changed
+- **deps-core**: extracted typed `CoalescedMemo`/`TtlMemo`/`CallOutcome` (new `deps_dev::memo` module) to replace 6 hand-rolled TTL memos in the deps.dev client, deriving each entry's TTL from its outcome instead of storing it alongside; no behavior change (resolves #1467)
 - **deps-lsp**: `handle_lockfile_change`'s lock-file-driven OSV rescan is now supervised, logging a panic instead of silently dropping it (resolves #1399) (#1410)
 - **deps-lsp**: diagnostics snapshotting/generation across the open, change, lockfile-change, and pull-diagnostics paths now share one `DiagnosticsSnapshot` type (resolves #1399) (#1410)
 - **deps-core**: package-completion builders no longer allocate and immediately discard `insert_text`/`text_edit` when the caller doesn't need them (resolves #1290) (#1306)

@@ -30,6 +30,7 @@
 //! renderer, which discloses it rather than presenting the score with the
 //! same confidence as an attested relation.
 
+mod memo;
 mod types;
 mod typosquat;
 
@@ -39,9 +40,8 @@ use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use dashmap::DashSet;
-use dashmap::mapref::entry::Entry;
-use tokio::sync::watch;
 
+use memo::{CallOutcome, CoalescedMemo, DEPS_DEV_TTLS, GOSSIP_TTLS, TtlMemo};
 use types::{
     DependentsWire, DepsDevProject, DepsDevVersionInfo, GetPackageWire, GossipBatchRequestWire,
     GossipFindingType, GossipFindingsBatchRequestWire, GossipFindingsBatchWire, GossipFindingsWire,
@@ -141,15 +141,6 @@ impl FetchCompleteness {
     }
 }
 
-/// The safe default for a call that gave up without ever resolving a real outcome (e.g.
-/// `coalesce`'s leader-takeover exhaustion fallback) — such a result must never be mistaken
-/// for a verified check.
-impl Default for FetchCompleteness {
-    fn default() -> Self {
-        Self::Incomplete
-    }
-}
-
 /// Per-call timeout for [`DepsDevClient::gossip_findings_for_version`] (issue #1456, spec
 /// 072) — hover's live, version-scoped low-usage fetch. Mirrors [`DEPS_DEV_CALL_TIMEOUT`]'s
 /// exact rationale: this call is awaited under hover's own `GOSSIP_WAIT_BUDGET`
@@ -212,14 +203,6 @@ struct MemoKey {
     version: String,
 }
 
-struct MemoEntry {
-    fetched_at: Instant,
-    ttl: Duration,
-    /// The outcome, negative results included — memoizing `None` is what
-    /// makes "zero requests on a repeat call" hold on the failure path too.
-    signal: Option<SupplyChainTrustSignal>,
-}
-
 /// Key for [`DepsDevClient`]'s project-level memo — the Scorecard is a
 /// property of the *project*, not the version, so this is keyed separately
 /// from [`MemoKey`] to avoid one project call per version of a package a
@@ -240,12 +223,6 @@ struct ProjectKeyMemo {
 /// caching a resolved `ScorecardSummary` here would let whichever package
 /// warms the entry first silently fix the disclosure marker for every later
 /// package sharing that key (security M1/critic C1).
-struct ProjectMemoEntry {
-    fetched_at: Instant,
-    ttl: Duration,
-    overall_score: Option<f32>,
-}
-
 /// Key for [`DepsDevClient`]'s similarity memo (issue #1437) — package-level, not
 /// version-level: `GetSimilarlyNamedPackages` has no version parameter, mirroring
 /// [`ProjectKeyMemo`]'s precedent for a memo scoped narrower than [`MemoKey`].
@@ -254,21 +231,6 @@ struct SimilarityMemoKey {
     base: String,
     system: DepsDevSystem,
     name: String,
-}
-
-/// [`DepsDevClient::similar_packages`]'s result shape, factored out to keep
-/// [`DepsDevClient::similarity_in_flight`]'s type from tripping
-/// `clippy::type_complexity`.
-type SimilarPackagesResult = (Vec<SimilarPackageCandidate>, FetchCompleteness);
-
-struct SimilarityMemoEntry {
-    fetched_at: Instant,
-    ttl: Duration,
-    candidates: Vec<SimilarPackageCandidate>,
-    /// Issue #1463: whether the fetch that produced `candidates` actually completed —
-    /// carried in the memo (not just at fresh-fetch time) so a cache hit within
-    /// [`DEPS_DEV_ERROR_TTL`]'s retry window still reports [`FetchCompleteness::Incomplete`].
-    completeness: FetchCompleteness,
 }
 
 /// Key for [`DepsDevClient`]'s popularity memo (issue #1437) — likewise package-level: a
@@ -282,21 +244,6 @@ struct PopularityMemoKey {
     name: String,
 }
 
-/// [`DepsDevClient::popularity`]'s result shape, factored out for the same
-/// `clippy::type_complexity` reason as [`SimilarPackagesResult`].
-type PopularityResult = (Option<u64>, FetchCompleteness);
-
-struct PopularityMemoEntry {
-    fetched_at: Instant,
-    ttl: Duration,
-    /// `None` on any resolution failure (`GetPackage`, no default version found, or
-    /// `GetDependents`) — memoized the same way [`MemoEntry::signal`] memoizes negative
-    /// outcomes.
-    dependent_count: Option<u64>,
-    /// Issue #1463: same rationale as [`SimilarityMemoEntry::completeness`].
-    completeness: FetchCompleteness,
-}
-
 /// Key for [`DepsDevClient`]'s package-level GOSSIP memo (issue #1456, spec 072) — mirrors
 /// [`PopularityMemoKey`]'s exact shape: `default_version`'s cooldown/low-usage data is a
 /// property of the package's own current default version, not of whatever version a
@@ -306,15 +253,6 @@ struct GossipMemoKey {
     base: String,
     system: DepsDevSystem,
     name: String,
-}
-
-struct GossipMemoEntry {
-    fetched_at: Instant,
-    ttl: Duration,
-    /// `None` when the package had no resolvable `defaultVersion` (e.g. a package-level
-    /// `NOT_FOUND`) — memoizing this negative outcome, like [`MemoEntry::signal`], is what
-    /// makes a repeat lookup for an unindexed/removed name issue zero requests too.
-    findings: Option<GossipFindings>,
 }
 
 /// Key for [`DepsDevClient`]'s version-scoped GOSSIP memo (issue #1456, spec 072) — backs
@@ -329,40 +267,11 @@ struct GossipVersionMemoKey {
     version: String,
 }
 
-struct GossipVersionMemoEntry {
-    fetched_at: Instant,
-    ttl: Duration,
-    findings: Option<GossipFindings>,
-}
-
-/// Releases an in-flight claim on drop — including on panic — so a claim can
-/// never leak and permanently block later calls for the same key.
-///
-/// Generic over both the key type and the in-flight map's value type (issue #1454 widened
-/// this from a `DashSet`-only guard to the `DashMap<K, watch::Receiver<..>>` shape
-/// [`coalesce`] uses), so [`DepsDevClient::trust_signal`]/[`DepsDevClient::similar_packages`]/
-/// [`DepsDevClient::popularity`] all share the identical cleanup mechanism instead of
-/// hand-rolling their own.
-struct InFlightGuard<'a, K: std::hash::Hash + Eq, W> {
-    map: &'a DashMap<K, W>,
-    key: K,
-}
-
-impl<K: std::hash::Hash + Eq, W> Drop for InFlightGuard<'_, K, W> {
-    fn drop(&mut self) {
-        self.map.remove(&self.key);
-    }
-}
-
-/// Releases a `DashSet`-backed in-flight claim on drop — including on panic — mirroring
-/// [`InFlightGuard`]'s identical rationale for the skip-and-defer (not `coalesce`-joined)
-/// GOSSIP dedup sets (issue #1456, spec 072 C1/M21d): [`InFlightGuard`] itself now only
-/// wraps a `DashMap<K, W>` (issue #1454), since every other in-flight set in this client
-/// upgraded to `coalesce`'s true-join shape, but GOSSIP's own dedup (a name already claimed
-/// elsewhere is skipped this round, not awaited) deliberately stayed a simpler `DashSet`
-/// claim per spec 072's own design history — this guard is the minimal adapter that keeps
-/// that behavior correct without pulling GOSSIP into the `coalesce`/`watch::Receiver`
-/// machinery its skip-and-defer design never needed.
+/// Releases a `DashSet`-backed in-flight claim on drop — including on panic — for the
+/// skip-and-defer (not coalesce-joined) GOSSIP dedup sets (issue #1456, spec 072 C1/M21d): a
+/// name already claimed elsewhere is skipped this round, not awaited, so this guard's cleanup is
+/// the minimal mechanism that design needs, independent of [`memo::CoalescedMemo`]'s true-join
+/// in-flight tracking.
 struct DashSetInFlightGuard<'a, K: std::hash::Hash + Eq> {
     set: &'a DashSet<K>,
     key: K,
@@ -372,111 +281,6 @@ impl<K: std::hash::Hash + Eq> Drop for DashSetInFlightGuard<'_, K> {
     fn drop(&mut self) {
         self.set.remove(&self.key);
     }
-}
-
-/// A [`coalesce`] watch-channel payload: "leader hasn't finished yet" vs. "leader finished
-/// with `V`". A dedicated enum rather than `Option<V>` (clippy `option_option`): two of
-/// [`coalesce`]'s three callers have `V` itself an `Option` (`Option<SupplyChainTrustSignal>`,
-/// `Option<u64>`), which would otherwise nest as `Option<Option<_>>`.
-#[derive(Debug, Clone)]
-enum Slot<V> {
-    /// The leader's `fetch` has not completed (or panicked) yet.
-    Pending,
-    /// The leader's `fetch` completed with this value.
-    Ready(V),
-}
-
-/// Either claims `key` as the leader (installing a fresh, `Pending` channel) or joins as a
-/// follower of whichever channel the current leader already installed — a plain, synchronous
-/// function so the returned [`dashmap::mapref::entry::Entry`] guard is dropped before
-/// [`coalesce`] ever reaches an `.await` (this workspace's `clippy.toml` denies holding one
-/// across an await point on principle, regardless of whether a given case is provably safe).
-fn claim_or_follow<K, V>(
-    in_flight: &DashMap<K, watch::Receiver<Slot<V>>>,
-    key: K,
-) -> Result<watch::Sender<Slot<V>>, watch::Receiver<Slot<V>>>
-where
-    K: std::hash::Hash + Eq,
-{
-    match in_flight.entry(key) {
-        Entry::Occupied(occupied) => Err(occupied.get().clone()),
-        Entry::Vacant(vacant) => {
-            let (tx, rx) = watch::channel(Slot::Pending);
-            vacant.insert(rx);
-            Ok(tx)
-        }
-    }
-}
-
-/// Bounds how many times [`coalesce`] takes over as a new leader after the previous one was
-/// cancelled before sending (issue #1455 critic S2), so a leader that keeps getting cancelled
-/// (or keeps panicking deterministically) cannot loop forever — the last attempt's caller
-/// either produces a real value or lets a genuine panic propagate to its own task, and every
-/// caller that loses that final round falls back to `V::default()`.
-const MAX_COALESCE_TAKEOVER_ATTEMPTS: u8 = 2;
-
-/// Coalesces concurrent callers for the same in-flight `key`: the first caller (the leader)
-/// runs `fetch` and broadcasts its result to every other concurrent caller for the same key
-/// (the followers) via a [`watch`] channel, instead of a follower returning a default value
-/// immediately (issue #1454) — the pre-existing behavior, which made a typosquat candidate or
-/// declared package that merely lost a concurrent-fetch race silently disappear from the
-/// result instead of being reported once the leader's fetch completed.
-///
-/// A follower whose leader is cancelled — it panics, or the task calling `coalesce` is
-/// `AbortHandle::abort()`-ed by something outside this function (a `tokio::time::timeout`
-/// around the whole call, or a superseding-task abort, e.g. `deps-lsp`'s
-/// `ServerState::track_typosquat_task`) — takes over as the new leader and calls `fetch` itself
-/// instead of silently degrading to `V::default()` (issue #1455 critic S2: the original
-/// panic-only design reintroduced almost exactly the false-negative shape #1454 set out to fix,
-/// since #1455's own new abort paths made leader cancellation routine rather than exotic).
-/// Bounded by
-/// [`MAX_COALESCE_TAKEOVER_ATTEMPTS`]; `in_flight`'s entry for `key` is removed on every path
-/// (including a panic or abort), via [`InFlightGuard`]'s `Drop` impl, so the entry is never
-/// stale by the time a takeover's `claim_or_follow` call runs.
-async fn coalesce<K, V, F, Fut>(
-    in_flight: &DashMap<K, watch::Receiver<Slot<V>>>,
-    key: K,
-    fetch: F,
-) -> V
-where
-    K: std::hash::Hash + Eq + Clone + Send + Sync,
-    V: Clone + Default + Send + Sync,
-    F: Fn() -> Fut + Send,
-    Fut: std::future::Future<Output = V> + Send,
-{
-    for attempt in 0..=MAX_COALESCE_TAKEOVER_ATTEMPTS {
-        match claim_or_follow(in_flight, key.clone()) {
-            Ok(tx) => {
-                let _guard = InFlightGuard {
-                    map: in_flight,
-                    key,
-                };
-                let value = fetch().await;
-                let _ = tx.send(Slot::Ready(value.clone()));
-                return value;
-            }
-            Err(mut rx) => loop {
-                let slot = rx.borrow_and_update().clone();
-                if let Slot::Ready(value) = slot {
-                    return value;
-                }
-                if rx.changed().await.is_err() {
-                    tracing::debug!(
-                        attempt,
-                        "coalesce: in-flight leader was cancelled before completing; taking \
-                         over as leader"
-                    );
-                    break;
-                }
-            },
-        }
-    }
-
-    tracing::debug!(
-        "coalesce: gave up after {} leader-takeover attempts; falling back to a default value",
-        MAX_COALESCE_TAKEOVER_ATTEMPTS + 1
-    );
-    V::default()
 }
 
 /// Maps a deps-lsp [`EcosystemId`] to deps.dev's `system` path segment.
@@ -644,46 +448,41 @@ pub struct DepsDevClient {
     cache: Arc<HttpCache>,
     base_url: String,
     trusted_origin: String,
-    memo: DashMap<MemoKey, MemoEntry>,
-    projects: DashMap<ProjectKeyMemo, ProjectMemoEntry>,
-    /// In-flight claims for [`Self::memo`] — a losing concurrent caller awaits the leader's
-    /// result via [`coalesce`] rather than returning `None` immediately (issue #1454).
-    in_flight: DashMap<MemoKey, watch::Receiver<Slot<Option<SupplyChainTrustSignal>>>>,
+    /// The trust-signal memo, coalesced (issue #1454): a losing concurrent caller awaits the
+    /// leader's result via [`memo::CoalescedMemo::get_or_fetch`] rather than returning `None`
+    /// immediately.
+    signals: CoalescedMemo<MemoKey, Option<SupplyChainTrustSignal>>,
+    /// Deliberately **not** coalesced, unlike [`Self::signals`]: a project-level Scorecard hit
+    /// shared across every package sharing that `project_key` is already the dedup this memo
+    /// exists for, so an added in-flight join would change no observable behavior for extra
+    /// complexity's sake.
+    projects: TtlMemo<ProjectKeyMemo, Option<f32>>,
     /// Issue #1437: `GetSimilarlyNamedPackages` results, keyed package-level (see
-    /// [`SimilarityMemoKey`]).
-    similarity: DashMap<SimilarityMemoKey, SimilarityMemoEntry>,
-    /// In-flight claims for [`Self::similarity`], mirroring [`Self::in_flight`]'s dedup
-    /// rationale — `fetch_typosquat_signals`'s concurrent fan-out across a document's
-    /// dependencies can otherwise issue duplicate `GetSimilarlyNamedPackages` requests for two
-    /// dependencies that happen to share a raw name before either write lands in the memo. A
-    /// losing caller awaits the leader's result via [`coalesce`] instead of returning an empty
-    /// `Vec` immediately (issue #1454).
-    similarity_in_flight: DashMap<SimilarityMemoKey, watch::Receiver<Slot<SimilarPackagesResult>>>,
-    /// Issue #1437: `GetPackage` + `GetDependents`-derived popularity, keyed package-level
-    /// (see [`PopularityMemoKey`]) — shared by every declared dependency and candidate that
-    /// resolves the same package name, the same way `projects` is shared across packages
-    /// sharing a Scorecard project key.
-    popularity: DashMap<PopularityMemoKey, PopularityMemoEntry>,
-    /// In-flight claims for [`Self::popularity`] — the more valuable of the two dedup maps,
-    /// since a popular typosquat target (e.g. `lodash`) is exactly the kind of candidate
-    /// multiple concurrently-resolved declared dependencies are likely to share. A losing
-    /// caller awaits the leader's result via [`coalesce`] instead of returning `None`
-    /// immediately (issue #1454) — previously the more damaging of the two typosquat dedup
-    /// maps, since a package-level popularity collision is common enough that
-    /// `typosquat_signal_concurrent_calls_share_one_candidate_popularity_request` used to
-    /// accept one of two real typosquats going unreported.
-    popularity_in_flight: DashMap<PopularityMemoKey, watch::Receiver<Slot<PopularityResult>>>,
+    /// [`SimilarityMemoKey`]), coalesced for the same reason as [`Self::signals`] —
+    /// `fetch_typosquat_signals`'s concurrent fan-out across a document's dependencies can
+    /// otherwise issue duplicate requests for two dependencies that happen to share a raw name
+    /// before either write lands in the memo.
+    similarity: CoalescedMemo<SimilarityMemoKey, Vec<SimilarPackageCandidate>>,
+    /// Issue #1437: `GetPackage` + `GetDependents`-derived popularity, keyed package-level (see
+    /// [`PopularityMemoKey`]), coalesced for the same reason as [`Self::signals`] — the more
+    /// valuable of the coalesced memos, since a popular typosquat target (e.g. `lodash`) is
+    /// exactly the kind of candidate multiple concurrently-resolved declared dependencies are
+    /// likely to share.
+    popularity: CoalescedMemo<PopularityMemoKey, Option<u64>>,
     /// Issue #1456: package-level GOSSIP findings memo, backing [`Self::gossip_findings_batch`]
     /// (see [`GossipMemoKey`]'s docs for why this is package-, not version-, scoped).
-    gossip: DashMap<GossipMemoKey, GossipMemoEntry>,
+    /// Deliberately not coalesced — [`Self::gossip_in_flight`] already dedups concurrent batch
+    /// calls at the skip-and-defer level.
+    gossip: TtlMemo<GossipMemoKey, Option<GossipFindings>>,
     /// Issue #1456: in-flight claims for [`Self::gossip`] — a name already claimed by another
-    /// concurrent batch call is skipped by this call rather than re-fetched (mirrors
-    /// [`Self::in_flight`]'s dedup shape); the claiming call's own memo write is what a losing
-    /// caller's *next* prefetch trigger will see.
+    /// concurrent batch call is skipped by this call rather than re-fetched; the claiming
+    /// call's own memo write is what a losing caller's *next* prefetch trigger will see.
     gossip_in_flight: DashSet<GossipMemoKey>,
     /// Issue #1456: version-scoped GOSSIP findings memo, backing
-    /// [`Self::gossip_findings_for_version`] (hover's live low-usage fetch).
-    gossip_versions: DashMap<GossipVersionMemoKey, GossipVersionMemoEntry>,
+    /// [`Self::gossip_findings_for_version`] (hover's live low-usage fetch). Deliberately not
+    /// coalesced, like [`Self::gossip`] — converting it would change this memo's existing,
+    /// intentional skip-and-defer semantics.
+    gossip_versions: TtlMemo<GossipVersionMemoKey, Option<GossipFindings>>,
     /// Issue #1456: in-flight claims for [`Self::gossip_versions`].
     gossip_version_in_flight: DashSet<GossipVersionMemoKey>,
     /// Issue #1456, spec 072 FR-012/N8: bounds concurrent `GetFindingsBatch` calls across
@@ -808,16 +607,13 @@ impl DepsDevClient {
             cache,
             base_url,
             trusted_origin,
-            memo: DashMap::new(),
-            projects: DashMap::new(),
-            in_flight: DashMap::new(),
-            similarity: DashMap::new(),
-            similarity_in_flight: DashMap::new(),
-            popularity: DashMap::new(),
-            popularity_in_flight: DashMap::new(),
-            gossip: DashMap::new(),
+            signals: CoalescedMemo::new(DEPS_DEV_TTLS),
+            projects: TtlMemo::new(DEPS_DEV_TTLS),
+            similarity: CoalescedMemo::new(DEPS_DEV_TTLS),
+            popularity: CoalescedMemo::new(DEPS_DEV_TTLS),
+            gossip: TtlMemo::new(GOSSIP_TTLS),
             gossip_in_flight: DashSet::new(),
-            gossip_versions: DashMap::new(),
+            gossip_versions: TtlMemo::new(GOSSIP_TTLS),
             gossip_version_in_flight: DashSet::new(),
             gossip_semaphore: tokio::sync::Semaphore::new(GOSSIP_PREFETCH_CONCURRENCY),
             gossip_last_refresh_attempt: DashMap::new(),
@@ -847,65 +643,10 @@ impl DepsDevClient {
             version: version.to_string(),
         };
 
-        if let Some(entry) = self.memo.get(&key)
-            && entry.fetched_at.elapsed() < entry.ttl
-        {
-            return entry.signal.clone();
-        }
-
-        coalesce(&self.in_flight, key.clone(), || async {
-            // Re-check the memo now that this call has actually won the leader claim (issue
-            // #1455 critic M1): a leader that finished and wrote the memo between the check
-            // above and this call's claim attempt would otherwise cost a wholly avoidable
-            // duplicate fetch.
-            if let Some(entry) = self.memo.get(&key)
-                && entry.fetched_at.elapsed() < entry.ttl
-            {
-                return entry.signal.clone();
-            }
-            let (signal, ttl) = self.fetch(system, name, version).await;
-            self.store_memo(key.clone(), signal.clone(), ttl);
-            signal
-        })
-        .await
-    }
-
-    fn store_memo(&self, key: MemoKey, signal: Option<SupplyChainTrustSignal>, ttl: Duration) {
-        if !self.memo.contains_key(&key) {
-            crate::cache_policy::evict_expired_then_oldest(
-                &self.memo,
-                MAX_MEMO_ENTRIES,
-                |e| e.fetched_at,
-                |e| e.ttl,
-            );
-        }
-        self.memo.insert(
-            key,
-            MemoEntry {
-                fetched_at: Instant::now(),
-                ttl,
-                signal,
-            },
-        );
-    }
-
-    fn store_project_memo(&self, key: ProjectKeyMemo, overall_score: Option<f32>, ttl: Duration) {
-        if !self.projects.contains_key(&key) {
-            crate::cache_policy::evict_expired_then_oldest(
-                &self.projects,
-                MAX_MEMO_ENTRIES,
-                |e| e.fetched_at,
-                |e| e.ttl,
-            );
-        }
-        self.projects.insert(
-            key,
-            ProjectMemoEntry {
-                fetched_at: Instant::now(),
-                ttl,
-                overall_score,
-            },
-        );
+        self.signals
+            .get_or_fetch(key, || self.fetch(system, name, version))
+            .await
+            .into_value()
     }
 
     /// One GET through the shared, transport-only, origin-pinned call site —
@@ -941,6 +682,48 @@ impl DepsDevClient {
         }
     }
 
+    /// One [`Self::get`] plus its JSON parse, collapsing the identical three-way
+    /// parse-failure/fetch-failure/timeout tracing and error mapping every deps.dev call site
+    /// used to duplicate. `NotFound` is reported as [`CallFailure::NotFound`] rather than
+    /// mapped here — whether a 404 is authoritative absence or a transient race is a
+    /// per-call-site decision (e.g. `fetch_popularity`'s dependents call treats it as the
+    /// latter), so only the call site can pick the right [`CallOutcome`] for it.
+    async fn get_json<W: serde::de::DeserializeOwned>(
+        &self,
+        url: &str,
+        timeout: Duration,
+        call: DepsDevCall<'_>,
+    ) -> Result<W, CallFailure> {
+        let label = call.label();
+        match self.get(url, timeout).await {
+            Ok(bytes) => match crate::parser::parse_json_checked::<W>(&bytes) {
+                Ok(value) => Ok(value),
+                Err(e) => {
+                    tracing::debug!(error = %e, "deps.dev {label} response parse failed");
+                    Err(CallFailure::Transient)
+                }
+            },
+            Err(DepsDevFetchError::NotFound) => Err(CallFailure::NotFound),
+            // #756: never interpolate `e`'s `Display` (`DepsError::safe_tracing_summary`).
+            Err(DepsDevFetchError::Failed(e)) => {
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(status = ?status, cause, "deps.dev {label} fetch failed");
+                Err(CallFailure::Transient)
+            }
+            Err(DepsDevFetchError::TimedOut) => {
+                if let DepsDevCall::Project { key } = &call {
+                    tracing::debug!(project_key = key, "deps.dev {label} fetch timed out");
+                } else if let Some(name) = call.timed_out_name() {
+                    tracing::debug!(
+                        package = %crate::redact::redact_declaration_key(name),
+                        "deps.dev {label} fetch timed out"
+                    );
+                }
+                Err(CallFailure::Transient)
+            }
+        }
+    }
+
     /// The two-call sequence (plan.md §4): the version call first, then —
     /// only if it yields a usable project key — the project call. Each step
     /// fails independently: a project-call failure keeps the provenance
@@ -950,10 +733,10 @@ impl DepsDevClient {
         system: DepsDevSystem,
         name: &str,
         version: &str,
-    ) -> (Option<SupplyChainTrustSignal>, Duration) {
+    ) -> CallOutcome<Option<SupplyChainTrustSignal>> {
         if is_dot_segment(name) {
             warn_rejected_value("is_dot_segment", "deps.dev trust-signal request URL", name);
-            return (None, DEPS_DEV_SUCCESS_TTL);
+            return CallOutcome::Definitive(None);
         }
         if is_dot_segment(version) {
             warn_rejected_value(
@@ -961,7 +744,7 @@ impl DepsDevClient {
                 "deps.dev trust-signal request URL",
                 version,
             );
-            return (None, DEPS_DEV_SUCCESS_TTL);
+            return CallOutcome::Definitive(None);
         }
 
         let version_url = format!(
@@ -973,51 +756,35 @@ impl DepsDevClient {
         );
 
         let (provenance, related_projects, licenses) = match self
-            .get(&version_url, DEPS_DEV_CALL_TIMEOUT)
+            .get_json::<DepsDevVersionInfo>(
+                &version_url,
+                DEPS_DEV_CALL_TIMEOUT,
+                DepsDevCall::Version { name },
+            )
             .await
         {
-            Ok(bytes) => match crate::parser::parse_json_checked::<DepsDevVersionInfo>(&bytes) {
-                Ok(info) => {
-                    let provenance =
-                        classify_provenance(&info.slsa_provenances, &info.attestations);
-                    (Some(provenance), info.related_projects, info.licenses)
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "deps.dev version response parse failed");
-                    return (None, DEPS_DEV_ERROR_TTL);
-                }
-            },
-            Err(DepsDevFetchError::NotFound) => return (None, DEPS_DEV_SUCCESS_TTL),
-            // #756: never interpolate `e`'s `Display` (`DepsError::safe_tracing_summary`) —
-            // kept consistent with `Self::get` above even though this URL is credential-free.
-            Err(DepsDevFetchError::Failed(e)) => {
-                let (status, cause) = e.safe_tracing_summary();
-                tracing::debug!(status = ?status, cause, "deps.dev version fetch failed");
-                return (None, DEPS_DEV_ERROR_TTL);
+            Ok(info) => {
+                let provenance = classify_provenance(&info.slsa_provenances, &info.attestations);
+                (Some(provenance), info.related_projects, info.licenses)
             }
-            Err(DepsDevFetchError::TimedOut) => {
-                tracing::debug!(
-                    package = %crate::redact::redact_declaration_key(name),
-                    "deps.dev version fetch timed out"
-                );
-                return (None, DEPS_DEV_ERROR_TTL);
-            }
+            Err(CallFailure::NotFound) => return CallOutcome::Definitive(None),
+            Err(CallFailure::Transient) => return CallOutcome::Degraded(None),
         };
 
-        // `project_ttl` is `DEPS_DEV_ERROR_TTL` only when the project call genuinely failed;
-        // `.min` below then downgrades the whole signal's memo TTL in that case (review
-        // C2/critic C2), so a successful version call can't paper over a transient
+        // `project_completeness` is `Incomplete` only when the project call genuinely failed
+        // (review C2/critic C2), so a successful version call can't paper over a transient
         // project-call failure with a full hour of "no Scorecard".
-        let (scorecard, project_ttl) = match choose_project_key(&related_projects) {
+        let (scorecard, project_completeness) = match choose_project_key(&related_projects) {
             Some((project_key, self_reported)) => {
-                let (raw_score, ttl) = self.fetch_scorecard(&project_key).await;
+                let (raw_score, completeness) =
+                    self.fetch_scorecard(&project_key).await.into_parts();
                 let scorecard = raw_score.map(|overall_score| ScorecardSummary {
                     overall_score,
                     self_reported,
                 });
-                (scorecard, ttl)
+                (scorecard, completeness)
             }
-            None => (None, DEPS_DEV_SUCCESS_TTL),
+            None => (None, FetchCompleteness::Complete),
         };
 
         let signal = SupplyChainTrustSignal {
@@ -1025,27 +792,24 @@ impl DepsDevClient {
             provenance,
             licenses,
         };
-        (Some(signal), DEPS_DEV_SUCCESS_TTL.min(project_ttl))
+        CallOutcome::with_completeness(Some(signal), project_completeness)
     }
 
-    /// Fetches (or serves from the project memo) the raw Scorecard score for
-    /// a single, already-validated `project_key`, plus the TTL this outcome
-    /// should be cached under.
+    /// Fetches (or serves from the project memo) the raw Scorecard score for a single,
+    /// already-validated `project_key`.
     ///
-    /// Returns the raw score only, **not** a [`ScorecardSummary`] — the
-    /// `self_reported` disclosure is applied by the caller from its own
-    /// per-relation knowledge, never cached here (see [`ProjectMemoEntry`]'s
-    /// docs; security M1/critic C1).
-    async fn fetch_scorecard(&self, project_key: &str) -> (Option<f32>, Duration) {
+    /// Returns the raw score only, **not** a [`ScorecardSummary`] — the `self_reported`
+    /// disclosure is applied by the caller from its own per-relation knowledge, never cached
+    /// here (security M1/critic C1). Not coalesced, unlike [`Self::signals`] — see
+    /// [`Self::projects`]'s field doc.
+    async fn fetch_scorecard(&self, project_key: &str) -> CallOutcome<Option<f32>> {
         let memo_key = ProjectKeyMemo {
             base: self.base_url.clone(),
             project_key: project_key.to_string(),
         };
 
-        if let Some(entry) = self.projects.get(&memo_key)
-            && entry.fetched_at.elapsed() < entry.ttl
-        {
-            return (entry.overall_score, entry.ttl);
+        if let Some(outcome) = self.projects.get_fresh(&memo_key) {
+            return outcome;
         }
 
         let url = format!(
@@ -1054,35 +818,27 @@ impl DepsDevClient {
             urlencoding::encode(project_key),
         );
 
-        let (overall_score, ttl) = match self.get(&url, DEPS_DEV_CALL_TIMEOUT).await {
-            Ok(bytes) => match crate::parser::parse_json_checked::<DepsDevProject>(&bytes) {
-                Ok(project) => {
-                    let overall_score = project
-                        .scorecard
-                        .and_then(|s| s.overall_score)
-                        .filter(|score| (0.0..=10.0).contains(score));
-                    (overall_score, DEPS_DEV_SUCCESS_TTL)
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "deps.dev project response parse failed");
-                    (None, DEPS_DEV_ERROR_TTL)
-                }
-            },
-            Err(DepsDevFetchError::NotFound) => (None, DEPS_DEV_SUCCESS_TTL),
-            // Same rationale as `Self::fetch`'s equivalent branch above.
-            Err(DepsDevFetchError::Failed(e)) => {
-                let (status, cause) = e.safe_tracing_summary();
-                tracing::debug!(status = ?status, cause, "deps.dev project fetch failed");
-                (None, DEPS_DEV_ERROR_TTL)
+        let outcome = match self
+            .get_json::<DepsDevProject>(
+                &url,
+                DEPS_DEV_CALL_TIMEOUT,
+                DepsDevCall::Project { key: project_key },
+            )
+            .await
+        {
+            Ok(project) => {
+                let overall_score = project
+                    .scorecard
+                    .and_then(|s| s.overall_score)
+                    .filter(|score| (0.0..=10.0).contains(score));
+                CallOutcome::Definitive(overall_score)
             }
-            Err(DepsDevFetchError::TimedOut) => {
-                tracing::debug!(project_key, "deps.dev project fetch timed out");
-                (None, DEPS_DEV_ERROR_TTL)
-            }
+            Err(CallFailure::NotFound) => CallOutcome::Definitive(None),
+            Err(CallFailure::Transient) => CallOutcome::Degraded(None),
         };
 
-        self.store_project_memo(memo_key, overall_score, ttl);
-        (overall_score, ttl)
+        self.projects.insert(memo_key, outcome.clone());
+        outcome
     }
 
     /// Returns a typosquat-suspect signal for one declared dependency (issue #1437, spec
@@ -1172,8 +928,8 @@ impl DepsDevClient {
                 "deps.dev similarly-named-packages request URL",
                 name,
             );
-            // Rejected before any request: retrying can never succeed for this name, so
-            // there is nothing left "incomplete" about it.
+            // Rejected before any request, and before the memo: retrying can never succeed
+            // for this name, so there is nothing left "incomplete" about it.
             return (Vec::new(), FetchCompleteness::Complete);
         }
 
@@ -1183,127 +939,53 @@ impl DepsDevClient {
             name: name.to_string(),
         };
 
-        if let Some(entry) = self.similarity.get(&key)
-            && entry.fetched_at.elapsed() < entry.ttl
-        {
-            return (entry.candidates.clone(), entry.completeness);
-        }
-
-        coalesce(&self.similarity_in_flight, key.clone(), || async {
-            // Re-check the memo now that this call has actually won the leader claim (issue
-            // #1455 critic M1) — see `trust_signal`'s identical recheck for why.
-            if let Some(entry) = self.similarity.get(&key)
-                && entry.fetched_at.elapsed() < entry.ttl
-            {
-                return (entry.candidates.clone(), entry.completeness);
-            }
-            let url = format!(
-                "{}/v3alpha/systems/{}/packages/{}:similarlyNamedPackages",
-                self.base_url,
-                system.as_path_segment(),
-                urlencoding::encode(name),
-            );
-
-            let (candidates, ttl, completeness) = match self.get(&url, TYPOSQUAT_CALL_TIMEOUT).await
-            {
-                Ok(bytes) => {
-                    match crate::parser::parse_json_checked::<SimilarlyNamedPackagesWire>(&bytes) {
-                        Ok(wire) => {
-                            // Filtered and capped *before* caching (issue #1437 security
-                            // review N2), not just at read time in `typosquat_signal`:
-                            // `GetSimilarlyNamedPackages` documents no upper bound on
-                            // `packages[]` (up to ~30k entries under the 1 MiB body cap), so
-                            // storing the full, uncapped list in the memo would keep that
-                            // worst case resident in memory across every memo entry.
-                            let candidates = wire
-                                .packages
-                                .into_iter()
-                                .map(|p| SimilarPackageCandidate {
-                                    name: p.package_key.name,
-                                })
-                                .filter(|candidate| candidate.name != name)
-                                .take(TYPOSQUAT_MAX_CANDIDATES_CHECKED)
-                                .collect();
-                            (
-                                candidates,
-                                DEPS_DEV_SUCCESS_TTL,
-                                FetchCompleteness::Complete,
-                            )
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                error = %e,
-                                "deps.dev similarly-named-packages response parse failed"
-                            );
-                            (
-                                Vec::new(),
-                                DEPS_DEV_ERROR_TTL,
-                                FetchCompleteness::Incomplete,
-                            )
-                        }
-                    }
-                }
-                Err(DepsDevFetchError::NotFound) => (
-                    Vec::new(),
-                    DEPS_DEV_SUCCESS_TTL,
-                    FetchCompleteness::Complete,
-                ),
-                Err(DepsDevFetchError::Failed(e)) => {
-                    let (status, cause) = e.safe_tracing_summary();
-                    tracing::debug!(
-                        status = ?status,
-                        cause,
-                        "deps.dev similarly-named-packages fetch failed"
-                    );
-                    (
-                        Vec::new(),
-                        DEPS_DEV_ERROR_TTL,
-                        FetchCompleteness::Incomplete,
-                    )
-                }
-                Err(DepsDevFetchError::TimedOut) => {
-                    tracing::debug!(
-                        package = %crate::redact::redact_declaration_key(name),
-                        "deps.dev similarly-named-packages fetch timed out"
-                    );
-                    (
-                        Vec::new(),
-                        DEPS_DEV_ERROR_TTL,
-                        FetchCompleteness::Incomplete,
-                    )
-                }
-            };
-
-            self.store_similarity_memo(key.clone(), candidates.clone(), ttl, completeness);
-            (candidates, completeness)
-        })
-        .await
+        self.similarity
+            .get_or_fetch(key, || self.fetch_similar_packages(system, name))
+            .await
+            .into_parts()
     }
 
-    fn store_similarity_memo(
+    /// `GetSimilarlyNamedPackages` call backing [`Self::similar_packages`].
+    async fn fetch_similar_packages(
         &self,
-        key: SimilarityMemoKey,
-        candidates: Vec<SimilarPackageCandidate>,
-        ttl: Duration,
-        completeness: FetchCompleteness,
-    ) {
-        if !self.similarity.contains_key(&key) {
-            crate::cache_policy::evict_expired_then_oldest(
-                &self.similarity,
-                MAX_MEMO_ENTRIES,
-                |e| e.fetched_at,
-                |e| e.ttl,
-            );
-        }
-        self.similarity.insert(
-            key,
-            SimilarityMemoEntry {
-                fetched_at: Instant::now(),
-                ttl,
-                candidates,
-                completeness,
-            },
+        system: DepsDevSystem,
+        name: &str,
+    ) -> CallOutcome<Vec<SimilarPackageCandidate>> {
+        let url = format!(
+            "{}/v3alpha/systems/{}/packages/{}:similarlyNamedPackages",
+            self.base_url,
+            system.as_path_segment(),
+            urlencoding::encode(name),
         );
+
+        match self
+            .get_json::<SimilarlyNamedPackagesWire>(
+                &url,
+                TYPOSQUAT_CALL_TIMEOUT,
+                DepsDevCall::SimilarlyNamed { name },
+            )
+            .await
+        {
+            Ok(wire) => {
+                // Filtered and capped *before* caching (issue #1437 security review N2), not
+                // just at read time in `typosquat_signal`: `GetSimilarlyNamedPackages`
+                // documents no upper bound on `packages[]` (up to ~30k entries under the 1
+                // MiB body cap), so storing the full, uncapped list in the memo would keep
+                // that worst case resident in memory across every memo entry.
+                let candidates = wire
+                    .packages
+                    .into_iter()
+                    .map(|p| SimilarPackageCandidate {
+                        name: p.package_key.name,
+                    })
+                    .filter(|candidate| candidate.name != name)
+                    .take(TYPOSQUAT_MAX_CANDIDATES_CHECKED)
+                    .collect();
+                CallOutcome::Definitive(candidates)
+            }
+            Err(CallFailure::NotFound) => CallOutcome::Definitive(Vec::new()),
+            Err(CallFailure::Transient) => CallOutcome::Degraded(Vec::new()),
+        }
     }
 
     /// Resolves (or serves from the popularity memo) `name`'s `GetDependents`-derived
@@ -1321,65 +1003,22 @@ impl DepsDevClient {
             name: name.to_string(),
         };
 
-        if let Some(entry) = self.popularity.get(&key)
-            && entry.fetched_at.elapsed() < entry.ttl
-        {
-            return (entry.dependent_count, entry.completeness);
-        }
-
-        coalesce(&self.popularity_in_flight, key.clone(), || async {
-            // Re-check the memo now that this call has actually won the leader claim (issue
-            // #1455 critic M1) — see `trust_signal`'s identical recheck for why.
-            if let Some(entry) = self.popularity.get(&key)
-                && entry.fetched_at.elapsed() < entry.ttl
-            {
-                return (entry.dependent_count, entry.completeness);
-            }
-            let (dependent_count, ttl, completeness) = self.fetch_popularity(system, name).await;
-            self.store_popularity_memo(key.clone(), dependent_count, ttl, completeness);
-            (dependent_count, completeness)
-        })
-        .await
+        self.popularity
+            .get_or_fetch(key, || self.fetch_popularity(system, name))
+            .await
+            .into_parts()
     }
 
-    fn store_popularity_memo(
-        &self,
-        key: PopularityMemoKey,
-        dependent_count: Option<u64>,
-        ttl: Duration,
-        completeness: FetchCompleteness,
-    ) {
-        if !self.popularity.contains_key(&key) {
-            crate::cache_policy::evict_expired_then_oldest(
-                &self.popularity,
-                MAX_MEMO_ENTRIES,
-                |e| e.fetched_at,
-                |e| e.ttl,
-            );
-        }
-        self.popularity.insert(
-            key,
-            PopularityMemoEntry {
-                fetched_at: Instant::now(),
-                ttl,
-                dependent_count,
-                completeness,
-            },
-        );
-    }
-
-    /// The `GetPackage` -> default version -> `GetDependents` sequence (plan.md §1). Each
-    /// step fails independently to `(None, ..)`, mirroring [`Self::fetch`]'s per-step
-    /// degradation; the third element of the tuple is issue #1463's completeness signal for
-    /// that same step (see [`FetchCompleteness`]).
+    /// The `GetPackage` -> default version -> `GetDependents` sequence (plan.md §1). Each step
+    /// fails independently, mirroring [`Self::fetch`]'s per-step degradation.
     async fn fetch_popularity(
         &self,
         system: DepsDevSystem,
         name: &str,
-    ) -> (Option<u64>, Duration, FetchCompleteness) {
+    ) -> CallOutcome<Option<u64>> {
         if is_dot_segment(name) {
             warn_rejected_value("is_dot_segment", "deps.dev package request URL", name);
-            return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete);
+            return CallOutcome::Definitive(None);
         }
 
         let package_url = format!(
@@ -1389,32 +1028,20 @@ impl DepsDevClient {
             urlencoding::encode(name),
         );
 
-        let default_version = match self.get(&package_url, TYPOSQUAT_CALL_TIMEOUT).await {
-            Ok(bytes) => match crate::parser::parse_json_checked::<GetPackageWire>(&bytes) {
-                Ok(package) => match package.versions.into_iter().find(|v| v.is_default) {
-                    Some(v) => v.version_key.version,
-                    None => return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete),
-                },
-                Err(e) => {
-                    tracing::debug!(error = %e, "deps.dev package response parse failed");
-                    return (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete);
-                }
+        let default_version = match self
+            .get_json::<GetPackageWire>(
+                &package_url,
+                TYPOSQUAT_CALL_TIMEOUT,
+                DepsDevCall::Package { name },
+            )
+            .await
+        {
+            Ok(package) => match package.versions.into_iter().find(|v| v.is_default) {
+                Some(v) => v.version_key.version,
+                None => return CallOutcome::Definitive(None),
             },
-            Err(DepsDevFetchError::NotFound) => {
-                return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete);
-            }
-            Err(DepsDevFetchError::Failed(e)) => {
-                let (status, cause) = e.safe_tracing_summary();
-                tracing::debug!(status = ?status, cause, "deps.dev package fetch failed");
-                return (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete);
-            }
-            Err(DepsDevFetchError::TimedOut) => {
-                tracing::debug!(
-                    package = %crate::redact::redact_declaration_key(name),
-                    "deps.dev package fetch timed out"
-                );
-                return (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete);
-            }
+            Err(CallFailure::NotFound) => return CallOutcome::Definitive(None),
+            Err(CallFailure::Transient) => return CallOutcome::Degraded(None),
         };
 
         if is_dot_segment(&default_version) {
@@ -1423,7 +1050,7 @@ impl DepsDevClient {
                 "deps.dev dependents request URL",
                 &default_version,
             );
-            return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete);
+            return CallOutcome::Definitive(None);
         }
 
         let dependents_url = format!(
@@ -1434,38 +1061,21 @@ impl DepsDevClient {
             urlencoding::encode(&default_version),
         );
 
-        match self.get(&dependents_url, TYPOSQUAT_CALL_TIMEOUT).await {
-            Ok(bytes) => match crate::parser::parse_json_checked::<DependentsWire>(&bytes) {
-                Ok(wire) => (
-                    Some(wire.dependent_count),
-                    DEPS_DEV_SUCCESS_TTL,
-                    FetchCompleteness::Complete,
-                ),
-                Err(e) => {
-                    tracing::debug!(error = %e, "deps.dev dependents response parse failed");
-                    (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
-                }
-            },
-            // Error TTL, not success (impl-critic addendum): unlike `GetPackage`'s own 404
-            // (a genuine "package doesn't exist"), a 404 here can be a transient race — the
-            // package's default version changed between the `GetPackage` call above and
-            // this one — not authoritative absence, so a short retry window is correct, and
-            // (issue #1463) it is an incomplete result, not a verified negative.
-            Err(DepsDevFetchError::NotFound) => {
-                (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
-            }
-            Err(DepsDevFetchError::Failed(e)) => {
-                let (status, cause) = e.safe_tracing_summary();
-                tracing::debug!(status = ?status, cause, "deps.dev dependents fetch failed");
-                (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
-            }
-            Err(DepsDevFetchError::TimedOut) => {
-                tracing::debug!(
-                    package = %crate::redact::redact_declaration_key(name),
-                    "deps.dev dependents fetch timed out"
-                );
-                (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
-            }
+        match self
+            .get_json::<DependentsWire>(
+                &dependents_url,
+                TYPOSQUAT_CALL_TIMEOUT,
+                DepsDevCall::Dependents { name },
+            )
+            .await
+        {
+            Ok(wire) => CallOutcome::Definitive(Some(wire.dependent_count)),
+            // Error TTL, not success (impl-critic addendum): unlike `GetPackage`'s own 404 (a
+            // genuine "package doesn't exist"), a 404 here can be a transient race — the
+            // package's default version changed between the `GetPackage` call above and this
+            // one — not authoritative absence, so a short retry window is correct, and (issue
+            // #1463) it is an incomplete result, not a verified negative.
+            Err(CallFailure::NotFound | CallFailure::Transient) => CallOutcome::Degraded(None),
         }
     }
 
@@ -1500,10 +1110,8 @@ impl DepsDevClient {
 
         for name in names {
             let key = self.gossip_key(system, name);
-            if let Some(entry) = self.gossip.get(&key)
-                && entry.fetched_at.elapsed() < entry.ttl
-            {
-                if let Some(findings) = entry.findings.clone() {
+            if let Some(outcome) = self.gossip.get_fresh(&key) {
+                if let Some(findings) = outcome.into_value() {
                     result.insert(name.clone(), findings);
                 }
                 continue;
@@ -1565,17 +1173,17 @@ impl DepsDevClient {
 
         for name in claimed {
             // A name absent from `fetched` (the whole call failed, or this specific name
-            // was missing from `responses[]`) memoizes the short error TTL so it is
-            // retried soon; a name present — even as `None`, a resolvable "no cooldown/
-            // low-usage finding" answer — memoizes the full success TTL.
-            let (findings, ttl) = match fetched.get(&name) {
-                Some(findings) => (findings.clone(), GOSSIP_SUCCESS_TTL),
-                None => (None, GOSSIP_ERROR_TTL),
+            // was missing from `responses[]`) memoizes as `Degraded` so it is retried soon;
+            // a name present — even as `None`, a resolvable "no cooldown/low-usage finding"
+            // answer — memoizes as `Definitive`.
+            let outcome = match fetched.get(&name) {
+                Some(findings) => CallOutcome::Definitive(findings.clone()),
+                None => CallOutcome::Degraded(None),
             };
-            if let Some(findings) = &findings {
-                result.insert(name.clone(), findings.clone());
+            if let Some(findings) = outcome.clone().into_value() {
+                result.insert(name.clone(), findings);
             }
-            self.store_gossip_memo(self.gossip_key(system, &name), findings, ttl);
+            self.gossip.insert(self.gossip_key(system, &name), outcome);
         }
 
         result
@@ -1676,14 +1284,14 @@ impl DepsDevClient {
 
         let mut result = HashMap::new();
         for name in eligible {
-            let (findings, ttl) = match fetched.get(&name) {
-                Some(findings) => (findings.clone(), GOSSIP_SUCCESS_TTL),
-                None => (None, GOSSIP_ERROR_TTL),
+            let outcome = match fetched.get(&name) {
+                Some(findings) => CallOutcome::Definitive(findings.clone()),
+                None => CallOutcome::Degraded(None),
             };
-            if let Some(findings) = &findings {
-                result.insert(name.clone(), findings.clone());
+            if let Some(findings) = outcome.clone().into_value() {
+                result.insert(name.clone(), findings);
             }
-            self.store_gossip_memo(self.gossip_key(system, &name), findings, ttl);
+            self.gossip.insert(self.gossip_key(system, &name), outcome);
         }
         result
     }
@@ -1694,30 +1302,6 @@ impl DepsDevClient {
             system,
             name: name.to_string(),
         }
-    }
-
-    fn store_gossip_memo(
-        &self,
-        key: GossipMemoKey,
-        findings: Option<GossipFindings>,
-        ttl: Duration,
-    ) {
-        if !self.gossip.contains_key(&key) {
-            crate::cache_policy::evict_expired_then_oldest(
-                &self.gossip,
-                MAX_MEMO_ENTRIES,
-                |e| e.fetched_at,
-                |e| e.ttl,
-            );
-        }
-        self.gossip.insert(
-            key,
-            GossipMemoEntry {
-                fetched_at: Instant::now(),
-                ttl,
-                findings,
-            },
-        );
     }
 
     /// One (possibly paginated) `POST /v3alpha/findingsbatch` call for `names`
@@ -1837,10 +1421,8 @@ impl DepsDevClient {
             version: version.to_string(),
         };
 
-        if let Some(entry) = self.gossip_versions.get(&key)
-            && entry.fetched_at.elapsed() < entry.ttl
-        {
-            return entry.findings.clone();
+        if let Some(outcome) = self.gossip_versions.get_fresh(&key) {
+            return outcome.into_value();
         }
 
         if !self.gossip_version_in_flight.insert(key.clone()) {
@@ -1851,33 +1433,10 @@ impl DepsDevClient {
             key: key.clone(),
         };
 
-        let (findings, ttl) = self.fetch_gossip_version(system, name, version).await;
-        self.store_gossip_version_memo(key, findings.clone(), ttl);
+        let outcome = self.fetch_gossip_version(system, name, version).await;
+        let findings = outcome.clone().into_value();
+        self.gossip_versions.insert(key, outcome);
         findings
-    }
-
-    fn store_gossip_version_memo(
-        &self,
-        key: GossipVersionMemoKey,
-        findings: Option<GossipFindings>,
-        ttl: Duration,
-    ) {
-        if !self.gossip_versions.contains_key(&key) {
-            crate::cache_policy::evict_expired_then_oldest(
-                &self.gossip_versions,
-                MAX_MEMO_ENTRIES,
-                |e| e.fetched_at,
-                |e| e.ttl,
-            );
-        }
-        self.gossip_versions.insert(
-            key,
-            GossipVersionMemoEntry {
-                fetched_at: Instant::now(),
-                ttl,
-                findings,
-            },
-        );
     }
 
     /// Version-scoped `GET .../versions/{version}:findings` call backing
@@ -1891,14 +1450,14 @@ impl DepsDevClient {
         system: DepsDevSystem,
         name: &str,
         version: &str,
-    ) -> (Option<GossipFindings>, Duration) {
+    ) -> CallOutcome<Option<GossipFindings>> {
         if is_dot_segment(name) {
             warn_rejected_value(
                 "is_dot_segment",
                 "deps.dev GOSSIP findings request URL",
                 name,
             );
-            return (None, GOSSIP_SUCCESS_TTL);
+            return CallOutcome::Definitive(None);
         }
         if is_dot_segment(version) {
             warn_rejected_value(
@@ -1906,7 +1465,7 @@ impl DepsDevClient {
                 "deps.dev GOSSIP findings request URL",
                 version,
             );
-            return (None, GOSSIP_SUCCESS_TTL);
+            return CallOutcome::Definitive(None);
         }
 
         let url = format!(
@@ -1917,46 +1476,29 @@ impl DepsDevClient {
             urlencoding::encode(version),
         );
 
-        match self.get(&url, GOSSIP_CALL_TIMEOUT).await {
-            Ok(bytes) => match crate::parser::parse_json_checked::<GossipFindingsWire>(&bytes) {
-                Ok(wire) => {
-                    // Security/impl-critic review M2: must NOT fall back to
-                    // `default_version` — this call asked for `version` specifically (a
-                    // pinned/resolved version that may differ from the package's default),
-                    // so falling back would attribute `defaultVersion`'s low-usage/cooldown
-                    // data to a version it was never computed for. An absent
-                    // `requestedVersion` means "nothing to report for this exact version".
-                    let findings = wire
-                        .requested_version
-                        .as_ref()
-                        .map(gossip_findings_from_entry);
-                    (findings, GOSSIP_SUCCESS_TTL)
-                }
-                Err(e) => {
-                    tracing::debug!(
-                        error = %e,
-                        "deps.dev GOSSIP version findings response parse failed"
-                    );
-                    (None, GOSSIP_ERROR_TTL)
-                }
-            },
-            Err(DepsDevFetchError::NotFound) => (None, GOSSIP_SUCCESS_TTL),
-            Err(DepsDevFetchError::Failed(e)) => {
-                let (status, cause) = e.safe_tracing_summary();
-                tracing::debug!(
-                    status = ?status,
-                    cause,
-                    "deps.dev GOSSIP version findings fetch failed"
-                );
-                (None, GOSSIP_ERROR_TTL)
+        match self
+            .get_json::<GossipFindingsWire>(
+                &url,
+                GOSSIP_CALL_TIMEOUT,
+                DepsDevCall::GossipVersionFindings { name },
+            )
+            .await
+        {
+            Ok(wire) => {
+                // Security/impl-critic review M2: must NOT fall back to `default_version` —
+                // this call asked for `version` specifically (a pinned/resolved version that
+                // may differ from the package's default), so falling back would attribute
+                // `defaultVersion`'s low-usage/cooldown data to a version it was never
+                // computed for. An absent `requestedVersion` means "nothing to report for
+                // this exact version".
+                let findings = wire
+                    .requested_version
+                    .as_ref()
+                    .map(gossip_findings_from_entry);
+                CallOutcome::Definitive(findings)
             }
-            Err(DepsDevFetchError::TimedOut) => {
-                tracing::debug!(
-                    package = %crate::redact::redact_declaration_key(name),
-                    "deps.dev GOSSIP version findings fetch timed out"
-                );
-                (None, GOSSIP_ERROR_TTL)
-            }
+            Err(CallFailure::NotFound) => CallOutcome::Definitive(None),
+            Err(CallFailure::Transient) => CallOutcome::Degraded(None),
         }
     }
 }
@@ -1968,6 +1510,63 @@ enum DepsDevFetchError {
     NotFound,
     Failed(DepsError),
     TimedOut,
+}
+
+/// Which deps.dev call [`DepsDevClient::get_json`] is making — carries just enough (a
+/// `'static` label plus the identifying name/key) to produce the exact per-call tracing every
+/// call site used to write out by hand.
+enum DepsDevCall<'a> {
+    /// `GET .../versions/{version}` (the trust-signal client's version call).
+    Version { name: &'a str },
+    /// `GET /v3/projects/{key}` (the Scorecard project call).
+    Project { key: &'a str },
+    /// `GET .../{name}:similarlyNamedPackages`.
+    SimilarlyNamed { name: &'a str },
+    /// `GET .../packages/{name}` (`GetPackage`).
+    Package { name: &'a str },
+    /// `GET .../versions/{version}:dependents` (`GetDependents`).
+    Dependents { name: &'a str },
+    /// `GET .../versions/{version}:findings` (GOSSIP's version-scoped findings call).
+    GossipVersionFindings { name: &'a str },
+}
+
+impl DepsDevCall<'_> {
+    /// The exact label every `"deps.dev {label} ..."` tracing message used to hard-code.
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Version { .. } => "version",
+            Self::Project { .. } => "project",
+            Self::SimilarlyNamed { .. } => "similarly-named-packages",
+            Self::Package { .. } => "package",
+            Self::Dependents { .. } => "dependents",
+            Self::GossipVersionFindings { .. } => "GOSSIP version findings",
+        }
+    }
+
+    /// The declaration-key name to redact for a timeout's tracing, for every variant except
+    /// [`Self::Project`] (which logs its own `project_key` field instead, unredacted — see
+    /// [`DepsDevClient::get_json`]'s `TimedOut` arm).
+    const fn timed_out_name(&self) -> Option<&str> {
+        match self {
+            Self::Version { name }
+            | Self::SimilarlyNamed { name }
+            | Self::Package { name }
+            | Self::Dependents { name }
+            | Self::GossipVersionFindings { name } => Some(name),
+            Self::Project { .. } => None,
+        }
+    }
+}
+
+/// [`DepsDevClient::get_json`]'s error shape — the two-way split every deps.dev call site
+/// actually branches on: whether a 404 was returned (a per-call-site decision on whether that
+/// means authoritative absence or a transient race), or everything else (parse failure,
+/// non-2xx, or timeout — all three degrade a [`CallOutcome`] the same way).
+enum CallFailure {
+    /// The server returned 404.
+    NotFound,
+    /// A parse failure, non-2xx response, or timeout.
+    Transient,
 }
 
 #[cfg(test)]
@@ -2468,17 +2067,16 @@ mod tests {
     #[tokio::test]
     async fn trust_signal_memo_keys_do_not_alias_on_control_characters() {
         let client = client();
-        client.store_memo(
+        client.signals.memo().insert(
             MemoKey {
                 base: "https://api.deps.dev".to_string(),
                 system: DepsDevSystem::Npm,
                 name: "a\0b".to_string(),
                 version: "c".to_string(),
             },
-            Some(SupplyChainTrustSignal::default()),
-            DEPS_DEV_SUCCESS_TTL,
+            CallOutcome::Definitive(Some(SupplyChainTrustSignal::default())),
         );
-        assert!(!client.memo.contains_key(&MemoKey {
+        assert!(!client.signals.memo().contains_key(&MemoKey {
             base: "https://api.deps.dev".to_string(),
             system: DepsDevSystem::Npm,
             name: "a".to_string(),
@@ -2775,7 +2373,11 @@ mod tests {
             name: "express".to_string(),
             version: "4.19.2".to_string(),
         };
-        let entry_ttl = client.memo.get(&key).expect("memo entry expected").ttl;
+        let entry_ttl = client
+            .signals
+            .memo()
+            .ttl_of(&key)
+            .expect("memo entry expected");
         assert_eq!(
             entry_ttl, DEPS_DEV_ERROR_TTL,
             "a failed project call must downgrade the whole signal's memo TTL to the short \
@@ -2835,7 +2437,7 @@ mod tests {
             version: "4.19.2".to_string(),
         };
         assert!(
-            !client.in_flight.contains_key(&key),
+            !client.signals.in_flight_contains(&key),
             "the in-flight claim must be released after a failed fetch, not just a successful one"
         );
     }
@@ -2864,7 +2466,11 @@ mod tests {
             name: "express".to_string(),
             version: "4.19.2".to_string(),
         };
-        let entry_ttl = client.memo.get(&key).expect("memo entry expected").ttl;
+        let entry_ttl = client
+            .signals
+            .memo()
+            .ttl_of(&key)
+            .expect("memo entry expected");
         assert_eq!(
             entry_ttl, DEPS_DEV_ERROR_TTL,
             "a failed version call must memoize the short error TTL, not the 1h success TTL"
@@ -2878,34 +2484,32 @@ mod tests {
     fn memo_evicts_when_max_entries_reached() {
         let client = client();
         for i in 0..MAX_MEMO_ENTRIES {
-            client.store_memo(
+            client.signals.memo().insert(
                 MemoKey {
                     base: "https://api.deps.dev".to_string(),
                     system: DepsDevSystem::Npm,
                     name: format!("pkg-{i}"),
                     version: "1.0.0".to_string(),
                 },
-                None,
-                DEPS_DEV_SUCCESS_TTL,
+                CallOutcome::Definitive(None),
             );
         }
-        assert_eq!(client.memo.len(), MAX_MEMO_ENTRIES);
+        assert_eq!(client.signals.memo().len(), MAX_MEMO_ENTRIES);
 
-        client.store_memo(
+        client.signals.memo().insert(
             MemoKey {
                 base: "https://api.deps.dev".to_string(),
                 system: DepsDevSystem::Npm,
                 name: "overflow".to_string(),
                 version: "1.0.0".to_string(),
             },
-            None,
-            DEPS_DEV_SUCCESS_TTL,
+            CallOutcome::Definitive(None),
         );
 
         assert!(
-            client.memo.len() <= MAX_MEMO_ENTRIES,
+            client.signals.memo().len() <= MAX_MEMO_ENTRIES,
             "memo must stay bounded at MAX_MEMO_ENTRIES, got {}",
-            client.memo.len()
+            client.signals.memo().len()
         );
     }
 
@@ -2933,24 +2537,22 @@ mod tests {
     fn project_memo_evicts_when_max_entries_reached() {
         let client = client();
         for i in 0..MAX_MEMO_ENTRIES {
-            client.store_project_memo(
+            client.projects.insert(
                 ProjectKeyMemo {
                     base: "https://api.deps.dev".to_string(),
                     project_key: format!("github.com/org/repo-{i}"),
                 },
-                Some(8.0),
-                DEPS_DEV_SUCCESS_TTL,
+                CallOutcome::Definitive(Some(8.0)),
             );
         }
         assert_eq!(client.projects.len(), MAX_MEMO_ENTRIES);
 
-        client.store_project_memo(
+        client.projects.insert(
             ProjectKeyMemo {
                 base: "https://api.deps.dev".to_string(),
                 project_key: "github.com/org/overflow".to_string(),
             },
-            Some(8.0),
-            DEPS_DEV_SUCCESS_TTL,
+            CallOutcome::Definitive(Some(8.0)),
         );
 
         assert!(
@@ -3244,15 +2846,21 @@ mod tests {
         };
         let entry = client
             .popularity
-            .get(&key)
+            .memo()
+            .get_fresh(&key)
             .expect("popularity memo entry expected");
         assert_eq!(
-            entry.ttl, DEPS_DEV_ERROR_TTL,
+            client
+                .popularity
+                .memo()
+                .ttl_of(&key)
+                .expect("popularity memo entry expected"),
+            DEPS_DEV_ERROR_TTL,
             "a GetDependents 404 must memoize the short error TTL, not the 1h success TTL \
              a genuine GetPackage 404 (authoritative absence) uses"
         );
         assert_eq!(
-            entry.completeness,
+            entry.completeness(),
             FetchCompleteness::Incomplete,
             "issue #1463: the memoized entry itself must carry the incomplete marker, so a \
              retry within the error TTL still reports Incomplete instead of a stale Complete"
@@ -3497,9 +3105,10 @@ mod tests {
         };
         let memo_len = client
             .similarity
-            .get(&key)
+            .memo()
+            .get_fresh(&key)
             .expect("similarity memo entry expected")
-            .candidates
+            .into_value()
             .len();
         assert_eq!(
             memo_len, TYPOSQUAT_MAX_CANDIDATES_CHECKED,
@@ -3683,89 +3292,6 @@ mod tests {
             "exactly one of the two concurrent calls must fetch the shared candidate's \
              GetPackage; the other must await that in-flight fetch's result rather than \
              duplicating the request"
-        );
-    }
-
-    /// Issue #1454 panic-safety, updated for #1455 critic S2's fix: a leader's `fetch`
-    /// panicking must not deadlock or panic a follower awaiting it via [`coalesce`] — the
-    /// follower now takes over as the new leader and recovers the *real* value from its own
-    /// fetch (previously it fell back to `V::default()`, reintroducing #1454's own
-    /// false-negative shape), and the in-flight entry is still cleaned up (via
-    /// [`InFlightGuard`]'s `Drop`) so a later call for the same key is not permanently
-    /// blocked.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn coalesce_leader_panic_lets_follower_take_over_and_recover_real_value() {
-        let map: Arc<DashMap<u32, watch::Receiver<Slot<u32>>>> = Arc::new(DashMap::new());
-
-        let leader_map = Arc::clone(&map);
-        let leader = tokio::spawn(async move {
-            coalesce(&leader_map, 1u32, || async {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                panic!("leader fetch panics");
-                #[allow(unreachable_code)]
-                0u32
-            })
-            .await
-        });
-
-        // Give the leader time to claim the in-flight entry before the follower starts.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        let follower = coalesce(&map, 1u32, || async { 99u32 }).await;
-
-        assert!(
-            leader.await.is_err(),
-            "the leader's own task must observe the panic"
-        );
-        assert_eq!(
-            follower, 99,
-            "a follower whose leader panicked must take over and recover the real value from \
-             its own fetch, never deadlock, panic itself, or silently degrade to V::default()"
-        );
-        assert!(
-            !map.contains_key(&1u32),
-            "the in-flight entry must be cleaned up after the leader panic and the follower's \
-             own successful takeover"
-        );
-    }
-
-    /// Issue #1455 critic S2: the same recovery as the panic test above, but for a leader
-    /// cancelled by `AbortHandle::abort()` rather than a panic — the routine case #1455 itself
-    /// introduced via `ServerState::track_typosquat_task`'s supersede-and-abort pattern, the
-    /// whole-document `tokio::time::timeout` around `fetch_typosquat_signals`, and `did_close`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn coalesce_aborted_leader_lets_follower_take_over_and_recover_real_value() {
-        let map: Arc<DashMap<u32, watch::Receiver<Slot<u32>>>> = Arc::new(DashMap::new());
-
-        let leader_map = Arc::clone(&map);
-        let leader = tokio::spawn(async move {
-            coalesce(&leader_map, 1u32, || async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                0u32
-            })
-            .await
-        });
-        // Give the leader time to claim the in-flight entry.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        let follower_map = Arc::clone(&map);
-        let follower =
-            tokio::spawn(async move { coalesce(&follower_map, 1u32, || async { 7u32 }).await });
-        // Give the follower time to join (see the Occupied entry and start waiting on
-        // `changed()`) before the leader is cancelled out from under it.
-        tokio::time::sleep(Duration::from_millis(10)).await;
-
-        leader.abort();
-
-        let follower_result = follower.await.expect("follower task must not panic");
-        assert_eq!(
-            follower_result, 7,
-            "a follower whose leader was aborted (not panicked) must take over and recover \
-             the real value from its own fetch, not silently degrade to V::default()"
-        );
-        assert!(
-            !map.contains_key(&1u32),
-            "the in-flight entry must be cleaned up after the leader's abort and the \
-             follower's own successful takeover"
         );
     }
 
@@ -3988,13 +3514,12 @@ mod tests {
 
         let entry_ttl = client
             .gossip
-            .get(&GossipMemoKey {
+            .ttl_of(&GossipMemoKey {
                 base: client.base_url.clone(),
                 system: DepsDevSystem::Npm,
                 name: "vite".to_string(),
             })
-            .expect("memo entry expected even on failure")
-            .ttl;
+            .expect("memo entry expected even on failure");
         assert_eq!(entry_ttl, GOSSIP_ERROR_TTL);
     }
 
