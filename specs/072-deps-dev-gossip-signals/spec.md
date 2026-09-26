@@ -135,6 +135,10 @@ THEN the hint reflects the authoritative recommendation (or, if `freshness.rs`'s
 
 ### US-003: Cross-referenced malicious/critical-vulnerability coverage
 
+**RESOLVED (§9, issue #1475 coverage-gap study, 2026-09-26)** — see the "2026-09-26 coverage-gap study
+conclusion (issue #1475)" subsection: the coverage-gap analysis below ran, and MALICIOUS/VULNERABLE
+adoption is rejected. Acceptance criteria kept as written for traceability.
+
 AS A deps-lsp maintainer
 I WANT to know whether GOSSIP's Malicious Packages and Critical Vulnerabilities signals catch anything
 OSV.dev's existing MAL-* records and vulnerability diagnostics miss
@@ -163,7 +167,7 @@ table. FR-010 is dropped; FR-005, FR-006, and FR-009 are corrected below.
 |----|------------|----------|
 | FR-001 | WHEN GOSSIP's Low-Usage Packages signal is adopted THE SYSTEM SHALL surface it as a distinct, low-severity signal from existing typosquat-similarity ([[071-typosquat-similarity-diagnostic/spec\|#071]]) and vulnerability diagnostics, not merged into either. **Gated**: implementation SHALL NOT finalize `GossipFindingsWire`'s low-usage sub-schema until a real `LOW_USAGE` finding has been observed live at least once (none was, across ~20 combined probes across both critique rounds) | must, gated on live observation |
 | FR-002 | WHEN GOSSIP's Dynamic Cooldown is available for a dependency (ecosystem covered, `GossipConfig.enabled`, document-level cache has data whose version exactly matches the registry's own reported latest — see FR-008) THE SYSTEM SHALL treat it as authoritative for that dependency's cooldown status at hover and diagnostics (`diagnostics.rs:2262`); WHEN unavailable THE SYSTEM SHALL fall back to the existing local `is_within_cooldown`/`FreshnessConfig.cooldown_secs` check. The two SHALL NOT be shown as disagreeing without the hover/diagnostic text making the source explicit, since live windows differ materially (verified 2026-09-26: npm 15d, PyPI 5d, Cargo 10d vs. local 3d default) | must |
-| FR-003 | Malicious Packages / Critical Vulnerabilities cross-reference — **not adopted**; deferred to a separate `research`-labeled coverage-gap issue. If ever revisited, THE SYSTEM SHALL treat OSV.dev as authoritative on any disagreement | deferred |
+| FR-003 | Malicious Packages / Critical Vulnerabilities cross-reference — **rejected** (issue #1475 coverage-gap study, 2026-09-26; see §9): GOSSIP's `MALICIOUS`/`VULNERABLE` findings add no observed coverage over OSV.dev for the pinned dependency version and are not adopted. If ever revisited, THE SYSTEM SHALL treat OSV.dev as authoritative on any disagreement | rejected |
 | FR-004 | WHEN GOSSIP is unavailable for a given ecosystem, disabled (FR-009), offline, or the dependency's source is not a public registry (per `SourcePolicy::source_is_public_registry_content`) THE SYSTEM SHALL degrade gracefully with no user-visible error | must |
 | FR-005 | **CORRECTED round 3 (critique N4), memo restored round 4 (critique N5): round 2's "await concurrently" framing does not fix hover's latency doubling, because cooldown and low-usage render at two different points in `hover.rs` (cooldown before the existing `trust_signal` join, low-usage at/after it).** THE SYSTEM SHALL instead source hover's cooldown callout from `VersionData.gossip_prefetch` (FR-006's storage, no live network wait at all for cooldown), and SHALL fetch low-usage live only for the pinned/resolved version, spawned alongside `spawn_trust_signal_fetch` and awaited at the same existing join point under its own `GOSSIP_WAIT_BUDGET`, backed by a version-keyed `DepsDevClient` memo entry so a response landing past the budget still warms something for the next hover instead of being lost (critique N5 — round 3 had no memo at all, so "spawn-and-warm" warmed nothing) | must |
 | FR-006 | **CORRECTED round 3 (critique N2/N3), further corrected round 4 (critique N5/N6).** Cooldown status SHALL be surfaced in completion (net-new — completion has no cooldown check today) via THE SYSTEM'S existing local `is_within_cooldown` per candidate as the **default-on baseline** (zero cost, works for all 14 ecosystems and with GOSSIP disabled, honoring the existing `FreshnessSettings.enabled`/`cooldown_secs` knobs already in `CompletionRequest`). **Completion SHALL NOT read any GOSSIP-sourced data** (round 4 reverses round 3's plan to enrich the `defaultVersion`-matching candidate: `generate_completions` has no `VersionData`/prefetch channel, and adding one requires either a sealed-trait signature change or a new field interacting with the `#319` DashMap-across-await liveness constraint — not justified for one candidate's cooldown-window precision). Hover/diagnostics SHALL read GOSSIP data from a **per-document** `GetFindingsBatch` result, backed by **both** a per-package `DepsDevClient` memo (network dedupe — critique N5, a `DocumentState`-only design reintroduces an uncached POST per debounced edit) **and** `DocumentState` storage (durability across idle documents — critique N2). No completion request SHALL ever issue a live network call | must |
@@ -254,7 +258,7 @@ which the first round never did):
 |----------|-------------------|
 | GOSSIP flags a package as low-usage that is a legitimate new/niche package (false positive) | RESOLVED (§9): surface the raw `LOW_USAGE` finding as-is, worded as a non-blocking, low-severity invitation to double-check package identity — no corroborating-signal gate built. Gated on FR-001's live-observation requirement first |
 | deps.dev API returns GOSSIP data for an ecosystem not yet confirmed to be covered | RESOLVED (§9): all 7 `deps_dev_system()` ecosystems (GO, RUBYGEMS, NPM, CARGO, MAVEN, PYPI, NUGET) confirmed covered by live testing — no coverage gap |
-| GOSSIP and OSV.dev disagree on whether a package is malicious | Not currently reachable: FR-003 defers Malicious/Critical-Vulnerabilities adoption entirely (§9). If a future coverage-gap study reverses that decision, OSV.dev is authoritative per §9's precedence rule |
+| GOSSIP and OSV.dev disagree on whether a package is malicious | Not currently reachable: FR-003 rejects Malicious/Critical-Vulnerabilities adoption entirely, per the issue #1475 coverage-gap study (§9). If a future coverage-gap study reverses that decision, OSV.dev is authoritative per §9's precedence rule |
 | GOSSIP and `freshness.rs` disagree on cooldown window for the same release | **REVISED 2026-09-26** (was incorrectly marked "not reachable" under the original full-replacement plan): this is a live, reachable case — verified windows differ by 2-12x (npm 15d/PyPI 5d/Cargo 10d vs. local 3d). FR-002 requires the source to be explicit in the hover/diagnostic text whenever GOSSIP is available for that dependency, precisely because the two can and do disagree |
 | GOSSIP API is still in preview/alpha status (unstable schema) | RESOLVED (§9): confirmed still `v3alpha`, no GA designation found. Follow the same provisional-integration posture spec 071 adopted for `GetSimilarlyNamedPackages` |
 | A package-level `NOT_FOUND`/`RISK_CRITICAL` finding is returned for a name that is not actually malicious, just not yet indexed by deps.dev (ingestion lag) | **NEW 2026-09-26** (critique finding M4): verified live for 2 legitimate-shaped but non-existent/very-new probe names. NFR-002: never surface `NOT_FOUND` as a standalone diagnostic — it is ambiguous between "malicious/removed" and "too new to index" |
@@ -387,6 +391,9 @@ Resolved by maintainer decision this session (2026-09-25), per §8's Agent Bound
     **OSV.dev takes priority** on any GOSSIP/OSV.dev disagreement over malicious or vulnerable status — OSV.dev
     remains the source of record for specs 002 and 049; GOSSIP would only ever add signal, never override or
     downgrade an existing OSV.dev-sourced diagnostic.
+  - **Update 2026-09-26 (issue #1475): the deferred coverage-gap study ran and is now conclusive — REJECTED,
+    not merely deferred.** See the "2026-09-26 coverage-gap study conclusion (issue #1475)" subsection below
+    for the evidence and the separate P0 gap the study surfaced.
 - **Low-Usage Packages / slopsquatting false-positive handling — RESOLVED: raw flag with soft wording, no
   corroborating-signal gate.** Maintainer decision: surface GOSSIP's `LOW_USAGE` finding as-is, worded as a
   non-blocking, low-severity invitation to double-check the package identity (per US-001's acceptance
@@ -492,6 +499,57 @@ Two items survived round 6's fix into the actual committed text, caught on a fol
 |---|---------|------------|
 | M16 (carried) | Round 6's fix was applied to plan §1/§2/§4/Key-Design-Decisions, but the `DocumentState.gossip_findings` field's own doc-comment (plan.md, the `pub struct DocumentState` snippet) still said "hits come from the DepsDevClient memo directly" — the exact wording M16 flagged as wrong | Fixed: the doc-comment now states the same three-way merge (memo hits + batch results + joined in-flight) as the rest of the document |
 | M21 (new) | FR-011's refetch, as originally specified, would be a no-op if built literally: (1) calling the normal fetch path again just re-reads the same memo-cached stale data — the memo itself must be bypassed/invalidated; (2) the version-mismatch that triggers it is detected in `deps-core`'s pure synchronous hover/diagnostics render code, which cannot spawn background work — detection belongs in `deps-lsp`, after a registry fetch lands; (3) the refetch's result must merge into and republish for **every** open document declaring the package, not just the one that noticed; (4) the per-package backoff map needs the same bounded eviction as other memos | FR-011 and plan.md §1 (M21 subsection) now specify all four mechanics explicitly |
+
+### 2026-09-26 coverage-gap study conclusion (issue #1475)
+
+A dedicated live coverage-gap study (issue #1475) tested GOSSIP's `MALICIOUS`/`VULNERABLE` findings against
+582 live OSV.dev malicious-package (MAL) records and 18 live critical-CVE versions across all 7
+GOSSIP-covered ecosystems, followed by two `rust-critic` adversarial rounds (verdicts: round 1 significant,
+round 2 minor/approved). Full evidence, scripts, and raw data:
+`.local/handoff/2026-09-26T22-52-19-architect.md` (original study), `.local/handoff/2026-09-26T23-03-34-critic.md`
+(round 1), `.local/handoff/2026-09-26T23-15-07-architect.md` (revised study, supersedes the original where
+they conflict), `.local/handoff/2026-09-26T23-30-00-critic.md` (round 2), raw data in
+`.local/handoff/1475-evidence/`.
+
+**Formal conclusion: REJECTED.** GOSSIP's `MALICIOUS`/`VULNERABLE` findings are not adopted as new
+diagnostic sources for the *pinned* dependency version (FR-003 above updated from `deferred` to `rejected`):
+
+- All 582 OSV MAL records were matched by OSV.dev; GOSSIP flagged only 149 (all npm) with the requested
+  version, and 0 with no OSV-equivalent record. "0 GOSSIP-only detections" is uninformative by construction
+  on an OSV-seeded corpus (round 1 finding S3) — it is not claimed as positive evidence GOSSIP adds nothing
+  in general, only that it added nothing observable on this corpus.
+- Non-npm coverage (0/324 RubyGems+PyPI+NuGet MAL records) is a deleted-package registry artifact (all
+  sampled names were already purged from their registries before GOSSIP could flag a live version), not a
+  GOSSIP data gap — untestable with this method, not "absent" (round 1 finding S2, corrected from the
+  original study's overclaim).
+- Of the 15 currently-live flagged npm versions, GOSSIP caught 10/15; the 5 misses remained `COOLDOWN`-only
+  across two live re-probes ~2.5h apart. GOSSIP was not observed to be faster than OSV.dev on this sample
+  (softened from the original study's stronger "lags" claim per round 1 finding M1).
+- `VULNERABLE` is a context-free boolean (present for 14/14 versions with a CRITICAL-severity OSV advisory,
+  absent for all 3 HIGH-max versions), strictly less informative than the per-advisory id/severity/fixed-version
+  data OSV.dev already provides deps-lsp (specs 002/049).
+- `GossipFindingType::Other` remains the catch-all for `MALICIOUS`/`VULNERABLE`/`NOT_FOUND` — no new
+  finding-type variants are added.
+
+**Real gap found (S1) — tracked as a separate P0 follow-up issue, NOT in scope for #1475 or this spec.**
+The study surfaced a genuine coverage gap unrelated to GOSSIP: OSV phase B
+(`crates/deps-lsp/src/document/osv_scan.rs:359-417`) only checks a dependency's `latest`/upgrade-target
+version for malicious status or critical vulnerabilities when phase A already flagged the *pinned* version
+as vulnerable — a cleanly-pinned dependency's `latest` is never OSV-checked at all. Live-verified:
+`feed-widget-helper@1.0.4` (OSV-clean pin) has a malicious `latest` (`1.0.8`, MAL-2026-16332);
+`@nf-addons/am-global-header@9.9.9` (OSV-clean pin) has a malicious `latest` (`9.9.10`, MAL-2026-17154).
+This reaches every deps-lsp renderer that presents `latest` as an upgrade target — hover, diagnostics'
+"Newer version available", code actions, code lens, inlay hints, and completion ranking (round 2 finding
+M4, widening the original study's incomplete renderer list) — and separately, `deps-cli update`'s default
+mode was live-verified to silently write both known-malicious versions into a manifest with **no OSV check
+at all** (`crates/deps-cli/src/analyze.rs:64-66`, `update/security.rs:105`; confirmed via
+`update --dry-run` reporting `[applied] 1.0.4 -> 1.0.8` and `[applied] 9.9.9 -> 9.9.10`). Severity **P0**
+per `.claude/rules/continuous-improvement.md`'s severity table (a live, exploitable supply-chain-risk bug —
+`deps-cli update` writes malicious versions into manifests today — not merely a rendering gap). The
+recommended fix is to extend OSV phase B to every dependency whose `latest` differs from its pinned
+version, independent of phase A's outcome (not a GOSSIP-based guard — OSV stays authoritative per this
+spec's existing precedence rule and covers all ecosystems, not just npm). Filed as a separate GitHub issue,
+outside this spec's and #1475's scope.
 
 ## 10. See Also
 
