@@ -106,6 +106,12 @@ impl PackageName {
     /// ordinary package name (including scoped ones like `@types/node` or
     /// `com.google.guava:guava`) passes through unchanged.
     ///
+    /// The result is also swept for control/format characters (`\n`, `\r`, a raw ESC byte, and
+    /// the wider Unicode `Cc`/`Cf`/`Zl`/`Zp` set), via
+    /// [`redact_declaration_key`](crate::redact::redact_declaration_key)'s own final pass — a
+    /// manifest-controlled name has no credential shape to trigger the redaction above, but could
+    /// otherwise forge a whole `tracing` log line or terminal escape sequence verbatim (#1469).
+    ///
     /// # Examples
     ///
     /// ```
@@ -116,6 +122,9 @@ impl PackageName {
     ///
     /// let name = PackageName::new("com.google.guava:deploy:TOKEN@git.internal.corp");
     /// assert_eq!(name.for_tracing(), "***@git.internal.corp");
+    ///
+    /// let name = PackageName::new("lodash\nERROR deps_lsp: FORGED\x1b[31mRED");
+    /// assert_eq!(name.for_tracing(), "lodash ERROR deps_lsp: FORGED [31mRED");
     /// ```
     #[must_use]
     pub fn for_tracing(&self) -> String {
@@ -532,6 +541,41 @@ mod tests {
     fn package_name_debug_leaves_ordinary_name_untouched() {
         let name = PackageName::new("com.google.guava:guava");
         assert_eq!(format!("{name:?}"), "\"com.google.guava:guava\"");
+    }
+
+    /// #1469 (CWE-117/CWE-150): a manifest-controlled name with no credential shape at all still
+    /// carries `\n`/`\r`/ESC through untouched, letting it forge a fake `tracing` log line or
+    /// terminal escape sequence in `deps-lsp`'s stderr output. Adapted from the issue's PoC.
+    #[test]
+    fn for_tracing_neutralizes_control_characters() {
+        for forged in [
+            "lodash\nERROR deps_lsp: FORGED\x1b[31mRED",
+            "ok\r\nWARN forged2",
+        ] {
+            let rendered = PackageName::new(forged).for_tracing();
+            assert!(
+                !rendered.contains('\n'),
+                "{rendered:?} must not contain \\n"
+            );
+            assert!(
+                !rendered.contains('\r'),
+                "{rendered:?} must not contain \\r"
+            );
+            assert!(
+                !rendered.contains('\x1b'),
+                "{rendered:?} must not contain ESC"
+            );
+        }
+    }
+
+    /// #1469: the same sweep must also apply once the credential-shape gate fires, so a
+    /// control character hiding past a redacted credential can't survive either.
+    #[test]
+    fn for_tracing_neutralizes_control_characters_alongside_credential_redaction() {
+        let rendered =
+            PackageName::new("com.google.guava:deploy:TOKEN@git.internal\ncorp").for_tracing();
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains("TOKEN"));
     }
 
     #[test]
