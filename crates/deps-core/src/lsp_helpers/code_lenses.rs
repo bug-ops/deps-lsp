@@ -1,8 +1,6 @@
 use tower_lsp_server::ls_types::{CodeLens, Command, Position, Range, TextEdit};
 
 use crate::ParseResult;
-#[cfg(test)]
-use crate::PublishTime;
 
 use super::{EcosystemFormatter, VersionData};
 

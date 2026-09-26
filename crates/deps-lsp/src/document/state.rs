@@ -5,7 +5,7 @@ use deps_core::net_policy::RegistryAccessPolicy;
 use deps_core::osv::{OsvClient, VulnerabilityMap};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, DepsDevClient, EcosystemId, EcosystemRegistry,
-    LicensePolicy, PackageName, PackageVersions, ParseResult, TyposquatSignal,
+    GossipFindings, LicensePolicy, PackageName, PackageVersions, ParseResult, TyposquatSignal,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -231,6 +231,23 @@ pub struct DocumentState {
     /// matching the open-path pre-fetch's own unconditional spawn).
     pub(crate) typosquat_checked_names:
         std::collections::HashSet<(PackageName, super::osv_scan::TyposquatSourceEligibility)>,
+    /// GOSSIP-sourced cooldown/low-usage findings per declared dependency (issue #1456,
+    /// spec 072), keyed by raw (unnormalized) package name — mirrors [`Self::typosquats`]'s
+    /// exact shape and rationale. Populated by `document::gossip_prefetch::run_gossip_prefetch`
+    /// (see [`Self::merge_gossip_findings`]), whose single call per prefetch cycle combines
+    /// the per-package `DepsDevClient` memo's hits with this document's own
+    /// `GetFindingsBatch` results for memo-misses — a name already claimed by another
+    /// concurrent prefetch (elsewhere) is skipped this round rather than joined, so it
+    /// lands here on that *other* prefetch's own commit or this document's next trigger,
+    /// not necessarily this one (security/impl-critic review, corrects an earlier design
+    /// note that claimed a true three-way join). A mid-fetch content change no longer drops
+    /// the whole result (security/impl-critic S1) — the result is filtered down to names
+    /// still declared in the document's current content and merged. Read synchronously into
+    /// `deps_core::VersionData::gossip_prefetch` by `handlers::hover`/`handlers::diagnostics`,
+    /// never fetched inline on either generation path. Empty until the prefetch completes
+    /// or when `policy.gossip.enabled` is `false`; carried across document edits by
+    /// `preserve_cache` so the signal doesn't flicker off on every keystroke.
+    pub gossip_findings: HashMap<PackageName, GossipFindings>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -262,6 +279,7 @@ impl Clone for DocumentState {
             licenses: self.licenses.clone(),
             typosquats: self.typosquats.clone(),
             typosquat_checked_names: self.typosquat_checked_names.clone(),
+            gossip_findings: self.gossip_findings.clone(),
             parsed_at: self.parsed_at,
             loading_state: self.loading_state,
             // Note: Instant is Copy. Clones share the same loading start time.
@@ -385,6 +403,7 @@ impl std::fmt::Debug for DocumentState {
                 "typosquat_checked_names_count",
                 &self.typosquat_checked_names.len(),
             )
+            .field("gossip_findings_count", &self.gossip_findings.len())
             .field("yanked_versions_count", &self.outcomes.yanked_count())
             .field("deprecations_count", &self.outcomes.deprecation_count())
             .field("fetch_failed_count", &self.outcomes.fetch_failure_count())
@@ -418,6 +437,7 @@ impl DocumentState {
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
             typosquat_checked_names: std::collections::HashSet::new(),
+            gossip_findings: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -443,6 +463,7 @@ impl DocumentState {
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
             typosquat_checked_names: std::collections::HashSet::new(),
+            gossip_findings: HashMap::new(),
             parsed_at: Instant::now(),
             loading_state: LoadingState::Idle,
             loading_started_at: None,
@@ -653,6 +674,26 @@ impl DocumentState {
         if &self.typosquat_checked_names == stale_snapshot {
             self.typosquat_checked_names.clear();
         }
+    }
+
+    /// Merges GOSSIP findings into [`Self::gossip_findings`] without disturbing existing
+    /// entries — mirrors [`Self::merge_typosquats`]'s exact additive shape.
+    ///
+    /// `document::gossip_prefetch::run_gossip_prefetch`'s single call per prefetch cycle
+    /// assembles `findings` from **two** sources before calling this — memo hits and this
+    /// document's own `GetFindingsBatch` results for memo-misses (a name already claimed
+    /// by another document's in-flight batch for the same package is skipped this round,
+    /// not joined — that other prefetch's own commit, or this document's next trigger,
+    /// picks it up instead). `findings` may also be a *filtered* subset of what was
+    /// actually fetched, when the document's content changed mid-fetch (security/
+    /// impl-critic review S1) — the caller drops only names no longer declared, not the
+    /// whole result. A stale (superseded-version) entry for a still-declared dependency is
+    /// naturally overwritten the next time that package is re-resolved, mirroring
+    /// [`Self::merge_typosquats`]'s identical "no separate eviction needed" reasoning — a
+    /// genuinely removed dependency's entry is reclaimed by
+    /// `document::lifecycle::commit_parsed_document`'s manifest-diff pruning loop.
+    pub fn merge_gossip_findings(&mut self, findings: HashMap<PackageName, GossipFindings>) {
+        self.gossip_findings.extend(findings);
     }
 
     /// Evicts every name in `names` from [`Self::licenses`] — called ahead of a resolved
@@ -945,6 +986,11 @@ pub struct ServerState {
     /// `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.typosquat`.
     pub typosquat_enabled: AtomicBool,
+    /// Live-updatable `policy.gossip.enabled` setting (issue #1456, spec 072), mirroring
+    /// `typosquat_enabled`'s exact rationale and shape. Defaults to `false` (disabled)
+    /// until `Backend::initialize`/`did_change_configuration` first parses
+    /// `initializationOptions.gossip`.
+    pub gossip_enabled: AtomicBool,
     /// Ecosystem ids `crate::register_ecosystems` actually threaded the live
     /// `registry_policy` handle into (issue #592 security M1) — the single source of truth
     /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
@@ -1089,6 +1135,7 @@ impl ServerState {
             gitlab_instance_host,
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
             typosquat_enabled: AtomicBool::new(false),
+            gossip_enabled: AtomicBool::new(false),
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
@@ -1203,6 +1250,20 @@ impl ServerState {
     /// [`Self::set_license_policy`]).
     pub fn set_typosquat_enabled(&self, enabled: bool) {
         self.typosquat_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns whether GOSSIP-sourced signals are currently enabled (issue #1456, spec
+    /// 072). Read by every diagnostics-generation call site — see
+    /// [`Self::gossip_enabled`]'s field doc.
+    pub fn is_gossip_enabled(&self) -> bool {
+        self.gossip_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Replaces the active `policy.gossip.enabled` flag (issue #1456, spec 072).
+    ///
+    /// Mirrors [`Self::set_typosquat_enabled`]'s exact rationale.
+    pub fn set_gossip_enabled(&self, enabled: bool) {
+        self.gossip_enabled.store(enabled, Ordering::Relaxed);
     }
 
     /// Unions `scope` into the pending coalesced reparse and bumps the generation counter

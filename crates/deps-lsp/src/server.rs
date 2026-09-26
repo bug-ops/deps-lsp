@@ -3,7 +3,7 @@ use crate::document::{
     CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, ResolvedVersionMove, ServerState,
     change_task_triggers, handle_document_change, handle_document_open, reload_resolved_versions,
     rescan_after_resolved_version_change, run_license_prefetch, spawn_supervised,
-    trigger_typosquat_prefetch_for_open_documents,
+    trigger_gossip_prefetch_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -693,6 +693,8 @@ impl LanguageServer for Backend {
             // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
             self.state
                 .set_typosquat_enabled(config.policy.typosquat.enabled);
+            // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
+            self.state.set_gossip_enabled(config.policy.gossip.enabled);
             *self.config.write().await = config;
         }
 
@@ -856,6 +858,10 @@ impl LanguageServer for Backend {
         // needs no separate snapshot here.
         let was_typosquat_enabled = self.state.is_typosquat_enabled();
         let typosquat_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
+        // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
+        let gossip_enabled = config.policy.gossip.enabled;
+        let was_gossip_enabled = self.state.is_gossip_enabled();
+        let gossip_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
 
         // Diff old vs new for parse-affecting changes (#592) under one write-guard
         // acquisition: `DepsConfig` has no `Clone`, so the diff must read the
@@ -918,6 +924,16 @@ impl LanguageServer for Backend {
                 typosquat_trigger_fetch_timeout_secs,
             )
             .await;
+        }
+        // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
+        self.state.set_gossip_enabled(gossip_enabled);
+        if gossip_enabled && !was_gossip_enabled {
+            trigger_gossip_prefetch_for_open_documents(
+                &self.state,
+                &self.client,
+                Arc::clone(&self.config),
+                gossip_trigger_fetch_timeout_secs,
+            );
         }
 
         match scope {
@@ -3483,6 +3499,31 @@ mod tests {
             assert!(backend.state.is_typosquat_enabled());
         }
 
+        /// Issue #1456, spec 072, mirroring `test_initialize_applies_valid_typosquat_config`.
+        #[tokio::test]
+        async fn test_initialize_applies_valid_gossip_config() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            assert!(
+                !backend.state.is_gossip_enabled(),
+                "must default to disabled before any config is applied"
+            );
+
+            let result = backend
+                .initialize(InitializeParams {
+                    initialization_options: Some(serde_json::json!({
+                        "gossip": { "enabled": true }
+                    })),
+                    ..Default::default()
+                })
+                .await;
+
+            assert!(result.is_ok());
+            assert!(backend.config.read().await.policy.gossip.enabled);
+            assert!(backend.state.is_gossip_enabled());
+        }
+
         /// Tester gap: an invalid SPDX entry must be dropped (with a warning) rather than
         /// rejecting the whole `initializationOptions` payload — `deserialize_spdx_list`
         /// filters at deserialize time, not `deny_unknown_fields`-style hard rejection.
@@ -3647,6 +3688,23 @@ mod tests {
 
             assert!(backend.config.read().await.policy.typosquat.enabled);
             assert!(backend.state.is_typosquat_enabled());
+        }
+
+        /// Issue #1456, spec 072, mirroring
+        /// `test_did_change_configuration_applies_valid_typosquat_config`.
+        #[tokio::test]
+        async fn test_did_change_configuration_applies_valid_gossip_config() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "gossip": { "enabled": true } }),
+                })
+                .await;
+
+            assert!(backend.config.read().await.policy.gossip.enabled);
+            assert!(backend.state.is_gossip_enabled());
         }
 
         /// Issue #483 (critic M6a): the primary UX of the flag — a live

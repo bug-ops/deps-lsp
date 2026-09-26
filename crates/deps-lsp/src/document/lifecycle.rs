@@ -7,6 +7,7 @@ use super::diff::{DependencyDiff, preserve_cache, reload_resolved_versions};
 use super::fetch::{
     fetch_failure_toast, fetch_registry_versions_for_change, merge_registry_fetch_result,
 };
+use super::gossip_prefetch::{run_gossip_prefetch, spawn_gossip_mismatch_refetch_if_needed};
 use super::loader::{MAX_FILE_SIZE, load_document_from_disk};
 use super::osv_scan::{
     OsvScanResult, declared_names, run_license_prefetch, run_osv_phase_b_and_commit,
@@ -302,6 +303,17 @@ async fn run_document_open_background_task(
         .track_typosquat_task(uri.clone(), typosquat_generation, typosquat_task)
         .await;
 
+    // GOSSIP pre-fetch (issue #1456, spec 072) — same detached, self-guarded shape as the
+    // typosquat pre-fetch above.
+    spawn_gossip_prefetch_and_republish(
+        uri.clone(),
+        Arc::clone(&state),
+        client.clone(),
+        Arc::clone(&ecosystem),
+        Arc::clone(&config),
+        diagnostics_snapshot.fetch_timeout_secs,
+    );
+
     // Collect dependency names+sources, the in-use-version map (§4.6), and the manifest's own
     // `SelectionContext` (#1433) in one pass while holding the reference (can't hold across
     // await). Deduped by name (critique M3): a duplicated name shares one registry fetch
@@ -442,6 +454,12 @@ async fn run_document_open_background_task(
             doc.set_failed();
         }
     }
+
+    // Issue #1456, spec 072 FR-011/M21b: detect a GOSSIP version-equality mismatch now that
+    // `cached_versions` reflects this registry fetch's fresh latest — after the `get_mut`
+    // guard above has been dropped, since this call takes its own `with_document`/`get_mut`
+    // guards on potentially the same and other documents.
+    spawn_gossip_mismatch_refetch_if_needed(&uri, &state, &client, &ecosystem, &config);
 
     if let Some(progress) = progress {
         progress.end(success).await;
@@ -696,6 +714,9 @@ fn commit_parsed_document(
         // Raw-`dep.name()`-keyed, same as `licenses` above (issue #1437) — same orphaned-entry
         // reclaim rationale.
         doc_state.typosquats.remove(removed_dep);
+        // Raw-`dep.name()`-keyed, same as `typosquats` above (issue #1456, spec 072) — same
+        // orphaned-entry reclaim rationale.
+        doc_state.gossip_findings.remove(removed_dep);
         let removed_normalized_name = formatter.normalize_package_name(removed_dep);
         doc_state
             .vulnerabilities
@@ -1199,6 +1220,17 @@ async fn run_document_change_task(
             .await;
     }
 
+    // GOSSIP pre-fetch (issue #1456, spec 072) — same unconditional, self-guarded,
+    // not-joined-before-publish shape as the typosquat pre-fetch above.
+    spawn_gossip_prefetch_and_republish(
+        uri.clone(),
+        Arc::clone(&state),
+        client.clone(),
+        Arc::clone(&ecosystem),
+        Arc::clone(&live_config),
+        config.diagnostics.fetch_timeout_secs,
+    );
+
     // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
     // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty
     // and this early-return skips the fetch — existing dependencies keep their
@@ -1275,6 +1307,13 @@ async fn run_document_change_task(
         success,
     );
     drop(fetch_permit);
+
+    // Issue #1456, spec 072 FR-011/M21b: same rationale as the open-path's identical call —
+    // `cached_versions` now reflects this fetch's fresh latest. `live_config`, not
+    // `config: ChangeTaskConfig` (mirrors `spawn_typosquat_prefetch_and_republish`'s own
+    // use of `live_config` for the identical "eventual republish re-reads current
+    // settings" reason).
+    spawn_gossip_mismatch_refetch_if_needed(&uri, &state, &client, &ecosystem, &live_config);
 
     if let Some(progress) = progress {
         progress.end(success).await;
@@ -1441,6 +1480,82 @@ fn spawn_typosquat_prefetch_and_republish(
             );
         },
     )
+}
+
+/// Spawns [`run_gossip_prefetch`] fully detached — never joined before the caller's own
+/// diagnostics publish, mirroring [`spawn_typosquat_prefetch_and_republish`]'s identical
+/// NFR-001-driven design (issue #1456, spec 072): GOSSIP is an opt-in, best-effort signal,
+/// so gating real OSV/outdated diagnostics on its batch call would violate "never becomes
+/// a reliability liability". Spawns the pre-fetch, and — only if it actually commits a
+/// non-empty result — issues its own follow-up `publish_document_diagnostics` call once it
+/// resolves, rather than blocking the publish the caller was already about to make.
+///
+/// `config` is re-read for the *republish* only, right before `publish_document_diagnostics`
+/// (mirrors [`spawn_typosquat_prefetch_and_republish`]'s identical reasoning).
+fn spawn_gossip_prefetch_and_republish(
+    uri: Uri,
+    state: Arc<ServerState>,
+    client: Client,
+    ecosystem: Arc<dyn Ecosystem>,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    tokio::spawn(
+        async move {
+            let changed = run_gossip_prefetch(
+                uri.clone(),
+                Arc::clone(&state),
+                ecosystem,
+                fetch_timeout_secs,
+            )
+            .await;
+            if changed {
+                let snapshot = {
+                    let cfg = config.read().await;
+                    diagnostics::DiagnosticsSnapshot::from_config(&cfg)
+                };
+                let dep_count = diagnostics::document_dependency_count(&state, &uri);
+                diagnostics::publish_document_diagnostics(
+                    &state, &client, &uri, &snapshot, dep_count,
+                )
+                .await;
+            }
+        }
+        .instrument(tracing::Span::current()),
+    );
+}
+
+/// Triggers the GOSSIP pre-fetch for every currently open document (issue #1456, spec 072)
+/// — intended to be called once, from `Backend::did_change_configuration`, exactly when
+/// `policy.gossip.enabled` transitions from `false` to `true`, mirroring
+/// [`trigger_typosquat_prefetch_for_open_documents`]'s identical rationale and shape.
+pub(crate) fn trigger_gossip_prefetch_for_open_documents(
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    let uris: Vec<Uri> = state
+        .documents
+        .iter()
+        .map(|entry| entry.key().clone())
+        .collect();
+    for uri in uris {
+        let Some(ecosystem_id) = state.with_document(&uri, |doc| doc.ecosystem) else {
+            continue;
+        };
+        let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_id) else {
+            continue;
+        };
+        spawn_gossip_prefetch_and_republish(
+            uri,
+            Arc::clone(state),
+            client.clone(),
+            ecosystem,
+            Arc::clone(&config),
+            fetch_timeout_secs,
+        );
+    }
 }
 
 /// Triggers the typosquat pre-fetch for every currently open document (issue #1437 M1) —

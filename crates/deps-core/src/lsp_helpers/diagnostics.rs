@@ -19,8 +19,9 @@ use crate::{
 };
 
 use super::{
-    EcosystemFormatter, PackageVersions, RequirementMatcher, RequirementStatus, VersionData,
-    resolve_scan_outcome, version_range_is_synthetic_empty,
+    EcosystemFormatter, GossipCooldownLookup, PackageVersions, RequirementMatcher,
+    RequirementStatus, VersionData, gossip_cooldown_for, resolve_scan_outcome,
+    version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -1839,6 +1840,99 @@ pub async fn fetch_typosquat_signals(
     }
 }
 
+/// Collects and batch-fetches GOSSIP cooldown/low-usage findings for every declared
+/// dependency of one document (issue #1456, spec 072).
+///
+/// The deps-lsp-facing counterpart of [`fetch_typosquat_signals`], but issuing ONE
+/// `GetFindingsBatch` POST for the whole document (via
+/// [`DepsDevClient::gossip_findings_batch`]) rather than one call per dependency.
+///
+/// **Not** called from this diagnostics pipeline itself (NFR-002, same rationale as
+/// [`fetch_typosquat_signals`]) — the sole caller is
+/// `deps-lsp::document::gossip_prefetch::run_gossip_prefetch`, a background
+/// document-lifecycle task that merges the result into `deps-lsp`'s own
+/// `DocumentState::gossip_findings` map, from which
+/// [`crate::lsp_helpers::VersionData::gossip_prefetch`] is populated synchronously. `pub`,
+/// not `pub(crate)`: called from outside this crate (`deps-lsp`).
+///
+/// Zero HTTP requests when `client` is `None` (`policy.gossip.enabled` is `false`),
+/// `offline` is set, or `ecosystem_id` is one of the seven ecosystems `deps_dev_system`
+/// doesn't cover — all checked before any dependency name is even collected.
+///
+/// `formatter.source_is_public_registry_content(&dep.source())` gates each dependency
+/// individually, mirroring [`fetch_typosquat_signals`]'s identical per-dependency privacy
+/// gate (issue #1456 FR-009/NFR-005).
+pub async fn fetch_gossip_findings_batch(
+    ecosystem_id: EcosystemId,
+    parse_result: &dyn ParseResult,
+    formatter: &dyn EcosystemFormatter,
+    offline: bool,
+    client: Option<&Arc<DepsDevClient>>,
+) -> HashMap<PackageName, crate::GossipFindings> {
+    let mut result = HashMap::new();
+
+    let Some(client) = client else {
+        return result;
+    };
+    if offline {
+        return result;
+    }
+    let Some(system) = deps_dev_system(ecosystem_id) else {
+        return result;
+    };
+
+    let mut seen = HashSet::new();
+    let names: Vec<String> = parse_result
+        .dependencies()
+        .into_iter()
+        .filter(|dep| formatter.source_is_public_registry_content(&dep.source()))
+        .map(|dep| dep.name().as_str().to_string())
+        .filter(|name| seen.insert(name.clone()))
+        .collect();
+
+    if names.is_empty() {
+        return result;
+    }
+
+    let batch = client.gossip_findings_batch(system, &names).await;
+    for (name, findings) in batch {
+        result.insert(PackageName::new(&name), findings);
+    }
+    result
+}
+
+/// Force-refetches GOSSIP findings for `names` under `ecosystem_id`'s deps.dev system,
+/// bypassing the per-package memo (issue #1456, spec 072 FR-011/M21).
+///
+/// The deps-lsp-facing counterpart of [`fetch_gossip_findings_batch`] (which encapsulates
+/// the same `EcosystemId` -> deps.dev `system` mapping `deps_dev_system` is
+/// `pub(crate)`-only for), for a caller that has already detected a version-equality
+/// mismatch (FR-008) via `DocumentState.gossip_findings` and knows the normal
+/// memo-respecting path would just return the same stale answer.
+///
+/// Returns an empty map immediately, with no network call, when `ecosystem_id` isn't one of
+/// the seven `deps_dev_system`-covered ecosystems — the sole caller,
+/// `deps-lsp::document::gossip_prefetch`'s mismatch-detection function, is only ever able to
+/// populate `names` from an ecosystem that already had `gossip_findings` entries in the
+/// first place, so this early-out is defensive, not expected to fire in practice.
+pub async fn force_refresh_gossip_findings(
+    ecosystem_id: EcosystemId,
+    names: &[String],
+    client: &Arc<DepsDevClient>,
+) -> HashMap<PackageName, crate::GossipFindings> {
+    let mut result = HashMap::new();
+
+    let Some(system) = deps_dev_system(ecosystem_id) else {
+        return result;
+    };
+
+    let refreshed = client.force_refresh_gossip_findings(system, names).await;
+    for (name, findings) in refreshed {
+        result.insert(PackageName::new(&name), findings);
+    }
+    result
+}
+
 /// R3 — package-level deprecation finding (#205, I4).
 ///
 /// Emitted independently of the in-use-yanked check (R4), for the same FR-007-style
@@ -2285,21 +2379,44 @@ fn apply_outdated_rule(
         .enabled
         .then_some(package_versions.published_at)
         .flatten();
+    // Issue #1456, spec 072 FR-002/FR-008, S2: a GOSSIP-sourced answer is authoritative
+    // (and explicitly attributed) whenever available for this exact latest version — both
+    // `Active` and `NotActive` skip the local heuristic entirely; only `Unavailable` (no
+    // GOSSIP data for this version) falls back to it. Gated on `ctx.freshness.enabled` too
+    // — disabling the freshness feature entirely disables this differentiation regardless
+    // of source, matching hover's identical gate.
+    let gossip_cooldown = ctx.freshness.enabled.then(|| {
+        gossip_cooldown_for(
+            ctx.versions.gossip_prefetch,
+            dep.name(),
+            latest.as_str(),
+            ctx.now,
+        )
+    });
     let latest =
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
-    let message = match published_at {
-        Some(published_at)
-            if is_within_cooldown(
-                published_at.age_secs_from(ctx.now),
-                ctx.freshness.cooldown_secs,
-            ) =>
-        {
-            format!(
-                "Newer version available: {latest} (published {} — still within the release cooldown window)",
-                format_relative_age(published_at.age_secs_from(ctx.now))
-            )
+    let message = match gossip_cooldown {
+        Some(GossipCooldownLookup::Active) => format!(
+            "Newer version available: {latest} (deps.dev/GOSSIP reports this release is \
+             still within its cooldown window)"
+        ),
+        Some(GossipCooldownLookup::NotActive) => {
+            format!("Newer version available: {latest}")
         }
-        _ => format!("Newer version available: {latest}"),
+        Some(GossipCooldownLookup::Unavailable) | None => match published_at {
+            Some(published_at)
+                if is_within_cooldown(
+                    published_at.age_secs_from(ctx.now),
+                    ctx.freshness.cooldown_secs,
+                ) =>
+            {
+                format!(
+                    "Newer version available: {latest} (published {} — still within the release cooldown window)",
+                    format_relative_age(published_at.age_secs_from(ctx.now))
+                )
+            }
+            _ => format!("Newer version available: {latest}"),
+        },
     };
     diagnostics.push(
         Diagnostic::new(resolved.version_range, message).with_severity(ctx.severities.outdated),
@@ -5674,6 +5791,205 @@ mod tests {
         // Guards against reintroducing the "ago ago" duplication bug found while
         // writing this test — `format_relative_age` already appends "ago".
         assert!(!diagnostics[0].message().contains("ago ago"));
+    }
+
+    /// Issue #1456, spec 072 FR-002/FR-008: a GOSSIP prefetch entry whose version exactly
+    /// matches `latest` and carries an active cooldown takes precedence over the local
+    /// heuristic — even though the local `published_at` here is well outside the local
+    /// 3-day default, the GOSSIP-attributed message must render instead.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_gossip_cooldown_takes_precedence() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                // 30 days ago — well outside the local 3-day default cooldown.
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 30 * 24 * 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let mut gossip = HashMap::new();
+        gossip.insert(
+            PackageName::new("serde"),
+            crate::GossipFindings {
+                version: "2.0.0".to_string(),
+                cooldown: Some(crate::GossipCooldown {
+                    end: PublishTime::from_unix_secs(PublishTime::now().as_unix_secs() + 1_000),
+                    risk: crate::GossipRiskLevel::High,
+                }),
+                low_usage: None,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_gossip_prefetch(&gossip),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0].message().contains("deps.dev/GOSSIP"),
+            "got: {}",
+            diagnostics[0].message()
+        );
+    }
+
+    /// A GOSSIP prefetch entry whose version does **not** match `latest` (FR-008: the
+    /// registry's own reported latest has moved past whatever the prefetch last resolved)
+    /// must be treated as a cache miss — falls back to the local heuristic unchanged.
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_gossip_version_mismatch_falls_back() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let mut gossip = HashMap::new();
+        gossip.insert(
+            PackageName::new("serde"),
+            crate::GossipFindings {
+                // Stale: the prefetch's own defaultVersion (1.9.0) doesn't match `latest`
+                // (2.0.0) at this call site.
+                version: "1.9.0".to_string(),
+                cooldown: Some(crate::GossipCooldown {
+                    end: PublishTime::from_unix_secs(PublishTime::now().as_unix_secs() + 1_000),
+                    risk: crate::GossipRiskLevel::High,
+                }),
+                low_usage: None,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_gossip_prefetch(&gossip),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert!(!diagnostics[0].message().contains("deps.dev/GOSSIP"));
+        assert!(
+            diagnostics[0]
+                .message()
+                .contains("still within the release cooldown window"),
+            "must fall back to the local heuristic unchanged: {}",
+            diagnostics[0].message()
+        );
+    }
+
+    /// Issue #1456 security/impl-critic review S2: GOSSIP data is present and version-
+    /// matched but explicitly reports no cooldown at all (`cooldown: None`) — the message
+    /// must NOT fall back to the local heuristic, even though the local `published_at`
+    /// here is well within the local cooldown window (which would otherwise render a
+    /// contradicting message).
+    #[test]
+    fn test_generate_diagnostics_from_cache_outdated_gossip_not_active_suppresses_local_fallback() {
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "serde".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                // 1 hour ago — well within the default 3-day local cooldown, which would
+                // otherwise fire if this fell back.
+                published_at: Some(PublishTime::from_unix_secs(
+                    PublishTime::now().as_unix_secs() - 60 * 60,
+                )),
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let mut gossip = HashMap::new();
+        gossip.insert(
+            PackageName::new("serde"),
+            crate::GossipFindings {
+                version: "2.0.0".to_string(),
+                cooldown: None,
+                low_usage: None,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_gossip_prefetch(&gossip),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message(), "Newer version available: 2.0.0");
     }
 
     /// Same setup, but `latest` was published well outside the cooldown window — the

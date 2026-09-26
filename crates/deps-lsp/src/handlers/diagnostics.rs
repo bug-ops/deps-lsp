@@ -271,6 +271,7 @@ pub(crate) async fn generate_diagnostics_internal(
             doc.outcomes.clone(),
             doc.licenses.clone(),
             doc.typosquats.clone(),
+            doc.gossip_findings.clone(),
         ))
     }) else {
         tracing::warn!("Document not found for diagnostics: {:?}", uri);
@@ -288,6 +289,7 @@ pub(crate) async fn generate_diagnostics_internal(
         outcomes,
         licenses,
         typosquats,
+        gossip_findings,
     )) = extracted
     else {
         return vec![];
@@ -321,6 +323,15 @@ pub(crate) async fn generate_diagnostics_internal(
     } else {
         &empty_typosquats
     };
+    // Issue #1456, spec 072: same rationale as `typosquat_prefetch` above — a disabled or
+    // offline transition must stop rendering a previously-populated `gossip_findings` map
+    // immediately, not merely stop refreshing it.
+    let empty_gossip = std::collections::HashMap::new();
+    let gossip_prefetch = if state.is_gossip_enabled() && !offline {
+        &gossip_findings
+    } else {
+        &empty_gossip
+    };
     let version_data = VersionData::new(&cached_versions, &resolved_versions)
         .with_resolved_version_candidates(&resolved_version_candidates)
         .with_vulnerabilities(&vulnerabilities)
@@ -330,7 +341,8 @@ pub(crate) async fn generate_diagnostics_internal(
         .with_license_source(ecosystem.license_source())
         .with_license_policy(&policy)
         .with_license_prefetch(&licenses)
-        .with_typosquat_prefetch(typosquat_prefetch);
+        .with_typosquat_prefetch(typosquat_prefetch)
+        .with_gossip_prefetch(gossip_prefetch);
 
     let domain_diagnostics = ecosystem
         .generate_diagnostics(

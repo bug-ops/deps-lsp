@@ -22,7 +22,7 @@ use crate::lsp_helpers::{
 };
 use crate::{
     ConcreteVersion, FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
-    format_relative_age,
+    format_relative_age, is_within_cooldown,
 };
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
@@ -1107,6 +1107,10 @@ impl VersionReplacement {
 /// * `now` - Current instant, injected explicitly rather than read internally, so every
 ///   item in the same completion response has its age computed against one consistent
 ///   instant instead of drifting mid-request.
+/// * `freshness` - Whether to render a relative age at all (`enabled`), and the cooldown
+///   window (`cooldown_secs`) a candidate still within it is badged against (issue #1456,
+///   spec 072 FR-006) — completion's own default-on, GOSSIP-free cooldown baseline; see
+///   this function's `# Format` section below.
 ///
 /// # Returns
 ///
@@ -1116,9 +1120,10 @@ impl VersionReplacement {
 ///
 /// - Label: `"version"` or `"version (latest)"` for the latest version
 /// - Detail: `"Update package_name to version"`
-/// - Label details: a greyed-out relative age (e.g. `"2 hours ago"`) when
-///   `display_item.published_at` is known and `freshness_enabled` is `true`; omitted
-///   entirely otherwise
+/// - Label details: a greyed-out relative age (e.g. `"2 hours ago"`, or `"⏳ 2 hours ago"`
+///   when still within `freshness.cooldown_secs` — issue #1456, spec 072 FR-006's local
+///   per-candidate cooldown baseline) when `display_item.published_at` is known and
+///   `freshness.enabled` is `true`; omitted entirely otherwise
 /// - Preselect: `true` for latest version, `false` otherwise
 /// - Sort: Index-based (00000, 00001, etc.)
 ///
@@ -1126,7 +1131,7 @@ impl VersionReplacement {
 ///
 /// ```no_run
 /// use deps_core::completion::{build_version_completion, VersionDisplayItem, VersionReplacement};
-/// use deps_core::PackageName;
+/// use deps_core::{FreshnessSettings, PackageName};
 /// use tower_lsp_server::ls_types::Range;
 ///
 /// # async fn example(version: &dyn deps_core::Version) {
@@ -1134,7 +1139,7 @@ impl VersionReplacement {
 ///
 /// // Without a replacement - insert at cursor
 /// let display_item = VersionDisplayItem::new(version, &PackageName::new("serde"), 0, true);
-/// let item = build_version_completion(&display_item, None, now, true);
+/// let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
 /// assert_eq!(item.label, display_item.label);
 ///
 /// // With a replacement - replace a whole tag span with lead + version + trail
@@ -1144,25 +1149,47 @@ impl VersionReplacement {
 ///     trail: "</version>".to_string(),
 ///     replaced_text: "<version/>".to_string(),
 /// };
-/// let item = build_version_completion(&display_item, Some(&replacement), now, true);
+/// let item = build_version_completion(
+///     &display_item,
+///     Some(&replacement),
+///     now,
+///     FreshnessSettings::default(),
+/// );
 /// # }
 /// ```
 pub fn build_version_completion(
     display_item: &VersionDisplayItem,
     replacement: Option<&VersionReplacement>,
     now: PublishTime,
-    freshness_enabled: bool,
+    freshness: FreshnessSettings,
 ) -> CompletionItem {
     let sort_text = format!("{:05}", display_item.index);
 
+    // Issue #1456, spec 072 FR-006: completion's own default-on cooldown baseline — the
+    // local `is_within_cooldown` heuristic per candidate, honoring the same
+    // `FreshnessSettings.enabled`/`cooldown_secs` knobs already threaded in here. No GOSSIP
+    // data is ever read in this module (N6b: `generate_completions` has no
+    // `VersionData`/prefetch channel, and `handlers/completion.rs` cannot hold a `DashMap`
+    // shard reference across an await, issue #319) — this is the *only* signal completion
+    // ever shows.
+    let within_cooldown = freshness
+        .enabled
+        .then_some(display_item.published_at)
+        .flatten()
+        .is_some_and(|published_at| {
+            is_within_cooldown(published_at.age_secs_from(now), freshness.cooldown_secs)
+        });
+
     // Greyed-out label suffix; unlike `label`, it never participates in filter matching,
     // so adding it cannot change which items match a typed prefix (FR-006).
-    let label_details = freshness_enabled
+    let label_details = freshness
+        .enabled
         .then_some(display_item.published_at)
         .flatten()
         .map(|published_at| CompletionItemLabelDetails {
             detail: Some(format!(
-                "  {}",
+                "  {}{}",
+                if within_cooldown { "⏳ " } else { "" },
                 format_relative_age(published_at.age_secs_from(now))
             )),
             description: None,
@@ -1798,8 +1825,7 @@ pub async fn complete_versions_generic_replacing(
             safe
         })
         .map(|item| {
-            let mut completion_item =
-                build_version_completion(item, replacement, now, freshness.enabled);
+            let mut completion_item = build_version_completion(item, replacement, now, freshness);
             // #1435 S3: preserve the typed prefix's presentation style (e.g. Composer's
             // `v`-prefix) instead of splicing the registry's raw candidate text verbatim —
             // `label`/`detail` are left showing the real registry version (informational),
@@ -3936,7 +3962,7 @@ mod tests {
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, false);
-        let item = build_version_completion(&display_item, None, now, true);
+        let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
 
         assert_eq!(item.label, "1.0.0");
         assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
@@ -3967,7 +3993,12 @@ mod tests {
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("junit"), 0, true);
-        let item = build_version_completion(&display_item, Some(&replacement), now, true);
+        let item = build_version_completion(
+            &display_item,
+            Some(&replacement),
+            now,
+            FreshnessSettings::default(),
+        );
 
         assert_eq!(
             item.text_edit,
@@ -3991,7 +4022,7 @@ mod tests {
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, false);
-        let item = build_version_completion(&display_item, None, now, true);
+        let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
 
         assert_eq!(item.filter_text, None);
         assert_eq!(item.insert_text_format, None);
@@ -4007,7 +4038,7 @@ mod tests {
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
-        let item = build_version_completion(&display_item, None, now, true);
+        let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
 
         assert_eq!(item.label, "1.0.0 (latest)");
         assert_eq!(item.kind, Some(CompletionItemKind::VALUE));
@@ -4028,7 +4059,7 @@ mod tests {
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("tokio"), 1, false);
-        let item = build_version_completion(&display_item, None, now, true);
+        let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
 
         assert_eq!(item.label, "0.9.0");
         assert_eq!(item.detail, Some("Update tokio to 0.9.0".to_string()));
@@ -4060,9 +4091,12 @@ mod tests {
         let display_item2 = VersionDisplayItem::new(&v2, &pkg("test"), 1, false);
         let display_item3 = VersionDisplayItem::new(&v3, &pkg("test"), 2, false);
         let now = PublishTime::now();
-        let item1 = build_version_completion(&display_item1, None, now, true);
-        let item2 = build_version_completion(&display_item2, None, now, true);
-        let item3 = build_version_completion(&display_item3, None, now, true);
+        let item1 =
+            build_version_completion(&display_item1, None, now, FreshnessSettings::default());
+        let item2 =
+            build_version_completion(&display_item2, None, now, FreshnessSettings::default());
+        let item3 =
+            build_version_completion(&display_item3, None, now, FreshnessSettings::default());
 
         assert_eq!(item1.sort_text.as_ref().unwrap(), "00000");
         assert_eq!(item2.sort_text.as_ref().unwrap(), "00001");
@@ -4099,7 +4133,7 @@ mod tests {
             .enumerate()
             .map(|(idx, v)| {
                 let display_item = VersionDisplayItem::new(v, &pkg("test"), idx, idx == 0);
-                build_version_completion(&display_item, None, now, true)
+                build_version_completion(&display_item, None, now, FreshnessSettings::default())
             })
             .collect();
 
@@ -4135,7 +4169,7 @@ mod tests {
                     prerelease: false,
                 };
                 let display_item = VersionDisplayItem::new(&v, &pkg("test"), idx, idx == 0);
-                build_version_completion(&display_item, None, now, true)
+                build_version_completion(&display_item, None, now, FreshnessSettings::default())
             })
             .collect();
 
@@ -6345,12 +6379,14 @@ mod tests {
         };
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
-        let item = build_version_completion(&display_item, None, now, true);
+        let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
 
         let details = item
             .label_details
             .expect("label_details must be set when published_at is known");
-        assert_eq!(details.detail, Some("  2 hours ago".to_string()));
+        // Issue #1456, spec 072 FR-006: 2 hours is well within the default 3-day
+        // cooldown, so completion's local per-candidate baseline badges it.
+        assert_eq!(details.detail, Some("  ⏳ 2 hours ago".to_string()));
         assert_eq!(details.description, None);
     }
 
@@ -6366,7 +6402,15 @@ mod tests {
         };
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
-        let item = build_version_completion(&display_item, None, now, false);
+        let item = build_version_completion(
+            &display_item,
+            None,
+            now,
+            FreshnessSettings {
+                enabled: false,
+                ..FreshnessSettings::default()
+            },
+        );
 
         assert!(item.label_details.is_none());
     }
@@ -6380,9 +6424,60 @@ mod tests {
         };
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
-        let item = build_version_completion(&display_item, None, PublishTime::now(), true);
+        let item = build_version_completion(
+            &display_item,
+            None,
+            PublishTime::now(),
+            FreshnessSettings::default(),
+        );
 
         assert!(item.label_details.is_none());
+    }
+
+    /// Issue #1456, spec 072 FR-006: completion's local per-candidate cooldown baseline —
+    /// a candidate published outside the configured cooldown window gets the plain
+    /// relative-age label, no ⏳ badge.
+    #[test]
+    fn test_build_version_completion_no_cooldown_badge_outside_window() {
+        let now = PublishTime::from_unix_secs(10_000);
+        // 4 days ago — outside the default 3-day cooldown.
+        let published = PublishTime::from_unix_secs(10_000 - 4 * 24 * 3600);
+        let version = MockVersionWithAge {
+            version: "1.2.3".into(),
+            published_at: Some(published),
+        };
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
+
+        let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
+
+        let details = item.label_details.expect("label_details must be set");
+        assert!(!details.detail.unwrap().contains('⏳'));
+    }
+
+    /// A custom, shorter `cooldown_secs` narrows the badge window — an age just past a
+    /// 1-hour cooldown must not be badged even though it would be under the 3-day default.
+    #[test]
+    fn test_build_version_completion_respects_custom_cooldown_secs() {
+        let now = PublishTime::from_unix_secs(10_000);
+        let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
+        let version = MockVersionWithAge {
+            version: "1.2.3".into(),
+            published_at: Some(published_two_hours_ago),
+        };
+        let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
+
+        let item = build_version_completion(
+            &display_item,
+            None,
+            now,
+            FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 3600, // 1 hour — 2 hours ago is outside this window
+            },
+        );
+
+        let details = item.label_details.expect("label_details must be set");
+        assert!(!details.detail.unwrap().contains('⏳'));
     }
 
     /// FR-006 regression guard: when freshness data is absent (the pre-feature and
@@ -6415,7 +6510,7 @@ mod tests {
         let now = PublishTime::now();
         let items: Vec<_> = display_items
             .iter()
-            .map(|item| build_version_completion(item, None, now, true))
+            .map(|item| build_version_completion(item, None, now, FreshnessSettings::default()))
             .collect();
 
         assert_eq!(items[0].label, "1.0.0 (latest)");

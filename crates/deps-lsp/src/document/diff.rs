@@ -73,6 +73,12 @@ pub(crate) fn preserve_cache(new_state: &mut DocumentState, old_state: &Document
     new_state
         .typosquat_checked_names
         .clone_from(&old_state.typosquat_checked_names);
+    // Same rationale again (issue #1456, spec 072): without this, hover's cooldown
+    // callout and diagnostics' GOSSIP-attributed message would flicker off on every
+    // keystroke until `document::gossip_prefetch`'s next background pass re-populates it.
+    new_state
+        .gossip_findings
+        .clone_from(&old_state.gossip_findings);
 }
 
 /// Drops previously cached version and fetch-failure data ahead of a forced re-fetch

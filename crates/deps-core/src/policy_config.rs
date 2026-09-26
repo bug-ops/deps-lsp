@@ -12,11 +12,11 @@ use serde::Deserialize;
 ///
 /// Every section struct below (`DiagnosticsConfig`, `CacheConfig`, `FreshnessConfig`,
 /// `SupplyChainConfig`, `RegistriesConfig`, `NetworkConfig`, `LicensePolicyConfig`,
-/// `TyposquatConfig`) is
+/// `TyposquatConfig`, `GossipConfig`) is
 /// `#[non_exhaustive]`, matching `deps-core`'s general convention (issue #1064) — a field added
 /// to any of them no longer breaks every downstream crate that names the struct's full literal
 /// shape. `PolicyConfig` itself deliberately stays exhaustive: issue #1064/FR-006 scopes this to
-/// the 8 leaf structs specifically, since `PolicyConfig`'s own fields only change when a whole
+/// the 9 leaf structs specifically, since `PolicyConfig`'s own fields only change when a whole
 /// new policy *section* is added — a much rarer, more architecturally significant event than a
 /// field added to an existing section.
 ///
@@ -65,6 +65,9 @@ pub struct PolicyConfig {
     /// Typosquat-similarity diagnostic settings (issue #1437).
     #[serde(default)]
     pub typosquat: TyposquatConfig,
+    /// deps.dev GOSSIP-signal settings (issue #1456).
+    #[serde(default)]
+    pub gossip: GossipConfig,
 }
 
 /// Which leaf fields differ between two [`PolicyConfig`] snapshots, at the exact granularity
@@ -155,6 +158,7 @@ impl PolicyConfig {
             network: new_network,
             license_policy: new_license_policy,
             typosquat: new_typosquat,
+            gossip: new_gossip,
         } = new;
 
         // Not parse-affecting: exhaustive `_` bindings (never `..`) force a decision when a
@@ -183,6 +187,7 @@ impl PolicyConfig {
         let NetworkConfig { offline: _ } = new_network;
         let LicensePolicyConfig { allow: _, deny: _ } = new_license_policy;
         let TyposquatConfig { enabled: _ } = new_typosquat;
+        let GossipConfig { enabled: _ } = new_gossip;
 
         // Parse-affecting: each leaf field of `registries` is individually diffed.
         let RegistriesConfig {
@@ -1295,6 +1300,58 @@ impl TyposquatConfig {
     }
 }
 
+/// Configuration for deps.dev GOSSIP-sourced signals (issue #1456, spec 072).
+///
+/// Controls whether a document's declared dependencies are batch-checked against deps.dev's
+/// `GetFindingsBatch`/`GetFindings` endpoints for Dynamic Cooldown and Low-Usage-Packages
+/// findings. Ships **disabled by default**, structural twin of [`TyposquatConfig`] for the
+/// identical reason: the per-document prefetch discloses every declared dependency's name to
+/// deps.dev.
+///
+/// # Defaults
+///
+/// - `enabled`: `false`
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::policy_config::GossipConfig;
+///
+/// let config = GossipConfig::default();
+/// assert!(!config.enabled);
+/// ```
+#[non_exhaustive]
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GossipConfig {
+    /// Whether GOSSIP-sourced cooldown/low-usage signals are fetched at all.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl GossipConfig {
+    /// Builds the default (disabled) configuration (mirrors [`Self::default`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::policy_config::GossipConfig;
+    ///
+    /// let config = GossipConfig::new();
+    /// assert!(!config.enabled);
+    /// ```
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { enabled: false }
+    }
+
+    /// Overrides [`Self::enabled`]. See [`Self::new`].
+    #[must_use]
+    pub const fn with_enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+}
+
 /// Custom deserializer for `LicensePolicyConfig`'s `allow`/`deny` lists: drops (and warns
 /// about, via [`crate::licenses::filter_valid_spdx_ids`]) any entry that isn't
 /// syntactically a plausible single SPDX identifier, exactly once at config-load time —
@@ -1515,6 +1572,25 @@ mod tests {
     #[test]
     fn test_network_config_with_offline() {
         assert!(NetworkConfig::new().with_offline(true).offline);
+    }
+
+    #[test]
+    fn test_gossip_config_defaults() {
+        assert!(!GossipConfig::default().enabled);
+    }
+
+    #[test]
+    fn test_gossip_config_with_enabled() {
+        assert!(GossipConfig::new().with_enabled(true).enabled);
+    }
+
+    /// Regression for plan.md M12: a partial `{"gossip":{}}` section (missing `enabled`)
+    /// must parse successfully rather than failing the whole config reload — the exact bug
+    /// a missing `#[serde(default)]` on `enabled` would cause.
+    #[test]
+    fn test_gossip_config_partial_object_parses() {
+        let config: PolicyConfig = serde_json::from_str(r#"{"gossip": {}}"#).unwrap();
+        assert!(!config.gossip.enabled);
     }
 
     #[test]

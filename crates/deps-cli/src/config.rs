@@ -333,6 +333,13 @@ fn ignored_sections(policy: &PolicyConfig) -> Vec<&'static str> {
     {
         sections.push("license_policy");
     }
+    // Issue #1456, spec 072, FR-010/M14: `deps-cli` GOSSIP parity was dropped from this
+    // issue's scope (near-zero practical value — see spec 072 §9's N1) — a `[gossip]`
+    // section now at least surfaces this "no effect" warning instead of being silently
+    // accepted, mirroring every other section here.
+    if policy.gossip.enabled != default.gossip.enabled {
+        sections.push("gossip");
+    }
 
     sections
 }
@@ -401,6 +408,22 @@ mod tests {
         let mut file = tempfile::NamedTempFile::new().expect("create temp file");
         file.write_all(content.as_bytes()).expect("write temp file");
         file
+    }
+
+    /// Issue #1456, spec 072, M14: a `[gossip]` section differing from default must warn
+    /// via `ignored_sections`, since `deps-cli` has no GOSSIP behavior at all (FR-010
+    /// dropped) — otherwise it would be silently accepted with no effect.
+    #[test]
+    fn test_ignored_sections_includes_gossip_when_enabled() {
+        let mut policy = PolicyConfig::default();
+        policy.gossip.enabled = true;
+        assert!(ignored_sections(&policy).contains(&"gossip"));
+    }
+
+    #[test]
+    fn test_ignored_sections_omits_gossip_when_default() {
+        let policy = PolicyConfig::default();
+        assert!(!ignored_sections(&policy).contains(&"gossip"));
     }
 
     #[test]

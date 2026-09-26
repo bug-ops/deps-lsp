@@ -1918,6 +1918,55 @@ impl HttpCache {
         read_body_capped(url, response, BodyLimit::DEFAULT).await
     }
 
+    /// Same as [`Self::post_json`], but additionally takes an explicit [`BodyLimit`]
+    /// (rather than the hardcoded [`BodyLimit::DEFAULT`]) and confines every redirect hop to
+    /// `trusted_origin` via [`crate::net_policy::is_trusted_prefix`] — the same guarantee
+    /// [`Self::get_transport_only_with_headers_limited_trusted_origin`] gives the GET path.
+    ///
+    /// [`Self::post_json`] itself has neither of these: it sends through
+    /// `Self::baseline`'s client (the generic, non-origin-pinned redirect policy) and
+    /// always caps the response at [`BodyLimit::DEFAULT`] (32 MiB) regardless of how much
+    /// smaller a caller's own payloads actually are — a gap for a caller (deps.dev's GOSSIP
+    /// batch endpoint) whose response is expected to be a few KB and whose request body
+    /// carries every declared dependency's name, where an unconfined redirect is a bigger
+    /// concern than for `post_json`'s existing callers.
+    ///
+    /// # Errors
+    ///
+    /// Same as [`Self::post_json`].
+    pub async fn post_json_limited_trusted_origin<T: Serialize + Sync + ?Sized>(
+        &self,
+        url: &str,
+        body: &T,
+        limit: BodyLimit,
+        trusted_origin: &str,
+    ) -> Result<Bytes> {
+        self.ensure_online(url)?;
+        ensure_https(url)?;
+
+        let transport = self.transport_for_origin(trusted_origin);
+        let response = transport
+            .client
+            .post(url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| DepsError::RegistryError {
+                package: RedactedUrl::new(url),
+                source: e.into(),
+            })?;
+
+        if !response.status().is_success() {
+            return Err(http_status_error(
+                url,
+                response.status(),
+                response.headers(),
+            ));
+        }
+
+        read_body_capped(url, response, limit).await
+    }
+
     /// GETs `url` and returns the response body, bypassing the entry-map
     /// cache entirely — reuses the client, HTTPS enforcement, size cap, and
     /// timeout, exactly like [`Self::post_json`], but for a plain GET.
@@ -3740,6 +3789,87 @@ mod tests {
             Err(DepsError::HttpStatus { status, .. }) => assert_eq!(status, 400),
             other => panic!("expected HttpStatus, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_post_json_limited_trusted_origin_success_returns_body_and_does_not_cache() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/v3alpha/findings:batchGet", server.url());
+
+        let _m = server
+            .mock("POST", "/v3alpha/findings:batchGet")
+            .match_header("content-type", "application/json")
+            .with_status(200)
+            .with_body(r#"{"findings":[]}"#)
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let body = serde_json::json!({ "queries": [] });
+        let result: Bytes = cache
+            .post_json_limited_trusted_origin(&url, &body, BodyLimit::new(1024), &trusted_origin)
+            .await
+            .unwrap();
+
+        assert_eq!(result.as_ref(), br#"{"findings":[]}"#);
+        assert!(
+            cache.is_empty(),
+            "post_json_limited_trusted_origin must not populate the entry-map cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_post_json_limited_trusted_origin_enforces_body_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/v3alpha/findings:batchGet", server.url());
+
+        let _m = server
+            .mock("POST", "/v3alpha/findings:batchGet")
+            .with_status(200)
+            .with_body("x".repeat(64))
+            .create_async()
+            .await;
+
+        let cache = HttpCache::new();
+        let body = serde_json::json!({ "queries": [] });
+        let result: Result<Bytes> = cache
+            .post_json_limited_trusted_origin(&url, &body, BodyLimit::new(8), &trusted_origin)
+            .await;
+
+        match result {
+            Err(DepsError::ResponseTooLarge { .. }) => {}
+            other => panic!("expected ResponseTooLarge, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_post_json_limited_trusted_origin_rejects_untrusted_redirect() {
+        let mut server = mockito::Server::new_async().await;
+        let mut evil = mockito::Server::new_async().await;
+        let trusted_origin = format!("{}/", server.url());
+        let url = format!("{}/v3alpha/findings:batchGet", server.url());
+
+        let _redirect = server
+            .mock("POST", "/v3alpha/findings:batchGet")
+            .with_status(302)
+            .with_header("location", &format!("{}/steal", evil.url()))
+            .create_async()
+            .await;
+        let evil_call = evil.mock("GET", "/steal").expect(0).create_async().await;
+
+        let cache = HttpCache::new();
+        let body = serde_json::json!({ "queries": [] });
+        let result: Result<Bytes> = cache
+            .post_json_limited_trusted_origin(&url, &body, BodyLimit::DEFAULT, &trusted_origin)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an untrusted redirect hop must not be followed"
+        );
+        evil_call.assert_async().await;
     }
 
     #[tokio::test]
