@@ -1538,8 +1538,40 @@ pub(super) struct OsvAffected {
     pub(super) ranges: Vec<OsvRange>,
 }
 
+/// OSV's `affected[].ranges[].type` discriminator (issue #1482).
+///
+/// A `GIT` range's `fixed` event is a 40-hex commit SHA, not a version string in any
+/// ecosystem's namespace — [`OsvVulnRecord::into_advisory`] must never let one reach
+/// [`Advisory::fixed_versions`], since [`super::compare_version_strings`]'s digit-leading
+/// heuristic (and any ecosystem-native comparator) has no meaningful way to rank a SHA
+/// against a real version, and [`is_safe_version_string`] alone does not exclude
+/// SHA-shaped strings (they are ordinary alphanumeric text).
+///
+/// [`Self::Unknown`] is the `#[serde(other)]`/`Default` catch-all for a type OSV's schema
+/// has not yet documented, or a range with the field omitted entirely — deliberately
+/// excluded from [`Advisory::fixed_versions`] the same way `Git` is (fail closed), rather
+/// than assumed to be `Semver`/`Ecosystem`-shaped. A record with one unrecognized range
+/// among several still resolves normally; only that range's `fixed` events are dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum OsvRangeType {
+    /// A SemVer range — `fixed` is a SemVer-shaped version string.
+    Semver,
+    /// An ecosystem-native range (PEP 440, Maven, npm's `node-semver`, ...) — `fixed` is a
+    /// version string in that ecosystem's own namespace.
+    Ecosystem,
+    /// A git commit-range — `fixed` is a 40-hex commit SHA, never a version string.
+    Git,
+    /// Unrecognized or omitted `type` value.
+    #[serde(other)]
+    #[default]
+    Unknown,
+}
+
 #[derive(Debug, Deserialize, Default)]
 pub(super) struct OsvRange {
+    #[serde(rename = "type", default)]
+    pub(super) range_type: OsvRangeType,
     #[serde(default)]
     pub(super) events: Vec<OsvEvent>,
 }
@@ -1659,9 +1691,29 @@ impl OsvVulnRecord {
             .or_else(|| self.severity.first())
             .map(|s| s.score.clone());
 
+        // #1482 impl-critic M2: `Git` is routine (every scanned ecosystem has real GIT-range
+        // advisories) and warrants no log, but an `Unknown` range carrying a `fixed` event is a
+        // signal OSV's schema grew a range `type` this crate doesn't recognize yet — silently
+        // dropping it would otherwise make a genuinely fixable advisory quietly render as
+        // "no fix available" with nothing in the logs to explain why.
+        for range in relevant.iter().flat_map(|a| a.ranges.iter()) {
+            if range.range_type == OsvRangeType::Unknown
+                && range.events.iter().any(|e| e.fixed.is_some())
+            {
+                tracing::debug!(
+                    id = %self.id,
+                    "OSV record has a range with an unrecognized type carrying a fixed event; excluding it from fixed_versions"
+                );
+            }
+        }
+
         let mut fixed_versions: Vec<String> = relevant
             .iter()
             .flat_map(|a| a.ranges.iter())
+            // #1482: a `GIT` range's `fixed` event is a commit SHA, never a version string —
+            // and an unrecognized range `type` is excluded the same way, fail closed. Only
+            // `SEMVER`/`ECOSYSTEM` ranges carry a `fixed` event safe to treat as a version.
+            .filter(|r| matches!(r.range_type, OsvRangeType::Semver | OsvRangeType::Ecosystem))
             .flat_map(|r| r.events.iter())
             .filter_map(|e| e.fixed.clone())
             .filter(|v| {
@@ -1974,6 +2026,7 @@ mod osv_version_validation_tests {
                 ecosystem_specific: None,
                 database_specific: None,
                 ranges: vec![OsvRange {
+                    range_type: OsvRangeType::Ecosystem,
                     events: fixed
                         .iter()
                         .map(|f| OsvEvent {
@@ -2103,6 +2156,184 @@ mod osv_version_validation_tests {
         let advisory = record.into_advisory("pkg", "crates.io").unwrap();
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
+    }
+
+    /// #1482: a PYSEC-shaped record with a `GIT` range's commit-SHA `fixed` event alongside
+    /// an `ECOSYSTEM` range's real version fix. The SHA must never enter `fixed_versions` —
+    /// mirrors the real `requests` PYSEC-2023-74 shape (`74ea7cf7...` `GIT`-range fix vs.
+    /// `2.31.0` `ECOSYSTEM`-range fix).
+    #[test]
+    fn git_range_fixed_sha_is_excluded_but_ecosystem_range_fix_survives() {
+        let record = OsvVulnRecord {
+            id: "PYSEC-2023-74".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![OsvAffected {
+                package: None,
+                ecosystem_specific: None,
+                database_specific: None,
+                ranges: vec![
+                    OsvRange {
+                        range_type: OsvRangeType::Git,
+                        events: vec![OsvEvent {
+                            fixed: Some("74ea7cf7b6a3e2ff56cd76ce0d7bfa7ddd7bcaba".to_string()),
+                        }],
+                    },
+                    OsvRange {
+                        range_type: OsvRangeType::Ecosystem,
+                        events: vec![OsvEvent {
+                            fixed: Some("2.31.0".to_string()),
+                        }],
+                    },
+                ],
+            }],
+        };
+
+        let advisory = record
+            .into_advisory("requests", "PyPI")
+            .expect("valid id, should resolve");
+
+        assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("2.31.0")]);
+    }
+
+    /// #1482 end-to-end: the GIT-range SHA must never win `recommended_fix()` over the real
+    /// ECOSYSTEM-range fix — the actual degradation this issue reports (a genuinely fixable
+    /// vulnerability collapsing to "no fix available", or recommending an unusable SHA as the
+    /// upgrade target).
+    #[test]
+    fn recommended_fix_never_targets_a_git_range_sha() {
+        let record = OsvVulnRecord {
+            id: "PYSEC-2023-74".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![OsvAffected {
+                package: None,
+                ecosystem_specific: None,
+                database_specific: None,
+                ranges: vec![
+                    OsvRange {
+                        range_type: OsvRangeType::Git,
+                        events: vec![OsvEvent {
+                            fixed: Some("74ea7cf7b6a3e2ff56cd76ce0d7bfa7ddd7bcaba".to_string()),
+                        }],
+                    },
+                    OsvRange {
+                        range_type: OsvRangeType::Ecosystem,
+                        events: vec![OsvEvent {
+                            fixed: Some("2.31.0".to_string()),
+                        }],
+                    },
+                ],
+            }],
+        };
+        let advisory = Arc::new(
+            record
+                .into_advisory("requests", "PyPI")
+                .expect("valid id, should resolve"),
+        );
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
+
+        let fix = dv.recommended_fix().expect("a fix must be recommended");
+        assert_eq!(fix.version, "2.31.0");
+    }
+
+    /// Tester gap: every prior GIT-range test pairs the SHA with an ECOSYSTEM/SEMVER fix in
+    /// the same record. When a record's `affected[].ranges` are *all* `GIT`-typed — no
+    /// verified fix exists at all — `fixed_versions` must end up empty and `recommended_fix()`
+    /// must return `None`, not silently fall back to treating the SHA as usable.
+    #[test]
+    fn all_git_range_record_has_no_fixed_versions_and_no_recommended_fix() {
+        let record = OsvVulnRecord {
+            id: "GHSA-all-git".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![OsvAffected {
+                package: None,
+                ecosystem_specific: None,
+                database_specific: None,
+                ranges: vec![OsvRange {
+                    range_type: OsvRangeType::Git,
+                    events: vec![OsvEvent {
+                        fixed: Some("74ea7cf7b6a3e2ff56cd76ce0d7bfa7ddd7bcaba".to_string()),
+                    }],
+                }],
+            }],
+        };
+        let advisory = record
+            .into_advisory("pkg", "crates.io")
+            .expect("valid id, should resolve");
+        assert!(
+            advisory.fixed_versions.is_empty(),
+            "an all-GIT-range record has no verified fix"
+        );
+
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
+        assert!(
+            dv.recommended_fix().is_none(),
+            "recommended_fix must return None when no advisory has a claimable fix"
+        );
+    }
+
+    /// #1482: a range whose `type` OSV has not documented (or that is malformed) must be
+    /// excluded the same way `GIT` is — fail closed rather than assumed usable.
+    #[test]
+    fn unrecognized_range_type_is_excluded() {
+        let record = OsvVulnRecord {
+            id: "GHSA-unknown-type".to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![OsvAffected {
+                package: None,
+                ecosystem_specific: None,
+                database_specific: None,
+                ranges: vec![OsvRange {
+                    range_type: OsvRangeType::Unknown,
+                    events: vec![OsvEvent {
+                        fixed: Some("1.2.3".to_string()),
+                    }],
+                }],
+            }],
+        };
+
+        let advisory = record
+            .into_advisory("pkg", "crates.io")
+            .expect("valid id, should resolve");
+
+        assert!(advisory.fixed_versions.is_empty());
+    }
+
+    /// A range's `type` field missing entirely from the wire JSON must deserialize as
+    /// [`OsvRangeType::Unknown`] (fail closed), not silently default to `Semver`/`Ecosystem`.
+    #[test]
+    fn range_type_defaults_to_unknown_when_field_is_absent() {
+        let json = r#"{"events":[{"fixed":"1.2.3"}]}"#;
+        let range: OsvRange = serde_json::from_str(json).unwrap();
+        assert_eq!(range.range_type, OsvRangeType::Unknown);
+    }
+
+    #[test]
+    fn range_type_deserializes_known_variants() {
+        for (wire, expected) in [
+            (r#""SEMVER""#, OsvRangeType::Semver),
+            (r#""ECOSYSTEM""#, OsvRangeType::Ecosystem),
+            (r#""GIT""#, OsvRangeType::Git),
+            (r#""SOME-FUTURE-TYPE""#, OsvRangeType::Unknown),
+        ] {
+            let got: OsvRangeType = serde_json::from_str(wire).unwrap();
+            assert_eq!(got, expected, "unexpected mapping for {wire}");
+        }
     }
 
     #[test]

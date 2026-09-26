@@ -77,28 +77,79 @@ const MAX_CACHE_ENTRIES: usize = 10_000;
 
 const OSV_API_BASE: &str = "https://api.osv.dev";
 
-/// Compares two version-like strings by their leading numeric dot-segments,
-/// falling back to a lexicographic compare of any non-numeric remainder.
+/// Compares two version-like strings by their leading numeric-and-dot release prefix (the
+/// longest leading run of `[0-9.]` after stripping a single leading `v`/`V` tag-prefix marker,
+/// trailing dot trimmed — `"2.0.0-rc.1"` and `"2.2.0.dev0"` both yield the release prefix
+/// `"2.0.0"`/`"2.2.0"`, and `"v1.20.3"` yields `"1.20.3"`), preferring a bare release over any
+/// string carrying a non-numeric suffix past that prefix once the two release prefixes tie — a
+/// pre-release marker in every scheme this workspace scans (SemVer's `-rc.1`, PEP 440's
+/// `rc1`/`.dev0`, Go's pseudo-version `-0.20210101000000-abcdef123456`, Maven's `-SNAPSHOT`) —
+/// then falling back to a lexicographic compare of any remaining tie.
 ///
-/// Used only to order [`Advisory::fixed_versions`] ascending — not a general
-/// semver comparator. Good enough for that purpose because the ordering only
-/// needs to pick out "the highest fixed version", and OSV's `fixed` events
-/// are plain dotted-numeric strings in every ecosystem this workspace scans.
+/// Used only to order [`Advisory::fixed_versions`] ascending and to pick
+/// [`DependencyVulnerabilities::recommended_fix`]'s target across advisories — not a general
+/// semver/PEP 440/Maven comparator, and deliberately **not** applied to `GIT`-range `fixed`
+/// events (40-hex commit SHAs), which [`OsvVulnRecord::into_advisory`] excludes from
+/// `fixed_versions` entirely before this ever runs (issue #1482) — this comparator has no
+/// meaningful way to rank a SHA against a real version, and a caller with an ecosystem-native
+/// parser at hand (`semver`, `pep440_rs`, ...) should prefer that over this heuristic when one
+/// is available.
+///
+/// The plain-release tie-break is a deliberate, documented over-simplification for a suffix
+/// this comparator cannot classify further: it also ranks a *post*-release (PEP 440's
+/// `1.0.0.post1`, Maven's `1.2.3-1` build number) below its own base release, which is
+/// backwards for those two schemes specifically — a real regression only if an OSV record's
+/// `fixed_versions` for one advisory ever mixes a bare release with that same release's
+/// post-release/build-number spelling, which is rarer than the pre-release case this fixes
+/// (PyPI/OSV normalize most post-releases to the `.postN` form regardless, and no live-verified
+/// OSV record in this project's test fixtures has hit it).
 fn compare_version_strings(a: &str, b: &str) -> std::cmp::Ordering {
+    /// The longest leading run of `[0-9.]` in `s`, trailing dot trimmed — the "release" part of
+    /// a version string, stopping before any pre-release/build/metadata suffix regardless of
+    /// whether that suffix starts with a dot (`.dev0`), a hyphen (`-rc.1`), or no separator at
+    /// all (`rc0`). Callers must strip a leading `v`/`V` tag-prefix marker before calling this —
+    /// see [`compare_version_strings`]'s own `normalize_tag` call — otherwise the marker itself
+    /// is the first non-digit-non-dot character and the whole release prefix collapses to
+    /// empty.
+    fn release_prefix(s: &str) -> &str {
+        let end = s
+            .char_indices()
+            .find(|(_, c)| !(c.is_ascii_digit() || *c == '.'))
+            .map_or(s.len(), |(i, _)| i);
+        // `end` always lands on a char boundary (`char_indices` guarantees it), but
+        // `clippy::string_slice` can't prove that statically — `get` sidesteps the lint
+        // without changing behavior, since the slice can never actually fail.
+        s.get(..end).unwrap_or(s).trim_end_matches('.')
+    }
+
     fn segments(s: &str) -> Vec<u64> {
-        s.split('.')
-            .map(|part| {
-                part.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0)
-            })
+        release_prefix(s)
+            .split('.')
+            .map(|part| part.parse().unwrap_or(0))
             .collect()
     }
 
+    /// Whether `s` is entirely its own release prefix (no pre-release/build/metadata suffix).
+    fn is_plain_release(s: &str) -> bool {
+        release_prefix(s).len() == s.len()
+    }
+
+    // Code-review regression (#1482): a leading `v`/`V` tag-prefix marker (a git release tag an
+    // OSV record can echo verbatim) is itself the first non-digit-non-dot character, so without
+    // stripping it first `release_prefix` collapsed to empty for both operands — "v1.20.3" and
+    // "v1.3.10" then tied on `segments`/`is_plain_release` and fell all the way to the
+    // lexicographic fallback, which compares character-by-character and ranks "v1.20.3" *below*
+    // "v1.3.10" (wrong: 20 > 3). `normalize_tag` is the same single-`v`/`V`-prefix strip
+    // [`crate::lsp_helpers::OsvNaming::osv_version`]/`osv_version_to_native` already apply to
+    // this exact class of value, so the rest of the release-prefix logic runs on real numeric
+    // content instead of stopping at the marker.
+    let a = crate::github::normalize_tag(a);
+    let b = crate::github::normalize_tag(b);
+
     let (sa, sb) = (segments(a), segments(b));
-    sa.cmp(&sb).then_with(|| a.cmp(b))
+    sa.cmp(&sb)
+        .then_with(|| is_plain_release(a).cmp(&is_plain_release(b)))
+        .then_with(|| a.cmp(b))
 }
 
 struct QueryCacheEntry {
@@ -776,6 +827,98 @@ mod tests {
         assert_eq!(versions, vec!["0.2.0", "0.2.2", "0.2.10", "0.2.23"]);
     }
 
+    /// A PEP 440 release candidate must never outrank its own release when the leading
+    /// numeric dot-segments tie — a bare lexicographic fallback puts `2.2.0rc0` after
+    /// `2.2.0` (longer string, same prefix), which would let a pre-release "win" as
+    /// `recommended_fix`'s target.
+    #[test]
+    fn compare_version_strings_prefers_plain_release_over_same_prefix_prerelease() {
+        assert_eq!(
+            compare_version_strings("2.2.0", "2.2.0rc0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_version_strings("2.2.0rc0", "2.2.0"),
+            std::cmp::Ordering::Less
+        );
+
+        let mut versions = vec!["2.2.0rc0".to_string(), "2.2.0".to_string()];
+        versions.sort_by(|a, b| compare_version_strings(a, b));
+        assert_eq!(versions, vec!["2.2.0rc0", "2.2.0"]);
+    }
+
+    /// impl-critic S1: the undotted-suffix case above (`2.2.0rc0`) is not representative —
+    /// SemVer's own spec (and Cargo/npm/NuGet, which follow it) always separates a pre-release
+    /// identifier with a `-`, usually followed by further dot segments. A fix must not only
+    /// tie-break on the exact leading digit segments matching; it must recognize that
+    /// `"2.0.0-rc.1"`'s *release* is `2.0.0`, the same as bare `"2.0.0"`.
+    #[test]
+    fn compare_version_strings_prefers_plain_release_over_dotted_semver_prerelease() {
+        assert_eq!(
+            compare_version_strings("2.0.0", "2.0.0-rc.1"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_version_strings("1.0.0", "1.0.0-beta.2"),
+            std::cmp::Ordering::Greater
+        );
+
+        let mut versions = vec!["2.0.0-rc.1".to_string(), "2.0.0".to_string()];
+        versions.sort_by(|a, b| compare_version_strings(a, b));
+        assert_eq!(versions, vec!["2.0.0-rc.1", "2.0.0"]);
+    }
+
+    /// impl-critic S1: PEP 440's `.dev0`/`rc1.dev0` and Go's pseudo-version suffixes are also
+    /// dotted or hyphen-separated past the release segments — the same bug class as the SemVer
+    /// case above, for different ecosystems.
+    #[test]
+    fn compare_version_strings_prefers_plain_release_over_pep440_and_go_pseudo_suffixes() {
+        assert_eq!(
+            compare_version_strings("2.2.0", "2.2.0.dev0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_version_strings("2.2.0", "2.2.0rc1.dev0"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_version_strings("1.2.4", "1.2.4-0.20210101000000-abcdef123456"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    /// Tester gap: an unrelated, lower pre-release must still lose to a higher plain release
+    /// purely on the leading numeric segments — the plain-release tie-break must only kick in
+    /// once the release segments already tie, never override a genuine version difference.
+    #[test]
+    fn compare_version_strings_numeric_ordering_still_wins_over_prerelease_tiebreak() {
+        assert_eq!(
+            compare_version_strings("2.2.0", "1.9.0rc1"),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    /// Code-review regression: without stripping a leading `v`/`V` tag-prefix marker first,
+    /// the marker itself was the first non-digit-non-dot character in the whole string, so
+    /// `release_prefix` collapsed to empty for both operands and the comparison fell through to
+    /// a purely lexicographic (character-by-character) compare — wrongly ranking `v1.20.3`
+    /// below `v1.3.10` (`'2' < '3'` at the second character) even though `20 > 3`.
+    #[test]
+    fn compare_version_strings_strips_leading_tag_prefix_before_ranking() {
+        assert_eq!(
+            compare_version_strings("v1.20.3", "v1.3.10"),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_version_strings("V1.20.3", "v1.3.10"),
+            std::cmp::Ordering::Greater
+        );
+
+        let mut versions = vec!["v1.3.10".to_string(), "v1.20.3".to_string()];
+        versions.sort_by(|a, b| compare_version_strings(a, b));
+        assert_eq!(versions, vec!["v1.3.10", "v1.20.3"]);
+    }
+
     #[tokio::test]
     async fn scan_empty_input_returns_empty_map() {
         let client = client();
@@ -988,10 +1131,10 @@ mod tests {
                    "affected":[
                      {"package":{"name":"log4j-api","ecosystem":"Maven"},
                       "ecosystem_specific":{"severity":"LOW"},
-                      "ranges":[{"events":[{"fixed":"1.0.0"}]}]},
+                      "ranges":[{"type":"ECOSYSTEM","events":[{"fixed":"1.0.0"}]}]},
                      {"package":{"name":"log4j-core","ecosystem":"Maven"},
                       "ecosystem_specific":{"severity":"CRITICAL"},
-                      "ranges":[{"events":[{"fixed":"2.17.1"}]}]}
+                      "ranges":[{"type":"ECOSYSTEM","events":[{"fixed":"2.17.1"}]}]}
                    ]}"#,
             )
             .create_async()
@@ -1096,10 +1239,10 @@ mod tests {
                    "summary":"Potential segfault","database_specific":{"severity":"HIGH"},
                    "affected":[
                      {"package":{"name":"time","ecosystem":"crates.io"},"ranges":[
-                       {"events":[{"introduced":"0"},{"fixed":"0.2.0"},{"fixed":"0.1.44"}]},
-                       {"events":[{"introduced":"0"},{"fixed":"0.2.4"},{"fixed":"0.1.43"}]},
-                       {"events":[{"introduced":"0"},{"fixed":"0.2.2"},{"fixed":"0.2.23"}]},
-                       {"events":[{"introduced":"0"},{"fixed":"0.2.1"},{"fixed":"0.2.3"}]}
+                       {"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"0.2.0"},{"fixed":"0.1.44"}]},
+                       {"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"0.2.4"},{"fixed":"0.1.43"}]},
+                       {"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"0.2.2"},{"fixed":"0.2.23"}]},
+                       {"type":"SEMVER","events":[{"introduced":"0"},{"fixed":"0.2.1"},{"fixed":"0.2.3"}]}
                      ]}
                    ]}"#,
             )
@@ -1289,7 +1432,7 @@ mod tests {
                     r#"{{"id":"ADV-{i}","modified":"2023-01-01T00:00:00Z",
                        "database_specific":{{"severity":"HIGH"}},
                        "affected":[{{"package":{{"name":"golang.org/x/net","ecosystem":"Go"}},
-                         "ranges":[{{"events":[{{"introduced":"0"}},{{"fixed":"{fixed}"}}]}}]}}]}}"#
+                         "ranges":[{{"type":"SEMVER","events":[{{"introduced":"0"}},{{"fixed":"{fixed}"}}]}}]}}]}}"#
                 ))
                 .create_async()
                 .await;
