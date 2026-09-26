@@ -46,12 +46,12 @@ pub use code_lenses::{
 };
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    MAX_DIAGNOSTIC_VALUE_CHARS, TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, fetch_gossip_findings_batch,
-    fetch_typosquat_signals, force_refresh_gossip_findings, generate_diagnostics_from_cache,
-    redact_name_for_diagnostic, redact_requirement_for_diagnostic, requirement_is_unsatisfiable,
-    sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
-    truncate_for_diagnostic,
+    MAX_DIAGNOSTIC_VALUE_CHARS, MAX_REQUIREMENT_LEN, TYPOSQUAT_DIAGNOSTIC_CODE,
+    TyposquatFetchOutcome, UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless,
+    fetch_gossip_findings_batch, fetch_typosquat_signals, force_refresh_gossip_findings,
+    generate_diagnostics_from_cache, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
+    requirement_is_unsatisfiable, sanitize_advisory_text_for_diagnostic,
+    sanitize_and_truncate_for_diagnostic, truncate_for_diagnostic,
 };
 // `pub(crate)` (matching the function's own visibility) so `edit.rs` and `in_use_version.rs`
 // can share the same oversized-requirement bound `diagnostics.rs`'s own gates use, rather than

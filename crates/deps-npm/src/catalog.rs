@@ -319,6 +319,15 @@ pub enum CatalogOutcome {
     DuplicateDefaultCatalog,
     /// `catalog:<name>` names a catalog that doesn't exist in `catalogs:`.
     UnknownCatalog,
+    /// The catalog entry exists and is a scalar string, but exceeds
+    /// [`deps_core::lsp_helpers::MAX_REQUIREMENT_LEN`] — rejected before it ever reaches
+    /// `node_semver::Range::parse` (CWE-400, #1483): `node_semver` allocates roughly 1.6 KB
+    /// per `||` alternative in a range, so an unbounded, attacker-controlled
+    /// `pnpm-workspace.yaml` entry (up to the 8 MiB `MAX_CACHED_FILE_BYTES` manifest cap)
+    /// would otherwise turn into a large heap allocation on every dependency that
+    /// references it, on every re-parse. No real pnpm catalog entry approaches this length —
+    /// the same cap every other npm requirement path applies before compiling a range.
+    RequirementTooLong,
     /// The referenced catalog exists (or the workspace file has neither a `catalog:` nor a
     /// `catalogs:` key at all, which behaves as an empty default catalog) but has no entry for
     /// this dependency's name.
@@ -348,6 +357,7 @@ impl std::fmt::Debug for CatalogOutcome {
             Self::DuplicateDefaultCatalog => f.debug_struct("DuplicateDefaultCatalog").finish(),
             Self::UnknownCatalog => f.debug_struct("UnknownCatalog").finish(),
             Self::MissingEntry => f.debug_struct("MissingEntry").finish(),
+            Self::RequirementTooLong => f.debug_struct("RequirementTooLong").finish(),
         }
     }
 }
@@ -522,6 +532,11 @@ impl CatalogOrigin {
             CatalogOutcome::MissingEntry => Some(format!(
                 "{specifier} has no entry for '{dependency_name}' in {catalog_phrase} of pnpm-workspace.yaml"
             )),
+            CatalogOutcome::RequirementTooLong => Some(format!(
+                "the entry for '{dependency_name}' in {catalog_phrase} of pnpm-workspace.yaml \
+                 exceeds the {}-byte limit for a version range and was not parsed",
+                deps_core::lsp_helpers::MAX_REQUIREMENT_LEN
+            )),
             CatalogOutcome::UnknownCatalog => {
                 let name = text(&bounded(self.catalog.as_deref().unwrap_or_default()));
                 Some(format!(
@@ -575,12 +590,21 @@ fn resolve(
     match catalog.get(dependency_name) {
         None => CatalogOutcome::MissingEntry,
         Some(CatalogValue::Malformed) => CatalogOutcome::MalformedEntry,
-        Some(CatalogValue::Range(range)) => match node_semver::Range::parse(range) {
-            Ok(_) => CatalogOutcome::Resolved(range.clone()),
-            Err(_) => CatalogOutcome::NonSemverEntry {
-                value: range.clone(),
-            },
-        },
+        Some(CatalogValue::Range(range)) => {
+            // #1483: reject before `node_semver::Range::parse` ever sees it — that parser
+            // allocates roughly 1.6 KB per `||` alternative, so an unbounded range string
+            // is a resource-exhaustion vector. Same cap `requirement_is_unsatisfiable`
+            // applies to every other npm requirement before compiling it.
+            if range.len() > deps_core::lsp_helpers::MAX_REQUIREMENT_LEN {
+                return CatalogOutcome::RequirementTooLong;
+            }
+            match node_semver::Range::parse(range) {
+                Ok(_) => CatalogOutcome::Resolved(range.clone()),
+                Err(_) => CatalogOutcome::NonSemverEntry {
+                    value: range.clone(),
+                },
+            }
+        }
     }
 }
 
@@ -1069,6 +1093,95 @@ mod tests {
         assert_matches!(
             deps[0].catalog.as_ref().unwrap().outcome,
             CatalogOutcome::Resolved(ref r) if r == "1.2"
+        );
+    }
+
+    /// #1483 (CWE-400): a catalog entry longer than `MAX_REQUIREMENT_LEN` must be rejected
+    /// before it ever reaches `node_semver::Range::parse`, which allocates roughly 1.6 KB per
+    /// `||` alternative and so is a resource-exhaustion vector on an unbounded string.
+    #[test]
+    fn test_apply_oversized_range_rejected_before_parse() {
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let oversized = "1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN + 1);
+        workspace(
+            root.path(),
+            &format!("catalog:\n  react: \"{oversized}\"\n"),
+        );
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(deps[0].version_req, None);
+        assert_eq!(
+            deps[0].catalog.as_ref().unwrap().outcome,
+            CatalogOutcome::RequirementTooLong
+        );
+        let message = deps[0]
+            .catalog
+            .as_ref()
+            .unwrap()
+            .diagnostic_message("react")
+            .unwrap();
+        assert!(message.contains("react"));
+        assert!(message.contains("limit"));
+    }
+
+    /// The cap is exclusive: a range of exactly `MAX_REQUIREMENT_LEN` bytes must still reach
+    /// `node_semver::Range::parse` rather than being rejected outright, matching
+    /// `requirement_is_unsatisfiable`'s own `> MAX_REQUIREMENT_LEN` boundary.
+    #[test]
+    fn test_apply_range_at_length_cap_still_reaches_parser() {
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let at_cap = "x".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN);
+        workspace(root.path(), &format!("catalog:\n  react: \"{at_cap}\"\n"));
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(
+            deps[0].catalog.as_ref().unwrap().outcome,
+            CatalogOutcome::NonSemverEntry { value: at_cap }
+        );
+    }
+
+    /// M3 (review): the previous at-cap test only proves the parser is reached, not that a
+    /// legitimate long range still resolves — pads a valid semver prerelease tag out to
+    /// exactly `MAX_REQUIREMENT_LEN` bytes so a real (if unusual) catalog entry at the
+    /// boundary still ends up `Resolved`, not rejected.
+    #[test]
+    fn test_apply_valid_range_at_length_cap_resolves() {
+        // Per `fs_probe::snapshot_guard`'s contract for fs_probe-touching tests.
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let prefix = "1.0.0-";
+        let padding_len = deps_core::lsp_helpers::MAX_REQUIREMENT_LEN - prefix.len();
+        let at_cap_valid = format!("{prefix}{}", "a".repeat(padding_len));
+        assert_eq!(
+            at_cap_valid.len(),
+            deps_core::lsp_helpers::MAX_REQUIREMENT_LEN
+        );
+        workspace(
+            root.path(),
+            &format!("catalog:\n  react: \"{at_cap_valid}\"\n"),
+        );
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("react", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(deps[0].version_req, Some(at_cap_valid.clone().into()));
+        assert_matches!(
+            deps[0].catalog.as_ref().unwrap().outcome,
+            CatalogOutcome::Resolved(ref r) if *r == at_cap_valid
         );
     }
 
