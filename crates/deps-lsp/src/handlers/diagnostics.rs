@@ -458,7 +458,7 @@ mod tests {
     /// Issue #1437 NFR-002 (perf-review finding): diagnostics generation must never
     /// `.await` a deps.dev fan-out inline — `VersionData::typosquat_prefetch` is read
     /// synchronously from `PackageSignals::typosquats`, populated ahead of time by a
-    /// background prefetch (`document::osv_scan::run_typosquat_prefetch`), never fetched
+    /// background prefetch (`document::typosquat::run_typosquat_prefetch`), never fetched
     /// on this path. Proven here by enabling the feature, populating `doc.signals.typosquats`
     /// directly (bypassing the prefetch entirely, simulating "prefetch already
     /// completed"), and wrapping the call in a deliberately tiny timeout: if a future
@@ -489,7 +489,7 @@ mod tests {
             .expect("Failed to parse manifest");
 
         // Resolved through a mocked server, the same way
-        // `document::osv_scan::run_typosquat_prefetch` resolves it in production — the
+        // `document::typosquat::run_typosquat_prefetch` resolves it in production — the
         // network round trip happens here, in setup, *before* the timed call below, never
         // inside `generate_diagnostics_internal` itself.
         let typosquats =

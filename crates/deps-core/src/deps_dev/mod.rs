@@ -74,7 +74,7 @@ const DEPS_DEV_CALL_TIMEOUT: Duration = Duration::from_millis(400);
 /// tuned for `trust_signal`'s synchronous, hover-request-path budget
 /// (`DEPS_DEV_WAIT_BUDGET = 700ms`, itself tight for two sequential 400ms calls);
 /// typosquat resolution instead runs from a background document-lifecycle prefetch (not
-/// on any live-request path — see `deps-lsp::document::osv_scan::run_typosquat_prefetch`),
+/// on any live-request path — see `deps-lsp::document::typosquat::run_typosquat_prefetch`),
 /// so there is no reason to keep the same tight per-call budget. Live measurement found
 /// `GetPackage` for popular packages (`react`, `typescript`, `next`, `aws-sdk`) routinely
 /// takes 0.4-0.52s — i.e. these would silently time out (and, per FR-005's graceful
@@ -2712,7 +2712,7 @@ mod tests {
     /// Issue #1463: a per-call timeout must report [`FetchCompleteness::Incomplete`], not
     /// silently the same [`FetchCompleteness::Complete`] a genuine "no similar packages"
     /// result would report — this is exactly the distinction
-    /// `deps-lsp::document::osv_scan::run_typosquat_prefetch`'s gate relies on to know a
+    /// `deps-lsp::document::typosquat::run_typosquat_prefetch`'s gate relies on to know a
     /// failed attempt must be retried.
     #[tokio::test]
     async fn typosquat_signal_timeout_on_similarity_returns_none() {

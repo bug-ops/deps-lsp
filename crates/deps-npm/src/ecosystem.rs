@@ -1147,7 +1147,7 @@ mod tests {
     /// from `VersionData::typosquat_prefetch` (NFR-002: no inline deps.dev `.await` on this
     /// path), this proves it fires end-to-end through npm's *real* `generate_diagnostics`
     /// override given a pre-resolved signal, exactly the shape
-    /// `deps-lsp::document::osv_scan::run_typosquat_prefetch` hands every ecosystem.
+    /// `deps-lsp::document::typosquat::run_typosquat_prefetch` hands every ecosystem.
     #[tokio::test]
     async fn test_generate_diagnostics_typosquat_signal_fires_through_npm_override() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1209,7 +1209,7 @@ mod tests {
         );
         let resolved_versions = HashMap::new();
 
-        // Resolves the map the same way `deps-lsp::document::osv_scan::run_typosquat_prefetch`
+        // Resolves the map the same way `deps-lsp::document::typosquat::run_typosquat_prefetch`
         // does in production (issue #1437 NFR-002: a background pre-fetch, not an inline
         // await on this test's own `generate_diagnostics` call below).
         let deps_dev = Arc::new(deps_core::DepsDevClient::for_test(cache, server.url()));

@@ -638,7 +638,7 @@ pub struct VersionData<'a> {
     /// [`Self::license_prefetch`]'s exact shape and rationale (NFR-002: this must never be
     /// an inline `.await` on the diagnostics-generation path, so it is resolved ahead of
     /// time by a document-lifecycle background task,
-    /// `deps-lsp::document::osv_scan::run_typosquat_prefetch`, and merely read
+    /// `deps-lsp::document::typosquat::run_typosquat_prefetch`, and merely read
     /// synchronously here — see that function's doc). Consumed directly inside
     /// [`generate_diagnostics_from_cache`] itself (not gated behind
     /// `Ecosystem::generate_diagnostics`'s default impl), the same way

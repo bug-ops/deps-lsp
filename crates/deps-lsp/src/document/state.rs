@@ -35,6 +35,68 @@ pub(crate) use signals::PrefetchVisibility;
 /// `tower_lsp_server`'s limited `buffer_unordered` concurrency slots.
 pub(crate) const CLIENT_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Which `workspace/*/refresh` request [`refresh_with_timeout`] fires (issue #1468 item 3) —
+/// an exhaustive enum, not a bare method-reference/closure parameter, so a future refresh kind
+/// forces every call site that matches on it to be updated, mirroring this project's
+/// `EcosystemId`-style exhaustive-match convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefreshKind {
+    /// `workspace/inlayHint/refresh`.
+    InlayHints,
+    /// `workspace/codeLens/refresh`.
+    CodeLens,
+    /// `workspace/diagnostic/refresh`.
+    Diagnostics,
+}
+
+impl RefreshKind {
+    /// The name used in this request's log messages — matches whichever convention the
+    /// pre-existing per-site log lines this type replaces already used: the bare
+    /// `tower_lsp_server::Client` method name for inlay hints/code lens, and the
+    /// slash-delimited LSP method name for diagnostics.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::InlayHints => "inlay_hint_refresh",
+            Self::CodeLens => "code_lens_refresh",
+            Self::Diagnostics => "workspace/diagnostic/refresh",
+        }
+    }
+}
+
+/// Fires the client refresh request for `kind`, bounded by [`CLIENT_REFRESH_TIMEOUT`], logging
+/// a failure or timeout at `debug` and never propagating either to the caller — the shared body
+/// behind every `workspace/*/refresh` call site in this crate (issue #1468 item 3: previously
+/// duplicated three ways across `document::state`/`document::reparse`/`server`, with the two
+/// diagnostics-refresh copies omitting the timeout duration from their log message; this
+/// unified version always includes it, matching the more complete inlay-hint/code-lens copies).
+/// Callers that need the request detached (not directly awaited) still wrap this in their own
+/// `tokio::spawn`, since whether to detach is a caller-specific concern (`ServerState::
+/// spawn_refresh_requests`/`document::reparse::reparse_open_documents` both do; `server`'s
+/// `did_change_configuration` no-reparse-needed fast path awaits it inline instead).
+pub(crate) async fn refresh_with_timeout(kind: RefreshKind, client: &Client) {
+    let result = match kind {
+        RefreshKind::InlayHints => {
+            tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.inlay_hint_refresh()).await
+        }
+        RefreshKind::CodeLens => {
+            tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.code_lens_refresh()).await
+        }
+        RefreshKind::Diagnostics => {
+            tokio::time::timeout(
+                CLIENT_REFRESH_TIMEOUT,
+                client.workspace_diagnostic_refresh(),
+            )
+            .await
+        }
+    };
+    let label = kind.label();
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::debug!("{label} failed: {:?}", e),
+        Err(_) => tracing::debug!("{label} timed out after {CLIENT_REFRESH_TIMEOUT:?}"),
+    }
+}
+
 /// Server-wide cap on concurrent registry-fetch *documents* in flight (issue #592 critic
 /// S2/S3) — an axis `cache.max_concurrent_fetches` does not cover, since that bounds
 /// dependencies within one document's fetch, not how many documents fetch at once.
@@ -470,47 +532,6 @@ impl DocumentState {
         self.signals.typosquats.extend(typosquats);
     }
 
-    /// Updates [`PackageSignals::typosquat_checked_names`] to `current` and reports whether it actually
-    /// differed from the previous value (issue #1455 batch item 1, critic S1) — the debounced-
-    /// edit typosquat pre-fetch gate calls this once per edit, spawning a pre-fetch only when
-    /// it returns `true`. Always updates, even when unchanged (a no-op clone in that case), so
-    /// the call site never needs a separate write.
-    pub(crate) fn refresh_typosquat_checked_names(
-        &mut self,
-        current: std::collections::HashSet<(
-            PackageName,
-            super::osv_scan::TyposquatSourceEligibility,
-        )>,
-    ) -> bool {
-        if self.signals.typosquat_checked_names == current {
-            false
-        } else {
-            self.signals.typosquat_checked_names = current;
-            true
-        }
-    }
-
-    /// Reverts [`PackageSignals::typosquat_checked_names`] to "not checked" for `stale_snapshot`'s
-    /// members, but only if it still equals `stale_snapshot` exactly (issue #1463) —
-    /// `document::osv_scan::run_typosquat_prefetch`'s timeout path calls this so a prefetch
-    /// that never completed doesn't leave the gate believing `stale_snapshot` was actually
-    /// checked, which would otherwise suppress every retry until some later edit changes the
-    /// declared (name, eligibility) set for an unrelated reason. Clearing unconditionally would
-    /// be wrong: if a *newer* edit already advanced this field past `stale_snapshot` (spawning
-    /// its own, independently-tracked pre-fetch) before this timed-out attempt's cleanup runs,
-    /// that newer state is still valid and must not be discarded by an older attempt's failure.
-    pub(crate) fn clear_typosquat_checked_names_if_stale(
-        &mut self,
-        stale_snapshot: &std::collections::HashSet<(
-            PackageName,
-            super::osv_scan::TyposquatSourceEligibility,
-        )>,
-    ) {
-        if &self.signals.typosquat_checked_names == stale_snapshot {
-            self.signals.typosquat_checked_names.clear();
-        }
-    }
-
     /// Merges GOSSIP findings into [`PackageSignals::gossip_findings`] without disturbing existing
     /// entries — mirrors [`Self::merge_typosquats`]'s exact additive shape.
     ///
@@ -856,7 +877,7 @@ pub struct ServerState {
     /// outlive that outer task rather than being aborted alongside it. This map instead lets
     /// a superseding pre-fetch spawn (a newer edit, or `did_close`) cancel the *previous*
     /// pre-fetch specifically, before it burns up to ~10s of deps.dev calls for a result
-    /// `document::osv_scan::run_typosquat_prefetch`'s own name-set staleness guard would
+    /// `document::typosquat::run_typosquat_prefetch`'s own name-set staleness guard would
     /// discard at commit time anyway.
     typosquat_tasks: tokio::sync::RwLock<HashMap<Uri, (u64, tokio::task::AbortHandle)>>,
     /// Monotonic source for [`Self::track_typosquat_task`]'s generation ordering (issue #1455
@@ -1203,36 +1224,16 @@ impl ServerState {
             // logs stay correlated with whichever document/ecosystem span triggered it.
             let span = tracing::Span::current();
             tokio::spawn(
-                async move {
-                    match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.inlay_hint_refresh())
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::debug!("inlay_hint_refresh failed: {:?}", e),
-                        Err(_) => tracing::debug!(
-                            "inlay_hint_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
-                        ),
-                    }
-                }
-                .instrument(span),
+                async move { refresh_with_timeout(RefreshKind::InlayHints, &client).await }
+                    .instrument(span),
             );
         }
         if self.code_lens_refresh_supported() {
             let client = client.clone();
             let span = tracing::Span::current();
             tokio::spawn(
-                async move {
-                    match tokio::time::timeout(CLIENT_REFRESH_TIMEOUT, client.code_lens_refresh())
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => tracing::debug!("code_lens_refresh failed: {:?}", e),
-                        Err(_) => tracing::debug!(
-                            "code_lens_refresh timed out after {CLIENT_REFRESH_TIMEOUT:?}"
-                        ),
-                    }
-                }
-                .instrument(span),
+                async move { refresh_with_timeout(RefreshKind::CodeLens, &client).await }
+                    .instrument(span),
             );
         }
     }
