@@ -9,9 +9,9 @@ use crate::hover::Hover;
 use crate::licenses::resolve_license_entries_for_display;
 use crate::osv::ScanOutcome;
 use crate::{
-    ConcreteVersion, Dependency, DependencySource, Deprecation, LicenseSource, ParseResult,
-    ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version, VersionReq,
-    is_within_cooldown,
+    ConcreteVersion, Dependency, DependencySource, Deprecation, GossipLowUsage, LicenseSource,
+    ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version,
+    VersionReq, is_within_cooldown,
 };
 
 use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
@@ -22,9 +22,9 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
-    EcosystemFormatter, HOVER_RECENT_VERSIONS, VersionData, await_versions_fetch, escape_markdown,
-    in_use_version, markdown_code_span, position_in_range, resolve_in_use_version,
-    resolve_scan_outcome,
+    EcosystemFormatter, GossipCooldownLookup, HOVER_RECENT_VERSIONS, VersionData,
+    await_versions_fetch, escape_markdown, gossip_cooldown_for, in_use_version, markdown_code_span,
+    position_in_range, resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -37,6 +37,15 @@ use crate::github::normalize_tag;
 /// instead of finishing into the memo, and the next hover would re-fire it under
 /// the short error TTL rather than getting a memo hit.
 const DEPS_DEV_WAIT_BUDGET: Duration = Duration::from_millis(700);
+
+/// Bounds how long [`generate_hover`] waits for the spawned GOSSIP low-usage fetch (issue
+/// #1456, spec 072 FR-005) — mirrors [`DEPS_DEV_WAIT_BUDGET`]'s exact "spawn-and-warm"
+/// rationale: past this deadline the spawned task keeps running and still warms
+/// [`crate::deps_dev::DepsDevClient`]'s version-scoped memo. Independent of
+/// [`DEPS_DEV_WAIT_BUDGET`] (spec 072 §1 — no shared-deadline machinery), since hover's
+/// cooldown callout no longer waits on anything live at all; this is the *only* remaining
+/// live GOSSIP fetch on the hover request path.
+const GOSSIP_WAIT_BUDGET: Duration = Duration::from_millis(700);
 
 /// Computes the age (in seconds) of one "Recent versions" hover entry, for
 /// [`HoverMarkdown::push_relative_age`].
@@ -121,6 +130,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     let normalized_name = formatter.normalize_package_name(dep.name());
 
     let trust_handle = spawn_trust_signal_fetch(
+        dep,
+        &dep_source,
+        &versions,
+        formatter,
+        normalized_name.as_str(),
+    );
+    // Issue #1456, spec 072 FR-005: hover's only remaining *live* GOSSIP fetch (cooldown
+    // is sourced synchronously from `versions.gossip_prefetch` below instead) — spawned
+    // here, alongside `trust_handle`, so the two overlap rather than stack.
+    let gossip_handle = spawn_gossip_low_usage_fetch(
         dep,
         &dep_source,
         &versions,
@@ -258,7 +277,16 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             }),
         _ => cached_latest.map(|v| (v.latest.as_str(), v.published_at)),
     };
-    push_latest_hover_section(&mut markdown, latest_line, freshness, now);
+    // Issue #1456, spec 072 FR-008: a hit is only trustworthy when its own recorded
+    // version exactly matches `latest_ver` — no live network wait, this is a synchronous
+    // read of the document-level prefetch populated ahead of time.
+    let gossip_cooldown = match latest_line {
+        Some((latest_ver, _)) => {
+            gossip_cooldown_for(versions.gossip_prefetch, dep.name(), latest_ver, now)
+        }
+        None => GossipCooldownLookup::Unavailable,
+    };
+    push_latest_hover_section(&mut markdown, latest_line, freshness, now, gossip_cooldown);
 
     // #394 S2: version-qualified key so a hover on one occurrence of a duplicated name never
     // shows another occurrence's OSV result.
@@ -294,6 +322,19 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         None => None,
     };
     push_trust_signal_hover_section(&mut markdown, trust_signal.as_ref());
+
+    // Issue #1456, spec 072 FR-005: awaited last alongside `trust_signal`, under its own
+    // independent `GOSSIP_WAIT_BUDGET` — over budget, the spawned task keeps running and
+    // still warms `DepsDevClient`'s version-scoped memo (spawn-and-warm, mirrors
+    // `trust_handle`'s identical pattern above).
+    let gossip_low_usage = match gossip_handle {
+        Some(handle) => match tokio::time::timeout(GOSSIP_WAIT_BUDGET, handle).await {
+            Ok(Ok(findings)) => findings.and_then(|f| f.low_usage),
+            Ok(Err(_)) | Err(_) => None,
+        },
+        None => None,
+    };
+    push_gossip_low_usage_hover_section(&mut markdown, gossip_low_usage.as_ref());
 
     // #204 (spec 010): resolved-version license first tries the already-fetched
     // `available_versions` list, then falls back to `trust_signal`'s `licenses`
@@ -496,6 +537,47 @@ fn spawn_trust_signal_fetch(
     })
 }
 
+/// Spawns hover's live, version-scoped GOSSIP low-usage fetch (issue #1456, spec 072
+/// FR-005) as a detached background task — the pinned/resolved version may not be the
+/// package's `defaultVersion`, so [`VersionData::gossip_prefetch`]'s document-level
+/// prefetch cannot cover it.
+///
+/// Gated on `versions.gossip_client` — a **separate** field from [`VersionData::trust`]
+/// (per that field's doc), so `GossipConfig.enabled` and `SupplyChainConfig.enabled` stay
+/// independently switchable — plus every gate [`spawn_trust_signal_fetch`] already applies
+/// (`network.offline` is not set, the source resolves against a public registry, the
+/// ecosystem is `deps_dev_system`-covered, and a concrete in-use version exists).
+fn spawn_gossip_low_usage_fetch(
+    dep: &dyn Dependency,
+    dep_source: &DependencySource,
+    versions: &VersionData<'_>,
+    formatter: &dyn EcosystemFormatter,
+    normalized_name: &str,
+) -> Option<tokio::task::JoinHandle<Option<crate::GossipFindings>>> {
+    versions.gossip_client.and_then(|client| {
+        let ecosystem = versions.ecosystem?;
+        let system = deps_dev_system(ecosystem)?;
+        if versions.offline || !formatter.source_is_public_registry_content(dep_source) {
+            return None;
+        }
+        let version = resolve_in_use_version(
+            dep,
+            normalized_name,
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )?;
+        let client = Arc::clone(client);
+        let name = dep.name().as_str().to_string();
+        Some(tokio::spawn(async move {
+            client
+                .gossip_findings_for_version(system, &name, &version)
+                .await
+        }))
+    })
+}
+
 /// Appends the hover header: the dependency name, linked to its registry page when
 /// `url` (from [`crate::lsp_helpers::PackageRendering::package_url`]) is present.
 ///
@@ -577,6 +659,7 @@ fn push_latest_hover_section(
     latest_line: Option<(&str, Option<PublishTime>)>,
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
+    gossip_cooldown: GossipCooldownLookup,
 ) {
     let Some((latest_ver, raw_published_at)) = latest_line else {
         return;
@@ -593,12 +676,63 @@ fn push_latest_hover_section(
         markdown.push_static(")*");
     }
     markdown.push_static("\n\n");
-    if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
-        markdown.push_static(
-            "> ⏳ **Recently published** — this release is still within the cooldown window.\n\
-             > It may still be yanked or superseded; consider verifying before upgrading.\n\n",
-        );
+
+    // Issue #1456, spec 072 FR-002/NFR-004, S2: a GOSSIP-sourced cooldown answer is
+    // authoritative whenever available — both `Active` (render the attributed callout) and
+    // `NotActive` (render nothing, and do NOT fall back to the local heuristic, which could
+    // contradict what GOSSIP already knows) skip the local heuristic entirely. Only
+    // `Unavailable` (no GOSSIP data for this exact version) falls back. Both branches
+    // respect `freshness.enabled` — disabling the freshness feature entirely disables this
+    // callout regardless of source.
+    if !freshness.enabled {
+        return;
     }
+    match gossip_cooldown {
+        GossipCooldownLookup::Active => {
+            markdown.push_static(
+                "> ⏳ **Recently published** — deps.dev/GOSSIP reports this release is still \
+                 within its cooldown window.\n\
+                 > It may still be yanked or superseded; consider verifying before upgrading.\n\n",
+            );
+        }
+        GossipCooldownLookup::NotActive => {}
+        GossipCooldownLookup::Unavailable => {
+            if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
+                markdown.push_static(
+                    "> ⏳ **Recently published** — this release is still within the cooldown \
+                     window.\n\
+                     > It may still be yanked or superseded; consider verifying before \
+                     upgrading.\n\n",
+                );
+            }
+        }
+    }
+}
+
+/// Appends the hover low-usage/slopsquatting-risk callout when GOSSIP flagged the pinned
+/// version (issue #1456, spec 072, US-001) — a non-blocking, low-severity invitation to
+/// double-check the package identity, worded as-is per the maintainer's resolved decision
+/// (spec 072 §9): no corroborating-signal gate built on top of GOSSIP's own raw flag.
+fn push_gossip_low_usage_hover_section(
+    markdown: &mut HoverMarkdown,
+    low_usage: Option<&GossipLowUsage>,
+) {
+    let Some(low_usage) = low_usage else {
+        return;
+    };
+    markdown.push_static(
+        "> 🔍 **Low usage** — deps.dev/GOSSIP flags this package version as having \
+         suspiciously low real-world usage. Double-check this is the package you intended \
+         to install, not a similarly-named or LLM-hallucinated name.",
+    );
+    // Registry-adjacent, deps.dev-reported name — `FieldKind::Name` matches this sink's
+    // sibling uses elsewhere in this module (#1311).
+    if let Some(alternative) = low_usage.alternative_packages.first() {
+        markdown.push_static(" A more widely-used alternative: ");
+        markdown.push_code(alternative, FieldKind::Name);
+        markdown.push_static(".");
+    }
+    markdown.push_static("\n\n");
 }
 
 /// Appends the "Recent versions" list: up to [`HOVER_RECENT_VERSIONS`] entries drawn from
@@ -1489,6 +1623,7 @@ mod tests {
             Some((long.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
+            GossipCooldownLookup::Unavailable,
         );
         assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
         assert!(markdown.as_str().contains('…'));
@@ -1506,6 +1641,7 @@ mod tests {
             Some((at_cap.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
+            GossipCooldownLookup::Unavailable,
         );
         assert_eq!(markdown.as_str(), format!("**Latest**: `{at_cap}`\n\n"));
 
@@ -1516,6 +1652,7 @@ mod tests {
             Some((over_cap.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
+            GossipCooldownLookup::Unavailable,
         );
         assert_eq!(
             markdown.as_str(),
@@ -1535,8 +1672,88 @@ mod tests {
             Some((value.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
+            GossipCooldownLookup::Unavailable,
         );
         assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
+    }
+
+    /// Issue #1456, spec 072 FR-002/NFR-004: an active GOSSIP cooldown renders the
+    /// GOSSIP-attributed callout, distinguishable from the local-heuristic wording.
+    #[test]
+    fn push_latest_hover_section_gossip_cooldown_renders_attributed_callout() {
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some(("8.3.1", None)),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::from_unix_secs(1_000),
+            GossipCooldownLookup::Active,
+        );
+        assert!(
+            markdown.as_str().contains("deps.dev/GOSSIP"),
+            "got: {markdown}"
+        );
+    }
+
+    /// No GOSSIP data available: falls back to the unmodified local heuristic, with no
+    /// GOSSIP attribution text.
+    #[test]
+    fn push_latest_hover_section_no_gossip_falls_back_to_local_heuristic() {
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some(("8.3.1", Some(PublishTime::from_unix_secs(999_999)))),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::from_unix_secs(1_000_000),
+            GossipCooldownLookup::Unavailable,
+        );
+        assert!(
+            !markdown.as_str().contains("deps.dev/GOSSIP"),
+            "got: {markdown}"
+        );
+        assert!(
+            markdown.as_str().contains("Recently published"),
+            "got: {markdown}"
+        );
+    }
+
+    /// Issue #1456 security/impl-critic review S2: GOSSIP authoritatively says "not in
+    /// cooldown" — must render nothing at all, and must NOT fall back to the local
+    /// heuristic even though the local `published_at` here is well within its own cooldown
+    /// window (which would otherwise render a contradicting callout).
+    #[test]
+    fn push_latest_hover_section_gossip_not_active_suppresses_local_fallback() {
+        let mut markdown = HoverMarkdown::new();
+        push_latest_hover_section(
+            &mut markdown,
+            Some(("8.3.1", Some(PublishTime::from_unix_secs(999_999)))),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::from_unix_secs(1_000_000),
+            GossipCooldownLookup::NotActive,
+        );
+        assert!(
+            !markdown.as_str().contains("Recently published"),
+            "GOSSIP's authoritative negative must suppress the local heuristic too: {markdown}"
+        );
+    }
+
+    #[test]
+    fn push_gossip_low_usage_hover_section_none_renders_nothing() {
+        let mut markdown = HoverMarkdown::new();
+        push_gossip_low_usage_hover_section(&mut markdown, None);
+        assert_eq!(markdown.as_str(), "");
+    }
+
+    #[test]
+    fn push_gossip_low_usage_hover_section_renders_alternative_package() {
+        let low_usage = crate::GossipLowUsage {
+            risk: crate::GossipRiskLevel::Medium,
+            alternative_packages: vec!["popular-pkg".to_string()],
+        };
+        let mut markdown = HoverMarkdown::new();
+        push_gossip_low_usage_hover_section(&mut markdown, Some(&low_usage));
+        assert!(markdown.as_str().contains("Low usage"), "got: {markdown}");
+        assert!(markdown.as_str().contains("popular-pkg"), "got: {markdown}");
     }
 
     #[test]

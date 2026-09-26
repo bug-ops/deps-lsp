@@ -231,8 +231,8 @@ pub use tower_lsp_server;
 pub use cache::{BodyLimit, CacheMode, CachedResponse, HttpCache, NetworkMode};
 pub use dependency_cap::{DependencyBudget, MAX_DEPENDENCIES_PER_DOCUMENT};
 pub use deps_dev::{
-    DepsDevClient, FetchCompleteness, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal,
-    TyposquatSignal,
+    DepsDevClient, FetchCompleteness, GossipCooldown, GossipFindings, GossipLowUsage,
+    GossipRiskLevel, ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal, TyposquatSignal,
 };
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, Dependency, Ecosystem, EcosystemConfig,

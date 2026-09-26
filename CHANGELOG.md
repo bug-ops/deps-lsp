@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core, deps-lsp**: new opt-in deps.dev GOSSIP signals (`gossip.enabled`, disabled by default) source hover's/diagnostics' outdated-cooldown callout from deps.dev's authoritative Dynamic Cooldown data (falling back to the existing local heuristic when unavailable), add a live hover low-usage/slopsquatting-risk callout for the pinned version, and give completion a new default-on local per-candidate cooldown badge, across the seven deps.dev-covered ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) (resolves #1456) (#1473)
 - **deps-core, deps-lsp**: new opt-in typosquat-similarity diagnostic (`typosquat.enabled`, disabled by default) flags a declared direct dependency whose name deps.dev's `GetSimilarlyNamedPackages`/`GetDependents` endpoints report as asymmetrically similar to a much more popular package, across the seven deps.dev-covered ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) (resolves #1437) (#1451)
 - **deps-core**: new ungated `edit` module (`ManifestEdit`, `PlannedUpdate`, `EditSpan`, `UpdateKind`/`classify_update`, `collect_update_edits`, `plan_vulnerability_fix`) shared by `deps-lsp`'s code-lens/code-action edit planning and the new `deps-cli update` subcommand (resolves #1329) (#1343)
 - **deps-core**: new `fs_probe::write_atomic` — symlink-refusing, permission-preserving atomic file write (resolves #1329) (#1343)

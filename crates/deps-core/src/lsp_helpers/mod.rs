@@ -10,7 +10,7 @@ use crate::osv::{ScanOutcome, VulnerabilityMap};
 use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
-    LicenseSource, PackageName, RemovalStatus, TyposquatSignal,
+    GossipFindings, LicenseSource, PackageName, PublishTime, RemovalStatus, TyposquatSignal,
 };
 
 #[cfg(feature = "lsp-responses")]
@@ -47,10 +47,11 @@ pub use code_lenses::{
 pub use diagnostics::{
     DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
     MAX_DIAGNOSTIC_VALUE_CHARS, TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, fetch_typosquat_signals,
-    generate_diagnostics_from_cache, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
-    requirement_is_unsatisfiable, sanitize_advisory_text_for_diagnostic,
-    sanitize_and_truncate_for_diagnostic, truncate_for_diagnostic,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless, fetch_gossip_findings_batch,
+    fetch_typosquat_signals, force_refresh_gossip_findings, generate_diagnostics_from_cache,
+    redact_name_for_diagnostic, redact_requirement_for_diagnostic, requirement_is_unsatisfiable,
+    sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
+    truncate_for_diagnostic,
 };
 // `pub(crate)` (not `pub`, matching the constant's own visibility) so `completion.rs` can
 // share this bound with `inlay_hints`/`hover` rather than declaring a duplicate cap.
@@ -643,6 +644,33 @@ pub struct VersionData<'a> {
     /// is disabled, the ecosystem isn't deps.dev-covered, offline, or no dependency in the
     /// document cleared the ratio gate.
     pub typosquat_prefetch: Option<&'a HashMap<PackageName, TyposquatSignal>>,
+    /// Background-pre-fetched deps.dev GOSSIP cooldown/low-usage findings per declared
+    /// dependency (issue #1456, spec 072), keyed by raw (unnormalized) package name —
+    /// mirrors [`Self::typosquat_prefetch`]'s exact shape and rationale: populated by
+    /// `deps-lsp::document::gossip_prefetch`, via `DocumentState.gossip_findings`, and
+    /// merely read synchronously here — never fetched inline on the hover/diagnostics-
+    /// generation path itself.
+    ///
+    /// A lookup hit is only trustworthy for the version it was resolved against
+    /// (spec 072 FR-008) — the entry's own [`crate::GossipFindings::version`] field must
+    /// be compared against the version actually being displayed at each call site (hover's
+    /// `latest_line`, diagnostics' `package_versions.latest`) before use; a mismatch is
+    /// treated as a cache miss and falls back to [`crate::is_within_cooldown`]. `None`
+    /// when the feature is disabled, offline, the ecosystem isn't deps.dev-covered, or no
+    /// dependency in the document has a prefetch result yet.
+    pub gossip_prefetch: Option<&'a HashMap<PackageName, GossipFindings>>,
+    /// The deps.dev client to fetch hover's live GOSSIP low-usage signal through (issue
+    /// #1456, spec 072 FR-005/FR-009), when the caller wants hover to attempt one. `None`
+    /// by default, mirroring [`Self::trust`]'s exact "presence is the gate" shape (FR-010's
+    /// structural pattern) — set only by `handlers/hover.rs` (deps-lsp) when
+    /// `GossipConfig.enabled` is set and not offline. Deliberately a **separate** field
+    /// from [`Self::trust`], not reused: `SupplyChainConfig.enabled` (opt-out, default
+    /// `true`) and `GossipConfig.enabled` (opt-in, default `false`) are independently
+    /// switchable — conflating the two fields would let disabling supply-chain trust
+    /// signals silently disable GOSSIP's low-usage fetch too, or vice versa. `&'a Arc<..>`,
+    /// not `&'a DepsDevClient`, for the same "clone into a detached background task"
+    /// reason [`Self::trust`]'s doc gives.
+    pub gossip_client: Option<&'a Arc<DepsDevClient>>,
 }
 
 impl<'a> VersionData<'a> {
@@ -680,6 +708,8 @@ impl<'a> VersionData<'a> {
             license_source: None,
             license_policy: None,
             typosquat_prefetch: None,
+            gossip_prefetch: None,
+            gossip_client: None,
         }
     }
 
@@ -898,6 +928,103 @@ impl<'a> VersionData<'a> {
     ) -> Self {
         self.typosquat_prefetch = Some(typosquat_prefetch);
         self
+    }
+
+    /// Attaches background-pre-fetched GOSSIP findings. See [`Self::gossip_prefetch`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let gossip = HashMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_gossip_prefetch(&gossip);
+    /// assert!(versions.gossip_prefetch.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_gossip_prefetch(
+        mut self,
+        gossip_prefetch: &'a HashMap<PackageName, GossipFindings>,
+    ) -> Self {
+        self.gossip_prefetch = Some(gossip_prefetch);
+        self
+    }
+
+    /// Attaches a deps.dev client, enabling hover to attempt a live GOSSIP low-usage fetch.
+    /// See [`Self::gossip_client`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{DepsDevClient, HttpCache, VersionData};
+    /// use std::collections::HashMap;
+    /// use std::sync::Arc;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let client = Arc::new(DepsDevClient::new(Arc::new(HttpCache::new())));
+    /// let versions = VersionData::new(&cached, &resolved).with_gossip_client(&client);
+    /// assert!(versions.gossip_client.is_some());
+    /// ```
+    #[must_use]
+    pub const fn with_gossip_client(mut self, client: &'a Arc<DepsDevClient>) -> Self {
+        self.gossip_client = Some(client);
+        self
+    }
+}
+
+/// The three states [`gossip_cooldown_for`] can resolve to — deliberately distinct from a
+/// plain `Option<&GossipCooldown>` (issue #1456 security/impl-critic review, S2): a bare
+/// `Option` conflates "no GOSSIP data available for this version at all" with "GOSSIP has
+/// data and it authoritatively says this version is not in cooldown", and both used to fall
+/// through to the unattributed local heuristic — which can then show a cooldown callout
+/// that directly contradicts what GOSSIP already knows, violating FR-002's "authoritative
+/// when available" requirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GossipCooldownLookup {
+    /// No GOSSIP data for this exact version (absent entry, or an FR-008 version mismatch)
+    /// — the caller falls back to the local `is_within_cooldown` heuristic, unattributed.
+    Unavailable,
+    /// GOSSIP data is present for this exact version and confirms an active cooldown as of
+    /// `now` (spec 072 FR-011's read-time `end > now` check) — the caller renders a
+    /// GOSSIP-attributed callout. Carries no payload: no caller renders the cooldown's own
+    /// `end`/`risk` today, only whether one is active — see [`gossip_cooldown_for`] for
+    /// where that data is still available (`GossipFindings.cooldown`) if a future caller
+    /// needs it.
+    Active,
+    /// GOSSIP data is present for this exact version and authoritatively reports it is
+    /// **not** in cooldown (no active `end` date, or a past one) — the caller must render
+    /// nothing here, never falling back to the local heuristic, which could contradict this
+    /// answer.
+    NotActive,
+}
+
+/// Looks up the GOSSIP cooldown state for `name` in `gossip_prefetch`, applying spec 072
+/// FR-008's version-equality gate against `comparand` (the version actually being displayed
+/// at this call site — hover's `latest_line`, diagnostics' `package_versions.latest`) and
+/// FR-011's read-time `end > now` check — shared by `hover::push_latest_hover_section` and
+/// `diagnostics::apply_outdated_rule` so the two call sites can never diverge on this gate.
+///
+/// See [`GossipCooldownLookup`]'s doc for why this returns a three-state enum rather than
+/// `Option<&GossipCooldown>`.
+pub(crate) fn gossip_cooldown_for(
+    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
+    name: &PackageName,
+    comparand: &str,
+    now: PublishTime,
+) -> GossipCooldownLookup {
+    let Some(findings) = gossip_prefetch.and_then(|m| m.get(name)) else {
+        return GossipCooldownLookup::Unavailable;
+    };
+    if findings.version != comparand {
+        return GossipCooldownLookup::Unavailable;
+    }
+    match findings.cooldown.as_ref() {
+        Some(cooldown) if cooldown.is_active(now) => GossipCooldownLookup::Active,
+        _ => GossipCooldownLookup::NotActive,
     }
 }
 
@@ -2612,6 +2739,118 @@ mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
     use crate::{PackageName, VersionReq};
+
+    // --- gossip_cooldown_for (issue #1456, spec 072 FR-008/FR-011, S2 tri-state) ---
+
+    fn gossip_findings_fixture(version: &str, end_unix_secs: i64) -> GossipFindings {
+        GossipFindings {
+            version: version.to_string(),
+            cooldown: Some(crate::GossipCooldown {
+                end: PublishTime::from_unix_secs(end_unix_secs),
+                risk: crate::GossipRiskLevel::High,
+            }),
+            low_usage: None,
+        }
+    }
+
+    fn gossip_findings_fixture_not_in_cooldown(version: &str) -> GossipFindings {
+        GossipFindings {
+            version: version.to_string(),
+            cooldown: None,
+            low_usage: None,
+        }
+    }
+
+    #[test]
+    fn gossip_cooldown_for_none_prefetch_is_unavailable() {
+        let name = PackageName::new("vite");
+        assert!(matches!(
+            gossip_cooldown_for(None, &name, "8.3.1", PublishTime::now()),
+            GossipCooldownLookup::Unavailable
+        ));
+    }
+
+    #[test]
+    fn gossip_cooldown_for_matching_active_version_is_active() {
+        let name = PackageName::new("vite");
+        let mut prefetch = HashMap::new();
+        prefetch.insert(name.clone(), gossip_findings_fixture("8.3.1", 2_000));
+
+        let lookup = gossip_cooldown_for(
+            Some(&prefetch),
+            &name,
+            "8.3.1",
+            PublishTime::from_unix_secs(1_000),
+        );
+        assert_eq!(lookup, GossipCooldownLookup::Active);
+    }
+
+    #[test]
+    fn gossip_cooldown_for_version_mismatch_is_unavailable() {
+        let name = PackageName::new("vite");
+        let mut prefetch = HashMap::new();
+        prefetch.insert(name.clone(), gossip_findings_fixture("8.3.1", 2_000));
+
+        // FR-008: the prefetch entry is for 8.3.1, but the caller is displaying 8.4.0 (a
+        // newer release the prefetch hasn't caught up with yet) — must be `Unavailable`,
+        // not the stale 8.3.1 answer.
+        let lookup = gossip_cooldown_for(
+            Some(&prefetch),
+            &name,
+            "8.4.0",
+            PublishTime::from_unix_secs(1_000),
+        );
+        assert!(matches!(lookup, GossipCooldownLookup::Unavailable));
+    }
+
+    #[test]
+    fn gossip_cooldown_for_ended_cooldown_self_clears_to_not_active_at_read_time() {
+        let name = PackageName::new("vite");
+        let mut prefetch = HashMap::new();
+        prefetch.insert(name.clone(), gossip_findings_fixture("8.3.1", 1_000));
+
+        // FR-011: `end` compared against `now` at read time, never a stored bool — a `now`
+        // past `end` must self-clear to `NotActive` (GOSSIP data is present and version-
+        // matched, it just no longer reports an active cooldown), never `Unavailable`
+        // (which would wrongly let the caller fall back to the local heuristic).
+        let lookup = gossip_cooldown_for(
+            Some(&prefetch),
+            &name,
+            "8.3.1",
+            PublishTime::from_unix_secs(2_000),
+        );
+        assert!(matches!(lookup, GossipCooldownLookup::NotActive));
+    }
+
+    /// Issue #1456 security/impl-critic review S2: GOSSIP data present, version-matched,
+    /// and explicitly reporting no cooldown at all (`cooldown: None` — no `COOLDOWN`
+    /// finding and no `cooldownEnd` fallback) must be `NotActive`, distinguishable from
+    /// `Unavailable` — the whole point of the tri-state fix.
+    #[test]
+    fn gossip_cooldown_for_present_but_no_cooldown_data_is_not_active() {
+        let name = PackageName::new("vite");
+        let mut prefetch = HashMap::new();
+        prefetch.insert(
+            name.clone(),
+            gossip_findings_fixture_not_in_cooldown("8.3.1"),
+        );
+
+        let lookup = gossip_cooldown_for(Some(&prefetch), &name, "8.3.1", PublishTime::now());
+        assert!(matches!(lookup, GossipCooldownLookup::NotActive));
+    }
+
+    #[test]
+    fn gossip_cooldown_for_absent_name_is_unavailable() {
+        let name = PackageName::new("vite");
+        let other = PackageName::new("left-pad");
+        let mut prefetch = HashMap::new();
+        prefetch.insert(other, gossip_findings_fixture("1.3.0", 2_000));
+
+        assert!(matches!(
+            gossip_cooldown_for(Some(&prefetch), &name, "8.3.1", PublishTime::now()),
+            GossipCooldownLookup::Unavailable
+        ));
+    }
 
     /// #919: a plain literal version — `version_range`'s slice equals the declared
     /// requirement exactly — must be admitted as editable.

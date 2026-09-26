@@ -1528,7 +1528,7 @@ mod tests {
                 &display_item,
                 Some(&replacement),
                 deps_core::PublishTime::now(),
-                true,
+                deps_core::FreshnessSettings::default(),
             );
 
             let Some(CompletionTextEdit::Edit(edit)) = item.text_edit else {
@@ -1613,7 +1613,7 @@ mod tests {
             &display_item,
             Some(&replacement),
             deps_core::PublishTime::now(),
-            true,
+            deps_core::FreshnessSettings::default(),
         );
         let Some(CompletionTextEdit::Edit(edit)) = item.text_edit else {
             panic!("expected a textEdit::Edit");

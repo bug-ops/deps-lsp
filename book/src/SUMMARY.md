@@ -16,6 +16,7 @@
   - [Licensing](cross-ecosystem/licensing.md)
   - [Yanked Versions & Vulnerabilities](cross-ecosystem/yanked-and-vulnerabilities.md)
   - [Typosquat Detection](cross-ecosystem/typosquat-detection.md)
+  - [deps.dev GOSSIP Signals](cross-ecosystem/gossip-signals.md)
   - [Version Diagnostics](cross-ecosystem/version-diagnostics.md)
   - [CI/CD Pinning](cross-ecosystem/ci-pinning.md)
 

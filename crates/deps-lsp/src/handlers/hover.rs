@@ -28,12 +28,13 @@ pub async fn handle_hover(
     }
 
     // Acquires the config RwLock before the DashMap shard guard, never the reverse (matches diagnostics.rs).
-    let (freshness, offline, supply_chain_enabled) = {
+    let (freshness, offline, supply_chain_enabled, gossip_enabled) = {
         let config = config.read().await;
         (
             config.policy.freshness.to_settings(),
             config.policy.network.offline,
             config.policy.supply_chain.enabled,
+            config.policy.gossip.enabled,
         )
     };
 
@@ -50,6 +51,7 @@ pub async fn handle_hover(
         vulnerabilities,
         outcomes,
         licenses,
+        gossip_findings,
     ) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
@@ -64,11 +66,22 @@ pub async fn handle_hover(
                 doc.vulnerabilities.clone(),
                 doc.outcomes.clone(),
                 doc.licenses.clone(),
+                doc.gossip_findings.clone(),
             ))
         })
         .flatten()?;
 
     tracing::Span::current().record("ecosystem", ecosystem_id.id());
+
+    // Issue #1456, spec 072: same rationale as diagnostics' identical gate — a disabled or
+    // offline transition must stop rendering a previously-populated `gossip_findings` map
+    // immediately, not merely stop refreshing it.
+    let empty_gossip = std::collections::HashMap::new();
+    let gossip_prefetch = if gossip_enabled && !offline {
+        &gossip_findings
+    } else {
+        &empty_gossip
+    };
 
     let mut versions = VersionData::new(&cached_versions, &resolved_versions)
         .with_resolved_version_candidates(&resolved_version_candidates)
@@ -77,11 +90,17 @@ pub async fn handle_hover(
         .with_ecosystem(ecosystem_id)
         .with_offline(offline)
         .with_license_source(ecosystem.license_source())
-        .with_license_prefetch(&licenses);
+        .with_license_prefetch(&licenses)
+        .with_gossip_prefetch(gossip_prefetch);
     // The only call site that sets `VersionData::trust` (see lsp_helpers::hover docs) —
     // makes the supply-chain trust signal hover-only by construction (FR-010).
     if supply_chain_enabled {
         versions = versions.with_trust(&state.deps_dev);
+    }
+    // Issue #1456, spec 072 FR-009: a separate gate from `supply_chain_enabled` above —
+    // see `VersionData::gossip_client`'s doc for why the two must not be conflated.
+    if gossip_enabled && !offline {
+        versions = versions.with_gossip_client(&state.deps_dev);
     }
 
     ecosystem

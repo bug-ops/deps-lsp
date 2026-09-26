@@ -33,18 +33,25 @@
 mod types;
 mod typosquat;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
+use dashmap::DashSet;
 use dashmap::mapref::entry::Entry;
 use tokio::sync::watch;
 
 use types::{
-    DependentsWire, DepsDevProject, DepsDevVersionInfo, GetPackageWire, ProvenanceEntry,
-    RelatedProject, SimilarlyNamedPackagesWire,
+    DependentsWire, DepsDevProject, DepsDevVersionInfo, GetPackageWire, GossipBatchRequestWire,
+    GossipFindingType, GossipFindingsBatchRequestWire, GossipFindingsBatchWire, GossipFindingsWire,
+    GossipPackageKeyRefWire, GossipVersionFindingsWire, ProvenanceEntry, RelatedProject,
+    SimilarlyNamedPackagesWire,
 };
-pub use types::{ProvenanceStatus, ScorecardSummary, SupplyChainTrustSignal};
+pub use types::{
+    GossipCooldown, GossipFindings, GossipLowUsage, GossipRiskLevel, ProvenanceStatus,
+    ScorecardSummary, SupplyChainTrustSignal,
+};
 pub use typosquat::TyposquatSignal;
 use typosquat::{SimilarPackageCandidate, TYPOSQUAT_MAX_CANDIDATES_CHECKED, evaluate_candidates};
 
@@ -142,6 +149,50 @@ impl Default for FetchCompleteness {
         Self::Incomplete
     }
 }
+
+/// Per-call timeout for [`DepsDevClient::gossip_findings_for_version`] (issue #1456, spec
+/// 072) — hover's live, version-scoped low-usage fetch. Mirrors [`DEPS_DEV_CALL_TIMEOUT`]'s
+/// exact rationale: this call is awaited under hover's own `GOSSIP_WAIT_BUDGET`
+/// (`lsp_helpers::hover`), a synchronous-request-path budget, not a background one.
+const GOSSIP_CALL_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// Per-call timeout for [`DepsDevClient::gossip_findings_batch`] (issue #1456, spec 072) —
+/// the per-document prefetch's `GetFindingsBatch` POST. Mirrors [`TYPOSQUAT_CALL_TIMEOUT`]'s
+/// rationale: this runs from a background document-lifecycle prefetch, never on any live
+/// hover/diagnostics request path, so it can afford a more generous budget than
+/// [`GOSSIP_CALL_TIMEOUT`] — a batch covering an entire document's dependencies is expected
+/// to take longer than one single-package call.
+const GOSSIP_BATCH_CALL_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Upper bound on how many `nextPageToken` pages [`DepsDevClient::gossip_findings_batch`]
+/// will follow for one batch call, so a misbehaving or adversarial server cannot keep this
+/// background prefetch looping indefinitely by never returning an empty `nextPageToken`.
+const GOSSIP_BATCH_MAX_PAGES: usize = 20;
+
+/// TTL for a successfully resolved GOSSIP result (batch or version-scoped), matching
+/// [`DEPS_DEV_SUCCESS_TTL`]'s reasoning — plan.md §0 round 4 (N5) restores this memo
+/// specifically so a document's 100ms-debounced re-prefetch trigger does not re-issue a
+/// network call for a package already resolved within the last hour.
+const GOSSIP_SUCCESS_TTL: Duration = Duration::from_hours(1);
+
+/// TTL for a failed GOSSIP fetch (network error, timeout, non-2xx, malformed response),
+/// matching [`DEPS_DEV_ERROR_TTL`]'s reasoning.
+const GOSSIP_ERROR_TTL: Duration = Duration::from_secs(90);
+
+/// Global cap on concurrent `GetFindingsBatch` calls across every open document (issue
+/// #1456, spec 072 FR-012/N8) — mirrors `deps-lsp::document::state::FETCH_PERMITS`'s
+/// server-wide-document-concurrency pattern, bounding the `disabled->enabled` config
+/// transition (one batch call per already-open document, fired simultaneously) and a
+/// cold-start multi-manifest workspace load, neither of which any within-document cap
+/// (there isn't one — this is one POST per document, not a per-package fan-out) would
+/// otherwise bound.
+const GOSSIP_PREFETCH_CONCURRENCY: usize = 8;
+
+/// Minimum interval between two [`DepsDevClient::force_refresh_gossip_findings`] calls for
+/// the same package (issue #1456, spec 072 FR-011/M21a) — deps.dev's own ingestion lag
+/// makes retrying a version-mismatch refetch more often than this pointless, since a newly
+/// published release is unlikely to be re-indexed within minutes.
+const GOSSIP_REFRESH_BACKOFF: Duration = Duration::from_mins(15);
 
 /// Key for [`DepsDevClient`]'s version-level memo.
 ///
@@ -246,6 +297,44 @@ struct PopularityMemoEntry {
     completeness: FetchCompleteness,
 }
 
+/// Key for [`DepsDevClient`]'s package-level GOSSIP memo (issue #1456, spec 072) — mirrors
+/// [`PopularityMemoKey`]'s exact shape: `default_version`'s cooldown/low-usage data is a
+/// property of the package's own current default version, not of whatever version a
+/// caller happens to ask about, so this is keyed package-level, not version-level.
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+struct GossipMemoKey {
+    base: String,
+    system: DepsDevSystem,
+    name: String,
+}
+
+struct GossipMemoEntry {
+    fetched_at: Instant,
+    ttl: Duration,
+    /// `None` when the package had no resolvable `defaultVersion` (e.g. a package-level
+    /// `NOT_FOUND`) — memoizing this negative outcome, like [`MemoEntry::signal`], is what
+    /// makes a repeat lookup for an unindexed/removed name issue zero requests too.
+    findings: Option<GossipFindings>,
+}
+
+/// Key for [`DepsDevClient`]'s version-scoped GOSSIP memo (issue #1456, spec 072) — backs
+/// [`DepsDevClient::gossip_findings_for_version`], hover's live low-usage fetch for the
+/// pinned/resolved version, which is not necessarily the package's `defaultVersion` and so
+/// cannot share [`GossipMemoKey`]'s package-level scope.
+#[derive(Debug, Hash, PartialEq, Eq, Clone)]
+struct GossipVersionMemoKey {
+    base: String,
+    system: DepsDevSystem,
+    name: String,
+    version: String,
+}
+
+struct GossipVersionMemoEntry {
+    fetched_at: Instant,
+    ttl: Duration,
+    findings: Option<GossipFindings>,
+}
+
 /// Releases an in-flight claim on drop — including on panic — so a claim can
 /// never leak and permanently block later calls for the same key.
 ///
@@ -262,6 +351,26 @@ struct InFlightGuard<'a, K: std::hash::Hash + Eq, W> {
 impl<K: std::hash::Hash + Eq, W> Drop for InFlightGuard<'_, K, W> {
     fn drop(&mut self) {
         self.map.remove(&self.key);
+    }
+}
+
+/// Releases a `DashSet`-backed in-flight claim on drop — including on panic — mirroring
+/// [`InFlightGuard`]'s identical rationale for the skip-and-defer (not `coalesce`-joined)
+/// GOSSIP dedup sets (issue #1456, spec 072 C1/M21d): [`InFlightGuard`] itself now only
+/// wraps a `DashMap<K, W>` (issue #1454), since every other in-flight set in this client
+/// upgraded to `coalesce`'s true-join shape, but GOSSIP's own dedup (a name already claimed
+/// elsewhere is skipped this round, not awaited) deliberately stayed a simpler `DashSet`
+/// claim per spec 072's own design history — this guard is the minimal adapter that keeps
+/// that behavior correct without pulling GOSSIP into the `coalesce`/`watch::Receiver`
+/// machinery its skip-and-defer design never needed.
+struct DashSetInFlightGuard<'a, K: std::hash::Hash + Eq> {
+    set: &'a DashSet<K>,
+    key: K,
+}
+
+impl<K: std::hash::Hash + Eq> Drop for DashSetInFlightGuard<'_, K> {
+    fn drop(&mut self) {
+        self.set.remove(&self.key);
     }
 }
 
@@ -564,6 +673,108 @@ pub struct DepsDevClient {
     /// `typosquat_signal_concurrent_calls_share_one_candidate_popularity_request` used to
     /// accept one of two real typosquats going unreported.
     popularity_in_flight: DashMap<PopularityMemoKey, watch::Receiver<Slot<PopularityResult>>>,
+    /// Issue #1456: package-level GOSSIP findings memo, backing [`Self::gossip_findings_batch`]
+    /// (see [`GossipMemoKey`]'s docs for why this is package-, not version-, scoped).
+    gossip: DashMap<GossipMemoKey, GossipMemoEntry>,
+    /// Issue #1456: in-flight claims for [`Self::gossip`] — a name already claimed by another
+    /// concurrent batch call is skipped by this call rather than re-fetched (mirrors
+    /// [`Self::in_flight`]'s dedup shape); the claiming call's own memo write is what a losing
+    /// caller's *next* prefetch trigger will see.
+    gossip_in_flight: DashSet<GossipMemoKey>,
+    /// Issue #1456: version-scoped GOSSIP findings memo, backing
+    /// [`Self::gossip_findings_for_version`] (hover's live low-usage fetch).
+    gossip_versions: DashMap<GossipVersionMemoKey, GossipVersionMemoEntry>,
+    /// Issue #1456: in-flight claims for [`Self::gossip_versions`].
+    gossip_version_in_flight: DashSet<GossipVersionMemoKey>,
+    /// Issue #1456, spec 072 FR-012/N8: bounds concurrent `GetFindingsBatch` calls across
+    /// every open document server-wide — see [`GOSSIP_PREFETCH_CONCURRENCY`]'s doc.
+    gossip_semaphore: tokio::sync::Semaphore,
+    /// Issue #1456, spec 072 FR-011/M21: per-package last-attempt timestamp backing
+    /// [`Self::force_refresh_gossip_findings`]'s >=15-minute backoff — bounded by the same
+    /// [`crate::cache_policy::evict_expired_then_oldest`] discipline every other memo in
+    /// this client uses (M21d), so a workspace touching many distinct packages over a long
+    /// server lifetime cannot grow this map unboundedly.
+    gossip_last_refresh_attempt: DashMap<GossipMemoKey, Instant>,
+    /// Code-review finding #4: claims a key for the whole duration of
+    /// [`Self::force_refresh_gossip_findings`]'s check-backoff/evict-memo/fetch/store-memo
+    /// sequence for that name — without this, the backoff read
+    /// (`gossip_last_refresh_attempt.get`) and write (`.insert`) are two separate,
+    /// non-atomic `DashMap` operations, so two concurrent force-refresh calls for the same
+    /// package can both observe "not throttled" before either writes, firing duplicate
+    /// fetches. Mirrors [`Self::gossip_in_flight`]'s identical claim-before-fetch shape
+    /// (the same fix already applied for [`Self::gossip_in_flight`] itself, code-review C1)
+    /// — a name already claimed here is skipped this round rather than raced on.
+    gossip_refresh_in_flight: DashSet<GossipMemoKey>,
+}
+
+/// Parses one `defaultVersion`/`requestedVersion` object into the consumer-facing
+/// [`GossipFindings`] (issue #1456, spec 072). Shared by
+/// [`DepsDevClient::gossip_findings_batch`] (via `defaultVersion`) and
+/// [`DepsDevClient::gossip_findings_for_version`] (via `requestedVersion`, falling back to
+/// `defaultVersion`).
+///
+/// Only the *first* `Cooldown`/`LowUsage` finding of each type is kept — deps.dev's schema
+/// does not document more than one of the same type ever appearing in `findings[]` for one
+/// version, so this is a defensive "first wins" rather than a documented merge rule.
+fn gossip_findings_from_entry(entry: &GossipVersionFindingsWire) -> GossipFindings {
+    let mut cooldown = None;
+    let mut low_usage = None;
+
+    for finding in &entry.findings {
+        match finding.finding_type {
+            GossipFindingType::Cooldown => {
+                if cooldown.is_none()
+                    && let Some(ctx) = &finding.cooldown_context
+                    && let Some(end) = crate::PublishTime::parse_rfc3339(&ctx.end)
+                {
+                    cooldown = Some(GossipCooldown {
+                        end,
+                        risk: finding.risk.into(),
+                    });
+                }
+            }
+            GossipFindingType::LowUsage => {
+                if low_usage.is_none() {
+                    let alternative_packages = finding
+                        .low_usage_context
+                        .as_ref()
+                        .map(|ctx| ctx.alternative_packages.clone())
+                        .unwrap_or_default();
+                    low_usage = Some(GossipLowUsage {
+                        risk: finding.risk.into(),
+                        alternative_packages,
+                    });
+                }
+            }
+            GossipFindingType::Other => {}
+        }
+    }
+
+    // Issue #1456 security/impl-critic review, S2: no `COOLDOWN` finding was present, but
+    // the version wrapper's own sibling `cooldownEnd` field is live-verified to always be
+    // present regardless (a historical timestamp, not itself the active-cooldown signal —
+    // see that field's own doc). Falling back to it here means `cooldown` ends up `Some`
+    // for *any* version-matched response that carries end-date information at all — which
+    // is exactly what lets `gossip_cooldown_for` (`lsp_helpers::mod`) tell "GOSSIP
+    // authoritatively says not in cooldown" (`cooldown.is_active(now) == false`) apart from
+    // "no GOSSIP data for this version at all" (`cooldown_prefetch` has no matching entry).
+    if cooldown.is_none()
+        && let Some(end) = entry
+            .cooldown_end
+            .as_deref()
+            .and_then(crate::PublishTime::parse_rfc3339)
+    {
+        cooldown = Some(GossipCooldown {
+            end,
+            risk: GossipRiskLevel::Informational,
+        });
+    }
+
+    GossipFindings {
+        version: entry.version_key.version.clone(),
+        cooldown,
+        low_usage,
+    }
 }
 
 /// Manual, non-exhaustive impl: `VersionData` derives `Debug` and holds this behind
@@ -604,6 +815,13 @@ impl DepsDevClient {
             similarity_in_flight: DashMap::new(),
             popularity: DashMap::new(),
             popularity_in_flight: DashMap::new(),
+            gossip: DashMap::new(),
+            gossip_in_flight: DashSet::new(),
+            gossip_versions: DashMap::new(),
+            gossip_version_in_flight: DashSet::new(),
+            gossip_semaphore: tokio::sync::Semaphore::new(GOSSIP_PREFETCH_CONCURRENCY),
+            gossip_last_refresh_attempt: DashMap::new(),
+            gossip_refresh_in_flight: DashSet::new(),
         }
     }
 
@@ -1247,6 +1465,497 @@ impl DepsDevClient {
                     "deps.dev dependents fetch timed out"
                 );
                 (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
+            }
+        }
+    }
+
+    /// Returns GOSSIP cooldown/low-usage findings for every name in `names` whose
+    /// package-level `defaultVersion` carries a resolvable result (issue #1456, spec 072)
+    /// — one `POST /v3alpha/findingsbatch` call for the memo-misses, never one call per
+    /// name.
+    ///
+    /// A name already served from `Self::gossip`'s memo (within `GOSSIP_SUCCESS_TTL`/
+    /// `GOSSIP_ERROR_TTL`) contributes nothing to the outbound request and lands directly
+    /// in the returned map. A name already claimed by another concurrent call to this
+    /// method is skipped by this call rather than fetched a second time (mirrors
+    /// `Self::similar_packages`'s identical in-flight trade-off) — the claiming call's own
+    /// memo write is what the losing caller's *next* prefetch trigger will see, rather than
+    /// this call joining that in-flight fetch directly.
+    ///
+    /// The returned map only ever contains a name when GOSSIP reported a resolvable
+    /// `defaultVersion` for it — a name with no resolvable default version (e.g. a
+    /// package-level `NOT_FOUND`) is simply absent, not present with an empty
+    /// [`GossipFindings`] (NFR-002).
+    ///
+    /// Does **not** itself check `system`/ecosystem coverage or any config opt-in switch —
+    /// mirrors every other public method on this client (see [`Self::typosquat_signal`]'s
+    /// doc for why that's the caller's responsibility).
+    pub async fn gossip_findings_batch(
+        &self,
+        system: DepsDevSystem,
+        names: &[String],
+    ) -> HashMap<String, GossipFindings> {
+        let mut result = HashMap::new();
+        let mut misses: Vec<String> = Vec::new();
+
+        for name in names {
+            let key = self.gossip_key(system, name);
+            if let Some(entry) = self.gossip.get(&key)
+                && entry.fetched_at.elapsed() < entry.ttl
+            {
+                if let Some(findings) = entry.findings.clone() {
+                    result.insert(name.clone(), findings);
+                }
+                continue;
+            }
+            misses.push(name.clone());
+        }
+
+        if misses.is_empty() {
+            return result;
+        }
+
+        let mut claimed: Vec<String> = Vec::with_capacity(misses.len());
+        // Security review C1/impl-critic C1: held across the whole fetch below (including
+        // the semaphore wait), not removed manually only on the normal-return path — a
+        // `tokio::time::timeout` around this call (as `run_gossip_prefetch` uses) can drop
+        // this future mid-`.await`, and a manual `self.gossip_in_flight.remove(..)` placed
+        // after the fetch would then never run, permanently leaking the claim for that
+        // package (every later call sees it as still in-flight and skips it forever, and
+        // the memo is never written either). `InFlightGuard`'s `Drop` impl runs on
+        // cancellation too, exactly like every other in-flight set in this client
+        // (`Self::in_flight`, `Self::similarity_in_flight`, `Self::popularity_in_flight`,
+        // `Self::gossip_version_in_flight`) already relies on.
+        let mut guards: Vec<DashSetInFlightGuard<'_, GossipMemoKey>> =
+            Vec::with_capacity(misses.len());
+        for name in misses {
+            let key = self.gossip_key(system, &name);
+            if self.gossip_in_flight.insert(key.clone()) {
+                guards.push(DashSetInFlightGuard {
+                    set: &self.gossip_in_flight,
+                    key,
+                });
+                claimed.push(name);
+            }
+        }
+        if claimed.is_empty() {
+            return result;
+        }
+
+        // N8: bounds concurrent batch calls across every open document, not just within
+        // this one call. `self.gossip_semaphore` is a plain in-process `Semaphore` this
+        // client owns exclusively and never closes, so `acquire` cannot return `Closed`.
+        #[expect(
+            clippy::expect_used,
+            reason = "gossip_semaphore is never closed for the lifetime of this client"
+        )]
+        let _permit = self
+            .gossip_semaphore
+            .acquire()
+            .await
+            .expect("gossip_semaphore is never closed");
+
+        let fetched = self.fetch_gossip_batch(system, &claimed).await;
+
+        // The fetch completed normally (a cancellation before this point would have
+        // dropped `guards` already, releasing every claim) — release them explicitly here
+        // too, rather than waiting for this whole method's stack frame to unwind, so a
+        // concurrent caller waiting on the same key doesn't wait longer than necessary.
+        drop(guards);
+
+        for name in claimed {
+            // A name absent from `fetched` (the whole call failed, or this specific name
+            // was missing from `responses[]`) memoizes the short error TTL so it is
+            // retried soon; a name present — even as `None`, a resolvable "no cooldown/
+            // low-usage finding" answer — memoizes the full success TTL.
+            let (findings, ttl) = match fetched.get(&name) {
+                Some(findings) => (findings.clone(), GOSSIP_SUCCESS_TTL),
+                None => (None, GOSSIP_ERROR_TTL),
+            };
+            if let Some(findings) = &findings {
+                result.insert(name.clone(), findings.clone());
+            }
+            self.store_gossip_memo(self.gossip_key(system, &name), findings, ttl);
+        }
+
+        result
+    }
+
+    /// Force-refetches GOSSIP findings for `names`, bypassing whatever the per-package memo
+    /// currently holds (issue #1456, spec 072 FR-011/M21a) — the counterpart to
+    /// [`Self::gossip_findings_batch`]'s normal, memo-respecting path, for a caller that has
+    /// already detected a genuine staleness signal (a version-equality mismatch, FR-008) and
+    /// knows a memo-respecting call would just return the same stale answer.
+    ///
+    /// Each name is independently throttled to at most once every `GOSSIP_REFRESH_BACKOFF`
+    /// (M21a) via `Self::gossip_last_refresh_attempt` — a name still within its backoff
+    /// window is silently skipped (absent from the returned map, exactly like a name with no
+    /// resolvable `defaultVersion`), so a caller does not need its own throttling logic on
+    /// top of this. Does **not** itself decide which packages need refreshing, which
+    /// documents to republish for, or filter for privacy — see
+    /// `deps-lsp::document::gossip_prefetch`'s mismatch-detection function (M21b/M21c), the
+    /// sole intended caller, which owns the `source_is_public_registry_content` gate.
+    ///
+    /// Code-review C1-mirroring fix (finding #4): the backoff check-then-write is not two
+    /// independent `DashMap` operations here — `Self::gossip_refresh_in_flight` claims each
+    /// name for the whole check/evict/fetch/store sequence, so two concurrent calls for the
+    /// same package can never both observe "not throttled" before either writes; the loser
+    /// simply skips that name this round (mirrors `Self::gossip_in_flight`'s identical
+    /// claim-before-fetch shape). Also acquires `Self::gossip_semaphore` before fetching
+    /// (finding #3) — without it, this path bypassed FR-012/N8's global concurrency cap
+    /// entirely, since it calls `Self::fetch_gossip_batch` directly rather than going
+    /// through [`Self::gossip_findings_batch`] (which already acquires it).
+    pub async fn force_refresh_gossip_findings(
+        &self,
+        system: DepsDevSystem,
+        names: &[String],
+    ) -> HashMap<String, GossipFindings> {
+        let mut eligible: Vec<String> = Vec::with_capacity(names.len());
+        let mut guards: Vec<DashSetInFlightGuard<'_, GossipMemoKey>> =
+            Vec::with_capacity(names.len());
+        let now = Instant::now();
+
+        for name in names {
+            let key = self.gossip_key(system, name);
+            if !self.gossip_refresh_in_flight.insert(key.clone()) {
+                continue;
+            }
+            let guard = DashSetInFlightGuard {
+                set: &self.gossip_refresh_in_flight,
+                key: key.clone(),
+            };
+
+            let throttled = self
+                .gossip_last_refresh_attempt
+                .get(&key)
+                .is_some_and(|last| now.duration_since(*last) < GOSSIP_REFRESH_BACKOFF);
+            if throttled {
+                drop(guard);
+                continue;
+            }
+            if !self.gossip_last_refresh_attempt.contains_key(&key) {
+                crate::cache_policy::evict_expired_then_oldest(
+                    &self.gossip_last_refresh_attempt,
+                    MAX_MEMO_ENTRIES,
+                    |attempt| *attempt,
+                    |_| GOSSIP_REFRESH_BACKOFF,
+                );
+            }
+            self.gossip_last_refresh_attempt.insert(key, now);
+            eligible.push(name.clone());
+            guards.push(guard);
+        }
+
+        if eligible.is_empty() {
+            return HashMap::new();
+        }
+
+        // M21a: evict the main memo entry before fetching, so this call cannot serve the
+        // same stale `defaultVersion` it was triggered to correct.
+        for name in &eligible {
+            self.gossip.remove(&self.gossip_key(system, name));
+        }
+
+        // Finding #3: same global cap `gossip_findings_batch` already applies.
+        #[expect(
+            clippy::expect_used,
+            reason = "gossip_semaphore is never closed for the lifetime of this client"
+        )]
+        let _permit = self
+            .gossip_semaphore
+            .acquire()
+            .await
+            .expect("gossip_semaphore is never closed");
+
+        let fetched = self.fetch_gossip_batch(system, &eligible).await;
+
+        // Release every refresh claim now that the fetch completed (a cancellation before
+        // this point would have dropped `guards` already, same as `gossip_findings_batch`'s
+        // C1 fix).
+        drop(guards);
+
+        let mut result = HashMap::new();
+        for name in eligible {
+            let (findings, ttl) = match fetched.get(&name) {
+                Some(findings) => (findings.clone(), GOSSIP_SUCCESS_TTL),
+                None => (None, GOSSIP_ERROR_TTL),
+            };
+            if let Some(findings) = &findings {
+                result.insert(name.clone(), findings.clone());
+            }
+            self.store_gossip_memo(self.gossip_key(system, &name), findings, ttl);
+        }
+        result
+    }
+
+    fn gossip_key(&self, system: DepsDevSystem, name: &str) -> GossipMemoKey {
+        GossipMemoKey {
+            base: self.base_url.clone(),
+            system,
+            name: name.to_string(),
+        }
+    }
+
+    fn store_gossip_memo(
+        &self,
+        key: GossipMemoKey,
+        findings: Option<GossipFindings>,
+        ttl: Duration,
+    ) {
+        if !self.gossip.contains_key(&key) {
+            crate::cache_policy::evict_expired_then_oldest(
+                &self.gossip,
+                MAX_MEMO_ENTRIES,
+                |e| e.fetched_at,
+                |e| e.ttl,
+            );
+        }
+        self.gossip.insert(
+            key,
+            GossipMemoEntry {
+                fetched_at: Instant::now(),
+                ttl,
+                findings,
+            },
+        );
+    }
+
+    /// One (possibly paginated) `POST /v3alpha/findingsbatch` call for `names`
+    /// (live-verified request/response shape 2026-09-26, `npm/vite` + `npm/left-pad`).
+    ///
+    /// Maps each resolved name to `Some(findings)`, or `None` when GOSSIP reported no
+    /// resolvable `defaultVersion` for it. The whole call failing (network, timeout,
+    /// non-2xx, malformed response, or a page exceeding [`DEPS_DEV_BODY_LIMIT`] — N8, this
+    /// guard applies to *every* page, not only the first) yields an empty map, so every
+    /// name [`Self::gossip_findings_batch`] asked for falls through to [`GOSSIP_ERROR_TTL`]
+    /// there rather than this method needing its own per-name failure bookkeeping.
+    async fn fetch_gossip_batch(
+        &self,
+        system: DepsDevSystem,
+        names: &[String],
+    ) -> HashMap<String, Option<GossipFindings>> {
+        let url = format!("{}/v3alpha/findingsbatch", self.base_url);
+        let system_upper = system.as_path_segment().to_uppercase();
+        let requests: Vec<GossipBatchRequestWire<'_>> = names
+            .iter()
+            .map(|name| GossipBatchRequestWire {
+                package_key: GossipPackageKeyRefWire {
+                    system: &system_upper,
+                    name,
+                },
+            })
+            .collect();
+
+        let mut result = HashMap::new();
+        let mut page_token: Option<String> = None;
+
+        for _ in 0..GOSSIP_BATCH_MAX_PAGES {
+            let body = GossipFindingsBatchRequestWire {
+                requests: &requests,
+                page_token: page_token.as_deref(),
+            };
+
+            let bytes = match tokio::time::timeout(
+                GOSSIP_BATCH_CALL_TIMEOUT,
+                self.cache.post_json_limited_trusted_origin(
+                    &url,
+                    &body,
+                    BodyLimit::new(DEPS_DEV_BODY_LIMIT),
+                    &self.trusted_origin,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(e)) => {
+                    let (status, cause) = e.safe_tracing_summary();
+                    tracing::debug!(
+                        status = ?status,
+                        cause,
+                        "deps.dev GOSSIP findings batch fetch failed"
+                    );
+                    return HashMap::new();
+                }
+                Err(_) => {
+                    tracing::debug!("deps.dev GOSSIP findings batch fetch timed out");
+                    return HashMap::new();
+                }
+            };
+
+            let wire = match crate::parser::parse_json_checked::<GossipFindingsBatchWire>(&bytes) {
+                Ok(wire) => wire,
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "deps.dev GOSSIP findings batch response parse failed"
+                    );
+                    return HashMap::new();
+                }
+            };
+
+            for entry in wire.responses {
+                let name = entry.request.package_key.name;
+                let findings = entry
+                    .findings
+                    .default_version
+                    .as_ref()
+                    .map(gossip_findings_from_entry);
+                result.insert(name, findings);
+            }
+
+            if wire.next_page_token.is_empty() {
+                break;
+            }
+            page_token = Some(wire.next_page_token);
+        }
+
+        result
+    }
+
+    /// Returns GOSSIP findings for one exact, resolved `(system, name, version)` — hover's
+    /// only live, per-request GOSSIP fetch (issue #1456, spec 072 FR-005): the
+    /// pinned/resolved version may not be the package's `defaultVersion`, so
+    /// [`Self::gossip_findings_batch`]'s package-level result cannot cover it.
+    ///
+    /// Infallible by construction, exactly like [`Self::trust_signal`]: every failure
+    /// degrades to `None`, memoized under `GOSSIP_ERROR_TTL` so a transient outage does
+    /// not re-fire on every hover. Backed by `Self::gossip_versions` (version-keyed, not
+    /// `Self::gossip`'s package-level memo) so a response landing past hover's
+    /// `GOSSIP_WAIT_BUDGET` (`lsp_helpers::hover`) still warms something usable by the next
+    /// hover on the same pinned version, mirroring [`Self::trust_signal`]'s
+    /// spawn-and-warm design.
+    pub async fn gossip_findings_for_version(
+        &self,
+        system: DepsDevSystem,
+        name: &str,
+        version: &str,
+    ) -> Option<GossipFindings> {
+        let key = GossipVersionMemoKey {
+            base: self.base_url.clone(),
+            system,
+            name: name.to_string(),
+            version: version.to_string(),
+        };
+
+        if let Some(entry) = self.gossip_versions.get(&key)
+            && entry.fetched_at.elapsed() < entry.ttl
+        {
+            return entry.findings.clone();
+        }
+
+        if !self.gossip_version_in_flight.insert(key.clone()) {
+            return None;
+        }
+        let _guard = DashSetInFlightGuard {
+            set: &self.gossip_version_in_flight,
+            key: key.clone(),
+        };
+
+        let (findings, ttl) = self.fetch_gossip_version(system, name, version).await;
+        self.store_gossip_version_memo(key, findings.clone(), ttl);
+        findings
+    }
+
+    fn store_gossip_version_memo(
+        &self,
+        key: GossipVersionMemoKey,
+        findings: Option<GossipFindings>,
+        ttl: Duration,
+    ) {
+        if !self.gossip_versions.contains_key(&key) {
+            crate::cache_policy::evict_expired_then_oldest(
+                &self.gossip_versions,
+                MAX_MEMO_ENTRIES,
+                |e| e.fetched_at,
+                |e| e.ttl,
+            );
+        }
+        self.gossip_versions.insert(
+            key,
+            GossipVersionMemoEntry {
+                fetched_at: Instant::now(),
+                ttl,
+                findings,
+            },
+        );
+    }
+
+    /// Version-scoped `GET .../versions/{version}:findings` call backing
+    /// [`Self::gossip_findings_for_version`]. Reads only `requestedVersion` (the exact
+    /// version asked about) — an absent `requestedVersion` means nothing to report for this
+    /// exact version, never falls back to `defaultVersion`, which would misattribute a
+    /// different (default/resolved) version's findings to the requested one (code-review
+    /// finding M2).
+    async fn fetch_gossip_version(
+        &self,
+        system: DepsDevSystem,
+        name: &str,
+        version: &str,
+    ) -> (Option<GossipFindings>, Duration) {
+        if is_dot_segment(name) {
+            warn_rejected_value(
+                "is_dot_segment",
+                "deps.dev GOSSIP findings request URL",
+                name,
+            );
+            return (None, GOSSIP_SUCCESS_TTL);
+        }
+        if is_dot_segment(version) {
+            warn_rejected_value(
+                "is_dot_segment",
+                "deps.dev GOSSIP findings request URL",
+                version,
+            );
+            return (None, GOSSIP_SUCCESS_TTL);
+        }
+
+        let url = format!(
+            "{}/v3alpha/systems/{}/packages/{}/versions/{}:findings",
+            self.base_url,
+            system.as_path_segment(),
+            urlencoding::encode(name),
+            urlencoding::encode(version),
+        );
+
+        match self.get(&url, GOSSIP_CALL_TIMEOUT).await {
+            Ok(bytes) => match crate::parser::parse_json_checked::<GossipFindingsWire>(&bytes) {
+                Ok(wire) => {
+                    // Security/impl-critic review M2: must NOT fall back to
+                    // `default_version` — this call asked for `version` specifically (a
+                    // pinned/resolved version that may differ from the package's default),
+                    // so falling back would attribute `defaultVersion`'s low-usage/cooldown
+                    // data to a version it was never computed for. An absent
+                    // `requestedVersion` means "nothing to report for this exact version".
+                    let findings = wire
+                        .requested_version
+                        .as_ref()
+                        .map(gossip_findings_from_entry);
+                    (findings, GOSSIP_SUCCESS_TTL)
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        error = %e,
+                        "deps.dev GOSSIP version findings response parse failed"
+                    );
+                    (None, GOSSIP_ERROR_TTL)
+                }
+            },
+            Err(DepsDevFetchError::NotFound) => (None, GOSSIP_SUCCESS_TTL),
+            Err(DepsDevFetchError::Failed(e)) => {
+                let (status, cause) = e.safe_tracing_summary();
+                tracing::debug!(
+                    status = ?status,
+                    cause,
+                    "deps.dev GOSSIP version findings fetch failed"
+                );
+                (None, GOSSIP_ERROR_TTL)
+            }
+            Err(DepsDevFetchError::TimedOut) => {
+                tracing::debug!(
+                    package = %crate::redact::redact_declaration_key(name),
+                    "deps.dev GOSSIP version findings fetch timed out"
+                );
+                (None, GOSSIP_ERROR_TTL)
             }
         }
     }
@@ -3057,6 +3766,811 @@ mod tests {
             !map.contains_key(&1u32),
             "the in-flight entry must be cleaned up after the leader's abort and the \
              follower's own successful takeover"
+        );
+    }
+
+    // --- GOSSIP (issue #1456, spec 072) ---
+
+    /// Live-captured response shape (2026-09-26, `POST /v3alpha/findingsbatch` against
+    /// `npm/vite` + `npm/left-pad`) — the regression fixture every batch test below reuses.
+    /// Also the fixture that caught a real bug during implementation: `GossipRiskWire`'s
+    /// variants must deserialize `"RISK_HIGH"`/`"RISK_MEDIUM"`, not a bare `"HIGH"`/
+    /// `"MEDIUM"` (a `#[serde(rename_all = "SCREAMING_SNAKE_CASE")]` alone produces the
+    /// latter, silently failing on every real deps.dev risk value).
+    const GOSSIP_BATCH_VITE_AND_LEFT_PAD: &str = r#"{"responses":[
+        {"request":{"packageKey":{"system":"NPM","name":"vite"}},
+         "findings":{"packageKey":{"system":"NPM","name":"vite"},"recommendedVersions":[],
+             "defaultVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                 "isDefault":true,
+                 "findings":[{"type":"COOLDOWN","risk":"RISK_HIGH",
+                     "cooldownContext":{"end":"2026-10-09T12:26:19Z"}}],
+                 "cooldownEnd":"2026-10-09T12:26:19Z"},
+             "packageFindings":[]}},
+        {"request":{"packageKey":{"system":"NPM","name":"left-pad"}},
+         "findings":{"packageKey":{"system":"NPM","name":"left-pad"},
+             "recommendedVersions":[{"versionKey":{"system":"NPM","name":"left-pad","version":"1.3.0"},
+                 "isDefault":true,
+                 "findings":[{"type":"DEPRECATED","risk":"RISK_MEDIUM",
+                     "deprecatedContext":{"reason":"use String.prototype.padStart()"}}],
+                 "cooldownEnd":"2018-04-24T01:10:45Z"}],
+             "defaultVersion":{"versionKey":{"system":"NPM","name":"left-pad","version":"1.3.0"},
+                 "isDefault":true,
+                 "findings":[{"type":"DEPRECATED","risk":"RISK_MEDIUM",
+                     "deprecatedContext":{"reason":"use String.prototype.padStart()"}}],
+                 "cooldownEnd":"2018-04-24T01:10:45Z"},
+             "packageFindings":[{"type":"DEPRECATED","risk":"RISK_MEDIUM"}]}}
+    ], "nextPageToken":""}"#;
+
+    #[tokio::test]
+    async fn gossip_findings_batch_parses_active_cooldown() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(GOSSIP_BATCH_VITE_AND_LEFT_PAD)
+            .create_async()
+            .await;
+
+        let result = client
+            .gossip_findings_batch(
+                DepsDevSystem::Npm,
+                &["vite".to_string(), "left-pad".to_string()],
+            )
+            .await;
+
+        let vite = result.get("vite").expect("vite findings expected");
+        assert_eq!(vite.version, "8.3.1");
+        let cooldown = vite.cooldown.expect("active cooldown expected");
+        assert_eq!(cooldown.risk, GossipRiskLevel::High);
+        assert!(cooldown.is_active(crate::PublishTime::from_unix_secs(0)));
+
+        // `left-pad`'s only real finding is `DEPRECATED`, which collapses into
+        // `GossipFindingType::Other` and is never surfaced as a cooldown/low-usage finding
+        // — but S2's fix means `cooldown` is still `Some`, sourced from the sibling
+        // `cooldownEnd` field (2018, long past) rather than a `COOLDOWN` finding — this is
+        // exactly the tri-state fix: GOSSIP data is present and authoritatively says "not
+        // active", distinguishable from "no GOSSIP data at all".
+        let left_pad = result.get("left-pad").expect("left-pad findings expected");
+        let left_pad_cooldown = left_pad
+            .cooldown
+            .expect("cooldownEnd fallback must still populate cooldown");
+        assert!(!left_pad_cooldown.is_active(crate::PublishTime::now()));
+        assert!(left_pad.low_usage.is_none());
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_batch_no_default_version_omits_name() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(
+                r#"{"responses":[{"request":{"packageKey":{"system":"NPM","name":"missing"}},
+                    "findings":{"packageKey":{"system":"NPM","name":"missing"},
+                        "recommendedVersions":[],
+                        "packageFindings":[{"type":"NOT_FOUND","risk":"RISK_CRITICAL"}]}}],
+                    "nextPageToken":""}"#,
+            )
+            .create_async()
+            .await;
+
+        let result = client
+            .gossip_findings_batch(DepsDevSystem::Npm, &["missing".to_string()])
+            .await;
+
+        assert!(
+            !result.contains_key("missing"),
+            "NFR-002: a name with no resolvable defaultVersion must be absent, not present \
+             with an empty GossipFindings"
+        );
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_batch_second_call_within_ttl_issues_zero_requests() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(GOSSIP_BATCH_VITE_AND_LEFT_PAD)
+            .expect(1)
+            .create_async()
+            .await;
+
+        client
+            .gossip_findings_batch(
+                DepsDevSystem::Npm,
+                &["vite".to_string(), "left-pad".to_string()],
+            )
+            .await;
+        client
+            .gossip_findings_batch(
+                DepsDevSystem::Npm,
+                &["vite".to_string(), "left-pad".to_string()],
+            )
+            .await;
+
+        batch.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_batch_follows_next_page_token() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut server, client) = mock_client().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body = req.body().map(|b| String::from_utf8_lossy(b).into_owned());
+                let is_page2 = body.is_ok_and(|b| b.contains("pageToken"));
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if is_page2 {
+                    br#"{"responses":[{"request":{"packageKey":{"system":"NPM","name":"left-pad"}},
+                        "findings":{"packageKey":{"system":"NPM","name":"left-pad"},
+                            "recommendedVersions":[],
+                            "defaultVersion":{"versionKey":{"system":"NPM","name":"left-pad","version":"1.3.0"}},
+                            "packageFindings":[]}}],
+                        "nextPageToken":""}"#
+                        .to_vec()
+                } else {
+                    br#"{"responses":[{"request":{"packageKey":{"system":"NPM","name":"vite"}},
+                        "findings":{"packageKey":{"system":"NPM","name":"vite"},
+                            "recommendedVersions":[],
+                            "defaultVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                                "isDefault":true,
+                                "findings":[{"type":"COOLDOWN","risk":"RISK_HIGH",
+                                    "cooldownContext":{"end":"2026-10-09T12:26:19Z"}}]},
+                            "packageFindings":[]}}],
+                        "nextPageToken":"page2"}"#
+                        .to_vec()
+                }
+            })
+            .create_async()
+            .await;
+
+        let result = client
+            .gossip_findings_batch(
+                DepsDevSystem::Npm,
+                &["vite".to_string(), "left-pad".to_string()],
+            )
+            .await;
+
+        assert!(
+            result.contains_key("vite"),
+            "page 1's result must be included"
+        );
+        assert!(
+            result.contains_key("left-pad"),
+            "page 2's result must be included"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "exactly two pages must be fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_batch_oversized_page_returns_empty_and_no_panic() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            // `DEPS_DEV_BODY_LIMIT` (1 MiB) — comfortably exceeded by this padded body.
+            .with_body(format!(
+                r#"{{"responses":[],"nextPageToken":"","padding":"{}"}}"#,
+                "x".repeat(DEPS_DEV_BODY_LIMIT + 1)
+            ))
+            .create_async()
+            .await;
+
+        let result = client
+            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_batch_non_2xx_returns_empty_and_memoizes_error_ttl() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let result = client
+            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        assert!(result.is_empty());
+
+        let entry_ttl = client
+            .gossip
+            .get(&GossipMemoKey {
+                base: client.base_url.clone(),
+                system: DepsDevSystem::Npm,
+                name: "vite".to_string(),
+            })
+            .expect("memo entry expected even on failure")
+            .ttl;
+        assert_eq!(entry_ttl, GOSSIP_ERROR_TTL);
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_batch_sends_uppercase_system() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .match_body(mockito::Matcher::Regex(r#""system":"NPM""#.to_string()))
+            .with_status(200)
+            .with_body(r#"{"responses":[],"nextPageToken":""}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        client
+            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+
+        batch.assert_async().await;
+    }
+
+    /// Security/impl-critic review C1 regression, positive-behavior half: two concurrent
+    /// `gossip_findings_batch` calls for the *same* name must issue exactly one network
+    /// request — the loser sees the name already claimed and skips it (skip-and-defer),
+    /// mirroring `typosquat_signal_concurrent_calls_share_one_candidate_popularity_request`'s
+    /// identical in-flight-dedup pattern for the sibling `popularity` memo.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gossip_findings_batch_concurrent_calls_for_same_name_issue_one_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut server, client) = mock_client().await;
+        let client = Arc::new(client);
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(60));
+                GOSSIP_BATCH_VITE_AND_LEFT_PAD.as_bytes().to_vec()
+            })
+            .create_async()
+            .await;
+
+        let (a, b) = tokio::join!(
+            {
+                let client = Arc::clone(&client);
+                async move {
+                    client
+                        .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+                        .await
+                }
+            },
+            {
+                let client = Arc::clone(&client);
+                async move {
+                    client
+                        .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+                        .await
+                }
+            }
+        );
+        // The claim winner gets the real result; the loser sees the name already claimed
+        // and returns without it this round (its own next prefetch trigger gets it from
+        // the memo the winner warms).
+        assert!(a.contains_key("vite") || b.contains_key("vite"));
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            1,
+            "exactly one of the two concurrent calls must issue the network request; the \
+             other must see the in-flight claim and skip it rather than duplicate the \
+             request"
+        );
+    }
+
+    /// Security/impl-critic review C1 regression, negative-behavior half — the actual bug:
+    /// after a `gossip_findings_batch` call is cancelled mid-flight (its future dropped
+    /// while `.await`ing the fetch, exactly like `run_gossip_prefetch`'s
+    /// `tokio::time::timeout` wrapper can do under realistic load), the claimed name must
+    /// NOT stay permanently in-flight — a later call for the same name must be able to
+    /// claim and fetch it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gossip_findings_batch_cancellation_releases_in_flight_claim() {
+        let (mut server, client) = mock_client().await;
+        let client = Arc::new(client);
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body_from_request(|_req| {
+                std::thread::sleep(Duration::from_millis(60));
+                GOSSIP_BATCH_VITE_AND_LEFT_PAD.as_bytes().to_vec()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+
+        let spawn_client = Arc::clone(&client);
+        let handle = tokio::spawn(async move {
+            spawn_client
+                .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+                .await
+        });
+        // Deliberately shorter than the mock's 60ms response — cancels (drops) the
+        // spawned future's `JoinHandle` before the fetch completes.
+        let outcome = tokio::time::timeout(Duration::from_millis(5), handle).await;
+        assert!(
+            outcome.is_err(),
+            "the artificial budget must elapse before the mock responds"
+        );
+
+        // Give the cancelled task's own future time to actually finish unwinding (the
+        // `tokio::spawn`ed task itself is NOT aborted by the timeout above — only this
+        // test's `JoinHandle` await was — so the task and its `InFlightGuard`s still run
+        // to completion in the background).
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let second = client
+            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        assert!(
+            second.contains_key("vite"),
+            "a leaked in-flight claim would make this call skip \"vite\" forever — got: \
+             {second:?}"
+        );
+        batch.assert_async().await;
+    }
+
+    /// Issue #1456, spec 072 FR-012/N8 regression: the global `GOSSIP_PREFETCH_CONCURRENCY`
+    /// semaphore must actually cap how many `GetFindingsBatch` calls are in flight at once
+    /// across documents, not just be wired without effect.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gossip_findings_batch_respects_global_concurrency_semaphore() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut server, client) = mock_client().await;
+        let client = Arc::new(client);
+        let concurrent = Arc::new(AtomicUsize::new(0));
+        let max_concurrent = Arc::new(AtomicUsize::new(0));
+        let concurrent_clone = Arc::clone(&concurrent);
+        let max_clone = Arc::clone(&max_concurrent);
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body_from_request(move |_req| {
+                let now = concurrent_clone.fetch_add(1, Ordering::SeqCst) + 1;
+                max_clone.fetch_max(now, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(60));
+                concurrent_clone.fetch_sub(1, Ordering::SeqCst);
+                br#"{"responses":[],"nextPageToken":""}"#.to_vec()
+            })
+            .create_async()
+            .await;
+
+        // Distinct names, so none of these dedupe against each other via the in-flight
+        // set — every one of them must reach the network and contend for the semaphore.
+        let handles: Vec<_> = (0..(GOSSIP_PREFETCH_CONCURRENCY * 2))
+            .map(|i| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    client
+                        .gossip_findings_batch(DepsDevSystem::Npm, &[format!("pkg-{i}")])
+                        .await
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.await.expect("task must not panic");
+        }
+
+        let observed = max_concurrent.load(Ordering::SeqCst);
+        assert!(
+            observed <= GOSSIP_PREFETCH_CONCURRENCY,
+            "observed {observed} concurrent GetFindingsBatch calls, expected at most \
+             {GOSSIP_PREFETCH_CONCURRENCY}"
+        );
+    }
+
+    /// Issue #1456, spec 072 FR-012/N8 regression: `DEPS_DEV_BODY_LIMIT` must reject an
+    /// oversized *second* page too, not only the first — the existing
+    /// `gossip_findings_batch_oversized_page_returns_empty_and_no_panic` test only covers
+    /// an oversized first page.
+    #[tokio::test]
+    async fn gossip_findings_batch_oversized_second_page_rejects_whole_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (mut server, client) = mock_client().await;
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = Arc::clone(&call_count);
+        let _batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body_from_request(move |req| {
+                let body = req.body().map(|b| String::from_utf8_lossy(b).into_owned());
+                let is_page2 = body.is_ok_and(|b| b.contains("pageToken"));
+                call_count_clone.fetch_add(1, Ordering::SeqCst);
+                if is_page2 {
+                    format!(
+                        r#"{{"responses":[],"nextPageToken":"","padding":"{}"}}"#,
+                        "x".repeat(DEPS_DEV_BODY_LIMIT + 1)
+                    )
+                    .into_bytes()
+                } else {
+                    br#"{"responses":[{"request":{"packageKey":{"system":"NPM","name":"vite"}},
+                        "findings":{"packageKey":{"system":"NPM","name":"vite"},
+                            "recommendedVersions":[],
+                            "defaultVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                                "isDefault":true,"findings":[]},
+                            "packageFindings":[]}}],"nextPageToken":"page2"}"#
+                        .to_vec()
+                }
+            })
+            .create_async()
+            .await;
+
+        let result = client
+            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        assert!(
+            result.is_empty(),
+            "an oversized second page must reject the whole batch result (M1's accepted \
+             all-or-nothing parsing) — got: {result:?}"
+        );
+        assert_eq!(
+            call_count.load(Ordering::SeqCst),
+            2,
+            "both pages must have actually been requested"
+        );
+    }
+
+    /// Issue #1456, spec 072 FR-011/M21a regression: the whole point of
+    /// `force_refresh_gossip_findings` is to reach the network even when
+    /// `gossip_findings_batch` would have served a fresh, non-expired memo entry — a
+    /// literal "just call the normal path again" would be a no-op.
+    #[tokio::test]
+    async fn force_refresh_gossip_findings_bypasses_fresh_memo_entry() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(GOSSIP_BATCH_VITE_AND_LEFT_PAD)
+            .expect(2)
+            .create_async()
+            .await;
+
+        // Warms the memo with a fresh (well within `GOSSIP_SUCCESS_TTL`) entry.
+        client
+            .gossip_findings_batch(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+
+        let refreshed = client
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        assert!(
+            refreshed.contains_key("vite"),
+            "force refresh must still return a result, not just bypass the memo silently"
+        );
+        batch.assert_async().await;
+    }
+
+    /// A second `force_refresh_gossip_findings` call for the same package within
+    /// `GOSSIP_REFRESH_BACKOFF` must be throttled — no second network call.
+    #[tokio::test]
+    async fn force_refresh_gossip_findings_throttles_within_backoff_window() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(GOSSIP_BATCH_VITE_AND_LEFT_PAD)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let first = client
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        assert!(first.contains_key("vite"));
+
+        let second = client
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        assert!(
+            second.is_empty(),
+            "a second force-refresh within the backoff window must be throttled, not \
+             fetched again"
+        );
+
+        batch.assert_async().await;
+    }
+
+    /// Two distinct packages are throttled independently — refreshing one must not
+    /// throttle the other.
+    #[tokio::test]
+    async fn force_refresh_gossip_findings_throttle_is_per_package() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(GOSSIP_BATCH_VITE_AND_LEFT_PAD)
+            .expect(2)
+            .create_async()
+            .await;
+
+        client
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["vite".to_string()])
+            .await;
+        client
+            .force_refresh_gossip_findings(DepsDevSystem::Npm, &["left-pad".to_string()])
+            .await;
+
+        // The real proof: the mock's `.expect(2)` above only passes if refreshing
+        // "left-pad" actually reached the network — a per-package (not global) backoff
+        // would have let it through; a global one would have wrongly throttled it.
+        batch.assert_async().await;
+    }
+
+    /// Issue #1456, spec 072 FR-011/M21d: the backoff map must stay bounded at
+    /// `MAX_MEMO_ENTRIES`, mirroring every other memo's boundary test in this module.
+    #[test]
+    fn gossip_last_refresh_attempt_evicts_when_max_entries_reached() {
+        let client = client();
+        let now = Instant::now();
+        for i in 0..MAX_MEMO_ENTRIES {
+            client.gossip_last_refresh_attempt.insert(
+                GossipMemoKey {
+                    base: "https://api.deps.dev".to_string(),
+                    system: DepsDevSystem::Npm,
+                    name: format!("pkg-{i}"),
+                },
+                now,
+            );
+        }
+        assert_eq!(client.gossip_last_refresh_attempt.len(), MAX_MEMO_ENTRIES);
+
+        crate::cache_policy::evict_expired_then_oldest(
+            &client.gossip_last_refresh_attempt,
+            MAX_MEMO_ENTRIES,
+            |attempt| *attempt,
+            |_| GOSSIP_REFRESH_BACKOFF,
+        );
+        client.gossip_last_refresh_attempt.insert(
+            GossipMemoKey {
+                base: "https://api.deps.dev".to_string(),
+                system: DepsDevSystem::Npm,
+                name: "overflow".to_string(),
+            },
+            now,
+        );
+
+        assert!(
+            client.gossip_last_refresh_attempt.len() <= MAX_MEMO_ENTRIES,
+            "backoff map must stay bounded at MAX_MEMO_ENTRIES, got {}",
+            client.gossip_last_refresh_attempt.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_for_version_returns_requested_version_cooldown() {
+        let (mut server, client) = mock_client().await;
+        let _findings = server
+            .mock("GET", "/v3alpha/systems/npm/packages/vite/versions/8.3.1:findings")
+            .with_status(200)
+            .with_body(
+                r#"{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                    "recommendedVersions":[],
+                    "requestedVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                        "isDefault":true,
+                        "findings":[{"type":"COOLDOWN","risk":"RISK_HIGH",
+                            "cooldownContext":{"end":"2026-10-09T12:26:19Z"}}]},
+                    "defaultVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                        "isDefault":true,
+                        "findings":[{"type":"COOLDOWN","risk":"RISK_HIGH",
+                            "cooldownContext":{"end":"2026-10-09T12:26:19Z"}}]},
+                    "packageFindings":[]}"#,
+            )
+            .create_async()
+            .await;
+
+        let findings = client
+            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .await
+            .expect("findings expected");
+        assert_eq!(findings.version, "8.3.1");
+        assert!(findings.cooldown.is_some());
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_for_version_low_usage_context_parses_alternative_packages() {
+        let (mut server, client) = mock_client().await;
+        let _findings = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/slopsquat-pkg/versions/1.0.0:findings",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"versionKey":{"system":"NPM","name":"slopsquat-pkg","version":"1.0.0"},
+                    "recommendedVersions":[],
+                    "requestedVersion":{"versionKey":{"system":"NPM","name":"slopsquat-pkg","version":"1.0.0"},
+                        "isDefault":true,
+                        "findings":[{"type":"LOW_USAGE","risk":"RISK_MEDIUM",
+                            "lowUsageContext":{"alternativePackages":["popular-pkg"]}}]},
+                    "packageFindings":[]}"#,
+            )
+            .create_async()
+            .await;
+
+        let findings = client
+            .gossip_findings_for_version(DepsDevSystem::Npm, "slopsquat-pkg", "1.0.0")
+            .await
+            .expect("findings expected");
+        let low_usage = findings.low_usage.expect("low-usage finding expected");
+        assert_eq!(low_usage.risk, GossipRiskLevel::Medium);
+        assert_eq!(
+            low_usage.alternative_packages,
+            vec!["popular-pkg".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_for_version_second_call_within_ttl_issues_zero_requests() {
+        let (mut server, client) = mock_client().await;
+        let findings = server
+            .mock("GET", "/v3alpha/systems/npm/packages/vite/versions/8.3.1:findings")
+            .with_status(200)
+            .with_body(
+                r#"{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                    "recommendedVersions":[],
+                    "requestedVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                        "isDefault":true,"findings":[]}}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+
+        client
+            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .await;
+        client
+            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .await;
+
+        findings.assert_async().await;
+    }
+
+    /// Test gap (impl-critic review, item 5): the version-scoped counterpart of
+    /// `trust_signal_survives_dropped_join_handle_and_warms_memo` — a late
+    /// `gossip_findings_for_version` response arriving after `GOSSIP_WAIT_BUDGET` has
+    /// elapsed (hover's own budget, `lsp_helpers::hover`) must still land in the
+    /// version-keyed memo, so the *next* hover on the same pinned version is a memo hit
+    /// rather than a repeated fetch.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gossip_findings_for_version_survives_dropped_join_handle_and_warms_memo() {
+        let (mut server, client) = mock_client().await;
+        let client = Arc::new(client);
+        let findings = server
+            .mock("GET", "/v3alpha/systems/npm/packages/vite/versions/8.3.1:findings")
+            .with_status(200)
+            .with_body_from_request(|_req| {
+                std::thread::sleep(Duration::from_millis(60));
+                br#"{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                    "recommendedVersions":[],
+                    "requestedVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                        "isDefault":true,
+                        "findings":[{"type":"COOLDOWN","risk":"RISK_HIGH",
+                            "cooldownContext":{"end":"2026-10-09T12:26:19Z"}}]}}"#
+                    .to_vec()
+            })
+            .expect(1)
+            .create_async()
+            .await;
+
+        let spawn_client = Arc::clone(&client);
+        let handle = tokio::spawn(async move {
+            spawn_client
+                .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+                .await
+        });
+        // Deliberately much shorter than the mock's 60ms response — this must reliably
+        // elapse first, mirroring `trust_signal_survives_dropped_join_handle_and_warms_memo`'s
+        // identical artificial-budget technique.
+        let outcome = tokio::time::timeout(Duration::from_millis(5), handle).await;
+        assert!(
+            outcome.is_err(),
+            "the artificial budget must elapse before the mock responds"
+        );
+
+        // Give the detached task ample real time to finish (60ms response + scheduling
+        // slack) and write the version-keyed memo.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let second = client
+            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "8.3.1")
+            .await;
+        assert!(
+            second.is_some(),
+            "the memo warmed by the detached task must serve the next call"
+        );
+        findings.assert_async().await;
+    }
+
+    /// #1452-style guard: a `.`/`..` name or version must never reach the request URL.
+    #[tokio::test]
+    async fn gossip_findings_for_version_dot_segment_rejected_before_request() {
+        let (mut server, client) = mock_client().await;
+        let call = server
+            .mock("GET", mockito::Matcher::Any)
+            .expect(0)
+            .create_async()
+            .await;
+
+        assert!(
+            client
+                .gossip_findings_for_version(DepsDevSystem::Npm, ".", "1.0.0")
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .gossip_findings_for_version(DepsDevSystem::Npm, "left-pad", "..")
+                .await
+                .is_none()
+        );
+        call.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gossip_findings_for_version_404_returns_none_no_panic() {
+        let (mut server, client) = mock_client().await;
+        let _findings = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/missing/versions/1.0.0:findings",
+            )
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let findings = client
+            .gossip_findings_for_version(DepsDevSystem::Npm, "missing", "1.0.0")
+            .await;
+        assert!(findings.is_none());
+    }
+
+    /// Security/impl-critic review M2 regression: when `requestedVersion` is absent from a
+    /// version-scoped `GetFindings` response, `defaultVersion`'s data must NOT be returned
+    /// as if it applied to the requested version — that would misattribute one version's
+    /// low-usage/cooldown finding to a different (pinned/resolved) version.
+    #[tokio::test]
+    async fn gossip_findings_for_version_no_requested_version_does_not_fall_back_to_default() {
+        let (mut server, client) = mock_client().await;
+        let _findings = server
+            .mock(
+                "GET",
+                "/v3alpha/systems/npm/packages/vite/versions/7.0.0:findings",
+            )
+            .with_status(200)
+            .with_body(
+                r#"{"versionKey":{"system":"NPM","name":"vite","version":"7.0.0"},
+                    "recommendedVersions":[],
+                    "defaultVersion":{"versionKey":{"system":"NPM","name":"vite","version":"8.3.1"},
+                        "isDefault":true,
+                        "findings":[{"type":"LOW_USAGE","risk":"RISK_MEDIUM"}]},
+                    "packageFindings":[]}"#,
+            )
+            .create_async()
+            .await;
+
+        let findings = client
+            .gossip_findings_for_version(DepsDevSystem::Npm, "vite", "7.0.0")
+            .await;
+        assert!(
+            findings.is_none(),
+            "must not return defaultVersion's (8.3.1) low-usage finding for the requested \
+             (7.0.0) version — got: {findings:?}"
         );
     }
 }
