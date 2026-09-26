@@ -44,7 +44,7 @@ const GOSSIP_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 /// publish proceed on its existing schedule and issues a second, later publish only if this
 /// returns `true`.
 ///
-/// Returns whether the merge actually *changed* [`super::state::DocumentState::gossip_findings`]
+/// Returns whether the merge actually *changed* [`super::state::PackageSignals::gossip_findings`]
 /// (security/impl-critic review M3) — `false` covers every early-out (disabled, offline, no
 /// document, no parse result, timeout, every fetched name filtered out by a mid-fetch
 /// content change) *and* the case where the fetch found only data the document already had,
@@ -141,7 +141,7 @@ pub(crate) async fn run_gossip_prefetch(
         // not cause a wasted republish on every debounced edit.
         let changed = findings
             .iter()
-            .any(|(name, value)| doc.gossip_findings.get(name) != Some(value));
+            .any(|(name, value)| doc.signals.gossip_findings.get(name) != Some(value));
         doc.merge_gossip_findings(findings);
         return changed;
     }
@@ -200,10 +200,11 @@ pub(crate) fn spawn_gossip_mismatch_refetch_if_needed(
                 })
                 .unwrap_or_default();
 
-            doc.gossip_findings
+            doc.signals
+                .gossip_findings
                 .iter()
                 .filter_map(|(name, findings)| {
-                    let latest = &doc.cached_versions.get(name)?.latest;
+                    let latest = &doc.signals.cached_versions.get(name)?.latest;
                     if latest.as_str() == findings.version {
                         return None;
                     }
@@ -283,7 +284,7 @@ async fn run_gossip_mismatch_refetch(
             }
             keyed
                 .iter()
-                .filter(|(name, _)| doc.cached_versions.contains_key(*name))
+                .filter(|(name, _)| doc.signals.cached_versions.contains_key(*name))
                 .map(|(name, findings)| (name.clone(), findings.clone()))
                 .collect::<HashMap<_, _>>()
         });
@@ -412,7 +413,9 @@ mod tests {
         for uri in [&uri_a, &uri_b] {
             let has_entry = state
                 .with_document(uri, |doc| {
-                    doc.gossip_findings.contains_key(&PackageName::new("vite"))
+                    doc.signals
+                        .gossip_findings
+                        .contains_key(&PackageName::new("vite"))
                 })
                 .unwrap_or(false);
             assert!(
@@ -506,7 +509,9 @@ mod tests {
 
         let declares_vite_has_entry = state
             .with_document(&uri_declares_vite, |doc| {
-                doc.gossip_findings.contains_key(&PackageName::new("vite"))
+                doc.signals
+                    .gossip_findings
+                    .contains_key(&PackageName::new("vite"))
             })
             .unwrap_or(false);
         assert!(
@@ -515,7 +520,9 @@ mod tests {
         );
 
         let other_npm_untouched = state
-            .with_document(&uri_other_npm_package, |doc| doc.gossip_findings.is_empty())
+            .with_document(&uri_other_npm_package, |doc| {
+                doc.signals.gossip_findings.is_empty()
+            })
             .unwrap_or(false);
         assert!(
             other_npm_untouched,
@@ -523,7 +530,9 @@ mod tests {
         );
 
         let cargo_untouched = state
-            .with_document(&uri_cargo_same_name, |doc| doc.gossip_findings.is_empty())
+            .with_document(&uri_cargo_same_name, |doc| {
+                doc.signals.gossip_findings.is_empty()
+            })
             .unwrap_or(false);
         assert!(
             cargo_untouched,
@@ -587,7 +596,7 @@ mod tests {
 
         batch.assert_async().await;
         let untouched = state
-            .with_document(&uri, |doc| doc.gossip_findings.is_empty())
+            .with_document(&uri, |doc| doc.signals.gossip_findings.is_empty())
             .unwrap_or(false);
         assert!(
             untouched,
@@ -686,11 +695,14 @@ mod tests {
 
         let doc = state.get_document(&uri).expect("document must still exist");
         assert!(
-            doc.gossip_findings.contains_key(&PackageName::new("vite")),
+            doc.signals
+                .gossip_findings
+                .contains_key(&PackageName::new("vite")),
             "still-declared \"vite\" must survive the content-change filter"
         );
         assert!(
-            !doc.gossip_findings
+            !doc.signals
+                .gossip_findings
                 .contains_key(&PackageName::new("left-pad")),
             "removed \"left-pad\" must not be merged in despite being in the fetch result"
         );
@@ -762,7 +774,9 @@ mod tests {
         run_gossip_prefetch(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5).await;
         let seeded = state
             .with_document(&uri, |doc| {
-                doc.gossip_findings.contains_key(&PackageName::new("vite"))
+                doc.signals
+                    .gossip_findings
+                    .contains_key(&PackageName::new("vite"))
             })
             .unwrap_or(false);
         assert!(
@@ -782,7 +796,10 @@ mod tests {
         let mut new_doc =
             DocumentState::new_from_parse_result(EcosystemId::Npm, content_git, parse_result_git);
         if let Some(old_doc) = state.get_document(&uri) {
-            new_doc.gossip_findings.clone_from(&old_doc.gossip_findings);
+            new_doc
+                .signals
+                .gossip_findings
+                .clone_from(&old_doc.signals.gossip_findings);
         }
         new_doc.update_cached_versions(HashMap::from([(
             PackageName::new("vite"),

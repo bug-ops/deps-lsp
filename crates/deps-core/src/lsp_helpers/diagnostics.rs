@@ -1791,7 +1791,7 @@ pub struct TyposquatFetchOutcome {
 /// **Not** called from this diagnostics pipeline itself (NFR-002: diagnostics generation
 /// must never `.await` a deps.dev fan-out inline) — the sole caller is
 /// `deps-lsp::document::osv_scan::run_typosquat_prefetch`, a background document-lifecycle
-/// task that merges the result into `deps-lsp`'s own `DocumentState::typosquats` map,
+/// task that merges the result into `deps-lsp`'s own `DocumentState::signals.typosquats` map,
 /// from which [`VersionData::typosquat_prefetch`] is populated synchronously before
 /// [`generate_diagnostics_from_cache`] runs — see that field's doc for the full picture and
 /// why this design (not an inline await behind `Ecosystem::generate_diagnostics`) is also
@@ -1883,7 +1883,7 @@ pub async fn fetch_typosquat_signals(
 /// [`fetch_typosquat_signals`]) — the sole caller is
 /// `deps-lsp::document::gossip_prefetch::run_gossip_prefetch`, a background
 /// document-lifecycle task that merges the result into `deps-lsp`'s own
-/// `DocumentState::gossip_findings` map, from which
+/// `DocumentState::signals.gossip_findings` map, from which
 /// [`crate::lsp_helpers::VersionData::gossip_prefetch`] is populated synchronously. `pub`,
 /// not `pub(crate)`: called from outside this crate (`deps-lsp`).
 ///
@@ -1939,7 +1939,7 @@ pub async fn fetch_gossip_findings_batch(
 /// The deps-lsp-facing counterpart of [`fetch_gossip_findings_batch`] (which encapsulates
 /// the same `EcosystemId` -> deps.dev `system` mapping `deps_dev_system` is
 /// `pub(crate)`-only for), for a caller that has already detected a version-equality
-/// mismatch (FR-008) via `DocumentState.gossip_findings` and knows the normal
+/// mismatch (FR-008) via `DocumentState::signals.gossip_findings` and knows the normal
 /// memo-respecting path would just return the same stale answer.
 ///
 /// Returns an empty map immediately, with no network call, when `ecosystem_id` isn't one of

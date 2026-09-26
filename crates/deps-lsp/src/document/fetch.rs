@@ -203,27 +203,27 @@ pub(crate) fn merge_registry_fetch_result(
         // this round" — only the former may clear a stale finding.
         let fetched_names: Vec<PackageName> = fetch_result.versions.keys().cloned().collect();
         for (name, version) in fetch_result.versions {
-            doc.cached_versions.insert(name, version);
+            doc.signals.cached_versions.insert(name, version);
         }
         // Issue #660/#661 tier-1 backfill: merge (never replace — see
         // `DocumentState::merge_licenses`'s docs), so this coexists safely with the
         // independent tier-3 background pre-fetch's own write to the same map.
         doc.merge_licenses(fetch_result.licenses);
         apply_fetch_outcomes(
-            &mut doc.outcomes,
+            &mut doc.signals.outcomes,
             fetch_result.yanked_versions,
             fetch_result.fetch_failed,
             collided_names,
             formatter,
         );
         merge_deprecations_after_fetch(
-            &mut doc.outcomes,
+            &mut doc.signals.outcomes,
             &fetched_names,
             fetch_result.deprecations,
             formatter,
         );
         merge_no_comparable_versions_after_fetch(
-            &mut doc.outcomes,
+            &mut doc.signals.outcomes,
             attempted_names,
             fetch_result.no_comparable_versions,
             formatter,
@@ -639,8 +639,8 @@ dependencies = ["requests>=2.0.0"]
             let doc = state.get_document(&uri).unwrap();
             let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
                 doc.parse_result().unwrap(),
-                VersionData::new(&doc.cached_versions, &doc.resolved_versions)
-                    .with_outcomes(&doc.outcomes),
+                VersionData::new(&doc.signals.cached_versions, &doc.signals.resolved_versions)
+                    .with_outcomes(&doc.signals.outcomes),
                 formatter,
                 &url,
                 deps_core::freshness::FreshnessSettings::default(),

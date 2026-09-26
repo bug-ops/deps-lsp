@@ -5,7 +5,7 @@
 
 use crate::config::{DepsConfig, InlayHintsConfig};
 use crate::document::{ServerState, ensure_document_loaded};
-use deps_core::{EcosystemConfig, VersionData};
+use deps_core::EcosystemConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -54,28 +54,18 @@ pub async fn handle_inlay_hints(
             return None;
         };
         let parse_result = doc.parse_result_arc()?;
-        Some((
-            ecosystem,
-            parse_result,
-            doc.cached_versions.clone(),
-            doc.resolved_versions.clone(),
-            doc.resolved_version_candidates.clone(),
-            doc.loading_state,
-        ))
+        let snapshot = doc
+            .signals
+            .snapshot()
+            .with_resolved_version_candidates()
+            .finish();
+        Some((ecosystem, parse_result, snapshot, doc.loading_state))
     }) else {
         tracing::warn!("Document not found: {:?}", uri);
         return vec![];
     };
 
-    let Some((
-        ecosystem,
-        parse_result,
-        cached_versions,
-        resolved_versions,
-        resolved_version_candidates,
-        loading_state,
-    )) = extracted
-    else {
+    let Some((ecosystem, parse_result, snapshot, loading_state)) = extracted else {
         return vec![];
     };
 
@@ -91,8 +81,7 @@ pub async fn handle_inlay_hints(
     ecosystem
         .generate_inlay_hints(
             parse_result.as_ref(),
-            VersionData::new(&cached_versions, &resolved_versions)
-                .with_resolved_version_candidates(&resolved_version_candidates),
+            snapshot.version_data(),
             loading_state,
             &ecosystem_config,
         )

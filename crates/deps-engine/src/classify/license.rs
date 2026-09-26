@@ -8,7 +8,7 @@
 //! `deps-cli` reaches the same license-policy verdicts as `deps-lsp` for these four ecosystems,
 //! instead of silently seeing no tier-3 license data at all. The orchestration around this
 //! dispatch — spawning it concurrently with the registry fetch, joining it before a diagnostics
-//! publish, the mid-flight staleness guard, and the additive `DocumentState::licenses` merge —
+//! publish, the mid-flight staleness guard, and the additive `DocumentState::signals.licenses` merge —
 //! stays in `deps-lsp`, since it owns a document lifecycle this crate must not know about
 //! (same split rationale as issue #1059).
 //!

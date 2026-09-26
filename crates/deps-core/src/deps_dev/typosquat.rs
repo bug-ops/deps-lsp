@@ -19,7 +19,7 @@ pub(super) struct SimilarPackageCandidate {
 ///
 /// Carries no `declared_name` field (issue #1455 batch item 2, removed after a #1437 review):
 /// every caller already keys its `TyposquatSignal` by the declared package's `PackageName`
-/// (`HashMap<PackageName, TyposquatSignal>` in `deps-lsp::DocumentState::typosquats` and
+/// (`HashMap<PackageName, TyposquatSignal>` in `deps-lsp::DocumentState::signals.typosquats` and
 /// `lsp_helpers::diagnostics::fetch_typosquat_signals`'s return type), and the sole diagnostic
 /// renderer, `lsp_helpers::diagnostics::apply_typosquat_rule`, already builds its message from
 /// the dependency it's iterating (`ctx.dep.name()`), never from this struct — a `declared_name`

@@ -1,8 +1,7 @@
 //! Hover handler using ecosystem trait delegation.
 
 use crate::config::DepsConfig;
-use crate::document::{ServerState, ensure_document_loaded};
-use deps_core::VersionData;
+use crate::document::{PrefetchVisibility, ServerState, ensure_document_loaded};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -41,57 +40,38 @@ pub async fn handle_hover(
     // Release the DashMap shard `Ref` before awaiting `generate_hover`'s registry fetch —
     // holding it across the await would block a concurrent `documents.get_mut` on the same
     // shard (#319); `with_document` makes this structural rather than a convention (#333).
-    let (
-        ecosystem,
-        ecosystem_id,
-        parse_result,
-        cached_versions,
-        resolved_versions,
-        resolved_version_candidates,
-        vulnerabilities,
-        outcomes,
-        licenses,
-        gossip_findings,
-    ) = state
+    // Issue #1456, spec 072: `gossip_visibility` is resolved to `Suppress` (rather than
+    // simply omitting the dimension) so a disabled or offline transition stops rendering a
+    // previously-populated `gossip_findings` map immediately, not merely stops refreshing it.
+    let gossip_visibility = if gossip_enabled && !offline {
+        PrefetchVisibility::Render
+    } else {
+        PrefetchVisibility::Suppress
+    };
+    let (ecosystem, ecosystem_id, parse_result, snapshot) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
             let parse_result = doc.parse_result_arc()?;
-            Some((
-                ecosystem,
-                doc.ecosystem,
-                parse_result,
-                doc.cached_versions.clone(),
-                doc.resolved_versions.clone(),
-                doc.resolved_version_candidates.clone(),
-                doc.vulnerabilities.clone(),
-                doc.outcomes.clone(),
-                doc.licenses.clone(),
-                doc.gossip_findings.clone(),
-            ))
+            let snapshot = doc
+                .signals
+                .snapshot()
+                .with_resolved_version_candidates()
+                .with_vulnerabilities()
+                .with_outcomes()
+                .with_license_prefetch()
+                .with_gossip_prefetch(gossip_visibility)
+                .finish();
+            Some((ecosystem, doc.ecosystem, parse_result, snapshot))
         })
         .flatten()?;
 
     tracing::Span::current().record("ecosystem", ecosystem_id.id());
 
-    // Issue #1456, spec 072: same rationale as diagnostics' identical gate — a disabled or
-    // offline transition must stop rendering a previously-populated `gossip_findings` map
-    // immediately, not merely stop refreshing it.
-    let empty_gossip = std::collections::HashMap::new();
-    let gossip_prefetch = if gossip_enabled && !offline {
-        &gossip_findings
-    } else {
-        &empty_gossip
-    };
-
-    let mut versions = VersionData::new(&cached_versions, &resolved_versions)
-        .with_resolved_version_candidates(&resolved_version_candidates)
-        .with_vulnerabilities(&vulnerabilities)
-        .with_outcomes(&outcomes)
+    let mut versions = snapshot
+        .version_data()
         .with_ecosystem(ecosystem_id)
         .with_offline(offline)
-        .with_license_source(ecosystem.license_source())
-        .with_license_prefetch(&licenses)
-        .with_gossip_prefetch(gossip_prefetch);
+        .with_license_source(ecosystem.license_source());
     // The only call site that sets `VersionData::trust` (see lsp_helpers::hover docs) —
     // makes the supply-chain trust signal hover-only by construction (FR-010).
     if supply_chain_enabled {
