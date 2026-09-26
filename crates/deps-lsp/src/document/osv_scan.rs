@@ -1566,6 +1566,7 @@ mod tests {
     /// "never touches `DocumentState` at all" style for the disabled/offline no-op cases.
     #[cfg(feature = "npm")]
     mod typosquat_prefetch_tests {
+        use super::super::super::state::DocumentState;
         use super::*;
 
         /// Default `ServerState` starts with `policy.typosquat.enabled == false` — no
