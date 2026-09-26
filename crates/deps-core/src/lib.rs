@@ -155,6 +155,11 @@ pub mod github;
 #[cfg(feature = "lsp-responses")]
 #[cfg_attr(docsrs, doc(cfg(feature = "lsp-responses")))]
 pub mod hover;
+/// Bounded property/variable values for manifest interpolation (issue #1481).
+///
+/// Shared by `deps-maven` (`${property}`) and `deps-gradle` (`version.ref`/`$name`/
+/// `${name}`) to bound retained resolution memory.
+pub mod interpolation;
 /// Shared bracket-interval version-range grammar (`[1.0,2.0)`-shaped), used by
 /// `deps-maven`, `deps-gradle`, and `deps-nuget` (#821).
 pub mod interval;
@@ -249,6 +254,9 @@ pub use edit::{
 pub use error::{DepsError, FetchFailure, RateLimitEvidence, Result};
 pub use freshness::{
     DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
+};
+pub use interpolation::{
+    MAX_INTERPOLATED_VALUE_BYTES, OversizedPropertyValue, PropertyValue, insert_bounded,
 };
 pub use json_ast::{JsonAst, JsonSection, find_last_prop};
 pub use json_helpers::string_valued_entries;

@@ -8,6 +8,7 @@
 //! `deps-maven::registry::parse_metadata_xml`'s remote, unbounded-by-default input.
 
 use crate::types::{MavenDependency, MavenScope};
+use deps_core::interpolation::{MAX_INTERPOLATED_VALUE_BYTES, PropertyValue};
 use deps_core::lsp_helpers::{LineOffsetTable, byte_span_to_range};
 use deps_core::position::Range;
 use deps_core::{DepsError, Result};
@@ -23,7 +24,7 @@ pub struct MavenParseResult {
     /// Dependencies found across `<dependencies>` and `<dependencyManagement>`.
     pub dependencies: Vec<MavenDependency>,
     /// The `<properties>` section, for resolving `${...}` version placeholders.
-    pub properties: HashMap<String, String>,
+    pub properties: HashMap<String, PropertyValue>,
     /// URI of the manifest this result was parsed from.
     pub uri: Url,
     /// `Some((kept, total))` once the manifest declared more dependencies than
@@ -189,12 +190,22 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                 } else if ctx == ParseContext::Properties
                     && let Some(key) = current_prop_key.take()
                 {
-                    properties.insert(key, text);
+                    deps_core::interpolation::insert_bounded(
+                        &mut properties,
+                        key,
+                        text,
+                        "maven property",
+                    );
                 } else if ctx == ParseContext::Root
                     && let Some(tag) = root_tag.take()
                 {
                     let prop_key = format!("project.{tag}");
-                    properties.insert(prop_key, text);
+                    deps_core::interpolation::insert_bounded(
+                        &mut properties,
+                        prop_key,
+                        text,
+                        "maven property",
+                    );
                 }
             }
             Event::Empty(ref e) => {
@@ -271,7 +282,7 @@ fn finalize_dep(
     dep: DepAccum,
     content: &str,
     line_table: &LineOffsetTable,
-    properties: &HashMap<String, String>,
+    properties: &HashMap<String, PropertyValue>,
 ) -> Option<MavenDependency> {
     let group_id = dep.group_id?;
     let artifact_id = dep.artifact_id?;
@@ -348,11 +359,15 @@ fn finalize_dep(
 /// Resolves `${property}` references in a string using the properties map.
 ///
 /// Handles `${project.version}` and similar Maven property expressions.
-/// Unresolved properties are left as-is.
+/// Unresolved properties are left as-is. The cap (#1481, [`MAX_INTERPOLATED_VALUE_BYTES`])
+/// applies to the whole resolved string, not just a single substituted value, so a
+/// legitimately long `systemPath` expansion (paths can run up to `PATH_MAX`, e.g. 4096 on
+/// Linux) can stay unresolved rather than being truncated — accepted as low-likelihood in
+/// practice.
 // All indices come from `find("${")`/`find('}')`, both ASCII tokens, so every slice bound
 // is always a char boundary.
 #[allow(clippy::string_slice)]
-fn resolve_properties(input: &str, properties: &HashMap<String, String>) -> String {
+fn resolve_properties(input: &str, properties: &HashMap<String, PropertyValue>) -> String {
     let mut result = input.to_string();
     // Capped at 5 to bound rare nested property references.
     for _ in 0..5 {
@@ -363,16 +378,26 @@ fn resolve_properties(input: &str, properties: &HashMap<String, String>) -> Stri
             break;
         };
         let key = &result[start + 2..start + end];
-        if let Some(value) = properties.get(key) {
-            result = format!(
-                "{}{}{}",
-                &result[..start],
-                value,
-                &result[start + end + 1..]
-            );
-        } else {
+        let Some(value) = properties.get(key) else {
+            break;
+        };
+        // Self-referential properties (e.g. `<p>${p}AAAA</p>`) can grow the result by up to
+        // one bounded value per round across all 5 rounds (#1481) — stop before this round's
+        // substitution once the predicted length would exceed the cap, leaving this
+        // placeholder unresolved. `break` (not discarding `result`) keeps this consistent
+        // with the missing-property fallback above: earlier rounds' successful, unrelated
+        // substitutions are preserved rather than reverted to the pristine input (review
+        // follow-up).
+        let predicted_len = result.len() - (end + 1) + value.len();
+        if predicted_len > MAX_INTERPOLATED_VALUE_BYTES {
             break;
         }
+        result = format!(
+            "{}{}{}",
+            &result[..start],
+            value.as_str(),
+            &result[start + end + 1..]
+        );
     }
     result
 }
@@ -777,16 +802,25 @@ mod tests {
         let result = parse_pom_xml(xml, &test_uri()).unwrap();
         assert_eq!(result.dependencies[0].version_req, Some("2.5.0".into()));
         assert_eq!(
-            result.properties.get("project.version"),
-            Some(&"2.5.0".to_string())
+            result
+                .properties
+                .get("project.version")
+                .map(PropertyValue::as_str),
+            Some("2.5.0")
         );
         assert_eq!(
-            result.properties.get("project.groupId"),
-            Some(&"org.example".to_string())
+            result
+                .properties
+                .get("project.groupId")
+                .map(PropertyValue::as_str),
+            Some("org.example")
         );
         assert_eq!(
-            result.properties.get("project.artifactId"),
-            Some(&"my-app".to_string())
+            result
+                .properties
+                .get("project.artifactId")
+                .map(PropertyValue::as_str),
+            Some("my-app")
         );
     }
 
@@ -926,8 +960,14 @@ mod tests {
     #[test]
     fn test_resolve_properties() {
         let mut props = HashMap::new();
-        props.insert("ver".to_string(), "1.0".to_string());
-        props.insert("suffix".to_string(), "RELEASE".to_string());
+        props.insert(
+            "ver".to_string(),
+            PropertyValue::new("1.0".to_string()).unwrap(),
+        );
+        props.insert(
+            "suffix".to_string(),
+            PropertyValue::new("RELEASE".to_string()).unwrap(),
+        );
 
         assert_eq!(resolve_properties("${ver}", &props), "1.0");
         assert_eq!(resolve_properties("plain", &props), "plain");
@@ -949,12 +989,173 @@ mod tests {
 
         let result = parse_pom_xml(xml, &test_uri()).unwrap();
         assert_eq!(
-            result.properties.get("java.version"),
-            Some(&"17".to_string())
+            result
+                .properties
+                .get("java.version")
+                .map(PropertyValue::as_str),
+            Some("17")
         );
         assert_eq!(
-            result.properties.get("spring.version"),
-            Some(&"3.2.0".to_string())
+            result
+                .properties
+                .get("spring.version")
+                .map(PropertyValue::as_str),
+            Some("3.2.0")
+        );
+    }
+
+    /// #1481: a property value past the cap is dropped from the map at insertion time, so a
+    /// reference to it falls through the same "unresolved" path as a genuinely missing
+    /// property, rather than retaining an unbounded value.
+    #[test]
+    fn test_oversized_property_value_dropped_leaves_reference_unresolved() {
+        let oversized = "x".repeat(MAX_INTERPOLATED_VALUE_BYTES + 1);
+        let xml = format!(
+            r"<project>
+  <properties>
+    <big.version>{oversized}</big.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>foo</artifactId>
+      <version>${{big.version}}</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert!(!result.properties.contains_key("big.version"));
+        assert_eq!(
+            result.dependencies[0].version_req,
+            Some("${big.version}".into())
+        );
+    }
+
+    /// #1481: a property value exactly at the cap is kept and resolves normally.
+    #[test]
+    fn test_property_value_at_exact_cap_resolves() {
+        let at_cap = "1".repeat(MAX_INTERPOLATED_VALUE_BYTES);
+        let mut props = HashMap::new();
+        props.insert(
+            "ver".to_string(),
+            PropertyValue::new(at_cap.clone()).unwrap(),
+        );
+
+        assert_eq!(resolve_properties("${ver}", &props), at_cap);
+    }
+
+    /// #1202/#1481 (systemPath sink): an oversized property referenced from `<systemPath>`
+    /// also falls through unresolved rather than retaining the raw text.
+    #[test]
+    fn test_oversized_property_value_in_system_path_stays_unresolved() {
+        let oversized = "x".repeat(MAX_INTERPOLATED_VALUE_BYTES + 1);
+        let xml = format!(
+            r"<project>
+  <properties>
+    <jar.path>{oversized}</jar.path>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-jar</artifactId>
+      <version>1.0.0</version>
+      <scope>system</scope>
+      <systemPath>${{jar.path}}</systemPath>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path {
+                path: "${jar.path}".into(),
+            }
+        );
+    }
+
+    /// #1481 (review follow-up): a self-referential property (`${p}` inside `p`'s own
+    /// definition) must not grow the resolved result unboundedly across the 5 substitution
+    /// rounds — once a later round's predicted length would exceed the cap, resolution stops
+    /// with the last successful substitution kept (round 1's expansion here), rather than
+    /// either performing a partial *over-cap* expansion or discarding round 1's already-safe
+    /// substitution back to the pristine input. `${p}` itself stays unresolved in the result
+    /// (round 2 never ran), which is the "no partial expansion past the cap" guarantee.
+    #[test]
+    fn test_self_referential_property_growth_stays_unresolved() {
+        let mut props = HashMap::new();
+        let filler = "A".repeat(MAX_INTERPOLATED_VALUE_BYTES - 4);
+        let self_ref_value = format!("${{p}}{filler}");
+        props.insert(
+            "p".to_string(),
+            PropertyValue::new(self_ref_value.clone()).unwrap(),
+        );
+
+        let result = resolve_properties("${p}", &props);
+        assert_eq!(
+            result, self_ref_value,
+            "round 1's successful substitution must be kept; only round 2's would-exceed-cap \
+             substitution is skipped, leaving the inner ${{p}} unresolved"
+        );
+        assert!(
+            result.contains("${p}"),
+            "the never-run round 2 substitution must leave its placeholder unresolved"
+        );
+    }
+
+    /// #1481 review follow-up: a cap-exceeded bail in one round must not discard an earlier
+    /// round's unrelated, already-successful substitution — only the offending placeholder
+    /// stays unresolved, matching the missing-property fallback's `break` semantics.
+    #[test]
+    fn test_cap_exceeded_bail_preserves_unrelated_earlier_substitution() {
+        let mut props = HashMap::new();
+        props.insert(
+            "a".to_string(),
+            PropertyValue::new("1.0".to_string()).unwrap(),
+        );
+        // At the per-value cap: round 1 resolves "${a}" to "1.0" (result becomes
+        // "1.0-${big}", 10 bytes), then round 2's predicted length for "${big}" is
+        // 10 - 6 + 1024 = 1028, over the cap, so round 2 bails via `break` — this value
+        // must itself be a valid `PropertyValue` (<= cap) to isolate the multi-round
+        // *combined*-length bail from the already-covered oversized-single-value case.
+        let at_cap = "X".repeat(MAX_INTERPOLATED_VALUE_BYTES);
+        props.insert("big".to_string(), PropertyValue::new(at_cap).unwrap());
+
+        let result = resolve_properties("${a}-${big}", &props);
+        assert_eq!(
+            result, "1.0-${big}",
+            "the unrelated ${{a}} substitution from round 1 must survive round 2's bail"
+        );
+    }
+
+    /// #1481 critic M4 follow-up: growth across rounds that lands *exactly* at the cap in a
+    /// round after the first must still resolve normally, not be mistaken for the
+    /// over-the-cap case `test_self_referential_property_growth_stays_unresolved` covers.
+    /// `p1` resolves to `${p2}` plus a 500-byte filler (round 1); `p2` then resolves to a
+    /// 524-byte value (round 2), landing the predicted length at exactly
+    /// `MAX_INTERPOLATED_VALUE_BYTES` (500 + 524 = 1024) on that second round.
+    #[test]
+    fn test_multi_round_growth_landing_exactly_at_cap_resolves() {
+        let mut props = HashMap::new();
+        let filler1 = "A".repeat(500);
+        let value2 = "B".repeat(524);
+        props.insert(
+            "p1".to_string(),
+            PropertyValue::new(format!("${{p2}}{filler1}")).unwrap(),
+        );
+        props.insert(
+            "p2".to_string(),
+            PropertyValue::new(value2.clone()).unwrap(),
+        );
+
+        let result = resolve_properties("${p1}", &props);
+        assert_eq!(
+            result,
+            format!("{value2}{filler1}"),
+            "a predicted length landing exactly at the cap on round 2 must still resolve"
         );
     }
 }

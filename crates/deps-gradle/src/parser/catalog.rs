@@ -4,6 +4,7 @@
 
 use crate::parser::{GradleParseResult, LineOffsetTable};
 use crate::types::GradleDependency;
+use deps_core::interpolation::PropertyValue;
 use deps_core::position::Range;
 use deps_core::{DepsError, Result};
 use std::collections::HashMap;
@@ -21,14 +22,19 @@ pub fn parse_version_catalog(content: &str, uri: &Url) -> Result<GradleParseResu
         deps_core::parse_toml_checked(content).map_err(|e| DepsError::parse_error("Gradle", &e))?;
 
     let line_table = LineOffsetTable::new(content);
-    let mut version_refs: HashMap<String, String> = HashMap::new();
+    let mut version_refs: HashMap<String, PropertyValue> = HashMap::new();
 
     if let Some(versions_table) = doc.as_table().and_then(|t| get_table_val(t, "versions"))
         && let Some(t) = versions_table.as_table()
     {
         for (key, item) in t {
             if let Some(ver_str) = item.as_str() {
-                version_refs.insert(key.name.to_string(), ver_str.to_string());
+                deps_core::interpolation::insert_bounded(
+                    &mut version_refs,
+                    key.name.to_string(),
+                    ver_str.to_string(),
+                    "gradle version.ref",
+                );
             }
         }
     }
@@ -73,7 +79,7 @@ fn parse_library_entry(
     item: &Value<'_>,
     content: &str,
     line_table: &LineOffsetTable,
-    version_refs: &HashMap<String, String>,
+    version_refs: &HashMap<String, PropertyValue>,
 ) -> Option<GradleDependency> {
     let table = item.as_table()?;
     let (group_id, artifact_id, name, name_range) =
@@ -121,7 +127,7 @@ fn extract_version(
     table: &Table<'_>,
     content: &str,
     line_table: &LineOffsetTable,
-    version_refs: &HashMap<String, String>,
+    version_refs: &HashMap<String, PropertyValue>,
 ) -> (Option<String>, Option<Range>) {
     let Some(version_val) = get_table_val(table, "version") else {
         return (None, None);
@@ -137,10 +143,13 @@ fn extract_version(
         && let Some(ref_val) = get_table_val(version_table, "ref")
         && let Some(ref_key) = ref_val.as_str()
     {
-        // A dangling alias (missing from [versions], or a rich version like `{ require = "1.0" }`)
-        // resolves to `None` — deps-core's diagnostics/hover paths treat that as "not verified"
-        // rather than comparing an empty-string fallback against the latest version.
-        let resolved = version_refs.get(ref_key).cloned();
+        // A dangling alias (missing from [versions] — including one dropped for exceeding
+        // the value-size cap, #1481 — or a rich version like `{ require = "1.0" }`) resolves
+        // to `None` — deps-core's diagnostics/hover paths treat that as "not verified" rather
+        // than comparing an empty-string fallback against the latest version.
+        let resolved = version_refs
+            .get(ref_key)
+            .map(|value| value.as_str().to_string());
         let range = span_to_range(content, line_table, ref_val.span);
         return (resolved, Some(range));
     }
@@ -357,5 +366,37 @@ hilt-compiler = { group = "com.google.dagger", name = "hilt-compiler", version.r
         // anchor a status — deps-core treats a `None` requirement paired with `Some` range as
         // `RequirementStatus::Unresolved` rather than an always-outdated empty string.
         assert!(result.dependencies[0].version_range.is_some());
+    }
+
+    /// #1481: a `[versions]` entry past `MAX_INTERPOLATED_VALUE_BYTES` is dropped, so any
+    /// `version.ref` alias pointing at it resolves the same as a dangling/missing alias.
+    #[test]
+    fn test_oversized_version_ref_value_stays_unresolved() {
+        let oversized = "9".repeat(deps_core::interpolation::MAX_INTERPOLATED_VALUE_BYTES + 1);
+        let content = format!(
+            "[versions]\nbig = \"{oversized}\"\n\n[libraries]\nspring-boot = {{ module = \"org.springframework.boot:spring-boot-starter\", version.ref = \"big\" }}\n"
+        );
+        let result = parse_version_catalog(&content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert!(result.dependencies[0].version_req.is_none());
+        assert!(result.dependencies[0].version_range.is_some());
+    }
+
+    /// #1481: a `[versions]` entry exactly at the cap is kept and resolves normally.
+    #[test]
+    fn test_version_ref_value_at_exact_cap_resolves() {
+        let at_cap = "9".repeat(deps_core::interpolation::MAX_INTERPOLATED_VALUE_BYTES);
+        let content = format!(
+            "[versions]\nbig = \"{at_cap}\"\n\n[libraries]\nspring-boot = {{ module = \"org.springframework.boot:spring-boot-starter\", version.ref = \"big\" }}\n"
+        );
+        let result = parse_version_catalog(&content, &make_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0]
+                .version_req
+                .as_ref()
+                .map(deps_core::VersionReq::as_str),
+            Some(at_cap.as_str())
+        );
     }
 }

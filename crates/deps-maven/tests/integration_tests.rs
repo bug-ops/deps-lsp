@@ -48,12 +48,18 @@ fn test_fixture_complex_pom() {
     assert!(result.dependencies.len() >= 8);
 
     assert_eq!(
-        result.properties.get("java.version"),
-        Some(&"17".to_string())
+        result
+            .properties
+            .get("java.version")
+            .map(deps_core::interpolation::PropertyValue::as_str),
+        Some("17")
     );
     assert_eq!(
-        result.properties.get("spring.version"),
-        Some(&"3.2.0".to_string())
+        result
+            .properties
+            .get("spring.version")
+            .map(deps_core::interpolation::PropertyValue::as_str),
+        Some("3.2.0")
     );
 
     let scopes: Vec<_> = result.dependencies.iter().map(|d| &d.scope).collect();
