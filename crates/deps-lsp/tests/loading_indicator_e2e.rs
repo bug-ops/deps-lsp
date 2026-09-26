@@ -28,26 +28,26 @@ tokio = { version = "1.0", features = ["full"] }
 
     let doc =
         DocumentState::new_from_parse_result(EcosystemId::Cargo, content.to_string(), parse_result);
-    assert_eq!(doc.loading_state, LoadingState::Idle);
-    assert!(doc.loading_started_at.is_none());
+    assert_eq!(doc.loading_state(), LoadingState::Idle);
+    assert!(doc.loading_started_at().is_none());
     state.update_document(uri.clone(), doc);
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.set_loading();
-        assert_eq!(doc.loading_state, LoadingState::Loading);
-        assert!(doc.loading_started_at.is_some());
+        assert_eq!(doc.loading_state(), LoadingState::Loading);
+        assert!(doc.loading_started_at().is_some());
     }
 
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
         doc.set_loaded();
-        assert_eq!(doc.loading_state, LoadingState::Loaded);
-        assert!(doc.loading_started_at.is_none());
+        assert_eq!(doc.loading_state(), LoadingState::Loaded);
+        assert!(doc.loading_started_at().is_none());
     }
 
     let doc = state.get_document(&uri).unwrap();
-    assert_eq!(doc.loading_state, LoadingState::Loaded);
+    assert_eq!(doc.loading_state(), LoadingState::Loaded);
 }
 
 /// Test configuration integration with loading indicator.
@@ -152,11 +152,11 @@ serde = "1.0.0"
     state.update_document(uri2.clone(), doc2);
 
     assert_eq!(
-        state.get_document(&uri1).unwrap().loading_state,
+        state.get_document(&uri1).unwrap().loading_state(),
         LoadingState::Loading
     );
     assert_eq!(
-        state.get_document(&uri2).unwrap().loading_state,
+        state.get_document(&uri2).unwrap().loading_state(),
         LoadingState::Loading
     );
 
@@ -165,11 +165,11 @@ serde = "1.0.0"
     }
 
     assert_eq!(
-        state.get_document(&uri1).unwrap().loading_state,
+        state.get_document(&uri1).unwrap().loading_state(),
         LoadingState::Loaded
     );
     assert_eq!(
-        state.get_document(&uri2).unwrap().loading_state,
+        state.get_document(&uri2).unwrap().loading_state(),
         LoadingState::Loading
     );
 }
@@ -198,11 +198,11 @@ async fn test_failed_loading_state() {
     let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
     doc.set_loading();
-    assert_eq!(doc.loading_state, LoadingState::Loading);
+    assert_eq!(doc.loading_state(), LoadingState::Loading);
 
     doc.set_failed();
-    assert_eq!(doc.loading_state, LoadingState::Failed);
-    assert!(doc.loading_started_at.is_none());
+    assert_eq!(doc.loading_state(), LoadingState::Failed);
+    assert!(doc.loading_started_at().is_none());
 }
 
 /// Test that set_loading resets the timer on repeated calls.
@@ -211,9 +211,9 @@ fn test_set_loading_resets_timer() {
     let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
     doc.set_loading();
-    let first_start = doc.loading_started_at;
+    let first_start = doc.loading_started_at();
     doc.set_loading();
-    let second_start = doc.loading_started_at;
+    let second_start = doc.loading_started_at();
 
     assert!(first_start.is_some());
     assert!(second_start.is_some());
@@ -221,8 +221,8 @@ fn test_set_loading_resets_timer() {
 
     doc.set_loaded();
     doc.set_loaded();
-    assert_eq!(doc.loading_state, LoadingState::Loaded);
-    assert!(doc.loading_started_at.is_none());
+    assert_eq!(doc.loading_state(), LoadingState::Loaded);
+    assert!(doc.loading_started_at().is_none());
 }
 
 /// Test loading indicator config defaults.
@@ -362,13 +362,13 @@ fn test_server_state_document_has_loading_state() {
 
     let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
-    assert_eq!(doc.loading_state, LoadingState::Idle);
-    assert!(doc.loading_started_at.is_none());
+    assert_eq!(doc.loading_state(), LoadingState::Idle);
+    assert!(doc.loading_started_at().is_none());
 
     state.update_document(uri.clone(), doc);
 
     let retrieved = state.get_document(&uri).unwrap();
-    assert_eq!(retrieved.loading_state, LoadingState::Idle);
+    assert_eq!(retrieved.loading_state(), LoadingState::Idle);
 }
 
 /// Test document state cloning preserves loading state.
@@ -379,8 +379,8 @@ fn test_document_state_clone_preserves_loading() {
 
     let cloned = original.clone();
 
-    assert_eq!(cloned.loading_state, LoadingState::Loading);
-    assert_eq!(cloned.loading_started_at, original.loading_started_at);
+    assert_eq!(cloned.loading_state(), LoadingState::Loading);
+    assert_eq!(cloned.loading_started_at(), original.loading_started_at());
 }
 
 /// Test loading state transitions in correct order.
@@ -388,23 +388,23 @@ fn test_document_state_clone_preserves_loading() {
 fn test_loading_state_transition_order() {
     let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
-    assert_eq!(doc.loading_state, LoadingState::Idle);
+    assert_eq!(doc.loading_state(), LoadingState::Idle);
 
     doc.set_loading();
-    assert_eq!(doc.loading_state, LoadingState::Loading);
-    assert!(doc.loading_started_at.is_some());
+    assert_eq!(doc.loading_state(), LoadingState::Loading);
+    assert!(doc.loading_started_at().is_some());
 
     doc.set_loaded();
-    assert_eq!(doc.loading_state, LoadingState::Loaded);
-    assert!(doc.loading_started_at.is_none());
+    assert_eq!(doc.loading_state(), LoadingState::Loaded);
+    assert!(doc.loading_started_at().is_none());
 
     doc.set_loading();
-    assert_eq!(doc.loading_state, LoadingState::Loading);
-    assert!(doc.loading_started_at.is_some());
+    assert_eq!(doc.loading_state(), LoadingState::Loading);
+    assert!(doc.loading_started_at().is_some());
 
     doc.set_failed();
-    assert_eq!(doc.loading_state, LoadingState::Failed);
-    assert!(doc.loading_started_at.is_none());
+    assert_eq!(doc.loading_state(), LoadingState::Failed);
+    assert!(doc.loading_started_at().is_none());
 }
 
 /// Test loading timeout scenario (>5 seconds).
@@ -423,8 +423,8 @@ async fn test_loading_timeout_scenario() {
     );
 
     doc.set_failed();
-    assert_eq!(doc.loading_state, LoadingState::Failed);
-    assert!(doc.loading_started_at.is_none());
+    assert_eq!(doc.loading_state(), LoadingState::Failed);
+    assert!(doc.loading_started_at().is_none());
 }
 
 /// Test rapid set_loading() calls for race condition handling.
@@ -446,5 +446,5 @@ async fn test_rapid_set_loading_calls() {
     }
 
     let doc = state.get_document(&uri).unwrap();
-    assert_eq!(doc.loading_state, LoadingState::Loading);
+    assert_eq!(doc.loading_state(), LoadingState::Loading);
 }

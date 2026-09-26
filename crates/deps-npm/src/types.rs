@@ -119,6 +119,110 @@ pub enum NpmDependencySection {
     OptionalDependencies,
 }
 
+/// An npm version's deprecation state, from the packument's `deprecated` field.
+///
+/// Replaces a bare `deprecated: bool` field plus a separate `deprecation: Option<Deprecation>`
+/// field, which could disagree with each other: npm's own convention for *un*-deprecating a
+/// package is republishing with an empty `"deprecated": ""` string, which must still count as
+/// deprecated (see [`Self::is_deprecated`]) even though it carries no payload worth showing the
+/// user (issue #205 M2). A `deprecated: bool` + `deprecation: Option<Deprecation>` pair can't
+/// express "deprecated, no payload" as a single source of truth — this enum makes that state
+/// unrepresentable as a disagreement.
+///
+/// # Examples
+///
+/// ```
+/// use deps_npm::types::NpmDeprecation;
+///
+/// assert!(!NpmDeprecation::from_registry_field(None).is_deprecated());
+/// assert!(NpmDeprecation::from_registry_field(Some("")).is_deprecated());
+/// assert!(NpmDeprecation::from_registry_field(Some("use foo")).is_deprecated());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NpmDeprecation {
+    /// The packument has no `deprecated` field for this version.
+    Active,
+    /// The packument's `deprecated` field is present. Carries the derived
+    /// [`deps_core::Deprecation`] payload, or `None` when the field is present but
+    /// all-whitespace/empty — npm's un-deprecation convention (see [`Self`]'s doc).
+    Deprecated(Option<deps_core::Deprecation>),
+}
+
+/// Derives a #205 [`Deprecation`](deps_core::Deprecation) payload from npm's free-text
+/// `deprecated` field message, or `None` if there is nothing worth telling the user.
+///
+/// M2: an all-whitespace message (`"deprecated": ""` is how a package is *un*-deprecated in
+/// practice) must produce `None`, not a `Deprecation` with a dangling, empty reason —
+/// [`NpmDeprecation::is_deprecated`] is unaffected (it still treats a present-but-empty field
+/// as flagged, matching pre-#205 behavior; this is only about the payload shown to the user).
+/// Never populates `replacement`: npm has no structured successor field, only free text (see
+/// [`NpmVersion::deprecation`]'s docs).
+fn deprecation_from_message(message: &str) -> Option<deps_core::Deprecation> {
+    let reason = message.trim();
+    (!reason.is_empty()).then(|| deps_core::Deprecation {
+        reason: Some(reason.to_string()),
+        replacement: None,
+    })
+}
+
+impl NpmDeprecation {
+    /// Builds a status from the npm packument's raw `deprecated` field: `None` when the field
+    /// is absent from the JSON payload, `Some(message)` when present (regardless of content).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_npm::types::NpmDeprecation;
+    ///
+    /// assert_eq!(NpmDeprecation::from_registry_field(None), NpmDeprecation::Active);
+    /// assert_eq!(
+    ///     NpmDeprecation::from_registry_field(Some("  ")),
+    ///     NpmDeprecation::Deprecated(None)
+    /// );
+    /// ```
+    #[must_use]
+    pub fn from_registry_field(field: Option<&str>) -> Self {
+        match field {
+            None => Self::Active,
+            Some(message) => Self::Deprecated(deprecation_from_message(message)),
+        }
+    }
+
+    /// Whether the packument marks this version as deprecated at all — the
+    /// `removal_status()`-driving signal, independent of whether a payload is attached.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_npm::types::NpmDeprecation;
+    ///
+    /// assert!(!NpmDeprecation::Active.is_deprecated());
+    /// assert!(NpmDeprecation::Deprecated(None).is_deprecated());
+    /// ```
+    #[must_use]
+    pub const fn is_deprecated(&self) -> bool {
+        matches!(self, Self::Deprecated(_))
+    }
+
+    /// The attached payload, if any. `None` for [`Self::Active`] and for a
+    /// [`Self::Deprecated`] with no payload.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_npm::types::NpmDeprecation;
+    ///
+    /// assert!(NpmDeprecation::Active.payload().is_none());
+    /// ```
+    #[must_use]
+    pub const fn payload(&self) -> Option<&deps_core::Deprecation> {
+        match self {
+            Self::Active => None,
+            Self::Deprecated(payload) => payload.as_ref(),
+        }
+    }
+}
+
 /// Version information for an npm package.
 ///
 /// Retrieved from the npm registry API at `https://registry.npmjs.org/{package}`.
@@ -127,28 +231,24 @@ pub enum NpmDependencySection {
 /// # Examples
 ///
 /// ```
-/// use deps_npm::types::NpmVersion;
+/// use deps_npm::types::{NpmDeprecation, NpmVersion};
 ///
-/// let version = NpmVersion::new("4.18.2".into(), false);
+/// let version = NpmVersion::new("4.18.2".into(), NpmDeprecation::Active);
 ///
-/// assert!(!version.deprecated);
+/// assert!(!version.deprecation.is_deprecated());
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct NpmVersion {
     /// The parsed version number.
     pub version: deps_core::ConcreteVersion,
-    /// Whether the packument marks this version as deprecated.
-    pub deprecated: bool,
-    /// Package-level deprecation payload (issue #205), derived from the packument's
-    /// `deprecated` free-text field. `None` whenever `deprecated` is absent, `null`, or
-    /// an all-whitespace string — npm's own convention for "un-deprecating" a package is
-    /// republishing with an empty `deprecated` string, so that case must not produce a
-    /// dangling, information-free diagnostic (see `deprecation_from_message`). Carries no
-    /// `replacement`: npm only ever names a successor in free text, and regex-extracting
-    /// a package name from registry-controlled prose to rewrite a manifest is a
-    /// typosquatting vector — see `NpmFormatter::supports_package_rename`.
-    pub deprecation: Option<deps_core::Deprecation>,
+    /// Whether the packument marks this version as deprecated, and its payload if any. See
+    /// [`NpmDeprecation`]'s doc for why this is one field rather than a `bool` +
+    /// `Option<Deprecation>` pair. Carries no `replacement`: npm only ever names a successor
+    /// in free text, and regex-extracting a package name from registry-controlled prose to
+    /// rewrite a manifest is a typosquatting vector — see
+    /// `NpmFormatter::supports_package_rename`.
+    pub deprecation: NpmDeprecation,
     /// Publish timestamp, populated only when `Registry::get_versions_with` is called with
     /// freshness enabled — derived from the full packument's `time` map, never the
     /// abbreviated packument `get_versions` otherwise uses.
@@ -156,9 +256,8 @@ pub struct NpmVersion {
 }
 
 impl NpmVersion {
-    /// Constructs an `NpmVersion` from its required fields, with [`Self::deprecation`] and
-    /// [`Self::published_at`] left `None` — chain [`Self::with_deprecation`] and/or
-    /// [`Self::with_published_at`] to attach them.
+    /// Constructs an `NpmVersion` from its required fields, with [`Self::published_at`] left
+    /// `None` — chain [`Self::with_published_at`] to attach it.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate must go through this constructor instead.
@@ -166,31 +265,23 @@ impl NpmVersion {
     /// # Arguments
     ///
     /// * `version` - The parsed version number
-    /// * `deprecated` - Whether the packument marks this version as deprecated
+    /// * `deprecation` - Whether the packument marks this version as deprecated
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_npm::types::NpmVersion;
+    /// use deps_npm::types::{NpmDeprecation, NpmVersion};
     ///
-    /// let version = NpmVersion::new("4.18.2".into(), false);
-    /// assert!(!version.deprecated);
+    /// let version = NpmVersion::new("4.18.2".into(), NpmDeprecation::Active);
+    /// assert!(!version.deprecation.is_deprecated());
     /// ```
     #[must_use]
-    pub const fn new(version: deps_core::ConcreteVersion, deprecated: bool) -> Self {
+    pub const fn new(version: deps_core::ConcreteVersion, deprecation: NpmDeprecation) -> Self {
         Self {
             version,
-            deprecated,
-            deprecation: None,
+            deprecation,
             published_at: None,
         }
-    }
-
-    /// Attaches the package-level deprecation payload. See [`Self::deprecation`].
-    #[must_use]
-    pub fn with_deprecation(mut self, deprecation: deps_core::Deprecation) -> Self {
-        self.deprecation = Some(deprecation);
-        self
     }
 
     /// Attaches the publish timestamp. See [`Self::published_at`].
@@ -206,12 +297,12 @@ impl NpmVersion {
 // since the registry enforces valid semver.
 deps_core::impl_version!(NpmVersion {
     version: version,
-    status: |v: &NpmVersion| deps_core::RemovalStatus::from_advisory(v.deprecated),
+    status: |v: &NpmVersion| deps_core::RemovalStatus::from_advisory(v.deprecation.is_deprecated()),
     published_at: published_at,
     prerelease: |v: &NpmVersion| {
         node_semver::Version::parse(v.version.as_str()).is_ok_and(|parsed| parsed.is_prerelease())
     },
-    deprecation: |v: &NpmVersion| v.deprecation.as_ref(),
+    deprecation: |v: &NpmVersion| v.deprecation.payload(),
 });
 
 /// Package metadata from npm registry.
@@ -347,21 +438,19 @@ mod tests {
     fn test_npm_version_creation() {
         let version = NpmVersion {
             version: "1.0.0".into(),
-            deprecated: false,
-            deprecation: None,
+            deprecation: NpmDeprecation::Active,
             published_at: None,
         };
 
         assert_eq!(version.version, "1.0.0");
-        assert!(!version.deprecated);
+        assert!(!version.deprecation.is_deprecated());
     }
 
     #[test]
     fn test_npm_version_trait() {
         let version = NpmVersion {
             version: "2.0.0".into(),
-            deprecated: true,
-            deprecation: None,
+            deprecation: NpmDeprecation::Deprecated(None),
             published_at: None,
         };
 
@@ -374,16 +463,15 @@ mod tests {
     }
 
     /// #205: `Version::deprecation()` reads the dedicated field, independent of the
-    /// `removal_status`-driving `deprecated` bool.
+    /// `removal_status`-driving [`NpmDeprecation::is_deprecated`].
     #[test]
     fn test_npm_version_deprecation_accessor() {
         let with_payload = NpmVersion {
             version: "2.0.0".into(),
-            deprecated: true,
-            deprecation: Some(deps_core::Deprecation {
+            deprecation: NpmDeprecation::Deprecated(Some(deps_core::Deprecation {
                 reason: Some("use foo".to_string()),
                 replacement: None,
-            }),
+            })),
             published_at: None,
         };
         assert_eq!(
@@ -393,25 +481,45 @@ mod tests {
 
         let without_payload = NpmVersion {
             version: "1.0.0".into(),
-            deprecated: false,
-            deprecation: None,
+            deprecation: NpmDeprecation::Active,
             published_at: None,
         };
         assert!(without_payload.deprecation().is_none());
     }
 
     #[test]
+    fn test_npm_deprecation_from_registry_field_trims_and_rejects_empty() {
+        assert_eq!(
+            NpmDeprecation::from_registry_field(None),
+            NpmDeprecation::Active
+        );
+        assert_eq!(
+            NpmDeprecation::from_registry_field(Some("")),
+            NpmDeprecation::Deprecated(None)
+        );
+        assert_eq!(
+            NpmDeprecation::from_registry_field(Some("   ")),
+            NpmDeprecation::Deprecated(None)
+        );
+        assert_eq!(
+            NpmDeprecation::from_registry_field(Some("  use foo instead  ")),
+            NpmDeprecation::Deprecated(Some(deps_core::Deprecation {
+                reason: Some("use foo instead".to_string()),
+                replacement: None,
+            }))
+        );
+    }
+
+    #[test]
     fn test_npm_version_is_prerelease() {
         let stable = NpmVersion {
             version: "18.0.0".into(),
-            deprecated: false,
-            deprecation: None,
+            deprecation: NpmDeprecation::Active,
             published_at: None,
         };
         let prerelease = NpmVersion {
             version: "18.0.0-beta.1".into(),
-            deprecated: false,
-            deprecation: None,
+            deprecation: NpmDeprecation::Active,
             published_at: None,
         };
 

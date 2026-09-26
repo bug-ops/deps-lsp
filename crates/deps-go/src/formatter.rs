@@ -3,7 +3,7 @@ use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
 };
-use deps_core::{ConcreteVersion, Dependency, DepsError, InvalidPackageName, PackageName};
+use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
 
@@ -68,19 +68,7 @@ impl PackageNaming for GoFormatter {
     ///
     /// Returns [`InvalidPackageName`] carrying `validate_module_path`'s rejection reason.
     fn validate_package_name(&self, name: &str) -> Result<(), InvalidPackageName> {
-        let Err(err) = crate::registry::validate_module_path(name) else {
-            return Ok(());
-        };
-        // `validate_module_path` only ever constructs `DepsError::InvalidVersionReq` (#399
-        // documents it as the shared "invalid input" carrier it deliberately reuses for this),
-        // so this is the only reachable arm — matched explicitly rather than a catch-all
-        // `.to_string()` fallback, both to avoid dead code per CLAUDE.md and because
-        // `DepsError`'s `Display` prefixes an unrelated "invalid version requirement: " label
-        // that would misrender the module-path reason here (#402 critique M3).
-        let DepsError::InvalidVersionReq(reason) = err else {
-            unreachable!("validate_module_path only ever returns DepsError::InvalidVersionReq")
-        };
-        Err(InvalidPackageName::new(reason))
+        crate::registry::validate_module_path(name)
     }
 }
 

@@ -68,6 +68,10 @@ pub struct GradleEcosystem {
     /// growing `MavenCentralRegistry`'s own (differently-scoped, `deps-maven`-owned)
     /// public API.
     http_cache: Arc<deps_core::HttpCache>,
+    /// Shared across every file this instance parses, so an ancestor `gradle.properties`
+    /// used by many build files is read and parsed once per mtime rather than once per parse
+    /// (#1514) — see [`crate::parser::parse_gradle_with_cache`].
+    properties_cache: crate::parser::properties::GradlePropertiesCache,
 }
 
 impl GradleEcosystem {
@@ -77,6 +81,7 @@ impl GradleEcosystem {
             registry: Arc::new(MavenCentralRegistry::new(Arc::clone(&cache))),
             formatter: GradleFormatter,
             http_cache: cache,
+            properties_cache: crate::parser::properties::GradlePropertiesCache::new(),
         }
     }
 
@@ -840,7 +845,8 @@ impl Ecosystem for GradleEcosystem {
         uri: &'a Url,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Box<dyn ParseResultTrait>>> {
         Box::pin(async move {
-            let result = crate::parser::parse_gradle(content, uri)?;
+            let result =
+                crate::parser::parse_gradle_with_cache(content, uri, &self.properties_cache)?;
             Ok(Box::new(result) as Box<dyn ParseResultTrait>)
         })
     }

@@ -3,17 +3,16 @@
 Construct `deps_core::DepsError` directly at call sites instead of using a local error wrapper. Use `deps_core::Result<T>` for function signatures:
 
 ```rust
-use deps_core::DepsError;
+use deps_core::{DepsError, InvalidPackageName};
 
-/// Example: validation function
-fn validate_module_path(path: &str) -> deps_core::Result<()> {
+/// Example: validation function — use `InvalidPackageName` for a malformed package/module
+/// identifier, not `InvalidVersionReq` (reserved for a malformed version-requirement string).
+fn validate_module_path(path: &str) -> Result<(), InvalidPackageName> {
     if path.is_empty() {
-        return Err(DepsError::InvalidVersionReq("module path is empty".into()));
+        return Err(InvalidPackageName::new("module path is empty"));
     }
     if path.contains("..") {
-        return Err(DepsError::InvalidVersionReq(
-            format!("invalid module path: {}", path)
-        ));
+        return Err(InvalidPackageName::new(format!("invalid module path: {path}")));
     }
     Ok(())
 }

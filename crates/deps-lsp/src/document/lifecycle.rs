@@ -2659,7 +2659,7 @@ mod tests {
                             .iter()
                             .filter(|uri| {
                                 state.get_document(uri).is_some_and(|d| {
-                                    d.loading_state == deps_core::LoadingState::Loading
+                                    d.loading_state() == deps_core::LoadingState::Loading
                                 })
                             })
                             .count();
@@ -2720,7 +2720,7 @@ mod tests {
             for uri in &uris {
                 let doc = state.get_document(uri).unwrap();
                 assert_ne!(
-                    doc.loading_state,
+                    doc.loading_state(),
                     deps_core::LoadingState::Loading,
                     "no document may be left stuck in Loading once every fetch has completed"
                 );
@@ -3258,12 +3258,12 @@ serde = "1.0"
             let doc = state.get_document(&uri).expect("document should be stored");
             assert!(
                 matches!(
-                    doc.loading_state,
+                    doc.loading_state(),
                     deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed
                 ),
                 "document loading must reach a terminal state, proving the pipeline ran \
                  past the refresh call sites to commit OSV results and diagnostics: {:?}",
-                doc.loading_state
+                doc.loading_state()
             );
         }
 
@@ -3323,12 +3323,12 @@ tokio = "1.0"
             let doc = state.get_document(&uri).expect("document should be stored");
             assert!(
                 matches!(
-                    doc.loading_state,
+                    doc.loading_state(),
                     deps_core::LoadingState::Loaded | deps_core::LoadingState::Failed
                 ),
                 "document loading must reach a terminal state, proving the pipeline ran \
                  past the refresh call sites to commit OSV results and diagnostics: {:?}",
-                doc.loading_state
+                doc.loading_state()
             );
         }
 

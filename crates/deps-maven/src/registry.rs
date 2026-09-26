@@ -736,7 +736,7 @@ where
 /// Returns `Ok(vec![])` (treated by [`MavenCentralRegistry::get_metadata`] as "no versions
 /// found") only for a malformed `groupId:artifactId` pair with no `:` separator.
 ///
-/// Returns `Err(DepsError::PackageNotFound)` — mirroring `deps-dart`'s `reject_dot_segment`
+/// Returns `Err(DepsError::PackageNotFound)` — mirroring `deps-dart`'s `SafePathSegment` gate
 /// (#349) — when [`maven_coordinate_path`] rejects the coordinate: a `groupId`/`artifactId`
 /// containing `../` (or other path-breakout characters, or an empty `.`-separated group
 /// component, #702) must never reach the URL construction below, since the resulting path

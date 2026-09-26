@@ -76,9 +76,9 @@ pub enum ComposerSection {
 /// ```
 /// use deps_composer::types::ComposerVersion;
 ///
-/// let version = ComposerVersion::new("6.0.0".into(), "6.0.0.0".into(), false);
+/// let version = ComposerVersion::new("6.0.0".into(), "6.0.0.0".into());
 ///
-/// assert!(!version.abandoned);
+/// assert!(!version.abandoned());
 /// ```
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -87,12 +87,13 @@ pub struct ComposerVersion {
     pub version: deps_core::ConcreteVersion,
     /// Packagist's normalized 4-part version string (e.g. `"6.0.0.0"`).
     pub version_normalized: String,
-    /// Whether Packagist marks this package/version as abandoned.
-    pub abandoned: bool,
     /// Package-level deprecation payload (issue #205), derived from Packagist's
     /// `abandoned` field. `Some(Deprecation { reason: None, replacement: None })` for a
     /// bare `"abandoned": true`; `replacement` populated when `abandoned` names a
-    /// successor package. `None` only when `abandoned` is absent/`false`/`null`.
+    /// successor package. `None` only when `abandoned` is absent/`false`/`null` — so
+    /// [`Self::abandoned`] (`abandoned == deprecation.is_some()` holds exactly for
+    /// Packagist's data) is the only abandonment signal this type carries; there is no
+    /// separate `abandoned: bool` field to disagree with it.
     pub deprecation: Option<deps_core::Deprecation>,
     /// Publish timestamp, parsed from the p2 entry's own `time` field.
     ///
@@ -124,30 +125,42 @@ impl ComposerVersion {
     /// * `version` - The parsed version number
     /// * `version_normalized` - Packagist's normalized 4-part version string (e.g.
     ///   `"6.0.0.0"`)
-    /// * `abandoned` - Whether Packagist marks this package/version as abandoned
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_composer::types::ComposerVersion;
     ///
-    /// let version = ComposerVersion::new("6.0.0".into(), "6.0.0.0".into(), false);
-    /// assert!(!version.abandoned);
+    /// let version = ComposerVersion::new("6.0.0".into(), "6.0.0.0".into());
+    /// assert!(!version.abandoned());
     /// ```
     #[must_use]
-    pub const fn new(
-        version: deps_core::ConcreteVersion,
-        version_normalized: String,
-        abandoned: bool,
-    ) -> Self {
+    pub const fn new(version: deps_core::ConcreteVersion, version_normalized: String) -> Self {
         Self {
             version,
             version_normalized,
-            abandoned,
             deprecation: None,
             published_at: None,
             license: Vec::new(),
         }
+    }
+
+    /// Whether Packagist marks this package/version as abandoned.
+    ///
+    /// `abandoned == deprecation.is_some()` holds exactly for Packagist's data (see
+    /// [`Self::deprecation`]'s doc), so there is no separate stored `abandoned` flag to keep
+    /// in sync with this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_composer::types::ComposerVersion;
+    ///
+    /// assert!(!ComposerVersion::new("6.0.0".into(), "6.0.0.0".into()).abandoned());
+    /// ```
+    #[must_use]
+    pub const fn abandoned(&self) -> bool {
+        self.deprecation.is_some()
     }
 
     /// Attaches the package-level deprecation payload. See [`Self::deprecation`].
@@ -288,7 +301,7 @@ pub(crate) fn is_prerelease_marker(s: &str) -> bool {
 // filters those before construction, so `is_prerelease()` never sees them (#327 M1).
 deps_core::impl_version!(ComposerVersion {
     version: version,
-    status: |v: &ComposerVersion| deps_core::RemovalStatus::from_advisory(v.abandoned),
+    status: |v: &ComposerVersion| deps_core::RemovalStatus::from_advisory(v.abandoned()),
     published_at: published_at,
     prerelease: |v: &ComposerVersion| {
         is_prerelease_marker(v.version.as_str())
@@ -427,8 +440,10 @@ mod tests {
         let version = ComposerVersion {
             version: "2.0.0".into(),
             version_normalized: "2.0.0.0".into(),
-            abandoned: true,
-            deprecation: None,
+            deprecation: Some(deps_core::Deprecation {
+                reason: None,
+                replacement: None,
+            }),
             published_at: None,
             license: vec![],
         };
@@ -447,7 +462,6 @@ mod tests {
         let with_license = ComposerVersion {
             version: "2.0.0".into(),
             version_normalized: "2.0.0.0".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec!["MIT".to_string(), "Apache-2.0".to_string()],
@@ -460,7 +474,6 @@ mod tests {
         let without_license = ComposerVersion {
             version: "1.0.0".into(),
             version_normalized: "1.0.0.0".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -469,13 +482,12 @@ mod tests {
     }
 
     /// #205: `Version::deprecation()` reads the dedicated field, independent of the
-    /// `removal_status`-driving `abandoned` bool.
+    /// `removal_status`-driving [`ComposerVersion::abandoned`].
     #[test]
     fn test_composer_version_deprecation_accessor() {
         let with_payload = ComposerVersion {
             version: "2.0.0".into(),
             version_normalized: "2.0.0.0".into(),
-            abandoned: true,
             deprecation: Some(deps_core::Deprecation {
                 reason: None,
                 replacement: Some("other/package".to_string()),
@@ -493,12 +505,37 @@ mod tests {
         let without_payload = ComposerVersion {
             version: "1.0.0".into(),
             version_normalized: "1.0.0.0".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
         };
         assert!(without_payload.deprecation().is_none());
+    }
+
+    /// `abandoned() == deprecation.is_some()` (#1514): asserted directly against the
+    /// computed method rather than only indirectly through `removal_status()`.
+    #[test]
+    fn test_composer_version_abandoned_derives_from_deprecation() {
+        let abandoned = ComposerVersion {
+            version: "2.0.0".into(),
+            version_normalized: "2.0.0.0".into(),
+            deprecation: Some(deps_core::Deprecation {
+                reason: None,
+                replacement: None,
+            }),
+            published_at: None,
+            license: vec![],
+        };
+        assert!(abandoned.abandoned());
+
+        let not_abandoned = ComposerVersion {
+            version: "1.0.0".into(),
+            version_normalized: "1.0.0.0".into(),
+            deprecation: None,
+            published_at: None,
+            license: vec![],
+        };
+        assert!(!not_abandoned.abandoned());
     }
 
     #[test]
@@ -508,7 +545,6 @@ mod tests {
         let alpha = ComposerVersion {
             version: "1.0.0-a1".into(),
             version_normalized: "1.0.0.0-alpha1".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -516,7 +552,6 @@ mod tests {
         let beta = ComposerVersion {
             version: "1.0.0-b1".into(),
             version_normalized: "1.0.0.0-beta1".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -542,7 +577,6 @@ mod tests {
             let version = ComposerVersion {
                 version: name.into(),
                 version_normalized: name.into(), // no expansion happened
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -668,7 +702,6 @@ mod tests {
         let version = ComposerVersion {
             version: "2.0.0RC1".into(),
             version_normalized: "2.0.0RC1".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -681,7 +714,6 @@ mod tests {
         let version = ComposerVersion {
             version: "6.0.0".into(),
             version_normalized: "6.0.0.0".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],

@@ -218,11 +218,35 @@ impl GradleManifestKind {
 /// parser based on its filename, then resolves `$var`/`${var}` property references
 /// for build files.
 ///
+/// Uses a fresh, one-shot [`properties::GradlePropertiesCache`] — callers that parse many
+/// files sharing the same ancestor `gradle.properties` chain (i.e. `GradleEcosystem`) should
+/// call [`parse_gradle_with_cache`] with a cache reused across calls instead, to actually get
+/// the benefit of [`deps_core::MtimeFileCache`]'s mtime-gated memoization.
+///
 /// # Errors
 ///
 /// Returns an error if the file's dedicated parser fails (e.g. malformed TOML for
 /// a version catalog).
 pub fn parse_gradle(content: &str, uri: &Url) -> Result<GradleParseResult> {
+    parse_gradle_with_cache(content, uri, &properties::GradlePropertiesCache::new())
+}
+
+/// Like [`parse_gradle`], but resolving `$var`/`${var}` property references through `cache`
+/// instead of a fresh, unshared one.
+///
+/// The cache should be held by the caller (e.g. `GradleEcosystem`) and reused across every file
+/// parsed, so an ancestor `gradle.properties` shared by many build files is read and parsed once
+/// per mtime, not once per parse (#1514).
+///
+/// # Errors
+///
+/// Returns an error if the file's dedicated parser fails (e.g. malformed TOML for
+/// a version catalog).
+pub fn parse_gradle_with_cache(
+    content: &str,
+    uri: &Url,
+    cache: &properties::GradlePropertiesCache,
+) -> Result<GradleParseResult> {
     let kind = GradleManifestKind::from_uri(uri);
     let mut result = match kind {
         GradleManifestKind::Catalog => catalog::parse_version_catalog(content, uri)?,
@@ -250,7 +274,7 @@ pub fn parse_gradle(content: &str, uri: &Url) -> Result<GradleParseResult> {
             .as_deref()
             .and_then(std::path::Path::parent)
         {
-            let props = properties::load_gradle_properties(dir);
+            let props = properties::load_gradle_properties(dir, cache);
             if !props.is_empty() {
                 resolve_variables(&mut result.dependencies, &props);
             }
@@ -685,9 +709,16 @@ pub(crate) fn apply_repository_content_restrictions(
     }
 }
 
-/// Returns the number of UTF-16 code units in `s`.
-pub(crate) fn utf16_len(s: &str) -> usize {
-    s.chars().map(|c| c.len_utf16()).sum()
+/// The UTF-16 length of a short string (a matched substring, not a whole line), saturating
+/// like [`deps_core::lsp_helpers::byte_to_utf16_offset`] itself.
+///
+/// A range's end position is `start + this length`, computed this way instead of a second
+/// [`deps_core::lsp_helpers::byte_to_utf16_offset`] call on the whole line at the end byte
+/// offset — that call is `O(end)` (it re-encodes the line's entire prefix from byte 0), so
+/// calling it twice per match would redundantly redo the first call's work. `s` is always the
+/// short matched text itself here, so this stays `O(match length)`.
+pub(crate) fn saturating_utf16_len(s: &str) -> u32 {
+    u32::try_from(s.encode_utf16().count()).unwrap_or(u32::MAX)
 }
 
 /// Finds the LSP range of `"group_id:artifact_id"` within the dependency
@@ -711,8 +742,8 @@ pub(crate) fn find_name_range(
     let search = format!("{group_id}:{artifact_id}");
     if let Some(rel) = scoped.find(&search) {
         let abs_start = match_start + rel;
-        let col_u32 = utf16_len(&line[..abs_start]) as u32;
-        let end_u32 = col_u32 + utf16_len(&search) as u32;
+        let col_u32 = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
+        let end_u32 = col_u32 + saturating_utf16_len(&search);
         Range::new(
             Position::new(line_idx, col_u32),
             Position::new(line_idx, end_u32),
@@ -750,8 +781,8 @@ pub(crate) fn find_version_range(
         let after_colon = &scoped[colon_pos + 1..];
         if let Some(rel) = after_colon.find(version) {
             let abs_start = match_start + colon_pos + 1 + rel;
-            let col_start = utf16_len(&line[..abs_start]) as u32;
-            let col_end = col_start + utf16_len(version) as u32;
+            let col_start = deps_core::lsp_helpers::byte_to_utf16_offset(line, abs_start);
+            let col_end = col_start + saturating_utf16_len(version);
             return Range::new(
                 Position::new(line_idx, col_start),
                 Position::new(line_idx, col_end),
@@ -1096,11 +1127,6 @@ mod tests {
         let first_range = find_version_range(line, 0, 0, "1.0.0");
         assert_ne!(range.start.character, first_range.start.character);
         assert!(range.start.character > second_match_start as u32);
-    }
-
-    #[test]
-    fn test_utf16_len_ascii() {
-        assert_eq!(utf16_len("hello"), 5);
     }
 
     /// #1212: `includeGroup` inside a repository's `content { }` block is a real static

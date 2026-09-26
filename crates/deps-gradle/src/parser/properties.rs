@@ -3,8 +3,10 @@
 //! Provides key-value parsing and directory-walking lookup.
 
 use deps_core::interpolation::PropertyValue;
+use deps_core::{DEFAULT_MAX_CACHED_FILES, MtimeFileCache};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Parses a gradle.properties content into key-value pairs.
 ///
@@ -29,17 +31,55 @@ pub fn parse_properties(content: &str) -> HashMap<String, PropertyValue> {
     result
 }
 
+/// Per-file memoization of parsed `gradle.properties` contents, invalidated by mtime.
+///
+/// A thin newtype over [`deps_core::MtimeFileCache`] — the same mtime-gated caching mechanism
+/// `deps-cargo`'s `ConfigFileCache` and `deps-npm`'s `NpmConfigCache` use for their own
+/// ancestor config-file walks (#1514). Before this type existed, every ancestor
+/// `gradle.properties` was re-read and re-parsed on every call to [`load_gradle_properties`]
+/// instead of being cached across calls.
+#[derive(Debug)]
+pub struct GradlePropertiesCache(MtimeFileCache<HashMap<String, PropertyValue>>);
+
+impl Default for GradlePropertiesCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GradlePropertiesCache {
+    /// Creates an empty cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self(MtimeFileCache::new(
+            DEFAULT_MAX_CACHED_FILES,
+            "gradle properties",
+        ))
+    }
+
+    /// Returns `path`'s parsed properties, from cache if `path`'s mtime is unchanged.
+    /// `None` if `path` does not exist, is not a regular file, exceeds
+    /// [`deps_core::MAX_CACHED_FILE_BYTES`], or cannot be read.
+    fn get_or_parse(&self, path: &Path) -> Option<Arc<HashMap<String, PropertyValue>>> {
+        self.0.get_or_parse(path, parse_properties)
+    }
+}
+
 /// Finds and parses gradle.properties files by walking up from `start_dir`.
 ///
-/// Merges properties from all levels, with child values overriding parent values. The walk
-/// stops after [`deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH`] ancestors regardless of whether the filesystem
-/// root has been reached, and each file is read through
-/// [`deps_core::fs_probe::read_to_string_capped`] — bounded by
-/// [`deps_core::MAX_CACHED_FILE_BYTES`], the same cap `deps-cargo`'s/`deps-npm`'s own
-/// config-file ancestor walks use (a `gradle.properties` file is a small config file, not a
-/// lock file, so it does not need `deps_core::lockfile::MAX_LOCKFILE_BYTES`'s larger cap) —
-/// so an oversized or maliciously deep ancestor chain cannot force unbounded work (CWE-400).
-pub fn load_gradle_properties(start_dir: &Path) -> HashMap<String, PropertyValue> {
+/// Merges properties from all levels, with child values overriding parent values, reusing
+/// `cache`'s memoized per-file results instead of unconditionally re-reading and re-parsing.
+/// The walk stops after [`deps_core::fs_probe::MAX_CONFIG_ANCESTOR_DEPTH`] ancestors regardless
+/// of whether the filesystem root has been reached, and each file is read through
+/// [`GradlePropertiesCache`] — bounded by [`deps_core::MAX_CACHED_FILE_BYTES`], the same cap
+/// `deps-cargo`'s/`deps-npm`'s own config-file ancestor walks use (a `gradle.properties` file
+/// is a small config file, not a lock file, so it does not need
+/// [`deps_core::lockfile::MAX_LOCKFILE_BYTES`]'s larger cap) — so an oversized or maliciously
+/// deep ancestor chain cannot force unbounded work (CWE-400).
+pub fn load_gradle_properties(
+    start_dir: &Path,
+    cache: &GradlePropertiesCache,
+) -> HashMap<String, PropertyValue> {
     let mut result = HashMap::new();
     let mut chain = Vec::new();
 
@@ -52,32 +92,17 @@ pub fn load_gradle_properties(start_dir: &Path) -> HashMap<String, PropertyValue
 
     // Apply from root to leaf so child values override parent
     for path in chain.into_iter().rev() {
-        // Cheap `stat` pre-filter (mirrors `MtimeFileCache::get_or_parse`): skips opening an
-        // obviously oversized file. The capped read below still enforces the bound on the
-        // read itself regardless of what this reports, closing the TOCTOU gap (CWE-367) a
-        // stat-only check alone would leave open.
-        if let Ok(metadata) = deps_core::fs_probe::metadata(&path)
-            && metadata.len() > deps_core::MAX_CACHED_FILE_BYTES
-        {
-            tracing::warn!(
+        match cache.get_or_parse(&path) {
+            Some(parsed) => result.extend(parsed.iter().map(|(k, v)| (k.clone(), v.clone()))),
+            // `path` passed `is_file` above, so a `None` here means the cache rejected it
+            // after that check — already logged with the specific reason (size cap) when
+            // that's the cause; this covers every other case (TOCTOU race, permission
+            // denied, other I/O failure) that `MtimeFileCache::get_or_parse`'s `Option`
+            // return does not otherwise surface to this caller.
+            None => tracing::warn!(
                 path = %path.display(),
-                len = metadata.len(),
-                cap = deps_core::MAX_CACHED_FILE_BYTES,
-                "gradle.properties exceeds size cap; not reading"
-            );
-            continue;
-        }
-
-        match deps_core::fs_probe::read_to_string_capped(&path, deps_core::MAX_CACHED_FILE_BYTES) {
-            Ok(Some(content)) => result.extend(parse_properties(&content)),
-            Ok(None) => tracing::warn!(
-                path = %path.display(),
-                cap = deps_core::MAX_CACHED_FILE_BYTES,
-                "gradle.properties exceeds size cap during read; not reading"
+                "gradle.properties could not be read or parsed; skipping"
             ),
-            Err(e) => {
-                tracing::warn!(path = %path.display(), error = %e, "failed to read gradle.properties");
-            }
         }
     }
 
@@ -186,7 +211,7 @@ mod tests {
         // this module — without the guard here, a concurrently running `cargo test` thread
         // could corrupt that test's count mid-diff.
         let _guard = deps_core::fs_probe::snapshot_guard();
-        let result = load_gradle_properties(dir.path());
+        let result = load_gradle_properties(dir.path(), &GradlePropertiesCache::new());
 
         assert!(
             !result.contains_key("key"),
@@ -214,7 +239,7 @@ mod tests {
         // See the comment in `test_load_gradle_properties_rejects_oversized_file` on why a
         // non-diffing test still needs this guard.
         let _guard = deps_core::fs_probe::snapshot_guard();
-        let result = load_gradle_properties(&current);
+        let result = load_gradle_properties(&current, &GradlePropertiesCache::new());
 
         assert!(
             !result.contains_key("beyondCap"),
@@ -243,7 +268,7 @@ mod tests {
         // See the comment in `test_load_gradle_properties_rejects_oversized_file` on why a
         // non-diffing test still needs this guard.
         let _guard = deps_core::fs_probe::snapshot_guard();
-        let result = load_gradle_properties(&current);
+        let result = load_gradle_properties(&current, &GradlePropertiesCache::new());
 
         assert_eq!(
             result.get("atCap").map(PropertyValue::as_str),
@@ -269,7 +294,7 @@ mod tests {
 
         let _guard = deps_core::fs_probe::snapshot_guard();
         let (stats_before, _) = deps_core::fs_probe::snapshot();
-        let result = load_gradle_properties(&current);
+        let result = load_gradle_properties(&current, &GradlePropertiesCache::new());
         let (stats_after, _) = deps_core::fs_probe::snapshot();
 
         assert!(result.is_empty());
@@ -278,5 +303,33 @@ mod tests {
             MAX_CONFIG_ANCESTOR_DEPTH,
             "expected exactly one stat per ancestor for all MAX_CONFIG_ANCESTOR_DEPTH levels"
         );
+    }
+
+    /// The whole point of [`GradlePropertiesCache`] (#1514): a cache reused across two
+    /// `load_gradle_properties` calls with an unchanged ancestor file must not re-read its
+    /// content on the second call. Mirrors `deps_core::mtime_cache::tests::hit_does_zero_reads_and_exactly_one_stat`
+    /// at the wiring level, not just the underlying `MtimeFileCache` primitive.
+    #[test]
+    fn test_load_gradle_properties_reuses_cache_across_calls() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("gradle.properties"), "key=value\n").unwrap();
+
+        let cache = GradlePropertiesCache::new();
+        let _guard = deps_core::fs_probe::snapshot_guard();
+
+        let first = load_gradle_properties(dir.path(), &cache);
+        assert_eq!(first.get("key").map(PropertyValue::as_str), Some("value"));
+
+        let (_, reads_before) = deps_core::fs_probe::snapshot();
+        let second = load_gradle_properties(dir.path(), &cache);
+        let (_, reads_after) = deps_core::fs_probe::snapshot();
+
+        assert_eq!(
+            reads_after - reads_before,
+            0,
+            "a second call through the same cache with an unchanged mtime must not re-read \
+             the file"
+        );
+        assert_eq!(second.get("key").map(PropertyValue::as_str), Some("value"));
     }
 }

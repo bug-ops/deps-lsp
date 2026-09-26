@@ -33,7 +33,7 @@ use deps_core::parser::DependencySource;
 #[cfg(test)]
 use deps_core::registry::MAX_ALTERNATE_REGISTRIES;
 use deps_core::{
-    DepsError, EcosystemId, HttpCache, Result, is_dot_segment,
+    DepsError, EcosystemId, HttpCache, InvalidPackageName, Result, is_dot_segment,
     lsp_helpers::warn_rejected_value,
     not_found_or as core_not_found_or,
     registry::{KeyShape, register_capped},
@@ -77,8 +77,10 @@ const MAX_VERSION_LENGTH: usize = 128;
 
 /// Validates a module path for length and basic format.
 ///
-/// Rejections intentionally render through the shared `DepsError::InvalidVersionReq` variant
-/// rather than a Go-specific one — see #399.
+/// Rejections render through [`InvalidPackageName`] (#1514) — propagated into
+/// [`DepsError::InvalidPackageName`] via `#[from]` at every `?` call site in this module —
+/// rather than [`DepsError::InvalidVersionReq`], which is for a malformed version-requirement
+/// string, not a malformed module path (#399 originally deferred this split).
 ///
 /// # Errors
 ///
@@ -89,13 +91,15 @@ const MAX_VERSION_LENGTH: usize = 128;
 ///
 /// `pub(crate)` (not private) so [`crate::formatter::GoFormatter::validate_package_name`] can
 /// reuse the same structural rule for its "Invalid package name" diagnostic lint (#402).
-pub(crate) fn validate_module_path(module_path: &str) -> Result<()> {
+pub(crate) fn validate_module_path(
+    module_path: &str,
+) -> std::result::Result<(), InvalidPackageName> {
     if module_path.is_empty() {
-        return Err(DepsError::InvalidVersionReq("module path is empty".into()));
+        return Err(InvalidPackageName::new("module path is empty"));
     }
 
     if module_path.len() > MAX_MODULE_PATH_LENGTH {
-        return Err(DepsError::InvalidVersionReq(format!(
+        return Err(InvalidPackageName::new(format!(
             "module path exceeds maximum length of {MAX_MODULE_PATH_LENGTH} characters"
         )));
     }
@@ -108,7 +112,7 @@ pub(crate) fn validate_module_path(module_path: &str) -> Result<()> {
     // URL parser's dot-segment normalization — the same defect class as #341/#349/#357/#361.
     if module_path.split('/').any(is_dot_segment) {
         warn_rejected_value("is_dot_segment", "Go module proxy request URL", module_path);
-        return Err(DepsError::InvalidVersionReq(format!(
+        return Err(InvalidPackageName::new(format!(
             "module path '{}' contains a `.`/`..` path segment",
             deps_core::net_policy::redact_declaration_key(module_path)
         )));
@@ -693,7 +697,7 @@ impl GoRegistry {
 
         std::str::from_utf8(&data)
             .map(std::string::ToString::to_string)
-            .map_err(|e| DepsError::CacheError(format!("Invalid UTF-8 in go.mod: {e}")))
+            .map_err(|e| DepsError::parse_error("go.mod", &e))
     }
 }
 
@@ -713,9 +717,8 @@ struct VersionInfo {
 /// Versions are sorted in descending order (newest first) to ensure
 /// `find_latest_stable` returns the correct latest version.
 fn parse_version_list(data: &[u8]) -> Result<Vec<GoVersion>> {
-    let content = std::str::from_utf8(data).map_err(|e| {
-        DepsError::CacheError(format!("Invalid UTF-8 in version list response: {e}"))
-    })?;
+    let content = std::str::from_utf8(data)
+        .map_err(|e| DepsError::parse_error("Go module proxy version list", &e))?;
 
     // Schwartzian transform: precomputes sort keys to avoid re-parsing on every comparison.
     let mut versions_with_keys: Vec<(GoVersion, Option<semver::Version>)> = content
@@ -1237,7 +1240,7 @@ mod tests {
     /// `get_versions` — not a reimplemented gate+sink pair — proving the gate is actually
     /// wired into the call path a real completion/hover/diagnostic request would take. No
     /// mock is needed: the gate must reject before any network request is issued.
-    /// The dot-segment gate rejects with `DepsError::InvalidVersionReq`, not
+    /// The dot-segment gate rejects with `DepsError::InvalidPackageName`, not
     /// `PackageNotFound` — this crate's existing not-found mapping is unrelated to the
     /// dot-segment gate and is left unchanged.
     #[tokio::test]
@@ -1247,7 +1250,7 @@ mod tests {
             .get_versions("github.com/user/..")
             .await
             .unwrap_err();
-        assert_matches!(err, DepsError::InvalidVersionReq(_));
+        assert_matches!(err, DepsError::InvalidPackageName(_));
     }
 
     #[tokio::test]
@@ -1359,8 +1362,8 @@ mod tests {
     fn test_validate_module_path_empty() {
         let result = validate_module_path("");
         match result {
-            Err(DepsError::InvalidVersionReq(msg)) => assert_eq!(msg, "module path is empty"),
-            other => panic!("expected InvalidVersionReq, got {other:?}"),
+            Err(err) => assert_eq!(err.reason(), "module path is empty"),
+            other => panic!("expected InvalidPackageName, got {other:?}"),
         }
     }
 
@@ -1369,7 +1372,6 @@ mod tests {
         let long_path = "a".repeat(MAX_MODULE_PATH_LENGTH + 1);
         let result = validate_module_path(&long_path);
         assert!(result.is_err());
-        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]
@@ -1382,14 +1384,12 @@ mod tests {
     fn test_validate_module_path_rejects_bare_dot_dot_segment() {
         let result = validate_module_path("github.com/user/..");
         assert!(result.is_err());
-        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]
     fn test_validate_module_path_rejects_bare_dot_segment() {
         let result = validate_module_path("./evil");
         assert!(result.is_err());
-        assert_matches!(result, Err(DepsError::InvalidVersionReq(_)));
     }
 
     #[test]

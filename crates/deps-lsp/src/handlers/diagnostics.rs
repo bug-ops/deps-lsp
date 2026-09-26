@@ -226,12 +226,13 @@ pub(crate) async fn generate_diagnostics_internal(
     // would stay `Loading` forever and permanently suppress diagnostics. Past the ceiling, force
     // `Failed` *before* extraction (critic M1/S2) — a read-only fallthrough would leave
     // `loading_state` stuck and `outcomes` empty, misrendering unresolved deps as "Unknown
-    // package" instead of "lookup could not be determined". `unwrap_or(Duration::MAX)` (critic
-    // M2) treats a `Loading` doc with no recorded start time as already past the ceiling.
+    // package" instead of "lookup could not be determined". `loading_duration()` is always
+    // `Some` here: `LoadPhase` (#1514) couples the `Loading` state and its start instant in one
+    // field, so `loading_state() == Loading` structurally guarantees a recorded start time.
     let past_ceiling = state
         .with_document(uri, |doc| {
-            doc.loading_state == deps_core::LoadingState::Loading
-                && doc.loading_duration().unwrap_or(Duration::MAX) >= loading_ceiling
+            doc.loading_state() == deps_core::LoadingState::Loading
+                && doc.loading_duration().is_some_and(|d| d >= loading_ceiling)
         })
         .unwrap_or(false);
     if past_ceiling {
@@ -254,7 +255,7 @@ pub(crate) async fn generate_diagnostics_internal(
 
         // The ceiling check above already forced a stuck document out of `Loading`, so
         // this only ever suppresses a document that is genuinely, recently loading.
-        if doc.loading_state == deps_core::LoadingState::Loading {
+        if doc.loading_state() == deps_core::LoadingState::Loading {
             return None;
         }
 
@@ -1118,7 +1119,7 @@ serde = "1.0.0"
             // Critic M1: the fallthrough must repair `loading_state`, not just read past it —
             // otherwise other handlers keep believing it's still loading and the warning refires.
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.loading_state, deps_core::LoadingState::Failed);
+            assert_eq!(doc.loading_state(), deps_core::LoadingState::Failed);
         }
 
         /// Issue #632 critic S2: forcing a stuck-`Loading` document to `Failed` must seed
@@ -1183,7 +1184,7 @@ serde = "1.0.0"
             );
 
             let doc = state.get_document(&uri).unwrap();
-            assert_eq!(doc.loading_state, deps_core::LoadingState::Failed);
+            assert_eq!(doc.loading_state(), deps_core::LoadingState::Failed);
         }
 
         /// Issue #632 companion: within the ceiling, the pre-existing suppression must

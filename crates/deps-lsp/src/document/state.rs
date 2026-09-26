@@ -209,10 +209,16 @@ pub struct DocumentState {
     pub signals: PackageSignals,
     /// Last successful parse time
     pub parsed_at: Instant,
-    /// Current loading state for registry data
-    pub loading_state: LoadingState,
-    /// When the current loading operation started (for timeout/metrics)
-    pub loading_started_at: Option<Instant>,
+    /// Load lifecycle phase, replacing separately-tracked `loading_state`/`loading_started_at`
+    /// fields (#1514): those were kept in sync only by convention through
+    /// `set_loading`/`set_loaded`/`set_failed`, with nothing stopping a call site from writing
+    /// one without the other. Private — read through [`Self::loading_state`]/
+    /// [`Self::loading_started_at`], which project onto the plain, `Copy`
+    /// [`deps_core::LoadingState`] shape those callers already expect. That shared type must
+    /// stay a plain `Copy` enum (every ecosystem crate's `generate_inlay_hints` takes it by
+    /// value), so the `Instant` timestamp lives only in this crate-private [`LoadPhase`], never
+    /// on it.
+    load_phase: LoadPhase,
     /// LSP document version from the client's `didOpen`/`didChange`, `None` if this
     /// state was populated from disk (cold start) rather than an LSP notification.
     ///
@@ -220,6 +226,45 @@ pub struct DocumentState {
     /// edit whose ranges were computed against a buffer state it has since moved past
     /// (see `handlers::code_lens`).
     pub version: Option<i32>,
+}
+
+/// [`DocumentState`]'s load lifecycle, carrying [`LoadingState::Loading`]'s start [`Instant`]
+/// as part of the state itself instead of a separately-tracked, convention-only-paired field
+/// (#1514).
+#[derive(Debug, Clone, Copy)]
+enum LoadPhase {
+    /// No data loaded, not currently loading.
+    Idle,
+    /// Currently fetching registry data, running since `since`.
+    Loading {
+        /// When this loading operation started (for timeout/metrics).
+        since: Instant,
+    },
+    /// Data fetched and cached.
+    Loaded,
+    /// Fetch failed (old cached data may still be available).
+    Failed,
+}
+
+impl LoadPhase {
+    /// Projects this phase onto the plain, `Copy` [`LoadingState`] shape shared across every
+    /// ecosystem crate's `generate_inlay_hints`.
+    const fn loading_state(self) -> LoadingState {
+        match self {
+            Self::Idle => LoadingState::Idle,
+            Self::Loading { .. } => LoadingState::Loading,
+            Self::Loaded => LoadingState::Loaded,
+            Self::Failed => LoadingState::Failed,
+        }
+    }
+
+    /// The loading start instant, when [`Self::Loading`].
+    const fn loading_started_at(self) -> Option<Instant> {
+        match self {
+            Self::Loading { since } => Some(since),
+            Self::Idle | Self::Loaded | Self::Failed => None,
+        }
+    }
 }
 
 /// Tracks recent cold start attempts per URI to prevent DOS.
@@ -321,8 +366,9 @@ impl std::fmt::Debug for DocumentState {
             .field("has_parse_result", &self.parse_result.is_some())
             .field("signals", &self.signals)
             .field("parsed_at", &self.parsed_at)
-            .field("loading_state", &self.loading_state)
-            .field("loading_started_at", &self.loading_started_at)
+            .field("load_phase", &self.load_phase)
+            .field("loading_state", &self.loading_state())
+            .field("loading_started_at", &self.loading_started_at())
             .field("version", &self.version)
             .finish()
     }
@@ -343,8 +389,7 @@ impl DocumentState {
             parse_result,
             signals: PackageSignals::default(),
             parsed_at: Instant::now(),
-            loading_state: LoadingState::Idle,
-            loading_started_at: None,
+            load_phase: LoadPhase::Idle,
             version: None,
         }
     }
@@ -638,7 +683,20 @@ impl DocumentState {
     /// ```
     #[must_use]
     pub fn is_ready_for_batch_update(&self) -> bool {
-        self.loading_state != LoadingState::Loading && self.version.is_some()
+        self.loading_state() != LoadingState::Loading && self.version.is_some()
+    }
+
+    /// Current loading state for registry data, derived from the internal load phase.
+    #[must_use]
+    pub const fn loading_state(&self) -> LoadingState {
+        self.load_phase.loading_state()
+    }
+
+    /// When the current loading operation started (for timeout/metrics), derived from the
+    /// internal load phase. `None` unless [`Self::loading_state`] is [`LoadingState::Loading`].
+    #[must_use]
+    pub const fn loading_started_at(&self) -> Option<Instant> {
+        self.load_phase.loading_started_at()
     }
 
     /// Mark document as loading registry data.
@@ -651,7 +709,7 @@ impl DocumentState {
     ///
     /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
-    /// assert!(doc.loading_started_at.is_some());
+    /// assert!(doc.loading_started_at().is_some());
     /// ```
     ///
     /// # Thread Safety
@@ -660,8 +718,23 @@ impl DocumentState {
     /// `DashMap::get_mut()`, thread safety is guaranteed by the lock.
     /// Calling while already `Loading` resets the timer.
     pub fn set_loading(&mut self) {
-        self.loading_state = LoadingState::Loading;
-        self.loading_started_at = Some(Instant::now());
+        self.load_phase = LoadPhase::Loading {
+            since: Instant::now(),
+        };
+    }
+
+    /// Test-only variant of [`Self::set_loading`] that lets a test simulate elapsed loading
+    /// time (e.g. exceeding a timeout ceiling) without a real sleep, by supplying `since`
+    /// directly instead of always using `Instant::now()` — the only sanctioned way to set an
+    /// arbitrary loading start instant; a test must not write [`Self::load_phase`] directly.
+    ///
+    /// `#[cfg(all(test, feature = "cargo"))]`, not just `#[cfg(test)]`: its sole caller
+    /// (`server.rs`'s `test_handle_lockfile_change_computes_ceiling_per_uri`) is itself gated
+    /// on the `cargo` feature, so a Feature Matrix build with `cargo` off would otherwise
+    /// leave this with zero callers and fail `-D warnings` on `dead_code`.
+    #[cfg(all(test, feature = "cargo"))]
+    pub(crate) fn set_loading_since(&mut self, since: Instant) {
+        self.load_phase = LoadPhase::Loading { since };
     }
 
     /// Mark document as loaded with fresh data.
@@ -675,12 +748,11 @@ impl DocumentState {
     /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// doc.set_loaded();
-    /// assert_eq!(doc.loading_state, LoadingState::Loaded);
-    /// assert!(doc.loading_started_at.is_none());
+    /// assert_eq!(doc.loading_state(), LoadingState::Loaded);
+    /// assert!(doc.loading_started_at().is_none());
     /// ```
     pub fn set_loaded(&mut self) {
-        self.loading_state = LoadingState::Loaded;
-        self.loading_started_at = None;
+        self.load_phase = LoadPhase::Loaded;
     }
 
     /// Mark document as failed to load (keeps old cached data).
@@ -694,12 +766,11 @@ impl DocumentState {
     /// let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, "".into());
     /// doc.set_loading();
     /// doc.set_failed();
-    /// assert_eq!(doc.loading_state, LoadingState::Failed);
-    /// assert!(doc.loading_started_at.is_none());
+    /// assert_eq!(doc.loading_state(), LoadingState::Failed);
+    /// assert!(doc.loading_started_at().is_none());
     /// ```
     pub fn set_failed(&mut self) {
-        self.loading_state = LoadingState::Failed;
-        self.loading_started_at = None;
+        self.load_phase = LoadPhase::Failed;
     }
 
     /// Get current loading duration if loading.
@@ -721,7 +792,7 @@ impl DocumentState {
     /// ```
     #[must_use]
     pub fn loading_duration(&self) -> Option<Duration> {
-        self.loading_started_at
+        self.loading_started_at()
             .map(|start| Instant::now().duration_since(start))
     }
 }
@@ -1550,7 +1621,7 @@ impl ServerState {
         let Some(mut doc) = self.documents.get_mut(uri) else {
             return;
         };
-        if doc.loading_state != LoadingState::Loading {
+        if doc.loading_state() != LoadingState::Loading {
             return;
         }
 
@@ -1818,12 +1889,12 @@ mod tests {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
             let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
-            assert_eq!(doc.loading_state, LoadingState::Idle);
-            assert!(doc.loading_started_at.is_none());
+            assert_eq!(doc.loading_state(), LoadingState::Idle);
+            assert!(doc.loading_started_at().is_none());
 
             doc.set_loading();
-            assert_eq!(doc.loading_state, LoadingState::Loading);
-            assert!(doc.loading_started_at.is_some());
+            assert_eq!(doc.loading_state(), LoadingState::Loading);
+            assert!(doc.loading_started_at().is_some());
 
             // Sleep to ensure duration is non-zero.
             std::thread::sleep(Duration::from_millis(10));
@@ -1833,8 +1904,8 @@ mod tests {
             assert!(duration.unwrap() >= Duration::from_millis(10));
 
             doc.set_loaded();
-            assert_eq!(doc.loading_state, LoadingState::Loaded);
-            assert!(doc.loading_started_at.is_none());
+            assert_eq!(doc.loading_state(), LoadingState::Loaded);
+            assert!(doc.loading_started_at().is_none());
             assert!(doc.loading_duration().is_none());
         }
 
@@ -1844,11 +1915,11 @@ mod tests {
             let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
             doc.set_loading();
-            assert_eq!(doc.loading_state, LoadingState::Loading);
+            assert_eq!(doc.loading_state(), LoadingState::Loading);
 
             doc.set_failed();
-            assert_eq!(doc.loading_state, LoadingState::Failed);
-            assert!(doc.loading_started_at.is_none());
+            assert_eq!(doc.loading_state(), LoadingState::Failed);
+            assert!(doc.loading_started_at().is_none());
         }
 
         #[test]
@@ -1859,8 +1930,8 @@ mod tests {
             doc.set_loading();
             let cloned = doc.clone();
 
-            assert_eq!(cloned.loading_state, LoadingState::Loading);
-            assert!(cloned.loading_started_at.is_some());
+            assert_eq!(cloned.loading_state(), LoadingState::Loading);
+            assert!(cloned.loading_started_at().is_some());
         }
 
         #[test]
@@ -1879,7 +1950,7 @@ mod tests {
             let content = "[dependencies]\nserde = \"1.0\"".to_string();
             let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, content);
 
-            assert_eq!(doc.loading_state, LoadingState::Idle);
+            assert_eq!(doc.loading_state(), LoadingState::Idle);
             assert!(doc.loading_duration().is_none());
         }
 
@@ -1951,7 +2022,7 @@ mod tests {
 
             let doc = state.get_document(&uri).unwrap();
             assert_matches!(
-                doc.loading_state,
+                doc.loading_state(),
                 LoadingState::Idle
                     | LoadingState::Loading
                     | LoadingState::Loaded
@@ -1969,8 +2040,8 @@ mod tests {
 
             doc.set_loaded();
 
-            assert_eq!(doc.loading_state, LoadingState::Loaded);
-            assert!(doc.loading_started_at.is_none());
+            assert_eq!(doc.loading_state(), LoadingState::Loaded);
+            assert!(doc.loading_started_at().is_none());
         }
 
         #[test]
@@ -1979,15 +2050,15 @@ mod tests {
                 DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
 
             doc.set_loading();
-            let first_start = doc.loading_started_at.unwrap();
+            let first_start = doc.loading_started_at().unwrap();
 
             std::thread::sleep(std::time::Duration::from_millis(10));
 
             doc.set_loading();
-            let second_start = doc.loading_started_at.unwrap();
+            let second_start = doc.loading_started_at().unwrap();
 
             assert!(second_start > first_start, "Timer should be reset");
-            assert_eq!(doc.loading_state, LoadingState::Loading);
+            assert_eq!(doc.loading_state(), LoadingState::Loading);
         }
 
         #[test]
@@ -1997,15 +2068,15 @@ mod tests {
 
             doc.set_loading();
             doc.set_failed();
-            assert_eq!(doc.loading_state, LoadingState::Failed);
-            assert!(doc.loading_started_at.is_none());
+            assert_eq!(doc.loading_state(), LoadingState::Failed);
+            assert!(doc.loading_started_at().is_none());
 
             doc.set_loading();
-            assert_eq!(doc.loading_state, LoadingState::Loading);
-            assert!(doc.loading_started_at.is_some());
+            assert_eq!(doc.loading_state(), LoadingState::Loading);
+            assert!(doc.loading_started_at().is_some());
 
             doc.set_loaded();
-            assert_eq!(doc.loading_state, LoadingState::Loaded);
+            assert_eq!(doc.loading_state(), LoadingState::Loaded);
         }
 
         #[test]
@@ -2015,14 +2086,14 @@ mod tests {
 
             doc.set_loading();
             doc.set_loaded();
-            assert_eq!(doc.loading_state, LoadingState::Loaded);
+            assert_eq!(doc.loading_state(), LoadingState::Loaded);
 
             doc.set_loading();
-            assert_eq!(doc.loading_state, LoadingState::Loading);
-            assert!(doc.loading_started_at.is_some());
+            assert_eq!(doc.loading_state(), LoadingState::Loading);
+            assert!(doc.loading_started_at().is_some());
 
             doc.set_loaded();
-            assert_eq!(doc.loading_state, LoadingState::Loaded);
+            assert_eq!(doc.loading_state(), LoadingState::Loaded);
         }
     }
 
@@ -2551,7 +2622,7 @@ mod tests {
         let reached_failed = poll_until(std::time::Duration::from_secs(1), || {
             state
                 .get_document(&uri)
-                .is_some_and(|d| d.loading_state == LoadingState::Failed)
+                .is_some_and(|d| d.loading_state() == LoadingState::Failed)
         })
         .await;
         assert!(
@@ -2571,7 +2642,7 @@ mod tests {
             crate::lsp_types_interop::to_lsp_uri(&deps_core::test_util::test_uri("/test.toml"));
 
         let doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
-        assert_eq!(doc.loading_state, LoadingState::Idle);
+        assert_eq!(doc.loading_state(), LoadingState::Idle);
         state.update_document(uri.clone(), doc);
 
         let task = tokio::spawn(async {
@@ -2584,7 +2655,7 @@ mod tests {
 
         let doc = state.get_document(&uri).unwrap();
         assert_eq!(
-            doc.loading_state,
+            doc.loading_state(),
             LoadingState::Idle,
             "a panic before the document ever reached Loading must not force it to Failed"
         );
@@ -2627,7 +2698,7 @@ mod tests {
 
         let doc = state.get_document(&uri).unwrap();
         assert_eq!(
-            doc.loading_state,
+            doc.loading_state(),
             LoadingState::Loading,
             "an aborted (superseded) task must not force the document to Failed"
         );

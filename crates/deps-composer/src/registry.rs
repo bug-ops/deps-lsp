@@ -10,8 +10,7 @@
 
 use crate::types::{ComposerPackage, ComposerVersion};
 use deps_core::{
-    Deprecation, DepsError, HttpCache, Result, StabilityFloor, is_dot_segment,
-    lsp_helpers::dot_segment_rejection_error,
+    Deprecation, DepsError, HttpCache, Result, SafePathSegment, SegmentedPathName, StabilityFloor,
 };
 use serde::Deserialize;
 use std::any::Any;
@@ -45,52 +44,48 @@ pub fn package_url(name: &str) -> String {
 /// Display name for Packagist used in not-found and API-response error messages.
 pub const REGISTRY: &str = "Packagist";
 
-/// Builds the Packagist v2 API request URL for `name`'s version metadata.
+/// Builds the Packagist v2 API request URL for `segments`' version metadata.
 ///
-/// Packagist names are `vendor/package`; each segment is percent-encoded individually.
-/// Callers must run [`reject_dot_segment`] first — a `vendor` of exactly `.`/`..` survives
-/// encoding unchanged (`.` is an RFC 3986 unreserved character) and sits between two real
-/// `/` separators here (`{base}/p2/{vendor}/{package}.json`), so it forms an exact
-/// dot-segment that a URL parser's dot-segment normalization collapses, escaping the `/p2/`
-/// prefix (#365). The unscoped `package` segment is glued directly onto `.json` with no
-/// separator and cannot form an exact dot-segment this way, but is still gated for
-/// consistency with every other ecosystem's blanket per-segment check.
-fn p2_url(base: &str, name: &str) -> String {
-    if let Some((vendor, package)) = name.split_once('/') {
-        format!(
+/// Packagist names are `vendor/package`; each segment is percent-encoded individually. Takes
+/// [`SegmentedPathName`] rather than a raw `name: &str` so a `vendor` of exactly `.`/`..` —
+/// which survives encoding unchanged (`.` is an RFC 3986 unreserved character) and sits
+/// between two real `/` separators here (`{base}/p2/{vendor}/{package}.json`), forming an
+/// exact dot-segment a URL parser's dot-segment normalization collapses, escaping the `/p2/`
+/// prefix (#365) — cannot reach this builder unchecked: [`safe_name_segments`] is the only
+/// way to construct the argument.
+fn p2_url(base: &str, segments: SegmentedPathName<'_>) -> String {
+    match segments {
+        SegmentedPathName::Prefixed(vendor, package) => format!(
             "{base}/p2/{}/{}.json",
-            urlencoding::encode(vendor),
-            urlencoding::encode(package)
-        )
-    } else {
-        format!("{base}/p2/{}.json", urlencoding::encode(name))
+            urlencoding::encode(vendor.as_str()),
+            urlencoding::encode(package.as_str())
+        ),
+        SegmentedPathName::Single(name) => {
+            format!("{base}/p2/{}.json", urlencoding::encode(name.as_str()))
+        }
     }
 }
 
-/// Whether `name` (a bare package name, or `vendor/package` form) has a path segment that
-/// is exactly `.`/`..`, guarding against the same vulnerability class as `deps-npm`'s
-/// `has_dot_segment` — not identical to it, though: npm strips a leading `@` scope marker
-/// before splitting, which this does not need to (a Composer vendor name never starts with
-/// `@`).
-fn has_dot_segment(name: &str) -> bool {
+/// Splits `name` (a bare package name, or `vendor/package` form) into validated
+/// [`SegmentedPathName`] segments before it would reach [`p2_url`], or
+/// `DepsError::PackageNotFound` if either segment is exactly `.`/`..` — guarding against the
+/// same vulnerability class as `deps-npm`'s scoped-name split, not identical to it though:
+/// npm strips a leading `@` scope marker before splitting, which this does not need to (a
+/// Composer vendor name never starts with `@`).
+fn safe_name_segments(name: &str) -> Result<SegmentedPathName<'_>> {
+    const CONTEXT: &str = "Packagist p2 metadata request URL";
+    // `SafePathSegment::checked_or_reject` reports the full `name` in its error/log, not just
+    // the rejected sub-segment — a bare ".." tells a reader far less than "vendor/.." does
+    // about which declared dependency triggered the rejection.
     if let Some((vendor, package)) = name.split_once('/') {
-        return is_dot_segment(vendor) || is_dot_segment(package);
+        Ok(SegmentedPathName::Prefixed(
+            SafePathSegment::checked_or_reject(vendor, name, CONTEXT, REGISTRY)?,
+            SafePathSegment::checked_or_reject(package, name, CONTEXT, REGISTRY)?,
+        ))
+    } else {
+        SafePathSegment::checked_or_reject(name, name, CONTEXT, REGISTRY)
+            .map(SegmentedPathName::Single)
     }
-    is_dot_segment(name)
-}
-
-/// Rejects a dot-segment `name` before it would reach [`p2_url`], as
-/// `DepsError::PackageNotFound`.
-fn reject_dot_segment(name: &str) -> Result<()> {
-    if has_dot_segment(name) {
-        return Err(dot_segment_rejection_error(
-            "is_dot_segment",
-            "Packagist p2 metadata request URL",
-            name,
-            REGISTRY,
-        ));
-    }
-    Ok(())
 }
 
 /// Composer's own wildcard-requirement existence-check ladder (#421 S2).
@@ -256,8 +251,8 @@ impl PackagistRegistry {
     /// Returns an error if the HTTP request or JSON parsing fails.
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<ComposerVersion>> {
-        reject_dot_segment(name)?;
-        let url = p2_url(&self.base, name);
+        let segments = safe_name_segments(name)?;
+        let url = p2_url(&self.base, segments);
         let data = self.cache.get_cached(&url).await?;
         parse_package_metadata(name, &data)
     }
@@ -462,10 +457,6 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
             continue;
         }
 
-        let abandoned = current
-            .abandoned
-            .as_ref()
-            .is_some_and(|v| v.as_bool() == Some(true) || v.is_string());
         let deprecation = deprecation_from_abandoned(current.abandoned.as_ref());
 
         result.push(ComposerVersion {
@@ -474,7 +465,6 @@ fn expand_minified_versions(entries: Vec<MinifiedVersion>) -> Vec<ComposerVersio
                 .version_normalized
                 .clone()
                 .unwrap_or_else(|| version.clone()),
-            abandoned,
             deprecation,
             published_at,
             license: current.license.clone().unwrap_or_default(),
@@ -662,42 +652,33 @@ mod tests {
     }
 
     #[test]
-    fn test_reject_dot_segment_rejects_bare_dot_dot() {
-        assert!(reject_dot_segment("..").is_err());
+    fn test_safe_name_segments_rejects_bare_dot_dot() {
+        assert!(safe_name_segments("..").is_err());
     }
 
     #[test]
-    fn test_reject_dot_segment_rejects_vendor_dot_dot() {
-        assert!(reject_dot_segment("../evil").is_err());
+    fn test_safe_name_segments_rejects_vendor_dot_dot() {
+        assert!(safe_name_segments("../evil").is_err());
     }
 
     #[test]
-    fn test_reject_dot_segment_rejects_package_dot_dot() {
-        assert!(reject_dot_segment("vendor/..").is_err());
+    fn test_safe_name_segments_rejects_package_dot_dot() {
+        assert!(safe_name_segments("vendor/..").is_err());
     }
 
     #[test]
-    fn test_reject_dot_segment_accepts_normal_names() {
-        assert!(reject_dot_segment("monolog/monolog").is_ok());
-        assert!(reject_dot_segment("symfony").is_ok());
+    fn test_safe_name_segments_accepts_normal_names() {
+        assert!(safe_name_segments("monolog/monolog").is_ok());
+        assert!(safe_name_segments("symfony").is_ok());
     }
 
-    /// Demonstrates the vulnerability `reject_dot_segment` exists to prevent: `p2_url`
-    /// alone (with no caller-side guard) builds a URL that, once parsed, has already lost
-    /// the `p2` path component for a `vendor` of exactly `..`.
-    #[test]
-    fn test_p2_url_bare_dot_dot_vendor_normalizes_above_p2_prefix() {
-        let url = p2_url("https://repo.packagist.org", "../evil");
-        let parsed = url::Url::parse(&url).unwrap();
-        assert_eq!(
-            parsed.path(),
-            "/evil.json",
-            "parsed path: {}",
-            parsed.path()
-        );
-    }
+    // A `p2_url("https://repo.packagist.org", "../evil")` call demonstrating the
+    // vulnerability `safe_name_segments` exists to prevent used to live here — it no longer
+    // compiles: `p2_url` only accepts a `SegmentedPathName`, which only `safe_name_segments`
+    // can construct, so calling the sink with an unchecked `vendor` is now a compile error
+    // rather than a runtime-tested invariant.
 
-    /// #365 regression sweep: exercises the real production `reject_dot_segment` gate and
+    /// #365 regression sweep: exercises the real production `safe_name_segments` gate and
     /// `p2_url` sink together against the shared adversarial input set (varying vendor,
     /// then package), guarding against a 6th recurrence of the dot-segment defect class in
     /// this crate.
@@ -706,9 +687,9 @@ mod tests {
         deps_core::test_util::assert_dot_segment_gated_or_contained(
             |seg| {
                 let name = format!("{seg}/package");
-                reject_dot_segment(&name)
+                safe_name_segments(&name)
                     .ok()
-                    .map(|()| p2_url("https://repo.packagist.org", &name))
+                    .map(|segments| p2_url("https://repo.packagist.org", segments))
             },
             "repo.packagist.org",
             "/p2/",
@@ -716,9 +697,9 @@ mod tests {
         deps_core::test_util::assert_dot_segment_gated_or_contained(
             |seg| {
                 let name = format!("vendor/{seg}");
-                reject_dot_segment(&name)
+                safe_name_segments(&name)
                     .ok()
-                    .map(|()| p2_url("https://repo.packagist.org", &name))
+                    .map(|segments| p2_url("https://repo.packagist.org", segments))
             },
             "repo.packagist.org",
             "/p2/",
@@ -764,7 +745,7 @@ mod tests {
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version, "3.0.0");
         assert_eq!(versions[1].version, "2.0.0");
-        assert!(!versions[0].abandoned);
+        assert!(!versions[0].abandoned());
     }
 
     #[test]
@@ -894,7 +875,7 @@ mod tests {
 
         let versions = expand_minified_versions(entries);
         assert_eq!(versions.len(), 1);
-        assert!(versions[0].abandoned);
+        assert!(versions[0].abandoned());
         assert_eq!(
             versions[0].deprecation,
             Some(Deprecation {
@@ -1282,15 +1263,16 @@ mod tests {
                 Box::new(ComposerVersion {
                     version: "2.0.0".into(),
                     version_normalized: "2.0.0.0".into(),
-                    abandoned: true,
-                    deprecation: None,
+                    deprecation: Some(deps_core::Deprecation {
+                        reason: None,
+                        replacement: None,
+                    }),
                     published_at: None,
                     license: vec![],
                 }),
                 Box::new(ComposerVersion {
                     version: "1.0.0".into(),
                     version_normalized: "1.0.0.0".into(),
-                    abandoned: false,
                     deprecation: None,
                     published_at: None,
                     license: vec![],
@@ -1319,16 +1301,20 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0".into(),
                 version_normalized: "2.0.0.0".into(),
-                abandoned: true,
-                deprecation: None,
+                deprecation: Some(deps_core::Deprecation {
+                    reason: None,
+                    replacement: None,
+                }),
                 published_at: None,
                 license: vec![],
             }),
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
-                abandoned: true,
-                deprecation: None,
+                deprecation: Some(deps_core::Deprecation {
+                    reason: None,
+                    replacement: None,
+                }),
                 published_at: None,
                 license: vec![],
             }),
@@ -1390,7 +1376,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1398,7 +1383,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1424,7 +1408,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1432,7 +1415,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1490,7 +1472,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0-a1".into(),
                 version_normalized: "2.0.0.0-alpha1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1498,7 +1479,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1523,7 +1503,6 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
             version: "1.0.0-a1".into(),
             version_normalized: "1.0.0.0-alpha1".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -1583,7 +1562,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0-beta2".into(),
                 version_normalized: "2.0.0.0-beta2".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1591,7 +1569,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1645,7 +1622,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0-alpha1".into(),
                 version_normalized: "2.0.0.0-alpha1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1653,7 +1629,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0-beta1".into(),
                 version_normalized: "2.0.0.0-beta1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1661,7 +1636,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1780,7 +1754,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0-beta1".into(),
                 version_normalized: "1.5.0.0-beta1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1788,7 +1761,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1814,7 +1786,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0-alpha1".into(),
                 version_normalized: "1.5.0.0-alpha1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1822,7 +1793,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1849,7 +1819,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0-beta1".into(),
                 version_normalized: "1.5.0.0-beta1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1857,7 +1826,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1883,7 +1851,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0-beta1".into(),
                 version_normalized: "1.5.0.0-beta1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1891,7 +1858,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.4.0-RC1".into(),
                 version_normalized: "1.4.0.0-RC1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1899,7 +1865,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1926,7 +1891,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0-alpha1".into(),
                 version_normalized: "1.5.0.0-alpha1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1934,7 +1898,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1959,7 +1922,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0-alpha1".into(),
                 version_normalized: "1.5.0.0-alpha1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1967,7 +1929,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.0.0".into(),
                 version_normalized: "1.0.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -1994,7 +1955,6 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
             version: "1.5.0-beta1".into(),
             version_normalized: "1.5.0.0-beta1".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -2017,7 +1977,6 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
             version: "1.5.0-alpha1".into(),
             version_normalized: "1.5.0.0-alpha1".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -2064,7 +2023,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0a1".into(),
                 version_normalized: "2.0.0a1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2072,7 +2030,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2098,7 +2055,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0a1".into(),
                 version_normalized: "2.0.0a1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2106,7 +2062,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2130,7 +2085,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0dev".into(),
                 version_normalized: "2.0.0dev".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2138,7 +2092,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2167,7 +2120,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "v2.3.0-alpha.1".into(),
                 version_normalized: "2.3.0.0-alpha1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2175,7 +2127,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "v2.2.8".into(),
                 version_normalized: "2.2.8.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2202,7 +2153,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "V3.0.0-RC1".into(),
                 version_normalized: "3.0.0.0-RC1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2210,7 +2160,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "v2.9.0".into(),
                 version_normalized: "2.9.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2241,7 +2190,6 @@ mod tests {
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(ComposerVersion {
             version: "V3.1.0".into(),
             version_normalized: "3.1.0.0".into(),
-            abandoned: false,
             deprecation: None,
             published_at: None,
             license: vec![],
@@ -2271,7 +2219,6 @@ mod tests {
                 // `version_normalized` deliberately left un-hyphenated (mirrors a Packagist
                 // response that never expanded it) so the primary path must catch this alone.
                 version_normalized: "2.0.0RC1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2279,7 +2226,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2305,7 +2251,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.0.0RC1".into(),
                 version_normalized: "2.0.0RC1".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2313,7 +2258,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "1.5.0".into(),
                 version_normalized: "1.5.0.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2339,7 +2283,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.6.3.alpha".into(),
                 version_normalized: "2.6.3.0-alpha".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2347,7 +2290,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.6.2".into(),
                 version_normalized: "2.6.2.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2374,7 +2316,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.6.3.alpha".into(),
                 version_normalized: "2.6.3.0-alpha".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
@@ -2382,7 +2323,6 @@ mod tests {
             Box::new(ComposerVersion {
                 version: "2.6.2".into(),
                 version_normalized: "2.6.2.0".into(),
-                abandoned: false,
                 deprecation: None,
                 published_at: None,
                 license: vec![],
