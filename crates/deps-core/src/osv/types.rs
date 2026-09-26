@@ -2270,7 +2270,7 @@ mod osv_version_validation_tests {
         };
 
         let log = crate::test_util::capture_tracing_output(|| {
-            assert!(record.into_advisory("pkg", "crates.io").is_none());
+            assert!(record.into_advisory("pkg", OsvEcosystem::CratesIo).is_none());
         });
 
         assert_eq!(
