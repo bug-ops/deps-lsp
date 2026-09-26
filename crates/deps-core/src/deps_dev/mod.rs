@@ -1686,8 +1686,18 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.trust_signal(DepsDevSystem::Npm, ".", "1.0.0").await.is_none());
-        assert!(client.trust_signal(DepsDevSystem::Npm, "..", "1.0.0").await.is_none());
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, ".", "1.0.0")
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, "..", "1.0.0")
+                .await
+                .is_none()
+        );
         call.assert_async().await;
     }
 
@@ -1702,8 +1712,18 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.trust_signal(DepsDevSystem::Npm, "left-pad", ".").await.is_none());
-        assert!(client.trust_signal(DepsDevSystem::Npm, "left-pad", "..").await.is_none());
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, "left-pad", ".")
+                .await
+                .is_none()
+        );
+        assert!(
+            client
+                .trust_signal(DepsDevSystem::Npm, "left-pad", "..")
+                .await
+                .is_none()
+        );
         call.assert_async().await;
     }
 
@@ -2540,8 +2560,18 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.similar_packages(DepsDevSystem::Npm, ".").await.is_empty());
-        assert!(client.similar_packages(DepsDevSystem::Npm, "..").await.is_empty());
+        assert!(
+            client
+                .similar_packages(DepsDevSystem::Npm, ".")
+                .await
+                .is_empty()
+        );
+        assert!(
+            client
+                .similar_packages(DepsDevSystem::Npm, "..")
+                .await
+                .is_empty()
+        );
         call.assert_async().await;
     }
 
