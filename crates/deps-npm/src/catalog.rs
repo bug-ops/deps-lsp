@@ -591,11 +591,9 @@ fn resolve(
         None => CatalogOutcome::MissingEntry,
         Some(CatalogValue::Malformed) => CatalogOutcome::MalformedEntry,
         Some(CatalogValue::Range(range)) => {
-            // #1483: reject before `node_semver::Range::parse` ever sees it — that parser
-            // allocates roughly 1.6 KB per `||` alternative, so an unbounded range string
-            // is a resource-exhaustion vector. Same cap `requirement_is_unsatisfiable`
-            // applies to every other npm requirement before compiling it.
-            if range.len() > deps_core::lsp_helpers::MAX_REQUIREMENT_LEN {
+            // #1483: reject before `Range::parse` ever sees it (see
+            // `requirement_len_exceeds_cap`'s docs).
+            if deps_core::lsp_helpers::requirement_len_exceeds_cap(range) {
                 return CatalogOutcome::RequirementTooLong;
             }
             match node_semver::Range::parse(range) {

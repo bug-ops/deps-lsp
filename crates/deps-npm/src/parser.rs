@@ -504,7 +504,19 @@ fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
     // No requirement, an empty one, or a dist-tag (`"beta"`/`"latest"`) `node_semver::Range`
     // can't parse is still a valid alias: treat it as an existence wildcard rather than
     // fabricating an invalid range or dropping the dependency (mirrors `is_existence_wildcard`).
-    let version_req = if version_req.is_empty() || node_semver::Range::parse(version_req).is_err() {
+    //
+    // An oversized requirement (see `requirement_len_exceeds_cap`'s docs) skips `Range::parse`
+    // entirely and is kept verbatim: mapping it to `"*"` would fabricate an existence wildcard
+    // and falsely report the real aliased package as up to date.
+    let version_req = if version_req.is_empty() {
+        "*"
+    } else if deps_core::lsp_helpers::requirement_len_exceeds_cap(version_req) {
+        tracing::debug!(
+            len = version_req.len(),
+            "npm: alias version requirement exceeds max length, keeping literal value"
+        );
+        version_req
+    } else if node_semver::Range::parse(version_req).is_err() {
         "*"
     } else {
         version_req
@@ -1306,6 +1318,47 @@ mod tests {
 }"#;
 
         let result = parse_package_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, Some("react".into()));
+        assert_eq!(dep.version_req, Some("*".into()));
+    }
+
+    /// #1490 (CWE-400): an alias version requirement longer than `MAX_REQUIREMENT_LEN` must
+    /// skip `node_semver::Range::parse` entirely (that parser allocates roughly 1.6 KB per
+    /// `||` alternative, so an unbounded string is a resource-exhaustion vector) and be kept
+    /// verbatim — mapping it to `"*"` would fabricate an existence wildcard and falsely report
+    /// the real aliased package as up to date.
+    #[test]
+    fn test_parse_npm_alias_oversized_version_kept_verbatim() {
+        let oversized = "1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN + 1);
+        let json = format!(r#"{{"dependencies": {{"my-react": "npm:react@{oversized}"}}}}"#);
+
+        let result = parse_package_json(&json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, Some("react".into()));
+        assert_eq!(dep.version_req, Some(oversized.into()));
+    }
+
+    /// The cap is exclusive: an alias version requirement of exactly `MAX_REQUIREMENT_LEN`
+    /// bytes must still reach `node_semver::Range::parse`, matching
+    /// `requirement_is_unsatisfiable`'s own `> MAX_REQUIREMENT_LEN` boundary. The payload is
+    /// deliberately unparseable (a 256-digit number overflows `node_semver`'s internal `u64`
+    /// component parse) rather than a valid range: a valid range at the cap would fall
+    /// through to the verbatim-value `else` branch either way, so it can't distinguish this
+    /// gate's correct exclusive `>` from a buggy `>=` — only an unparseable at-cap payload
+    /// that reaches the parser and is rejected there (falling back to `"*"`) proves the gate
+    /// itself didn't fire early (impl-critic S1).
+    #[test]
+    fn test_parse_npm_alias_version_at_length_cap_reaches_parser() {
+        let at_cap = "1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN);
+        assert_eq!(at_cap.len(), deps_core::lsp_helpers::MAX_REQUIREMENT_LEN);
+        assert!(
+            node_semver::Range::parse(&at_cap).is_err(),
+            "test fixture must be unparseable to distinguish the exclusive `>` gate from a buggy `>=`"
+        );
+        let json = format!(r#"{{"dependencies": {{"my-react": "npm:react@{at_cap}"}}}}"#);
+
+        let result = parse_package_json(&json, &test_uri()).unwrap();
         let dep = &result.dependencies[0];
         assert_eq!(dep.package, Some("react".into()));
         assert_eq!(dep.version_req, Some("*".into()));
