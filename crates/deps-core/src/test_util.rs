@@ -958,6 +958,43 @@ pub fn stub_parse_result_with_dependencies(count: usize) -> Box<dyn crate::Parse
     })
 }
 
+/// Builds a [`crate::GossipFindings`] fixture for one package version, with an optional
+/// active-or-expired cooldown.
+///
+/// For a cross-crate test (e.g. `deps-engine`'s fetch-level GOSSIP filter, spec 074) that
+/// needs a value of this `#[non_exhaustive]` type without going through a live/mocked
+/// `DepsDevClient` HTTP round trip. Mirrors [`stub_parse_result_with_dependencies`]'s role
+/// for [`crate::ParseResult`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PublishTime;
+/// use deps_core::deps_dev::{GossipCooldown, GossipRiskLevel};
+/// use deps_core::test_util::stub_gossip_findings;
+///
+/// let findings = stub_gossip_findings(
+///     "2.0.0",
+///     Some(GossipCooldown::new(
+///         PublishTime::from_unix_secs(i64::MAX / 2),
+///         GossipRiskLevel::High,
+///     )),
+/// );
+/// assert_eq!(findings.version, "2.0.0");
+/// assert!(findings.cooldown.is_some());
+/// ```
+#[must_use]
+pub fn stub_gossip_findings(
+    version: impl Into<String>,
+    cooldown: Option<crate::deps_dev::GossipCooldown>,
+) -> crate::GossipFindings {
+    crate::GossipFindings {
+        version: version.into(),
+        cooldown,
+        low_usage: None,
+    }
+}
+
 #[cfg(all(test, feature = "test-util"))]
 mod tests {
     use super::capture_tracing_output;

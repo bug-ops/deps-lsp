@@ -85,10 +85,16 @@ fn sanitizing_field_format()
     .delimited(" ")
 }
 
-/// Shared per-run handles: HTTP cache, OSV client, lock-file cache, and the ecosystem
-/// registry — built identically for `check` and `update`.
+/// Shared per-run handles: HTTP cache, OSV client, deps.dev (GOSSIP) client, lock-file
+/// cache, and the ecosystem registry — built identically for `check` and `update`.
 struct RuntimeHandles {
     osv: Arc<OsvClient>,
+    /// Always constructed (spec 074 FR-001) — construction alone makes no network call, so
+    /// there is no cost to building this unconditionally. Every call site threads it as
+    /// `Option<&Arc<DepsDevClient>>`, `None` when `!policy.gossip.enabled`, and the reused
+    /// `deps_core::lsp_helpers::fetch_gossip_findings_batch` helper short-circuits before
+    /// any HTTP request on `None` (mirrors `deps-lsp`'s own always-built `DocumentState::deps_dev`).
+    deps_dev: Arc<deps_core::DepsDevClient>,
     lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
     cache: Arc<HttpCache>,
     ecosystem_registry: EcosystemRegistry,
@@ -114,6 +120,7 @@ fn build_runtime_handles(policy: &PolicyConfig) -> RuntimeHandles {
 
     RuntimeHandles {
         osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+        deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
         lockfile_cache,
         cache,
         ecosystem_registry,
@@ -195,6 +202,7 @@ async fn run_check(
     let ctx = CheckContext {
         cache: Arc::clone(&handles.cache),
         osv: handles.osv,
+        deps_dev: handles.deps_dev,
         lockfile_cache: handles.lockfile_cache,
         policy,
     };
@@ -368,12 +376,26 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
     // freshness-filtered registry pick. Warn, don't reject; comparing the final resolved
     // `policy` value (after `apply_overrides`) against the default catches both sources
     // uniformly instead of checking `args.cooldown` alone.
-    if args.security_only
-        && policy.freshness.cooldown_secs != PolicyConfig::default().freshness.cooldown_secs
-    {
-        eprintln!(
-            "deps-cli: warning: a non-default freshness cooldown has no effect under --security-only (the fix target comes from the advisory, not the freshness-filtered registry pick)"
-        );
+    //
+    // Spec 074 FR-006: GOSSIP's fetch-level cooldown exclusion (FR-003) is, for the exact
+    // same reason, equally without effect under `--security-only` — extended here rather
+    // than as a second independent warning so both no-op cooldown sources are named in one
+    // place when both apply.
+    if args.security_only {
+        let freshness_non_default =
+            policy.freshness.cooldown_secs != PolicyConfig::default().freshness.cooldown_secs;
+        let gossip_enabled = policy.gossip.enabled;
+        let source = match (freshness_non_default, gossip_enabled) {
+            (true, true) => Some("a non-default freshness cooldown and GOSSIP"),
+            (true, false) => Some("a non-default freshness cooldown"),
+            (false, true) => Some("GOSSIP"),
+            (false, false) => None,
+        };
+        if let Some(source) = source {
+            eprintln!(
+                "deps-cli: warning: {source} has no effect under --security-only (the fix target comes from the advisory, not the freshness/GOSSIP-filtered registry pick)"
+            );
+        }
     }
 
     // FR-015: hard-error rather than silently scanning zero dependencies and exiting 0.
@@ -501,6 +523,7 @@ async fn run_update(
     let ctx = CheckContext {
         cache: Arc::clone(&handles.cache),
         osv: Arc::clone(&handles.osv),
+        deps_dev: Arc::clone(&handles.deps_dev),
         lockfile_cache: handles.lockfile_cache,
         policy,
     };

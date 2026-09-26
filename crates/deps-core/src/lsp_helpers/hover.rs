@@ -3740,6 +3740,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -3789,6 +3790,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -3860,6 +3862,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -3907,6 +3910,7 @@ mod tests {
                 available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -3953,6 +3957,7 @@ mod tests {
                 available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -4023,6 +4028,7 @@ mod tests {
                 published_at: Some(PublishTime::from_unix_secs(
                     now.as_unix_secs() - 90 * 24 * 60 * 60,
                 )),
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();

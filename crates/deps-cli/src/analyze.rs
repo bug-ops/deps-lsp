@@ -223,6 +223,20 @@ pub async fn analyze_manifest(
         .map(|(name, _)| name.clone())
         .collect();
 
+    // Spec 074 FR-002: one batch prefetch per manifest, mirroring `prefetch_tier3_licenses`'s
+    // own "prefetch once, thread the result through" shape below. `None` when
+    // `!ctx.policy.gossip.enabled` short-circuits `fetch_gossip_findings_batch` before any
+    // HTTP call (FR-009) — construction of `ctx.deps_dev` itself is unconditional (FR-001).
+    let gossip_client = ctx.policy.gossip.enabled.then_some(&ctx.deps_dev);
+    let gossip_findings = deps_core::lsp_helpers::fetch_gossip_findings_batch(
+        ecosystem_id,
+        parse_result.as_ref(),
+        formatter,
+        ctx.policy.network.offline,
+        gossip_client,
+    )
+    .await;
+
     let fetch_result = fetch_latest_versions_parallel(
         ecosystem.registry(),
         prep.dep_sources,
@@ -232,6 +246,7 @@ pub async fn analyze_manifest(
         ctx.policy.cache.fetch_timeout_secs,
         ctx.policy.cache.max_concurrent_fetches,
         &prep.selection_context,
+        Some(&gossip_findings),
     )
     .await;
     // `fetch_failed` (genuine failures only), not `failure_summary`'s count, which also

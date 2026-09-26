@@ -160,7 +160,7 @@ need per-ecosystem `Registry` trait changes to filter the fallback itself); see 
 | NFR-002 | Reliability | A `DepsDevClient` error, timeout, or empty batch result degrades silently to local-freshness-only exclusion (FR-009) — `deps-cli check`/`update` never fail or change exit code solely because a GOSSIP call errored |
 | NFR-003 | Privacy | Per FR-009, no dependency name reaches deps.dev unless `[gossip].enabled = true`, the run is not offline, and the dependency's source passes the same public-registry-content gate spec 072 already established — identical policy, no new opt-in surface |
 | NFR-004 | Consistency | `deps-cli` and `deps-lsp` are explicitly allowed to diverge in *how* GOSSIP data is surfaced (per spec 072 FR-007: `cooldown_secs` remains deps-cli's own, unchanged, non-GOSSIP-overridden source outside this feature's additive filter) — this spec does not attempt to unify the two surfaces' precedence models, only to give `deps-cli` a working GOSSIP signal of its own |
-| NFR-005 | Maintainability | Zero new `deps-core` code — every type (`GossipFindings`, `GossipCooldown`, `fetch_gossip_findings_batch`) and every concurrency/privacy control already ships from spec 072/PR #1473. This spec only adds wiring in `deps-engine` and `deps-cli` | 
+| NFR-005 | Maintainability | No new deps.dev data types, endpoints, or client methods — every GOSSIP type (`GossipFindings`, `GossipCooldown`, `fetch_gossip_findings_batch`) and every concurrency/privacy control already ships from spec 072/PR #1473. **Corrected round 1**: `deps-core` does gain one small, additive outcome-reporting field (`PackageVersions::gossip_excluded_version`, §5), since the attribution requirement (FR-005) lives on a type shared with `deps-lsp` — "zero new deps-core code" was never literally true once that's accounted for, and this row's original wording contradicted §5's own data model from the start | 
 
 ## 5. Data Model
 
@@ -197,7 +197,7 @@ New, additive-only field proposed in `plan.md` §3: an attribution marker on `Pa
 | SC-005 | Regression coverage for C1a/C1b/S1 (rounds 1-2 critique) | Dedicated tests: in-use version itself flagged (C1a: floor neutralizes exclusion, no attribution), in-use version safe with a newer flagged release above it (T2: exclusion applies, attribution set), no in-use version at all with the sole candidate flagged (C1b: asserted as a no-op — GOSSIP changes nothing, not merely "documented as still-broken"), and a floor-protected candidate list whose ecosystem-level selection still yields no pick (S1: unfiltered pick used, `get_latest_matching_from` never invoked) |
 | SC-002 | `--fail-on`/`Category` enum | Zero new variants added; `cargo clippy`'s exhaustiveness checks pass unchanged |
 | SC-003 | `[gossip]`/`[typosquat]` warning parity | Warning fires identically for auto-discovered and explicit `--config` paths; `safe_auto_discovered_config`'s reset behavior is unchanged for the auto-discovered path |
-| SC-004 | New `deps-core` code | Zero — verified via `git diff --stat crates/deps-core` on the implementing PR |
+| SC-004 | New `deps-core` code | No new GOSSIP data types, endpoints, or client methods (`git diff --stat crates/deps-core/src/deps_dev` is empty on the implementing PR) — the one additive `PackageVersions` field is expected, not a scope violation (see NFR-005's round-1 correction) |
 
 ## 8. Agent Boundaries
 

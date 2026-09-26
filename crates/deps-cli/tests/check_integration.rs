@@ -61,6 +61,7 @@ fn offline_context() -> (EcosystemRegistry, CheckContext) {
     let ctx = CheckContext {
         cache: Arc::clone(&cache),
         osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+        deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
         lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
         policy,
     };
@@ -628,6 +629,7 @@ async fn test_follow_symlinks_lockfile_lookup_uses_symlinks_directory_not_target
     let buggy_ctx = CheckContext {
         cache: Arc::clone(&ctx.cache),
         osv: Arc::clone(&ctx.osv),
+        deps_dev: Arc::clone(&ctx.deps_dev),
         lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
         policy: ctx.policy.clone(),
     };
@@ -665,6 +667,7 @@ fn live_context(license_policy: LicensePolicyConfig) -> (EcosystemRegistry, Chec
     let ctx = CheckContext {
         cache: Arc::clone(&cache),
         osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+        deps_dev: Arc::new(deps_core::DepsDevClient::new(Arc::clone(&cache))),
         lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
         policy,
     };
@@ -855,7 +858,8 @@ mod tier3_wiring_regression {
         let cache = Arc::new(HttpCache::new());
         CheckContext {
             cache: Arc::clone(&cache),
-            osv: Arc::new(OsvClient::new(cache)),
+            osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+            deps_dev: Arc::new(deps_core::DepsDevClient::new(cache)),
             lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
             policy,
         }

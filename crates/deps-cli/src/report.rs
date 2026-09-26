@@ -319,6 +319,11 @@ pub struct CheckContext {
     pub cache: Arc<HttpCache>,
     /// Shared OSV.dev vulnerability scan client.
     pub osv: Arc<OsvClient>,
+    /// Shared deps.dev client for GOSSIP cooldown findings (spec 074) — always constructed,
+    /// regardless of `policy.gossip.enabled`; see `deps-cli::main::RuntimeHandles::deps_dev`'s
+    /// doc for why. [`crate::analyze::analyze_manifest`] passes it through as
+    /// `Option<&Arc<DepsDevClient>>`, `None` when GOSSIP is disabled.
+    pub deps_dev: Arc<deps_core::DepsDevClient>,
     /// Shared lock-file cache, keyed by resolved lockfile path.
     pub lockfile_cache: Arc<deps_core::lockfile::LockFileCache>,
     /// The resolved policy configuration for this run.
@@ -438,6 +443,7 @@ pub async fn check_manifest(
                 diagnostic,
                 &advisory_severities,
                 &vuln_keys,
+                &analysis.cached_versions,
             )
         })
         .collect();
@@ -533,6 +539,12 @@ fn advisory_severity_index(
 /// (from [`DependencyIndex`]), its `dependency_name`/`requirement`. `advisory_severities` and
 /// `vuln_keys` together resolve [`CheckFinding::advisory_severity`] — see
 /// [`advisory_severity_index`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal (non-pub) call-site-controlled classification/attribution inputs; \
+              grouping into a struct would only move, not reduce, the single production \
+              call site's churn"
+)]
 fn to_finding(
     ecosystem: EcosystemId,
     display_path: &Path,
@@ -541,6 +553,7 @@ fn to_finding(
     diagnostic: Diagnostic,
     advisory_severities: &HashMap<(deps_core::osv::VulnKey, String), VulnSeverity>,
     vuln_keys: &VulnKeys,
+    cached_versions: &HashMap<deps_core::PackageName, deps_core::lsp_helpers::PackageVersions>,
 ) -> CheckFinding {
     let category = classify(&diagnostic, formatter);
     let dep = dep_index.lookup(diagnostic.range);
@@ -559,6 +572,23 @@ fn to_finding(
             .get(&(dependency_key, code.to_string()))
             .copied()
     });
+    // Spec 074 FR-005: attribute an `Outdated` finding to an active GOSSIP cooldown when it
+    // is the sole reason a newer version was excluded from being "latest" — matched by the
+    // occurrence's own (pre-redaction) `PackageName`, never `CheckFinding::dependency_name`
+    // (already redacted by this point, and not guaranteed to equal `cached_versions`'s raw
+    // key). No `deps-core` change: this only reads the additive
+    // `PackageVersions::gossip_excluded_version` field `deps-engine`'s fetch already set.
+    let mut message = diagnostic.message().to_string();
+    if category == Category::Outdated
+        && let Some(dep) = dep
+        && cached_versions
+            .get(dep.name())
+            .is_some_and(|v| v.gossip_excluded_version.is_some())
+    {
+        message.push_str(
+            " (a newer version was excluded from this pick by an active GOSSIP cooldown finding)",
+        );
+    }
     CheckFinding {
         ecosystem,
         manifest_path: crate::sanitize::sanitize_path_for_display(display_path),
@@ -572,7 +602,7 @@ fn to_finding(
         advisory_severity,
         severity: diagnostic.severity.unwrap_or(Severity::Warning),
         range: diagnostic.range,
-        message: diagnostic.message().to_string(),
+        message,
     }
 }
 
@@ -910,6 +940,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
         assert_eq!(finding.code.as_deref(), Some("RUSTSEC-2024-0001"));
     }
@@ -927,8 +958,66 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
         assert!(finding.code.is_none());
+    }
+
+    /// Spec 074 FR-005: an `Outdated` finding whose dependency has a
+    /// `gossip_excluded_version` in `cached_versions` is attributed to GOSSIP in its message.
+    #[test]
+    fn test_to_finding_attributes_outdated_to_gossip_when_excluded() {
+        let parse_result = dep_index_with_named_dependency("serde");
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Newer version available: 1.0.0");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            PackageName::new("serde"),
+            deps_core::lsp_helpers::PackageVersions::latest_only("1.0.0")
+                .with_gossip_excluded_version(deps_core::ConcreteVersion::new("2.0.0")),
+        );
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &STUB_FORMATTER,
+            diagnostic,
+            &HashMap::new(),
+            &VulnKeys::default(),
+            &cached_versions,
+        );
+        assert_eq!(finding.category, Category::Outdated);
+        assert!(
+            finding.message.contains("GOSSIP"),
+            "message must attribute the exclusion to GOSSIP: {:?}",
+            finding.message
+        );
+    }
+
+    /// The same dependency with no `gossip_excluded_version` set must not gain the
+    /// attribution suffix.
+    #[test]
+    fn test_to_finding_does_not_attribute_when_no_gossip_exclusion() {
+        let parse_result = dep_index_with_named_dependency("serde");
+        let dep_index = DependencyIndex::build(parse_result.as_ref());
+        let diagnostic = diagnostic_with(None, "Newer version available: 1.0.0");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            PackageName::new("serde"),
+            deps_core::lsp_helpers::PackageVersions::latest_only("1.0.0"),
+        );
+        let finding = to_finding(
+            EcosystemId::Cargo,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &STUB_FORMATTER,
+            diagnostic,
+            &HashMap::new(),
+            &VulnKeys::default(),
+            &cached_versions,
+        );
+        assert_eq!(finding.category, Category::Outdated);
+        assert!(!finding.message.contains("GOSSIP"));
     }
 
     #[test]
@@ -948,6 +1037,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
         assert_eq!(
             finding.advisory_url.as_deref(),
@@ -968,6 +1058,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
         assert!(finding.advisory_url.is_none());
     }
@@ -991,6 +1082,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
 
         let name = finding
@@ -1023,6 +1115,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
 
         let sarif = crate::format::sarif::to_sarif(&CheckReport {
@@ -1070,6 +1163,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
 
         let sanitized = finding.manifest_path.to_string_lossy().into_owned();
@@ -1135,6 +1229,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
 
         let requirement = finding.requirement.expect("range matched the dependency");
@@ -1167,6 +1262,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &VulnKeys::default(),
+            &HashMap::new(),
         );
 
         let report = CheckReport {
@@ -1222,6 +1318,7 @@ mod tests {
             diagnostic,
             &severities,
             &vuln_keys,
+            &HashMap::new(),
         );
         assert_eq!(finding.advisory_severity, Some(VulnSeverity::Critical));
     }
@@ -1247,6 +1344,7 @@ mod tests {
             diagnostic,
             &HashMap::new(),
             &vuln_keys,
+            &HashMap::new(),
         );
         assert!(finding.advisory_severity.is_none());
     }
@@ -1276,6 +1374,7 @@ mod tests {
             diagnostic,
             &severities,
             &VulnKeys::default(),
+            &HashMap::new(),
         );
         assert!(finding.advisory_severity.is_none());
     }
