@@ -64,7 +64,8 @@ fn parse_config(value: serde_json::Value) -> Option<DepsConfig> {
         Ok(config) => Some(config),
         Err(e) => {
             tracing::warn!(
-                "failed to parse deps-lsp configuration: {e} (keeping previous configuration)"
+                error = %deps_core::redact::sanitize_invisible(&e.to_string()),
+                "failed to parse deps-lsp configuration (keeping previous configuration)"
             );
             None
         }
@@ -3145,6 +3146,32 @@ mod tests {
         fn test_parse_config_rejects_non_object_payload() {
             let result = parse_config(serde_json::json!(["not", "an", "object"]));
             assert!(result.is_none());
+        }
+
+        /// #1505 P1: `serde`'s `unknown field` message embeds the offending key verbatim, so
+        /// a client that flattens attacker/user-controlled text into a settings key (e.g. a
+        /// forwarded editor setting) could forge a log line before this fix sanitized the
+        /// stringified error via `sanitize_invisible`.
+        #[test]
+        fn test_parse_config_rejects_and_sanitizes_malicious_unknown_field() {
+            let malicious_key = "evil\r\n\x1b[31mERROR deps_lsp: FORGED";
+            let payload = serde_json::json!({ malicious_key: true });
+
+            let log = deps_core::test_util::capture_tracing_output(|| {
+                let result = parse_config(payload);
+                assert!(result.is_none());
+            });
+
+            assert_eq!(
+                log.lines().count(),
+                1,
+                "a crafted config key must not forge an extra log line: {log:?}"
+            );
+            assert!(
+                !log.contains(malicious_key),
+                "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+                 intact: {log:?}"
+            );
         }
 
         /// End-to-end regression for issue #1083 critic S1: `diagnostic::Severity`'s

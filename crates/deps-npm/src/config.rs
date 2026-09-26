@@ -452,7 +452,7 @@ fn resolve_entry(
                 config_trust::EnvExpansionError::UndefinedVar { name } => {
                     tracing::warn!(
                         raw = %redacted,
-                        var = %name,
+                        var = ?name,
                         "npm registry value references an undefined environment variable"
                     );
                 }
@@ -904,6 +904,34 @@ mod tests {
             })
         );
         assert_eq!(result.unwrap_err().raw.to_string(), "${UNDEFINED_VAR}");
+    }
+
+    /// #1505 P5: an undefined-env-var warning used to interpolate the variable name raw
+    /// (`var = %name`), letting a crafted `${...}` placeholder in a user-tier `.npmrc` forge a
+    /// log line — `scan_shell` places no character restriction on the name between `${`/`}`.
+    /// `var` is now a `?`-Debug field.
+    #[test]
+    fn test_resolve_entry_undefined_var_with_control_char_logs_sanitized() {
+        let policy = all_policy();
+
+        let malicious_var = "bad\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let raw = format!("${{{malicious_var}}}");
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let result = resolve_entry(&raw, ConfigTier::User, &policy);
+            assert!(result.is_err());
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted env-var name must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_var),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
+        );
     }
 
     /// #1420: a project-tier value containing `${VAR}` is rejected outright, even when the

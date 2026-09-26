@@ -1756,7 +1756,7 @@ impl OsvVulnRecord {
     /// into this one's rendering.
     pub(super) fn into_advisory(self, osv_name: &str, osv_eco: OsvEcosystem) -> Option<Advisory> {
         if !is_valid_osv_id(&self.id) {
-            tracing::warn!(id = %self.id, "OSV record has a malformed id, dropping");
+            tracing::warn!(id = ?self.id, "OSV record has a malformed id, dropping");
             return None;
         }
 
@@ -2248,6 +2248,44 @@ mod osv_version_validation_tests {
             record
                 .into_advisory("pkg", OsvEcosystem::CratesIo)
                 .is_none()
+        );
+    }
+
+    /// #1505 finding 6: a malformed OSV record id used to be interpolated raw
+    /// (`id = %self.id`), letting a spoofed/malicious OSV response forge a log line.
+    /// `id` is now a `?`-Debug field, which escapes a raw newline instead of emitting a real
+    /// line break.
+    #[test]
+    #[cfg(feature = "test-util")]
+    fn into_advisory_malformed_id_with_control_char_logs_sanitized() {
+        let malicious_id = "not-a-real-id\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let record = OsvVulnRecord {
+            id: malicious_id.to_string(),
+            modified: "2023-01-01T00:00:00Z".to_string(),
+            summary: None,
+            aliases: vec![],
+            severity: vec![],
+            database_specific: None,
+            affected: vec![],
+        };
+
+        let log = crate::test_util::capture_tracing_output(|| {
+            assert!(
+                record
+                    .into_advisory("pkg", OsvEcosystem::CratesIo)
+                    .is_none()
+            );
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a malformed id must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_id),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
         );
     }
 

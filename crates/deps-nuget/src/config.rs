@@ -4040,6 +4040,34 @@ mod tests {
         assert!(raw.sources.is_empty());
     }
 
+    /// #1505 regression: `MismatchedEndTag`'s `expected`/`found` tag names can carry a raw
+    /// control character (e.g. ESC, `\x1b`) that survives quick_xml's own name tokenization —
+    /// unlike `\n`/`\r`, which quick_xml treats as whitespace and never lets reach a tag name.
+    /// `redact_parse_error_for_log` (already fixed by #1500's `sanitize_invisible` sweep) must
+    /// still neutralize it before it reaches `tracing`.
+    #[test]
+    fn test_1505_malformed_xml_warn_sanitizes_control_char() {
+        let xml = "<a\x1bb></c>";
+
+        let log = deps_core::test_util::capture_tracing_output(|| {
+            let _ = parse_nuget_config_raw(xml);
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "log must be a single line, not forged with an embedded newline: {log:?}"
+        );
+        assert!(
+            !log.contains("a\x1bb"),
+            "raw ESC from the crafted tag name must not survive into the log: {log:?}"
+        );
+        assert!(
+            log.contains("expected `</a b>`, but `</c>` was found"),
+            "ESC must be swept to a space, keeping the message diagnosable: {log:?}"
+        );
+    }
+
     /// #1243 M1: `parse_nuget_config_raw`'s malformed-XML warn path logs `%error` (the raw
     /// `quick_xml` error's `Display` text), which can embed a credential-shaped tag name
     /// verbatim (`IllFormed::MismatchedEndTag`) — must be redacted before reaching `tracing`,

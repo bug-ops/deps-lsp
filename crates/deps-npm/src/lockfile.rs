@@ -194,7 +194,7 @@ fn parse_package_lock_json_content(content: String) -> Result<ResolvedPackages> 
             .unwrap_or_else(|| extract_package_name(&key).to_string());
 
         let Some(ref version) = entry.version else {
-            tracing::debug!("Skipping package '{}' with no version", name);
+            tracing::debug!(package = ?name, "skipping package with no version");
             continue;
         };
 
@@ -314,7 +314,8 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
                 // `lockfileVersion` gate above — plain `as_str()` would silently drop it.
                 let Some(raw_version) = yaml_scalar_string(&entry["version"]) else {
                     tracing::debug!(
-                        "Skipping pnpm entry '{importer_key}' with missing or non-scalar version field"
+                        package = ?importer_key,
+                        "skipping pnpm entry with missing or non-scalar version field"
                     );
                     continue;
                 };
@@ -330,7 +331,9 @@ fn parse_pnpm_lock_yaml(content: &str) -> Result<ResolvedPackages> {
                 // must not be stored as a fake version — it would leak into hover/OSV queries.
                 if node_semver::Version::parse(version).is_err() {
                     tracing::debug!(
-                        "Skipping pnpm entry '{name}' with non-semver version '{version}'"
+                        package = ?name,
+                        version = %deps_core::redact::redact_declaration_key(version),
+                        "skipping pnpm entry with non-semver version"
                     );
                     continue;
                 }
@@ -517,6 +520,112 @@ packages:
         let message = parse_pnpm_lock_yaml(content).unwrap_err().to_string();
         assert_eq!(message, expected);
     }
+
+    /// #1505 finding 5: a package name missing its `version` field used to be interpolated
+    /// raw (`"Skipping package '{}' with no version", name`), letting a crafted name forge a
+    /// log line. `package` is now a `?`-Debug field, which escapes a raw newline instead of
+    /// emitting a real line break.
+    #[test]
+    fn test_1505_missing_version_field_logs_sanitized_package_name() {
+        let malicious_name = "bad\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let content = r#"{
+  "name": "my-project",
+  "lockfileVersion": 3,
+  "packages": {
+    "": { "name": "my-project" },
+    "node_modules/evil": { "name": "bad\r\n\u001b[31mERROR deps_lsp: FORGED" }
+  }
+}"#
+        .to_string();
+
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let packages = parse_package_lock_json_content(content).unwrap();
+            assert!(packages.is_empty());
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted package name must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_name),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
+        );
+    }
+
+    /// #1505 P3: a pnpm importer entry missing its `version` field used to be interpolated
+    /// raw (`"Skipping pnpm entry '{importer_key}' with missing or non-scalar version
+    /// field"`), letting a crafted dependency key forge a log line. `package` is now a
+    /// `?`-Debug field.
+    #[test]
+    fn test_1505_pnpm_missing_version_field_logs_sanitized_key() {
+        let malicious_key = "bad\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let content = "
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      \"bad\\r\\n\\x1b[31mERROR deps_lsp: FORGED\":
+        specifier: ^1.0.0
+";
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let packages = parse_pnpm_lock_yaml(content).unwrap();
+            assert!(packages.is_empty());
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted dependency key must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_key),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
+        );
+    }
+
+    /// #1505 P3: a non-semver pnpm version used to be interpolated raw
+    /// (`"Skipping pnpm entry '{name}' with non-semver version '{version}'"`). `package` is
+    /// now a `?`-Debug field, and `version` goes through `redact_declaration_key` (also
+    /// swept via `sanitize_invisible`), so a crafted version string can't forge a log line.
+    #[test]
+    fn test_1505_pnpm_non_semver_version_logs_sanitized() {
+        let malicious_version = "1.0.0-build\r\n\x1b[31mERROR deps_lsp: FORGED";
+        let content = "
+lockfileVersion: '9.0'
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.0.0
+        version: \"1.0.0-build\\r\\n\\x1b[31mERROR deps_lsp: FORGED\"
+";
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let packages = parse_pnpm_lock_yaml(content).unwrap();
+            assert!(packages.is_empty());
+        });
+
+        assert_eq!(
+            log.lines().count(),
+            1,
+            "a crafted version string must not forge an extra log line: {log:?}"
+        );
+        assert!(
+            !log.contains(malicious_version),
+            "the raw, un-escaped payload (with its literal CR/ESC bytes) must not survive \
+             intact: {log:?}"
+        );
+    }
+
+    // Credential redaction itself (a `git+https://user:tok@host/...` `version` value) is
+    // exercised by `redact_declaration_key`'s own tests in `deps_core::redact::key` — not
+    // duplicated here, since `resolve_pnpm_entry_name_and_version`'s `name@version` alias-style
+    // splitting (unrelated to this fix) reinterprets a bare `@` in `version` before this call
+    // site is reached, making a credential-bearing fixture here misleading about what this
+    // specific log call redacts.
 
     #[test]
     fn test_extract_package_name_simple() {
