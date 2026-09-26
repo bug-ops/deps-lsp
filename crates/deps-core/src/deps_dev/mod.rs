@@ -452,10 +452,11 @@ pub struct DepsDevClient {
     /// leader's result via [`memo::CoalescedMemo::get_or_fetch`] rather than returning `None`
     /// immediately.
     signals: CoalescedMemo<MemoKey, Option<SupplyChainTrustSignal>>,
-    /// Deliberately **not** coalesced, unlike [`Self::signals`]: a project-level Scorecard hit
-    /// shared across every package sharing that `project_key` is already the dedup this memo
-    /// exists for, so an added in-flight join would change no observable behavior for extra
-    /// complexity's sake.
+    /// Deliberately **not** coalesced, unlike [`Self::signals`]: two concurrent trust-signal
+    /// fetches for different packages that share a `project_key` do still issue duplicate
+    /// project GETs today, and coalescing would dedup that — but doing so is out of scope for
+    /// issue #1467 (a storage-layer refactor, not a behavior change), so this memo is left
+    /// exactly as uncoalesced as it was before this refactor.
     projects: TtlMemo<ProjectKeyMemo, Option<f32>>,
     /// Issue #1437: `GetSimilarlyNamedPackages` results, keyed package-level (see
     /// [`SimilarityMemoKey`]), coalesced for the same reason as [`Self::signals`] —
@@ -1130,10 +1131,11 @@ impl DepsDevClient {
         // this future mid-`.await`, and a manual `self.gossip_in_flight.remove(..)` placed
         // after the fetch would then never run, permanently leaking the claim for that
         // package (every later call sees it as still in-flight and skips it forever, and
-        // the memo is never written either). `InFlightGuard`'s `Drop` impl runs on
-        // cancellation too, exactly like every other in-flight set in this client
-        // (`Self::in_flight`, `Self::similarity_in_flight`, `Self::popularity_in_flight`,
-        // `Self::gossip_version_in_flight`) already relies on.
+        // the memo is never written either). `DashSetInFlightGuard`'s `Drop` impl runs on
+        // cancellation too, exactly like every other in-flight tracker in this client relies
+        // on — `memo::InFlightGuard` for `Self::signals`/`Self::similarity`/`Self::popularity`
+        // (each a [`memo::CoalescedMemo`] wrapping its own `DashMap`-backed in-flight join),
+        // and this same `DashSetInFlightGuard` for `Self::gossip_version_in_flight`.
         let mut guards: Vec<DashSetInFlightGuard<'_, GossipMemoKey>> =
             Vec::with_capacity(misses.len());
         for name in misses {

@@ -188,9 +188,9 @@ where
 }
 
 /// A [`coalesce`] watch-channel payload: "leader hasn't finished yet" vs. "leader finished with
-/// `T`". A dedicated enum rather than `Option<T>` (clippy `option_option`): every current
-/// [`CoalescedMemo`] instantiates `T` as `CallOutcome<Option<_>>`, which would otherwise nest as
-/// `Option<Option<_>>`.
+/// `T`". A dedicated enum rather than `Option<T>`: this "pending vs. ready" state is distinct
+/// from — and must not be conflated with — `coalesce`'s own `Option<T>` *return* value, where
+/// `None` instead means every takeover attempt was exhausted.
 #[derive(Debug, Clone)]
 pub(super) enum Slot<T> {
     /// The leader's `fetch` has not completed (or panicked) yet.
@@ -295,7 +295,7 @@ where
     }
 
     tracing::debug!(
-        "coalesce: gave up after {} leader-takeover attempts; giving up",
+        "coalesce: gave up after {} leader-takeover attempts",
         MAX_COALESCE_TAKEOVER_ATTEMPTS + 1
     );
     None
@@ -326,7 +326,10 @@ where
     }
 
     /// Returns `key`'s memoized outcome if still fresh; otherwise runs `fetch` — coalesced with
-    /// any other concurrent caller for the same `key` — stores its outcome, and returns it.
+    /// any other concurrent caller for the same `key` — stores its outcome, and returns it. If
+    /// every leader-takeover attempt is exhausted (see [`coalesce`]) without ever resolving a
+    /// real outcome, returns `CallOutcome::Degraded(V::default())` instead — unmemoized, so the
+    /// next call retries rather than being stuck behind a cached give-up.
     ///
     /// # Examples
     ///
@@ -498,7 +501,7 @@ mod tests {
     async fn get_or_fetch_degraded_expires_on_the_shorter_degraded_ttl() {
         let memo: CoalescedMemo<u32, u32> = CoalescedMemo::new(TtlPolicy::new(
             Duration::from_secs(60),
-            Duration::from_millis(20),
+            Duration::from_millis(200),
         ));
 
         let outcome = memo
@@ -507,7 +510,7 @@ mod tests {
         assert!(matches!(outcome, CallOutcome::Degraded(0)));
         assert!(memo.memo().get_fresh(&1u32).is_some());
 
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(
             memo.memo().get_fresh(&1u32).is_none(),
             "a Degraded entry must expire on the shorter degraded TTL, not the definitive one"
