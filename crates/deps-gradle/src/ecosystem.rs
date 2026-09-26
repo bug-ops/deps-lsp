@@ -942,10 +942,10 @@ impl Ecosystem for GradleEcosystem {
         self
     }
 
-    /// Fetches `name`'s (`"group:artifact"`) license at `version` from Maven Central,
-    /// following one or more `<parent>` POM hops when the leaf POM declares no
-    /// `<licenses>` block of its own (issue #660/#688/#692). See
-    /// `crate::license::fetch_license`.
+    /// Fetches `name`'s (`"group:artifact"`) license at `version` from Maven Central or
+    /// Google Maven (routed per-`groupId`, issue #1479), following one or more `<parent>`
+    /// POM hops when the leaf POM declares no `<licenses>` block of its own (issue
+    /// #660/#688/#692). See `crate::license::fetch_license`.
     fn fetch_license<'a>(
         &'a self,
         name: &'a str,

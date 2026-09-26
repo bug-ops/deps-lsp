@@ -103,19 +103,62 @@ const SEARCH_CACHE_ROWS: usize = 50;
 /// this memo to prevent.
 const RECENT_FAILURE_TTL: Duration = deps_core::lsp_helpers::COMPLETION_SEARCH_TIMEOUT;
 
-const GOOGLE_PREFIXES: &[&str] = &[
-    "androidx.",
-    "com.google.firebase.",
-    "com.google.android.",
-    "com.google.gms.",
-    "com.android.",
+/// Root Google-Maven-hosted groups, without a trailing dot: [`is_google_group`] matches
+/// a group equal to one of these roots *or* nested under it (`root` followed by `.`).
+///
+/// Impl-critic (issue #1479 review): storing these dot-terminated (`"com.google.firebase."`)
+/// and matching via a bare `starts_with` used to reject the bare root group itself —
+/// `com.google.firebase`/`com.google.gms` are real, live groupIds (`firebase-analytics`,
+/// `firebase-bom`, `google-services`), not just prefixes for their sub-packages, and
+/// 404 against Maven Central while resolving `200` against Google Maven, same as any
+/// nested sub-package.
+const GOOGLE_GROUP_ROOTS: &[&str] = &[
+    "androidx",
+    "com.google.firebase",
+    "com.google.android",
+    "com.google.gms",
+    "com.android",
 ];
 
+/// Whether `group_id` is Google-Maven-hosted: equal to one of [`GOOGLE_GROUP_ROOTS`], or a
+/// dotted sub-package of one (`root.anything`) — deliberately not a plain `starts_with`
+/// against a dot-suffixed root, which would silently reject the bare root group itself.
 fn is_google_group(group_id: &str) -> bool {
-    GOOGLE_PREFIXES.iter().any(|p| group_id.starts_with(p))
+    GOOGLE_GROUP_ROOTS.iter().any(|root| {
+        group_id
+            .strip_prefix(root)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
 }
 
-fn repo_base_for_group(group_id: &str) -> &'static str {
+/// Repository base URL used to resolve `group_id`'s coordinates.
+///
+/// Google-hosted groups (`androidx.*`, `com.google.firebase.*`, `com.google.android.*`,
+/// `com.google.gms.*`, `com.android.*`) resolve against Google Maven, everything else
+/// against Maven Central.
+///
+/// `metadata_urls` (this crate's own version-lookup routing) uses this as its primary
+/// base pick. `deps-gradle`'s independent tier-3 POM license fetch
+/// (`deps_gradle::license::fetch_license`) reuses this exact function rather than
+/// re-deriving the same routing rule as a local constant — a prior copy that only took
+/// the Maven-Central default branch is what caused issue #1479 (androidx/Firebase
+/// dependencies never getting a license).
+///
+/// # Examples
+///
+/// ```
+/// use deps_maven::registry::repo_base_for_group;
+///
+/// assert_eq!(
+///     repo_base_for_group("androidx.core"),
+///     "https://dl.google.com/dl/android/maven2"
+/// );
+/// assert_eq!(
+///     repo_base_for_group("org.apache.commons"),
+///     "https://repo1.maven.org/maven2"
+/// );
+/// ```
+pub fn repo_base_for_group(group_id: &str) -> &'static str {
     if is_google_group(group_id) {
         GOOGLE_MAVEN_BASE
     } else {
@@ -1095,6 +1138,34 @@ mod tests {
         assert_eq!(repo_base_for_group("com.android.tools"), GOOGLE_MAVEN_BASE);
     }
 
+    /// Issue #1479 impl-critic: the bare root groupId (no sub-package) is itself a real,
+    /// live Maven coordinate for these two — `com.google.firebase` (`firebase-analytics`,
+    /// `firebase-bom`, `firebase-auth`) and `com.google.gms` (`google-services`) — not
+    /// just a prefix for their sub-packages. Live-verified: Maven Central 404s, Google
+    /// Maven 200s with a `<licenses>` block for both. A dot-terminated-prefix
+    /// `starts_with` check rejects the bare root (it's shorter than the prefix string),
+    /// silently falling through to Maven Central and 404ing — exactly the #1479 bug this
+    /// fix targets, reintroduced one level down.
+    #[test]
+    fn test_repo_base_for_group_google_bare_root() {
+        assert_eq!(
+            repo_base_for_group("com.google.firebase"),
+            GOOGLE_MAVEN_BASE
+        );
+        assert_eq!(repo_base_for_group("com.google.gms"), GOOGLE_MAVEN_BASE);
+        assert_eq!(repo_base_for_group("androidx"), GOOGLE_MAVEN_BASE);
+        assert_eq!(repo_base_for_group("com.android"), GOOGLE_MAVEN_BASE);
+        assert_eq!(repo_base_for_group("com.google.android"), GOOGLE_MAVEN_BASE);
+    }
+
+    /// A group that merely shares a root's characters without the required `.` boundary
+    /// must not be mistaken for that root (e.g. `com.android2.foo` is not `com.android`).
+    #[test]
+    fn test_repo_base_for_group_rejects_partial_root_match() {
+        assert_eq!(repo_base_for_group("com.android2.foo"), MAVEN_REPO_BASE);
+        assert_eq!(repo_base_for_group("androidxtra"), MAVEN_REPO_BASE);
+    }
+
     #[test]
     fn test_package_url_central() {
         assert_eq!(
@@ -1148,7 +1219,7 @@ mod tests {
     // `test_package_url_encodes_malicious_group_and_artifact`/`_google_...` above stay
     // hand-written: the shared hostile fixture does contain a `:` (from its embedded
     // `https://`), so it exercises this function's `groupId:artifactId` split branch too —
-    // but its `groupId` half never matches a `GOOGLE_PREFIXES` entry, so it never reaches
+    // but its `groupId` half never matches a `GOOGLE_GROUP_ROOTS` entry, so it never reaches
     // the Google-routing branch `_google_encodes_malicious_group_and_artifact` covers. Both
     // hand-written tests also assert general bracket-safety properties rather than pinning
     // an exact encoded string, which is why they stay separate from

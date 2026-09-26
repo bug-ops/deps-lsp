@@ -9,11 +9,16 @@
 //! 2026-09-08 against `com.squareup.okhttp3:okhttp:4.12.0`, whose POM carries
 //! `<licenses><license><name>The Apache Software License, Version 2.0</name>...`.
 //!
-//! Deliberately targets Maven Central only (`repo1.maven.org`), not the Google Maven /
-//! Gradle Plugin Portal fallbacks `MavenCentralRegistry`'s version lookup also tries —
-//! those two are edge cases for the small minority of Android/plugin-only coordinates,
-//! and this is a best-effort secondary signal (NFR-003 graceful degradation already
-//! covers a POM that 404s there).
+//! Routes each fetch through [`deps_maven::registry::repo_base_for_group`] — the same
+//! per-`groupId` Maven-Central-vs-Google-Maven pick `MavenCentralRegistry`'s own version
+//! lookup uses — so Android/Firebase coordinates (`androidx.*`, `com.google.firebase.*`,
+//! `com.google.android.*`, `com.google.gms.*`, `com.android.*`) resolve against Google
+//! Maven instead of 404ing against Maven Central (issue #1479; a prior local copy of this
+//! routing rule only took the Maven-Central default branch). The Gradle Plugin Portal
+//! fallback `metadata_urls` also tries for non-Google groups is not covered here yet —
+//! left as a follow-up (a Plugin Portal retry would need to rework the
+//! [`MAX_POM_FETCHES`]/hop-count accounting to add a second base candidate per hop
+//! without breaking the existing hop-count semantics, issue #823).
 //!
 //! **Parent POM traversal (issue #692)**: a Maven multi-module project commonly declares
 //! `<licenses>` only on a shared parent POM, leaving each module's own (leaf) POM to
@@ -62,14 +67,9 @@ const MAX_POM_LICENSE_ENTRIES: usize = 64;
 /// found so far — acceptable for this best-effort secondary signal (see module docs).
 const MAX_POM_LICENSE_BYTES_SCANNED: usize = 1024 * 1024;
 
-/// Maven Central's repository root. Mirrors `deps-maven`'s own (private)
-/// `MAVEN_REPO_BASE` — kept as an independent constant rather than a shared one so this
-/// crate does not need a new public export from `deps-maven` for a single string.
-const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
-
-/// Builds the Maven Central POM URL for `coordinate` (`"group:artifact"`) at
-/// `version`, or `None` if `coordinate` isn't in that shape or any path segment (each
-/// dot-separated `group` component, `artifact`, or `version`) fails
+/// Builds the POM URL for `coordinate` (`"group:artifact"`) at `version`, rooted at the
+/// given repository `base`, or `None` if `coordinate` isn't in that shape or any path
+/// segment (each dot-separated `group` component, `artifact`, or `version`) fails
 /// [`is_safe_maven_coordinate_segment`].
 ///
 /// Security P3 (impl-critic): a bare exact-match `.`/`..` reject is not enough here —
@@ -113,13 +113,14 @@ fn pom_url(base: &str, coordinate: &str, version: &str) -> Option<String> {
 /// network round trips.
 const MAX_POM_FETCHES: u8 = 3;
 
-/// Fetches `coordinate`'s (`"group:artifact"`) license at `version` from Maven
-/// Central.
+/// Fetches `coordinate`'s (`"group:artifact"`) license at `version`, resolving each hop's
+/// repository base via [`deps_maven::registry::repo_base_for_group`] (issue #1479) — Maven
+/// Central for most coordinates, Google Maven for Android/Firebase groups.
 ///
 /// Returns an empty `Vec` (never an error) when `coordinate` isn't in the expected
-/// `"group:artifact"` shape, the fetch fails (network error, 404 — a large fraction of
-/// Gradle plugin/Android coordinates live on Google Maven or the Gradle Plugin Portal
-/// instead, not Maven Central), or neither the POM nor any `<parent>` POM within
+/// `"group:artifact"` shape, the fetch fails (network error, 404 — some Gradle
+/// plugin-marker coordinates live on the Gradle Plugin Portal instead, which this fetch
+/// does not yet try), or neither the POM nor any `<parent>` POM within
 /// [`MAX_POM_FETCHES`] declares a `<licenses>` block — graceful degradation (NFR-003),
 /// since this is a best-effort secondary signal, not core version data.
 pub(crate) async fn fetch_license(
@@ -127,20 +128,30 @@ pub(crate) async fn fetch_license(
     coordinate: &str,
     version: &str,
 ) -> Vec<String> {
-    fetch_license_from(cache, MAVEN_REPO_BASE, coordinate, version).await
+    fetch_license_from(
+        cache,
+        |group| deps_maven::registry::repo_base_for_group(group).to_string(),
+        coordinate,
+        version,
+    )
+    .await
 }
 
-/// [`fetch_license`]'s implementation, parameterized over the repository base URL so
-/// tests can point it at a mockito server instead of live Maven Central — mirrors
-/// `deps-dart::PubDevRegistry::with_base`/`deps-swift`'s equivalent test-only base
-/// override (tester gap: unlike Swift/Dart/Deno's fetch layer, Gradle's had no
-/// HTTP-mocked coverage at all, only the malformed-coordinate short-circuit below).
+/// [`fetch_license`]'s implementation, parameterized over a per-`groupId` repository-base
+/// resolver so tests can point it at a mockito server instead of live Maven
+/// Central/Google Maven — mirrors `deps-dart::PubDevRegistry::with_base`/`deps-swift`'s
+/// equivalent test-only base override (tester gap: unlike Swift/Dart/Deno's fetch layer,
+/// Gradle's had no HTTP-mocked coverage at all, only the malformed-coordinate
+/// short-circuit below).
 ///
 /// Follows `<parent>` POM coordinates (issue #692) when a fetched POM's own
 /// `<licenses>` is empty, up to [`MAX_POM_FETCHES`] total fetches (the leaf plus its
-/// parent chain). Each hop re-validates its coordinate/version through [`pom_url`] —
-/// the same allowlist the leaf fetch uses — so a malicious `<parent>` value can no more
-/// escape Maven Central's URL space than a malicious leaf coordinate could.
+/// parent chain); `base_for_group` is re-applied to each hop's own `groupId` (not just
+/// the leaf's), so a parent POM declared under a different group still resolves against
+/// the right repository. Each hop re-validates its coordinate/version through
+/// [`pom_url`] — the same allowlist the leaf fetch uses — so a malicious `<parent>`
+/// value can no more escape the resolved repository's URL space than a malicious leaf
+/// coordinate could.
 ///
 /// Deliberately the sole instrumented function on this path (issue #823): the actual
 /// bounded fetch loop lives in [`fetch_license_hops`], a plain, uninstrumented helper
@@ -155,13 +166,16 @@ pub(crate) async fn fetch_license(
     ),
     level = "debug"
 )]
-async fn fetch_license_from(
+async fn fetch_license_from<F>(
     cache: &Arc<HttpCache>,
-    base: &str,
+    base_for_group: F,
     coordinate: &str,
     version: &str,
-) -> Vec<String> {
-    let (licenses, hops) = fetch_license_hops(cache, base, coordinate, version).await;
+) -> Vec<String>
+where
+    F: Fn(&str) -> String + Send + Sync,
+{
+    let (licenses, hops) = fetch_license_hops(cache, &base_for_group, coordinate, version).await;
     tracing::Span::current().record("hops", hops);
     licenses
 }
@@ -180,17 +194,24 @@ async fn fetch_license_from(
 /// could silently omit it — the same silent-omission failure mode issue #819 removes
 /// from the completion-context dispatch, reintroduced one level down if each exit had
 /// to remember its own `Span::current().record` call.
-async fn fetch_license_hops(
+async fn fetch_license_hops<F>(
     cache: &Arc<HttpCache>,
-    base: &str,
+    base_for_group: &F,
     coordinate: &str,
     version: &str,
-) -> (Vec<String>, u64) {
+) -> (Vec<String>, u64)
+where
+    F: Fn(&str) -> String + Send + Sync,
+{
     let mut current_coordinate = coordinate.to_string();
     let mut current_version = version.to_string();
 
     for hop in 0..MAX_POM_FETCHES {
-        let Some(url) = pom_url(base, &current_coordinate, &current_version) else {
+        let group = current_coordinate
+            .split_once(':')
+            .map_or(current_coordinate.as_str(), |(group, _)| group);
+        let base = base_for_group(group);
+        let Some(url) = pom_url(&base, &current_coordinate, &current_version) else {
             // No network call happens on this path, so `hop` (not `hop + 1`) is the
             // count of fetches actually performed so far.
             return (Vec::new(), u64::from(hop));
@@ -370,6 +391,10 @@ pub fn fuzz_parse_pom_licenses(data: &[u8]) {
 mod tests {
     use super::*;
 
+    /// Fixture base for `pom_url`-only tests below, which exercise URL construction, not
+    /// group-based routing — production routing is [`deps_maven::registry::repo_base_for_group`].
+    const MAVEN_REPO_BASE: &str = "https://repo1.maven.org/maven2";
+
     #[test]
     fn pom_url_builds_group_path_from_dots() {
         let url = pom_url(MAVEN_REPO_BASE, "com.squareup.okhttp3:okhttp", "4.12.0").unwrap();
@@ -431,6 +456,19 @@ mod tests {
     #[test]
     fn pom_url_rejects_embedded_slash_path_traversal_in_group() {
         assert!(pom_url(MAVEN_REPO_BASE, "com.example/../evil:artifact", "1.0").is_none());
+    }
+
+    /// Issue #1479: an Android/Firebase coordinate must resolve its POM against Google
+    /// Maven, not Maven Central (where it 404s) — reusing
+    /// `deps_maven::registry::repo_base_for_group` rather than always assuming Central.
+    #[test]
+    fn pom_url_routes_google_group_through_google_maven() {
+        let base = deps_maven::registry::repo_base_for_group("androidx.core");
+        let url = pom_url(base, "androidx.core:core", "1.13.1").unwrap();
+        assert_eq!(
+            url,
+            "https://dl.google.com/dl/android/maven2/androidx/core/core/1.13.1/core-1.13.1.pom"
+        );
     }
 
     #[test]
@@ -603,7 +641,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let licenses = fetch_license_from(
             &cache,
-            &server.url(),
+            |_: &str| server.url(),
             "com.squareup.okhttp3:okhttp",
             "4.12.0",
         )
@@ -622,8 +660,13 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let licenses =
-            fetch_license_from(&cache, &server.url(), "com.example:missing", "1.0.0").await;
+        let licenses = fetch_license_from(
+            &cache,
+            |_: &str| server.url(),
+            "com.example:missing",
+            "1.0.0",
+        )
+        .await;
 
         assert!(licenses.is_empty());
     }
@@ -639,10 +682,129 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let licenses =
-            fetch_license_from(&cache, &server.url(), "com.example:broken", "1.0.0").await;
+        let licenses = fetch_license_from(
+            &cache,
+            |_: &str| server.url(),
+            "com.example:broken",
+            "1.0.0",
+        )
+        .await;
 
         assert!(licenses.is_empty());
+    }
+
+    /// Issue #1479: proves `fetch_license_hops` actually re-derives the base per hop from
+    /// the *current* coordinate's `groupId` (via `base_for_group`), not a single fixed
+    /// base for the whole call — a Google-routed leaf coordinate must hit the mock
+    /// standing in for Google Maven, never the one standing in for Maven Central.
+    #[tokio::test]
+    async fn fetch_license_from_routes_per_group_base() {
+        let mut central = mockito::Server::new_async().await;
+        let central_mock = central
+            .mock("GET", "/androidx/core/core/1.13.1/core-1.13.1.pom")
+            .expect(0)
+            .create_async()
+            .await;
+
+        let mut google = mockito::Server::new_async().await;
+        let _google_mock = google
+            .mock("GET", "/androidx/core/core/1.13.1/core-1.13.1.pom")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <licenses>
+    <license><name>Apache-2.0</name></license>
+  </licenses>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let central_url = central.url();
+        let google_url = google.url();
+        let cache = Arc::new(HttpCache::new());
+        let licenses = fetch_license_from(
+            &cache,
+            move |group: &str| {
+                if group.starts_with("androidx") {
+                    google_url.clone()
+                } else {
+                    central_url.clone()
+                }
+            },
+            "androidx.core:core",
+            "1.13.1",
+        )
+        .await;
+
+        assert_eq!(licenses, vec!["Apache-2.0".to_string()]);
+        central_mock.assert_async().await;
+    }
+
+    /// Issue #1479 (tester): the single-hop test above only proves routing for one
+    /// coordinate — it doesn't prove `base_for_group` is re-applied independently to
+    /// *each* hop. This drives a leaf (Google-routed) -> parent (non-Google-routed) POM
+    /// chain across two different mock servers and asserts each gets exactly one hit for
+    /// its own hop, proving the base is re-derived per hop rather than fixed for the
+    /// whole traversal.
+    #[tokio::test]
+    async fn fetch_license_from_routes_each_parent_hop_independently_by_group() {
+        let mut google = mockito::Server::new_async().await;
+        let google_mock = google
+            .mock("GET", "/androidx/core/core/1.13.1/core-1.13.1.pom")
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent-module</artifactId>
+    <version>1.0.0</version>
+  </parent>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let mut central = mockito::Server::new_async().await;
+        let central_mock = central
+            .mock(
+                "GET",
+                "/com/example/parent-module/1.0.0/parent-module-1.0.0.pom",
+            )
+            .with_status(200)
+            .with_body(
+                r#"<?xml version="1.0"?>
+<project>
+  <licenses>
+    <license><name>MIT</name></license>
+  </licenses>
+</project>"#,
+            )
+            .create_async()
+            .await;
+
+        let google_url = google.url();
+        let central_url = central.url();
+        let cache = Arc::new(HttpCache::new());
+        let licenses = fetch_license_from(
+            &cache,
+            move |group: &str| {
+                if group.starts_with("androidx") {
+                    google_url.clone()
+                } else {
+                    central_url.clone()
+                }
+            },
+            "androidx.core:core",
+            "1.13.1",
+        )
+        .await;
+
+        assert_eq!(licenses, vec!["MIT".to_string()]);
+        google_mock.assert_async().await;
+        central_mock.assert_async().await;
     }
 
     // --- Issue #692: parent POM traversal ---
@@ -759,7 +921,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let licenses = fetch_license_from(
             &cache,
-            &server.url(),
+            |_: &str| server.url(),
             "com.google.guava:guava",
             "32.0.1-jre",
         )
@@ -828,7 +990,8 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let licenses = fetch_license_from(&cache, &server.url(), "com.example:leaf", "1.0.0").await;
+        let licenses =
+            fetch_license_from(&cache, |_: &str| server.url(), "com.example:leaf", "1.0.0").await;
 
         assert_eq!(
             licenses,
@@ -867,7 +1030,8 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let licenses = fetch_license_from(&cache, &server.url(), "com.example:leaf", "1.0.0").await;
+        let licenses =
+            fetch_license_from(&cache, |_: &str| server.url(), "com.example:leaf", "1.0.0").await;
 
         assert!(
             licenses.is_empty(),
@@ -882,7 +1046,13 @@ mod tests {
     #[tokio::test]
     async fn fetch_license_hops_malformed_leaf_coordinate_records_zero_hops() {
         let cache = Arc::new(HttpCache::new());
-        let (licenses, hops) = fetch_license_hops(&cache, MAVEN_REPO_BASE, "no-colon", "1.0").await;
+        let (licenses, hops) = fetch_license_hops(
+            &cache,
+            &|_: &str| MAVEN_REPO_BASE.to_string(),
+            "no-colon",
+            "1.0",
+        )
+        .await;
 
         assert!(licenses.is_empty());
         assert_eq!(
@@ -914,7 +1084,7 @@ mod tests {
         let cache = Arc::new(HttpCache::new());
         let (licenses, hops) = fetch_license_hops(
             &cache,
-            &server.url(),
+            &|_: &str| server.url(),
             "com.squareup.okhttp3:okhttp",
             "4.12.0",
         )
@@ -948,7 +1118,7 @@ mod tests {
 
         let cache = Arc::new(HttpCache::new());
         let (licenses, hops) =
-            fetch_license_hops(&cache, &server.url(), "com.example:leaf", "1.0.0").await;
+            fetch_license_hops(&cache, &|_: &str| server.url(), "com.example:leaf", "1.0.0").await;
 
         assert!(licenses.is_empty());
         assert_eq!(
@@ -969,8 +1139,13 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let licenses =
-            fetch_license_from(&cache, &server.url(), "com.example:orphan", "1.0.0").await;
+        let licenses = fetch_license_from(
+            &cache,
+            |_: &str| server.url(),
+            "com.example:orphan",
+            "1.0.0",
+        )
+        .await;
 
         assert!(licenses.is_empty());
     }
@@ -1027,7 +1202,8 @@ mod tests {
             .await;
 
         let cache = Arc::new(HttpCache::new());
-        let licenses = fetch_license_from(&cache, &server.url(), "com.example:mod0", "1.0.0").await;
+        let licenses =
+            fetch_license_from(&cache, |_: &str| server.url(), "com.example:mod0", "1.0.0").await;
 
         assert!(
             licenses.is_empty(),
