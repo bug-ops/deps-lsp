@@ -169,7 +169,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `SelectionContext` now holds a typed `Option<StabilityFloor>` instead of `Option<String>` (resolves #1444) (#1450)
 - **deps-composer**: `ComposerParseResult::minimum_stability` is now the `parser::MinimumStability` enum instead of `Option<String>`; stability-ranking helpers in `formatter`/`registry` are retyped onto `StabilityFloor` (resolves #1444) (#1450)
 - **deps-engine**: `FetchResult`'s `failed_count`/`first_error` public fields are removed, replaced by a single `failure_summary: Option<FailureSummary>` field read via the new `failed_count()`/`failure_message()` accessors (or `FailureSummary`'s own `count()`/`message()`); `FetchResult::new`'s arity drops from 8 to 7 parameters (resolves #1470) (#1499)
-- **deps-core**: `EcosystemId::osv_ecosystem` now returns `Option<osv::OsvEcosystem>`, the exhaustive enum, instead of `Option<&'static str>` (resolves #1484)
+- **deps-core**: `EcosystemId::osv_ecosystem` now returns `Option<osv::OsvEcosystem>`, the exhaustive enum, instead of `Option<&'static str>` (resolves #1484) (#1506)
 
 ### Changed
 - **deps-core**: extracted typed `CoalescedMemo`/`TtlMemo`/`CallOutcome` (new `deps_dev::memo` module) to replace 6 hand-rolled TTL memos in the deps.dev client, deriving each entry's TTL from its outcome instead of storing it alongside; no behavior change (resolves #1467) (#1491)
@@ -190,7 +190,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cargo, deps-pypi, deps-gradle, deps-cli**: new `deps_core::parse_toml_checked` (`CheckedTomlError`) replaces per-crate TOML depth-guard-then-parse boilerplate at all 10 call sites (resolves #1406) (#1412)
 - **deps-core, deps-cli, deps-gitlab-ci, deps-github-actions, deps-swift**: `HttpCache::set_offline`/`set_cache_enabled` now take `NetworkMode`/`CacheMode`, `DepsError::rate_limited`'s `verified` field is now `RateLimitEvidence`, and `deps-cli`'s `dry_run`/`offline`/`had_execution_error` boolean parameters are now typed (`format::DryRun`, `deps_core::NetworkMode`, `exit::ExecutionOutcome`), replacing boolean-blind public APIs (part of #1436) (#1445)
 - **deps-gradle, deps-nuget, deps-npm**: manifest/lockfile kind is now derived from a private typed `from_uri`/`from_path` classification (mirroring `deps-pypi`'s existing pattern) instead of independently re-matching the URI/filename string at each call site (part of #1436) (#1445)
-- **deps-lsp, deps-core, deps-swift**: dedupes `initialize`/`did_change_configuration`'s config side-effect application, fixes a stale doc comment, and adds a deps-swift fixture integration test; no behavior change (resolves #1484)
+- **deps-lsp, deps-core, deps-swift**: dedupes `initialize`/`did_change_configuration`'s config side-effect application, fixes a stale doc comment, and adds a deps-swift fixture integration test; no behavior change (resolves #1484) (#1506)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
