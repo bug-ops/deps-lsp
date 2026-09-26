@@ -17,7 +17,7 @@
 set -euo pipefail
 
 THREADS="${1:-32}"
-CRATES=(deps-core deps-gradle deps-cargo deps-npm deps-nuget deps-lsp)
+CRATES=(deps-core deps-gradle deps-cargo deps-npm deps-nuget deps-maven deps-lsp)
 RUNS=15
 FAILED=0
 

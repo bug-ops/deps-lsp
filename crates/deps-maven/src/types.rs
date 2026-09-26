@@ -28,22 +28,16 @@ pub struct MavenDependency {
     /// Maven dependency scope (`compile`, `test`, `runtime`, etc.).
     #[raw]
     pub scope: MavenScope,
-    /// Resolved source (#1202): `Path` for a `scope: system` dependency's `<systemPath>`
-    /// (an explicit, per-dependency local-jar binding), `Registry` otherwise.
+    /// Resolved source: `Path` for a `scope: system` dependency's `<systemPath>` (#1202, an
+    /// explicit, per-dependency local-jar binding), or for a dependency whose jar is found at
+    /// the standard Maven repository layout under a declared `<repositories>/<repository>
+    /// <url>file://...</url>` directory (#1503, a per-package filesystem probe — Maven's
+    /// `<repository>` element has no per-package binding to key off of directly, so this
+    /// probes each dependency individually instead of reclassifying the whole document).
+    /// `Registry` otherwise.
     #[raw]
     pub source: deps_core::parser::DependencySource,
 }
-
-// TODO(follow-up to #1202): `pom.xml`'s `<repositories>`/`<repository><url>file://...</url>`
-// declarations are still not parsed at all (distinct from `scope: system`'s `<systemPath>`,
-// which now classifies as `Path` — see `parser::finalize_dep`), so a dependency resolved from
-// a local/custom *repository* still classifies as `DependencySource::Registry` and the
-// #1136/#1203 gate stays inert for that specific case. Unlike Composer's `vcs`/`path`
-// repositories, Maven's `<repository>` has no per-package binding to exploit even
-// heuristically — every declared repository is simply tried, in order, for any dependency —
-// so closing this properly needs either an explicit-mapping heuristic (none exists in the POM
-// format) or accepting a coarser "any repository present" classification; scoped out of this
-// PR pending a decision, tracked as a follow-up to #1202.
 
 /// Maven dependency scope (the `<scope>` element).
 #[non_exhaustive]

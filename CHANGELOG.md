@@ -71,6 +71,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-maven**: dependencies resolved from a local `<repositories>/<repository><url>file://...</url>` are now classified as `Path` sources (resolves #1503)
 - **deps-core**: unsatisfiable-requirement diagnostics no longer compile the same version requirement twice per call, across all 14 ecosystems (resolves #1494)
 - **deps-deno**: unsatisfiable `npm:`/`jsr:` requirement diagnostics in `deno.json`/`deno.jsonc` now include the pre-release hint, matching `package.json`'s (resolves #1478) (#1492)
 - **deps-deno**: `jsr:` version matching now routes through the same shared matcher as `npm:`, fixing a wildcard requirement against an all-yanked JSR package incorrectly resolving to no match (resolves #1493) (#1498)

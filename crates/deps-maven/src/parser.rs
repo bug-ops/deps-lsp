@@ -6,6 +6,11 @@
 //! No element-count/scan-position bound is applied here (#698): the input is a local
 //! manifest already capped by `deps-lsp`'s `MAX_FILE_SIZE` (10 MB) read path, unlike
 //! `deps-maven::registry::parse_metadata_xml`'s remote, unbounded-by-default input.
+//!
+//! The `<repositories>` `file://` probe (#1503) is the one exception: unlike the rest of
+//! this module, it performs real filesystem I/O (`fs_probe::metadata`), so it carries its own
+//! separate bound (`MAX_TOTAL_PROBE_ATTEMPTS`) independent of the string-parsing cost
+//! the rest of this module's lack of a scan-position bound accepts.
 
 use crate::types::{MavenDependency, MavenScope};
 use deps_core::interpolation::{MAX_INTERPOLATED_VALUE_BYTES, PropertyValue};
@@ -43,6 +48,8 @@ enum ParseContext {
     Dependency,
     Plugin,
     Properties,
+    Repositories,
+    Repository,
 }
 
 /// Accumulator for a single dependency being parsed.
@@ -69,6 +76,63 @@ struct DepAccum {
     system_path: Option<String>,
 }
 
+/// Upper bound on how many distinct `file://` repository directories a single `pom.xml` can
+/// make [`parse_pom_xml`] probe (#1503) — bounds the filesystem I/O one manifest parse can
+/// trigger, independent of how many `<repository>` entries it declares.
+const MAX_FILE_REPO_DIRS: usize = 8;
+
+/// Upper bound on the total number of `fs_probe::metadata` calls a single `pom.xml` parse can
+/// make across every dependency × repository combination (#1503) — without this, a manifest
+/// with `MAX_FILE_REPO_DIRS` repositories and `MAX_DEPENDENCIES_PER_DOCUMENT`
+/// dependencies could trigger up to 8 × 5000 = 40,000 blocking `stat` calls in one parse,
+/// synchronously inside the async `parse_manifest` future, on every edit (CWE-400). Once
+/// exhausted, probing stops entirely for the rest of the document — every dependency not yet
+/// probed keeps its current classification, a best-effort cap rather than a guarantee that
+/// declaration order doesn't matter.
+const MAX_TOTAL_PROBE_ATTEMPTS: usize = 256;
+
+/// True if `segment` is exactly one plain path component ([`std::path::Component::Normal`]) —
+/// structurally rejects an empty string, `.`, `..`, a leading/embedded path separator, and a
+/// Windows drive-letter/UNC-prefix shape (`C:`) all at once, rather than an ad-hoc character
+/// blocklist. A blocklist missed that `group_id.replace('.', MAIN_SEPARATOR_STR)` turns a
+/// `.`-prefixed segment like `.etc` into an absolute-looking `/etc` path component, which
+/// [`std::path::Path::join`] then treats as *replacing* the whole base path outright rather
+/// than joining onto it (#1503 M1) — checking `Component` structure instead catches every
+/// path-escape shape a filesystem actually recognizes, on any platform, not just the ones an
+/// character list happened to enumerate.
+fn is_plain_path_component(segment: &str) -> bool {
+    let mut components = std::path::Path::new(segment).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
+}
+
+/// True if every `.`-delimited segment of `group_id` (each becomes its own directory level via
+/// `group_id.replace('.', MAIN_SEPARATOR_STR)`), plus `artifact_id` and `version` verbatim, is
+/// a single plain path component — see [`is_plain_path_component`]. `group_id`/`artifact_id`/
+/// the version text are attacker-controlled `pom.xml` content (#1503).
+fn is_safe_maven_coordinate(group_id: &str, artifact_id: &str, version: &str) -> bool {
+    !group_id.is_empty()
+        && group_id.split('.').all(is_plain_path_component)
+        && is_plain_path_component(artifact_id)
+        && is_plain_path_component(version)
+}
+
+/// True if `version` uses Maven version-range syntax (`[1.0,2.0)`, `(,1.0]`, …), which has no
+/// single corresponding directory to probe (#1503).
+fn is_version_range_syntax(version: &str) -> bool {
+    version.contains(['[', ']', '(', ')', ','])
+}
+
+/// A dependency finalized during parsing, paired with whether it came from `<plugins>` rather
+/// than `<dependencies>`/`<dependencyManagement>` (#1503) — kept together (rather than as two
+/// index-correlated `Vec`s) so the file:// probing loop below can never desync which flag
+/// belongs to which dependency. A `<plugin>` resolves via the separate `<pluginRepositories>`
+/// config, so it must never be reclassified by a `<repositories>` file:// match.
+struct AccumulatedDep {
+    dep: MavenDependency,
+    is_plugin: bool,
+}
+
 /// Parses a `pom.xml` document into a [`MavenParseResult`].
 ///
 /// # Errors
@@ -76,7 +140,7 @@ struct DepAccum {
 /// Returns an error if the content is not well-formed XML.
 pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
     let line_table = LineOffsetTable::new(content);
-    let mut dependencies = Vec::new();
+    let mut dependencies: Vec<AccumulatedDep> = Vec::new();
     let mut properties = HashMap::new();
 
     let mut reader = Reader::from_str(content);
@@ -88,6 +152,10 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
     let mut current_prop_key: Option<String> = None;
     let mut root_tag: Option<String> = None;
     let mut budget = deps_core::DependencyBudget::new(deps_core::MAX_DEPENDENCIES_PER_DOCUMENT);
+    // Raw `<repository><url>` text, resolved and scheme-checked only after the full parse
+    // (#1503): properties referenced by a repository URL may be declared anywhere in the
+    // document relative to the `<repositories>` block.
+    let mut repository_urls: Vec<String> = Vec::new();
 
     loop {
         let pos = reader.buffer_position();
@@ -132,6 +200,16 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                     }
                     (ParseContext::Properties, key) => {
                         current_prop_key = Some(key.to_string());
+                    }
+                    (ParseContext::Root, "repositories") => {
+                        context_stack.push(ParseContext::Repositories);
+                    }
+                    (ParseContext::Repositories, "repository") => {
+                        context_stack.push(ParseContext::Repository);
+                        current_tag = None;
+                    }
+                    (ParseContext::Repository, field) => {
+                        current_tag = Some(field.to_string());
                     }
                     (ParseContext::Dependency | ParseContext::Plugin, field) => {
                         current_tag = Some(field.to_string());
@@ -196,6 +274,8 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
                         text,
                         "maven property",
                     );
+                } else if ctx == ParseContext::Repository && current_tag.as_deref() == Some("url") {
+                    repository_urls.push(text.clone());
                 } else if ctx == ParseContext::Root
                     && let Some(tag) = root_tag.take()
                 {
@@ -235,21 +315,33 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
 
                 match (ctx, tag.as_str()) {
                     (ParseContext::Dependency, "dependency") | (ParseContext::Plugin, "plugin") => {
+                        let this_is_plugin = tag == "plugin";
                         context_stack.pop();
                         if let Some(dep) = current_dep.take()
                             && let Some(maven_dep) =
                                 finalize_dep(dep, content, &line_table, &properties)
                             && budget.allow()
                         {
-                            dependencies.push(maven_dep);
+                            dependencies.push(AccumulatedDep {
+                                dep: maven_dep,
+                                is_plugin: this_is_plugin,
+                            });
                         }
                         current_tag = None;
                     }
                     (ParseContext::Dependencies, "dependencies")
                     | (ParseContext::DependencyManagement, "dependencyManagement")
                     | (ParseContext::Plugins, "plugins")
-                    | (ParseContext::Properties, "properties") => {
+                    | (ParseContext::Properties, "properties")
+                    | (ParseContext::Repositories, "repositories") => {
                         context_stack.pop();
+                    }
+                    (ParseContext::Repository, "repository") => {
+                        context_stack.pop();
+                        current_tag = None;
+                    }
+                    (ParseContext::Repository, _) => {
+                        current_tag = None;
                     }
                     (ParseContext::Dependency | ParseContext::Plugin, "version") => {
                         if let Some(dep) = current_dep.as_mut()
@@ -270,8 +362,132 @@ pub fn parse_pom_xml(content: &str, doc_uri: &Url) -> Result<MavenParseResult> {
         }
     }
 
+    // #1503: Maven's `<repository>` element has no per-package binding to exploit
+    // heuristically — every declared repository is tried, in order, for any dependency — so
+    // rather than a coarse "any file:// repository present -> every dependency is Path"
+    // rule (which would also silence OSV/outdated diagnostics for implicit Maven Central
+    // dependencies that have nothing to do with the local repo — a P3 bug's fix must not
+    // regress into a missed-CVE risk), this probes the standard Maven repository layout
+    // (`<group-path>/<artifact>/<version>/<artifact>-<version>.jar`) under each declared
+    // `file://` repository directory and only classifies a dependency as `Path` when its jar
+    // is actually found there.
+    //
+    // Gated on `doc_uri` itself resolving to a real local file (#1090's existing "only touch
+    // the local filesystem when the manifest is a genuine local file" rule) — skipped
+    // entirely for a non-local `doc_uri` (`untitled:`, `https:`, an in-memory buffer, …).
+    if let Some(manifest_path) = deps_core::lockfile::resolve_manifest_file_path(doc_uri) {
+        // `${project.basedir}` (Maven's own name for the pom.xml's containing directory) is
+        // the idiomatic way to declare a repository relative to the project, so it is resolved
+        // here as a local overlay over the parsed `<properties>` — never overriding a pom that
+        // already defines its own `project.basedir` (#1503 S2). The value is the URL-path
+        // form (`Url::from_file_path`'s `.path()`: forward-slash-separated, percent-encoded,
+        // e.g. `/C:/Users/...` on Windows) rather than `Path::display()`'s native separators —
+        // this text is about to be substituted back into a `file://` URL string
+        // (`file://${project.basedir}/repo`), where a Windows-native `C:\Users\...` would not
+        // parse as a valid URL.
+        let basedir_overlay: Option<HashMap<String, PropertyValue>> =
+            if properties.contains_key("project.basedir") {
+                None
+            } else {
+                manifest_path.parent().and_then(|basedir| {
+                    let basedir_url = Url::from_file_path(basedir).ok()?;
+                    PropertyValue::new(basedir_url.path().to_string())
+                        .ok()
+                        .map(|value| {
+                            let mut overlay = properties.clone();
+                            overlay.insert("project.basedir".to_string(), value);
+                            overlay
+                        })
+                })
+            };
+        let repo_properties = basedir_overlay.as_ref().unwrap_or(&properties);
+
+        // Each candidate repository URL is resolved the same way `resolve_manifest_file_path`
+        // resolves `doc_uri` above (host check + `to_file_path`), not just a bare `file://`
+        // scheme check — a `file://attacker.example/share` URL keeps its host, and
+        // `to_file_path()` alone would hand back a Windows UNC path; any subsequent filesystem
+        // access against it makes Windows silently attempt SMB/NTLM auth against that host
+        // (#1503 C1). Reused from `deps_core::lockfile` (#1090) rather than re-deriving the
+        // same host check locally.
+        let mut file_repositories: Vec<std::path::PathBuf> = Vec::new();
+        for raw in &repository_urls {
+            let resolved = resolve_properties(raw, repo_properties);
+            let Ok(url) = Url::parse(resolved.trim()) else {
+                continue;
+            };
+            let Some(dir) = deps_core::lockfile::resolve_manifest_file_path(&url) else {
+                continue;
+            };
+            if file_repositories.contains(&dir) {
+                continue;
+            }
+            file_repositories.push(dir);
+            if file_repositories.len() >= MAX_FILE_REPO_DIRS {
+                break;
+            }
+        }
+
+        if !file_repositories.is_empty() {
+            // Sync `fs_probe` calls here are bounded (`MAX_TOTAL_PROBE_ATTEMPTS`) and
+            // follow the same inline pattern as deps-npm's `config_ancestors` walk
+            // (`catalog.rs`) — no `spawn_blocking` needed for this class of bounded fs_probe
+            // call.
+            //
+            // Only the default `jar` packaging layout is probed — a `<type>` other than the
+            // implicit default, a timestamped SNAPSHOT filename, or a classifier are out of
+            // scope for this probe.
+            let mut probes_remaining = MAX_TOTAL_PROBE_ATTEMPTS;
+            'dependencies: for accum in &mut dependencies {
+                if accum.is_plugin
+                    || accum.dep.source != deps_core::parser::DependencySource::Registry
+                {
+                    continue;
+                }
+                let Some(version) = accum
+                    .dep
+                    .version_req
+                    .as_ref()
+                    .map(|v| v.as_ref().to_string())
+                else {
+                    continue;
+                };
+                let group_id = accum.dep.group_id.as_str();
+                let artifact_id = accum.dep.artifact_id.as_str();
+                if !is_safe_maven_coordinate(group_id, artifact_id, &version)
+                    || is_version_range_syntax(&version)
+                {
+                    continue;
+                }
+                let group_path = group_id.replace('.', std::path::MAIN_SEPARATOR_STR);
+                for repo_dir in &file_repositories {
+                    let candidate = repo_dir
+                        .join(&group_path)
+                        .join(artifact_id)
+                        .join(&version)
+                        .join(format!("{artifact_id}-{version}.jar"));
+                    // Belt-and-suspenders on top of `is_safe_maven_coordinate` (#1503 M1):
+                    // if the joined path ever ends up outside `repo_dir` despite the segment
+                    // checks above, treat it as unresolvable rather than probe it.
+                    if !candidate.starts_with(repo_dir) {
+                        continue;
+                    }
+                    if probes_remaining == 0 {
+                        break 'dependencies;
+                    }
+                    probes_remaining -= 1;
+                    if deps_core::fs_probe::metadata(&candidate).is_ok() {
+                        accum.dep.source = deps_core::parser::DependencySource::Path {
+                            path: candidate.display().to_string(),
+                        };
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(MavenParseResult {
-        dependencies,
+        dependencies: dependencies.into_iter().map(|accum| accum.dep).collect(),
         properties,
         uri: doc_uri.clone(),
         dependency_truncation: budget.truncation(),
@@ -326,11 +542,12 @@ fn finalize_dep(
         .unwrap_or_default();
 
     // #1202 (critic Maven fix): `scope: system` is an explicit, per-dependency local-jar
-    // binding via `<systemPath>` — unlike the unbound `<repositories>` gap (see the
-    // `types.rs` TODO), this one is already a real per-dependency field this parser reads,
-    // so classifying it needs no heuristic at all. Falls back to `Registry` only if a
-    // malformed manifest declares `scope: system` with no `systemPath` at all (never crashes
-    // on it, but there is nothing to classify against either).
+    // binding via `<systemPath>` — a real per-dependency field this parser reads, so
+    // classifying it needs no heuristic at all (contrast with the `<repositories>` file://
+    // probe in `parse_pom_xml`, #1503, which runs after this and only overrides a dependency
+    // still left as `Registry`, never one already `Path` here). Falls back to `Registry` only
+    // if a malformed manifest declares `scope: system` with no `systemPath` at all (never
+    // crashes on it, but there is nothing to classify against either).
     let source = if scope == MavenScope::System {
         dep.system_path
             .as_deref()
@@ -447,6 +664,7 @@ mod tests {
     use super::*;
 
     use std::assert_matches;
+    use std::fmt::Write as _;
 
     fn test_uri() -> Url {
         deps_core::test_util::test_uri("/test/pom.xml")
@@ -564,6 +782,754 @@ mod tests {
             deps_core::parser::DependencySource::Path {
                 path: "/opt/lib/internal-jar-1.0.0.jar".into(),
             }
+        );
+        assert_eq!(guava.source, deps_core::parser::DependencySource::Registry);
+    }
+
+    /// Creates `<repo_root>/<group-path>/<artifact_id>/<version>/<artifact_id>-<version>.jar`
+    /// (an empty file — only its existence is probed), for #1503's per-package probe tests.
+    fn write_fake_jar(
+        repo_root: &std::path::Path,
+        group_id: &str,
+        artifact_id: &str,
+        version: &str,
+    ) {
+        let group_path = group_id.replace('.', std::path::MAIN_SEPARATOR_STR);
+        let dir = repo_root.join(group_path).join(artifact_id).join(version);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{artifact_id}-{version}.jar")), b"").unwrap();
+    }
+
+    /// #1503: a dependency whose jar is actually present at the standard Maven layout path
+    /// under a declared `file://` repository classifies as `Path`.
+    #[test]
+    fn test_file_repository_probe_classifies_present_jar_as_path() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_jar(tmp.path(), "com.acme", "internal-lib", "1.0.0");
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_matches!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path { .. }
+        );
+    }
+
+    /// #1503 S1 regression: a dependency declared alongside a `file://` repository, but whose
+    /// jar does NOT exist under it (e.g. a Central-resolvable package with no local presence),
+    /// must stay `Registry` — the coarse "any file:// repo present" rule this replaces would
+    /// have wrongly silenced OSV/outdated diagnostics for it.
+    #[test]
+    fn test_file_repository_probe_leaves_unresolved_jar_as_registry() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>33.0.0-jre</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// #1503 S2 regression: a `<plugin>` entry is never reclassified by the `file://` probe,
+    /// even when a matching jar happens to exist at its derived path — plugins resolve via
+    /// the separate `<pluginRepositories>` config, not `<repositories>`.
+    #[test]
+    fn test_file_repository_probe_never_reclassifies_plugin_entries() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_jar(
+            tmp.path(),
+            "org.apache.maven.plugins",
+            "maven-compiler-plugin",
+            "3.11.0",
+        );
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.11.0</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// #1503 security regression: `groupId`/`artifactId`/version text is attacker-controlled
+    /// `pom.xml` content used to build a filesystem path — a path-traversal-shaped `groupId`
+    /// must be rejected (left `Registry`) before it ever reaches `Path::join`, never panic.
+    #[test]
+    fn test_file_repository_probe_rejects_path_traversal_group_id() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>../../etc</groupId>
+      <artifactId>passwd</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// #1503 security regression (same as the `groupId` variant, exercised via `artifactId`).
+    #[test]
+    fn test_file_repository_probe_rejects_path_traversal_artifact_id() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>../../etc/passwd</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// #1503 security regression (same as the `groupId` variant, exercised via the version
+    /// text).
+    #[test]
+    fn test_file_repository_probe_rejects_path_traversal_version() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>../../../../etc/passwd</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// #1503 M1 regression: `group_id = "com..etc"` (or, without any `..` substring at all,
+    /// `group_id = ".etc"`) passes a `..`/slash-only character blocklist since neither
+    /// individual character appears, but after `group_id.replace('.', MAIN_SEPARATOR_STR)` a
+    /// leading-dot segment becomes an absolute-looking path component that `Path::join` would
+    /// treat as replacing the whole base directory outright, escaping the repo entirely. The
+    /// structural per-segment `Component::Normal` check must reject this even though no
+    /// individual disallowed character is present.
+    #[test]
+    fn test_file_repository_probe_rejects_dot_prefixed_group_id_segment() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        // If the bypass were still present, this would resolve to `/etc/passwd/1.0.0/...`
+        // on the real filesystem — assert it does NOT touch the filesystem at all.
+        let before = deps_core::fs_probe::snapshot();
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>.etc</groupId>
+      <artifactId>passwd</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        let after = deps_core::fs_probe::snapshot();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+        assert_eq!(
+            before, after,
+            "a dot-prefixed group_id segment must never reach fs_probe::metadata"
+        );
+    }
+
+    /// #1503: more than `MAX_FILE_REPO_DIRS` (8) distinct `file://` repositories
+    /// silently stop being added past the cap — the 9th+ are never probed, and parsing never
+    /// panics.
+    #[test]
+    fn test_file_repository_probe_caps_at_max_repositories_probed() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        // The dependency's jar only exists under the 9th repository directory — if the cap is
+        // enforced correctly, this repository is never added to the probe list, so the
+        // dependency stays `Registry`.
+        let dirs: Vec<_> = (0..9).map(|_| tempfile::TempDir::new().unwrap()).collect();
+        write_fake_jar(dirs[8].path(), "com.acme", "internal-lib", "1.0.0");
+
+        let mut repositories = String::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            let url = Url::from_file_path(dir.path()).unwrap();
+            writeln!(
+                repositories,
+                "<repository><id>repo-{i}</id><url>{url}</url></repository>"
+            )
+            .unwrap();
+        }
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    {repositories}
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry,
+            "the 9th repository (the only one with a matching jar) must never be probed \
+             once MAX_FILE_REPO_DIRS is reached"
+        );
+    }
+
+    /// #1503 M7: once `MAX_TOTAL_PROBE_ATTEMPTS` (256) probe calls have been spent on
+    /// earlier dependencies with no matching jar, a later dependency's genuinely-present jar
+    /// is never probed and stays `Registry` — an accepted best-effort-cap limitation (the
+    /// budget does not guarantee declaration order doesn't matter), not a bug.
+    #[test]
+    fn test_file_repository_probe_stops_after_total_budget_exhausted() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_jar(tmp.path(), "com.acme", "internal-lib", "1.0.0");
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let mut fillers = String::new();
+        for i in 0..MAX_TOTAL_PROBE_ATTEMPTS {
+            writeln!(
+                fillers,
+                "<dependency><groupId>com.filler</groupId><artifactId>dep-{i}</artifactId>\
+                 <version>1.0.0</version></dependency>"
+            )
+            .unwrap();
+        }
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    {fillers}
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), MAX_TOTAL_PROBE_ATTEMPTS + 1);
+        let internal_lib = result
+            .dependencies
+            .iter()
+            .find(|d| d.artifact_id == "internal-lib")
+            .unwrap();
+        assert_eq!(
+            internal_lib.source,
+            deps_core::parser::DependencySource::Registry,
+            "a dependency declared after the total probe budget is exhausted must stay \
+             Registry, even though its jar genuinely exists in the repo"
+        );
+    }
+
+    /// #1503 M7: a non-local `doc_uri` (`untitled:`, `https:`, an in-memory buffer, …) skips
+    /// the whole file:// probing block outright — never touches `fs_probe` at all, verified
+    /// via a zero stat-count diff, and every dependency keeps its non-probed classification.
+    #[test]
+    fn test_file_repository_probe_skips_entirely_for_non_local_doc_uri() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let before = deps_core::fs_probe::snapshot();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_jar(tmp.path(), "com.acme", "internal-lib", "1.0.0");
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let non_local_uri: Url = "untitled:/test/pom.xml".parse().unwrap();
+        let result = parse_pom_xml(&xml, &non_local_uri).unwrap();
+        let after = deps_core::fs_probe::snapshot();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+        assert_eq!(
+            before, after,
+            "a non-local doc_uri must skip the whole file:// probing block, never touching \
+             fs_probe"
+        );
+    }
+
+    /// #1503: a version-range requirement (`[1.0,2.0)`) has no single corresponding directory
+    /// to probe, so it is skipped (left `Registry`) rather than probed against a literal,
+    /// bracket-containing path segment.
+    #[test]
+    fn test_file_repository_probe_skips_version_range_syntax() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>ranged-lib</artifactId>
+      <version>[1.0,2.0)</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// #1503: multiple declared `file://` repositories are probed in declaration order; a
+    /// match in a later repository still classifies the dependency as `Path`.
+    #[test]
+    fn test_file_repository_probe_checks_all_repositories_in_order() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp_empty = tempfile::TempDir::new().unwrap();
+        let tmp_hit = tempfile::TempDir::new().unwrap();
+        write_fake_jar(tmp_hit.path(), "com.acme", "internal-lib", "1.0.0");
+
+        let repo_url_empty = Url::from_file_path(tmp_empty.path()).unwrap();
+        let repo_url_hit = Url::from_file_path(tmp_hit.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>empty-repo</id>
+      <url>{repo_url_empty}</url>
+    </repository>
+    <repository>
+      <id>hit-repo</id>
+      <url>{repo_url_hit}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_matches!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path { .. }
+        );
+    }
+
+    /// #1503: a `scope: system` dependency's `<systemPath>` classification is untouched by the
+    /// `file://` probe even when a `file://` repository is also declared in the same
+    /// `pom.xml` — the probe only ever overrides a dependency still classified `Registry`.
+    #[test]
+    fn test_file_repository_probe_does_not_clobber_system_path_classification() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-jar</artifactId>
+      <version>1.0.0</version>
+      <scope>system</scope>
+      <systemPath>/opt/lib/internal-jar-1.0.0.jar</systemPath>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path {
+                path: "/opt/lib/internal-jar-1.0.0.jar".into(),
+            }
+        );
+    }
+
+    /// #1503: a `${property}`-resolved repository URL (e.g. `file://${local.repo.path}`)
+    /// still probes correctly once resolved.
+    #[test]
+    fn test_file_repository_probe_resolves_property_in_url() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_jar(tmp.path(), "com.acme", "internal-lib", "1.0.0");
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+        let repo_url_suffix = repo_url
+            .as_str()
+            .strip_prefix("file://")
+            .expect("from_file_path always produces a file:// URL");
+
+        let xml = format!(
+            r"<project>
+  <properties>
+    <local.repo.path>{repo_url_suffix}</local.repo.path>
+  </properties>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>file://${{local.repo.path}}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_matches!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path { .. }
+        );
+    }
+
+    /// #1503 C1 (critical security regression): a `file://` repository URL that carries a
+    /// host (e.g. `file://attacker.example/share`) can resolve to a Windows UNC path, which
+    /// would make any subsequent filesystem access attempt SMB/NTLM auth against that host.
+    /// Such a URL must be rejected before probing — left `Registry` — and, more importantly,
+    /// must never reach `fs_probe::metadata` at all, verified via a stat-count snapshot diff.
+    #[test]
+    fn test_file_repository_probe_rejects_unc_host_and_never_touches_filesystem() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let before = deps_core::fs_probe::snapshot();
+
+        let xml = r"<project>
+  <repositories>
+    <repository>
+      <id>evil-repo</id>
+      <url>file://attacker.example/share</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        let after = deps_core::fs_probe::snapshot();
+
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+        assert_eq!(
+            before, after,
+            "a host-bearing file:// repository URL must never reach fs_probe::metadata"
+        );
+    }
+
+    /// #1503 S2 regression: `${project.basedir}` (the idiomatic, most common way to declare a
+    /// repository relative to the project) resolves correctly against a real `doc_uri`, and
+    /// the probe still finds a jar declared relative to it.
+    #[test]
+    fn test_file_repository_probe_resolves_project_basedir_property() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_jar(
+            &tmp.path().join("local-maven-repo"),
+            "com.acme",
+            "internal-lib",
+            "1.0.0",
+        );
+        let pom_uri = Url::from_file_path(tmp.path().join("pom.xml")).unwrap();
+
+        let xml = r"<project>
+  <repositories>
+    <repository>
+      <id>local-repo</id>
+      <url>file://${project.basedir}/local-maven-repo</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &pom_uri).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_matches!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Path { .. }
+        );
+    }
+
+    /// #1503 regression: a `pom.xml` with only `http(s)://` repositories must keep the
+    /// default `Registry` classification.
+    #[test]
+    fn test_http_only_repository_keeps_registry_classification() {
+        let xml = r"<project>
+  <repositories>
+    <repository>
+      <id>central-mirror</id>
+      <url>https://mirror.example.com/maven2</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>public-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+  </dependencies>
+</project>";
+
+        let result = parse_pom_xml(xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        assert_eq!(
+            result.dependencies[0].source,
+            deps_core::parser::DependencySource::Registry
+        );
+    }
+
+    /// #1503: mixed `file://` and `http(s)://` repositories in the same `pom.xml` — the
+    /// `http(s)://` entry is ignored for probing purposes, and the dependency whose jar is
+    /// actually present under the `file://` entry still classifies as `Path`, while a sibling
+    /// with no matching jar stays `Registry` (the per-package probe, not a blanket rule).
+    #[test]
+    fn test_mixed_repositories_probes_only_file_scheme_entries() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_fake_jar(tmp.path(), "com.acme", "internal-lib", "1.0.0");
+        let repo_url = Url::from_file_path(tmp.path()).unwrap();
+
+        let xml = format!(
+            r"<project>
+  <repositories>
+    <repository>
+      <id>central-mirror</id>
+      <url>https://mirror.example.com/maven2</url>
+    </repository>
+    <repository>
+      <id>local-repo</id>
+      <url>{repo_url}</url>
+    </repository>
+  </repositories>
+  <dependencies>
+    <dependency>
+      <groupId>com.acme</groupId>
+      <artifactId>internal-lib</artifactId>
+      <version>1.0.0</version>
+    </dependency>
+    <dependency>
+      <groupId>com.google.guava</groupId>
+      <artifactId>guava</artifactId>
+      <version>33.0.0-jre</version>
+    </dependency>
+  </dependencies>
+</project>"
+        );
+
+        let result = parse_pom_xml(&xml, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 2);
+        let internal_lib = result
+            .dependencies
+            .iter()
+            .find(|d| d.artifact_id == "internal-lib")
+            .unwrap();
+        let guava = result
+            .dependencies
+            .iter()
+            .find(|d| d.artifact_id == "guava")
+            .unwrap();
+        assert_matches!(
+            internal_lib.source,
+            deps_core::parser::DependencySource::Path { .. }
         );
         assert_eq!(guava.source, deps_core::parser::DependencySource::Registry);
     }
