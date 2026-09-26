@@ -53,6 +53,7 @@ use deps_core::net_policy::{
     ValidatedRegistryUrl,
 };
 use deps_core::parser::DependencySource;
+use deps_core::redact::sanitize_invisible;
 use deps_core::{BlockedSourceClass, EcosystemId, PackageName, RejectedSourceClass};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -1329,7 +1330,7 @@ fn decode_attr(raw: &str) -> String {
 fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> InvalidOrValid {
     if add.protocol_version.as_deref() == Some("2") {
         tracing::debug!(
-            key = %add.key,
+            key = %sanitize_invisible(&add.key),
             "skipping NuGet V2 (protocolVersion=\"2\") package source; only V3 feeds are supported"
         );
         return Err(InvalidEntry::new(
@@ -1340,8 +1341,11 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
     if !add.value.contains("://") {
         let redacted = RedactedUrl::new(&add.value);
         tracing::debug!(
-            key = %add.key,
-            value = %redacted,
+            key = %sanitize_invisible(&add.key),
+            // `RedactedUrl`'s own `Display` doesn't sweep control characters (that sweep is
+            // #1500's separate, still-unmerged scope) — sanitize here too rather than
+            // depending on merge order (#1501 impl-critic M1).
+            value = %sanitize_invisible(redacted.as_ref()),
             "skipping local/UNC NuGet package source; only V3 http(s) feeds are supported"
         );
         return Err(InvalidEntry::new(
@@ -1354,7 +1358,14 @@ fn resolve_source_entry(add: &RawSourceAdd, policy: &RegistryAccessPolicy) -> In
         // `InvalidEntry::raw`, which can surface as `DependencySource::CustomRegistry`'s
         // hover/diagnostics text, so a query-string credential must be stripped too.
         let redacted = RedactedUrl::new(&add.value);
-        tracing::warn!(key = %add.key, raw = %redacted, %reason, "NuGet package source failed validation");
+        tracing::warn!(
+            key = %sanitize_invisible(&add.key),
+            // Same #1501 impl-critic M1 rationale as the `debug!` above — `reason` can embed
+            // an unswept `RedactedUrl` (`NuGetFeedUrlError::Url(IndexUrlError::InvalidUrl)`).
+            raw = %sanitize_invisible(redacted.as_ref()),
+            reason = %sanitize_invisible(&reason.to_string()),
+            "NuGet package source failed validation"
+        );
         InvalidEntry::new(redacted, reason)
     })
 }
@@ -2024,15 +2035,20 @@ fn fail_closed(
         if config_cache.should_warn_once(hasher.finish()) {
             if matches!(reason, NuGetFeedUrlError::Disabled) {
                 tracing::debug!(
-                    key = %entry.key,
-                    %reason,
+                    key = %sanitize_invisible(&entry.key),
+                    // #1501 correctness-gate finding #8: same rationale as the sibling
+                    // `resolve_source_entry` warn! a few hundred lines above — `reason` can
+                    // embed an unswept `RedactedUrl` via `NuGetFeedUrlError::Url(IndexUrlError::
+                    // InvalidUrl)`. Currently unreachable here (every caller only passes a
+                    // payload-free variant), but kept consistent for defense in depth.
+                    reason = %sanitize_invisible(&reason.to_string()),
                     ?cause,
                     "NuGet package source fails closed on credential binding"
                 );
             } else {
                 tracing::warn!(
-                    key = %entry.key,
-                    %reason,
+                    key = %sanitize_invisible(&entry.key),
+                    reason = %sanitize_invisible(&reason.to_string()),
                     ?cause,
                     "NuGet package source fails closed on credential binding"
                 );
@@ -2148,7 +2164,7 @@ fn expand_credential_with(
     let credential = &cred.credential;
     if credential.encrypted {
         tracing::debug!(
-            key = %credential.key,
+            key = %sanitize_invisible(&credential.key),
             "DPAPI-encrypted <Password> is not supported; dropping credential"
         );
         return Err(NuGetFeedUrlError::EncryptedPasswordUnsupported);
@@ -2353,6 +2369,52 @@ mod tests {
             source("Corp Feed", "https://b.example/v3/index.json", &policy),
         ];
         assert!(resolve_mapping_source_key("Corp Feed", &sources).is_none());
+    }
+
+    /// #1501 correctness-gate finding #3: empirically settles a conflict between impl-critic
+    /// (claimed safe) and the correctness-gate reviewer (claimed a CWE-117 sink) over this
+    /// ambiguous-match `debug!`'s bare `key = mapping_key` field (no `%`/`?` sigil). Verified via
+    /// `tracing_subscriber::fmt`'s default visitor (the exact layer `deps-lsp`/`deps-cli`'s
+    /// `main.rs` both install): a bare `&str` field value is recorded through
+    /// `Visit::record_str`, which the default formatter renders `Debug`-escaped (a quoted string
+    /// with `\n`/`\r` backslash-escaped), unlike the `%`-sigil `Display` fields this fix had to
+    /// wrap in `sanitize_invisible` elsewhere in this file. No code change needed here — this
+    /// test pins that verified-safe behavior so a future formatter/field-style change that
+    /// silently reopens it is caught.
+    #[test]
+    fn test_resolve_mapping_source_key_ambiguous_log_key_field_is_debug_escaped() {
+        let policy = all_policy();
+        // Two sources whose keys differ only by ASCII case — `key_candidates` lowercases both,
+        // so they collide into an ambiguous match while each still carries the embedded
+        // control characters literally (case-folding never touches them).
+        let sources = vec![
+            source(
+                "Evil\nWARN forged log line\r",
+                "https://a.example/v3/index.json",
+                &policy,
+            ),
+            source(
+                "EVIL\nWARN forged log line\r",
+                "https://b.example/v3/index.json",
+                &policy,
+            ),
+        ];
+
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            assert!(resolve_mapping_source_key("Evil\nWARN forged log line\r", &sources).is_none());
+        });
+
+        assert!(
+            log.contains("\\n") && log.contains("\\r"),
+            "bare field must render the escaped two-character sequence, not a raw control byte: \
+             {log:?}"
+        );
+        assert_eq!(
+            log.trim_end_matches('\n').matches('\n').count(),
+            0,
+            "a control character in the mapping key must not split the log into extra lines: \
+             {log:?}"
+        );
     }
 
     // --- NuGetConfig::resolve_source_for: plain (non-mapping) chain ---
@@ -5116,4 +5178,75 @@ mod tests {
             auth: None,
         },
     );
+
+    /// #1501: `<add key="...">` is read straight from `NuGet.config`, a file inside the
+    /// repository — a `\n`/`\r` in it must not forge a fake log line when
+    /// `resolve_source_entry`'s local/UNC-skip `debug!` renders it (CWE-117).
+    #[test]
+    fn test_resolve_source_entry_sanitizes_key_control_chars_in_log() {
+        let add = RawSourceAdd {
+            key: "Evil\nWARN forged log line\r".to_string(),
+            value: "/local/unc/path".to_string(),
+            protocol_version: None,
+        };
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let _ = resolve_source_entry(&add, &policy);
+        });
+
+        assert!(
+            log.contains("Evil"),
+            "expected the key to still be logged: {log:?}"
+        );
+        assert_eq!(
+            log.trim_end_matches('\n').matches('\n').count(),
+            0,
+            "a control character in the key must not split the log into extra lines: {log:?}"
+        );
+        assert!(
+            !log.contains('\r'),
+            "carriage return must not survive into the log: {log:?}"
+        );
+    }
+
+    /// #1501: same sink class, exercised through the full XML parse path (not just the
+    /// unit under test above) — a NuGet.config `key` attribute using numeric character
+    /// references (`&#10;`/`&#13;`) decodes, via `decode_attr`'s `quick_xml::escape::unescape`
+    /// call, to raw `\n`/`\r` bytes, proving the sink is reachable from real
+    /// repository-controlled `NuGet.config` content, not just a hand-built fixture.
+    #[test]
+    fn test_resolve_with_context_sanitizes_key_control_chars_from_xml_char_refs() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        write_config(
+            &repo,
+            r#"<configuration><packageSources>
+                <add key="Evil&#10;WARN forged log line&#13;" value="/local/unc/path" />
+            </packageSources></configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+
+        let log = deps_core::test_util::capture_tracing_output_at(tracing::Level::DEBUG, || {
+            let _ = resolve_ctx(&repo, &cache, &policy, None, false);
+        });
+
+        assert!(
+            log.contains("Evil"),
+            "expected the key to still be logged: {log:?}"
+        );
+        assert_eq!(
+            log.trim_end_matches('\n').matches('\n').count(),
+            0,
+            "a decoded control character in the key must not split the log into extra lines: \
+             {log:?}"
+        );
+        assert!(
+            !log.contains('\r'),
+            "carriage return must not survive into the log: {log:?}"
+        );
+    }
 }
