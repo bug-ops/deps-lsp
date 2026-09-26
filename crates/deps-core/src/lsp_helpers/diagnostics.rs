@@ -7287,11 +7287,7 @@ mod tests {
             ) -> Option<Box<dyn RequirementMatcher>> {
                 self.compile_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                requirement
-                    .as_str()
-                    .parse::<semver::VersionReq>()
-                    .ok()
-                    .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+                crate::lsp_helpers::compile_semver_requirement(requirement)
             }
         }
         impl DiagnosticMessages for CountingFormatter {}
@@ -8402,20 +8398,16 @@ mod tests {
     mod matching_prerelease_would_satisfy_tests {
         use super::*;
 
-        /// Same underlying `semver::VersionReq` comparator as `StrictSemverFormatter`'s
-        /// `RealSemverMatcher` (defined in the parent `tests` module and shared with the
-        /// `generate_diagnostics_from_cache` end-to-end coverage), but this matcher does not
-        /// override `strict_prerelease_exclusion` — mirrors Maven/NuGet/Composer/Gradle's own
+        /// Shares `matches()`'s logic with [`compile_semver_requirement`]'s matcher via
+        /// `semver_req_matches`, but hand-rolls `strict_prerelease_exclusion() == false` rather
+        /// than delegating — the whole point of this type is exercising the opposite of what the
+        /// shared constructor always returns. Mirrors Maven/NuGet/Composer/Gradle's own
         /// matchers, none of which override it either, so this formatter must never get the
         /// enrichment.
         struct NonStrictSemverMatcher(semver::VersionReq);
         impl RequirementMatcher for NonStrictSemverMatcher {
             fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-                version
-                    .as_str()
-                    .parse::<semver::Version>()
-                    .ok()
-                    .map(|v| self.0.matches(&v))
+                crate::lsp_helpers::semver_req_matches(&self.0, version)
             }
 
             fn strict_prerelease_exclusion(&self) -> bool {

@@ -1260,25 +1260,10 @@ impl SourcePolicy for ExactMatchFormatter {}
 
 impl OsvNaming for ExactMatchFormatter {}
 
-pub(crate) struct RealSemverMatcher(pub(crate) semver::VersionReq);
-impl RequirementMatcher for RealSemverMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        version
-            .as_str()
-            .parse::<semver::Version>()
-            .ok()
-            .map(|v| self.0.matches(&v))
-    }
-
-    fn strict_prerelease_exclusion(&self) -> bool {
-        true
-    }
-}
-
-/// Mirrors `deps-cargo`/`deps-swift`'s real formatter shape (`semver::VersionReq`
-/// compilation, whose matcher opts into `strict_prerelease_exclusion`) without depending on
-/// those crates. Shared by `matching_prerelease_would_satisfy_tests` and the
-/// `generate_diagnostics_from_cache` end-to-end coverage below (#299).
+/// Mirrors `deps-cargo`/`deps-swift`'s real formatter shape (delegates to the shared
+/// [`compile_semver_requirement`], whose matcher opts into `strict_prerelease_exclusion`)
+/// without depending on those crates. Shared by `matching_prerelease_would_satisfy_tests` and
+/// the `generate_diagnostics_from_cache` end-to-end coverage below (#299).
 pub(crate) struct StrictSemverFormatter;
 impl PackageNaming for StrictSemverFormatter {}
 
@@ -1294,11 +1279,7 @@ impl PackageRendering for StrictSemverFormatter {
 
 impl RequirementResolution for StrictSemverFormatter {
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
-        requirement
-            .as_str()
-            .parse::<semver::VersionReq>()
-            .ok()
-            .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+        compile_semver_requirement(requirement)
     }
 }
 

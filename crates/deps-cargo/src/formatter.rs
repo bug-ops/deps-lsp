@@ -1,6 +1,6 @@
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy,
+    RequirementMatcher, RequirementResolution, SourcePolicy, compile_semver_requirement,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
@@ -14,26 +14,6 @@ use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
 /// passes the shared URL-safety check but still correctly fails this diagnostic's
 /// length check. Do not "fix" the two caps back into lockstep.
 const MAX_NAME_LENGTH: usize = 64;
-
-/// Precise semver `VersionReq` matcher, compiled once per dependency by
-/// [`CargoFormatter::compile_requirement`].
-struct SemverMatcher(semver::VersionReq);
-
-impl RequirementMatcher for SemverMatcher {
-    fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
-        let version = version.as_str();
-        version
-            .parse::<semver::Version>()
-            .ok()
-            .map(|v| self.0.matches(&v))
-    }
-
-    /// `semver::VersionReq::matches` excludes pre-releases unless `requirement` itself pins
-    /// to the same `X.Y.Z` tuple with a pre-release tag — strict SemVer 2.0.0 semantics (#299).
-    fn strict_prerelease_exclusion(&self) -> bool {
-        true
-    }
-}
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Cargo.
 pub struct CargoFormatter;
@@ -120,19 +100,15 @@ impl PackageRendering for CargoFormatter {
 }
 
 impl RequirementResolution for CargoFormatter {
-    /// Compiles `requirement` via `semver::VersionReq`, the same crate `deps-cargo`'s
-    /// registry uses for matching — precise range semantics (`^`, `~`, comparator lists),
-    /// unlike the default `version_satisfies_requirement` heuristic this method
-    /// deliberately does not reuse (see that method's docs).
+    /// Delegates to [`compile_semver_requirement`] — precise `semver::VersionReq` range
+    /// semantics (`^`, `~`, comparator lists), the same crate `deps-cargo`'s registry uses for
+    /// matching, unlike the default `version_satisfies_requirement` heuristic this method
+    /// deliberately does not reuse (see that method's docs). Shared with `deps-swift` (#1495).
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
-        requirement
-            .as_str()
-            .parse::<semver::VersionReq>()
-            .ok()
-            .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+        compile_semver_requirement(requirement)
     }
 
     // #1370/#1391: `Cargo.toml`'s own TOML grammar has no placeholder syntax of its own —

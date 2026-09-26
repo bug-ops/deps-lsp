@@ -193,6 +193,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-cli, deps-gitlab-ci, deps-github-actions, deps-swift**: `HttpCache::set_offline`/`set_cache_enabled` now take `NetworkMode`/`CacheMode`, `DepsError::rate_limited`'s `verified` field is now `RateLimitEvidence`, and `deps-cli`'s `dry_run`/`offline`/`had_execution_error` boolean parameters are now typed (`format::DryRun`, `deps_core::NetworkMode`, `exit::ExecutionOutcome`), replacing boolean-blind public APIs (part of #1436) (#1445)
 - **deps-gradle, deps-nuget, deps-npm**: manifest/lockfile kind is now derived from a private typed `from_uri`/`from_path` classification (mirroring `deps-pypi`'s existing pattern) instead of independently re-matching the URI/filename string at each call site (part of #1436) (#1445)
 - **deps-lsp, deps-core, deps-swift**: dedupes `initialize`/`did_change_configuration`'s config side-effect application, fixes a stale doc comment, and adds a deps-swift fixture integration test; no behavior change (resolves #1484) (#1506)
+- **deps-core, deps-cargo, deps-swift**: new `deps_core::lsp_helpers::compile_semver_requirement` replaces the byte-identical `SemverMatcher(semver::VersionReq)` wrapper independently defined in deps-cargo and deps-swift; no behavior change (resolves #1495)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
