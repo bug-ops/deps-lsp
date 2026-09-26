@@ -919,7 +919,8 @@ impl LanguageServer for Backend {
                 &self.client,
                 Arc::clone(&self.config),
                 gossip_trigger_fetch_timeout_secs,
-            );
+            )
+            .await;
         }
 
         match scope {

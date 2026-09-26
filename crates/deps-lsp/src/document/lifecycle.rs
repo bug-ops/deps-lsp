@@ -304,8 +304,9 @@ async fn run_document_open_background_task(
         .await;
 
     // GOSSIP pre-fetch (issue #1456, spec 072) — same detached, self-guarded shape as the
-    // typosquat pre-fetch above.
-    spawn_gossip_prefetch_and_republish(
+    // typosquat pre-fetch above, including task tracking (finding #4).
+    let gossip_generation = state.next_gossip_task_generation();
+    let gossip_task = spawn_gossip_prefetch_and_republish(
         uri.clone(),
         Arc::clone(&state),
         client.clone(),
@@ -313,6 +314,9 @@ async fn run_document_open_background_task(
         Arc::clone(&config),
         diagnostics_snapshot.fetch_timeout_secs,
     );
+    state
+        .track_gossip_task(uri.clone(), gossip_generation, gossip_task)
+        .await;
 
     // Collect dependency names+sources, the in-use-version map (§4.6), and the manifest's own
     // `SelectionContext` (#1433) in one pass while holding the reference (can't hold across
@@ -1193,8 +1197,10 @@ async fn run_document_change_task(
     }
 
     // GOSSIP pre-fetch (issue #1456, spec 072) — same unconditional, self-guarded,
-    // not-joined-before-publish shape as the typosquat pre-fetch above.
-    spawn_gossip_prefetch_and_republish(
+    // not-joined-before-publish shape as the typosquat pre-fetch above, including task
+    // tracking (finding #4).
+    let gossip_generation = state.next_gossip_task_generation();
+    let gossip_task = spawn_gossip_prefetch_and_republish(
         uri.clone(),
         Arc::clone(&state),
         client.clone(),
@@ -1202,6 +1208,9 @@ async fn run_document_change_task(
         Arc::clone(&live_config),
         config.diagnostics.fetch_timeout_secs,
     );
+    state
+        .track_gossip_task(uri.clone(), gossip_generation, gossip_task)
+        .await;
 
     // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
     // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty
@@ -1380,54 +1389,43 @@ async fn await_license_prefetch(task: Option<JoinHandle<()>>) {
     }
 }
 
-/// Spawns [`run_typosquat_prefetch`] fully detached — never joined before the caller's own
-/// diagnostics publish (issue #1437 impl-critic N2, correcting an earlier design that
-/// mirrored [`await_license_prefetch`]'s join-before-publish shape for typosquat too).
+/// Shared spawn+republish scaffolding behind [`spawn_typosquat_prefetch_and_republish`] and
+/// [`spawn_gossip_prefetch_and_republish`] (issue #1476 finding #4): both pre-fetches are an
+/// opt-in, best-effort signal (NFR-001) run fully detached — never joined before the caller's
+/// own diagnostics publish — and, only if the pre-fetch actually commits a non-empty result,
+/// followed by their own `publish_document_diagnostics` call rather than blocking the publish
+/// the caller was already about to make. They differ only in which `prefetch` future they run
+/// and the `label` identifying them in the panic log.
 ///
-/// `run_license_prefetch`'s join is a deliberate tradeoff: it only ever touches four small
-/// tier-3 ecosystems, and a license-policy violation is judged important enough to justify
-/// briefly delaying the first diagnostics publish for it. Typosquat has neither property —
-/// it fans out across all seven major deps.dev ecosystems, each dependency can cost up to
-/// `2 + 2N` sequential-per-candidate deps.dev round trips, and the resulting diagnostic is
-/// an opt-in, best-effort `Severity::Hint`. Gating real OSV/outdated diagnostics on it would
-/// violate spec 071 NFR-001 ("never becomes a reliability liability"). So this spawns the
-/// pre-fetch, and — only if it actually commits a non-empty result — issues its own
-/// follow-up `publish_document_diagnostics` call once it resolves, rather than blocking the
-/// publish the caller was already about to make.
-///
-/// `fetch_timeout_secs` bounds the pre-fetch itself and is taken as the caller's spawn-time
-/// value (matching every other background task's timeout parameter — an internal tuning
-/// value, not something a live setting change needs to affect retroactively). `config` is
-/// re-read for the *republish* only, right before `publish_document_diagnostics` (issue
-/// #1437 impl-critic M1): the pre-fetch can take up to ~10s, and reusing a spawn-time
-/// `DiagnosticsSnapshot` for that call would show the user's severity/freshness/offline
-/// settings as they were when the prefetch *started*, not as they are by the time it
-/// actually publishes.
+/// `config` is re-read for the *republish* only, right before `publish_document_diagnostics`:
+/// the pre-fetch can take up to ~10s, and reusing a spawn-time `DiagnosticsSnapshot` for that
+/// call would show the user's severity/freshness/offline settings as they were when the
+/// pre-fetch *started*, not as they are by the time it actually publishes.
 ///
 /// Supervised via [`spawn_supervised`] (issue #1455 batch item 1, following #1399's precedent
 /// for detached background work) so a panic surfaces in the logs instead of vanishing
 /// silently, and returns the worker's own [`tokio::task::AbortHandle`] so the caller can
-/// register it with [`ServerState::track_typosquat_task`] — letting a superseding edit or
-/// `did_close` cancel a still-running pre-fetch instead of leaving it to run to completion
-/// only for `run_typosquat_prefetch`'s own content-staleness guard to discard its result.
-fn spawn_typosquat_prefetch_and_republish(
+/// register it with its own generation-ordered task registry. What that registration then
+/// does with a superseded task differs by caller: typosquat's
+/// ([`ServerState::track_typosquat_task`]) cancels it, since its own content/name-set
+/// staleness guard would otherwise just discard the stale result anyway; GOSSIP's
+/// ([`ServerState::track_gossip_task`]) deliberately never does (critic S1 — see that
+/// method's own doc).
+fn spawn_prefetch_and_republish<Fut>(
     uri: Uri,
     state: Arc<ServerState>,
     client: Client,
-    ecosystem: Arc<dyn Ecosystem>,
     config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
-) -> tokio::task::AbortHandle {
+    label: &'static str,
+    prefetch: Fut,
+) -> tokio::task::AbortHandle
+where
+    Fut: std::future::Future<Output = bool> + Send + 'static,
+{
     let log_uri = uri.clone();
     spawn_supervised(
         async move {
-            let changed = run_typosquat_prefetch(
-                uri.clone(),
-                Arc::clone(&state),
-                ecosystem,
-                fetch_timeout_secs,
-            )
-            .await;
+            let changed = prefetch.await;
             if changed {
                 let snapshot = {
                     let cfg = config.read().await;
@@ -1443,24 +1441,48 @@ fn spawn_typosquat_prefetch_and_republish(
         .instrument(tracing::Span::current()),
         move |e| {
             tracing::error!(
-                "typosquat pre-fetch for {:?} panicked ({e}); its typosquat diagnostic may be \
-                 stale",
+                "{label} pre-fetch for {:?} panicked ({e}); its {label} diagnostic may be stale",
                 log_uri
             );
         },
     )
 }
 
-/// Spawns [`run_gossip_prefetch`] fully detached — never joined before the caller's own
-/// diagnostics publish, mirroring [`spawn_typosquat_prefetch_and_republish`]'s identical
-/// NFR-001-driven design (issue #1456, spec 072): GOSSIP is an opt-in, best-effort signal,
-/// so gating real OSV/outdated diagnostics on its batch call would violate "never becomes
-/// a reliability liability". Spawns the pre-fetch, and — only if it actually commits a
-/// non-empty result — issues its own follow-up `publish_document_diagnostics` call once it
-/// resolves, rather than blocking the publish the caller was already about to make.
-///
-/// `config` is re-read for the *republish* only, right before `publish_document_diagnostics`
-/// (mirrors [`spawn_typosquat_prefetch_and_republish`]'s identical reasoning).
+/// Spawns [`run_typosquat_prefetch`] via [`spawn_prefetch_and_republish`] — never joined before
+/// the caller's own diagnostics publish (issue #1437 impl-critic N2, correcting an earlier
+/// design that mirrored [`await_license_prefetch`]'s join-before-publish shape for typosquat
+/// too): `run_license_prefetch`'s join is a deliberate tradeoff justified by its four small
+/// tier-3 ecosystems and license violations needing to appear immediately, but typosquat's
+/// fan-out covers all seven major deps.dev ecosystems, can cost up to `2 + 2N`
+/// sequential-per-candidate deps.dev round trips per dependency, and its diagnostic is only an
+/// opt-in, best-effort `Severity::Hint` — gating real OSV/outdated diagnostics on it would
+/// violate spec 071 NFR-001. `fetch_timeout_secs` bounds the pre-fetch itself and is taken as
+/// the caller's spawn-time value (matching every other background task's timeout parameter).
+/// See [`spawn_prefetch_and_republish`]'s doc for the rest of the shared
+/// spawn/republish/panic-supervision shape.
+fn spawn_typosquat_prefetch_and_republish(
+    uri: Uri,
+    state: Arc<ServerState>,
+    client: Client,
+    ecosystem: Arc<dyn Ecosystem>,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) -> tokio::task::AbortHandle {
+    let prefetch = run_typosquat_prefetch(
+        uri.clone(),
+        Arc::clone(&state),
+        ecosystem,
+        fetch_timeout_secs,
+    );
+    spawn_prefetch_and_republish(uri, state, client, config, "typosquat", prefetch)
+}
+
+/// Spawns [`run_gossip_prefetch`] via [`spawn_prefetch_and_republish`] — GOSSIP (issue #1456,
+/// spec 072) migrated from a bare `tokio::spawn` to [`spawn_supervised`] by issue #1476 finding
+/// #4, mirroring [`spawn_typosquat_prefetch_and_republish`]'s panic supervision. See that
+/// function's doc for the rest of the shared spawn/republish/panic-supervision shape, and
+/// [`ServerState::track_gossip_task`]'s doc (critic S1) for why this one's superseded-task
+/// handling deliberately differs from typosquat's.
 fn spawn_gossip_prefetch_and_republish(
     uri: Uri,
     state: Arc<ServerState>,
@@ -1468,62 +1490,66 @@ fn spawn_gossip_prefetch_and_republish(
     ecosystem: Arc<dyn Ecosystem>,
     config: Arc<RwLock<DepsConfig>>,
     fetch_timeout_secs: u64,
-) {
-    tokio::spawn(
-        async move {
-            let changed = run_gossip_prefetch(
-                uri.clone(),
-                Arc::clone(&state),
-                ecosystem,
-                fetch_timeout_secs,
-            )
-            .await;
-            if changed {
-                let snapshot = {
-                    let cfg = config.read().await;
-                    diagnostics::DiagnosticsSnapshot::from_config(&cfg)
-                };
-                let dep_count = diagnostics::document_dependency_count(&state, &uri);
-                diagnostics::publish_document_diagnostics(
-                    &state, &client, &uri, &snapshot, dep_count,
-                )
-                .await;
-            }
-        }
-        .instrument(tracing::Span::current()),
+) -> tokio::task::AbortHandle {
+    let prefetch = run_gossip_prefetch(
+        uri.clone(),
+        Arc::clone(&state),
+        ecosystem,
+        fetch_timeout_secs,
     );
+    spawn_prefetch_and_republish(uri, state, client, config, "GOSSIP", prefetch)
 }
 
-/// Triggers the GOSSIP pre-fetch for every currently open document (issue #1456, spec 072)
-/// — intended to be called once, from `Backend::did_change_configuration`, exactly when
-/// `policy.gossip.enabled` transitions from `false` to `true`, mirroring
-/// [`trigger_typosquat_prefetch_for_open_documents`]'s identical rationale and shape.
-pub(crate) fn trigger_gossip_prefetch_for_open_documents(
-    state: &Arc<ServerState>,
-    client: &Client,
-    config: Arc<RwLock<DepsConfig>>,
-    fetch_timeout_secs: u64,
-) {
+/// Every currently open document's `Uri` paired with its resolved [`Ecosystem`] — shared
+/// enumeration behind [`trigger_gossip_prefetch_for_open_documents`] and
+/// [`trigger_typosquat_prefetch_for_open_documents`]. A document whose ecosystem has since been
+/// unregistered (should not happen in practice) is silently skipped rather than panicking.
+fn open_documents_with_ecosystem(state: &Arc<ServerState>) -> Vec<(Uri, Arc<dyn Ecosystem>)> {
+    // Critic M3: collects every key into an owned `Vec` — and so drops every `documents.iter()`
+    // shard guard — *before* the second pass below takes its own `documents.get` guard via
+    // `with_document`, rather than chaining both lazily in one iterator (which would call
+    // `with_document` on a shard `iter()` is still holding a read guard on).
     let uris: Vec<Uri> = state
         .documents
         .iter()
         .map(|entry| entry.key().clone())
         .collect();
-    for uri in uris {
-        let Some(ecosystem_id) = state.with_document(&uri, |doc| doc.ecosystem) else {
-            continue;
-        };
-        let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_id) else {
-            continue;
-        };
-        spawn_gossip_prefetch_and_republish(
-            uri,
+    uris.into_iter()
+        .filter_map(|uri| {
+            let ecosystem_id = state.with_document(&uri, |doc| doc.ecosystem)?;
+            let ecosystem = state.ecosystem_registry.get(ecosystem_id)?;
+            Some((uri, ecosystem))
+        })
+        .collect()
+}
+
+/// Triggers the GOSSIP pre-fetch for every currently open document (issue #1456, spec 072)
+/// — intended to be called once, from `Backend::did_change_configuration`, exactly when
+/// `policy.gossip.enabled` transitions from `false` to `true`, mirroring
+/// [`trigger_typosquat_prefetch_for_open_documents`]'s identical rationale and shape. Fires-and-
+/// forgets one [`spawn_gossip_prefetch_and_republish`] per document, registering each task's
+/// handle (issue #1476 finding #4) so `did_close` can still cancel it — this function itself
+/// returns as soon as every per-document task is spawned and tracked, without waiting for any
+/// of them to resolve.
+pub(crate) async fn trigger_gossip_prefetch_for_open_documents(
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    for (uri, ecosystem) in open_documents_with_ecosystem(state) {
+        let gossip_generation = state.next_gossip_task_generation();
+        let gossip_task = spawn_gossip_prefetch_and_republish(
+            uri.clone(),
             Arc::clone(state),
             client.clone(),
             ecosystem,
             Arc::clone(&config),
             fetch_timeout_secs,
         );
+        state
+            .track_gossip_task(uri, gossip_generation, gossip_task)
+            .await;
     }
 }
 
@@ -1533,26 +1559,14 @@ pub(crate) fn trigger_gossip_prefetch_for_open_documents(
 /// document picks up the signal immediately instead of waiting for its next edit or
 /// reopen. Fires-and-forgets one [`spawn_typosquat_prefetch_and_republish`] per document —
 /// this function itself returns as soon as every per-document task is spawned, without
-/// waiting for any of them to resolve. A document whose ecosystem has since been
-/// unregistered (should not happen in practice) is silently skipped rather than panicking.
+/// waiting for any of them to resolve.
 pub(crate) async fn trigger_typosquat_prefetch_for_open_documents(
     state: &Arc<ServerState>,
     client: &Client,
     config: Arc<RwLock<DepsConfig>>,
     fetch_timeout_secs: u64,
 ) {
-    let uris: Vec<Uri> = state
-        .documents
-        .iter()
-        .map(|entry| entry.key().clone())
-        .collect();
-    for uri in uris {
-        let Some(ecosystem_id) = state.with_document(&uri, |doc| doc.ecosystem) else {
-            continue;
-        };
-        let Some(ecosystem) = state.ecosystem_registry.get(ecosystem_id) else {
-            continue;
-        };
+    for (uri, ecosystem) in open_documents_with_ecosystem(state) {
         // Seeds `PackageSignals::typosquat_checked_names` from the current content (issue
         // #1455 critic S1), mirroring the open path — this call always spawns regardless
         // (the feature just transitioned on, so every open document needs its first check),

@@ -9,7 +9,6 @@ use deps_core::Ecosystem;
 use deps_core::PackageName;
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Duration;
 use tower_lsp_server::ls_types::Uri;
 
 /// Ceiling on the typosquat pre-fetch's overall timeout, independent of the configured
@@ -236,26 +235,18 @@ pub(crate) async fn run_typosquat_prefetch(
     // concurrent `cargo build`/`npm install`, without touching declared names) would discard
     // an already-correct, already-computed typosquat result for a reason that has nothing to
     // do with this signal's own invariants.
-    let (names_snapshot, parse_result): (
-        HashSet<(PackageName, TyposquatSourceEligibility)>,
-        Arc<dyn deps_core::ParseResult>,
-    ) = {
-        let Some(doc) = state.get_document(&uri) else {
-            return false;
-        };
-        let Some(parse_result) = doc.parse_result_arc() else {
-            return false;
-        };
-        (
-            declared_names(parse_result.as_ref(), ecosystem.formatter()),
-            parse_result,
-        )
+    let Some((names_snapshot, parse_result)) =
+        super::prefetch_support::document_prefetch_snapshot(&state, &uri, |_, parse_result| {
+            declared_names(parse_result.as_ref(), ecosystem.formatter())
+        })
+    else {
+        return false;
     };
 
-    let timeout_duration =
-        Duration::from_secs(fetch_timeout_secs.min(TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS));
-    let outcome = match tokio::time::timeout(
-        timeout_duration,
+    let Some(outcome) = super::prefetch_support::bounded_prefetch_fetch(
+        fetch_timeout_secs,
+        TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS,
+        "typosquat",
         deps_core::lsp_helpers::fetch_typosquat_signals(
             ecosystem.ecosystem_id(),
             parse_result.as_ref(),
@@ -265,22 +256,18 @@ pub(crate) async fn run_typosquat_prefetch(
         ),
     )
     .await
-    {
-        Ok(outcome) => outcome,
-        Err(_) => {
-            tracing::debug!("typosquat pre-fetch timed out");
-            // Issue #1463: a timed-out attempt must not leave the debounced-edit gate
-            // believing `names_snapshot` was actually checked, or a later edit that
-            // doesn't change names/eligibility again would never re-trigger a retry.
-            // Only clears if nothing has since advanced past this snapshot (see the
-            // method's own doc for why that guard matters).
-            if let Some(mut doc) = state.documents.get_mut(&uri) {
-                doc.signals
-                    .typosquat_checked_names
-                    .clear_if_stale(&names_snapshot);
-            }
-            return false;
+    else {
+        // Issue #1463: a timed-out attempt must not leave the debounced-edit gate
+        // believing `names_snapshot` was actually checked, or a later edit that
+        // doesn't change names/eligibility again would never re-trigger a retry.
+        // Only clears if nothing has since advanced past this snapshot (see the
+        // method's own doc for why that guard matters).
+        if let Some(mut doc) = state.documents.get_mut(&uri) {
+            doc.signals
+                .typosquat_checked_names
+                .clear_if_stale(&names_snapshot);
         }
+        return false;
     };
 
     // Issue #1463 (impl-critic S1): the outer timeout above only catches the
