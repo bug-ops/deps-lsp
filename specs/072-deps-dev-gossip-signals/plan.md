@@ -146,6 +146,31 @@ yet covered by N1-N6:
   `GetFindingsBatch`'s own 5000-item batch limit — no separate cap needed there, just a note that the two
   numbers happen to already agree.
 
+**2026-09-26, round 6**: the critic's actual verdict on round 4 (commit `961034a6e`, delayed in delivery
+and only now fully received) was **minor** — N5, N6a, N6b, and M15 confirmed correctly addressed, ready for
+implementation modulo one must-fix and three optional polish items:
+
+- **M16 (must-fix, addressed here)**: round 4's plan said hover/diagnostics read "from the document-level
+  cache", but the actual reader is `VersionData.gossip_prefetch`, sourced *only* from
+  `DocumentState.gossip_findings` — never the memo directly. The prefetch task's own wording ("memo-misses
+  via batch; hits come from the memo directly") never specified that memo *hits* (and names another
+  document's in-flight batch is currently fetching) also get merged into *this* document's
+  `DocumentState`. Without that, a package already warmed elsewhere would sit in the memo forever but never
+  reach a document that didn't itself trigger the original fetch — reintroducing N2 for the single most
+  common case. Fixed above: the merge always assembles memo hits + batch results + joined in-flight results
+  together, not just this fetch's own POST results.
+- **M17 (deferred, deps-cli follow-up)**: `ignored_sections` (M14's fix) only fires for an
+  auto-discovered `deps.toml` (`config.rs:234/298`) — an explicit `--config` still accepts `[gossip]`
+  silently. `typosquat` has the same pre-existing gap. Fix both together in the `deps-cli` GOSSIP-parity
+  follow-up issue (§0), not here.
+- **M18 (addressed here)**: stale mentions of a "completion candidate" FR-008 comparand in plan §7 and
+  spec FR-008, left over from before N6b dropped completion enrichment. Corrected.
+- **M19/M20 (addressed by round 5 + noted here)**: N7/N8 (round 5) already adopted the critic's
+  `end > now()`-at-read-time and refresh-on-mismatch suggestions as hard requirements (FR-011/FR-012), not
+  just a deferred brief note — round 5 was written before this round-4 verdict fully arrived, so the two
+  independently converged on the same fix. `HttpCache::post_json` hardening (body cap per page, fixed
+  origin) is confirmed as the first standalone implementation task with its own test (§6/§7, M20).
+
 ## 1. Architecture
 
 ### Approach
@@ -164,10 +189,19 @@ callout) and `diagnostics.rs:2262` (outdated-dependency message). `completion.rs
 3. Does **not** touch `deps-cli` (FR-010 dropped, N1) beyond adding `gossip` to its existing
    `ignored_sections` "no effect" warning list (M14) — filed as a separate follow-up issue for real parity.
 
-**Data flow, corrected through round 4 (N2/N3/N4/N5/N6a)**: a per-package `DepsDevClient` memo (1h TTL,
-same shape as `trust_signal`'s) provides network dedupe; a document-lifecycle prefetch task requests one
-`GetFindingsBatch` POST per document **for memo-misses only**, covering every declared dependency whose
-source passes `SourcePolicy::source_is_public_registry_content`. Successful results populate both the
+**Data flow, corrected through round 6 (N2/N3/N4/N5/N6a/M16)**: a per-package `DepsDevClient` memo (1h TTL,
+same shape as `trust_signal`'s) provides network dedupe; a document-lifecycle prefetch task, for every
+declared dependency whose source passes `SourcePolicy::source_is_public_registry_content`, checks the memo
+first. **Critical (M16 — every reader uses only `DocumentState.gossip_findings`, never the memo directly,
+so this document's single merge must assemble the full picture, not just this fetch's own results):** the
+prefetch task's `DocumentState.merge_gossip_findings` call for this document combines **three** sources in
+one guarded merge — (1) names already present in the memo (a hit from this document's own prior prefetch,
+another document's prefetch, or a hover fetch), copied in directly with no network call; (2) names missing
+from the memo, fetched via one `GetFindingsBatch` POST; (3) names currently being fetched by *another*
+document's in-flight batch for the same package — awaited (joined onto that in-flight future, mirroring
+the existing `InFlightGuard`-style dedup other `deps_dev` methods already use) rather than issuing a
+redundant second POST. Omitting (1) or (3) would silently reintroduce N2 for the single most common case:
+a package already warmed by another open document or a prior hover. Successful results populate both the
 memo (dedupe for the *next* prefetch or hover on the same package) and `DocumentState.gossip_findings`
 (durability for *this* document across idle periods — TTL expiry/eviction from the memo must not silently
 regress an already-rendered document back to the local fallback). `DocumentState` merging follows
@@ -270,6 +304,7 @@ graph TD
 | Staleness handling | A version-mismatch (FR-008) or ~1h soft age triggers a background refetch (>=15min backoff per package); data is never dropped on a timer | N7: a memo/`DocumentState` TTL that drops data reintroduces N2; refetch-in-background-while-still-serving is the actual fix for "idle document, new release appeared" | A hard TTL eviction (round 2's original design) — this was N2's bug; not repeating it under a different name |
 | Cross-document concurrency | A global `Semaphore` around `GetFindingsBatch`, mirroring `max_concurrent_fetches` | N8: the `disabled->enabled` transition and cold-start multi-manifest loads can fire many simultaneous batch calls across documents even with no within-document fan-out | Leaving it unbounded "to revisit if it becomes a problem" — critic's explicit pushback: cheap to add now, so add it now |
 | Per-page body limit | `DEPS_DEV_BODY_LIMIT` applied to every `nextPageToken` page, not just the first | A paginated batch response's page size isn't bounded by the API itself | Assuming the existing GET-path guard automatically covers a new POST/pagination path — it doesn't (M7) |
+| Prefetch merge scope | One `merge_gossip_findings` call combining memo hits + this batch's results + joined in-flight results from other documents | M16: every reader (`VersionData.gossip_prefetch`) sources *only* from `DocumentState`, never the memo directly — merging only this fetch's own POST results would silently miss already-warmed packages | Merging only batch-miss results (round 5's wording) — this was M16's exact bug: correct for a never-before-seen package, wrong for one another document/hover already warmed |
 
 ## 2. Project Structure
 
@@ -319,11 +354,14 @@ crates/deps-lsp/src/
 │   ├── state.rs          # DocumentState gains `gossip_findings: HashMap<PackageName, GossipFindings>`
 │   │                     #   (mirrors the existing typosquat-findings field) + `merge_gossip_findings`
 │   │                     #   (mirrors `merge_typosquats`, same content-snapshot staleness guard)
-│   └── gossip_prefetch.rs # NEW — checks the DepsDevClient memo first (N5), POSTs GetFindingsBatch only
-│                         #   for memo-misses, filtered by source_is_public_registry_content, on
-│                         #   open/change and on the disabled->enabled config transition; on success calls
-│                         #   doc.merge_gossip_findings() and republishes diagnostics (mirrors
-│                         #   spawn_typosquat_prefetch_and_republish, lifecycle.rs:1344)
+│   └── gossip_prefetch.rs # NEW — checks the DepsDevClient memo first (N5); for hits, joins any
+│                         #   in-flight fetch from another document rather than re-issuing a POST; for
+│                         #   misses, POSTs GetFindingsBatch; filtered by source_is_public_registry_content;
+│                         #   on open/change and on the disabled->enabled config transition. Merges memo
+│                         #   hits + batch results + joined in-flight results TOGETHER into one
+│                         #   doc.merge_gossip_findings() call (M16 — omitting memo hits/in-flight joins
+│                         #   here would silently reintroduce N2 for the most common case) and republishes
+│                         #   diagnostics (mirrors spawn_typosquat_prefetch_and_republish, lifecycle.rs:1344)
 └── server.rs              # + is_gossip_enabled/set_gossip_enabled ServerState atomic,
                           #   trigger_gossip_prefetch_for_open_documents, wired into
                           #   did_change_configuration exactly like typosquat's (server.rs:866-927)
@@ -481,7 +519,7 @@ Internal methods (not an LSP-facing API):
 
 | Method | Scope | Callers | Notes |
 |--------|-------|---------|-------|
-| `gossip_findings_batch(system, [name])` | `GetFindingsBatch` | `gossip_prefetch` (document-lifecycle task) | One call per document, **only for names missing from the per-package memo** (N5); `source_is_public_registry_content`-filtered input; paginates via `nextPageToken` with `DEPS_DEV_BODY_LIMIT` enforced per page (N8); bounded by a global `Semaphore` across documents (N8); populates both the memo and the caller's `DocumentState` merge; a version mismatch found later (FR-008) schedules a follow-up call through this same method, throttled to >=15min per package (N7) |
+| `gossip_findings_batch(system, [name])` | `GetFindingsBatch` | `gossip_prefetch` (document-lifecycle task) | Called **only for names missing from the per-package memo and not already in-flight elsewhere** (N5); `source_is_public_registry_content`-filtered input; paginates via `nextPageToken` with `DEPS_DEV_BODY_LIMIT` enforced per page (N8); bounded by a global `Semaphore` across documents (N8); a version mismatch found later (FR-008) schedules a follow-up call through this same method, throttled to >=15min per package (N7). The caller's single `DocumentState` merge combines this call's results with memo hits and joined in-flight results — never just this call's own output (M16) |
 | `gossip_findings_for_version(system, name, version)` | version-scoped `GetFindings` | hover's low-usage section only | Spawned beside `spawn_trust_signal_fetch`, awaited at the same join point under `GOSSIP_WAIT_BUDGET`; skipped entirely when `resolve_in_use_version` returns `None` (M5); backed by a version-keyed memo entry so a late response still warms something (N5) |
 
 ## 5. Integration Points
@@ -495,10 +533,12 @@ Internal methods (not an LSP-facing API):
 - No new secrets or auth — both endpoints are public and unauthenticated (confirmed live).
 - No new input-validation surface beyond `deps_dev_system()`'s exhaustive match (fixed origin, not
   user-configurable).
-- **`HttpCache::post_json` gap (M7)**: the existing GET path has body-limit and trusted-origin guarantees
-  this POST path does not yet have — implementation must close this gap before shipping the batch call.
-  `DEPS_DEV_BODY_LIMIT` must be enforced on **every** `nextPageToken` page of a batch response, not just
-  the first (N8) — page size is not itself bounded by the API.
+- **`HttpCache::post_json` gap (M7/M20)**: the existing GET path has body-limit and trusted-origin
+  guarantees this POST path does not yet have — this is the **first standalone implementation task**, with
+  its own test, not a detail folded into the batch-fetch task (M20: the security property should be
+  verifiable independently of the feature logic built on top of it). `DEPS_DEV_BODY_LIMIT` must be enforced
+  on **every** `nextPageToken` page of a batch response, not just the first (N8) — page size is not itself
+  bounded by the API.
 - **Privacy (S5/FR-009/NFR-005, unchanged)**: the document-level prefetch discloses every declared
   dependency's name to deps.dev — opt-in (`GossipConfig.enabled`, default `false`), filtered through
   `SourcePolicy::source_is_public_registry_content`.
@@ -512,12 +552,13 @@ Internal methods (not an LSP-facing API):
 |-------|--------------|
 | Unit (`deps_dev::tests`) | `GossipFindingsWire` batch-response deserialization against real captured shapes (`vite` active-`COOLDOWN`, `request`/`left-pad` `DEPRECATED`); `nextPageToken` pagination handling |
 | Unit (`state.rs`) | `merge_gossip_findings` drops a stale result when `content` changed mid-fetch (direct port of the existing `merge_typosquats` test) |
-| Unit (`deps_dev::mod`) | FR-008's version-equality check at each of its 3 comparands (hover `latest_line`, diagnostics `package_versions.latest`, completion's default-matching candidate) — a mismatch must be treated as a cache-miss |
+| Unit (`deps_dev::mod`) | FR-008's version-equality check at each of its 2 comparands (hover `latest_line`, diagnostics `package_versions.latest` — completion reads no GOSSIP data at all per N6b, so it has no comparand here) — a mismatch must be treated as a cache-miss |
 | Unit (`hover.rs`) | Cooldown callout reads from the passed-in cache snapshot with no network call in the test (regression guard against reintroducing a live wait — this is what actually fixes N4); low-usage fetch still exercises the existing spawn-and-timeout pattern; `resolve_in_use_version() == None` skips the low-usage fetch entirely (M5) |
 | Unit (`freshness.rs`) | **No changes required** — untouched |
 | Unit (`completion.rs`) | Local `is_within_cooldown` baseline fires for every candidate, honors `FreshnessSettings.enabled`/`cooldown_secs` (M15); zero HTTP requests during candidate rendering in all cases; **no** GOSSIP-sourced field is read anywhere in this module (N6b — a regression test that completion never touches `VersionData`/the memo/`DocumentState.gossip_findings`) |
 | Unit (`policy_config.rs`) | `GossipConfig::default().enabled == false`; a partial `{"gossip":{}}` config parses successfully (regression test for M12's `#[serde(default)]` requirement) |
 | Unit (`deps_dev::mod`, new) | The per-package memo actually dedupes: two `gossip_prefetch` calls for the same package within the TTL window issue exactly one network request (regression test for N5); a hover low-usage response arriving after `GOSSIP_WAIT_BUDGET` still lands in the version-keyed memo (companion to the existing `trust_signal_survives_dropped_join_handle_and_warms_memo` test) |
+| Unit (`gossip_prefetch.rs`, new) | **M16 regression**: a package already present in the memo (warmed by a prior hover, or by another document's earlier prefetch) is merged into *this* document's `DocumentState.gossip_findings` even though this document's own prefetch issues zero network calls for it; a package currently being fetched by another document's in-flight batch is joined onto that fetch rather than triggering a second POST, and its result also lands in this document's `DocumentState` |
 | Unit (`deps-cli::config`) | `ignored_sections` includes `"gossip"` when a `[gossip]` section differs from default (M14) |
 | Unit (`deps_dev::mod`, new) | A `GossipCooldown` with `end` in the past is treated as inactive purely from the comparison at read time, with no separate stored flag (N7); an FR-008 mismatch schedules exactly one refetch, and a second mismatch within 15 minutes for the same package does not schedule another (N7 backoff); the global `Semaphore` actually caps in-flight `GetFindingsBatch` calls when many documents trigger simultaneously (N8); a paginated response whose second page exceeds `DEPS_DEV_BODY_LIMIT` is rejected the same way an oversized first-page GET response already is (N8) |
 | Integration | `crates/deps-lsp` — `gossip_prefetch` checks the memo before POSTing, fires on document open/change and on the disabled→enabled config transition, republishes diagnostics on new data; a document idle longer than the memo's TTL still shows correct GOSSIP-sourced diagnostics on the next unrelated regeneration (regression test for N2, now correctly backed by both storage layers); a document left open across a real new release (simulated) eventually shows the new release's cooldown status without requiring an edit (N7 end-to-end) |
@@ -575,6 +616,8 @@ of this PR — tracked in a separate follow-up issue (P4, per the maintainer dec
 | A large workspace with many simultaneously-open documents each firing a batch call | Low-medium | Low | The shared per-package memo (N5) absorbs most cross-document duplication for shared packages; the global `Semaphore` (N8) bounds simultaneous in-flight calls regardless — no longer left to "revisit later" |
 | Dropping completion GOSSIP enrichment (N6b) under-delivers relative to earlier plan.md's stated scope | Low — completion still gets a genuine new capability (local cooldown baseline) | N/A (already decided) | Documented as a deliberate engineering-cost/benefit call in §0/§1, not an oversight; revisit only if `#319`'s constraint is relaxed or a signature change becomes acceptable for other reasons |
 | An idle document stays on stale GOSSIP data indefinitely after a new release | Low — N7's refetch trigger closes this | Low (mitigated) | FR-008 mismatch schedules a >=15min-backoff background refetch; a soft ~1h staleness age catches GOSSIP's own indexing-lag edge case too |
+| Merging only this fetch's own results into `DocumentState`, missing memo hits/in-flight joins (M16) | Medium if unfixed — silently reintroduces N2 for the most common case | Low (fixed here) | §1/§2/§4 now specify the merge explicitly combines memo hits + batch results + joined in-flight results; regression test in §7 |
+| A `[gossip]` section is silently accepted under an explicit `--config` in `deps-cli` (M17) | Low — `deps-cli` has no GOSSIP behavior to silently misconfigure either way (FR-010 dropped) | Low | Pre-existing gap shared with `typosquat`'s same mechanism; fix both together in the `deps-cli` follow-up issue, not this PR |
 
 ## See Also
 
