@@ -208,21 +208,29 @@ pub struct DocumentState {
     /// document edits by `preserve_cache` so the diagnostic doesn't flicker off on every
     /// keystroke.
     pub typosquats: HashMap<PackageName, TyposquatSignal>,
-    /// The declared dependency name set as of the last typosquat pre-fetch this document
-    /// actually spawned (issue #1455 batch item 1, critic S1) — compared against the
-    /// *current* declared name set by `document::lifecycle`'s debounced-edit gate, instead of
-    /// that edit's own local `DependencyDiff`. A per-edit diff alone misses a name added by an
-    /// edit whose own change task got aborted (superseded by the very next debounced edit)
-    /// before ever reaching the pre-fetch spawn — the added name would then never be checked,
-    /// since the *next* edit's own diff shows no name change either. Comparing against this
-    /// persisted set self-corrects across any number of such aborted edits: whatever the
-    /// document's true current names are, they either already match what was last actually
-    /// checked, or they don't and a re-check is due, independent of which specific edit's diff
-    /// would have flagged it. Carried across edits by `preserve_cache`, same as
-    /// [`Self::typosquats`], and reset to empty on a fresh `DocumentState` (a cold-open/reopen
-    /// document that has never been checked has nothing to compare against, so its first check
-    /// is unconditional — matching the open-path pre-fetch's own unconditional spawn).
-    pub(crate) typosquat_checked_names: std::collections::HashSet<PackageName>,
+    /// The declared (name, source-eligibility) set as of the last typosquat pre-fetch this
+    /// document actually spawned (issue #1455 batch item 1, critic S1; the eligibility half of
+    /// the key added by issue #1462) — compared against the *current* set by
+    /// `document::lifecycle`'s debounced-edit gate, instead of that edit's own local
+    /// `DependencyDiff`. A per-edit diff alone misses a name added by an edit whose own change
+    /// task got aborted (superseded by the very next debounced edit) before ever reaching the
+    /// pre-fetch spawn — the added name would then never be checked, since the *next* edit's
+    /// own diff shows no name change either. Comparing against this persisted set self-corrects
+    /// across any number of such aborted edits: whatever the document's true current
+    /// (name, eligibility) pairs are, they either already match what was last actually checked,
+    /// or they don't and a re-check is due, independent of which specific edit's diff would
+    /// have flagged it. Pairing each name with its
+    /// [`TyposquatSourceEligibility`](super::osv_scan::TyposquatSourceEligibility) closes issue
+    /// #1462's gap: only an eligible dependency is ever sent to deps.dev
+    /// (`deps_core::lsp_helpers::fetch_typosquat_signals` applies the same filter), so a
+    /// name-only key couldn't tell "already checked, still ineligible" apart from "same name,
+    /// newly eligible" when a dependency's source flips (e.g. git -> registry) without its name
+    /// changing. Carried across edits by `preserve_cache`, same as [`Self::typosquats`], and
+    /// reset to empty on a fresh `DocumentState` (a cold-open/reopen document that has never
+    /// been checked has nothing to compare against, so its first check is unconditional —
+    /// matching the open-path pre-fetch's own unconditional spawn).
+    pub(crate) typosquat_checked_names:
+        std::collections::HashSet<(PackageName, super::osv_scan::TyposquatSourceEligibility)>,
     /// Last successful parse time
     pub parsed_at: Instant,
     /// Current loading state for registry data
@@ -613,13 +621,37 @@ impl DocumentState {
     /// the call site never needs a separate write.
     pub(crate) fn refresh_typosquat_checked_names(
         &mut self,
-        current: std::collections::HashSet<PackageName>,
+        current: std::collections::HashSet<(
+            PackageName,
+            super::osv_scan::TyposquatSourceEligibility,
+        )>,
     ) -> bool {
         if self.typosquat_checked_names == current {
             false
         } else {
             self.typosquat_checked_names = current;
             true
+        }
+    }
+
+    /// Reverts [`Self::typosquat_checked_names`] to "not checked" for `stale_snapshot`'s
+    /// members, but only if it still equals `stale_snapshot` exactly (issue #1463) —
+    /// `document::osv_scan::run_typosquat_prefetch`'s timeout path calls this so a prefetch
+    /// that never completed doesn't leave the gate believing `stale_snapshot` was actually
+    /// checked, which would otherwise suppress every retry until some later edit changes the
+    /// declared (name, eligibility) set for an unrelated reason. Clearing unconditionally would
+    /// be wrong: if a *newer* edit already advanced this field past `stale_snapshot` (spawning
+    /// its own, independently-tracked pre-fetch) before this timed-out attempt's cleanup runs,
+    /// that newer state is still valid and must not be discarded by an older attempt's failure.
+    pub(crate) fn clear_typosquat_checked_names_if_stale(
+        &mut self,
+        stale_snapshot: &std::collections::HashSet<(
+            PackageName,
+            super::osv_scan::TyposquatSourceEligibility,
+        )>,
+    ) {
+        if &self.typosquat_checked_names == stale_snapshot {
+            self.typosquat_checked_names.clear();
         }
     }
 

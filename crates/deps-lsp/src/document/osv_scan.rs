@@ -333,16 +333,54 @@ const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
 /// background task running indefinitely.
 const TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
 
-/// The declared dependency name set of `parse_result` — [`run_typosquat_prefetch`]'s staleness
-/// unit (issue #1455 critic S1): its result depends only on declared package *names*
-/// (`SimilarityMemoKey`/`PopularityMemoKey` are package-level, with no version dimension at
-/// all — plan.md §3), so this is what "has the document moved on" must mean for it, not full
-/// manifest text.
-pub(crate) fn declared_names(parse_result: &dyn deps_core::ParseResult) -> HashSet<PackageName> {
+/// Whether a declared dependency's currently-resolved [`deps_core::parser::DependencySource`]
+/// is one [`deps_core::lsp_helpers::EcosystemFormatter::source_is_public_registry_content`]
+/// classifies as eligible for the deps.dev typosquat check (issue #1462) — folded into
+/// [`declared_names`]'s comparison key alongside the package name itself. Only an
+/// [`Eligible`](Self::Eligible) dependency is ever actually sent to deps.dev
+/// (`deps_core::lsp_helpers::fetch_typosquat_signals` applies the same filter), so a name-only
+/// key cannot distinguish "already checked, still ineligible" from "same name, newly eligible,
+/// never checked" — the gap this issue closes: a dependency whose source flips (e.g. git ->
+/// registry) while its name stays the same must be treated as a gate-relevant change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum TyposquatSourceEligibility {
+    /// A public-registry source `fetch_typosquat_signals` will actually query deps.dev for.
+    Eligible,
+    /// Any other source (git, path, url, workspace, SDK, unresolved custom registry, ...).
+    Ineligible,
+}
+
+impl TyposquatSourceEligibility {
+    fn of(is_public_registry: bool) -> Self {
+        if is_public_registry {
+            Self::Eligible
+        } else {
+            Self::Ineligible
+        }
+    }
+}
+
+/// The declared dependency name set of `parse_result`, paired with each dependency's
+/// [`TyposquatSourceEligibility`] — [`run_typosquat_prefetch`]'s staleness unit (issue #1455
+/// critic S1, source-eligibility dimension added by issue #1462). Its result depends only on
+/// declared package *names* among *eligible* dependencies (`SimilarityMemoKey`/
+/// `PopularityMemoKey` are package-level, with no version dimension at all — plan.md §3), so
+/// this is what "has the document moved on" must mean for it, not full manifest text — and a
+/// source-type change is exactly as significant as a name change, since it can move a
+/// dependency across the eligibility filter `fetch_typosquat_signals` applies.
+pub(crate) fn declared_names(
+    parse_result: &dyn deps_core::ParseResult,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> HashSet<(PackageName, TyposquatSourceEligibility)> {
     parse_result
         .dependencies()
         .into_iter()
-        .map(|dep| dep.name().clone())
+        .map(|dep| {
+            let eligibility = TyposquatSourceEligibility::of(
+                formatter.source_is_public_registry_content(&dep.source()),
+            );
+            (dep.name().clone(), eligibility)
+        })
         .collect()
 }
 
@@ -393,7 +431,11 @@ pub(crate) fn declared_names(parse_result: &dyn deps_core::ParseResult) -> HashS
 /// Returns whether a non-empty result was actually merged — `false` covers every early-out
 /// (disabled, offline, no document, no parse result, timeout, stale-names drop) *and* the
 /// case where the fetch genuinely found nothing, so a caller can skip a pointless republish
-/// whose diagnostic set would be identical to the one already published.
+/// whose diagnostic set would be identical to the one already published. A degraded
+/// ([`deps_core::FetchCompleteness::Incomplete`]) result may still return `true` if some
+/// *other* dependency in the same fan-out did resolve a signal — completeness and "was
+/// anything merged" are independent (issue #1463): the gate clear this function performs on
+/// an incomplete result is unconditional, but the merge/republish decision below it is not.
 pub(crate) async fn run_typosquat_prefetch(
     uri: Uri,
     state: Arc<ServerState>,
@@ -415,19 +457,25 @@ pub(crate) async fn run_typosquat_prefetch(
     // concurrent `cargo build`/`npm install`, without touching declared names) would discard
     // an already-correct, already-computed typosquat result for a reason that has nothing to
     // do with this signal's own invariants.
-    let (names_snapshot, parse_result): (HashSet<PackageName>, Arc<dyn deps_core::ParseResult>) = {
+    let (names_snapshot, parse_result): (
+        HashSet<(PackageName, TyposquatSourceEligibility)>,
+        Arc<dyn deps_core::ParseResult>,
+    ) = {
         let Some(doc) = state.get_document(&uri) else {
             return false;
         };
         let Some(parse_result) = doc.parse_result_arc() else {
             return false;
         };
-        (declared_names(parse_result.as_ref()), parse_result)
+        (
+            declared_names(parse_result.as_ref(), ecosystem.formatter()),
+            parse_result,
+        )
     };
 
     let timeout_duration =
         Duration::from_secs(fetch_timeout_secs.min(TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS));
-    let typosquats = match tokio::time::timeout(
+    let outcome = match tokio::time::timeout(
         timeout_duration,
         deps_core::lsp_helpers::fetch_typosquat_signals(
             ecosystem.ecosystem_id(),
@@ -439,19 +487,48 @@ pub(crate) async fn run_typosquat_prefetch(
     )
     .await
     {
-        Ok(typosquats) => typosquats,
+        Ok(outcome) => outcome,
         Err(_) => {
             tracing::debug!("typosquat pre-fetch timed out");
+            // Issue #1463: a timed-out attempt must not leave the debounced-edit gate
+            // believing `names_snapshot` was actually checked, or a later edit that
+            // doesn't change names/eligibility again would never re-trigger a retry.
+            // Only clears if nothing has since advanced past this snapshot (see the
+            // method's own doc for why that guard matters).
+            if let Some(mut doc) = state.documents.get_mut(&uri) {
+                doc.clear_typosquat_checked_names_if_stale(&names_snapshot);
+            }
             return false;
         }
     };
 
-    if typosquats.is_empty() {
+    // Issue #1463 (impl-critic S1): the outer timeout above only catches the
+    // whole-document fan-out running out of its shared deadline — it never fires for a
+    // single dependency's deps.dev call failing/timing out/being unreachable, which
+    // `fetch_typosquat_signals` degrades internally to a `None`/empty result indistinguishable
+    // from a genuine "nothing found" *unless* its `completeness` is read. An `Incomplete`
+    // result must be treated the same as the outer-timeout case: clear the gate so the next
+    // debounced edit retries even without a name/eligibility change, regardless of whether
+    // some other dependency in the same fan-out did resolve a usable signal (merged below
+    // either way — a partial result is still worth keeping).
+    if outcome.completeness == deps_core::FetchCompleteness::Incomplete {
+        tracing::debug!(
+            "typosquat pre-fetch degraded: at least one dependency's deps.dev call did not \
+             complete"
+        );
+        if let Some(mut doc) = state.documents.get_mut(&uri) {
+            doc.clear_typosquat_checked_names_if_stale(&names_snapshot);
+        }
+    }
+
+    if outcome.signals.is_empty() {
         return false;
     }
 
     if let Some(mut doc) = state.documents.get_mut(&uri) {
-        let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+        let current_names = doc
+            .parse_result()
+            .map_or_else(HashSet::new, |pr| declared_names(pr, ecosystem.formatter()));
         if current_names != names_snapshot {
             tracing::debug!(
                 "dropping stale typosquat pre-fetch result: declared dependency names changed \
@@ -459,7 +536,7 @@ pub(crate) async fn run_typosquat_prefetch(
             );
             return false;
         }
-        doc.merge_typosquats(typosquats);
+        doc.merge_typosquats(outcome.signals);
         return true;
     }
     false
@@ -1489,6 +1566,7 @@ mod tests {
     /// "never touches `DocumentState` at all" style for the disabled/offline no-op cases.
     #[cfg(feature = "npm")]
     mod typosquat_prefetch_tests {
+        use super::super::super::state::DocumentState;
         use super::*;
 
         /// Default `ServerState` starts with `policy.typosquat.enabled == false` — no
@@ -1531,22 +1609,83 @@ mod tests {
             assert_eq!(state.document_count(), 0);
         }
 
-        // Note: a full "resolves through a mocked deps.dev server and commits" test
-        // (mirroring `run_license_prefetch`'s live-fetch tests) is not exercised at this
-        // level — `ServerState::deps_dev` is fixed at construction with no test-only
-        // injection point, and `ServerState` carries several module-private fields that
-        // block a struct-update-syntax substitution from a sibling test module. That
-        // resolve-then-merge path is covered at two other levels instead:
-        // `deps_core::deps_dev::tests::typosquat_signal_*` (the HTTP resolution itself,
-        // mockito-backed) and `handlers::diagnostics::tests::
-        // test_generate_diagnostics_internal_typosquat_prefetch_is_synchronous` (the
-        // same mocked-resolution-then-merge shape, exercised via `merge_typosquats`
-        // directly rather than through this function's own name-set staleness guard).
-        // Same limitation for the fix in issue #1455 critic S1: a dedicated "a version-only
-        // edit racing a completed fetch must not discard it" test would need the same
-        // `state.deps_dev` injection this module has never had — `declared_names`' own
-        // doc/callers and `document::lifecycle`'s `test_name_added_by_aborted_predecessor_
-        // edit_is_still_checked_by_successor` (the companion S1(b) fix) are the closest
-        // coverage available without it.
+        /// Issue #1463 impl-critic S1: builds a real document, points this test's
+        /// `ServerState::deps_dev` at a mocked server that fails (not times out) the
+        /// similarity call, and drives `run_typosquat_prefetch` itself end to end — proving
+        /// the gate-clear wired into this function's `outcome.completeness` check actually
+        /// runs, not just the extracted `DocumentState::clear_typosquat_checked_names_if_stale`
+        /// primitive in isolation. `ServerState::deps_dev`/`cache` are both `pub` fields, so a
+        /// fresh `ServerState` built (not yet `Arc`-wrapped) can have `deps_dev` swapped for a
+        /// `DepsDevClient::for_test` before this test wraps it in `Arc` itself — no dedicated
+        /// injection seam needed, contrary to this module's previous note (which this test
+        /// replaces).
+        #[cfg(feature = "npm")]
+        #[tokio::test]
+        async fn run_typosquat_prefetch_degraded_result_clears_gate_for_retry() {
+            let mut server = mockito::Server::new_async().await;
+            let _similarity = server
+                .mock(
+                    "GET",
+                    "/v3alpha/systems/npm/packages/crossenv:similarlyNamedPackages",
+                )
+                .with_status(500)
+                .create_async()
+                .await;
+
+            let mut state = ServerState::new();
+            state.set_typosquat_enabled(true);
+            state.deps_dev = Arc::new(deps_core::DepsDevClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            ));
+            let state = Arc::new(state);
+
+            let url = deps_core::test_util::test_uri("/test/package.json");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = r#"{"dependencies": {"crossenv": "1.0.0"}}"#;
+            let ecosystem = state
+                .ecosystem_registry
+                .for_uri(&url)
+                .expect("npm ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(content, &url).await.unwrap();
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::Npm,
+                content.to_string(),
+                parse_result,
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            // Seeds the gate exactly like the real open/edit spawn path does
+            // (`document::lifecycle`), so this test proves the *degraded-fetch* path clears
+            // an already-set gate back out, not merely that a never-set gate stays empty.
+            let names_snapshot = {
+                let doc = state.get_document(&uri).expect("document just inserted");
+                declared_names(
+                    doc.parse_result().expect("parse result just inserted"),
+                    ecosystem.formatter(),
+                )
+            };
+            {
+                let mut doc = state
+                    .documents
+                    .get_mut(&uri)
+                    .expect("document just inserted");
+                doc.refresh_typosquat_checked_names(names_snapshot);
+            }
+
+            let changed =
+                run_typosquat_prefetch(uri.clone(), Arc::clone(&state), ecosystem, 5).await;
+            assert!(
+                !changed,
+                "a fetch that resolved no usable signal must not report a merge"
+            );
+
+            let doc = state.get_document(&uri).expect("document still present");
+            assert!(
+                doc.typosquat_checked_names.is_empty(),
+                "issue #1463: a degraded (non-timeout) deps.dev failure must clear the gate \
+                 so the next debounced edit retries even without a name/eligibility change"
+            );
+        }
     }
 }

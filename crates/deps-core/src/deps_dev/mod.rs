@@ -97,6 +97,52 @@ const MAX_MEMO_ENTRIES: usize = 512;
 /// few KB at most; this is defense-in-depth, not a tuned budget.
 const DEPS_DEV_BODY_LIMIT: usize = 1024 * 1024;
 
+/// Whether a typosquat-signal evaluation's deps.dev calls all returned a definitive answer,
+/// or at least one degraded to a failure (issue #1463).
+///
+/// `similar_packages`, `popularity` and [`DepsDevClient::typosquat_signal`] all report this
+/// alongside their usual `None`/empty-on-any-failure degradation (FR-005/FR-006), because a
+/// caller deciding whether a "no signal" result may be trusted as a completed check (versus
+/// retried later) needs to tell "genuinely nothing found" apart from "couldn't ask". Threaded
+/// through the similarity/popularity memos themselves (not just the fresh-fetch path), so a
+/// cache hit inside `DEPS_DEV_ERROR_TTL`'s retry window still reports [`Self::Incomplete`]
+/// instead of silently reporting [`Self::Complete`] for a result that was never actually
+/// verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchCompleteness {
+    /// Every call this evaluation needed returned a definitive answer — a successfully
+    /// parsed response or an authoritative negative (e.g. a `GetPackage` 404), fresh or
+    /// served from a success-TTL memo hit.
+    Complete,
+    /// At least one call failed, timed out, or returned unparseable data — fresh, or served
+    /// from an error-TTL memo hit still within its retry window. A `None`/empty result under
+    /// this variant is not a verified negative; the check simply never completed.
+    Incomplete,
+}
+
+impl FetchCompleteness {
+    /// Combines two completeness readings from calls that jointly determine one evaluation —
+    /// `Incomplete` if either input is, matching how a chain of dependent or concurrent calls
+    /// is only as complete as its least complete member.
+    #[must_use]
+    pub fn combine(self, other: Self) -> Self {
+        if self == Self::Incomplete || other == Self::Incomplete {
+            Self::Incomplete
+        } else {
+            Self::Complete
+        }
+    }
+}
+
+/// The safe default for a call that gave up without ever resolving a real outcome (e.g.
+/// `coalesce`'s leader-takeover exhaustion fallback) — such a result must never be mistaken
+/// for a verified check.
+impl Default for FetchCompleteness {
+    fn default() -> Self {
+        Self::Incomplete
+    }
+}
+
 /// Key for [`DepsDevClient`]'s version-level memo.
 ///
 /// A typed struct, not a `\0`-joined string: `name` comes from a manifest
@@ -159,10 +205,19 @@ struct SimilarityMemoKey {
     name: String,
 }
 
+/// [`DepsDevClient::similar_packages`]'s result shape, factored out to keep
+/// [`DepsDevClient::similarity_in_flight`]'s type from tripping
+/// `clippy::type_complexity`.
+type SimilarPackagesResult = (Vec<SimilarPackageCandidate>, FetchCompleteness);
+
 struct SimilarityMemoEntry {
     fetched_at: Instant,
     ttl: Duration,
     candidates: Vec<SimilarPackageCandidate>,
+    /// Issue #1463: whether the fetch that produced `candidates` actually completed —
+    /// carried in the memo (not just at fresh-fetch time) so a cache hit within
+    /// [`DEPS_DEV_ERROR_TTL`]'s retry window still reports [`FetchCompleteness::Incomplete`].
+    completeness: FetchCompleteness,
 }
 
 /// Key for [`DepsDevClient`]'s popularity memo (issue #1437) — likewise package-level: a
@@ -176,6 +231,10 @@ struct PopularityMemoKey {
     name: String,
 }
 
+/// [`DepsDevClient::popularity`]'s result shape, factored out for the same
+/// `clippy::type_complexity` reason as [`SimilarPackagesResult`].
+type PopularityResult = (Option<u64>, FetchCompleteness);
+
 struct PopularityMemoEntry {
     fetched_at: Instant,
     ttl: Duration,
@@ -183,6 +242,8 @@ struct PopularityMemoEntry {
     /// `GetDependents`) — memoized the same way [`MemoEntry::signal`] memoizes negative
     /// outcomes.
     dependent_count: Option<u64>,
+    /// Issue #1463: same rationale as [`SimilarityMemoEntry::completeness`].
+    completeness: FetchCompleteness,
 }
 
 /// Releases an in-flight claim on drop — including on panic — so a claim can
@@ -488,8 +549,7 @@ pub struct DepsDevClient {
     /// dependencies that happen to share a raw name before either write lands in the memo. A
     /// losing caller awaits the leader's result via [`coalesce`] instead of returning an empty
     /// `Vec` immediately (issue #1454).
-    similarity_in_flight:
-        DashMap<SimilarityMemoKey, watch::Receiver<Slot<Vec<SimilarPackageCandidate>>>>,
+    similarity_in_flight: DashMap<SimilarityMemoKey, watch::Receiver<Slot<SimilarPackagesResult>>>,
     /// Issue #1437: `GetPackage` + `GetDependents`-derived popularity, keyed package-level
     /// (see [`PopularityMemoKey`]) — shared by every declared dependency and candidate that
     /// resolves the same package name, the same way `projects` is shared across packages
@@ -503,7 +563,7 @@ pub struct DepsDevClient {
     /// maps, since a package-level popularity collision is common enough that
     /// `typosquat_signal_concurrent_calls_share_one_candidate_popularity_request` used to
     /// accept one of two real typosquats going unreported.
-    popularity_in_flight: DashMap<PopularityMemoKey, watch::Receiver<Slot<Option<u64>>>>,
+    popularity_in_flight: DashMap<PopularityMemoKey, watch::Receiver<Slot<PopularityResult>>>,
 }
 
 /// Manual, non-exhaustive impl: `VersionData` derives `Debug` and holds this behind
@@ -808,23 +868,28 @@ impl DepsDevClient {
     }
 
     /// Returns a typosquat-suspect signal for one declared dependency (issue #1437, spec
-    /// 071), or `None` when nothing clears the ratio gate.
+    /// 071), or `None` when nothing clears the ratio gate, paired with whether every
+    /// deps.dev call this evaluation needed actually completed (issue #1463) — see
+    /// [`FetchCompleteness`].
     ///
     /// Infallible by construction (NFR-001/FR-005), exactly like [`Self::trust_signal`]:
-    /// every failure at any stage — a below-threshold ratio included — degrades to `None`.
-    /// Does **not** itself check `system`/ecosystem coverage or any config opt-in switch;
-    /// callers (`lsp_helpers::diagnostics::fetch_typosquat_signals`) are responsible for
-    /// only calling this for a `system` `deps_dev_system` actually maps to, and only when
-    /// the feature is enabled (FR-002/FR-009) — mirroring how [`Self::trust_signal`] itself
-    /// never checks ecosystem coverage either.
+    /// every failure at any stage — a below-threshold ratio included — degrades to `None`,
+    /// never a propagated error. [`FetchCompleteness::Incomplete`] is the caller-facing signal
+    /// that a `None`/empty degradation of *this specific* kind happened; it does not itself
+    /// change what this function returns as the signal. Does **not** itself check
+    /// `system`/ecosystem coverage or any config opt-in switch; callers
+    /// (`lsp_helpers::diagnostics::fetch_typosquat_signals`) are responsible for only calling
+    /// this for a `system` `deps_dev_system` actually maps to, and only when the feature is
+    /// enabled (FR-002/FR-009) — mirroring how [`Self::trust_signal`] itself never checks
+    /// ecosystem coverage either.
     pub async fn typosquat_signal(
         &self,
         system: DepsDevSystem,
         name: &str,
-    ) -> Option<TyposquatSignal> {
-        let candidates = self.similar_packages(system, name).await;
+    ) -> (Option<TyposquatSignal>, FetchCompleteness) {
+        let (candidates, similarity_completeness) = self.similar_packages(system, name).await;
         if candidates.is_empty() {
-            return None;
+            return (None, similarity_completeness);
         }
 
         // `candidates` is already self-match-filtered and capped at
@@ -840,38 +905,58 @@ impl DepsDevClient {
         // round trips end-to-end for one dependency — concurrent resolution collapses that
         // to roughly the cost of the single slowest branch.
         let candidate_futures = candidates.iter().map(|candidate| async move {
-            let dependent_count = self.popularity(system, &candidate.name).await;
-            (candidate.name.clone(), dependent_count)
+            let (dependent_count, completeness) = self.popularity(system, &candidate.name).await;
+            (candidate.name.clone(), dependent_count, completeness)
         });
-        let (declared_dependent_count, resolved_candidates) = futures::future::join(
-            self.popularity(system, name),
-            futures::future::join_all(candidate_futures),
-        )
-        .await;
-        let declared_dependent_count = declared_dependent_count?;
+        let ((declared_dependent_count, declared_completeness), resolved_candidates) =
+            futures::future::join(
+                self.popularity(system, name),
+                futures::future::join_all(candidate_futures),
+            )
+            .await;
+
+        // Issue #1463: a candidate's popularity call failing is just as much an incomplete
+        // evaluation as the similarity/declared-popularity calls failing — that candidate
+        // might have been the qualifying suspect, so its absence from `resolved` below must
+        // not be reported as a verified "nothing found".
+        let completeness = resolved_candidates.iter().fold(
+            similarity_completeness.combine(declared_completeness),
+            |acc, (_, _, c)| acc.combine(*c),
+        );
+
+        let Some(declared_dependent_count) = declared_dependent_count else {
+            return (None, completeness);
+        };
 
         let resolved: Vec<(String, u64)> = resolved_candidates
             .into_iter()
-            .filter_map(|(name, dependent_count)| dependent_count.map(|count| (name, count)))
+            .filter_map(|(name, dependent_count, _)| dependent_count.map(|count| (name, count)))
             .collect();
 
-        evaluate_candidates(name, declared_dependent_count, &resolved)
+        (
+            evaluate_candidates(name, declared_dependent_count, &resolved),
+            completeness,
+        )
     }
 
     /// Fetches (or serves from the similarity memo) `GetSimilarlyNamedPackages`'s
-    /// `packages[]` for `name` — identity only, no popularity (plan.md §1).
+    /// `packages[]` for `name` — identity only, no popularity (plan.md §1) — paired with
+    /// whether this result reflects a completed fetch (issue #1463; see
+    /// [`FetchCompleteness`]).
     async fn similar_packages(
         &self,
         system: DepsDevSystem,
         name: &str,
-    ) -> Vec<SimilarPackageCandidate> {
+    ) -> (Vec<SimilarPackageCandidate>, FetchCompleteness) {
         if is_dot_segment(name) {
             warn_rejected_value(
                 "is_dot_segment",
                 "deps.dev similarly-named-packages request URL",
                 name,
             );
-            return Vec::new();
+            // Rejected before any request: retrying can never succeed for this name, so
+            // there is nothing left "incomplete" about it.
+            return (Vec::new(), FetchCompleteness::Complete);
         }
 
         let key = SimilarityMemoKey {
@@ -883,7 +968,7 @@ impl DepsDevClient {
         if let Some(entry) = self.similarity.get(&key)
             && entry.fetched_at.elapsed() < entry.ttl
         {
-            return entry.candidates.clone();
+            return (entry.candidates.clone(), entry.completeness);
         }
 
         coalesce(&self.similarity_in_flight, key.clone(), || async {
@@ -892,7 +977,7 @@ impl DepsDevClient {
             if let Some(entry) = self.similarity.get(&key)
                 && entry.fetched_at.elapsed() < entry.ttl
             {
-                return entry.candidates.clone();
+                return (entry.candidates.clone(), entry.completeness);
             }
             let url = format!(
                 "{}/v3alpha/systems/{}/packages/{}:similarlyNamedPackages",
@@ -901,7 +986,8 @@ impl DepsDevClient {
                 urlencoding::encode(name),
             );
 
-            let (candidates, ttl) = match self.get(&url, TYPOSQUAT_CALL_TIMEOUT).await {
+            let (candidates, ttl, completeness) = match self.get(&url, TYPOSQUAT_CALL_TIMEOUT).await
+            {
                 Ok(bytes) => {
                     match crate::parser::parse_json_checked::<SimilarlyNamedPackagesWire>(&bytes) {
                         Ok(wire) => {
@@ -920,18 +1006,30 @@ impl DepsDevClient {
                                 .filter(|candidate| candidate.name != name)
                                 .take(TYPOSQUAT_MAX_CANDIDATES_CHECKED)
                                 .collect();
-                            (candidates, DEPS_DEV_SUCCESS_TTL)
+                            (
+                                candidates,
+                                DEPS_DEV_SUCCESS_TTL,
+                                FetchCompleteness::Complete,
+                            )
                         }
                         Err(e) => {
                             tracing::debug!(
                                 error = %e,
                                 "deps.dev similarly-named-packages response parse failed"
                             );
-                            (Vec::new(), DEPS_DEV_ERROR_TTL)
+                            (
+                                Vec::new(),
+                                DEPS_DEV_ERROR_TTL,
+                                FetchCompleteness::Incomplete,
+                            )
                         }
                     }
                 }
-                Err(DepsDevFetchError::NotFound) => (Vec::new(), DEPS_DEV_SUCCESS_TTL),
+                Err(DepsDevFetchError::NotFound) => (
+                    Vec::new(),
+                    DEPS_DEV_SUCCESS_TTL,
+                    FetchCompleteness::Complete,
+                ),
                 Err(DepsDevFetchError::Failed(e)) => {
                     let (status, cause) = e.safe_tracing_summary();
                     tracing::debug!(
@@ -939,19 +1037,27 @@ impl DepsDevClient {
                         cause,
                         "deps.dev similarly-named-packages fetch failed"
                     );
-                    (Vec::new(), DEPS_DEV_ERROR_TTL)
+                    (
+                        Vec::new(),
+                        DEPS_DEV_ERROR_TTL,
+                        FetchCompleteness::Incomplete,
+                    )
                 }
                 Err(DepsDevFetchError::TimedOut) => {
                     tracing::debug!(
                         package = %crate::redact::redact_declaration_key(name),
                         "deps.dev similarly-named-packages fetch timed out"
                     );
-                    (Vec::new(), DEPS_DEV_ERROR_TTL)
+                    (
+                        Vec::new(),
+                        DEPS_DEV_ERROR_TTL,
+                        FetchCompleteness::Incomplete,
+                    )
                 }
             };
 
-            self.store_similarity_memo(key.clone(), candidates.clone(), ttl);
-            candidates
+            self.store_similarity_memo(key.clone(), candidates.clone(), ttl, completeness);
+            (candidates, completeness)
         })
         .await
     }
@@ -961,6 +1067,7 @@ impl DepsDevClient {
         key: SimilarityMemoKey,
         candidates: Vec<SimilarPackageCandidate>,
         ttl: Duration,
+        completeness: FetchCompleteness,
     ) {
         if !self.similarity.contains_key(&key) {
             crate::cache_policy::evict_expired_then_oldest(
@@ -976,13 +1083,20 @@ impl DepsDevClient {
                 fetched_at: Instant::now(),
                 ttl,
                 candidates,
+                completeness,
             },
         );
     }
 
     /// Resolves (or serves from the popularity memo) `name`'s `GetDependents`-derived
-    /// `dependentCount` for its default version, via `GetPackage` (plan.md §1).
-    async fn popularity(&self, system: DepsDevSystem, name: &str) -> Option<u64> {
+    /// `dependentCount` for its default version, via `GetPackage` (plan.md §1) — paired with
+    /// whether this result reflects a completed fetch (issue #1463; see
+    /// [`FetchCompleteness`]).
+    async fn popularity(
+        &self,
+        system: DepsDevSystem,
+        name: &str,
+    ) -> (Option<u64>, FetchCompleteness) {
         let key = PopularityMemoKey {
             base: self.base_url.clone(),
             system,
@@ -992,7 +1106,7 @@ impl DepsDevClient {
         if let Some(entry) = self.popularity.get(&key)
             && entry.fetched_at.elapsed() < entry.ttl
         {
-            return entry.dependent_count;
+            return (entry.dependent_count, entry.completeness);
         }
 
         coalesce(&self.popularity_in_flight, key.clone(), || async {
@@ -1001,11 +1115,11 @@ impl DepsDevClient {
             if let Some(entry) = self.popularity.get(&key)
                 && entry.fetched_at.elapsed() < entry.ttl
             {
-                return entry.dependent_count;
+                return (entry.dependent_count, entry.completeness);
             }
-            let (dependent_count, ttl) = self.fetch_popularity(system, name).await;
-            self.store_popularity_memo(key.clone(), dependent_count, ttl);
-            dependent_count
+            let (dependent_count, ttl, completeness) = self.fetch_popularity(system, name).await;
+            self.store_popularity_memo(key.clone(), dependent_count, ttl, completeness);
+            (dependent_count, completeness)
         })
         .await
     }
@@ -1015,6 +1129,7 @@ impl DepsDevClient {
         key: PopularityMemoKey,
         dependent_count: Option<u64>,
         ttl: Duration,
+        completeness: FetchCompleteness,
     ) {
         if !self.popularity.contains_key(&key) {
             crate::cache_policy::evict_expired_then_oldest(
@@ -1030,17 +1145,23 @@ impl DepsDevClient {
                 fetched_at: Instant::now(),
                 ttl,
                 dependent_count,
+                completeness,
             },
         );
     }
 
     /// The `GetPackage` -> default version -> `GetDependents` sequence (plan.md §1). Each
     /// step fails independently to `(None, ..)`, mirroring [`Self::fetch`]'s per-step
-    /// degradation.
-    async fn fetch_popularity(&self, system: DepsDevSystem, name: &str) -> (Option<u64>, Duration) {
+    /// degradation; the third element of the tuple is issue #1463's completeness signal for
+    /// that same step (see [`FetchCompleteness`]).
+    async fn fetch_popularity(
+        &self,
+        system: DepsDevSystem,
+        name: &str,
+    ) -> (Option<u64>, Duration, FetchCompleteness) {
         if is_dot_segment(name) {
             warn_rejected_value("is_dot_segment", "deps.dev package request URL", name);
-            return (None, DEPS_DEV_SUCCESS_TTL);
+            return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete);
         }
 
         let package_url = format!(
@@ -1054,25 +1175,27 @@ impl DepsDevClient {
             Ok(bytes) => match crate::parser::parse_json_checked::<GetPackageWire>(&bytes) {
                 Ok(package) => match package.versions.into_iter().find(|v| v.is_default) {
                     Some(v) => v.version_key.version,
-                    None => return (None, DEPS_DEV_SUCCESS_TTL),
+                    None => return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete),
                 },
                 Err(e) => {
                     tracing::debug!(error = %e, "deps.dev package response parse failed");
-                    return (None, DEPS_DEV_ERROR_TTL);
+                    return (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete);
                 }
             },
-            Err(DepsDevFetchError::NotFound) => return (None, DEPS_DEV_SUCCESS_TTL),
+            Err(DepsDevFetchError::NotFound) => {
+                return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete);
+            }
             Err(DepsDevFetchError::Failed(e)) => {
                 let (status, cause) = e.safe_tracing_summary();
                 tracing::debug!(status = ?status, cause, "deps.dev package fetch failed");
-                return (None, DEPS_DEV_ERROR_TTL);
+                return (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete);
             }
             Err(DepsDevFetchError::TimedOut) => {
                 tracing::debug!(
                     package = %crate::redact::redact_declaration_key(name),
                     "deps.dev package fetch timed out"
                 );
-                return (None, DEPS_DEV_ERROR_TTL);
+                return (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete);
             }
         };
 
@@ -1082,7 +1205,7 @@ impl DepsDevClient {
                 "deps.dev dependents request URL",
                 &default_version,
             );
-            return (None, DEPS_DEV_SUCCESS_TTL);
+            return (None, DEPS_DEV_SUCCESS_TTL, FetchCompleteness::Complete);
         }
 
         let dependents_url = format!(
@@ -1095,28 +1218,35 @@ impl DepsDevClient {
 
         match self.get(&dependents_url, TYPOSQUAT_CALL_TIMEOUT).await {
             Ok(bytes) => match crate::parser::parse_json_checked::<DependentsWire>(&bytes) {
-                Ok(wire) => (Some(wire.dependent_count), DEPS_DEV_SUCCESS_TTL),
+                Ok(wire) => (
+                    Some(wire.dependent_count),
+                    DEPS_DEV_SUCCESS_TTL,
+                    FetchCompleteness::Complete,
+                ),
                 Err(e) => {
                     tracing::debug!(error = %e, "deps.dev dependents response parse failed");
-                    (None, DEPS_DEV_ERROR_TTL)
+                    (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
                 }
             },
             // Error TTL, not success (impl-critic addendum): unlike `GetPackage`'s own 404
             // (a genuine "package doesn't exist"), a 404 here can be a transient race — the
             // package's default version changed between the `GetPackage` call above and
-            // this one — not authoritative absence, so a short retry window is correct.
-            Err(DepsDevFetchError::NotFound) => (None, DEPS_DEV_ERROR_TTL),
+            // this one — not authoritative absence, so a short retry window is correct, and
+            // (issue #1463) it is an incomplete result, not a verified negative.
+            Err(DepsDevFetchError::NotFound) => {
+                (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
+            }
             Err(DepsDevFetchError::Failed(e)) => {
                 let (status, cause) = e.safe_tracing_summary();
                 tracing::debug!(status = ?status, cause, "deps.dev dependents fetch failed");
-                (None, DEPS_DEV_ERROR_TTL)
+                (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
             }
             Err(DepsDevFetchError::TimedOut) => {
                 tracing::debug!(
                     package = %crate::redact::redact_declaration_key(name),
                     "deps.dev dependents fetch timed out"
                 );
-                (None, DEPS_DEV_ERROR_TTL)
+                (None, DEPS_DEV_ERROR_TTL, FetchCompleteness::Incomplete)
             }
         }
     }
@@ -2169,13 +2299,14 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client
+        let (signal, completeness) = client
             .typosquat_signal(DepsDevSystem::Npm, "crossenv")
-            .await
-            .expect("300x ratio must fire");
+            .await;
+        let signal = signal.expect("300x ratio must fire");
         assert_eq!(signal.suspected_name, "cross-env");
         assert_eq!(signal.declared_dependent_count, 3);
         assert_eq!(signal.suspected_dependent_count, 900);
+        assert_eq!(completeness, FetchCompleteness::Complete);
     }
 
     /// Negative counterpart: a legitimate similarly-named pair whose ratio never clears
@@ -2225,13 +2356,14 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client
+        let (signal, completeness) = client
             .typosquat_signal(DepsDevSystem::Npm, "coffeescript")
             .await;
         assert!(
             signal.is_none(),
             "a ~6.9x ratio must stay well under the 50x threshold"
         );
+        assert_eq!(completeness, FetchCompleteness::Complete);
     }
 
     #[tokio::test]
@@ -2254,11 +2386,21 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal(DepsDevSystem::Npm, "missing").await;
+        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "missing").await;
         assert!(signal.is_none());
+        assert_eq!(
+            completeness,
+            FetchCompleteness::Complete,
+            "a 404 is deps.dev's authoritative negative, not a failure to retry"
+        );
         package_call.assert_async().await;
     }
 
+    /// Issue #1463: a per-call timeout must report [`FetchCompleteness::Incomplete`], not
+    /// silently the same [`FetchCompleteness::Complete`] a genuine "no similar packages"
+    /// result would report — this is exactly the distinction
+    /// `deps-lsp::document::osv_scan::run_typosquat_prefetch`'s gate relies on to know a
+    /// failed attempt must be retried.
     #[tokio::test]
     async fn typosquat_signal_timeout_on_similarity_returns_none() {
         // Sleeps past `TYPOSQUAT_CALL_TIMEOUT` (3s, not `DEPS_DEV_CALL_TIMEOUT`'s 400ms —
@@ -2278,8 +2420,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal(DepsDevSystem::Npm, "slow").await;
+        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "slow").await;
         assert!(signal.is_none());
+        assert_eq!(completeness, FetchCompleteness::Incomplete);
     }
 
     #[tokio::test]
@@ -2295,8 +2438,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal(DepsDevSystem::Npm, "broken").await;
+        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "broken").await;
         assert!(signal.is_none());
+        assert_eq!(completeness, FetchCompleteness::Incomplete);
     }
 
     /// #1452 review M1: `fetch_popularity`'s *name* guard, reached via `popularity`, is
@@ -2314,8 +2458,14 @@ mod tests {
             .create_async()
             .await;
 
-        assert!(client.popularity(DepsDevSystem::Npm, ".").await.is_none());
-        assert!(client.popularity(DepsDevSystem::Npm, "..").await.is_none());
+        assert!(client.popularity(DepsDevSystem::Npm, ".").await.0.is_none());
+        assert!(
+            client
+                .popularity(DepsDevSystem::Npm, "..")
+                .await
+                .0
+                .is_none()
+        );
         call.assert_async().await;
     }
 
@@ -2342,7 +2492,7 @@ mod tests {
             .create_async()
             .await;
 
-        let dependent_count = client.popularity(DepsDevSystem::Npm, "evil").await;
+        let (dependent_count, _) = client.popularity(DepsDevSystem::Npm, "evil").await;
         assert!(dependent_count.is_none());
         dependents_call.assert_async().await;
     }
@@ -2369,23 +2519,34 @@ mod tests {
             .create_async()
             .await;
 
-        let dependent_count = client.popularity(DepsDevSystem::Npm, "racy").await;
+        let (dependent_count, completeness) = client.popularity(DepsDevSystem::Npm, "racy").await;
         assert!(dependent_count.is_none());
+        assert_eq!(
+            completeness,
+            FetchCompleteness::Incomplete,
+            "issue #1463: a transient default-version race is not a verified negative and \
+             must not be reported as a completed check"
+        );
 
         let key = PopularityMemoKey {
             base: client.base_url.clone(),
             system: DepsDevSystem::Npm,
             name: "racy".to_string(),
         };
-        let entry_ttl = client
+        let entry = client
             .popularity
             .get(&key)
-            .expect("popularity memo entry expected")
-            .ttl;
+            .expect("popularity memo entry expected");
         assert_eq!(
-            entry_ttl, DEPS_DEV_ERROR_TTL,
+            entry.ttl, DEPS_DEV_ERROR_TTL,
             "a GetDependents 404 must memoize the short error TTL, not the 1h success TTL \
              a genuine GetPackage 404 (authoritative absence) uses"
+        );
+        assert_eq!(
+            entry.completeness,
+            FetchCompleteness::Incomplete,
+            "issue #1463: the memoized entry itself must carry the incomplete marker, so a \
+             retry within the error TTL still reports Incomplete instead of a stale Complete"
         );
     }
 
@@ -2410,8 +2571,9 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal(DepsDevSystem::Npm, "lonely").await;
+        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "lonely").await;
         assert!(signal.is_none());
+        assert_eq!(completeness, FetchCompleteness::Complete);
         package_call.assert_async().await;
     }
 
@@ -2456,10 +2618,11 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client
+        let (signal, completeness) = client
             .typosquat_signal(DepsDevSystem::Npm, "self-echo")
             .await;
         assert!(signal.is_none());
+        assert_eq!(completeness, FetchCompleteness::Complete);
         similarity.assert_async().await;
         declared_package.assert_async().await;
         declared_dependents.assert_async().await;
@@ -2536,11 +2699,12 @@ mod tests {
             .create_async()
             .await;
 
-        let signal = client.typosquat_signal(DepsDevSystem::Npm, "tiny").await;
+        let (signal, completeness) = client.typosquat_signal(DepsDevSystem::Npm, "tiny").await;
         assert!(
             signal.is_some(),
             "at least one of the capped candidates should still qualify"
         );
+        assert_eq!(completeness, FetchCompleteness::Complete);
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             2 * TYPOSQUAT_MAX_CANDIDATES_CHECKED,
@@ -2564,12 +2728,14 @@ mod tests {
             client
                 .similar_packages(DepsDevSystem::Npm, ".")
                 .await
+                .0
                 .is_empty()
         );
         assert!(
             client
                 .similar_packages(DepsDevSystem::Npm, "..")
                 .await
+                .0
                 .is_empty()
         );
         call.assert_async().await;
@@ -2602,7 +2768,8 @@ mod tests {
             .create_async()
             .await;
 
-        let candidates = client.similar_packages(DepsDevSystem::Npm, "tiny").await;
+        let (candidates, completeness) = client.similar_packages(DepsDevSystem::Npm, "tiny").await;
+        assert_eq!(completeness, FetchCompleteness::Complete);
 
         assert_eq!(
             candidates.len(),
@@ -2784,7 +2951,7 @@ mod tests {
             .create_async()
             .await;
 
-        let (a, b) = tokio::join!(
+        let ((a, a_completeness), (b, b_completeness)) = tokio::join!(
             {
                 let client = Arc::clone(&client);
                 async move { client.typosquat_signal(DepsDevSystem::Npm, "pkg-a").await }
@@ -2799,6 +2966,8 @@ mod tests {
         // `coalesce` instead of degrading to `None`.
         assert!(a.is_some(), "pkg-a must see the real typosquat signal");
         assert!(b.is_some(), "pkg-b must see the real typosquat signal");
+        assert_eq!(a_completeness, FetchCompleteness::Complete);
+        assert_eq!(b_completeness, FetchCompleteness::Complete);
         assert_eq!(
             call_count.load(Ordering::SeqCst),
             1,

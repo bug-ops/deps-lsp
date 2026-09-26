@@ -282,7 +282,9 @@ async fn run_document_open_background_task(
     // instead of an empty one, which would otherwise make that first edit's gate fire even
     // for a version-only change.
     if let Some(mut doc) = state.documents.get_mut(&uri) {
-        let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+        let current_names = doc
+            .parse_result()
+            .map_or_else(HashSet::new, |pr| declared_names(pr, ecosystem.formatter()));
         doc.refresh_typosquat_checked_names(current_names);
     }
     // Drawn synchronously, immediately before spawning (issue #1455 critic M2) — see
@@ -658,8 +660,19 @@ fn commit_parsed_document(
     };
     doc_state.set_version(version);
 
-    if let Some(old_doc) = state.get_document(uri) {
-        preserve_cache(&mut doc_state, &old_doc);
+    // Held across `preserve_cache` *and* the final `state.update_document` replacement below
+    // (issue #1463 impl-critic M2) — reading the old state via a short-lived `get_document`
+    // and only inserting the new one at the very end of this function left a window in
+    // which a concurrent `documents.get_mut` write (e.g.
+    // `osv_scan::run_typosquat_prefetch`'s timeout path clearing
+    // `DocumentState::typosquat_checked_names`) could land on the *old* entry after this
+    // function already read it but before it replaces it, silently discarding that write the
+    // moment this commit lands. One `Entry` held for the whole read-preserve-prune-write
+    // sequence makes it atomic with respect to any other `state.documents` access for this
+    // same `uri`, since nothing below re-enters `state.documents`.
+    let entry = state.documents.entry(uri.clone());
+    if let dashmap::mapref::entry::Entry::Occupied(ref old_doc) = entry {
+        preserve_cache(&mut doc_state, old_doc.get());
     }
 
     // Prune stale cache entries for removed dependencies. `vulnerabilities`
@@ -725,7 +738,16 @@ fn commit_parsed_document(
         }
     }
 
-    state.update_document(uri.clone(), doc_state);
+    // Consumes the same `entry` acquired above — see that binding's comment for why this
+    // must not be a fresh `state.update_document` lookup.
+    match entry {
+        dashmap::mapref::entry::Entry::Occupied(mut old_doc) => {
+            old_doc.insert(doc_state);
+        }
+        dashmap::mapref::entry::Entry::Vacant(vacant) => {
+            vacant.insert(doc_state);
+        }
+    }
     true
 }
 
@@ -1157,7 +1179,9 @@ async fn run_document_change_task(
     // Deliberately *not* joined before either of this function's diagnostics publishes below
     // (impl-critic N2) — see `spawn_typosquat_prefetch_and_republish`'s own doc for why.
     let typosquat_names_changed = state.documents.get_mut(&uri).is_some_and(|mut doc| {
-        let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+        let current_names = doc
+            .parse_result()
+            .map_or_else(HashSet::new, |pr| declared_names(pr, ecosystem.formatter()));
         doc.refresh_typosquat_checked_names(current_names)
     });
     if typosquat_names_changed {
@@ -1450,7 +1474,9 @@ pub(crate) async fn trigger_typosquat_prefetch_for_open_documents(
         // (the feature just transitioned on, so every open document needs its first check),
         // but the *next* debounced edit still needs a real baseline to gate against.
         if let Some(mut doc) = state.documents.get_mut(&uri) {
-            let current_names = doc.parse_result().map_or_else(HashSet::new, declared_names);
+            let current_names = doc
+                .parse_result()
+                .map_or_else(HashSet::new, |pr| declared_names(pr, ecosystem.formatter()));
             doc.refresh_typosquat_checked_names(current_names);
         }
         let typosquat_generation = state.next_typosquat_task_generation();
@@ -1593,6 +1619,7 @@ pub async fn ensure_document_loaded(
 #[cfg(test)]
 mod tests {
     use super::super::diff::drop_cache_for_forced_refetch;
+    use super::super::osv_scan::TyposquatSourceEligibility;
     use super::*;
     use deps_core::EcosystemId;
     #[cfg(feature = "cargo")]
@@ -1659,7 +1686,11 @@ mod tests {
     #[test]
     fn refresh_typosquat_checked_names_fires_only_on_a_real_set_change() {
         let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
-        let base: HashSet<PackageName> = std::iter::once(PackageName::new("serde")).collect();
+        let base: HashSet<(PackageName, TyposquatSourceEligibility)> = std::iter::once((
+            PackageName::new("serde"),
+            TyposquatSourceEligibility::Eligible,
+        ))
+        .collect();
 
         assert!(
             doc.refresh_typosquat_checked_names(base.clone()),
@@ -1668,22 +1699,85 @@ mod tests {
 
         assert!(
             !doc.refresh_typosquat_checked_names(base),
-            "an unchanged name set (e.g. a version-only edit) must not re-fire"
+            "an unchanged (name, eligibility) set (e.g. a version-only edit) must not re-fire"
         );
 
-        let added: HashSet<PackageName> = [PackageName::new("serde"), PackageName::new("tokio")]
-            .into_iter()
-            .collect();
+        let added: HashSet<(PackageName, TyposquatSourceEligibility)> = [
+            (
+                PackageName::new("serde"),
+                TyposquatSourceEligibility::Eligible,
+            ),
+            (
+                PackageName::new("tokio"),
+                TyposquatSourceEligibility::Eligible,
+            ),
+        ]
+        .into_iter()
+        .collect();
         assert!(
             doc.refresh_typosquat_checked_names(added.clone()),
             "an added name must fire"
         );
         assert!(!doc.refresh_typosquat_checked_names(added));
 
-        let removed: HashSet<PackageName> = std::iter::once(PackageName::new("tokio")).collect();
+        let removed: HashSet<(PackageName, TyposquatSourceEligibility)> = std::iter::once((
+            PackageName::new("tokio"),
+            TyposquatSourceEligibility::Eligible,
+        ))
+        .collect();
         assert!(
             doc.refresh_typosquat_checked_names(removed),
             "a removed name must also fire"
+        );
+
+        // Issue #1462: a source-type flip with the *name set unchanged* must still fire —
+        // this is the whole point of folding eligibility into the comparison key.
+        let same_name_now_ineligible: HashSet<(PackageName, TyposquatSourceEligibility)> =
+            std::iter::once((
+                PackageName::new("tokio"),
+                TyposquatSourceEligibility::Ineligible,
+            ))
+            .collect();
+        assert!(
+            doc.refresh_typosquat_checked_names(same_name_now_ineligible.clone()),
+            "a source-eligibility flip on an otherwise-unchanged name must fire"
+        );
+        assert!(!doc.refresh_typosquat_checked_names(same_name_now_ineligible));
+    }
+
+    /// Issue #1463: a timed-out/failed prefetch must not permanently suppress retries for a
+    /// declared set that never changes again — `clear_typosquat_checked_names_if_stale` is the
+    /// primitive `osv_scan::run_typosquat_prefetch`'s timeout path relies on to make that true.
+    #[test]
+    fn clear_typosquat_checked_names_if_stale_only_clears_an_exact_match() {
+        let mut doc = DocumentState::new_without_parse_result(EcosystemId::Cargo, String::new());
+        let snapshot: HashSet<(PackageName, TyposquatSourceEligibility)> = std::iter::once((
+            PackageName::new("serde"),
+            TyposquatSourceEligibility::Eligible,
+        ))
+        .collect();
+        doc.refresh_typosquat_checked_names(snapshot.clone());
+
+        doc.clear_typosquat_checked_names_if_stale(&snapshot);
+        assert!(
+            doc.typosquat_checked_names.is_empty(),
+            "a failed attempt's own snapshot, still current, must be cleared so the next \
+             debounced edit retries even without a name/eligibility change"
+        );
+
+        // A newer edit has since advanced the field past the old snapshot — the older
+        // attempt's belated cleanup must not clobber that newer, valid state.
+        let newer: HashSet<(PackageName, TyposquatSourceEligibility)> = std::iter::once((
+            PackageName::new("tokio"),
+            TyposquatSourceEligibility::Eligible,
+        ))
+        .collect();
+        doc.refresh_typosquat_checked_names(newer.clone());
+        doc.clear_typosquat_checked_names_if_stale(&snapshot);
+        assert_eq!(
+            doc.typosquat_checked_names, newer,
+            "clearing must be a no-op once a newer edit has already superseded the stale \
+             snapshot"
         );
     }
 
@@ -3318,6 +3412,68 @@ tokio = "1.0"
                 state.typosquat_task_id(&uri).await,
                 Some(after_open),
                 "an edit that adds a dependency name must re-spawn the typosquat pre-fetch"
+            );
+        }
+
+        /// Issue #1462: a source-type switch (git -> registry) with the declared name
+        /// unchanged must still re-spawn the typosquat pre-fetch — the name-only gate
+        /// this closes would otherwise never check a dependency that becomes newly
+        /// eligible for the deps.dev typosquat signal.
+        #[tokio::test]
+        async fn test_handle_document_change_gates_typosquat_prefetch_on_source_eligibility_change()
+        {
+            use crate::test_utils::test_helpers::create_test_client_and_config;
+
+            let state = Arc::new(ServerState::new());
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let original_content = r#"[dependencies]
+serde = { git = "https://github.com/serde-rs/serde" }
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            handle_document_open(
+                uri.clone(),
+                original_content,
+                Some(1),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("initial open should succeed")
+            .await
+            .expect("initial open's background task must not panic");
+
+            let after_open = state
+                .typosquat_task_id(&uri)
+                .await
+                .expect("open unconditionally spawns and tracks a typosquat pre-fetch");
+
+            // Source-changed edit: same declared name ("serde"), git -> registry source.
+            let source_changed_content = r#"[dependencies]
+serde = "1.0"
+"#
+            .to_string();
+            let (client, config) = create_test_client_and_config();
+            handle_document_change(
+                uri.clone(),
+                source_changed_content,
+                Some(2),
+                state.clone(),
+                client,
+                config,
+            )
+            .await
+            .expect("normal-sized change should be accepted")
+            .await
+            .expect("background task must not panic");
+
+            assert_ne!(
+                state.typosquat_task_id(&uri).await,
+                Some(after_open),
+                "a git -> registry source switch with an unchanged name must re-spawn the \
+                 typosquat pre-fetch"
             );
         }
 
