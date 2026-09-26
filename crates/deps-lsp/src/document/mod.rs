@@ -5,6 +5,7 @@
 //! - `lifecycle`: Document open/change event handling and stage sequencing
 //! - `fetch`: Registry fetch fan-out and dependency-source routing
 //! - `osv_scan`: OSV vulnerability scan orchestration
+//! - `typosquat`: Typosquat pre-fetch orchestration and its declared-name staleness gate
 //! - `diff`: Dependency diffing and cache reconciliation
 //! - `resolved`: Lock-file and in-use dependency version resolution
 //! - `loader`: Disk-based document loading for cold start support
@@ -15,6 +16,7 @@ mod gossip_prefetch;
 mod lifecycle;
 mod loader;
 mod osv_scan;
+mod typosquat;
 // Every snapshot test inside is gated on one of these ecosystem features; with none
 // enabled, the module's shared fixtures/helpers would otherwise be dead code.
 #[cfg(all(
@@ -48,5 +50,7 @@ pub use lifecycle::{ensure_document_loaded, handle_document_change, handle_docum
 pub use loader::load_document_from_disk;
 pub(crate) use osv_scan::{rescan_after_resolved_version_change, run_license_prefetch};
 pub(crate) use resolved::RefetchPolicy;
-pub(crate) use state::{CLIENT_REFRESH_TIMEOUT, PrefetchVisibility, spawn_supervised};
+pub(crate) use state::{
+    CLIENT_REFRESH_TIMEOUT, PrefetchVisibility, RefreshKind, refresh_with_timeout, spawn_supervised,
+};
 pub use state::{ColdStartLimiter, DocumentState, LoadingState, PackageSignals, ServerState};

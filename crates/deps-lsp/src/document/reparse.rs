@@ -5,7 +5,7 @@
 
 use super::lifecycle::{CommitGuard, handle_document_change_guarded};
 use super::resolved::RefetchPolicy;
-use super::state::{CLIENT_REFRESH_TIMEOUT, ServerState};
+use super::state::{RefreshKind, ServerState, refresh_with_timeout};
 use crate::config::{DepsConfig, ReparseScope};
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,19 +89,8 @@ pub(crate) async fn reparse_open_documents(
         // stay correlated with whatever span triggered this reparse.
         let span = tracing::Span::current();
         tokio::spawn(
-            async move {
-                match tokio::time::timeout(
-                    CLIENT_REFRESH_TIMEOUT,
-                    client.workspace_diagnostic_refresh(),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => tracing::debug!("workspace/diagnostic/refresh failed: {:?}", e),
-                    Err(_) => tracing::debug!("workspace/diagnostic/refresh timed out"),
-                }
-            }
-            .instrument(span),
+            async move { refresh_with_timeout(RefreshKind::Diagnostics, &client).await }
+                .instrument(span),
         );
     }
 

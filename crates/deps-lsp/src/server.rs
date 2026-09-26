@@ -1,9 +1,10 @@
 use crate::config::DepsConfig;
 use crate::document::{
-    CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, ResolvedVersionMove, ServerState,
-    change_task_triggers, handle_document_change, handle_document_open, reload_resolved_versions,
-    rescan_after_resolved_version_change, run_license_prefetch, spawn_supervised,
-    trigger_gossip_prefetch_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
+    CLIENT_REFRESH_TIMEOUT, ChangeTaskTriggerGates, RefreshKind, ResolvedVersionMove, ServerState,
+    change_task_triggers, handle_document_change, handle_document_open, refresh_with_timeout,
+    reload_resolved_versions, rescan_after_resolved_version_change, run_license_prefetch,
+    spawn_supervised, trigger_gossip_prefetch_for_open_documents,
+    trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -971,18 +972,7 @@ impl LanguageServer for Backend {
                 // pull-capable client must be told to re-request them (push-only clients
                 // are a known v1 gap, M2). Timeout-bounded (#493) against a hanging client.
                 if self.diagnostic_refresh_supported().await {
-                    match tokio::time::timeout(
-                        CLIENT_REFRESH_TIMEOUT,
-                        self.client.workspace_diagnostic_refresh(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            tracing::debug!("workspace/diagnostic/refresh failed: {:?}", e);
-                        }
-                        Err(_) => tracing::debug!("workspace/diagnostic/refresh timed out"),
-                    }
+                    refresh_with_timeout(RefreshKind::Diagnostics, &self.client).await;
                 }
             }
         }

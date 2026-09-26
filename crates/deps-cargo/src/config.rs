@@ -288,18 +288,29 @@ pub struct ResolvedRegistryEntry {
 #[derive(Debug, Default)]
 pub struct CargoConfig {
     registries: HashMap<String, ResolvedRegistryEntry>,
-    /// Aliases whose resolution failed *specifically* because the current
-    /// [`deps_core::net_policy::RegistryAccessPolicy`] blocked the candidate host (spec
-    /// #443, plan-1b §1.7) — as opposed to "no matching config entry" or any other
-    /// validation failure. Surfaced by `crate::parser::resolve_alternate_registries` as a
-    /// positional diagnostic on the offending dependency's line.
-    blocked: HashMap<String, HostClass>,
-    /// Aliases whose `.cargo/config.toml` `[registries.<name>] index = ...` entry failed
-    /// validation for a reason other than a policy-blocked host (#1453, mirrors
-    /// [`Self::blocked`]) — an invalid URL, a non-https scheme, or embedded userinfo.
-    /// Surfaced by `crate::parser::resolve_alternate_registries` the same way
-    /// [`Self::blocked`] is.
-    rejected: HashMap<String, RegistryRejectionReason>,
+    /// Aliases whose resolution failed, paired with why (issue #1468 item 4). Previously two
+    /// disjoint `HashMap<String, _>`s (`blocked`/`rejected`) — resolution only ever inserts
+    /// one or the other for a given alias, never both, but that "at most one" invariant was
+    /// only a convention encoded in call order (`blocked_class` checked before
+    /// `rejected_reason` at every caller); [`UnresolvedIndex`] makes it a structural
+    /// impossibility instead, since a single map slot can only ever hold one variant.
+    unresolved: HashMap<String, UnresolvedIndex>,
+}
+
+/// Why a `.cargo/config.toml`/`$CARGO_HOME` alias failed to resolve to a usable registry
+/// index — see [`CargoConfig::blocked_class`]/[`CargoConfig::rejected_reason`].
+#[derive(Debug, Clone, Copy)]
+enum UnresolvedIndex {
+    /// The current [`deps_core::net_policy::RegistryAccessPolicy`] blocked the candidate
+    /// host (spec #443, plan-1b §1.7) — as opposed to "no matching config entry" or any
+    /// other validation failure. Surfaced by `crate::parser::resolve_alternate_registries`
+    /// as a positional diagnostic on the offending dependency's line.
+    Blocked(HostClass),
+    /// The `.cargo/config.toml` `[registries.<name>] index = ...` entry failed validation
+    /// for a reason other than a policy-blocked host (#1453, mirrors [`Self::Blocked`]) —
+    /// an invalid URL, a non-https scheme, or embedded userinfo. Surfaced the same way
+    /// [`Self::Blocked`] is.
+    Rejected(RegistryRejectionReason),
 }
 
 impl CargoConfig {
@@ -313,7 +324,10 @@ impl CargoConfig {
     /// why it did not resolve.
     #[must_use]
     pub(crate) fn blocked_class(&self, alias: &str) -> Option<HostClass> {
-        self.blocked.get(alias).copied()
+        match self.unresolved.get(alias) {
+            Some(UnresolvedIndex::Blocked(class)) => Some(*class),
+            Some(UnresolvedIndex::Rejected(_)) | None => None,
+        }
     }
 
     /// [`Self::blocked_class`]'s counterpart for every rejection reason other than a
@@ -321,7 +335,10 @@ impl CargoConfig {
     /// failed validation, if that (and specifically that) is why it did not resolve.
     #[must_use]
     pub(crate) fn rejected_reason(&self, alias: &str) -> Option<RegistryRejectionReason> {
-        self.rejected.get(alias).copied()
+        match self.unresolved.get(alias) {
+            Some(UnresolvedIndex::Rejected(reason)) => Some(*reason),
+            Some(UnresolvedIndex::Blocked(_)) | None => None,
+        }
     }
 }
 
@@ -788,8 +805,7 @@ fn resolve_registries(
         .collect();
 
     let mut registries = HashMap::new();
-    let mut blocked = HashMap::new();
-    let mut rejected = HashMap::new();
+    let mut unresolved = HashMap::new();
     for alias in referenced_aliases {
         if let Some(entry) = tiers.workspace.iter().find_map(|file| match &file.tier {
             CachedTier::Workspace(map) => map.get(alias).map(|raw_index| (raw_index, file)),
@@ -808,11 +824,11 @@ fn resolve_registries(
                     );
                 }
                 Err(RegistryIndexError::BlockedHost { class }) => {
-                    blocked.insert(alias.clone(), class);
+                    unresolved.insert(alias.clone(), UnresolvedIndex::Blocked(class));
                 }
                 Err(error) => {
                     if let Some(reason) = error.rejection_reason().into_reason() {
-                        rejected.insert(alias.clone(), reason);
+                        unresolved.insert(alias.clone(), UnresolvedIndex::Rejected(reason));
                     }
                     tracing::warn!(alias, %error, "registry index failed validation");
                 }
@@ -831,7 +847,7 @@ fn resolve_registries(
                 registries.insert(alias.clone(), entry);
             }
             CargoHomeResolution::Rejected(reason) => {
-                rejected.insert(alias.clone(), reason);
+                unresolved.insert(alias.clone(), UnresolvedIndex::Rejected(reason));
             }
             CargoHomeResolution::Absent => {}
         }
@@ -839,8 +855,7 @@ fn resolve_registries(
 
     CargoConfig {
         registries,
-        blocked,
-        rejected,
+        unresolved,
     }
 }
 

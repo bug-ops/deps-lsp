@@ -14,8 +14,9 @@ use deps_core::{
     ConcreteVersion, DependencyOutcomes, GossipFindings, PackageName, PackageVersions,
     TyposquatSignal, VersionData,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use super::super::typosquat::TyposquatGate;
 use super::ResolvedGeneration;
 
 /// The per-package signal maps for a single document, plus the resolved-versions
@@ -96,7 +97,7 @@ pub struct PackageSignals {
     pub licenses: HashMap<PackageName, Vec<String>>,
     /// Background-pre-fetched typosquat-suspect signal per declared dependency (issue
     /// #1437), keyed by raw (unnormalized) package name — mirrors [`Self::licenses`]'s exact
-    /// shape and rationale. Populated by `document::osv_scan::run_typosquat_prefetch`, via
+    /// shape and rationale. Populated by `document::typosquat::run_typosquat_prefetch`, via
     /// `DocumentState::merge_typosquats` (never a full replace, for the same "one dependency's
     /// transient failure must not drop another's still-valid signal" reason
     /// [`Self::licenses`]'s doc gives). Read synchronously into
@@ -118,20 +119,23 @@ pub struct PackageSignals {
     /// (name, eligibility) pairs are, they either already match what was last actually checked,
     /// or they don't and a re-check is due, independent of which specific edit's diff would
     /// have flagged it. Pairing each name with its
-    /// `super::super::osv_scan::TyposquatSourceEligibility` closes issue
+    /// `super::super::typosquat::TyposquatSourceEligibility` closes issue
     /// #1462's gap: only an eligible dependency is ever sent to deps.dev
     /// (`deps_core::lsp_helpers::fetch_typosquat_signals` applies the same filter), so a
     /// name-only key couldn't tell "already checked, still ineligible" apart from "same name,
     /// newly eligible" when a dependency's source flips (e.g. git -> registry) without its name
     /// changing. Carried across edits by `preserve_cache`, same as [`Self::typosquats`], and
-    /// reset to empty on a fresh `DocumentState` (a cold-open/reopen document that has never
-    /// been checked has nothing to compare against, so its first check is unconditional —
-    /// matching the open-path pre-fetch's own unconditional spawn). Never pruned by
-    /// [`Self::prune_removed`] (see that method's doc).
-    pub(crate) typosquat_checked_names: HashSet<(
-        PackageName,
-        super::super::osv_scan::TyposquatSourceEligibility,
-    )>,
+    /// reset to "never checked" on a fresh `DocumentState` (a cold-open/reopen document that
+    /// has never been checked has nothing to compare against, so its first check is
+    /// unconditional — matching the open-path pre-fetch's own unconditional spawn). Never
+    /// pruned by [`Self::prune_removed`] (see that method's doc). A [`TyposquatGate`] (issue
+    /// #1468 item 1), not a raw `HashSet` — this only changes the *internal representation*
+    /// (an `Option`, so a future reader can no longer conflate "never checked" with "checked,
+    /// found nothing" while reading the type definition); every current caller still observes
+    /// "never checked" and "checked, found an empty declared set" as equivalent, since
+    /// [`TyposquatGate`]'s own `refresh_from`/`clear_if_stale`/`PartialEq` all treat `None` as
+    /// interchangeable with `Some(<empty set>)`, exactly reproducing the pre-#1468 behavior.
+    pub(crate) typosquat_checked_names: TyposquatGate,
     /// GOSSIP-sourced cooldown/low-usage findings per declared dependency (issue #1456,
     /// spec 072), keyed by raw (unnormalized) package name — mirrors [`Self::typosquats`]'s
     /// exact shape and rationale. Populated by `document::gossip_prefetch::run_gossip_prefetch`
@@ -212,7 +216,7 @@ impl Default for PackageSignals {
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
-            typosquat_checked_names: HashSet::new(),
+            typosquat_checked_names: TyposquatGate::default(),
             gossip_findings: HashMap::new(),
         }
     }
@@ -448,8 +452,8 @@ mod tests {
 
     const LOWERCASE_FORMATTER: StubFormatter = StubFormatter::new().with_lowercase_names();
 
-    fn eligible() -> crate::document::osv_scan::TyposquatSourceEligibility {
-        crate::document::osv_scan::TyposquatSourceEligibility::Eligible
+    fn eligible() -> crate::document::typosquat::TyposquatSourceEligibility {
+        crate::document::typosquat::TyposquatSourceEligibility::Eligible
     }
 
     /// One entry for `"MyPkg"` (the name every test below asks `prune_removed` to remove)
@@ -517,9 +521,8 @@ mod tests {
                 "other",
                 (ConcreteVersion::new("2.0.0"), RemovalStatus::Yanked),
             );
-        signals
-            .typosquat_checked_names
-            .insert((PackageName::new("MyPkg"), eligible()));
+        signals.typosquat_checked_names =
+            std::iter::once((PackageName::new("MyPkg"), eligible())).collect();
         signals
     }
 
