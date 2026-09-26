@@ -675,11 +675,26 @@ pub fn requirement_is_unsatisfiable(
     requirement: &VersionReq,
     available: &[ConcreteVersion],
 ) -> bool {
+    unsatisfiable_matcher(formatter, requirement, available).is_some()
+}
+
+/// Same decision as [`requirement_is_unsatisfiable`], but returns the compiled matcher that
+/// decided it instead of discarding it.
+///
+/// Exists so [`apply_unsatisfiable_rule`] can reuse the matcher it already compiled here when
+/// it later calls [`matching_prerelease_would_satisfy`], instead of calling
+/// [`RequirementResolution::compile_requirement`](super::RequirementResolution::compile_requirement)
+/// a second time for the same requirement (#1494).
+fn unsatisfiable_matcher(
+    formatter: &dyn EcosystemFormatter,
+    requirement: &VersionReq,
+    available: &[ConcreteVersion],
+) -> Option<Box<dyn RequirementMatcher>> {
     if available.is_empty() || requirement.as_str().trim().is_empty() {
-        return false;
+        return None;
     }
     if requirement.as_str().len() > MAX_REQUIREMENT_LEN {
-        return false;
+        return None;
     }
     // #1391: also consults `requirement_is_placeholder` directly, not only
     // `requirement_is_unresolved` — closes a gap for `deps-github-actions`/`deps-gitlab-ci`,
@@ -689,24 +704,22 @@ pub fn requirement_is_unsatisfiable(
     if formatter.requirement_is_unresolved(requirement)
         || formatter.requirement_is_placeholder(requirement)
     {
-        return false;
+        return None;
     }
     if formatter.requirement_is_undecidable_given_available(requirement, available) {
-        return false;
+        return None;
     }
-    let Some(matcher) = formatter.compile_requirement(requirement) else {
-        return false;
-    };
+    let matcher = formatter.compile_requirement(requirement)?;
 
     let mut saw_decided_false = false;
     for candidate in available {
         match matcher.matches(candidate) {
-            Some(true) => return false,
+            Some(true) => return None,
             Some(false) => saw_decided_false = true,
             None => {}
         }
     }
-    saw_decided_false
+    saw_decided_false.then_some(matcher)
 }
 
 /// Splits a strict-SemVer version string's stable `X.Y.Z` core from its pre-release
@@ -758,14 +771,19 @@ fn requirement_names_prerelease(requirement: &str) -> bool {
 /// default comparator excludes pre-releases, not because no compatible version was ever
 /// published (#299).
 ///
-/// Returns `None` when `requirement` doesn't compile, the compiled matcher hasn't opted into
-/// strict pre-release exclusion, `requirement` itself already names a pre-release (see
-/// [`requirement_names_prerelease`] — in that shape a non-matching candidate is rejected by
-/// ordering against the requirement's own explicit floor, not by pre-release exclusion), or no
-/// such pre-release exists. `available` is assumed newest-first (see
-/// [`PackageVersions::available`]), so the first match found is the newest.
+/// `matcher` is `requirement`'s already-compiled [`RequirementMatcher`] — callers reach this
+/// function only after [`unsatisfiable_matcher`] has already compiled `requirement` to decide
+/// unsatisfiability, so this takes that matcher directly instead of recompiling `requirement`
+/// a second time via `compile_requirement` (#1494).
+///
+/// Returns `None` when the matcher hasn't opted into strict pre-release exclusion,
+/// `requirement` itself already names a pre-release (see [`requirement_names_prerelease`] — in
+/// that shape a non-matching candidate is rejected by ordering against the requirement's own
+/// explicit floor, not by pre-release exclusion), or no such pre-release exists. `available` is
+/// assumed newest-first (see [`PackageVersions::available`]), so the first match found is the
+/// newest.
 fn matching_prerelease_would_satisfy(
-    formatter: &dyn EcosystemFormatter,
+    matcher: &dyn RequirementMatcher,
     requirement: &VersionReq,
     available: &[ConcreteVersion],
     yanked: &[(ConcreteVersion, RemovalStatus)],
@@ -773,7 +791,6 @@ fn matching_prerelease_would_satisfy(
     if requirement_names_prerelease(requirement.as_str()) {
         return None;
     }
-    let matcher = formatter.compile_requirement(requirement)?;
     if !matcher.strict_prerelease_exclusion() {
         return None;
     }
@@ -2252,9 +2269,10 @@ fn apply_unknown_package_rule(
 /// hence the `can_resolve_source` gate below.
 ///
 /// Reads: `can_resolve_source(&dep.source())` **and** `dep.version_requirement()`
-/// **and** `requirement_is_unsatisfiable(formatter, req,
-/// &resolved.package_versions.available)`. Message enriched via
-/// `matching_prerelease_would_satisfy` when a non-yanked pre-release whose stable core
+/// **and** `unsatisfiable_matcher(formatter, req, &resolved.package_versions.available)`
+/// — the same decision `requirement_is_unsatisfiable` makes, but keeping the compiled
+/// matcher instead of discarding it. Message enriched via `matching_prerelease_would_satisfy`,
+/// reusing that same matcher (#1494), when a non-yanked pre-release whose stable core
 /// matches exists (#299).
 /// Emits: 1 diagnostic (`UNSATISFIABLE_DIAGNOSTIC_CODE`) on `resolved.version_range`.
 /// Suppressed by: nothing.
@@ -2271,27 +2289,28 @@ fn apply_unsatisfiable_rule(
     let dep = ctx.dep;
     let package_versions = resolved.package_versions;
     let latest = &package_versions.latest;
+    let version_req = dep.version_requirement();
 
-    let unsatisfiable = ctx.formatter.can_resolve_source(&dep.source())
-        && dep.version_requirement().is_some_and(|version_req| {
-            requirement_is_unsatisfiable(ctx.formatter, version_req, &package_versions.available)
-        });
-
-    if !unsatisfiable {
+    if !ctx.formatter.can_resolve_source(&dep.source()) {
         return RuleFlow::Continue;
     }
+    let Some(matcher) = version_req.and_then(|version_req| {
+        unsatisfiable_matcher(ctx.formatter, version_req, &package_versions.available)
+    }) else {
+        return RuleFlow::Continue;
+    };
 
     let req_str = sanitize_and_truncate_for_diagnostic(
-        dep.version_requirement().map_or("", |r| r.as_str()),
+        version_req.map_or("", |r| r.as_str()),
         MAX_VERSION_DIAGNOSTIC_CHARS,
     );
     let latest =
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
     let mut message =
         format!("No published version satisfies requirement '{req_str}'; latest is {latest}");
-    if let Some(prerelease) = dep.version_requirement().and_then(|version_req| {
+    if let Some(prerelease) = version_req.and_then(|version_req| {
         matching_prerelease_would_satisfy(
-            ctx.formatter,
+            matcher.as_ref(),
             version_req,
             &package_versions.available,
             &package_versions.yanked,
@@ -7190,6 +7209,149 @@ mod tests {
         );
     }
 
+    /// #1494 regression coverage: end-to-end (via `generate_diagnostics_from_cache`, not a
+    /// direct `matching_prerelease_would_satisfy` call) for a *non-strict* ecosystem shape
+    /// (`ExactMatchFormatter`'s matcher has `strict_prerelease_exclusion() == false`, mirroring
+    /// Maven/Gradle/NuGet/Composer/PyPI/Go/Bundler/Dart). `available` contains
+    /// "2.0.0-rc.1" whose stable core "2.0.0" would exactly match the "2.0.0" requirement —
+    /// if `apply_unsatisfiable_rule` ever threaded the wrong matcher, or the
+    /// `strict_prerelease_exclusion` gate were bypassed, this would incorrectly enrich the
+    /// message with a "matching pre-release" mention.
+    #[test]
+    fn test_generate_diagnostics_unsatisfiable_no_enrichment_for_non_strict_ecosystem() {
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert(
+                "dep".into(),
+                PackageVersions {
+                    latest: "1.5.0".into(),
+                    available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
+                    yanked: Arc::from(Vec::new()),
+                    published_at: None,
+                },
+            );
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/pom.xml");
+        let mut dependency = dep_at("dep");
+        dependency.version_req = VersionReq::new("2.0.0");
+        let parse_result = SingleDepParseResult {
+            dep: dependency,
+            uri,
+        };
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &ExactMatchFormatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let message = diagnostics
+            .iter()
+            .find(|d| d.message().contains("No published version satisfies"))
+            .map(|d| d.message())
+            .expect("unsatisfiable WARNING must fire");
+        assert!(
+            !message.contains("pre-release"),
+            "non-strict ecosystem must never get pre-release enrichment, got: {message}"
+        );
+    }
+
+    /// #1494: `apply_unsatisfiable_rule` must reuse the matcher `unsatisfiable_matcher` already
+    /// compiled instead of compiling `requirement` a second time for the pre-release
+    /// enrichment call. A counting formatter proves this at the `generate_diagnostics_from_cache`
+    /// entry point rather than only at the (behavior-identical either way) unit level.
+    #[test]
+    fn test_apply_unsatisfiable_rule_compiles_requirement_only_once() {
+        struct CountingFormatter {
+            compile_calls: std::sync::atomic::AtomicUsize,
+        }
+        impl PackageNaming for CountingFormatter {}
+        impl PackageRendering for CountingFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for CountingFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                self.compile_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                requirement
+                    .as_str()
+                    .parse::<semver::VersionReq>()
+                    .ok()
+                    .map(|req| Box::new(RealSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+            }
+        }
+        impl DiagnosticMessages for CountingFormatter {}
+        impl DiagnosticPolicy for CountingFormatter {}
+        impl SourcePolicy for CountingFormatter {}
+        impl OsvNaming for CountingFormatter {}
+
+        let cached_versions = {
+            let mut m = HashMap::new();
+            m.insert(
+                "dep".into(),
+                PackageVersions {
+                    latest: "1.5.0".into(),
+                    available: Arc::from(vec!["2.0.0-rc.1".into(), "1.5.0".into(), "1.4.0".into()]),
+                    yanked: Arc::from(Vec::new()),
+                    published_at: None,
+                },
+            );
+            m
+        };
+        let resolved_versions = HashMap::new();
+        let uri = crate::test_util::test_uri("/test/Cargo.toml");
+        let mut dependency = dep_at("dep");
+        dependency.version_req = VersionReq::new("^2.0.0");
+        let parse_result = SingleDepParseResult {
+            dep: dependency,
+            uri,
+        };
+        let formatter = CountingFormatter {
+            compile_calls: std::sync::atomic::AtomicUsize::new(0),
+        };
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message().contains("No published version satisfies")),
+            "unsatisfiable WARNING must fire so both the unsatisfiable check and the \
+             pre-release enrichment run"
+        );
+        assert_eq!(
+            formatter
+                .compile_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "requirement must be compiled exactly once, reusing the matcher for both the \
+             unsatisfiable decision and the pre-release enrichment (#1494) — a redundant \
+             second compile must not be reintroduced"
+        );
+    }
+
     #[test]
     fn test_generate_diagnostics_unsatisfiable_skipped_for_non_registry_sources() {
         use crate::parser::DependencySource;
@@ -8305,6 +8467,18 @@ mod tests {
                 .collect()
         }
 
+        /// `matching_prerelease_would_satisfy` now takes an already-compiled matcher (#1494)
+        /// rather than compiling `requirement` itself — this compiles it the way
+        /// `apply_unsatisfiable_rule` does before calling that function.
+        fn compile(
+            formatter: &impl RequirementResolution,
+            requirement: &VersionReq,
+        ) -> Box<dyn RequirementMatcher> {
+            formatter
+                .compile_requirement(requirement)
+                .expect("test requirement compiles")
+        }
+
         #[test]
         fn test_semver_prerelease_base() {
             assert_eq!(semver_prerelease_base("2.0.0-rc.1"), Some("2.0.0"));
@@ -8330,10 +8504,11 @@ mod tests {
         /// (a) No pre-release exists among `available` — no enrichment.
         #[test]
         fn test_no_prerelease_available_returns_none() {
+            let requirement = VersionReq::new("^2.0.0");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("^2.0.0"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["1.5.0", "1.4.0"]),
                     &[],
                 ),
@@ -8345,10 +8520,11 @@ mod tests {
         /// scenario from the issue's example (`^2.0.0` vs. published `2.0.0-rc.1`).
         #[test]
         fn test_matching_prerelease_is_found() {
+            let requirement = VersionReq::new("^2.0.0");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("^2.0.0"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
@@ -8360,10 +8536,11 @@ mod tests {
         /// newest-first).
         #[test]
         fn test_returns_newest_matching_prerelease_first() {
+            let requirement = VersionReq::new("^2.0.0");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("^2.0.0"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.2", "2.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
@@ -8375,10 +8552,11 @@ mod tests {
         /// major version) must not be surfaced.
         #[test]
         fn test_non_matching_prerelease_returns_none() {
+            let requirement = VersionReq::new("^2.0.0");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("^2.0.0"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["3.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
@@ -8389,13 +8567,15 @@ mod tests {
         /// (c) The requirement is itself an exact pin to a nonexistent pre-release
         /// (`=2.0.0-rc.5`) — existing #206 behavior. A published pre-release with a
         /// different tag must not be surfaced, since the requirement already names a
-        /// pre-release tag (`requirement_names_prerelease` bails before even compiling).
+        /// pre-release tag (`matching_prerelease_would_satisfy` bails on
+        /// `requirement_names_prerelease` before ever consulting the matcher).
         #[test]
         fn test_exact_prerelease_pin_does_not_misfire_on_unrelated_prerelease() {
+            let requirement = VersionReq::new("=2.0.0-rc.5");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("=2.0.0-rc.5"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
@@ -8410,10 +8590,11 @@ mod tests {
         /// floor (`rc.1 < rc.5`), not SemVer's default pre-release exclusion.
         #[test]
         fn test_caret_requirement_naming_prerelease_returns_none() {
+            let requirement = VersionReq::new("^2.0.0-rc.5");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("^2.0.0-rc.5"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
@@ -8424,10 +8605,11 @@ mod tests {
         /// S1 regression, `~` shape.
         #[test]
         fn test_tilde_requirement_naming_prerelease_returns_none() {
+            let requirement = VersionReq::new("~2.0.0-rc.5");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("~2.0.0-rc.5"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
@@ -8438,10 +8620,11 @@ mod tests {
         /// S1 regression, `>=` shape.
         #[test]
         fn test_gte_requirement_naming_prerelease_returns_none() {
+            let requirement = VersionReq::new(">=2.0.0-rc.5");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new(">=2.0.0-rc.5"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
@@ -8453,10 +8636,11 @@ mod tests {
         /// actually usable, so naming it as "would satisfy" would be misleading.
         #[test]
         fn test_yanked_matching_prerelease_is_skipped() {
+            let requirement = VersionReq::new("^2.0.0");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("^2.0.0"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
                     &yanked_versions(&["2.0.0-rc.1"]),
                 ),
@@ -8467,10 +8651,11 @@ mod tests {
         /// M1: a yanked pre-release is skipped in favor of an older, non-yanked matching one.
         #[test]
         fn test_yanked_matching_prerelease_falls_back_to_non_yanked() {
+            let requirement = VersionReq::new("^2.0.0");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &StrictSemverFormatter,
-                    &VersionReq::new("^2.0.0"),
+                    compile(&StrictSemverFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.2", "2.0.0-rc.1", "1.5.0"]),
                     &yanked_versions(&["2.0.0-rc.2"]),
                 ),
@@ -8482,10 +8667,11 @@ mod tests {
         /// enrichment, even against a requirement/available pair that would otherwise match.
         #[test]
         fn test_non_opted_in_ecosystem_returns_none() {
+            let requirement = VersionReq::new("^2.0.0");
             assert_eq!(
                 matching_prerelease_would_satisfy(
-                    &NonStrictFormatter,
-                    &VersionReq::new("^2.0.0"),
+                    compile(&NonStrictFormatter, &requirement).as_ref(),
+                    &requirement,
                     &versions(&["2.0.0-rc.1", "1.5.0"]),
                     &[],
                 ),
