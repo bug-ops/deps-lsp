@@ -8,6 +8,8 @@
 
 use std::borrow::Cow;
 
+use super::key::sanitize_invisible;
+
 /// Replaces any embedded `user:pass@`/`user@` userinfo component in `raw` with a fixed
 /// `***@` marker, for a caller to log or retain instead of the raw credential-bearing value.
 ///
@@ -2131,6 +2133,13 @@ fn mask_token_segments(redacted: &str) -> Cow<'_, str> {
 /// shape alone, from a genuine base64url-encoded token of the same length
 /// (`is_unprefixed_base64url_token`).
 ///
+/// Finally, [`sanitize_invisible`](super::sanitize_invisible) sweeps the redacted result for
+/// control/format characters — a manifest-controlled `raw` (e.g. a schemeless package name
+/// forwarded here via [`RedactedUrl`](super::RedactedUrl)) can carry a raw `\n`, `\r`, or ESC
+/// byte that survives every redaction pass above unchanged, since none of them are credential
+/// shapes; left alone, it would forge a fake log line or terminal escape sequence in whatever
+/// `tracing`/log sink renders this output verbatim (#1469).
+///
 /// # Examples
 ///
 /// ```
@@ -2143,6 +2152,10 @@ fn mask_token_segments(redacted: &str) -> Cow<'_, str> {
 /// assert_eq!(
 ///     url_for_tracing("https://user:hunter2@registry.example/simple?token=x"),
 ///     "https://***@registry.example/simple"
+/// );
+/// assert_eq!(
+///     url_for_tracing("ok\r\nWARN forged2"),
+///     "ok  WARN forged2"
 /// );
 /// ```
 #[must_use]
@@ -2174,9 +2187,16 @@ pub(super) fn url_for_tracing_with_parsed(raw: &str, parsed: Option<url::Url>) -
     };
     // #1429: mask any remaining token-shaped host label/path piece `redact_userinfo` leaves
     // untouched. `Cow::Borrowed` reuses `redacted` outright rather than allocating again.
-    match mask_token_segments(&redacted) {
+    let masked = match mask_token_segments(&redacted) {
         Cow::Borrowed(_) => redacted,
         Cow::Owned(masked) => masked,
+    };
+    // #1469: redaction alone doesn't stop a manifest-controlled `\n`/`\r`/ESC from forging a
+    // tracing log line or terminal escape sequence — sweep control/format characters last, once
+    // no further redaction can reintroduce one.
+    match sanitize_invisible(&masked) {
+        Cow::Borrowed(_) => masked,
+        Cow::Owned(sanitized) => sanitized,
     }
 }
 
@@ -4283,6 +4303,43 @@ mod tests {
             "https://docs.rs/sk-lang@1.2.3"
         );
         assert_eq!(url_for_tracing("@types/node"), "@types/node");
+    }
+
+    /// #1469 (CWE-117/CWE-150): a manifest-controlled value with no credential shape at all
+    /// (e.g. a schemeless package name forwarded here via `RedactedUrl`) still carries
+    /// `\n`/`\r`/ESC through untouched, letting it forge a fake `tracing` log line or terminal
+    /// escape sequence. Adapted from the issue's PoC.
+    #[test]
+    fn test_url_for_tracing_neutralizes_control_characters() {
+        for forged in [
+            "lodash\nERROR deps_lsp: FORGED\x1b[31mRED",
+            "ok\r\nWARN forged2",
+        ] {
+            let rendered = url_for_tracing(forged);
+            assert!(
+                !rendered.contains('\n'),
+                "{rendered:?} must not contain \\n"
+            );
+            assert!(
+                !rendered.contains('\r'),
+                "{rendered:?} must not contain \\r"
+            );
+            assert!(
+                !rendered.contains('\x1b'),
+                "{rendered:?} must not contain ESC"
+            );
+        }
+    }
+
+    /// #1469: the same sweep must also apply once userinfo redaction fires, so a control
+    /// character hiding past a redacted credential can't survive either.
+    #[test]
+    fn test_url_for_tracing_neutralizes_control_characters_alongside_credential_redaction() {
+        let rendered =
+            url_for_tracing("https://user:hunter2@registry.example/simple\n\x1binjected");
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\x1b'));
+        assert!(!rendered.contains("hunter2"));
     }
 
     /// #1429: a bracketed IPv6 host and a plain `host:port` authority both fail

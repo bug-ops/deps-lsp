@@ -80,6 +80,12 @@ use super::url::{
 ///     redact_declaration_key("source:feed//mirror"),
 ///     "source:feed//mirror"
 /// );
+/// // A control character survives the credential-shape gate (no `@` here at all) but is still
+/// // swept, since it could otherwise forge a log line on its own (#1469).
+/// assert_eq!(
+///     redact_declaration_key("lodash\nERROR deps_lsp: FORGED"),
+///     "lodash ERROR deps_lsp: FORGED"
+/// );
 /// ```
 #[must_use]
 #[expect(
@@ -92,7 +98,7 @@ pub fn redact_declaration_key(key: &str) -> std::borrow::Cow<'_, str> {
     // (#1317) — `is_authority_bearing_url` hands back the parsed `Url` instead of a plain `bool`
     // for exactly this reason.
     let parsed = is_authority_bearing_url(key);
-    if parsed.is_some() || has_credential_shape(key) {
+    let redacted = if parsed.is_some() || has_credential_shape(key) {
         // The gate firing doesn't mean the text actually changed (e.g. an authority-bearing,
         // credential-free URL) — a value-equality check is needed to still borrow in that case,
         // not just when the gate never fires at all (critic S1, #1317). Note this still costs
@@ -110,6 +116,14 @@ pub fn redact_declaration_key(key: &str) -> std::borrow::Cow<'_, str> {
             Some(idx) => std::borrow::Cow::Owned(key[..idx].to_string()),
             None => std::borrow::Cow::Borrowed(key),
         }
+    };
+    // #1469: the credential-shape gate above has no opinion on control characters, so a
+    // manifest-controlled `key` with no credential shape at all (e.g. a plain package name
+    // carrying a raw `\n`/`\r`/ESC) would otherwise reach this function's callers — including
+    // `PackageName::for_tracing()` — unsanitized.
+    match sanitize_invisible(&redacted) {
+        std::borrow::Cow::Borrowed(_) => redacted,
+        std::borrow::Cow::Owned(sanitized) => std::borrow::Cow::Owned(sanitized),
     }
 }
 
