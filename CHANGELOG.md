@@ -68,6 +68,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-deno**: unsatisfiable `npm:`/`jsr:` requirement diagnostics in `deno.json`/`deno.jsonc` now include the pre-release hint, matching `package.json`'s (resolves #1478)
 - **deps-maven, deps-gradle**: fix deps-gradle license fetch and deps-maven's Google-group routing to resolve androidx/Firebase POMs via Google Maven instead of 404ing against Maven Central (resolves #1479) (#1485)
 - **deps-maven, deps-gradle**: `Package` completion for a `group:partial-artifact` prefix (e.g. `com.google.guava:gua`) now returns real Maven Central matches instead of 0 results — Solr's `q` param is now a proper field-query (`g:<group> AND a:<artifact-prefix>*`) instead of the raw, colon-bearing prefix that Maven Central's Solr endpoint rejected with `HTTP 400` (resolves #1457) (#1460)
 - **deps-cargo**: a `registry-index`/`.cargo/config.toml`/`$CARGO_HOME/config.toml`/`CARGO_REGISTRIES_*_INDEX` value rejected for a reason other than a policy-blocked host (invalid URL, non-https, embedded userinfo) now surfaces a warning diagnostic via `rejected_registries()`, matching npm/PyPI/Go/NuGet (resolves #1453)
@@ -129,6 +130,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Breaking
 - **deps-core**: `FetchCompleteness` no longer implements `Default` — completeness is now always derived from a call's outcome, never defaulted (resolves #1467) (#1491)
+- **deps-core**: `DiagnosticPolicy::strict_semver_prerelease_exclusion` is removed; the same property now lives on the compiled matcher as `RequirementMatcher::strict_prerelease_exclusion`, a required method with no default, so a matcher-reusing formatter (e.g. `deps-deno`) inherits it automatically and a new matcher type must decide it explicitly rather than silently opting out by omission (resolves #1478)
 - **deps-core**: `DepsDevClient::trust_signal`/`typosquat_signal`'s `system` parameter is now the typed `DepsDevSystem` enum instead of `&'static str` (resolves #1455) (#1465)
 - **deps-core**: `TyposquatSignal` no longer has a `declared_name` field — every caller already keys its `TyposquatSignal` map by `PackageName` and the one diagnostic renderer never read it (resolves #1455) (#1465)
 - **deps-core**: `RegistryRejectionClassifier::rejection_reason` now returns the three-state `RejectionOutcome` enum instead of `Option<RegistryRejectionReason>`, distinguishing "already reported via the blocked-host path" from "intentionally never surfaced" (resolves #1455) (#1465)

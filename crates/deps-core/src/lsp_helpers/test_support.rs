@@ -1228,6 +1228,10 @@ impl RequirementMatcher for ExactMatcher {
     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
         Some(version.as_str() == self.0)
     }
+
+    fn strict_prerelease_exclusion(&self) -> bool {
+        false
+    }
 }
 
 impl PackageNaming for ExactMatchFormatter {}
@@ -1265,10 +1269,14 @@ impl RequirementMatcher for RealSemverMatcher {
             .ok()
             .map(|v| self.0.matches(&v))
     }
+
+    fn strict_prerelease_exclusion(&self) -> bool {
+        true
+    }
 }
 
 /// Mirrors `deps-cargo`/`deps-swift`'s real formatter shape (`semver::VersionReq`
-/// compilation, opted into `strict_semver_prerelease_exclusion`) without depending on
+/// compilation, whose matcher opts into `strict_prerelease_exclusion`) without depending on
 /// those crates. Shared by `matching_prerelease_would_satisfy_tests` and the
 /// `generate_diagnostics_from_cache` end-to-end coverage below (#299).
 pub(crate) struct StrictSemverFormatter;
@@ -1296,11 +1304,7 @@ impl RequirementResolution for StrictSemverFormatter {
 
 impl DiagnosticMessages for StrictSemverFormatter {}
 
-impl DiagnosticPolicy for StrictSemverFormatter {
-    fn strict_semver_prerelease_exclusion(&self) -> bool {
-        true
-    }
-}
+impl DiagnosticPolicy for StrictSemverFormatter {}
 
 impl SourcePolicy for StrictSemverFormatter {}
 

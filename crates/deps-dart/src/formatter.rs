@@ -34,6 +34,11 @@ impl RequirementMatcher for PubDevMatcher {
         let version = version.as_str();
         Some(version_matches_normalized_constraint(version, &self.0))
     }
+
+    /// pub.dev's constraint grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
+    fn strict_prerelease_exclusion(&self) -> bool {
+        false
+    }
 }
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Dart/Pub.

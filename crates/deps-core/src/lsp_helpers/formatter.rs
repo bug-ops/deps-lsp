@@ -648,36 +648,6 @@ pub trait DiagnosticMessages: Send + Sync {
 /// because the underlying signal is wrong, but to avoid duplicating the separate #205
 /// package-level deprecation diagnostic that would otherwise fire alongside it.
 pub trait DiagnosticPolicy: Send + Sync {
-    /// Whether this ecosystem's requirement/version syntax follows strict SemVer 2.0.0
-    /// pre-release semantics: a pre-release version (`X.Y.Z-pre`) is excluded from matching
-    /// `requirement` unless `requirement` itself pins to the same `X.Y.Z` tuple with a
-    /// pre-release tag — the rule Cargo's `semver` crate and npm's `node-semver` both
-    /// implement, and that `compile_requirement`'s matcher inherits from its underlying
-    /// comparator.
-    ///
-    /// Used by [`crate::lsp_helpers::requirement_is_unsatisfiable`]'s caller in `generate_diagnostics_from_cache`
-    /// to decide whether the unsatisfiable-requirement WARNING should be enriched with a
-    /// mention of a published pre-release that would satisfy `requirement` if pre-release
-    /// exclusion were relaxed (#299). Maven/NuGet/Composer/Gradle use non-strict,
-    /// ecosystem-specific range models where this premise does not hold — they must not
-    /// override this.
-    ///
-    /// Default `false`. `deps-cargo`, `deps-npm`, and `deps-swift` override this to `true`.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use deps_core::lsp_helpers::DiagnosticPolicy;
-    ///
-    /// struct DefaultFormatter;
-    /// impl DiagnosticPolicy for DefaultFormatter {}
-    ///
-    /// assert!(!DefaultFormatter.strict_semver_prerelease_exclusion());
-    /// ```
-    fn strict_semver_prerelease_exclusion(&self) -> bool {
-        false
-    }
-
     /// Whether this ecosystem's deprecation payload ([`crate::Deprecation::replacement`])
     /// is safe to offer as a "Replace with X" rename quickfix.
     ///

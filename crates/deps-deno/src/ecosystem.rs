@@ -301,8 +301,14 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionData;
+    use std::collections::HashMap;
     #[cfg(feature = "lsp-responses")]
     use tower_lsp_server::ls_types::Position;
+
+    fn pkg(s: &str) -> deps_core::PackageName {
+        deps_core::PackageName::new(s)
+    }
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/
     // test_ecosystem_display_name/test_ecosystem_manifest_filenames/test_as_any.
@@ -478,6 +484,78 @@ mod tests {
 
         let result = ecosystem.parse_manifest("{ not valid !!", &uri).await;
         assert!(result.is_err());
+    }
+
+    /// #1478: behavioral proof through the real `Ecosystem::generate_diagnostics` entry
+    /// point (not just a unit check of the compiled matcher's
+    /// `RequirementMatcher::strict_prerelease_exclusion`) — an unsatisfiable requirement
+    /// whose only satisfying candidate is a pre-release must render the pre-release hint for
+    /// both `npm:` and `jsr:` specifiers in `deno.json`, exactly as `package.json`'s
+    /// equivalent `npm` diagnostic already does.
+    #[tokio::test]
+    async fn test_generate_diagnostics_unsatisfiable_includes_prerelease_hint_for_npm_and_jsr() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = DenoEcosystem::new(cache);
+        let uri = deps_core::test_util::test_uri("/test/deno.json");
+
+        let content = r#"{"imports": {
+            "ts": "npm:typescript@^2.0.0",
+            "fmt": "jsr:@std/fmt@^3.0.0"
+        }}"#;
+        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            pkg("npm:typescript"),
+            deps_core::lsp_helpers::PackageVersions::new(
+                deps_core::ConcreteVersion::new("1.9.0"),
+                Arc::from(vec![
+                    deps_core::ConcreteVersion::new("2.0.0-rc.1"),
+                    deps_core::ConcreteVersion::new("1.9.0"),
+                ]),
+            ),
+        );
+        cached_versions.insert(
+            pkg("jsr:@std/fmt"),
+            deps_core::lsp_helpers::PackageVersions::new(
+                deps_core::ConcreteVersion::new("1.9.0"),
+                Arc::from(vec![
+                    deps_core::ConcreteVersion::new("3.0.0-rc.1"),
+                    deps_core::ConcreteVersion::new("1.9.0"),
+                ]),
+            ),
+        );
+        let resolved_versions = HashMap::new();
+
+        let diagnostics = ecosystem
+            .generate_diagnostics(
+                parse_result.as_ref(),
+                VersionData::new(&cached_versions, &resolved_versions),
+                &uri,
+                deps_core::FreshnessSettings::default(),
+                deps_core::DiagnosticSeverities::default(),
+            )
+            .await;
+
+        let npm_message = diagnostics
+            .iter()
+            .find(|d| d.message().contains("2.0.0-rc.1"))
+            .map(|d| d.message())
+            .expect("npm: unsatisfiable diagnostic with matching pre-release must fire");
+        assert!(
+            npm_message.contains("pre-release"),
+            "npm: message must mention the matching pre-release, got: {npm_message}"
+        );
+
+        let jsr_message = diagnostics
+            .iter()
+            .find(|d| d.message().contains("3.0.0-rc.1"))
+            .map(|d| d.message())
+            .expect("jsr: unsatisfiable diagnostic with matching pre-release must fire");
+        assert!(
+            jsr_message.contains("pre-release"),
+            "jsr: message must mention the matching pre-release, got: {jsr_message}"
+        );
     }
 
     #[cfg(feature = "lsp-responses")]

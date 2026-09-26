@@ -1828,6 +1828,10 @@ mod tests {
             fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
                 Some(version.as_str() >= self.0.as_str())
             }
+
+            fn strict_prerelease_exclusion(&self) -> bool {
+                false
+            }
         }
 
         impl PackageNaming for FloorFormatter {}

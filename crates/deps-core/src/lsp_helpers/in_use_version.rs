@@ -538,6 +538,10 @@ mod tests {
                 .ok()
                 .map(|v| self.0.matches(&v))
         }
+
+        fn strict_prerelease_exclusion(&self) -> bool {
+            false
+        }
     }
 
     impl crate::lsp_helpers::PackageNaming for CaretFormatter {}

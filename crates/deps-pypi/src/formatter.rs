@@ -19,6 +19,11 @@ impl RequirementMatcher for Pep440Matcher {
         let version = version.as_str();
         Version::from_str(version).ok().map(|v| self.0.contains(&v))
     }
+
+    /// PEP 440's own pre-release handling is not SemVer 2.0.0's (#299) — must not opt in.
+    fn strict_prerelease_exclusion(&self) -> bool {
+        false
+    }
 }
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for PyPI.

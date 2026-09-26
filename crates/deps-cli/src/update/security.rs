@@ -508,6 +508,10 @@ mod tests {
         fn matches(&self, _version: &deps_core::ConcreteVersion) -> Option<bool> {
             Some(self.0)
         }
+
+        fn strict_prerelease_exclusion(&self) -> bool {
+            false
+        }
     }
 
     /// A formatter with a `compile_requirement` override (like 12 of the 14 real ecosystems),

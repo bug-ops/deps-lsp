@@ -45,6 +45,11 @@ impl RequirementMatcher for NuGetMatcher {
             }
         })
     }
+
+    /// NuGet's range/float grammar is not strict SemVer 2.0.0 (#299) — must not opt in.
+    fn strict_prerelease_exclusion(&self) -> bool {
+        false
+    }
 }
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for NuGet.
