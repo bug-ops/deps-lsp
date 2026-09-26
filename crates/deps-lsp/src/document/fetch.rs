@@ -18,7 +18,8 @@ use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
 };
 use deps_engine::classify::fetch::{
-    DepSources, FetchResult, apply_fetch_outcomes, fetch_latest_versions_parallel, prepare_fetch,
+    DepSources, FailureSummary, FetchResult, apply_fetch_outcomes, fetch_latest_versions_parallel,
+    prepare_fetch,
 };
 use std::collections::{HashMap, HashSet};
 use tower_lsp_server::Client;
@@ -29,28 +30,29 @@ use tower_lsp_server::ls_types::Uri;
 /// `handle_document_open` and `handle_document_change` so both share one policy and the
 /// policy itself is unit-testable without an LSP transport.
 ///
-/// `failed_count` counts both genuine fetch failures and not-found lookups (see #276 S2),
-/// so the message deliberately says "could not be resolved" rather than "failed to fetch"
-/// or anything containing "lookup failed" — that phrasing is the exact inline "Registry
-/// lookup failed" diagnostic text, which excludes not-found by design (#267 C1), so reusing
-/// it here would recreate the same overcount confusion in different words. "could not be
-/// resolved" covers both the "Registry lookup failed" and "Unknown package" diagnostic
-/// outcomes, so the count stays checkable against their union (#490).
+/// `failure.count()` counts both genuine fetch failures and not-found lookups (see #276
+/// S2), so the message deliberately says "could not be resolved" rather than "failed to
+/// fetch" or anything containing "lookup failed" — that phrasing is the exact inline
+/// "Registry lookup failed" diagnostic text, which excludes not-found by design (#267 C1),
+/// so reusing it here would recreate the same overcount confusion in different words.
+/// "could not be resolved" covers both the "Registry lookup failed" and "Unknown package"
+/// diagnostic outcomes, so the count stays checkable against their union (#490).
 ///
 /// Returns `None` when there were no failures at all, or when `offline` is set (issue
 /// #483): every fetch fails by design while `network.offline` is set, so toasting on every
 /// document open/change would make offline mode unusable.
 pub(crate) fn fetch_failure_toast(
-    failed_count: usize,
-    first_error: Option<&str>,
+    failure: Option<&FailureSummary>,
     offline: bool,
 ) -> Option<String> {
-    if failed_count == 0 || offline {
+    if offline {
         return None;
     }
+    let failure = failure?;
     Some(format!(
-        "deps-lsp: {failed_count} package(s) could not be resolved: {}",
-        first_error.unwrap_or("timeout or network error")
+        "deps-lsp: {} package(s) could not be resolved: {}",
+        failure.count(),
+        failure.message()
     ))
 }
 
@@ -184,7 +186,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
 /// newly fetched versions, yanked/fetch-failure markers (re-keyed raw -> normalized),
 /// collided names recorded as not-attempted, and deprecation / no-comparable-versions
 /// bookkeeping — then marks the document loaded or failed depending on `success`. Returns
-/// `(failed_count, first_error)`, the two `FetchResult` fields this function does not
+/// `fetch_result.failure_summary`, the one `FetchResult` field this function does not
 /// consume, so the caller can still raise the fetch-failure toast after `fetch_result`
 /// itself has been moved in here.
 pub(crate) fn merge_registry_fetch_result(
@@ -195,7 +197,7 @@ pub(crate) fn merge_registry_fetch_result(
     attempted_names: &[PackageName],
     collided_names: HashSet<PackageName>,
     success: bool,
-) -> (usize, Option<String>) {
+) -> Option<FailureSummary> {
     if let Some(mut doc) = state.documents.get_mut(uri) {
         // Captured before `fetch_result.versions` is consumed below: every name
         // successfully fetched this round, used by the S1 deprecation-clearing
@@ -235,7 +237,7 @@ pub(crate) fn merge_registry_fetch_result(
         }
     }
 
-    (fetch_result.failed_count, fetch_result.first_error)
+    fetch_result.failure_summary
 }
 #[cfg(test)]
 mod tests {
@@ -273,17 +275,22 @@ mod tests {
     /// `show_message` calls over.
     mod fetch_failure_toast_tests {
         use super::*;
+        use std::num::NonZeroUsize;
 
         #[test]
         fn test_no_failures_produces_no_toast_regardless_of_offline() {
-            assert_eq!(fetch_failure_toast(0, None, false), None);
-            assert_eq!(fetch_failure_toast(0, Some("ignored"), true), None);
+            assert_eq!(fetch_failure_toast(None, false), None);
+            assert_eq!(fetch_failure_toast(None, true), None);
         }
 
         #[test]
         fn test_offline_suppresses_toast_even_with_failures() {
+            let summary = FailureSummary::new(
+                NonZeroUsize::new(3).unwrap(),
+                "offline: request to https://x was blocked".to_string(),
+            );
             assert_eq!(
-                fetch_failure_toast(3, Some("offline: request to https://x was blocked"), true),
+                fetch_failure_toast(Some(&summary), true),
                 None,
                 "every fetch fails by design while offline; toasting would make it unusable"
             );
@@ -291,21 +298,14 @@ mod tests {
 
         #[test]
         fn test_online_failure_with_first_error_uses_it_verbatim() {
+            let summary = FailureSummary::new(
+                NonZeroUsize::new(1).unwrap(),
+                "HTTP 503 for https://example.com".to_string(),
+            );
             assert_eq!(
-                fetch_failure_toast(1, Some("HTTP 503 for https://example.com"), false),
+                fetch_failure_toast(Some(&summary), false),
                 Some(
                     "deps-lsp: 1 package(s) could not be resolved: HTTP 503 for https://example.com"
-                        .to_string()
-                )
-            );
-        }
-
-        #[test]
-        fn test_online_failure_with_no_first_error_uses_count_fallback() {
-            assert_eq!(
-                fetch_failure_toast(5, None, false),
-                Some(
-                    "deps-lsp: 5 package(s) could not be resolved: timeout or network error"
                         .to_string()
                 )
             );
@@ -386,14 +386,14 @@ mod tests {
         )
         .await;
 
-        assert_eq!(result.failed_count, 2);
+        assert_eq!(result.failed_count(), 2);
         assert_eq!(
             result.fetch_failed.len(),
             1,
             "not-found must not be in fetch_failed"
         );
 
-        let toast = fetch_failure_toast(result.failed_count, result.first_error.as_deref(), false)
+        let toast = fetch_failure_toast(result.failure_summary.as_ref(), false)
             .expect("failed_count > 0 and not offline, so a toast must be produced");
         assert!(
             toast.starts_with("deps-lsp: 2 package(s) could not be resolved:"),

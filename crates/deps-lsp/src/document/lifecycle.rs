@@ -410,7 +410,7 @@ async fn run_document_open_background_task(
     let success = !fetch_result.versions.is_empty();
     tracing::debug!(
         fetched = fetch_result.versions.len(),
-        failed = fetch_result.failed_count,
+        failed = fetch_result.failed_count(),
         yanked = fetch_result.yanked_versions.len(),
         "registry fetch complete"
     );
@@ -466,25 +466,22 @@ async fn run_document_open_background_task(
     }
 
     // Notify user about failed packages — suppressed when offline, see
-    // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
-    // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
-    // site that increments `failed_count` also sets either `priority_error` or
-    // `first_error`, and the two are merged into this field before returning).
-    match fetch_failure_toast(
-        fetch_result.failed_count,
-        fetch_result.first_error.as_deref(),
-        state.cache.is_offline(),
-    ) {
+    // `fetch_failure_toast`'s docs. `fetch_result.failure_summary` is a single typed value
+    // (issue #1470), so there's no longer a separate count/message pair that can drift out
+    // of sync (#480, #490).
+    let failure_summary = fetch_result.failure_summary.as_ref();
+    match fetch_failure_toast(failure_summary, state.cache.is_offline()) {
         Some(message) => {
             client.show_message(MessageType::WARNING, message).await;
         }
-        None if fetch_result.failed_count > 0 => {
-            tracing::debug!(
-                failed_count = fetch_result.failed_count,
-                "suppressing fetch-failure toast: offline"
-            );
+        None => {
+            if let Some(summary) = failure_summary {
+                tracing::debug!(
+                    failed_count = summary.count(),
+                    "suppressing fetch-failure toast: offline"
+                );
+            }
         }
-        None => {}
     }
 
     // Kick off inlay hint / code lens refresh as soon as loading completes, so
@@ -1272,7 +1269,7 @@ async fn run_document_change_task(
 
     let success = !fetch_result.versions.is_empty();
 
-    let (failed_count, first_error) = merge_registry_fetch_result(
+    let failure_summary = merge_registry_fetch_result(
         &state,
         &uri,
         ecosystem.formatter(),
@@ -1295,22 +1292,19 @@ async fn run_document_change_task(
     }
 
     // Notify user about failed packages — suppressed when offline, see
-    // `fetch_failure_toast`'s docs. `fetch_result.first_error` is always populated
-    // by `fetch_latest_versions_parallel` whenever `failed_count > 0` (#480: every
-    // site that increments `failed_count` also sets either `priority_error` or
-    // `first_error`, and the two are merged into this field before returning).
-    match fetch_failure_toast(
-        failed_count,
-        first_error.as_deref(),
-        state.cache.is_offline(),
-    ) {
+    // `fetch_failure_toast`'s docs. `failure_summary` is a single typed value (issue
+    // #1470), so there's no longer a separate count/message pair that can drift out of
+    // sync (#480, #490).
+    match fetch_failure_toast(failure_summary.as_ref(), state.cache.is_offline()) {
         Some(message) => {
             client.show_message(MessageType::WARNING, message).await;
         }
-        None if failed_count > 0 => {
-            tracing::debug!(failed_count, "suppressing fetch-failure toast: offline");
+        None => {
+            if let Some(summary) = &failure_summary {
+                let failed_count = summary.count();
+                tracing::debug!(failed_count, "suppressing fetch-failure toast: offline");
+            }
         }
-        None => {}
     }
 
     // Detached, capability-gated, timeout-bounded (issue #493): see
@@ -1716,7 +1710,7 @@ mod tests {
     use deps_core::Registry;
     use deps_core::RemovalStatus;
     #[cfg(feature = "cargo")]
-    use deps_engine::classify::fetch::FetchResult;
+    use deps_engine::classify::fetch::{FailureSummary, FetchResult};
     // Only the cargo-gated tests below sleep or time out on a bare `Duration`
     // (go_tests imports its own `tokio::time::Duration` locally instead).
     #[cfg(feature = "cargo")]
@@ -2342,12 +2336,14 @@ mod tests {
                 HashMap::new(),
                 HashMap::from([(PackageName::new("serde"), FetchFailure::Transient)]),
                 HashSet::new(),
-                1,
-                Some("network down".to_string()),
+                Some(FailureSummary::new(
+                    std::num::NonZeroUsize::new(1).unwrap(),
+                    "network down".to_string(),
+                )),
                 HashMap::new(),
             );
 
-            let (failed_count, _) = merge_registry_fetch_result(
+            let failure_summary = merge_registry_fetch_result(
                 &state,
                 &uri,
                 ecosystem.formatter(),
@@ -2356,7 +2352,7 @@ mod tests {
                 HashSet::new(),
                 false,
             );
-            assert_eq!(failed_count, 1);
+            assert_eq!(failure_summary.map(|f| f.count()), Some(1));
 
             let diags = diagnostics::generate_diagnostics_internal(
                 Arc::clone(&state),
