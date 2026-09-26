@@ -110,14 +110,44 @@ Resolved by direct code inspection of `crates/deps-engine/src/classify/fetch.rs`
 `crates/deps-cli/src/{main,analyze,config}.rs`, and `crates/deps-core/src/{deps_dev,lsp_helpers}`
 during this spec session (2026-09-26) — see `plan.md` for exact call-site line numbers.
 
+**Revised 2026-09-26 after critique round 1** (independent `rust-critic`, `rust-security-maintenance`,
+and `rust-testing-engineer` passes on the first implementation, verdict: critical). All three found
+the same false premise: `crates/deps-core/src/lsp_helpers/diagnostics.rs`'s existing local
+`freshness.cooldown_secs` heuristic **never excludes a version from being picked as `latest`** — it
+only annotates a downstream diagnostic *message*, verified directly against
+`get_versions_with`/`get_versions_from`'s contract and every ecosystem's `select_latest_matching_impl`.
+So the original FR-003 ("union with the existing local exclusion") was building on an exclusion
+mechanism that does not exist: GOSSIP's version-filter was the *first* thing ever to change what
+counts as `latest`, and a naive implementation (excluding a cooldown-flagged version outright) could:
+
+- **C1 (critical)**: regress `latest` *below* a dependency's already-declared/in-use version when
+  that exact version is the one GOSSIP flags — `check` then reports a false "newer version available"
+  pointing at an *older* release, `--fail-on Outdated` fails CI on an already-current dependency, and
+  `deps-cli update` (`crates/deps-core/src/edit.rs`'s `collect_update_candidates`, which reads
+  `PackageVersions.latest` with no downgrade guard) rewrites the manifest to that older version — a
+  real, silent downgrade.
+- **S1**: the `get_latest_matching_from` fallback (fetch.rs, invoked when the list-based pick finds
+  nothing) is not filtered at all, and can simply return the same GOSSIP-flagged version — bypassing
+  the exclusion entirely once it's the sole list-based candidate.
+
+FR-003 is corrected below to a **floor-protected filter**: GOSSIP may only exclude a version that is
+*strictly newer* than the newest version already in use for that dependency. A version at or older
+than that floor is never excluded, so `latest` can never regress past what is already declared —
+closing C1 by construction. This also closes S1 whenever an in-use version is known: the floor
+version always satisfies the (wildcard) selection requirement, so the list-based pick can never come
+up empty for GOSSIP reasons, and the `get_latest_matching_from` fallback is never reached on that
+account. S1 remains a **narrow, documented residual gap** only for a dependency with *no* in-use
+version at all (a fresh add, no lockfile) — accepted as out of proportion to fix for a P4 issue (would
+need per-ecosystem `Registry` trait changes to filter the fallback itself); see §6/§9.
+
 | ID | Requirement | Priority |
 |----|------------|----------|
 | FR-001 | WHEN `deps-engine`'s composition root builds its runtime handles THE SYSTEM SHALL construct an `Arc<DepsDevClient>` alongside the existing `Arc<OsvClient>` (`crates/deps-cli/src/main.rs:115-120`'s `RuntimeHandles`), unconditionally — construction itself is free; all network calls remain gated by `GossipConfig.enabled` inside the reused `fetch_gossip_findings_batch` helper | must |
 | FR-002 | WHEN `[gossip].enabled = true`, the run is not offline, and a manifest's ecosystem is one of the 7 `deps_dev_system`-covered systems THE SYSTEM SHALL batch-prefetch GOSSIP findings for every declared dependency in that manifest **once per manifest** (not once per package) via the existing, unmodified `deps_core::lsp_helpers::fetch_gossip_findings_batch(ecosystem_id, parse_result, formatter, offline, client)`, called from `deps-cli::analyze::analyze_manifest` before `fetch_latest_versions_parallel` — mirroring the existing `prefetch_tier3_licenses` call shape at `analyze.rs` (same file, same "prefetch once, thread the result through" pattern) | must |
-| FR-003 | WHEN `fetch_and_classify_package` (`crates/deps-engine/src/classify/fetch.rs:763`) has fetched a package's `versions` list from the registry (already filtered by the ecosystem's own local-freshness logic inside `get_versions_from`) THE SYSTEM SHALL additionally exclude, before calling `select_latest_matching`, any version whose string exactly equals a prefetched `GossipFindings.version` for that package AND whose `GossipFindings.cooldown` is `Some(c)` with `c.is_active(now)` — a **union** with the existing local exclusion, never a replacement. `now` SHALL be read once per fetch call, not memoized across the batch | must |
-| FR-004 | THE SYSTEM SHALL NOT add a new `Category` variant or change `FailOnPolicy::matches` (`crates/deps-cli/src/report.rs:299`). The GOSSIP-vs-`--fail-on` question is resolved: GOSSIP's effect on `--fail-on Outdated`/exit code is entirely indirect, through the same `Category::Outdated` classification path the existing local-cooldown filter already participates in — no new gating mechanism is needed | must |
-| FR-005 | WHEN a version is excluded by FR-003's GOSSIP check but would **not** have been excluded by the local `cooldown_secs` heuristic alone (i.e., GOSSIP is the sole reason a different, older version was picked as "latest") THE SYSTEM SHALL attribute this in `PackageStatus::Resolved`'s data (a new field on `PackageVersions` or an equivalent outcome field) so `table`/`json`/`sarif` rendering can name GOSSIP as the source, mirroring deps-lsp's NFR-004 attribution rule. WHEN local and GOSSIP agree, or only local excludes, existing message text is unchanged | must |
-| FR-006 | `deps-cli update`'s non-`--security-only` fix-target pick SHALL inherit FR-003's behavior with no update-specific code, because `run_update`/`run_check` already share one classification pipeline (`analyze_manifest` → `fetch_latest_versions_parallel` → `fetch_and_classify_package`, confirmed at `crates/deps-cli/src/main.rs:513-515` and `crates/deps-cli/src/analyze.rs:226`). The existing `--security-only` no-effect warning (`main.rs:364-376`, FR-014 of spec 068) SHALL be extended to also name GOSSIP as a second cooldown source with no effect in that mode, for the same underlying reason (fix target comes from the advisory, never the freshness/GOSSIP-filtered pick) | must |
+| FR-003 | **CORRECTED round 1 (C1/S1).** WHEN `fetch_and_classify_package` (`crates/deps-engine/src/classify/fetch.rs:763`) has fetched a package's `versions` list (newest-first, per `PackageVersions::available`'s documented invariant — **not** pre-filtered by anything local; see the round-1 correction above) THE SYSTEM SHALL determine whether the unfiltered list-based pick is itself GOSSIP-cooldown-flagged (`GossipFindings.version` matches, `cooldown.is_active(now)`); if not, behavior is unchanged (zero extra cost — no second selection pass runs). WHEN it IS flagged, THE SYSTEM SHALL compute a **protect floor**: the position, in that same newest-first list, of the newest version string appearing in `in_use_versions` (the package's already-declared/resolved version(s) for this manifest) — `None` if no `in_use_versions` entry is found in the list. THE SYSTEM SHALL then re-run `select_latest_matching` over a filtered copy of the list that excludes a GOSSIP-cooldown-flagged version **only when its position is strictly newer than the protect floor** (a floor position, or any position at/after it, is never excluded). THE SYSTEM SHALL set the FR-005 attribution field **only if** this second pick's version differs from the original unfiltered pick — if the floor fully neutralizes the exclusion (the flagged version *is* the floor, i.e. already in use and still the best available), no exclusion actually occurred and no attribution is set. `now` SHALL be read once per fetch call, not memoized across the batch | must |
+| FR-004 | THE SYSTEM SHALL NOT add a new `Category` variant or change `FailOnPolicy::matches` (`crates/deps-cli/src/report.rs:299`). The GOSSIP-vs-`--fail-on` question is resolved: GOSSIP's effect on `--fail-on Outdated`/exit code is entirely indirect, through the same `Category::Outdated` classification path FR-003's filtered `latest` feeds — no new gating mechanism is needed | must |
+| FR-005 | **CORRECTED round 1**: WHEN FR-003's second (filtered) pick differs from its first (unfiltered) pick THE SYSTEM SHALL attribute this in `PackageStatus::Resolved`'s data (`PackageVersions.gossip_excluded_version`) so `table`/`json`/`sarif` rendering can name GOSSIP as the source, mirroring deps-lsp's NFR-004 attribution rule. WHEN the two picks are identical (no exclusion actually took effect — including the floor-neutralized case) THE SYSTEM SHALL NOT set this field, and existing message text is unchanged | must |
+| FR-006 | `deps-cli update`'s non-`--security-only` fix-target pick SHALL inherit FR-003's behavior with no update-specific code, because `run_update`/`run_check` already share one classification pipeline (`analyze_manifest` → `fetch_latest_versions_parallel` → `fetch_and_classify_package`, confirmed at `crates/deps-cli/src/main.rs:513-515` and `crates/deps-cli/src/analyze.rs:226`) and FR-003's floor protection is keyed off the same `in_use_versions` `collect_update_candidates` (`crates/deps-core/src/edit.rs:701`) ultimately reads `PackageVersions.latest` from — a version at or below what's already declared can never become the computed `latest`, so `update` can never be pointed at a downgrade by this feature. The existing `--security-only` no-effect warning (`main.rs:364-376`, FR-014 of spec 068) SHALL be extended to also name GOSSIP as a second cooldown source with no effect in that mode, for the same underlying reason (fix target comes from the advisory, never the freshness/GOSSIP-filtered pick) | must |
 | FR-007 | WHEN `crates/deps-cli/src/config.rs`'s `ignored_sections(&policy)` (config.rs:298) is evaluated THE SYSTEM SHALL add a `typosquat` check (`policy.typosquat.enabled != default.typosquat.enabled`) mirroring the existing `gossip` check (config.rs:340-342) — closing the gap where `[typosquat]` has no `ignored_sections` entry at all today | must |
 | FR-008 | WHEN `load()` (config.rs:217) parses a config file THE SYSTEM SHALL emit `ignored_sections`' per-section warning for **both** an auto-discovered file and an explicitly-given `--config` file — the warning-emission loop currently gated behind `if !required` (config.rs:233) SHALL run unconditionally. `safe_auto_discovered_config`'s field-reset (the untrusted-input hardening from spec 062's F1/F1-follow-up) SHALL remain gated to the auto-discovered (`!required`) path only — an explicit `--config` stays fully trusted as written (config.rs:210-211's existing doc comment), only the "this section has no effect in deps-cli" warning becomes unconditional | must |
 | FR-009 | WHEN GOSSIP is disabled, the run is offline, the ecosystem is not `deps_dev_system`-covered, or a dependency's source fails `EcosystemFormatter::source_is_public_registry_content` THE SYSTEM SHALL degrade to the existing local-freshness-only behavior with no user-visible error — `fetch_gossip_findings_batch` already implements every one of these gates (`diagnostics.rs:1938-1975`), reused as-is | must |
@@ -149,7 +179,9 @@ New, additive-only field proposed in `plan.md` §3: an attribution marker on `Pa
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| GOSSIP flags the registry-latest version, but the local `cooldown_secs` heuristic already excluded an even-older set of versions too | Union semantics (FR-003): both exclusions apply; the first non-excluded version (by either source) wins, same as today's local-only logic just with a wider exclusion set |
+| **C1 (round 1)**: the dependency's already-declared/in-use version is itself the one GOSSIP flags with an active cooldown, and it is also the true registry-latest | FR-003's protect floor covers this version's own position — the exclusion is fully neutralized, the pick is unchanged, and no attribution is set (nothing was actually held back; this is genuinely the best available version) |
+| **T2 (round 1)**: the in-use version is older and safe, but GOSSIP flags only the newest release while a safe intermediate release exists above the floor | The flagged release alone is excluded; the safe intermediate release is picked as `latest`, with attribution naming the excluded (flagged) version |
+| **S1 residual (round 1, documented, not fixed)**: no `in_use_versions` entry is found in the fetched list at all (fresh dependency add, no lockfile), and GOSSIP flags the sole list-based candidate | No protect floor exists to guarantee a non-empty filtered pick; the existing `get_latest_matching_from` fallback path is taken, which is not GOSSIP-aware and may return the same flagged version — accepted as a narrow, low-severity residual gap (P4 issue; fixing it needs a `Registry` trait change touching all 14 ecosystem crates) |
 | GOSSIP's `GossipFindings.version` does not match any version in the ecosystem's `versions` list (deps.dev's view of "latest" lags the registry, or vice versa) | Treated as no signal for this run (FR-003's exact-match requirement) — never a fallback fuzzy match, mirroring spec 072 FR-008 |
 | `[gossip]` and `[typosquat]` are both non-default in an explicitly-given `--config` file | Both warnings print (FR-007/FR-008), independently, one line per differing section — matches the existing per-section warning shape, just no longer gated on auto-discovery |
 | `deps-cli update --security-only` with `[gossip].enabled = true` | GOSSIP has no effect here either (FR-006) — the existing FR-014 warning text is extended to name both sources, not just `--cooldown` |
@@ -160,7 +192,8 @@ New, additive-only field proposed in `plan.md` §3: an attribution marker on `Pa
 
 | ID | Metric | Target |
 |----|--------|--------|
-| SC-001 | `deps-cli check`/`update` classification of a GOSSIP-covered package in active cooldown | Excludes that version from being "latest", matching `deps-lsp`'s hover/diagnostics behavior for the same package/version |
+| SC-001 | `deps-cli check`/`update` classification of a GOSSIP-covered package in active cooldown | Excludes that version from being "latest" **only when a strictly newer, safe version would result** — never regresses below the dependency's already-declared/in-use version (FR-003's protect floor) |
+| SC-005 | Regression coverage for C1/S1 (round 1 critique) | Dedicated tests: in-use version itself flagged (floor neutralizes exclusion, no attribution), in-use version safe with a newer flagged release above it (exclusion applies, attribution set), no in-use version with the sole candidate flagged (documented residual fallback-bypass, asserted not silently "fixed" by accident) |
 | SC-002 | `--fail-on`/`Category` enum | Zero new variants added; `cargo clippy`'s exhaustiveness checks pass unchanged |
 | SC-003 | `[gossip]`/`[typosquat]` warning parity | Warning fires identically for auto-discovered and explicit `--config` paths; `safe_auto_discovered_config`'s reset behavior is unchanged for the auto-discovered path |
 | SC-004 | New `deps-core` code | Zero — verified via `git diff --stat crates/deps-core` on the implementing PR |
@@ -185,10 +218,11 @@ New, additive-only field proposed in `plan.md` §3: an attribution marker on `Pa
 None outstanding. All three decisions the issue asked for are resolved above by direct code
 inspection rather than left as `[NEEDS CLARIFICATION]`:
 
-- **Precedence rule** (`--cooldown`/`freshness.cooldown_secs` vs. GOSSIP): resolved as **union**
-  (FR-003) — simpler than `deps-lsp`'s override-with-attribution model (appropriate here since
-  `deps-cli`'s output is consumed by both humans and CI parsers, where an unexplained "override"
-  is a bigger surprise than an explained "wider exclusion set").
+- **Precedence rule** (`--cooldown`/`freshness.cooldown_secs` vs. GOSSIP): **revised round 1** — the
+  original "union with local exclusion" framing was retired once critique proved no local exclusion
+  exists to union with (`freshness.cooldown_secs` only ever changes message text). GOSSIP is the sole
+  exclusion mechanism, hardened by FR-003's protect floor so it can only ever hold back forward
+  progress (a newer, not-yet-safe release), never regress an already-declared dependency.
 - **`--fail-on`/exit-code effect**: resolved — indirect only, through the existing
   `Category::Outdated` path, no new `Category` (FR-004).
 - **`update`'s cooldown-awareness**: resolved — inherited for free via the shared classification
