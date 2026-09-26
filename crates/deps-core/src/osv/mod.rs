@@ -25,9 +25,9 @@ use dashmap::DashMap;
 
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 pub use types::{
-    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, OsvVersion, ScanOutcome,
-    ScanTarget, SkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap,
-    is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
+    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, OsvEcosystem, OsvVersion,
+    ScanOutcome, ScanTarget, SkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity,
+    VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
 };
 use types::{
     OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
@@ -171,7 +171,7 @@ struct RecordCacheEntry {
 /// every open document's scan benefits from the same query/record cache.
 pub struct OsvClient {
     cache: Arc<HttpCache>,
-    query_cache: DashMap<(&'static str, String, OsvVersion), QueryCacheEntry>,
+    query_cache: DashMap<(OsvEcosystem, String, OsvVersion), QueryCacheEntry>,
     record_cache: DashMap<String, RecordCacheEntry>,
     /// Overridable in test builds only, so `mockito` can stand in for
     /// `https://api.osv.dev` — mirrors [`crate::cache::ensure_https`]'s existing
@@ -395,12 +395,12 @@ impl OsvClient {
     /// the *entire* chunk degrades to [`SkipReason::QueryFailed`] rather than
     /// risking misattributing an advisory to the wrong dependency.
     #[tracing::instrument(
-        skip(self, chunk, outcomes, truncated),
-        fields(url = tracing::field::Empty)
+        skip(self, osv_eco, chunk, outcomes, truncated),
+        fields(url = tracing::field::Empty, osv_eco = osv_eco.as_str())
     )]
     async fn resolve_chunk(
         &self,
-        osv_eco: &'static str,
+        osv_eco: OsvEcosystem,
         chunk: &[ScanTarget],
         outcomes: &mut VulnerabilityMap,
         truncated: &mut Vec<ScanTarget>,
@@ -416,7 +416,7 @@ impl OsvClient {
             .map(|t| OsvQuery {
                 package: OsvPackage {
                     name: t.osv_name.clone(),
-                    ecosystem: osv_eco.to_string(),
+                    ecosystem: osv_eco.as_str().to_owned(),
                 },
                 version: t.version.clone().into_string(),
             })
@@ -481,7 +481,7 @@ impl OsvClient {
     /// ever rendering as zero advisories.
     async fn recover_truncated(
         &self,
-        osv_eco: &'static str,
+        osv_eco: OsvEcosystem,
         truncated: &[ScanTarget],
         outcomes: &mut VulnerabilityMap,
     ) {
@@ -535,7 +535,7 @@ impl OsvClient {
     /// [`Capped::total`] still reflects OSV's reported count (critique M1).
     fn outcome_from_full_records(
         &self,
-        osv_eco: &'static str,
+        osv_eco: OsvEcosystem,
         target: &ScanTarget,
         records: Vec<OsvVulnRecord>,
     ) -> ScanOutcome {
@@ -572,7 +572,7 @@ impl OsvClient {
     /// fetching up to [`MAX_ADVISORY_RECORDS`] full records.
     async fn build_outcome(
         &self,
-        osv_eco: &str,
+        osv_eco: OsvEcosystem,
         osv_name: &str,
         vuln_ids: &[(String, String)],
     ) -> ScanOutcome {
@@ -602,7 +602,7 @@ impl OsvClient {
     /// with a half-populated placeholder.
     async fn fetch_records(
         &self,
-        osv_eco: &str,
+        osv_eco: OsvEcosystem,
         osv_name: &str,
         ids: &[(String, String)],
     ) -> Vec<Arc<Advisory>> {
@@ -666,10 +666,13 @@ impl OsvClient {
         }
     }
 
-    #[tracing::instrument(skip(self, target), fields(url = tracing::field::Empty))]
+    #[tracing::instrument(
+        skip(self, osv_eco, target),
+        fields(url = tracing::field::Empty, osv_eco = osv_eco.as_str())
+    )]
     async fn query_single(
         &self,
-        osv_eco: &'static str,
+        osv_eco: OsvEcosystem,
         target: &ScanTarget,
     ) -> Option<OsvSingleQueryResponse> {
         let url = self.single_query_url();
@@ -681,7 +684,7 @@ impl OsvClient {
         let body = OsvQuery {
             package: OsvPackage {
                 name: target.osv_name.clone(),
-                ecosystem: osv_eco.to_string(),
+                ecosystem: osv_eco.as_str().to_owned(),
             },
             version: target.version.clone().into_string(),
         };
@@ -712,7 +715,7 @@ impl OsvClient {
 
     fn store_query_cache(
         &self,
-        osv_eco: &'static str,
+        osv_eco: OsvEcosystem,
         target: &ScanTarget,
         vuln_ids: &[(String, String)],
     ) {
@@ -1555,11 +1558,15 @@ mod tests {
     fn query_cache_evicts_oldest_when_max_entries_reached() {
         let client = client();
         for i in 0..MAX_CACHE_ENTRIES {
-            client.store_query_cache("npm", &target(&format!("pkg-{i}"), "1.0.0"), &[]);
+            client.store_query_cache(
+                OsvEcosystem::Npm,
+                &target(&format!("pkg-{i}"), "1.0.0"),
+                &[],
+            );
         }
         assert_eq!(client.query_cache.len(), MAX_CACHE_ENTRIES);
 
-        client.store_query_cache("npm", &target("overflow", "1.0.0"), &[]);
+        client.store_query_cache(OsvEcosystem::Npm, &target("overflow", "1.0.0"), &[]);
 
         assert!(
             client.query_cache.len() <= MAX_CACHE_ENTRIES,
@@ -1608,7 +1615,7 @@ mod tests {
         let t = target("pkg", "1.0.0");
 
         client.query_cache.insert(
-            ("npm", t.osv_name.clone(), t.version.clone()),
+            (OsvEcosystem::Npm, t.osv_name.clone(), t.version.clone()),
             QueryCacheEntry {
                 vuln_ids: vec![],
                 fetched_at: Instant::now()

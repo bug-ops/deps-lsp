@@ -236,24 +236,26 @@ impl EcosystemId {
     ///
     /// ```
     /// use deps_core::EcosystemId;
+    /// use deps_core::osv::OsvEcosystem;
     ///
-    /// assert_eq!(EcosystemId::Cargo.osv_ecosystem(), Some("crates.io"));
-    /// assert_eq!(EcosystemId::Gradle.osv_ecosystem(), Some("Maven"));
+    /// assert_eq!(EcosystemId::Cargo.osv_ecosystem(), Some(OsvEcosystem::CratesIo));
+    /// assert_eq!(EcosystemId::Gradle.osv_ecosystem(), Some(OsvEcosystem::Maven));
     /// ```
     #[must_use]
-    pub const fn osv_ecosystem(self) -> Option<&'static str> {
+    pub const fn osv_ecosystem(self) -> Option<crate::osv::OsvEcosystem> {
+        use crate::osv::OsvEcosystem;
         match self {
-            Self::Cargo => Some("crates.io"),
-            Self::Npm | Self::Deno => Some("npm"),
-            Self::Pypi => Some("PyPI"),
-            Self::Go => Some("Go"),
-            Self::Bundler => Some("RubyGems"),
-            Self::Dart => Some("Pub"),
-            Self::Maven | Self::Gradle => Some("Maven"),
-            Self::Composer => Some("Packagist"),
-            Self::Swift => Some("SwiftURL"),
-            Self::NuGet => Some("NuGet"),
-            Self::GithubActions => Some("GitHub Actions"),
+            Self::Cargo => Some(OsvEcosystem::CratesIo),
+            Self::Npm | Self::Deno => Some(OsvEcosystem::Npm),
+            Self::Pypi => Some(OsvEcosystem::PyPI),
+            Self::Go => Some(OsvEcosystem::Go),
+            Self::Bundler => Some(OsvEcosystem::RubyGems),
+            Self::Dart => Some(OsvEcosystem::Pub),
+            Self::Maven | Self::Gradle => Some(OsvEcosystem::Maven),
+            Self::Composer => Some(OsvEcosystem::Packagist),
+            Self::Swift => Some(OsvEcosystem::SwiftURL),
+            Self::NuGet => Some(OsvEcosystem::NuGet),
+            Self::GithubActions => Some(OsvEcosystem::GitHubActions),
             // A git-tag/release pin has no OSV coordinate by name (mirrors
             // `deps_gitlab_ci::formatter::GitlabCiFormatter`'s `OsvNaming` docs).
             Self::GitlabCi => None,
@@ -1798,7 +1800,7 @@ mod tests {
 
         for (id, expected_str) in expected {
             assert_eq!(
-                id.osv_ecosystem(),
+                id.osv_ecosystem().map(crate::osv::OsvEcosystem::as_str),
                 Some(*expected_str),
                 "unexpected OSV ecosystem string for {id:?}"
             );

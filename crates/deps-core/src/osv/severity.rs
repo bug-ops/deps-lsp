@@ -6,7 +6,7 @@
 
 use crate::diagnostic::Severity;
 
-use super::types::{OsvAffected, VulnSeverity};
+use super::types::{OsvAffected, OsvEcosystem, VulnSeverity};
 
 /// Parses an OSV severity label (`database_specific.severity` or
 /// `ecosystem_specific.severity`) case-insensitively.
@@ -107,7 +107,7 @@ pub(super) fn classify(
     database_specific: Option<&serde_json::Value>,
     relevant_affected: &[&OsvAffected],
     osv_name: &str,
-    osv_eco: &str,
+    osv_eco: OsvEcosystem,
 ) -> VulnSeverity {
     if id.starts_with("MAL-") || aliases.iter().any(|alias| alias.starts_with("MAL-")) {
         return VulnSeverity::Malicious;
@@ -131,7 +131,7 @@ pub(super) fn classify(
         let genuinely_this_package = affected
             .package
             .as_ref()
-            .is_some_and(|p| p.name == osv_name && p.ecosystem == osv_eco);
+            .is_some_and(|p| p.name == osv_name && p.ecosystem == osv_eco.as_str());
         if genuinely_this_package
             && affected
                 .database_specific
@@ -199,6 +199,7 @@ mod tests {
 
     const PKG_NAME: &str = "yaml-rust";
     const PKG_ECO: &str = "crates.io";
+    const PKG_OSV_ECO: OsvEcosystem = OsvEcosystem::CratesIo;
 
     #[test]
     fn database_specific_severity_wins() {
@@ -210,7 +211,7 @@ mod tests {
                 Some(&json),
                 &[],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Critical
         );
@@ -226,7 +227,7 @@ mod tests {
                 Some(&json),
                 &[],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Medium
         );
@@ -247,7 +248,7 @@ mod tests {
                 None,
                 &[&affected],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Low
         );
@@ -256,7 +257,7 @@ mod tests {
     #[test]
     fn cvss_vector_only_record_is_unknown() {
         assert_eq!(
-            classify("RUSTSEC-2020-0071", &[], None, &[], PKG_NAME, PKG_ECO),
+            classify("RUSTSEC-2020-0071", &[], None, &[], PKG_NAME, PKG_OSV_ECO),
             VulnSeverity::Unknown
         );
     }
@@ -264,7 +265,7 @@ mod tests {
     #[test]
     fn no_severity_at_all_is_unknown() {
         assert_eq!(
-            classify("RUSTSEC-2020-0071", &[], None, &[], PKG_NAME, PKG_ECO),
+            classify("RUSTSEC-2020-0071", &[], None, &[], PKG_NAME, PKG_OSV_ECO),
             VulnSeverity::Unknown
         );
     }
@@ -276,7 +277,14 @@ mod tests {
         // list must not be misclassified as Malicious (NFR-001).
         let aliases = ["GHSA-xxxx-xxxx-xxxx".to_string(), "CVE-2020-1".to_string()];
         assert_eq!(
-            classify("RUSTSEC-2020-0071", &aliases, None, &[], PKG_NAME, PKG_ECO),
+            classify(
+                "RUSTSEC-2020-0071",
+                &aliases,
+                None,
+                &[],
+                PKG_NAME,
+                PKG_OSV_ECO
+            ),
             VulnSeverity::Unknown
         );
     }
@@ -286,7 +294,7 @@ mod tests {
         // Live-verified shape: OSV's MAL-2025-47141 record for npm
         // `@ctrl/tinycolor` has no severity field anywhere.
         assert_eq!(
-            classify("MAL-2025-47141", &[], None, &[], PKG_NAME, PKG_ECO),
+            classify("MAL-2025-47141", &[], None, &[], PKG_NAME, PKG_OSV_ECO),
             VulnSeverity::Malicious
         );
     }
@@ -298,7 +306,14 @@ mod tests {
         // masked by an unrelated graded value.
         let json = serde_json::json!({ "severity": "CRITICAL" });
         assert_eq!(
-            classify("MAL-2025-47141", &[], Some(&json), &[], PKG_NAME, PKG_ECO),
+            classify(
+                "MAL-2025-47141",
+                &[],
+                Some(&json),
+                &[],
+                PKG_NAME,
+                PKG_OSV_ECO
+            ),
             VulnSeverity::Malicious
         );
     }
@@ -320,7 +335,7 @@ mod tests {
                 Some(&json),
                 &[],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
         );
@@ -346,12 +361,12 @@ mod tests {
                 Some(&ghsa_severity),
                 &[],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
         );
         assert_eq!(
-            classify("MAL-2022-1", &mal_aliases, None, &[], PKG_NAME, PKG_ECO),
+            classify("MAL-2022-1", &mal_aliases, None, &[], PKG_NAME, PKG_OSV_ECO),
             VulnSeverity::Malicious
         );
         assert_eq!(
@@ -361,14 +376,14 @@ mod tests {
                 None,
                 &[],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
         );
     }
 
     /// An `affected[]` entry whose `package` genuinely, exactly matches
-    /// `PKG_NAME`/`PKG_ECO` — the only shape `classify()`'s informational
+    /// `PKG_NAME`/`PKG_OSV_ECO` — the only shape `classify()`'s informational
     /// pass treats as a genuine match (FR-002b/M2).
     fn informational_affected(value: &str) -> OsvAffected {
         OsvAffected {
@@ -394,7 +409,7 @@ mod tests {
                 None,
                 &[&affected],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Informational
         );
@@ -414,7 +429,7 @@ mod tests {
                 None,
                 &[&affected],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
         );
@@ -433,7 +448,7 @@ mod tests {
                 None,
                 &[&affected],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
         );
@@ -452,7 +467,7 @@ mod tests {
                 None,
                 &[&affected],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
         );
@@ -468,7 +483,7 @@ mod tests {
                 None,
                 &[&affected],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
         );
@@ -495,7 +510,7 @@ mod tests {
                 None,
                 &[&informational, &graded],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::High,
             "informational entry listed first must not win over a later graded entry"
@@ -507,7 +522,7 @@ mod tests {
                 None,
                 &[&graded, &informational],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::High
         );
@@ -517,7 +532,14 @@ mod tests {
     fn mal_prefix_wins_over_informational() {
         let affected = informational_affected("unmaintained");
         assert_eq!(
-            classify("MAL-2025-47141", &[], None, &[&affected], PKG_NAME, PKG_ECO),
+            classify(
+                "MAL-2025-47141",
+                &[],
+                None,
+                &[&affected],
+                PKG_NAME,
+                PKG_OSV_ECO
+            ),
             VulnSeverity::Malicious
         );
     }
@@ -543,7 +565,7 @@ mod tests {
                 None,
                 &[&stranger],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
         );
@@ -568,7 +590,7 @@ mod tests {
                 None,
                 &[&affected],
                 PKG_NAME,
-                PKG_ECO
+                PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
         );
@@ -598,7 +620,7 @@ mod tests {
                     None,
                     &[&affected],
                     PKG_NAME,
-                    PKG_ECO
+                    PKG_OSV_ECO
                 ),
                 VulnSeverity::Unknown,
                 "expected {value:?} to not trigger Informational classification"
