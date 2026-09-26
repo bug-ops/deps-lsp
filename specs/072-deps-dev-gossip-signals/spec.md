@@ -155,7 +155,8 @@ THEN a coverage-gap analysis exists showing overlap vs. GOSSIP-only vs. OSV-only
 facts and 4 follow-up maintainer decisions, not the original (partly wrong) assumptions.
 
 **Revised again 2026-09-26 (round 3)** after a second critic pass on the round-2 revision found 4 further
-gaps (N1-N4) — see §9's round-3 table. FR-010 is dropped; FR-005 and FR-006 are corrected below.
+gaps (N1-N4) — see §9's round-3 table. A fourth pass found 2 more (N5-N6) — see §9's round-4 table. FR-010
+is dropped; FR-005, FR-006, and FR-009 are corrected below.
 
 | ID | Requirement | Priority |
 |----|------------|----------|
@@ -163,8 +164,8 @@ gaps (N1-N4) — see §9's round-3 table. FR-010 is dropped; FR-005 and FR-006 a
 | FR-002 | WHEN GOSSIP's Dynamic Cooldown is available for a dependency (ecosystem covered, `GossipConfig.enabled`, document-level cache has data whose version exactly matches the registry's own reported latest — see FR-008) THE SYSTEM SHALL treat it as authoritative for that dependency's cooldown status at hover and diagnostics (`diagnostics.rs:2262`); WHEN unavailable THE SYSTEM SHALL fall back to the existing local `is_within_cooldown`/`FreshnessConfig.cooldown_secs` check. The two SHALL NOT be shown as disagreeing without the hover/diagnostic text making the source explicit, since live windows differ materially (verified 2026-09-26: npm 15d, PyPI 5d, Cargo 10d vs. local 3d default) | must |
 | FR-003 | Malicious Packages / Critical Vulnerabilities cross-reference — **not adopted**; deferred to a separate `research`-labeled coverage-gap issue. If ever revisited, THE SYSTEM SHALL treat OSV.dev as authoritative on any disagreement | deferred |
 | FR-004 | WHEN GOSSIP is unavailable for a given ecosystem, disabled (FR-009), offline, or the dependency's source is not a public registry (per `SourcePolicy::source_is_public_registry_content`) THE SYSTEM SHALL degrade gracefully with no user-visible error | must |
-| FR-005 | **CORRECTED round 3 (critique N4): round 2's "await concurrently" framing does not fix hover's latency doubling, because cooldown and low-usage render at two different points in `hover.rs` (cooldown before the existing `trust_signal` join, low-usage at/after it).** THE SYSTEM SHALL instead source hover's cooldown callout from the same document-level GOSSIP cache diagnostics/completion read (FR-006's storage, no live network wait at all for cooldown), and SHALL fetch low-usage live only for the pinned/resolved version, spawned alongside `spawn_trust_signal_fetch` and awaited at the same existing join point under its own `GOSSIP_WAIT_BUDGET` — since both awaits now happen at the same point, no shared-deadline mechanism is needed | must |
-| FR-006 | **CORRECTED round 3 (critique N2/N3).** Cooldown status SHALL be surfaced in completion (net-new — completion has no cooldown check today) via THE SYSTEM'S existing local `is_within_cooldown` per candidate as the **default-on baseline** (zero cost, works for all 14 ecosystems and with GOSSIP disabled) — not a dedicated completion-only prefetch/cache layer as round 2 specified. THE SYSTEM SHALL additionally enrich only the one candidate matching the package's `defaultVersion` from a **per-document** GOSSIP cache (one `GetFindingsBatch` call per open document, stored in `DocumentState` — not the shared `DepsDevClient` memo, which silently loses data for idle documents per critique N2) that diagnostics also reads. No completion request SHALL ever issue a live network call | must |
+| FR-005 | **CORRECTED round 3 (critique N4), memo restored round 4 (critique N5): round 2's "await concurrently" framing does not fix hover's latency doubling, because cooldown and low-usage render at two different points in `hover.rs` (cooldown before the existing `trust_signal` join, low-usage at/after it).** THE SYSTEM SHALL instead source hover's cooldown callout from `VersionData.gossip_prefetch` (FR-006's storage, no live network wait at all for cooldown), and SHALL fetch low-usage live only for the pinned/resolved version, spawned alongside `spawn_trust_signal_fetch` and awaited at the same existing join point under its own `GOSSIP_WAIT_BUDGET`, backed by a version-keyed `DepsDevClient` memo entry so a response landing past the budget still warms something for the next hover instead of being lost (critique N5 — round 3 had no memo at all, so "spawn-and-warm" warmed nothing) | must |
+| FR-006 | **CORRECTED round 3 (critique N2/N3), further corrected round 4 (critique N5/N6).** Cooldown status SHALL be surfaced in completion (net-new — completion has no cooldown check today) via THE SYSTEM'S existing local `is_within_cooldown` per candidate as the **default-on baseline** (zero cost, works for all 14 ecosystems and with GOSSIP disabled, honoring the existing `FreshnessSettings.enabled`/`cooldown_secs` knobs already in `CompletionRequest`). **Completion SHALL NOT read any GOSSIP-sourced data** (round 4 reverses round 3's plan to enrich the `defaultVersion`-matching candidate: `generate_completions` has no `VersionData`/prefetch channel, and adding one requires either a sealed-trait signature change or a new field interacting with the `#319` DashMap-across-await liveness constraint — not justified for one candidate's cooldown-window precision). Hover/diagnostics SHALL read GOSSIP data from a **per-document** `GetFindingsBatch` result, backed by **both** a per-package `DepsDevClient` memo (network dedupe — critique N5, a `DocumentState`-only design reintroduces an uncached POST per debounced edit) **and** `DocumentState` storage (durability across idle documents — critique N2). No completion request SHALL ever issue a live network call | must |
 | FR-007 | WHEN GOSSIP's Dynamic Cooldown is available THE SYSTEM SHALL use it in preference to `FreshnessConfig.cooldown_secs` **only within `deps-lsp`'s hover/diagnostics/completion call sites** for covered ecosystems. `FreshnessConfig.cooldown_secs` is **NOT removed** — it remains unchanged for `deps-cli`'s `--cooldown` flag, the GitHub Action's `cooldown` input, and as the operative window for the 7 ecosystems GOSSIP does not cover. This is a behavior-precedence change within `deps-lsp` only, **not** a breaking change | must |
 | FR-008 | WHEN reading GOSSIP data from the per-document cache (FR-006) THE SYSTEM SHALL treat `defaultVersion`'s cooldown/low-usage data as applicable only if its version exactly equals the version being displayed at that call site — named per site: hover's `latest_line`, diagnostics' `package_versions.latest`, completion's own candidate version (critique M13; live-verified canonical version strings for Go/NuGet/PyPI make plain string equality viable). On mismatch, treat as a cache-miss and fall back per FR-002/FR-006 | must |
 | FR-009 | WHEN GOSSIP integration is shipped THE SYSTEM SHALL gate all GOSSIP network calls behind a new opt-in `GossipConfig.enabled` flag (default `false`, structural twin of `TyposquatConfig` — including `#[serde(default)]` on the field and `#[non_exhaustive]` on the struct, critique M12), because the per-document prefetch discloses every declared dependency's name to deps.dev | must |
@@ -174,7 +175,7 @@ gaps (N1-N4) — see §9's round-3 table. FR-010 is dropped; FR-005 and FR-006 a
 
 | ID | Category | Requirement |
 |----|----------|-------------|
-| NFR-001 | Performance | Hover's only live GOSSIP wait is the low-usage fetch, under its own `GOSSIP_WAIT_BUDGET`, at the same point `trust_signal` already awaits (FR-005, corrected round 3 — cooldown no longer waits on anything live). Completion and diagnostics incur zero added latency — synchronous reads from the per-document cache (FR-006) |
+| NFR-001 | Performance | Hover's only live GOSSIP wait is the low-usage fetch, under its own `GOSSIP_WAIT_BUDGET`, at the same point `trust_signal` already awaits (FR-005 — cooldown no longer waits on anything live). Diagnostics incurs zero added latency — synchronous `VersionData.gossip_prefetch` reads. Completion incurs zero added latency AND zero GOSSIP involvement (FR-006, round 4). The per-document prefetch (FR-006) must check a per-package memo before firing `GetFindingsBatch`, so repeated triggers from the 100ms `did_change` debounce do not each cost a network round-trip (critique N5) |
 | NFR-002 | Reliability | GOSSIP unavailability (disabled, offline, non-public-registry source, cache miss/version mismatch) must degrade to the FR-002/FR-007 local-heuristic fallback, never to a blocking error. A `NOT_FOUND`/`RISK_CRITICAL` package-level finding SHALL NOT be surfaced as a diagnostic on its own — ambiguous between "malicious/removed" and "too new to be indexed yet" |
 | NFR-003 | Maintainability | `freshness.rs`'s pure functions are kept, unmodified, as the fallback layer for all ecosystems and all GOSSIP-unavailable cases — this feature adds new GOSSIP-integration code in front of it, never inside it |
 | NFR-004 | Accuracy | Any GOSSIP-sourced signal presented to the user must be attributable to deps.dev/GOSSIP as its source, distinguishable from the local-heuristic fallback when both could apply (FR-002) |
@@ -253,27 +254,33 @@ which the first round never did):
 | GOSSIP and `freshness.rs` disagree on cooldown window for the same release | **REVISED 2026-09-26** (was incorrectly marked "not reachable" under the original full-replacement plan): this is a live, reachable case — verified windows differ by 2-12x (npm 15d/PyPI 5d/Cargo 10d vs. local 3d). FR-002 requires the source to be explicit in the hover/diagnostic text whenever GOSSIP is available for that dependency, precisely because the two can and do disagree |
 | GOSSIP API is still in preview/alpha status (unstable schema) | RESOLVED (§9): confirmed still `v3alpha`, no GA designation found. Follow the same provisional-integration posture spec 071 adopted for `GetSimilarlyNamedPackages` |
 | A package-level `NOT_FOUND`/`RISK_CRITICAL` finding is returned for a name that is not actually malicious, just not yet indexed by deps.dev (ingestion lag) | **NEW 2026-09-26** (critique finding M4): verified live for 2 legitimate-shaped but non-existent/very-new probe names. NFR-002: never surface `NOT_FOUND` as a standalone diagnostic — it is ambiguous between "malicious/removed" and "too new to index" |
-| A completion candidate's version is neither `defaultVersion` nor covered by the per-document cache | **CORRECTED round 3** (FR-006/FR-008): unlike round 2's plan, this is not a "no badge" case — the local `is_within_cooldown` baseline already renders a cooldown badge for every candidate from locally-known `published_at` data; only the GOSSIP-specific enrichment (precise cooldown end, low-usage) is skipped for that candidate |
+| A completion candidate needs a cooldown/low-usage signal | **CORRECTED round 3, simplified further round 4** (FR-006): the local `is_within_cooldown` baseline renders a cooldown badge for every candidate from locally-known `published_at` data — this is the *only* signal completion ever shows (round 4, N6b: no GOSSIP data reaches completion at all, so there is no separate "covered by the cache" case to distinguish) |
 
 ## 7. Success Criteria
 
-Met (2026-09-25, revised twice on 2026-09-26): all `[NEEDS CLARIFICATION]` items in §9 are resolved. Two
-successive adversarial `rust-critic` passes found, respectively, 4 false premises (round 2) and 4 further
-design gaps (round 3) in the plan — both corrected via direct code verification and live-API testing, not
-guesswork. Current adopted scope:
+Met (2026-09-25, revised three times on 2026-09-26): all `[NEEDS CLARIFICATION]` items in §9 are resolved.
+Three successive adversarial `rust-critic` passes found, respectively, 4 false premises (round 2), 4 further
+design gaps (round 3), and 2 gaps introduced by round 3's own fixes (round 4) — each corrected via direct
+code verification and live-API testing, not guesswork. Current adopted scope:
 
 - **Adopt**: Dynamic Cooldown at hover and diagnostics (`diagnostics.rs:2262`) — the only 2 real existing
-  call sites, not 5 as originally assumed (critique C1) — sourced from a per-document `GetFindingsBatch`
-  cache stored in `DocumentState` (round 3, critique N2/N4), not a live per-request fetch. Plus **net-new**
-  cooldown in completion (FR-006), built on the existing local `is_within_cooldown` per candidate as the
-  default-on baseline, with GOSSIP only enriching the `defaultVersion`-matching candidate (round 3, critique
-  N3 — this is a correction of round 2's "dedicated completion prefetch layer" design, not an expansion of
-  it). Plus Low-Usage/slopsquatting (raw flag, soft wording, gated on live observation per FR-001).
-  `FreshnessConfig.cooldown_secs` is **kept**, not removed (FR-007) — it remains the sole, unchanged source
-  for `deps-cli`, the GitHub Action, and the 7 non-GOSSIP ecosystems, and the `deps-lsp` fallback elsewhere.
-  All GOSSIP network calls are opt-in (FR-009), mirroring spec 071's typosquat prefetch.
+  call sites, not 5 as originally assumed (critique C1) — sourced from `VersionData.gossip_prefetch`
+  (a new field mirroring the existing `typosquat_prefetch`, round 4 critique N6a), populated from a
+  per-document `GetFindingsBatch` result backed by **both** a per-package `DepsDevClient` memo (network
+  dedupe, round 4 critique N5) **and** `DocumentState` storage (durability across idle documents, round 3
+  critique N2) — not a live per-request fetch. Plus **net-new** cooldown in completion (FR-006), shipped as
+  the local `is_within_cooldown` per-candidate baseline **only** — no GOSSIP enrichment (round 4 critique
+  N6b reverses round 3's plan to enrich the `defaultVersion`-matching candidate, once the real plumbing cost
+  was found: `generate_completions` has no data channel for it without a sealed-trait signature change or a
+  new field touching a real liveness constraint, `#319`). Plus Low-Usage/slopsquatting (raw flag, soft
+  wording, gated on live observation per FR-001). `FreshnessConfig.cooldown_secs` is **kept**, not removed
+  (FR-007) — it remains the sole, unchanged source for `deps-cli`, the GitHub Action, and the 7 non-GOSSIP
+  ecosystems, and the `deps-lsp` fallback elsewhere. All GOSSIP network calls are opt-in (FR-009), mirroring
+  spec 071's typosquat prefetch.
 - **Dropped from this issue**: `deps-cli` GOSSIP parity (FR-010, round 3 critique N1) — near-zero practical
-  value for real implementation cost; filed as a separate follow-up issue instead.
+  value for real implementation cost; filed as a separate follow-up issue instead. A `[gossip]` config
+  section now surfaces `deps-cli`'s existing "no effect" warning (round 4, M14) rather than being silently
+  accepted.
 - **Defer to separate research issue**: Malicious Packages, Critical Vulnerabilities (coverage-gap study
   needed first) — unchanged from the original decision.
 - **No action** (redundant with existing signal, not re-litigated): Archived Packages — unchanged.
@@ -425,13 +432,28 @@ C3, C4, S1, S2, S3, S5, S6, M1-M4. New findings:
 | N4 | Round 2's FR-005 ("await concurrently") doesn't fix M1: hover's cooldown callout renders before the code point where `trust_signal` is joined, so a single `join!` there can't supply cooldown data in time; two sequential timeouts would still sum to ~1.4s | Source hover's cooldown from the same `DocumentState` cache N2/N3 use (no live wait for cooldown at all); low-usage remains the only live hover fetch, at the same point `trust_signal` already awaits, under its own budget — no shared-deadline mechanism needed once cooldown isn't live |
 | M5 | Hover's low-usage fetch needs `resolve_in_use_version` — a range-only dependency with no lockfile has no concrete version to check | Skip the low-usage fetch entirely when `resolve_in_use_version` returns `None`; cooldown still works via the document-level cache |
 | M6 | The old plan's "already warmed by a prior hover" claim was false — hover (version-scoped) and prefetch (package-scoped in round 2) use different endpoints/keys | Moot in round 3 — hover no longer does a version-scoped cooldown fetch at all |
-| M7 | `GetFindingsBatch` (one POST per document) is simpler than round 2's per-package fan-out, and live-verified to work with `nextPageToken` pagination | Adopted: replaces the per-package prefetch entirely (round 3 §1/§2) |
+| M7 | `GetFindingsBatch` (one POST per document) is simpler than round 2's per-package fan-out, and live-verified to work with `nextPageToken` pagination | Adopted for the network-fetch shape; **round 4 note**: round 3 also dropped the per-package memo entirely alongside the fan-out, which turned out to be a separate mistake (see round-4 table, N5) — the batch-vs-fan-out simplification and the memo-vs-no-memo dedupe question are independent decisions |
 | M8 | `GossipConfig` needs a `PolicyConfigDiff` destructure entry and the same runtime-toggle mechanics as `TyposquatConfig` (`ServerState` atomic + trigger-on-enable, `server.rs:866-927`) | Added to plan.md §1/§2/§3 |
 | M9 | `low_usage_context: Option<serde_json::Value>` was an untyped placeholder — a type-safety-rule violation for no benefit | Dropped from `GossipFindingWire` entirely until a live finding is observed (serde ignores unknown keys safely) |
 | M10 | FR-002's exact message wording was unspecified; the local text must stay unchanged when GOSSIP is disabled (existing `diagnostics.rs` tests) | Implementation-task detail, flagged for the developer to specify against the existing test fixtures |
 | M11 | Stale spec text still repeated the "5 call sites"/"full replacement" claims in §7-§9 after round 2's correction | Cleaned up throughout this document (this revision) |
 | M12 | `GossipConfig`'s snippet lacked `#[serde(default)]` on `enabled` and `#[non_exhaustive]` — without the former, a partial `{"gossip":{}}` config fails to parse and the *entire* config reload is discarded | Fixed in plan.md §3's snippet, matching `TyposquatConfig`'s exact shape |
 | M13 | FR-008 should name the exact comparand per call site; live Go/NuGet/PyPI default-version strings are canonical, so plain string equality is viable | Named per site in FR-008/plan.md §1 |
+
+### 2026-09-26 critique round 4
+
+A third `rust-critic` pass, on the round-3 revision (commit `faeaa4e8e`), returned verdict **significant**
+once more — confirmed N1-N4/M5-M13 all actually addressed, but round 3's own fixes introduced 2 new gaps:
+
+| # | Finding | Resolution |
+|---|---------|------------|
+| N5 | Round 3 dropped the `DepsDevClient` memo/in-flight pair entirely, removing all network-request dedupe: the document prefetch fires on every 100ms-debounced `did_change` (`lifecycle.rs:920`), so an uncached `GetFindingsBatch` POST would fire per edit per document; the content-snapshot guard then discards most in-flight results anyway (a ~300ms call routinely outlives the 100ms debounce); hover's low-usage GET, also memo-less, meant "spawn-and-warm" warmed nothing | Restore a per-package `DepsDevClient` memo (1h TTL, as round 2) *alongside* `DocumentState` (round 3) — the batch prefetch requests only memo-misses; a version-keyed memo entry covers the hover low-usage fetch |
+| N6 | (a) `VersionData` already has the exact precedent field for this pattern — `typosquat_prefetch` (`lsp_helpers/mod.rs:645`) — so round 3's "passed alongside `VersionData`" would have meant changing the sealed `Ecosystem` trait's signatures instead of adding a sibling field. (b) Completion never receives `VersionData` at all (`generate_completions`'s real signature has no such parameter), and `handlers/completion.rs` cannot hold a `DashMap` shard reference across an await (`#319`, a real liveness constraint with its own regression test) — enriching one completion candidate would need a sealed-trait change or a new `CompletionRequest` field, for one candidate's cooldown-window precision | (a) Add `VersionData.gossip_prefetch` mirroring `typosquat_prefetch` exactly (FR-005/FR-006). (b) **Drop GOSSIP enrichment from completion entirely** — ship only the local per-candidate baseline (FR-006, maintainer-equivalent engineering decision 2026-09-26: an acceptable cost/benefit call on an already-approved capability, not a scope reversal, since completion still gets a genuine new cooldown signal it never had) |
+
+Minor: `[gossip]` in `deps.toml` would be silently accepted with no effect in `deps-cli` now that FR-010 is
+dropped — added to `deps-cli`'s existing `ignored_sections` "no effect" warning list (M14). Completion's
+new local baseline must honor the existing `FreshnessSettings.enabled`/`cooldown_secs` knobs already
+threaded into `CompletionRequest`, not bypass them (M15).
 
 ## 10. See Also
 
