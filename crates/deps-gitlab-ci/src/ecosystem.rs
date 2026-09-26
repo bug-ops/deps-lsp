@@ -527,13 +527,15 @@ impl Ecosystem for GitlabCiEcosystem {
                 .await;
                 match outcome {
                     Ok(Ok(Some(resolved))) => {
-                        hover.rewrite_markdown(|md| {
-                            deps_core::lsp_helpers::splice_resolved_line(
-                                md,
-                                resolved.version.as_str(),
-                                &resolved.sha,
-                            )
-                        });
+                        if let Some(sha) = &resolved.sha {
+                            hover.rewrite_markdown(|md| {
+                                deps_core::lsp_helpers::splice_resolved_line(
+                                    md,
+                                    resolved.version.as_str(),
+                                    sha.as_str(),
+                                )
+                            });
+                        }
                     }
                     Ok(Ok(None)) => {}
                     Ok(Err(error)) => {
@@ -856,7 +858,7 @@ async fn build_dynamic_component_pin_action(
         }
     };
 
-    let changes = deps_core::single_file_edit(uri, version_range, resolved.sha);
+    let changes = deps_core::single_file_edit(uri, version_range, resolved.sha?.to_string());
 
     Some(CodeAction {
         title: format!(
@@ -930,15 +932,14 @@ fn bulk_sha_pin_text_edit_for(
             let releases =
                 reconstitute_component_releases(dep.name(), gl_dep, formatter, versions)?;
             let resolved = crate::component::resolve_component_pin(pin, raw, &releases)?;
-            // The reconstituted list may carry empty-SHA placeholders (see
-            // `reconstitute_component_releases`); only a winner with a genuine full SHA
-            // is safe to splice into a `TextEdit`.
-            if !deps_core::lsp_helpers::is_full_sha(&resolved.sha) {
-                return None;
-            }
+            // The reconstituted list may carry `sha: None` placeholders (see
+            // `reconstitute_component_releases`); only a winner with a known SHA is safe
+            // to splice into a `TextEdit` — `CommitSha` already guarantees full-SHA shape,
+            // so no separate `is_full_sha` recheck is needed here.
+            let sha = resolved.sha?;
             Some(TextEdit {
                 range: version_range.into(),
-                new_text: resolved.sha,
+                new_text: sha.to_string(),
             })
         }
     }
@@ -950,21 +951,20 @@ fn bulk_sha_pin_text_edit_for(
 /// [`crate::registry::GitlabCiRegistry::resolve_component_pin`]'s live fetch, since a bulk
 /// code lens must never itself trigger one.
 ///
-/// **Never drops an entry whose SHA is unknown in the `TagIndex`** — keeps it with an
-/// empty-string `sha` placeholder instead. This is not a per-release SHA gap guard (the
-/// registry's own `releases_to_versions` already drops any release with no valid SHA
-/// before it ever reaches `versions.cached`); it guards a *lifetime* mismatch between two
-/// caches populated at different times: `TagIndex` is capacity-bounded and evictable,
-/// while `versions.cached` is not, so a `tag_to_sha` miss for a release still present in
-/// `versions.cached` is a live possibility, not a hypothetical one. Dropping such an entry
-/// would silently shift what `Latest`/`Partial` resolves to onto a *different* release —
-/// and since `resolve_component_pin`'s `max_by` returns the **last** maximum on a tie
-/// (two releases normalizing to the same semver), preserving `versions.cached`'s exact
-/// order (itself the registry's own fetch/sort order) matters as much as preserving every
-/// entry. The placeholder is unreachable by the ladder's only SHA-matching arm
+/// **Never drops an entry whose SHA is unknown in the `TagIndex`** — keeps it with
+/// `sha: None` instead. This is not a per-release SHA gap guard (the registry's own
+/// `releases_to_versions` already drops any release with no valid SHA before it ever
+/// reaches `versions.cached`); it guards a *lifetime* mismatch between two caches populated
+/// at different times: `TagIndex` is capacity-bounded and evictable, while `versions.cached`
+/// is not, so a `tag_to_sha` miss for a release still present in `versions.cached` is a live
+/// possibility, not a hypothetical one. Dropping such an entry would silently shift what
+/// `Latest`/`Partial` resolves to onto a *different* release — and since
+/// `resolve_component_pin`'s `max_by` returns the **last** maximum on a tie (two releases
+/// normalizing to the same semver), preserving `versions.cached`'s exact order (itself the
+/// registry's own fetch/sort order) matters as much as preserving every entry. The
+/// `sha: None` placeholder is unreachable by the ladder's only SHA-matching arm
 /// (`PinStyle::Sha`, which [`sha_pin_quickfix_kind`] never routes to this path) — the
-/// caller still verifies the *winning* release's SHA independently
-/// (`bulk_sha_pin_text_edit_for`'s [`deps_core::lsp_helpers::is_full_sha`] check) before
+/// caller still verifies the *winning* release actually has a SHA (`resolved.sha?`) before
 /// splicing it into a `TextEdit`.
 #[cfg(feature = "lsp-responses")]
 fn reconstitute_component_releases(
@@ -988,8 +988,7 @@ fn reconstitute_component_releases(
             .map(|version| {
                 let sha = tag_index
                     .as_ref()
-                    .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned())
-                    .unwrap_or_default();
+                    .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned());
                 let prerelease =
                     semver::Version::parse(deps_core::github::normalize_tag(version.as_str()))
                         .is_ok_and(|parsed| !parsed.pre.is_empty());
@@ -1040,12 +1039,12 @@ fn splice_project_line(markdown: &str, url: &str) -> String {
 #[allow(clippy::string_slice)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use crate::registry::TagIndex;
     use crate::types::EndpointKind;
     use dashmap::DashMap;
     #[cfg(feature = "lsp-responses")]
     use deps_core::lsp_helpers::splice_resolved_line;
+    #[cfg(feature = "lsp-responses")]
+    use deps_core::lsp_helpers::{CommitSha, TagIndex};
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id_and_display_name
     // and test_as_any. `lockfile_filenames()` is omitted — GitLab CI pipelines have no lock
@@ -1794,7 +1793,9 @@ mod tests {
         let formatter = test_formatter();
         let mut index = TagIndex::default();
         let sha = "a".repeat(40);
-        index.tag_to_sha.insert("v1.0.0".to_string(), sha.clone());
+        index
+            .tag_to_sha
+            .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
         formatter.tag_index.insert(
             (
                 EndpointKind::Tags,
@@ -1863,7 +1864,10 @@ mod tests {
 
         let formatter = test_formatter();
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("main".to_string(), "a".repeat(40));
+        index.tag_to_sha.insert(
+            "main".to_string(),
+            CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         formatter.tag_index.insert(
             (
                 EndpointKind::Tags,
@@ -2062,7 +2066,9 @@ mod tests {
         let sha1 = "1".repeat(40);
         let sha2 = "2".repeat(40);
         let mut index1 = TagIndex::default();
-        index1.tag_to_sha.insert("v1.0.0".to_string(), sha1.clone());
+        index1
+            .tag_to_sha
+            .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
         formatter.tag_index.insert(
             (
                 EndpointKind::Tags,
@@ -2071,7 +2077,9 @@ mod tests {
             Arc::new(index1),
         );
         let mut index2 = TagIndex::default();
-        index2.tag_to_sha.insert("v2.0.0".to_string(), sha2.clone());
+        index2
+            .tag_to_sha
+            .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
         formatter.tag_index.insert(
             (
                 EndpointKind::Tags,
@@ -2135,9 +2143,10 @@ mod tests {
         let project_sha = "1".repeat(40);
         let component_sha = "2".repeat(40);
         let mut project_index = TagIndex::default();
-        project_index
-            .tag_to_sha
-            .insert("v1.0.0".to_string(), project_sha.clone());
+        project_index.tag_to_sha.insert(
+            "v1.0.0".to_string(),
+            CommitSha::parse(&project_sha).unwrap(),
+        );
         formatter.tag_index.insert(
             (
                 EndpointKind::Tags,
@@ -2146,9 +2155,10 @@ mod tests {
             Arc::new(project_index),
         );
         let mut component_index = TagIndex::default();
-        component_index
-            .tag_to_sha
-            .insert("1.0.0".to_string(), component_sha.clone());
+        component_index.tag_to_sha.insert(
+            "1.0.0".to_string(),
+            CommitSha::parse(&component_sha).unwrap(),
+        );
         formatter.tag_index.insert(
             (
                 EndpointKind::Releases,
@@ -2211,12 +2221,13 @@ mod tests {
         let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
 
         let host_bare = server.url();
-        let name = PackageName::new(format!("{host_bare}/org/proj/comp"));
+        let host = crate::host::GitlabHost::for_test(&host_bare);
+        let name = PackageName::new(format!("{}/org/proj/comp", host.host()));
         let index = "gitlab:component-pin-test".to_string();
         registry.register_alternate(&[(
             index.clone(),
             crate::types::GitlabRoute {
-                origin: host_bare.clone(),
+                host,
                 endpoint: EndpointKind::Releases,
             },
         )]);
@@ -2413,12 +2424,16 @@ mod tests {
         // `rsplit_once('/')`, keeping everything before the last `/` as the project path
         // (must stay exactly "org/proj" to match the mock below) and treating the last
         // segment as the (here, deliberately hostile) component name.
-        let name = PackageName::new(format!("{host_bare}/org/proj/co\u{202E}mp{long_suffix}"));
+        let host = crate::host::GitlabHost::for_test(&host_bare);
+        let name = PackageName::new(format!(
+            "{}/org/proj/co\u{202E}mp{long_suffix}",
+            host.host()
+        ));
         let index = "gitlab:component-pin-title-test".to_string();
         registry.register_alternate(&[(
             index.clone(),
             crate::types::GitlabRoute {
-                origin: host_bare.clone(),
+                host,
                 endpoint: EndpointKind::Releases,
             },
         )]);
@@ -2546,7 +2561,7 @@ mod tests {
         routes.insert(
             "resolved-route".to_string(),
             crate::types::GitlabRoute {
-                origin: "https://gitlab.com".to_string(),
+                host: crate::host::GitlabHost::for_test("https://gitlab.com"),
                 endpoint: EndpointKind::Releases,
             },
         );
@@ -2709,13 +2724,17 @@ mod tests {
         let sha1 = "1".repeat(40);
         let sha2 = "2".repeat(40);
         let mut index1 = TagIndex::default();
-        index1.tag_to_sha.insert("v1.0.0".to_string(), sha1.clone());
+        index1
+            .tag_to_sha
+            .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
         eco.formatter.tag_index.insert(
             (EndpointKind::Tags, deps[0].name().clone()),
             Arc::new(index1),
         );
         let mut index2 = TagIndex::default();
-        index2.tag_to_sha.insert("v2.0.0".to_string(), sha2.clone());
+        index2
+            .tag_to_sha
+            .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
         eco.formatter.tag_index.insert(
             (EndpointKind::Tags, deps[1].name().clone()),
             Arc::new(index2),
@@ -2785,7 +2804,9 @@ mod tests {
 
         let sha = "a".repeat(40);
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("2.0.0".to_string(), sha.clone());
+        index
+            .tag_to_sha
+            .insert("2.0.0".to_string(), CommitSha::parse(&sha).unwrap());
         eco.formatter
             .tag_index
             .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2815,10 +2836,12 @@ mod tests {
         let sha_low = "1".repeat(40);
         let sha_high = "2".repeat(40);
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("1.2.0".to_string(), sha_low);
         index
             .tag_to_sha
-            .insert("1.2.5".to_string(), sha_high.clone());
+            .insert("1.2.0".to_string(), CommitSha::parse(&sha_low).unwrap());
+        index
+            .tag_to_sha
+            .insert("1.2.5".to_string(), CommitSha::parse(&sha_high).unwrap());
         eco.formatter
             .tag_index
             .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2860,7 +2883,10 @@ mod tests {
 
         // Only "1.0.0" has a TagIndex entry; "2.0.0" (the true winner) does not.
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("1.0.0".to_string(), "a".repeat(40));
+        index.tag_to_sha.insert(
+            "1.0.0".to_string(),
+            CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         eco.formatter
             .tag_index
             .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2901,10 +2927,12 @@ mod tests {
         let sha_first = "1".repeat(40);
         let sha_last = "2".repeat(40);
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("1.2.0".to_string(), sha_first);
         index
             .tag_to_sha
-            .insert("v1.2.0".to_string(), sha_last.clone());
+            .insert("1.2.0".to_string(), CommitSha::parse(&sha_first).unwrap());
+        index
+            .tag_to_sha
+            .insert("v1.2.0".to_string(), CommitSha::parse(&sha_last).unwrap());
         eco.formatter
             .tag_index
             .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
@@ -2945,7 +2973,9 @@ mod tests {
             .clone();
         let sha = "a".repeat(40);
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("v1.0.0".to_string(), sha.clone());
+        index
+            .tag_to_sha
+            .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
         eco.formatter
             .tag_index
             .insert((EndpointKind::Tags, name), Arc::new(index));

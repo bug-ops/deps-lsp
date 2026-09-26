@@ -1059,7 +1059,7 @@ fn build_source_and_route(
             let route_key =
                 deps_core::hash_routing_key("gitlab", [h.origin(), endpoint.as_str()].into_iter());
             let route = GitlabRoute {
-                origin: h.origin().to_string(),
+                host: h.clone(),
                 endpoint,
             };
             (

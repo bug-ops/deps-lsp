@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementResolution, RequirementStatus, SourcePolicy, match_v_prefix_style,
+    RequirementResolution, RequirementStatus, SourcePolicy, TagIndex, match_v_prefix_style,
     requirement_contains_template_placeholder, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
@@ -26,7 +26,7 @@ pub struct GitlabCiFormatter {
     /// S2, see [`crate::types::IncludeKind::endpoint`]'s doc) — so an unrelated `project:`
     /// and `component:` include can never share one entry even when their host-qualified
     /// names collide textually.
-    pub(crate) tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<crate::registry::TagIndex>>>,
+    pub(crate) tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
 }
 
 impl GitlabCiFormatter {
@@ -34,7 +34,7 @@ impl GitlabCiFormatter {
     #[must_use]
     pub fn new(
         routes: Arc<DashMap<String, GitlabRoute>>,
-        tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<crate::registry::TagIndex>>>,
+        tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>>,
     ) -> Self {
         Self { routes, tag_index }
     }
@@ -57,7 +57,7 @@ impl GitlabCiFormatter {
 
     /// Looks up `tag`'s commit SHA for `name` under `endpoint` in the shared tag index —
     /// the reverse direction of `Self::resolved_tag_for_sha`, both read from the very
-    /// same [`crate::registry::TagIndex`] entry (issue #634: no second parallel cache).
+    /// same [`deps_core::lsp_helpers::TagIndex`] entry (issue #634: no second parallel cache).
     /// Backs the "Pin to commit SHA" quickfix (`crate::ecosystem::build_sha_pin_action`).
     ///
     /// `endpoint` disambiguates a `project:` (Tags) include from a `component:` (Releases)
@@ -76,13 +76,13 @@ impl GitlabCiFormatter {
     /// ```
     /// use dashmap::DashMap;
     /// use deps_gitlab_ci::{EndpointKind, GitlabCiFormatter};
-    /// use deps_gitlab_ci::registry::TagIndex;
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
     /// use deps_core::PackageName;
     /// use std::sync::Arc;
     ///
     /// let tag_index = Arc::new(DashMap::new());
     /// let mut index = TagIndex::default();
-    /// index.tag_to_sha.insert("v1.0.0".to_string(), "a".repeat(40));
+    /// index.tag_to_sha.insert("v1.0.0".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
     /// tag_index.insert(
     ///     (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
     ///     Arc::new(index),
@@ -109,6 +109,7 @@ impl GitlabCiFormatter {
         self.tag_index
             .get(&(endpoint, name.clone()))
             .and_then(|index| index.tag_to_sha.get(tag).cloned())
+            .map(|sha| sha.to_string())
     }
 }
 
@@ -498,7 +499,7 @@ mod tests {
         fmt.routes.insert(
             "gitlab:abc".to_string(),
             GitlabRoute {
-                origin: "https://gitlab.com".into(),
+                host: crate::host::GitlabHost::for_test("https://gitlab.com"),
                 endpoint: EndpointKind::Tags,
             },
         );
@@ -516,7 +517,7 @@ mod tests {
         fmt.routes.insert(
             "gitlab:abc".to_string(),
             GitlabRoute {
-                origin: "https://gitlab.com".into(),
+                host: crate::host::GitlabHost::for_test("https://gitlab.com"),
                 endpoint: EndpointKind::Releases,
             },
         );

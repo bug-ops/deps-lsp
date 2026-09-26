@@ -21,7 +21,7 @@ impl IncludeKind {
     /// 1:1 correspondence `crate::parser::build_project_dependency`/
     /// `crate::parser::build_component_dependency` bake in at parse time.
     ///
-    /// Used to key [`crate::registry::TagIndex`] lookups by `(EndpointKind, PackageName)`
+    /// Used to key [`deps_core::lsp_helpers::TagIndex`] lookups by `(EndpointKind, PackageName)`
     /// rather than by `PackageName` alone (validation finding S2): a `component:`'s
     /// host-qualified name can textually collide with an unrelated `project:` include's own
     /// name (spec §3.1's documented residual collision is same-project only; this is the
@@ -145,15 +145,29 @@ impl std::fmt::Debug for HostRef {
 /// The `(host, endpoint)` pair a dependency resolves against, registered at parse time
 /// under an opaque routing key carried in `DependencySource::AlternateRegistry.index`.
 ///
+/// `host` carries an already-validated [`GitlabHost`] (#1480 item 3) rather than a bare
+/// origin `String` rebuilt via `GitlabHost::trusted` on every read — the route is only ever
+/// constructed from a [`GitlabHost`] that already went through [`GitlabHost::parse`], so
+/// storing the validated value directly removes the unnecessary round trip and the
+/// now-deleted `GitlabHost::trusted` escape hatch entirely.
+///
 /// Output-only: constructed internally by this crate's own parser, never by external code —
 /// no constructor is provided.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitlabRoute {
-    /// Normalized, ASCII-serialized origin (`https://{host}`).
-    pub origin: String,
+    /// The already-validated host this route resolves against.
+    pub(crate) host: GitlabHost,
     /// Which endpoint this route resolves against.
     pub endpoint: EndpointKind,
+}
+
+impl GitlabRoute {
+    /// The already-validated host this route resolves against.
+    #[must_use]
+    pub fn host(&self) -> &GitlabHost {
+        &self.host
+    }
 }
 
 /// How a pin (a `project:` ref, or a `component:` version) is classified.
@@ -256,8 +270,11 @@ deps_core::impl_dependency!(GitlabCiDependency {
 pub struct GitlabCiVersion {
     /// The tag/release name as published, `v` prefix (or lack of one) kept as-is.
     pub version: deps_core::ConcreteVersion,
-    /// The commit SHA this tag/release points at.
-    pub sha: String,
+    /// The commit SHA this tag/release points at, when known. `None` stands in for the
+    /// previous empty-string sentinel a reconstituted-from-cache entry used when its SHA
+    /// was missing from a capacity-evictable `TagIndex` (#1480 item 2) — making the "SHA
+    /// unknown" state part of the type instead of an unvalidated placeholder string.
+    pub sha: Option<deps_core::lsp_helpers::CommitSha>,
     /// Whether the semver `pre` component is non-empty.
     pub prerelease: bool,
     /// `Some(released_at)` for the releases endpoint (free — same response); `None` for
@@ -277,19 +294,25 @@ impl GitlabCiVersion {
     ///
     /// * `version` - The tag/release name as published, `v` prefix (or lack of one) kept
     ///   as-is
-    /// * `sha` - The commit SHA this tag/release points at
+    /// * `sha` - The commit SHA this tag/release points at, when known
     /// * `prerelease` - Whether the semver `pre` component is non-empty
     ///
     /// # Examples
     ///
     /// ```
+    /// use deps_core::lsp_helpers::CommitSha;
     /// use deps_gitlab_ci::GitlabCiVersion;
     ///
-    /// let version = GitlabCiVersion::new("1.2.0".into(), "a".repeat(40), false);
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let version = GitlabCiVersion::new("1.2.0".into(), Some(sha), false);
     /// assert_eq!(version.version.as_str(), "1.2.0");
     /// ```
     #[must_use]
-    pub const fn new(version: deps_core::ConcreteVersion, sha: String, prerelease: bool) -> Self {
+    pub const fn new(
+        version: deps_core::ConcreteVersion,
+        sha: Option<deps_core::lsp_helpers::CommitSha>,
+        prerelease: bool,
+    ) -> Self {
         Self {
             version,
             sha,
@@ -446,13 +469,13 @@ mod tests {
     fn test_gitlab_ci_version_prerelease() {
         let stable = GitlabCiVersion {
             version: "v1.0.0".into(),
-            sha: "a".repeat(40),
+            sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)),
             prerelease: false,
             published_at: None,
         };
         let pre = GitlabCiVersion {
             version: "v1.0.0-beta.1".into(),
-            sha: "b".repeat(40),
+            sha: deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)),
             prerelease: true,
             published_at: None,
         };

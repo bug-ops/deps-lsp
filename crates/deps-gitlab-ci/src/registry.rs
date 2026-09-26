@@ -6,8 +6,9 @@
 
 use dashmap::DashMap;
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
-use deps_core::github::normalize_tag;
-use deps_core::rate_limit::RateLimitGate;
+use deps_core::github::{normalize_tag, semver_tags_newest_first};
+use deps_core::lsp_helpers::{CommitSha, TagIndex};
+use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
 use deps_core::registry::{CapResult, KeyShape, register_capped};
 use deps_core::{EcosystemId, PackageName, PublishTime};
 use std::any::Any;
@@ -16,47 +17,17 @@ use std::sync::Arc;
 
 use crate::client::{
     GitlabApiClient, GitlabRelease, GitlabTag, MAX_GITLAB_PAGES, gitlab_rate_limit_error,
-    gitlab_rate_limit_error_verified, parse_releases_page, parse_tags_page,
+    parse_releases_page, parse_tags_page,
 };
-use crate::host::GitlabHost;
 use crate::types::{EndpointKind, GitlabCiVersion, GitlabRoute, PinStyle};
 
 /// Display name for the registry backing GitLab CI version lookups.
 pub const REGISTRY: &str = "GitLab";
 
-/// How long [`RateLimitGate`] keeps a host's fetches short-circuiting locally after a
-/// rate-limited/untokened-auth-failure response, before allowing another live request.
-const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
-
-/// Per-`(endpoint, name)` tag/release-name -> commit-SHA cross-reference.
-///
-/// Mirrors `deps_github_actions::registry::TagIndex` in shape — lets a SHA pin render a
-/// readable `**Resolved**` hover line, and lets a `PinStyle::Tag` pin render a "Pin to
-/// commit SHA" quickfix (issue #634). Populated from whichever endpoint the route used: tag
-/// names for `project:`, release names for `component:`.
-///
-/// Keyed by `(EndpointKind, PackageName)`, not `PackageName` alone (validation finding S2,
-/// see [`crate::types::IncludeKind::endpoint`]'s doc): a `component:`'s host-qualified name
-/// can textually collide with an unrelated `project:` include's own name, and a
-/// `PackageName`-only key would let the two share one entry — resolving a quickfix's SHA
-/// from the wrong repository.
-///
-/// No constructor beyond [`Default`] is provided: a caller builds one via
-/// `TagIndex::default()` and populates it by mutating [`Self::tag_to_sha`]/
-/// [`Self::sha_to_tag`] directly, which `#[non_exhaustive]` does not restrict.
-#[non_exhaustive]
-#[derive(Debug, Default)]
-pub struct TagIndex {
-    /// Maps a tag/release name to its resolved commit SHA.
-    pub tag_to_sha: std::collections::HashMap<String, String>,
-    /// Maps a commit SHA back to the tag/release name that resolved to it.
-    pub sha_to_tag: std::collections::HashMap<String, String>,
-}
-
 /// Maximum number of [`GitlabCiRegistry::tag_index`] entries.
 const MAX_TAG_INDEX_ENTRIES: usize = 256;
 
-/// Populates one `TagIndex` entry from raw `(name, sha)` pairs — independent of whatever
+/// Populates one [`TagIndex`] entry from raw `(name, sha)` pairs — independent of whatever
 /// semver filter the caller's own version-list conversion (`tags_to_versions`) applies.
 ///
 /// A non-semver-shaped tag (e.g. a literal tool-name tag like `cargo-deny`, or a bare-major
@@ -74,20 +45,10 @@ pub(crate) fn populate_tag_index_entries<'a>(
     key: (EndpointKind, PackageName),
     entries: impl Iterator<Item = (&'a str, &'a str)>,
 ) {
-    let mut built = TagIndex::default();
-    for (name, sha) in entries {
-        if !deps_core::lsp_helpers::is_full_sha(sha) {
-            continue;
-        }
-        built
-            .sha_to_tag
-            .entry(sha.to_string())
-            .or_insert_with(|| name.to_string());
-        built
-            .tag_to_sha
-            .entry(name.to_string())
-            .or_insert_with(|| sha.to_string());
-    }
+    let valid: Vec<(&str, CommitSha)> = entries
+        .filter_map(|(name, sha)| Some((name, CommitSha::parse(sha)?)))
+        .collect();
+    let built = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)));
     if !index.contains_key(&key) {
         deps_core::cache_policy::evict_arbitrary_if_full(index, MAX_TAG_INDEX_ENTRIES);
     }
@@ -100,32 +61,20 @@ pub(crate) fn populate_tag_index_entries<'a>(
 /// `deps-github-actions`): a `GitlabCiVersion`'s `sha` is later spliced verbatim into hover
 /// text.
 fn tags_to_versions(tags: Vec<GitlabTag>) -> Vec<GitlabCiVersion> {
-    let mut seen = HashSet::new();
-    let mut with_parsed: Vec<(GitlabCiVersion, semver::Version)> = tags
-        .into_iter()
-        .filter_map(|tag| {
-            if !deps_core::lsp_helpers::is_full_sha(&tag.commit.id) {
-                return None;
-            }
-            let normalized = normalize_tag(&tag.name).to_string();
-            let parsed = semver::Version::parse(&normalized).ok()?;
-            if !seen.insert(normalized) {
-                return None;
-            }
+    semver_tags_newest_first(
+        tags,
+        |tag| tag.name.as_str(),
+        |tag, _normalized, parsed| {
+            let sha = CommitSha::parse(&tag.commit.id)?;
             let prerelease = !parsed.pre.is_empty();
-            Some((
-                GitlabCiVersion {
-                    version: tag.name.into(),
-                    sha: tag.commit.id,
-                    prerelease,
-                    published_at: None,
-                },
-                parsed,
-            ))
-        })
-        .collect();
-    with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    with_parsed.into_iter().map(|(v, _)| v).collect()
+            Some(GitlabCiVersion {
+                version: tag.name.into(),
+                sha: Some(sha),
+                prerelease,
+                published_at: None,
+            })
+        },
+    )
 }
 
 /// Converts a fetched releases page into a version list — deliberately **not**
@@ -138,9 +87,7 @@ fn releases_to_versions(releases: Vec<GitlabRelease>) -> Vec<GitlabCiVersion> {
     let mut versions: Vec<GitlabCiVersion> = releases
         .into_iter()
         .filter_map(|r| {
-            if !deps_core::lsp_helpers::is_full_sha(&r.commit.id) {
-                return None;
-            }
+            let sha = CommitSha::parse(&r.commit.id)?;
             let published_at = r
                 .released_at
                 .as_deref()
@@ -149,7 +96,7 @@ fn releases_to_versions(releases: Vec<GitlabRelease>) -> Vec<GitlabCiVersion> {
                 semver::Version::parse(normalize_tag(&r.tag_name)).is_ok_and(|v| !v.pre.is_empty());
             Some(GitlabCiVersion {
                 version: r.tag_name.into(),
-                sha: r.commit.id,
+                sha: Some(sha),
                 prerelease,
                 published_at,
             })
@@ -217,7 +164,7 @@ impl GitlabCiRegistry {
     /// which needs it to distinguish a `project:` (Tags) route from a `component:`
     /// (Releases) route for the hover-heading-link carve-out (spec §8.2).
     #[must_use]
-    pub fn routes(&self) -> Arc<DashMap<String, GitlabRoute>> {
+    pub(crate) fn routes(&self) -> Arc<DashMap<String, GitlabRoute>> {
         Arc::clone(&self.routes)
     }
 
@@ -233,7 +180,7 @@ impl GitlabCiRegistry {
     /// prior local implementation (#1205). Worst case per reparse is bounded by
     /// `deps_core::MAX_DEPENDENCIES_PER_DOCUMENT`, since refused routes stay refused and are
     /// re-registered (and re-warned) on every reparse.
-    pub fn register_alternate(&self, routes: &[(String, GitlabRoute)]) -> HashSet<String> {
+    pub(crate) fn register_alternate(&self, routes: &[(String, GitlabRoute)]) -> HashSet<String> {
         let mut refused = HashSet::new();
         for (key, route) in routes {
             if register_capped(
@@ -257,7 +204,7 @@ impl GitlabCiRegistry {
         Arc::clone(
             self.rate_limits
                 .entry(origin.to_string())
-                .or_insert_with(|| Arc::new(RateLimitGate::new(RATE_LIMIT_COOLDOWN_SECS)))
+                .or_insert_with(|| Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)))
                 .value(),
         )
     }
@@ -282,31 +229,40 @@ impl GitlabCiRegistry {
             // runs for every `HttpCache` live-fetch site, including GitLab's — so a confirmed
             // case now arrives here as `RateLimited` instead of the `HttpStatus{401|403|429}`
             // shape the two arms below match on, and would otherwise silently stop tripping
-            // this gate. Swapped for `gitlab_rate_limit_error_verified()` (critic N2), not
-            // passed through unchanged: the registry-neutral message `deps_core::cache` built
-            // has no `GITLAB_TOKEN` remedy, which would make a *confirmed* rate limit strictly
-            // less helpful than the unverified guess below gives —
-            // `verified: RateLimitEvidence::Confirmed` is kept.
+            // this gate. Swapped for `gitlab_rate_limit_error(RateLimitEvidence::Confirmed)`
+            // (critic N2), not passed through unchanged: the registry-neutral message
+            // `deps_core::cache` built has no `GITLAB_TOKEN` remedy, which would make a
+            // *confirmed* rate limit strictly less helpful than the unverified guess below
+            // gives — `verified: RateLimitEvidence::Confirmed` is kept.
             DepsError::RateLimited {
                 verified: RateLimitEvidence::Confirmed,
                 ..
             } => {
                 self.rate_limit_gate(origin).trip_verified();
-                gitlab_rate_limit_error_verified()
+                gitlab_rate_limit_error(RateLimitEvidence::Confirmed)
             }
+            // A bare, unconfirmed 429 — `trip()`, not `trip_verified()` — is always
+            // `RateLimitEvidence::Inferred` by construction (critic M1): pass it explicitly
+            // rather than re-reading it back via `gate.evidence()`, which would race a
+            // concurrent `trip_verified()` call for the same origin landing between the
+            // `trip()` above and the `evidence()` read below and mislabel this plain 429 as
+            // `Confirmed`. `gate.evidence()` is for a caller re-reading an already-tripped
+            // gate's state (e.g. `Self::fetch_route`'s short-circuit), not the call site
+            // doing the tripping.
             DepsError::HttpStatus { status: 429, .. } => {
                 self.rate_limit_gate(origin).trip();
-                gitlab_rate_limit_error()
+                gitlab_rate_limit_error(RateLimitEvidence::Inferred)
             }
             // A *tokened* 401/403 is scoped to this one project (private/insufficient-scope),
             // not treated as a workspace-wide outage — mirrors
             // `deps_github_actions::registry::GithubActionsRegistry::map_tags_error`'s
-            // identical `has_token()` split.
+            // identical `has_token()` split. Same `Inferred`-by-construction reasoning as the
+            // 429 arm above.
             DepsError::HttpStatus {
                 status: 401 | 403, ..
             } if !self.client.has_token() => {
                 self.rate_limit_gate(origin).trip();
-                gitlab_rate_limit_error()
+                gitlab_rate_limit_error(RateLimitEvidence::Inferred)
             }
             DepsError::HttpStatus {
                 status: 404 | 400, ..
@@ -326,20 +282,16 @@ impl GitlabCiRegistry {
         name: &PackageName,
         route: &GitlabRoute,
     ) -> Result<Vec<GitlabCiVersion>> {
-        let gate = self.rate_limit_gate(&route.origin);
+        let gate = self.rate_limit_gate(route.host().origin());
         if gate.is_tripped() {
             // Replays the gate's own recorded `verified` state (#1295 critic N3, mirroring
             // `deps_github_actions::registry::GithubActionsRegistry::rate_limited_error`'s S3
             // fix) rather than always reporting the unverified guess — otherwise a later call
             // short-circuited by a *confirmed* trip would report `verified: false`.
-            return Err(if gate.verified() {
-                gitlab_rate_limit_error_verified()
-            } else {
-                gitlab_rate_limit_error()
-            });
+            return Err(gitlab_rate_limit_error(gate.evidence()));
         }
 
-        let host = GitlabHost::trusted(&route.origin);
+        let host = route.host().clone();
         let Some(project_path) = project_path_from_name(name.as_str(), host.host(), route.endpoint)
         else {
             return Err(DepsError::PackageNotFound {
@@ -362,7 +314,7 @@ impl GitlabCiRegistry {
                     |data| parse_tags_page(data),
                 )
                 .await
-                .map_err(|e| self.map_error(&route.origin, name.as_str(), e))?;
+                .map_err(|e| self.map_error(route.host().origin(), name.as_str(), e))?;
                 // C1 (validation finding): index straight from the raw, unfiltered `tags`
                 // response, not `tags_to_versions`' semver-filtered output — see
                 // `populate_tag_index_entries`'s doc.
@@ -386,7 +338,7 @@ impl GitlabCiRegistry {
                     |data| parse_releases_page(data),
                 )
                 .await
-                .map_err(|e| self.map_error(&route.origin, name.as_str(), e))?;
+                .map_err(|e| self.map_error(route.host().origin(), name.as_str(), e))?;
                 // `releases_to_versions` never drops an entry on shape grounds (unlike
                 // `tags_to_versions`), so this is not affected by C1 — kept symmetric with
                 // the Tags arm anyway, and keyed by `EndpointKind::Releases` (S2 fix).
@@ -592,7 +544,7 @@ mod tests {
 
     fn route(origin: &str, endpoint: EndpointKind) -> GitlabRoute {
         GitlabRoute {
-            origin: origin.to_string(),
+            host: crate::host::GitlabHost::for_test(origin),
             endpoint,
         }
     }
@@ -746,7 +698,10 @@ mod tests {
             route(&host_bare, EndpointKind::Tags),
         )]);
 
-        let name = PackageName::new(format!("{host_bare}/org/proj"));
+        let name = PackageName::new(format!(
+            "{}/org/proj",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
         let source = DependencySource::AlternateRegistry {
             index: "gitlab:test".to_string(),
             mirrors_crates_io: false,
@@ -794,7 +749,10 @@ mod tests {
         let registry = GitlabCiRegistry::new(test_client());
         let host_bare = server.url();
         let gitlab_route = route(&host_bare, EndpointKind::Releases);
-        let name = PackageName::new(format!("{host_bare}/org/proj/comp"));
+        let name = PackageName::new(format!(
+            "{}/org/proj/comp",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
 
         let versions = registry.fetch_route(&name, &gitlab_route).await.unwrap();
 
@@ -827,7 +785,10 @@ mod tests {
         let registry = GitlabCiRegistry::new(test_client());
         let host_bare = server.url();
         let gitlab_route = route(&host_bare, EndpointKind::Tags);
-        let name = PackageName::new(format!("{host_bare}/org/proj"));
+        let name = PackageName::new(format!(
+            "{}/org/proj",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
 
         let versions = registry.fetch_route(&name, &gitlab_route).await.unwrap();
 
@@ -863,7 +824,10 @@ mod tests {
         let registry = GitlabCiRegistry::new(test_client());
         let host_bare = server.url();
         let gitlab_route = route(&host_bare, EndpointKind::Tags);
-        let name = PackageName::new(format!("{host_bare}/org/proj"));
+        let name = PackageName::new(format!(
+            "{}/org/proj",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
 
         let versions = registry.fetch_route(&name, &gitlab_route).await.unwrap();
         assert!(
@@ -875,7 +839,57 @@ mod tests {
             .tag_index
             .get(&(EndpointKind::Tags, name))
             .expect("expected a TagIndex entry despite the tag failing the semver filter");
-        assert_eq!(index.tag_to_sha.get("cargo-deny"), Some(&sha));
+        assert_eq!(
+            index.tag_to_sha.get("cargo-deny"),
+            Some(&CommitSha::parse(&sha).unwrap())
+        );
+    }
+
+    /// #1480 item 3 regression: when a bare-moving tag (`v1`) and the precise semver release
+    /// it currently points at (`v1.0.0`) share one commit SHA, `sha_to_tag` — driven by
+    /// `TagIndex::from_tags` since this crate adopted the shared helper — must resolve to the
+    /// semver-parseable name, not whichever tag the `/tags` API happened to list first.
+    /// Mirrors `deps_github_actions`'s
+    /// `test_get_versions_sha_to_tag_prefers_semver_tag_over_bare_moving_tag`.
+    #[tokio::test]
+    async fn test_fetch_route_sha_to_tag_prefers_semver_tag_over_bare_moving_tag() {
+        let mut server = mockito::Server::new_async().await;
+        let sha = "a".repeat(40);
+        // The moving tag ("v1") is listed before the precise release ("v1.0.0").
+        let _tags_mock = server
+            .mock("GET", "/api/v4/projects/org%2Fproj/repository/tags")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_body(format!(
+                r#"[{{"name":"v1","commit":{{"id":"{sha}"}}}}, {{"name":"v1.0.0","commit":{{"id":"{sha}"}}}}]"#
+            ))
+            .create_async()
+            .await;
+
+        let registry = GitlabCiRegistry::new(test_client());
+        let host_bare = server.url();
+        let gitlab_route = route(&host_bare, EndpointKind::Tags);
+        let name = PackageName::new(format!(
+            "{}/org/proj",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
+
+        registry.fetch_route(&name, &gitlab_route).await.unwrap();
+
+        let index = registry
+            .tag_index
+            .get(&(EndpointKind::Tags, name))
+            .expect("expected a TagIndex entry");
+        let expected_sha = CommitSha::parse(&sha).unwrap();
+        assert_eq!(
+            index.sha_to_tag.get(&expected_sha),
+            Some(&"v1.0.0".to_string()),
+            "sha_to_tag must prefer the semver-parseable tag over the bare moving one"
+        );
+        // tag_to_sha has no such ambiguity (keyed by the workflow's own literal ref text) —
+        // both names must still resolve to the shared SHA.
+        assert_eq!(index.tag_to_sha.get("v1"), Some(&expected_sha));
+        assert_eq!(index.tag_to_sha.get("v1.0.0"), Some(&expected_sha));
     }
 
     // --- validation finding S2: TagIndex must not collide across (endpoint, name) ---
@@ -916,7 +930,10 @@ mod tests {
         let host_bare = server.url();
         // Same `PackageName` text for both: a `project:` include for repo `org/proj/comp`,
         // and a `component:` include naming component `comp` inside project `org/proj`.
-        let name = PackageName::new(format!("{host_bare}/org/proj/comp"));
+        let name = PackageName::new(format!(
+            "{}/org/proj/comp",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
 
         let project_versions = registry
             .fetch_route(&name, &route(&host_bare, EndpointKind::Tags))
@@ -927,8 +944,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(project_versions[0].sha, project_sha);
-        assert_eq!(component_versions[0].sha, component_sha);
+        assert_eq!(project_versions[0].sha, CommitSha::parse(&project_sha));
+        assert_eq!(component_versions[0].sha, CommitSha::parse(&component_sha));
 
         let project_index = registry
             .tag_index
@@ -938,10 +955,13 @@ mod tests {
             .tag_index
             .get(&(EndpointKind::Releases, name))
             .expect("expected a Releases-endpoint TagIndex entry");
-        assert_eq!(project_index.tag_to_sha.get("v1.0.0"), Some(&project_sha));
+        assert_eq!(
+            project_index.tag_to_sha.get("v1.0.0"),
+            Some(&CommitSha::parse(&project_sha).unwrap())
+        );
         assert_eq!(
             component_index.tag_to_sha.get("v1.0.0"),
-            Some(&component_sha)
+            Some(&CommitSha::parse(&component_sha).unwrap())
         );
     }
 
@@ -968,7 +988,10 @@ mod tests {
         let registry = GitlabCiRegistry::new(test_client());
         let host_bare = server.url();
         let gitlab_route = route(&host_bare, EndpointKind::Releases);
-        let name = PackageName::new(format!("{host_bare}/org/proj/comp"));
+        let name = PackageName::new(format!(
+            "{}/org/proj/comp",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
 
         let resolved = registry
             .resolve_component_pin(&name, &gitlab_route, &PinStyle::Partial, "1.2")
@@ -977,7 +1000,7 @@ mod tests {
             .expect("a matching release exists");
 
         assert_eq!(resolved.version.as_str(), "1.2.5");
-        assert_eq!(resolved.sha, sha_b);
+        assert_eq!(resolved.sha, CommitSha::parse(&sha_b));
     }
 
     #[tokio::test]
@@ -997,7 +1020,10 @@ mod tests {
         let registry = GitlabCiRegistry::new(test_client());
         let host_bare = server.url();
         let gitlab_route = route(&host_bare, EndpointKind::Releases);
-        let name = PackageName::new(format!("{host_bare}/org/proj/comp"));
+        let name = PackageName::new(format!(
+            "{}/org/proj/comp",
+            crate::host::GitlabHost::for_test(&host_bare).host()
+        ));
 
         let resolved = registry
             .resolve_component_pin(&name, &gitlab_route, &PinStyle::Partial, "1.2")
@@ -1122,7 +1148,7 @@ mod tests {
     fn version(v: &str, prerelease: bool) -> Box<dyn deps_core::Version> {
         Box::new(GitlabCiVersion {
             version: v.into(),
-            sha: "a".repeat(40),
+            sha: CommitSha::parse(&"a".repeat(40)),
             prerelease,
             published_at: None,
         })

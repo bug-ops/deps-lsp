@@ -1,12 +1,14 @@
 //! Generic "never surfaced via `Debug`/`Display`" wrapper for in-memory secrets.
 //!
-//! `deps_core::github::AuthToken`, `deps_cargo::config::AuthToken`,
-//! `deps_nuget::config::NuGetAuth`, and `deps_nuget::config::RedactedSecret` each
-//! hand-rolled the same single-field tuple struct: a private/crate-visible constructor, an
-//! `as_str()` accessor documented "never logged, printed, or otherwise surfaced", and
-//! hand-written `Debug`/`Display` impls that print `***` (#573). [`Redacted<T>`] is the one
-//! place that pattern is implemented, so the four call sites cannot silently diverge on it
-//! and a fifth ecosystem crate needing the same guarantee does not reinvent it a fifth time.
+//! `deps_cargo::config::AuthToken`, `deps_nuget::config::NuGetAuth`, and
+//! `deps_nuget::config::RedactedSecret` each hand-rolled the same single-field tuple struct: a
+//! private/crate-visible constructor, an `as_str()` accessor documented "never logged,
+//! printed, or otherwise surfaced", and hand-written `Debug`/`Display` impls that print `***`
+//! (#573). [`Redacted<T>`] is the one place that pattern is implemented, so the call sites
+//! cannot silently diverge on it and a new ecosystem crate needing the same guarantee does
+//! not reinvent it — [`ApiToken`] (#1480 item 8) is this module's own generic token wrapper
+//! built directly on [`Redacted<T>`], replacing what were previously independent hand-rolled
+//! `AuthToken` copies in `deps_core::github` and `deps_gitlab_ci::client`.
 //!
 //! Placed beside [`crate::redact::redact_userinfo`], which owns the adjacent "a
 //! credential must not leak via a log line" concern for URLs specifically, while this module
@@ -20,7 +22,7 @@
 //! [`Redacted::expose_secret`]'s result into a plain `String` (e.g. via `format!`) must not
 //! let that copy outlive an unzeroized scope. The preferred fix (issue #672) is to format the
 //! derived value — e.g. a `Bearer`/`Basic` `Authorization` header — once at construction time
-//! and rewrap it in a new [`Redacted<T>`] right away, the way `deps_core::github::AuthToken`,
+//! and rewrap it in a new [`Redacted<T>`] right away, the way [`ApiToken`],
 //! `deps_cargo::config::AuthToken`, and `deps_nuget::config::NuGetAuth` all do; reach for a
 //! bare [`zeroize::Zeroizing`] only when that per-request re-derivation is unavoidable.
 //!
@@ -171,6 +173,74 @@ pub fn auth_digest(origin: &str, secret: Option<&str>) -> Option<u64> {
     Some(hasher.finish())
 }
 
+/// A registry API bearer/private token, redacted everywhere except the one call site that
+/// hands it to a request as a header value.
+///
+/// A thin wrapper over [`Redacted`] rather than a bare type alias: `Debug` prints
+/// `ApiToken(***)`, not `Redacted(***)`, so a panic message or log line still names which
+/// credential leaked its type. Extracted from `deps_core::github::AuthToken` and
+/// `deps_gitlab_ci::client::AuthToken`, which had independently hand-rolled the identical
+/// wrapper (#1480 item 8) — `deps_cargo::config::AuthToken` deliberately keeps its own
+/// separate type, since its `pub(crate)` constructor is a provenance security boundary, not
+/// just a redaction wrapper.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiToken(Redacted);
+
+impl ApiToken {
+    /// Wraps `value`.
+    #[must_use]
+    pub fn new(value: String) -> Self {
+        Self(Redacted::new(value))
+    }
+
+    /// The raw header value, for attaching to a request. Never logged, printed, or
+    /// otherwise surfaced — callers must not pass this to anything but a header value.
+    #[must_use]
+    pub fn expose_secret(&self) -> &str {
+        self.0.expose_secret()
+    }
+}
+
+impl std::fmt::Debug for ApiToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiToken(***)")
+    }
+}
+
+impl std::fmt::Display for ApiToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("***")
+    }
+}
+
+/// Reads `var` from the environment, treating an unset or empty value as absent.
+///
+/// Returns a [`zeroize::Zeroizing`] wrapper so the raw token text is wiped from memory once
+/// the caller drops it, mirroring [`Redacted`]'s own zeroize-on-drop guarantee. Does not log
+/// anything itself — callers keep their own `tracing::info!("... detected, using
+/// authenticated ... requests")` line, since only the caller knows which token/ecosystem it
+/// is naming.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::secret::token_from_env;
+///
+/// assert!(token_from_env("DEPS_CORE_DOCTEST_UNSET_TOKEN_VAR").is_none());
+/// ```
+#[must_use]
+pub fn token_from_env(var: &str) -> Option<zeroize::Zeroizing<String>> {
+    non_empty_token(std::env::var(var).ok())
+}
+
+/// Pure predicate behind [`token_from_env`] over an already-read `Option<String>`, mirroring
+/// `crate::test_util::is_configured_token`'s split: `std::env::set_var` is `unsafe` (forbidden
+/// workspace-wide), so no test can mutate the real environment to exercise the
+/// present/empty-string branches directly — this lets them be tested without touching it.
+fn non_empty_token(raw: Option<String>) -> Option<zeroize::Zeroizing<String>> {
+    raw.map(zeroize::Zeroizing::new).filter(|t| !t.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::Redacted;
@@ -227,6 +297,30 @@ mod tests {
     fn implements_zeroize_on_drop() {
         fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
         assert_zeroize_on_drop::<Redacted<String>>();
+    }
+
+    #[test]
+    fn api_token_debug_and_display_redact() {
+        let token = super::ApiToken::new("hunter2".to_string());
+        assert_eq!(format!("{token:?}"), "ApiToken(***)");
+        assert_eq!(format!("{token}"), "***");
+        assert_eq!(token.expose_secret(), "hunter2");
+    }
+
+    #[test]
+    fn token_from_env_absent_var_is_none() {
+        assert!(super::token_from_env("DEPS_CORE_TEST_UNSET_TOKEN_VAR_XYZ").is_none());
+    }
+
+    #[test]
+    fn non_empty_token_empty_string_is_none() {
+        assert!(super::non_empty_token(Some(String::new())).is_none());
+    }
+
+    #[test]
+    fn non_empty_token_present_value_is_some() {
+        let token = super::non_empty_token(Some("hunter2".to_string())).unwrap();
+        assert_eq!(*token, "hunter2");
     }
 
     #[test]

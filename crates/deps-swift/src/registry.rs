@@ -5,8 +5,8 @@
 
 use crate::types::{SwiftPackage, SwiftVersion};
 use deps_core::github::{
-    GithubTag, GithubTagsClient, ReleaseDatesCache, classify_tags_fetch_error, normalize_tag,
-    paginate_tags, validate_owner_repo,
+    GithubTag, GithubTagsClient, ReleaseDatesCache, classify_tags_fetch_error, paginate_tags,
+    semver_tags_newest_first, validate_owner_repo,
 };
 use deps_core::{EcosystemId, HttpCache, PublishTime, Result};
 use serde::Deserialize;
@@ -196,27 +196,26 @@ impl SwiftRegistry {
 
 /// Converts raw tags (possibly accumulated across pages) into a
 /// newest-first `SwiftVersion` list. Non-semver tags are skipped.
+///
+/// Unlike GitHub Actions/GitLab CI, Swift tracks no per-tag SHA, so `build` never rejects an
+/// entry — the only behavior change from adopting the shared
+/// [`semver_tags_newest_first`] helper (#1480 item 1) is that an exact-duplicate tag pair
+/// (`1.0.0` and `v1.0.0` both present) now dedupes to one entry instead of two, since the
+/// helper always dedupes by normalized name.
 fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<SwiftVersion> {
-    let mut versions_with_parsed: Vec<(SwiftVersion, semver::Version)> = tags
-        .into_iter()
-        .filter_map(|tag| {
-            let name = normalize_tag(&tag.name).to_string();
-            let parsed = semver::Version::parse(&name).ok()?;
+    semver_tags_newest_first(
+        tags,
+        |tag| tag.name.as_str(),
+        |_tag, normalized, parsed| {
             let prerelease = !parsed.pre.is_empty();
-            Some((
-                SwiftVersion {
-                    version: name.into(),
-                    yanked: false,
-                    published_at: None,
-                    prerelease,
-                },
-                parsed,
-            ))
-        })
-        .collect();
-
-    versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    versions_with_parsed.into_iter().map(|(v, _)| v).collect()
+            Some(SwiftVersion {
+                version: normalized.into(),
+                yanked: false,
+                published_at: None,
+                prerelease,
+            })
+        },
+    )
 }
 
 /// Attaches release publish times onto an already-fetched version list, in place.
@@ -552,6 +551,20 @@ mod tests {
         assert_eq!(versions.len(), 3);
         assert_eq!(versions[0].version, "3.0.0");
         assert_eq!(versions[2].version, "1.0.0");
+    }
+
+    /// #1480 item 1 accepted side effect: adopting the shared `semver_tags_newest_first`
+    /// helper gives Swift dedupe by normalized name for free — a repository tagging both
+    /// `v1.0.0` and `1.0.0` (the same release under two conventions) now surfaces one
+    /// entry, not two, matching GitHub Actions/GitLab CI's existing dedupe behavior.
+    #[test]
+    fn test_tags_to_versions_dedupes_exact_duplicate_v_prefix_and_bare() {
+        let tags =
+            deps_core::github::parse_tags_page(br#"[{"name": "v1.0.0"}, {"name": "1.0.0"}]"#)
+                .unwrap();
+        let versions = tags_to_versions(tags);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "1.0.0");
     }
 
     #[test]
