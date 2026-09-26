@@ -120,25 +120,6 @@ impl GitlabHost {
     pub fn origin(&self) -> &str {
         &self.origin
     }
-
-    /// Reconstructs a [`GitlabHost`] from an already-validated origin string (spec §3.2 —
-    /// `GitlabRoute::origin` is only ever populated from a [`Self::origin`] value this type
-    /// itself produced), without re-running [`Self::parse`]'s policy/round-trip checks.
-    ///
-    /// `pub(crate)`, not `pub`: the trust boundary is this crate's own route table
-    /// (`crate::registry::GitlabCiRegistry`), which never stores an origin from any other
-    /// source.
-    #[must_use]
-    pub(crate) fn trusted(origin: &str) -> Self {
-        let host = origin
-            .strip_prefix("https://")
-            .unwrap_or(origin)
-            .to_string();
-        Self {
-            host,
-            origin: origin.to_string(),
-        }
-    }
 }
 
 /// Whether `s` is safe to splice into a GitLab API request path and/or is a syntactically

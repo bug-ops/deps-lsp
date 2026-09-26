@@ -117,11 +117,13 @@ pub fn gitlab_version_req(raw: &str) -> Option<semver::VersionReq> {
 /// # Examples
 ///
 /// ```
+/// use deps_core::lsp_helpers::CommitSha;
 /// use deps_gitlab_ci::PinStyle;
 /// use deps_gitlab_ci::component::resolve_component_pin;
 /// use deps_gitlab_ci::GitlabCiVersion;
 ///
-/// let releases = vec![GitlabCiVersion::new("1.2.0".into(), "a".repeat(40), false)];
+/// let sha = CommitSha::parse(&"a".repeat(40));
+/// let releases = vec![GitlabCiVersion::new("1.2.0".into(), sha, false)];
 /// let resolved = resolve_component_pin(&PinStyle::Tag, "1.2.0", &releases).unwrap();
 /// assert_eq!(resolved.version.as_str(), "1.2.0");
 /// ```
@@ -132,7 +134,10 @@ pub fn resolve_component_pin(
     releases: &[GitlabCiVersion],
 ) -> Option<GitlabCiVersion> {
     match pin {
-        PinStyle::Sha => releases.iter().find(|r| r.sha == raw).cloned(),
+        PinStyle::Sha => releases
+            .iter()
+            .find(|r| r.sha.as_ref().is_some_and(|s| s.as_str() == raw))
+            .cloned(),
         // An exact release match always wins regardless of the parse-time shape guess —
         // FR-007's priority order puts it ahead of the "branch" honest-unknown, and the
         // registry is the only place this can actually be verified.
@@ -172,7 +177,7 @@ mod tests {
     fn release(version: &str, sha: &str) -> GitlabCiVersion {
         GitlabCiVersion {
             version: version.into(),
-            sha: sha.to_string(),
+            sha: deps_core::lsp_helpers::CommitSha::parse(sha),
             prerelease: version.contains('-'),
             published_at: None,
         }

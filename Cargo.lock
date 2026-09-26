@@ -780,7 +780,6 @@ dependencies = [
  "url",
  "urlencoding",
  "yaml-rust2",
- "zeroize",
 ]
 
 [[package]]

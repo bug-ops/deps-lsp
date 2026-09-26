@@ -124,7 +124,7 @@ pub struct GithubActionsVersion {
     /// The tag as published on GitHub, `v` prefix (or lack of one) kept as-is.
     pub version: deps_core::ConcreteVersion,
     /// The commit SHA this tag points at, as reported by the GitHub tags API.
-    pub sha: String,
+    pub sha: deps_core::lsp_helpers::CommitSha,
     /// Whether the tag's semver `pre` component is non-empty, computed once from the
     /// `semver::Version` already parsed while sorting tags.
     pub prerelease: bool,
@@ -225,13 +225,13 @@ mod tests {
     fn test_github_actions_version_prerelease() {
         let stable = GithubActionsVersion {
             version: "v4.2.0".into(),
-            sha: "a".repeat(40),
+            sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
             prerelease: false,
             published_at: None,
         };
         let pre = GithubActionsVersion {
             version: "v4.2.0-beta.1".into(),
-            sha: "b".repeat(40),
+            sha: deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
             prerelease: true,
             published_at: None,
         };

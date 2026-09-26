@@ -22,8 +22,9 @@ use deps_core::{
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
 use crate::formatter::GithubActionsFormatter;
-use crate::registry::{GithubActionsRegistry, TagIndex};
+use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, PinStyle};
+use deps_core::lsp_helpers::TagIndex;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
 /// it against registry versions. Empty: a `uses:` ref is a bare tag/branch/SHA, with no
@@ -319,7 +320,7 @@ impl Ecosystem for GithubActionsEcosystem {
 
     /// One documented NFR-004 divergence (S3): appends a `**Resolved**` line naming the
     /// tag a SHA pin's commit actually corresponds to, per
-    /// [`crate::registry::GithubActionsRegistry`]'s [`crate::registry::TagIndex`].
+    /// [`crate::registry::GithubActionsRegistry`]'s [`TagIndex`].
     ///
     /// Necessary, not merely additive: `versions.resolved` (the shared helper's
     /// `**Current**` source) is keyed by package name and is unconditionally empty for
@@ -845,14 +846,19 @@ mod tests {
              \x20 - uses: taiki-e/install-action@v2\n";
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-        let mut index = crate::registry::TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("cargo-deny".to_string(), "a".repeat(40));
-        index
-            .tag_to_sha
-            .insert("nextest".to_string(), "b".repeat(40));
-        index.tag_to_sha.insert("v2".to_string(), "c".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "cargo-deny".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
+        index.tag_to_sha.insert(
+            "nextest".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
+        );
+        index.tag_to_sha.insert(
+            "v2".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"c".repeat(40)).unwrap(),
+        );
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("taiki-e/install-action"),
             Arc::new(index),
@@ -967,8 +973,11 @@ mod tests {
         let eco = GithubActionsEcosystem::new(cache);
         let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1116,8 +1125,11 @@ mod tests {
         let formatter = GithubActionsFormatter {
             tag_index: Arc::new(dashmap::DashMap::new()),
         };
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1157,8 +1169,11 @@ mod tests {
         let formatter = GithubActionsFormatter {
             tag_index: Arc::new(dashmap::DashMap::new()),
         };
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1205,8 +1220,11 @@ mod tests {
         let formatter = GithubActionsFormatter {
             tag_index: Arc::new(dashmap::DashMap::new()),
         };
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("main".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "main".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         formatter.tag_index.insert(
             deps_core::PackageName::new("some-org/some-action"),
             Arc::new(index),
@@ -1235,8 +1253,11 @@ mod tests {
         let formatter = GithubActionsFormatter {
             tag_index: Arc::new(dashmap::DashMap::new()),
         };
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1270,8 +1291,11 @@ mod tests {
         let formatter = GithubActionsFormatter {
             tag_index: Arc::new(dashmap::DashMap::new()),
         };
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1437,8 +1461,11 @@ mod tests {
         let content = "steps:\n  - uses: actions/checkout@v4\n";
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1588,8 +1615,11 @@ mod tests {
         let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
         let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
 
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1639,8 +1669,11 @@ mod tests {
             .unwrap();
         assert!(!gha_dep.is_last_on_line);
 
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            "v4".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),
@@ -1674,8 +1707,11 @@ mod tests {
 
     #[cfg(feature = "lsp-responses")]
     fn seed_tag(eco: &GithubActionsEcosystem, name: &str, tag: &str, sha: &str) {
-        let mut index = crate::registry::TagIndex::default();
-        index.tag_to_sha.insert(tag.to_string(), sha.to_string());
+        let mut index = TagIndex::default();
+        index.tag_to_sha.insert(
+            tag.to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(sha).unwrap(),
+        );
         eco.formatter
             .tag_index
             .insert(deps_core::PackageName::new(name), Arc::new(index));
@@ -1756,13 +1792,17 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = GithubActionsEcosystem::new(cache);
         let sha = "a".repeat(40);
-        let mut index = crate::registry::TagIndex::default();
-        index.sha_to_tag.insert(sha.clone(), "v4.0.0".to_string());
+        let mut index = TagIndex::default();
+        index.sha_to_tag.insert(
+            deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap(),
+            "v4.0.0".to_string(),
+        );
         // Needed so `format_version_replacing_for` produces a real replacement for `latest`,
         // or a `tag_to_sha` miss falls back to the unchanged literal and drops the edit.
-        index
-            .tag_to_sha
-            .insert("v4.3.1".to_string(), "b".repeat(40));
+        index.tag_to_sha.insert(
+            "v4.3.1".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
+        );
         eco.formatter.tag_index.insert(
             deps_core::PackageName::new("actions/checkout"),
             Arc::new(index),

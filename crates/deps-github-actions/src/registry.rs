@@ -6,9 +6,10 @@
 use dashmap::DashMap;
 use deps_core::github::{
     GithubTag, GithubTagsClient, ReleaseDatesCache, normalize_tag, paginate_tags,
-    validate_owner_repo,
+    semver_tags_newest_first, validate_owner_repo,
 };
-use deps_core::rate_limit::RateLimitGate;
+use deps_core::lsp_helpers::{CommitSha, TagIndex};
+use deps_core::rate_limit::{DEFAULT_COOLDOWN_SECS, RateLimitGate};
 use deps_core::{
     DepsError, EcosystemId, HttpCache, PackageName, PublishTime, RateLimitEvidence, Result,
 };
@@ -28,42 +29,6 @@ const MAX_TAG_INDEX_ENTRIES: usize = 256;
 /// Maximum number of repositories with a coalescing lock outstanding in
 /// [`GithubActionsRegistry::in_flight`] at once.
 const MAX_IN_FLIGHT_ENTRIES: usize = 256;
-
-/// How long [`RateLimitGate`] keeps `get_versions` short-circuiting locally after a
-/// 403-without-token response, before allowing another live request.
-///
-/// GitHub's unauthenticated rate limit resets on a rolling hourly window whose exact
-/// reset instant this crate has no way to learn: [`DepsError::HttpStatus`] carries only a
-/// bare status code, not response headers, so the `x-ratelimit-reset` header GitHub
-/// returns on a 403 is not observable here without widening `deps-core`'s shared HTTP
-/// error type for one caller. A fixed, conservative cooldown is the documented trade-off
-/// (critic C1) — long enough to meaningfully stop hammering a workspace with many unique
-/// actions, short enough to recover without a restart.
-const RATE_LIMIT_COOLDOWN_SECS: u64 = 300;
-
-/// Per-repository tag/SHA cross-reference.
-///
-/// Populated on every successful tags fetch (the `/tags` response already carries
-/// `commit.sha` — zero extra requests). Read by
-/// [`crate::formatter::GithubActionsFormatter`] to resolve a SHA-pin edit's replacement
-/// text and by the hover override to resolve a tag or SHA's counterpart for display.
-///
-/// Fields are `pub` (not `pub(crate)`) so a cross-crate integration test that exercises
-/// the shared `deps_core::collect_update_all_edits`/hover machinery — which never itself
-/// drives a live registry fetch — can seed a repository's entry directly via
-/// [`GithubActionsRegistry::tag_index`].
-///
-/// No constructor beyond [`Default`] is provided: a caller builds one via
-/// `TagIndex::default()` and populates it by mutating [`Self::tag_to_sha`]/
-/// [`Self::sha_to_tag`] directly, which `#[non_exhaustive]` does not restrict.
-#[non_exhaustive]
-#[derive(Debug, Default)]
-pub struct TagIndex {
-    /// Tag text (as published) -> the commit SHA it points at.
-    pub tag_to_sha: HashMap<String, String>,
-    /// Commit SHA -> the tag text (as published) it corresponds to.
-    pub sha_to_tag: HashMap<String, String>,
-}
 
 /// Evicts entries from the in-flight coalescing map, but — unlike
 /// [`deps_core::cache_policy::evict_arbitrary_if_full`] — **only** an entry whose
@@ -122,7 +87,7 @@ impl GithubActionsRegistry {
             github: GithubTagsClient::new(cache),
             tag_index: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
-            rate_limit: Arc::new(RateLimitGate::new(RATE_LIMIT_COOLDOWN_SECS)),
+            rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
         }
     }
@@ -144,7 +109,7 @@ impl GithubActionsRegistry {
             github: GithubTagsClient::for_test(cache, api_base, has_token),
             tag_index: Arc::new(DashMap::new()),
             in_flight: Arc::new(DashMap::new()),
-            rate_limit: Arc::new(RateLimitGate::new(RATE_LIMIT_COOLDOWN_SECS)),
+            rate_limit: Arc::new(RateLimitGate::new(DEFAULT_COOLDOWN_SECS)),
             release_dates: Arc::new(ReleaseDatesCache::new()),
         }
     }
@@ -170,11 +135,7 @@ impl GithubActionsRegistry {
     /// failure to investigate rather than an expected skip, regressing #1297's live-test
     /// skip-not-panic behavior for exactly the multi-package runs it protects.
     fn rate_limited_error(&self) -> DepsError {
-        if self.rate_limit.verified() {
-            deps_core::github::github_rate_limit_error_verified()
-        } else {
-            deps_core::github::github_rate_limit_error()
-        }
+        deps_core::github::github_rate_limit_error(self.rate_limit.evidence())
     }
 
     /// Classifies a tags-fetch error via the shared
@@ -246,30 +207,11 @@ impl GithubActionsRegistry {
     /// ambiguity — it is keyed by the workflow's own literal ref text — so it stays a
     /// plain first-wins index over the raw tags.
     fn populate_tag_index(&self, name: &PackageName, tags: &[GithubTag]) {
-        let mut index = TagIndex::default();
-        let valid_tags: Vec<&GithubTag> = tags
+        let valid: Vec<(&str, CommitSha)> = tags
             .iter()
-            .filter(|tag| crate::parser::is_full_sha(&tag.commit.sha))
+            .filter_map(|tag| Some((tag.name.as_str(), CommitSha::parse(&tag.commit.sha)?)))
             .collect();
-
-        for tag in &valid_tags {
-            if semver::Version::parse(normalize_tag(&tag.name)).is_ok() {
-                index
-                    .sha_to_tag
-                    .entry(tag.commit.sha.clone())
-                    .or_insert_with(|| tag.name.clone());
-            }
-        }
-        for tag in &valid_tags {
-            index
-                .sha_to_tag
-                .entry(tag.commit.sha.clone())
-                .or_insert_with(|| tag.name.clone());
-            index
-                .tag_to_sha
-                .entry(tag.name.clone())
-                .or_insert_with(|| tag.commit.sha.clone());
-        }
+        let index = TagIndex::from_tags(valid.iter().map(|(name, sha)| (*name, sha)));
         if !self.tag_index.contains_key(name) {
             deps_core::cache_policy::evict_arbitrary_if_full(
                 &self.tag_index,
@@ -408,33 +350,20 @@ impl GithubActionsRegistry {
 /// the identical filter independently for `TagIndex`, since it indexes from the raw
 /// tags rather than this function's semver-filtered output (#503).
 fn tags_to_versions(tags: Vec<GithubTag>) -> Vec<GithubActionsVersion> {
-    let mut seen = std::collections::HashSet::new();
-    let mut versions_with_parsed: Vec<(GithubActionsVersion, semver::Version)> = tags
-        .into_iter()
-        .filter_map(|tag| {
-            let normalized = normalize_tag(&tag.name).to_string();
-            let parsed = semver::Version::parse(&normalized).ok()?;
-            if !seen.insert(normalized) {
-                return None;
-            }
-            if !crate::parser::is_full_sha(&tag.commit.sha) {
-                return None;
-            }
+    semver_tags_newest_first(
+        tags,
+        |tag| tag.name.as_str(),
+        |tag, _normalized, parsed| {
+            let sha = CommitSha::parse(&tag.commit.sha)?;
             let prerelease = !parsed.pre.is_empty();
-            Some((
-                GithubActionsVersion {
-                    version: tag.name.into(),
-                    sha: tag.commit.sha,
-                    prerelease,
-                    published_at: None,
-                },
-                parsed,
-            ))
-        })
-        .collect();
-
-    versions_with_parsed.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-    versions_with_parsed.into_iter().map(|(v, _)| v).collect()
+            Some(GithubActionsVersion {
+                version: tag.name.into(),
+                sha,
+                prerelease,
+                published_at: None,
+            })
+        },
+    )
 }
 
 /// Attaches release publish times onto an already-fetched version list, in place.
@@ -547,7 +476,7 @@ mod tests {
         let versions = tags_to_versions(tags);
         assert_eq!(versions.len(), 2);
         assert_eq!(versions[0].version, "v4.2.0");
-        assert_eq!(versions[0].sha, sha1);
+        assert_eq!(versions[0].sha.as_str(), sha1);
         assert_eq!(versions[1].version, "v4.1.0");
     }
 
@@ -573,7 +502,7 @@ mod tests {
         let tags: Vec<GithubTag> = deps_core::github::parse_tags_page(json.as_bytes()).unwrap();
         let versions = tags_to_versions(tags);
         assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0].sha, first_sha);
+        assert_eq!(versions[0].sha.as_str(), first_sha);
     }
 
     #[test]
@@ -619,6 +548,26 @@ mod tests {
         assert!(tags_to_versions(tags).is_empty());
     }
 
+    /// #1480 item 1 regression: a bad-SHA `v1.0.0` must not hide a later, SHA-valid
+    /// `1.0.0` for the same normalized version — the bug the old implementation had
+    /// because it deduped by normalized name *before* filtering on SHA validity, so the
+    /// bad-SHA entry (rejected only afterward) still consumed the dedup slot.
+    #[test]
+    fn test_tags_to_versions_bad_sha_does_not_hide_later_valid_version() {
+        let valid_sha = "a".repeat(40);
+        let json = format!(
+            r#"[
+            {{"name": "v1.0.0", "commit": {{"sha": "not-a-real-sha"}}}},
+            {{"name": "1.0.0", "commit": {{"sha": "{valid_sha}"}}}}
+        ]"#
+        );
+        let tags: Vec<GithubTag> = deps_core::github::parse_tags_page(json.as_bytes()).unwrap();
+        let versions = tags_to_versions(tags);
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].version, "1.0.0");
+        assert_eq!(versions[0].sha.as_str(), valid_sha);
+    }
+
     // Pagination/validation helpers are now shared with `deps-swift` via
     // `deps_core::github` (#472); their unit tests moved there.
 
@@ -650,7 +599,10 @@ mod tests {
 
         let name = PackageName::new("actions/checkout");
         let index = registry.tag_index.get(&name).unwrap();
-        assert_eq!(index.tag_to_sha.get("v4.2.0"), Some(&sha.to_string()));
+        assert_eq!(
+            index.tag_to_sha.get("v4.2.0"),
+            Some(&CommitSha::parse(sha).unwrap())
+        );
         assert_eq!(index.sha_to_tag.get(sha), Some(&"v4.2.0".to_string()));
     }
 
@@ -685,7 +637,7 @@ mod tests {
         let index = registry.tag_index.get(&name).unwrap();
         assert_eq!(
             index.tag_to_sha.get("v4"),
-            Some(&sha.to_string()),
+            Some(&CommitSha::parse(sha).unwrap()),
             "the SHA-pin index must resolve a bare-major tag even though it's not a version"
         );
         assert_eq!(index.sha_to_tag.get(sha), Some(&"v4".to_string()));
@@ -742,14 +694,15 @@ mod tests {
         let name = PackageName::new("owner/repo");
         let index = registry.tag_index.get(&name).unwrap();
         assert_eq!(
-            index.sha_to_tag.get(&sha),
+            index.sha_to_tag.get(sha.as_str()),
             Some(&"v0.1.15".to_string()),
             "sha_to_tag must prefer the semver-parseable tag over the bare moving one"
         );
         // tag_to_sha has no such ambiguity (keyed by the workflow's own literal ref
         // text) — both names must still resolve to the shared SHA.
-        assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
-        assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&sha));
+        let expected_sha = CommitSha::parse(&sha).unwrap();
+        assert_eq!(index.tag_to_sha.get("v1"), Some(&expected_sha));
+        assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&expected_sha));
     }
 
     #[tokio::test]
@@ -1086,7 +1039,7 @@ mod tests {
 
         let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(GithubActionsVersion {
             version: "v2.0.0-beta.1".into(),
-            sha: "a".repeat(40),
+            sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
             prerelease: true,
             published_at: None,
         })];
@@ -1107,13 +1060,13 @@ mod tests {
             versions: vec![
                 Box::new(GithubActionsVersion {
                     version: "v2.0.0".into(),
-                    sha: "a".repeat(40),
+                    sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
                     prerelease: false,
                     published_at: None,
                 }),
                 Box::new(GithubActionsVersion {
                     version: "v1.0.0".into(),
-                    sha: "a".repeat(40),
+                    sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
                     prerelease: false,
                     published_at: None,
                 }),
@@ -1259,7 +1212,7 @@ mod tests {
         // must strip it before looking up.
         let mut versions = vec![GithubActionsVersion {
             version: "v4.2.0".into(),
-            sha: "a".repeat(40),
+            sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
             prerelease: false,
             published_at: None,
         }];
@@ -1273,7 +1226,7 @@ mod tests {
     fn test_attach_publish_times_missing_release_stays_none() {
         let mut versions = vec![GithubActionsVersion {
             version: "v4.2.0".into(),
-            sha: "a".repeat(40),
+            sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
             prerelease: false,
             published_at: None,
         }];

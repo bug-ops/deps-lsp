@@ -127,40 +127,44 @@ const GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED: &str = "GitHub API request forbidden
      or an abuse-detection false positive. Set GITHUB_TOKEN to rule out the rate limit and \
      increase the limit (5000 req/h). Run: export GITHUB_TOKEN=$(gh auth token)";
 
-/// The actionable error returned when a request hits GitHub's unauthenticated rate limit
-/// (60 req/h per IP, vs 5000 req/h with a token).
+/// The actionable error returned when a request hits GitHub's rate limit.
 ///
-/// Inferred from a 403 status and the absence of a token alone, with no corroborating
-/// response evidence — `verified: RateLimitEvidence::Inferred` (#1295). Use
-/// [`github_rate_limit_error_verified`] instead when the response already confirmed exhaustion.
-#[must_use]
-pub fn github_rate_limit_error() -> DepsError {
-    DepsError::RateLimited {
-        message: GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED.into(),
-        verified: RateLimitEvidence::Inferred,
-        // No live response at this canned, inference-only construction site (#1295 N1).
-        source_status: None,
-    }
-}
-
-/// The actionable error for a *confirmed* rate limit (`verified: RateLimitEvidence::Confirmed`, #1295).
+/// Either a 403 inferred from status and the absence of a token alone
+/// (`verified: RateLimitEvidence::Inferred`), or one `crate::cache` already confirmed via
+/// response evidence (`verified: RateLimitEvidence::Confirmed`, #1295).
 ///
-/// `crate::cache` already established, via response evidence, that the request was rejected
-/// for genuine rate-limit exhaustion.
+/// A single `fn(RateLimitEvidence)` (#1480 item 8), not the two separate
+/// `github_rate_limit_error`/`github_rate_limit_error_verified` constructors this replaced:
+/// the only difference between the two was which message/`verified` pair to use, so every
+/// caller had to duplicate an `if verified { .. } else { .. }` branch — see
+/// [`crate::rate_limit::RateLimitGate::evidence`] for the matching gate-side projection.
 ///
 /// `pub`, not `pub(crate)`: needed both by [`classify_tags_fetch_error`] (this crate) and by
 /// `deps_github_actions::registry::GithubActionsRegistry`'s rate-limit-gate short-circuit
 /// (critic S3), which must replay the same verified state a gate was tripped with rather than
 /// always reporting an unverified guess.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::RateLimitEvidence;
+/// use deps_core::github::github_rate_limit_error;
+///
+/// let err = github_rate_limit_error(RateLimitEvidence::Confirmed);
+/// assert!(err.to_string().contains("GITHUB_TOKEN"));
+/// ```
 #[must_use]
-pub fn github_rate_limit_error_verified() -> DepsError {
+pub fn github_rate_limit_error(verified: RateLimitEvidence) -> DepsError {
+    let message = match verified {
+        RateLimitEvidence::Confirmed => GITHUB_RATE_LIMIT_MESSAGE_VERIFIED,
+        RateLimitEvidence::Inferred => GITHUB_RATE_LIMIT_MESSAGE_UNVERIFIED,
+    };
     DepsError::RateLimited {
-        message: GITHUB_RATE_LIMIT_MESSAGE_VERIFIED.into(),
-        verified: RateLimitEvidence::Confirmed,
-        // Reconstructed fresh (see `classify_tags_fetch_error`'s enrichment arm) rather than
-        // carrying forward whatever `source_status` the incoming error had — this constructor
-        // is also called from `deps-github-actions`'s gate-replay path, which has no live
-        // response at all (#1295 N1).
+        message: message.into(),
+        verified,
+        // No live response at this canned, inference-only construction site (#1295 N1) —
+        // also called from `deps-github-actions`'s gate-replay path, which has no live
+        // response at all either.
         source_status: None,
     }
 }
@@ -172,9 +176,9 @@ pub fn github_rate_limit_error_verified() -> DepsError {
 /// surfaced by #1295): an already-verified [`DepsError::RateLimited`] from `crate::cache`'s
 /// registry-neutral header-evidence check (critic S1 — that check has no GitHub-specific
 /// wording, since it runs for every ecosystem) gets GitHub's specific remedy swapped in via
-/// [`github_rate_limit_error_verified`], a 403 with no `has_token` evidence maps to
-/// [`github_rate_limit_error`], a 404 maps to [`DepsError::PackageNotFound`], and everything
-/// else passes through unchanged.
+/// [`github_rate_limit_error`], a 403 with no `has_token` evidence maps to the same
+/// constructor with `RateLimitEvidence::Inferred`, a 404 maps to
+/// [`DepsError::PackageNotFound`], and everything else passes through unchanged.
 ///
 /// A caller that needs a side effect when the result is a rate limit (e.g.
 /// `deps-github-actions`'s local cooldown gate) should check the *returned* error's shape
@@ -205,47 +209,15 @@ pub fn classify_tags_fetch_error(
         DepsError::RateLimited {
             verified: RateLimitEvidence::Confirmed,
             ..
-        } => github_rate_limit_error_verified(),
-        DepsError::HttpStatus { status: 403, .. } if !has_token => github_rate_limit_error(),
+        } => github_rate_limit_error(RateLimitEvidence::Confirmed),
+        DepsError::HttpStatus { status: 403, .. } if !has_token => {
+            github_rate_limit_error(RateLimitEvidence::Inferred)
+        }
         DepsError::HttpStatus { status: 404, .. } => DepsError::PackageNotFound {
             package: name.to_string().into(),
             registry,
         },
         _ => e,
-    }
-}
-
-/// A `GITHUB_TOKEN` bearer-header value, redacted everywhere except the one call site
-/// ([`GithubTagsClient::headers`]) that hands it to a request as a header value.
-///
-/// A thin wrapper over [`crate::secret::Redacted`] rather than a bare type alias: `Debug`
-/// prints `AuthToken(***)`, not `Redacted(***)`, so a panic message or log line still names
-/// which credential leaked its type — mirrors `deps_cargo::config::AuthToken`.
-#[derive(Clone, PartialEq, Eq)]
-struct AuthToken(crate::secret::Redacted);
-
-impl AuthToken {
-    /// Wraps `value`.
-    fn new(value: String) -> Self {
-        Self(crate::secret::Redacted::new(value))
-    }
-
-    /// The raw header value, for attaching to a request. Never logged, printed, or
-    /// otherwise surfaced — callers must not pass this to anything but a header value.
-    fn expose_secret(&self) -> &str {
-        self.0.expose_secret()
-    }
-}
-
-impl std::fmt::Debug for AuthToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AuthToken(***)")
-    }
-}
-
-impl std::fmt::Display for AuthToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("***")
     }
 }
 
@@ -257,7 +229,7 @@ impl std::fmt::Display for AuthToken {
 #[derive(Clone)]
 pub struct GithubTagsClient {
     cache: Arc<HttpCache>,
-    auth_headers: Vec<(HeaderName, AuthToken)>,
+    auth_headers: Vec<(HeaderName, crate::secret::ApiToken)>,
     has_token: bool,
     api_base: String,
     /// `{api_base}/`, precomputed once so [`Self::fetch_authenticated`] never re-`format!`s
@@ -283,15 +255,15 @@ impl GithubTagsClient {
     /// ```
     #[must_use]
     pub fn new(cache: Arc<HttpCache>) -> Self {
-        let token = std::env::var("GITHUB_TOKEN")
-            .ok()
-            .map(zeroize::Zeroizing::new)
-            .filter(|t| !t.is_empty());
+        let token = crate::secret::token_from_env("GITHUB_TOKEN");
         let has_token = token.is_some();
         let auth_headers = token
             .map(|token| {
                 tracing::info!("GITHUB_TOKEN detected, using authenticated GitHub API requests");
-                vec![(AUTHORIZATION, AuthToken::new(format!("Bearer {}", *token)))]
+                vec![(
+                    AUTHORIZATION,
+                    crate::secret::ApiToken::new(format!("Bearer {}", *token)),
+                )]
             })
             .unwrap_or_default();
 
@@ -316,7 +288,7 @@ impl GithubTagsClient {
         let auth_headers = if has_token {
             vec![(
                 AUTHORIZATION,
-                AuthToken::new("Bearer test-token".to_string()),
+                crate::secret::ApiToken::new("Bearer test-token".to_string()),
             )]
         } else {
             Vec::new()
@@ -346,7 +318,7 @@ impl GithubTagsClient {
 
     /// Borrowed auth-header pairs to send on each request; empty when no token is set.
     ///
-    /// `pub(crate)` rather than `pub`: this is the one place [`AuthToken`]'s redaction
+    /// `pub(crate)` rather than `pub`: this is the one place [`crate::secret::ApiToken`]'s redaction
     /// boundary is crossed back into a plain `&str`, so it must not hand the raw token to
     /// another crate. Ecosystem crates needing an authenticated GitHub request go through
     /// [`Self::fetch_authenticated`] instead, which applies these headers internally.
@@ -555,16 +527,13 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::CacheError`] when `data` parses as a GitHub error object.
+/// Returns [`DepsError::ParseError`] when `data` parses as a GitHub error object.
 pub fn parse_tags_page(data: &[u8]) -> Result<Vec<GithubTag>> {
     match crate::parser::parse_json_checked(data) {
         Ok(tags) => Ok(tags),
         Err(_) => {
             if let Ok(err) = crate::parser::parse_json_checked::<GithubErrorResponse>(data) {
-                Err(DepsError::CacheError(format!(
-                    "GitHub API error: {}",
-                    err.message
-                )))
+                Err(DepsError::parse_error("GitHub tags response", &err.message))
             } else {
                 Ok(vec![])
             }
@@ -592,6 +561,58 @@ pub fn parse_tags_page(data: &[u8]) -> Result<Vec<GithubTag>> {
 #[must_use]
 pub fn normalize_tag(name: &str) -> &str {
     name.strip_prefix(['v', 'V']).unwrap_or(name)
+}
+
+/// Converts a raw git-tags-datasource response into a newest-first, semver-filtered list.
+///
+/// Shared by every ecosystem that resolves versions from git tags (GitHub Actions, GitLab
+/// CI, Swift) — `tags` may be accumulated across pages.
+///
+/// `name` extracts the raw tag/release name from each item; `build` receives the item, its
+/// [`normalize_tag`]-stripped name, and the already-parsed [`semver::Version`], and returns
+/// the ecosystem's own version type — or `None` to drop the entry (e.g. GitHub Actions and
+/// GitLab CI drop a tag whose commit SHA is not [`crate::lsp_helpers::is_full_sha`]-shaped,
+/// security S-3; Swift never drops one, since it tracks no SHA at all).
+///
+/// Filtering (`build`) runs **before** deduping by normalized name, first-`build`-success
+/// wins — not the other way around. A prior per-ecosystem implementation deduped first,
+/// which meant a bad-SHA `v1.0.0` (rejected by `build`, so it should never win) could still
+/// consume the dedup slot ahead of a later, SHA-valid `1.0.0` for the same normalized
+/// version, hiding it from the result entirely (issue #1480 item 1).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::github::{parse_tags_page, semver_tags_newest_first};
+///
+/// let json = br#"[{"name": "v1.0.0"}, {"name": "v2.0.0"}]"#;
+/// let tags = parse_tags_page(json).unwrap();
+/// let versions = semver_tags_newest_first(
+///     tags,
+///     |t| t.name.as_str(),
+///     |tag, _normalized, _parsed| Some(tag.name),
+/// );
+/// assert_eq!(versions, vec!["v2.0.0".to_string(), "v1.0.0".to_string()]);
+/// ```
+pub fn semver_tags_newest_first<S, T>(
+    tags: impl IntoIterator<Item = S>,
+    name: impl Fn(&S) -> &str,
+    mut build: impl FnMut(S, &str, &semver::Version) -> Option<T>,
+) -> Vec<T> {
+    let mut built: Vec<(T, semver::Version, String)> = Vec::new();
+    for tag in tags {
+        let normalized = normalize_tag(name(&tag)).to_string();
+        let Ok(parsed) = semver::Version::parse(&normalized) else {
+            continue;
+        };
+        if let Some(item) = build(tag, &normalized, &parsed) {
+            built.push((item, parsed, normalized));
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    built.retain(|(_, _, normalized)| seen.insert(normalized.clone()));
+    built.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    built.into_iter().map(|(item, _, _)| item).collect()
 }
 
 /// TTL for a successful `/releases` memo entry (§3.1 of #223's plan). Chosen so a newly
@@ -880,6 +901,43 @@ mod tests {
     use super::*;
     #[cfg(feature = "test-util")]
     use crate::test_util::{capture_tracing_output, capture_tracing_output_async};
+
+    // --- semver_tags_newest_first ---
+
+    #[test]
+    fn test_semver_tags_newest_first_sorts_descending() {
+        let tags = parse_tags_page(br#"[{"name": "1.0.0"}, {"name": "2.0.0"}]"#).unwrap();
+        let versions = semver_tags_newest_first(tags, |t| t.name.as_str(), |t, _, _| Some(t.name));
+        assert_eq!(versions, vec!["2.0.0".to_string(), "1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn test_semver_tags_newest_first_skips_non_semver() {
+        let tags = parse_tags_page(br#"[{"name": "not-semver"}]"#).unwrap();
+        let versions = semver_tags_newest_first(tags, |t| t.name.as_str(), |t, _, _| Some(t.name));
+        assert!(versions.is_empty());
+    }
+
+    /// #1480 item 1: `build`'s rejection must run *before* the dedupe pass — a bad entry
+    /// (here, `build` returning `None` to simulate a filter like an invalid SHA) must not
+    /// consume the dedup slot ahead of a later, valid entry for the same normalized version.
+    #[test]
+    fn test_semver_tags_newest_first_rejected_entry_does_not_hide_later_valid_one() {
+        let tags = parse_tags_page(br#"[{"name": "v1.0.0"}, {"name": "1.0.0"}]"#).unwrap();
+        let versions = semver_tags_newest_first(
+            tags,
+            |t| t.name.as_str(),
+            |t, _normalized, _parsed| (t.name != "v1.0.0").then_some(t.name),
+        );
+        assert_eq!(versions, vec!["1.0.0".to_string()]);
+    }
+
+    #[test]
+    fn test_semver_tags_newest_first_dedupes_by_normalized_name_first_build_wins() {
+        let tags = parse_tags_page(br#"[{"name": "v1.0.0"}, {"name": "1.0.0"}]"#).unwrap();
+        let versions = semver_tags_newest_first(tags, |t| t.name.as_str(), |t, _, _| Some(t.name));
+        assert_eq!(versions, vec!["v1.0.0".to_string()]);
+    }
 
     // --- is_valid_github_identity / validate_owner_repo ---
 
@@ -1292,34 +1350,22 @@ mod tests {
         assert!(client.headers().is_empty());
     }
 
-    // --- AuthToken redaction ---
+    // --- ApiToken redaction (bare-type coverage lives in `crate::secret`'s own tests) ---
 
     #[test]
-    fn test_auth_token_debug_redacts_value() {
-        let token = AuthToken::new("Bearer super-secret-value".to_string());
-        assert_eq!(format!("{token:?}"), "AuthToken(***)");
-    }
-
-    #[test]
-    fn test_auth_token_display_redacts_value() {
-        let token = AuthToken::new("Bearer super-secret-value".to_string());
-        assert_eq!(format!("{token}"), "***");
-    }
-
-    #[test]
-    fn test_auth_token_debug_redacts_when_embedded_in_header_vec() {
+    fn test_api_token_debug_redacts_when_embedded_in_header_vec() {
         // Guards against a future `#[derive(Debug)]` on `GithubTagsClient` (or a struct
         // embedding it) accidentally printing a raw `GITHUB_TOKEN` value: exercises the
         // exact shape `GithubTagsClient::auth_headers` stores, `Vec<(HeaderName,
-        // AuthToken)>`, not just a bare `AuthToken`.
-        let token = AuthToken::new("Bearer super-secret-value".to_string());
+        // ApiToken)>`, not just a bare `ApiToken`.
+        let token = crate::secret::ApiToken::new("Bearer super-secret-value".to_string());
         let headers = vec![(AUTHORIZATION, token)];
         let debug_output = format!("{headers:?}");
         assert!(
             !debug_output.contains("super-secret-value"),
             "{debug_output}"
         );
-        assert!(debug_output.contains("AuthToken(***)"), "{debug_output}");
+        assert!(debug_output.contains("ApiToken(***)"), "{debug_output}");
     }
 
     // --- fetch_authenticated: wire-level behavior ---

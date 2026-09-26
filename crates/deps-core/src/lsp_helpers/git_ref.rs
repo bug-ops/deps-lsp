@@ -38,6 +38,137 @@ pub fn is_full_sha(s: &str) -> bool {
     s.len() == SHA_LEN && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// A validated, full 40-hex-character git commit SHA.
+///
+/// The only constructor is [`CommitSha::parse`], which routes every value through
+/// [`is_full_sha`] — the shared allowlist gate for the one registry-controlled string in
+/// each git-tags-datasource ecosystem (GitHub Actions, GitLab CI) that is later spliced
+/// verbatim into a manifest text edit and a hover string with no other validation (security
+/// S-3). Once constructed, a caller holding a `CommitSha` never needs to re-check it.
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
+pub struct CommitSha(String);
+
+impl CommitSha {
+    /// Validates `s` as a full 40-hex-character commit SHA via [`is_full_sha`].
+    ///
+    /// Stores `s` verbatim, not lowercased — [`is_full_sha`] accepts uppercase hex, and
+    /// lowercasing would diverge from the exact text a registry API returned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::CommitSha;
+    ///
+    /// assert!(CommitSha::parse(&"a".repeat(40)).is_some());
+    /// assert!(CommitSha::parse("not-a-sha").is_none());
+    /// ```
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        is_full_sha(s).then(|| Self(s.to_string()))
+    }
+
+    /// The validated SHA text, verbatim as constructed.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for CommitSha {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::borrow::Borrow<str> for CommitSha {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Per-repository/per-route tag/SHA cross-reference, shared by every git-tags-datasource
+/// ecosystem (GitHub Actions, GitLab CI).
+///
+/// Populated on every successful tags/releases fetch (the response already carries the
+/// commit SHA — zero extra requests). Read by each ecosystem's formatter to resolve a
+/// SHA-pin edit's replacement text and by a hover override to resolve a tag or SHA's
+/// counterpart for display.
+///
+/// Fields are `pub` (not `pub(crate)`) so a cross-crate integration test that exercises the
+/// shared `deps_core::collect_update_all_edits`/hover machinery — which never itself drives
+/// a live registry fetch — can seed a repository's entry directly.
+///
+/// No constructor beyond [`Default`] and [`Self::from_tags`] is provided: a caller may also
+/// build one via `TagIndex::default()` and populate [`Self::tag_to_sha`]/[`Self::sha_to_tag`]
+/// directly, which `#[non_exhaustive]` does not restrict.
+#[non_exhaustive]
+#[derive(Debug, Default)]
+pub struct TagIndex {
+    /// Tag/release text (as published) -> the commit SHA it points at.
+    pub tag_to_sha: std::collections::HashMap<String, CommitSha>,
+    /// Commit SHA -> the tag/release text (as published) it corresponds to.
+    pub sha_to_tag: std::collections::HashMap<CommitSha, String>,
+}
+
+impl TagIndex {
+    /// Builds a `TagIndex` from `(name, sha)` pairs, preferring a full-semver-parseable name
+    /// over a bare/non-semver one when several entries share one SHA.
+    ///
+    /// A bare-major moving tag like `v3`/`v4` (or a non-semver release name) normalizes to
+    /// something `semver::Version::parse` rejects, so a first-wins pass over raw fetch order
+    /// can resolve a shared SHA to a less-specific name instead of the precise release it was
+    /// actually cut from — the fetch API's ordering is undocumented, so "first in the
+    /// response" is not a reliable proxy for "most specific". [`Self::sha_to_tag`] runs a
+    /// semver-preferring pass first, then fills any remaining entries first-wins;
+    /// [`Self::tag_to_sha`] has no such ambiguity (keyed by the caller's own literal ref
+    /// text), so it stays a plain first-wins index over `entries`' order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// // "v1" (a bare-major moving tag) is listed before "v0.1.0" (the precise release) —
+    /// // `sha_to_tag` must still prefer the semver-parseable name.
+    /// let index = TagIndex::from_tags([("v1", &sha), ("v0.1.0", &sha)]);
+    /// assert_eq!(index.sha_to_tag.get(&sha), Some(&"v0.1.0".to_string()));
+    /// assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
+    /// ```
+    #[must_use]
+    pub fn from_tags<'a, I>(entries: I) -> Self
+    where
+        I: IntoIterator<Item = (&'a str, &'a CommitSha)>,
+        I::IntoIter: Clone,
+    {
+        // Two passes need the sequence twice — cloning the iterator (cheap: the call sites'
+        // iterators are all slice-backed, so this copies a pointer/index pair, not the
+        // underlying tag/SHA data) avoids collecting into an intermediate `Vec` here on top of
+        // whatever collection the caller already built to own its `CommitSha` values.
+        let iter = entries.into_iter();
+        let mut index = Self::default();
+        for (name, sha) in iter.clone() {
+            if semver::Version::parse(crate::github::normalize_tag(name)).is_ok() {
+                index
+                    .sha_to_tag
+                    .entry(sha.clone())
+                    .or_insert_with(|| name.to_string());
+            }
+        }
+        for (name, sha) in iter {
+            index
+                .sha_to_tag
+                .entry(sha.clone())
+                .or_insert_with(|| name.to_string());
+            index
+                .tag_to_sha
+                .entry(name.to_string())
+                .or_insert_with(|| sha.clone());
+        }
+        index
+    }
+}
+
 /// Whether `s` has the shape of a tag ref: an optional leading `v`/`V` followed by a digit.
 ///
 /// Anything else (that isn't an [`is_full_sha`] SHA) is treated as a branch name — the
@@ -957,6 +1088,45 @@ mod tests {
         assert!(is_full_sha(&"a".repeat(40)));
         assert!(!is_full_sha(&"a".repeat(39)));
         assert!(!is_full_sha(&"g".repeat(40)));
+    }
+
+    #[test]
+    fn test_commit_sha_parse_accepts_and_rejects() {
+        assert!(CommitSha::parse(&"a".repeat(40)).is_some());
+        assert!(CommitSha::parse("not-a-sha").is_none());
+    }
+
+    #[test]
+    fn test_commit_sha_parse_preserves_case() {
+        let sha = "A".repeat(40);
+        assert_eq!(CommitSha::parse(&sha).unwrap().as_str(), sha);
+    }
+
+    #[test]
+    fn test_commit_sha_borrow_str_enables_hashmap_lookup_by_str() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let mut map = std::collections::HashMap::new();
+        map.insert(sha.clone(), "v1.0.0".to_string());
+        assert_eq!(map.get(sha.as_str()), Some(&"v1.0.0".to_string()));
+    }
+
+    #[test]
+    fn test_tag_index_from_tags_dedupes_first_wins_for_tag_to_sha() {
+        let sha_a = CommitSha::parse(&"a".repeat(40)).unwrap();
+        let sha_b = CommitSha::parse(&"b".repeat(40)).unwrap();
+        let index = TagIndex::from_tags([("v1.0.0", &sha_a), ("v1.0.0", &sha_b)]);
+        assert_eq!(index.tag_to_sha.get("v1.0.0"), Some(&sha_a));
+    }
+
+    #[test]
+    fn test_tag_index_from_tags_sha_to_tag_prefers_semver_over_bare_moving_tag() {
+        let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+        // The moving tag ("v1") listed before the precise release ("v0.1.15") — sha_to_tag
+        // must still resolve to the semver-parseable one, regardless of iteration order.
+        let index = TagIndex::from_tags([("v1", &sha), ("v0.1.15", &sha)]);
+        assert_eq!(index.sha_to_tag.get(&sha), Some(&"v0.1.15".to_string()));
+        assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
+        assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&sha));
     }
 
     #[test]

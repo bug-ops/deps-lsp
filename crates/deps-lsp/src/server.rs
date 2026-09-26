@@ -4502,8 +4502,12 @@ mod tests {
                 .as_any()
                 .downcast_ref::<deps_github_actions::GithubActionsRegistry>()
                 .expect("github-actions ecosystem must back onto a GithubActionsRegistry");
-            let mut index = deps_github_actions::registry::TagIndex::default();
-            index.tag_to_sha.insert(tag.to_string(), sha.to_string());
+            let mut index = deps_core::lsp_helpers::TagIndex::default();
+            index.tag_to_sha.insert(
+                tag.to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(sha)
+                    .expect("test fixture must pass a valid 40-hex SHA"),
+            );
             gha_registry
                 .tag_index()
                 .insert(deps_core::PackageName::new(name), Arc::new(index));
@@ -4935,10 +4939,11 @@ mod tests {
         let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
             .name()
             .clone();
-        let mut index = deps_gitlab_ci::registry::TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v1.0.0".to_string(), "a".repeat(40));
+        let mut index = deps_core::lsp_helpers::TagIndex::default();
+        index.tag_to_sha.insert(
+            "v1.0.0".to_string(),
+            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+        );
         gitlab_registry
             .tag_index()
             .insert((deps_gitlab_ci::EndpointKind::Tags, name), Arc::new(index));

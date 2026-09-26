@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **deps-core**: new shared `secret::ApiToken`/`secret::token_from_env` and `rate_limit::DEFAULT_COOLDOWN_SECS`, replacing GitHub Actions' and GitLab CI's independently duplicated auth-token and rate-limit-cooldown code (part of #1480) (#1510)
 - **deps-core, deps-lsp**: new opt-in deps.dev GOSSIP signals (`gossip.enabled`, disabled by default) source hover's/diagnostics' outdated-cooldown callout from deps.dev's authoritative Dynamic Cooldown data (falling back to the existing local heuristic when unavailable), add a live hover low-usage/slopsquatting-risk callout for the pinned version, and give completion a new default-on local per-candidate cooldown badge, across the seven deps.dev-covered ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) (resolves #1456) (#1473)
 - **deps-core, deps-lsp**: new opt-in typosquat-similarity diagnostic (`typosquat.enabled`, disabled by default) flags a declared direct dependency whose name deps.dev's `GetSimilarlyNamedPackages`/`GetDependents` endpoints report as asymmetrically similar to a much more popular package, across the seven deps.dev-covered ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) (resolves #1437) (#1451)
 - **deps-core**: new ungated `edit` module (`ManifestEdit`, `PlannedUpdate`, `EditSpan`, `UpdateKind`/`classify_update`, `collect_update_edits`, `plan_vulnerability_fix`) shared by `deps-lsp`'s code-lens/code-action edit planning and the new `deps-cli update` subcommand (resolves #1329) (#1343)
@@ -74,6 +75,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-core**: `coalesce()` leader-takeover regression tests no longer rely on sleep-based ordering that could silently stop exercising the takeover path under load (resolves #1464) (#1515)
 - **deps-maven**: dependencies resolved from a local `<repositories>/<repository><url>file://...</url>` are now classified as `Path` sources (resolves #1503) (#1508)
+- **deps-github-actions, deps-core**: `tags_to_versions` no longer lets a tag with an invalid SHA occupy the dedupe slot ahead of a later, valid same-name version — the new shared `github::semver_tags_newest_first` helper validates each tag's SHA before deduplicating, not after (part of #1480) (#1510)
+- **deps-gitlab-ci, deps-core**: GitLab CI hover's Resolved line now shows the semver-parseable tag pinned to a shared SHA instead of a floating alias like `v1`, matching GitHub Actions' existing tag-index preference (part of #1480) (#1510)
 - **deps-core**: unsatisfiable-requirement diagnostics no longer compile the same version requirement twice per call, across all 14 ecosystems (resolves #1494)
 - **deps-deno**: unsatisfiable `npm:`/`jsr:` requirement diagnostics in `deno.json`/`deno.jsonc` now include the pre-release hint, matching `package.json`'s (resolves #1478) (#1492)
 - **deps-deno**: `jsr:` version matching now routes through the same shared matcher as `npm:`, fixing a wildcard requirement against an all-yanked JSR package incorrectly resolving to no match (resolves #1493) (#1498)
@@ -137,6 +140,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: the dependency-count-ceiling wrapper now forwards `selection_context`/`invalid_minimum_stability`, fixing lost `minimum-stability` enforcement on a capped `composer.json` (resolves #1444) (#1450)
 
 ### Breaking
+- **deps-core**: `GithubActionsVersion.sha`/`GitlabCiVersion.sha` are now the new `lsp_helpers::CommitSha` newtype (`Option<CommitSha>` for GitLab) instead of `String`; `GitlabCiVersion::new`'s signature changed accordingly (part of #1480) (#1510)
+- **deps-core**: `TagIndex` moved from `deps-github-actions`/`deps-gitlab-ci`'s own `registry` modules to `deps_core::lsp_helpers::TagIndex`, now keyed by `CommitSha` instead of `String` (part of #1480) (#1510)
+- **deps-gitlab-ci**: `GitlabRoute`'s public `origin: String` field is replaced by a `pub(crate)` `host: GitlabHost` field plus a `host()` getter; `GitlabHost::trusted` is removed; `routes()`/`register_alternate` are now `pub(crate)` (part of #1480) (#1510)
+- **deps-core, deps-gitlab-ci**: `github_rate_limit_error`/`gitlab_rate_limit_error` now take a single `RateLimitEvidence` parameter; the separate `*_rate_limit_error_verified` functions are removed (part of #1480) (#1510)
+- **deps-core, deps-gitlab-ci**: a malformed GitHub tags response or GitLab API error object now surfaces as `DepsError::ParseError` instead of `DepsError::CacheError` (part of #1480) (#1510)
 - **deps-core**: `FetchCompleteness` no longer implements `Default` — completeness is now always derived from a call's outcome, never defaulted (resolves #1467) (#1491)
 - **deps-core**: `DiagnosticPolicy::strict_semver_prerelease_exclusion` is removed; the same property now lives on the compiled matcher as `RequirementMatcher::strict_prerelease_exclusion`, a required method with no default, so a matcher-reusing formatter (e.g. `deps-deno`) inherits it automatically and a new matcher type must decide it explicitly rather than silently opting out by omission (resolves #1478) (#1492)
 - **deps-lsp**: per-package `DocumentState` fields moved under a new `DocumentState::signals: PackageSignals` field (resolves #1477, #1471) (#1497)

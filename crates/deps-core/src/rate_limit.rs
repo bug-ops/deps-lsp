@@ -3,8 +3,18 @@
 //! Extracted from `deps-github-actions` and `deps-gitlab-ci` (#1205), which had
 //! independently implemented the identical mechanism.
 
+use crate::error::RateLimitEvidence;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Default cooldown, in seconds, a [`RateLimitGate`] keeps short-circuiting further requests
+/// after a rate-limit/auth-rejection trip, before allowing another live request.
+///
+/// Extracted from `deps-github-actions` and `deps-gitlab-ci`'s identical
+/// `RATE_LIMIT_COOLDOWN_SECS` constants (#1480 item 8) — long enough to meaningfully stop
+/// hammering a workspace with many unique packages, short enough to recover without a
+/// restart.
+pub const DEFAULT_COOLDOWN_SECS: u64 = 300;
 
 fn now_epoch_secs() -> u64 {
     SystemTime::now()
@@ -75,6 +85,21 @@ impl RateLimitGate {
     #[must_use]
     pub fn verified(&self) -> bool {
         self.verified.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::verified`], projected onto [`RateLimitEvidence`] — lets a caller building the
+    /// error for an already-tripped gate write `some_rate_limit_error(gate.evidence())` instead
+    /// of re-deriving the `if gate.verified() { .. } else { .. }` branch at every call site
+    /// (#1480 item 8: this replaces `GithubActionsRegistry::rate_limited_error`'s and
+    /// `GitlabCiRegistry::fetch_route`'s identical hand-rolled versions of this projection).
+    /// Meaningless when [`Self::is_tripped`] is `false`, exactly like [`Self::verified`] itself.
+    #[must_use]
+    pub fn evidence(&self) -> RateLimitEvidence {
+        if self.verified() {
+            RateLimitEvidence::Confirmed
+        } else {
+            RateLimitEvidence::Inferred
+        }
     }
 
     /// Trips the gate until `now + cooldown_secs`, recording that this trip was *not* backed

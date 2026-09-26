@@ -71,9 +71,9 @@ pub use formatter::{
     PackageRendering, RequirementResolution, SourcePolicy,
 };
 pub use git_ref::{
-    MAX_FALLBACK_SCAN_BYTES, MarkedScalar, byte_span_to_range, is_full_sha, is_null_tag,
-    is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset,
-    match_v_prefix_style,
+    CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, TagIndex, byte_span_to_range, is_full_sha,
+    is_null_tag, is_partial_semver_shaped, is_plain_null, is_tag_shaped, locate_value_span,
+    marker_byte_offset, match_v_prefix_style,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{

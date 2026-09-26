@@ -3,7 +3,7 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementResolution, RequirementStatus, SourcePolicy, match_v_prefix_style,
+    RequirementResolution, RequirementStatus, SourcePolicy, TagIndex, match_v_prefix_style,
     requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
@@ -14,7 +14,6 @@ use deps_core::{
 use std::sync::Arc;
 
 use crate::parser::{is_full_sha, is_tag_shaped};
-use crate::registry::TagIndex;
 use crate::types::{GithubActionsDependency, PinStyle};
 
 /// Formatter for GitHub Actions ecosystem LSP responses.
@@ -32,7 +31,7 @@ impl GithubActionsFormatter {
     ///
     /// `tag_index` stays `pub(crate)` (critic M1): this constructor is the intended
     /// external construction path — a seeded `TagIndex` for a doctest/integration test
-    /// goes through [`crate::registry::TagIndex`]'s own already-`pub` fields, not
+    /// goes through [`deps_core::lsp_helpers::TagIndex`]'s own already-`pub` fields, not
     /// through widening this struct's field visibility.
     ///
     /// # Examples
@@ -40,13 +39,13 @@ impl GithubActionsFormatter {
     /// ```
     /// use dashmap::DashMap;
     /// use deps_github_actions::GithubActionsFormatter;
-    /// use deps_github_actions::registry::TagIndex;
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
     /// use deps_core::PackageName;
     /// use std::sync::Arc;
     ///
     /// let tag_index = Arc::new(DashMap::new());
     /// let mut index = TagIndex::default();
-    /// index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+    /// index.tag_to_sha.insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
     /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
     ///
     /// let formatter = GithubActionsFormatter::new(tag_index);
@@ -77,13 +76,13 @@ impl GithubActionsFormatter {
     /// ```
     /// use dashmap::DashMap;
     /// use deps_github_actions::GithubActionsFormatter;
-    /// use deps_github_actions::registry::TagIndex;
+    /// use deps_core::lsp_helpers::{CommitSha, TagIndex};
     /// use deps_core::PackageName;
     /// use std::sync::Arc;
     ///
     /// let tag_index = Arc::new(DashMap::new());
     /// let mut index = TagIndex::default();
-    /// index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+    /// index.tag_to_sha.insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
     /// tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
     ///
     /// let formatter = GithubActionsFormatter::new(tag_index);
@@ -391,6 +390,7 @@ impl OsvNaming for GithubActionsFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::CommitSha;
     use deps_core::parser::DependencySource;
     use deps_core::{Position, Range};
 
@@ -695,7 +695,7 @@ mod tests {
                 Box::pin(async move {
                     Ok(vec![Box::new(crate::types::GithubActionsVersion {
                         version: "v4.2.0".into(),
-                        sha: "a".repeat(40),
+                        sha: deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
                         prerelease: false,
                         published_at: None,
                     }) as Box<dyn deps_core::Version>])
@@ -891,7 +891,9 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index.sha_to_tag.insert(sha.clone(), "v4.0.0".to_string());
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "v4.0.0".to_string());
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -929,7 +931,9 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index.sha_to_tag.insert(sha.clone(), "v4.0.0".to_string());
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "v4.0.0".to_string());
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -988,7 +992,9 @@ mod tests {
         let sha = "b".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), sha.clone());
+        index
+            .tag_to_sha
+            .insert("v4".to_string(), CommitSha::parse(&sha).unwrap());
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -1126,9 +1132,10 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        index.tag_to_sha.insert(
+            "v5.0.0".to_string(),
+            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
+        );
         fmt.tag_index.insert(name, Arc::new(index));
 
         let d = dep(
@@ -1159,9 +1166,10 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        index.tag_to_sha.insert(
+            "v5.0.0".to_string(),
+            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
+        );
         fmt.tag_index.insert(name, Arc::new(index));
 
         let old_sha = "a".repeat(40);
@@ -1216,9 +1224,10 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        index.tag_to_sha.insert(
+            "v5.0.0".to_string(),
+            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
+        );
         fmt.tag_index.insert(name, Arc::new(index));
 
         let mut d = dep(
@@ -1246,9 +1255,10 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        index.tag_to_sha.insert(
+            "v5.0.0".to_string(),
+            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
+        );
         fmt.tag_index.insert(name, Arc::new(index));
 
         let sha = "11bd71901bbe5b1630ceea73d27597364c9af683";
@@ -1277,9 +1287,10 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v5.0.0".to_string(), "deadbeef".repeat(5));
+        index.tag_to_sha.insert(
+            "v5.0.0".to_string(),
+            CommitSha::parse(&"deadbeef".repeat(5)).unwrap(),
+        );
         fmt.tag_index.insert(name, Arc::new(index));
 
         let d = dep(
@@ -1329,7 +1340,9 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        index
+            .tag_to_sha
+            .insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         assert_eq!(
@@ -1345,7 +1358,10 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("owner/repo");
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("2.1.0".to_string(), "b".repeat(40));
+        index.tag_to_sha.insert(
+            "2.1.0".to_string(),
+            CommitSha::parse(&"b".repeat(40)).unwrap(),
+        );
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         assert_eq!(
@@ -1366,7 +1382,9 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        index
+            .tag_to_sha
+            .insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         assert_eq!(fmt.sha_pin_replacement_for(&name, "v5"), None);
@@ -1380,7 +1398,9 @@ mod tests {
         let fmt = formatter();
         let name = PackageName::new("actions/checkout");
         let mut index = TagIndex::default();
-        index.tag_to_sha.insert("v4".to_string(), "a".repeat(40));
+        index
+            .tag_to_sha
+            .insert("v4".to_string(), CommitSha::parse(&"a".repeat(40)).unwrap());
         fmt.tag_index.insert(name.clone(), Arc::new(index));
 
         let via_sha_pin_action = fmt.sha_pin_replacement_for(&name, "v4").unwrap();

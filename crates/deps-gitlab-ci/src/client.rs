@@ -10,6 +10,7 @@ use bytes::Bytes;
 use dashmap::DashSet;
 use deps_core::cache::HttpCache;
 use deps_core::error::{DepsError, RateLimitEvidence, Result};
+use deps_core::secret::{ApiToken, token_from_env};
 use reqwest::header::HeaderName;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -32,31 +33,10 @@ fn private_token_header() -> HeaderName {
 /// generously high cap there, but there is no reason to pick a materially different number.
 pub const MAX_GITLAB_PAGES: u32 = 30;
 
-/// A `GITLAB_TOKEN` header value, redacted everywhere except the one call site that hands
-/// it to a request as a header value. Mirrors `deps_core::github`'s `AuthToken` (module-
-/// private there too — this crate keeps its own copy rather than widening that
-/// visibility for a ~15-line type).
-#[derive(Clone, PartialEq, Eq)]
-struct AuthToken(deps_core::secret::Redacted);
-
-impl AuthToken {
-    fn new(value: String) -> Self {
-        Self(deps_core::secret::Redacted::new(value))
-    }
-
-    fn expose_secret(&self) -> &str {
-        self.0.expose_secret()
-    }
-}
-
-impl std::fmt::Debug for AuthToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AuthToken(***)")
-    }
-}
-
-/// Fixed message shared by [`gitlab_rate_limit_error`] and [`gitlab_rate_limit_error_verified`]
-/// — the only difference between the two is [`DepsError::RateLimited`]'s `verified` flag.
+/// Fixed message for a GitLab rate-limit/auth-rejection error, regardless of
+/// [`RateLimitEvidence`] — the message itself never varies with confidence for this
+/// ecosystem (unlike GitHub's, see `deps_core::github::github_rate_limit_error`'s two
+/// distinct messages).
 const GITLAB_RATE_LIMIT_MESSAGE: &str = "GitLab API rate limit exceeded or authentication required. Set \
      GITLAB_TOKEN to a GitLab Personal/Project Access Token to increase the \
      limit and access private projects.";
@@ -64,26 +44,20 @@ const GITLAB_RATE_LIMIT_MESSAGE: &str = "GitLab API rate limit exceeded or authe
 /// The actionable error returned when a request hits GitLab's rate limit, or a 401/403
 /// with no `GITLAB_TOKEN` configured (spec FR-014).
 ///
-/// Inferred from a bare status code, like `deps_core::github::github_rate_limit_error` before
-/// #1295 — this crate has the same unverified-403 ambiguity, out of scope here
-/// (`verified: RateLimitEvidence::Inferred`). Use [`gitlab_rate_limit_error_verified`] instead
-/// when the response already confirmed exhaustion.
-#[must_use]
-pub fn gitlab_rate_limit_error() -> DepsError {
-    // `DepsError::rate_limited`, not a struct literal: `RateLimited` is `#[non_exhaustive]`.
-    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, RateLimitEvidence::Inferred)
-}
-
-/// Same message as [`gitlab_rate_limit_error`], but `verified: RateLimitEvidence::Confirmed`
-/// (#1295 critic N2).
+/// A single `fn(RateLimitEvidence)` (#1480 item 8), not the two separate
+/// `gitlab_rate_limit_error`/`gitlab_rate_limit_error_verified` constructors this replaced —
+/// see [`deps_core::rate_limit::RateLimitGate::evidence`] for the matching gate-side
+/// projection every call site now uses instead of its own `if gate.verified() { .. } else
+/// { .. }` branch.
 ///
-/// `crate::registry::GitlabCiRegistry::map_error` uses this instead of passing the
-/// `deps_core::cache`-classified error through with its registry-neutral message, so a
+/// `crate::registry::GitlabCiRegistry::map_error`/`fetch_route` use this instead of passing
+/// a `deps_core::cache`-classified error through with its registry-neutral message, so a
 /// confirmed rate limit still gets GitLab's `GITLAB_TOKEN` remedy rather than a strictly less
-/// helpful generic message than the unverified guess gives.
+/// helpful generic message than the unverified guess gives (#1295 critic N2).
 #[must_use]
-pub fn gitlab_rate_limit_error_verified() -> DepsError {
-    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, RateLimitEvidence::Confirmed)
+pub fn gitlab_rate_limit_error(verified: RateLimitEvidence) -> DepsError {
+    // `DepsError::rate_limited`, not a struct literal: `RateLimited` is `#[non_exhaustive]`.
+    DepsError::rate_limited(GITLAB_RATE_LIMIT_MESSAGE, verified)
 }
 
 /// GitLab tags API response item (`GET /projects/:id/repository/tags`).
@@ -137,7 +111,7 @@ struct GitlabErrorResponse {
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::CacheError`] when `data` parses as a GitLab error object.
+/// Returns [`DepsError::ParseError`] when `data` parses as a GitLab error object.
 pub fn parse_tags_page(data: &[u8]) -> Result<Vec<GitlabTag>> {
     parse_gitlab_page(data)
 }
@@ -146,7 +120,7 @@ pub fn parse_tags_page(data: &[u8]) -> Result<Vec<GitlabTag>> {
 ///
 /// # Errors
 ///
-/// Returns [`DepsError::CacheError`] when `data` parses as a GitLab error object.
+/// Returns [`DepsError::ParseError`] when `data` parses as a GitLab error object.
 pub fn parse_releases_page(data: &[u8]) -> Result<Vec<GitlabRelease>> {
     parse_gitlab_page(data)
 }
@@ -161,7 +135,7 @@ fn parse_gitlab_page<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<Vec<
                     .map(|v| v.to_string())
                     .or(err.error)
                     .unwrap_or_default();
-                Err(DepsError::CacheError(format!("GitLab API error: {text}")))
+                Err(DepsError::parse_error("GitLab API response", &text))
             } else {
                 Ok(vec![])
             }
@@ -174,7 +148,7 @@ fn parse_gitlab_page<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<Vec<
 #[derive(Clone)]
 pub struct GitlabApiClient {
     cache: Arc<HttpCache>,
-    token: Option<AuthToken>,
+    token: Option<ApiToken>,
     instance_host: Arc<GitlabInstanceHost>,
     /// Origins already known (H3, #466 review) to reject `order_by=version` with a `400`
     /// — a pre-16.0 self-hosted instance. Memoized per host so the degradation is
@@ -191,16 +165,13 @@ impl GitlabApiClient {
     /// [`crate::host::token_host_origin`]).
     #[must_use]
     pub fn new(cache: Arc<HttpCache>, instance_host: Arc<GitlabInstanceHost>) -> Self {
-        let token = std::env::var("GITLAB_TOKEN")
-            .ok()
-            .map(zeroize::Zeroizing::new)
-            .filter(|t| !t.is_empty());
+        let token = token_from_env("GITLAB_TOKEN");
         if token.is_some() {
             tracing::info!("GITLAB_TOKEN detected, using authenticated GitLab API requests");
         }
         Self {
             cache,
-            token: token.map(|t| AuthToken::new((*t).clone())),
+            token: token.map(|t| ApiToken::new((*t).clone())),
             instance_host,
             degraded_order_by_hosts: Arc::new(DashSet::new()),
         }
@@ -224,7 +195,7 @@ impl GitlabApiClient {
     ) -> Self {
         Self {
             cache,
-            token: token.map(|t| AuthToken::new(t.to_string())),
+            token: token.map(|t| ApiToken::new(t.to_string())),
             instance_host,
             degraded_order_by_hosts: Arc::new(DashSet::new()),
         }
@@ -316,7 +287,7 @@ impl GitlabApiClient {
         let is_token_host =
             token_host_origin(&self.instance_host).is_some_and(|origin| origin == host.origin());
         let token_value = if is_token_host {
-            self.token.as_ref().map(AuthToken::expose_secret)
+            self.token.as_ref().map(ApiToken::expose_secret)
         } else {
             None
         };
@@ -383,7 +354,7 @@ mod tests {
         let json = r#"{"message":"404 Project Not Found"}"#;
         let result: Result<Vec<GitlabTag>> = parse_gitlab_page(json.as_bytes());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("GitLab API error"));
+        assert!(matches!(result.unwrap_err(), DepsError::ParseError { .. }));
     }
 
     #[test]
