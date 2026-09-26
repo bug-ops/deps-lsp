@@ -27,24 +27,40 @@ pub struct PinNoun {
 
 /// Manifest edits bringing every safely-editable outdated dependency to `latest`.
 ///
-/// A dependency is included when all of the following hold:
+/// Delegates to [`crate::edit::collect_update_edits`], which classifies every dependency via
+/// [`crate::edit::collect_update_candidates`] and keeps only its
+/// [`UpdateCandidate::Planned`](crate::edit::UpdateCandidate::Planned) subset (deduped). A
+/// dependency is included when all of the following hold:
 /// - it declares a `version_range` (a span to rewrite exists);
 /// - a `latest` version is known in `versions.cached` (normalized name first, then raw —
 ///   mirroring [`crate::lsp_helpers::generate_diagnostics_from_cache`]);
-/// - `formatter.is_requirement_up_to_date` reports the declared requirement as *not*
-///   satisfying `latest` — the same predicate diagnostics use, so on a fixture where the
-///   guard below is a no-op, `collect_update_all_edits(..).len()` equals the number of
-///   `generate_diagnostics_from_cache` "Newer version available" diagnostics;
-/// - the **literal-span guard** (`literal_span_matches`): `content` sliced over
-///   `version_range` must still be (up to whitespace and NuGet's bracket wrap) the
-///   literal text — [`Dependency::version_literal`](crate::Dependency::version_literal)
-///   when the ecosystem provides one (e.g. `deps-swift`, whose synthesized comparator
-///   requirement string diverges from the bare literal `version_range` spans), falling
-///   back to the declared requirement text otherwise. Some ecosystems point
-///   `version_range` at something that is not a version literal at all — a Maven
-///   `${property}` reference or a Gradle DSL variable/version-catalog alias — and
-///   rewriting those spans would corrupt the manifest instead of fixing it. A dependency
-///   that fails the guard is skipped entirely: neither counted nor edited.
+/// - it declares a non-empty version requirement that [`crate::edit::requirement_is_placeholder_for`]
+///   does not consider an unexpanded placeholder (#1370 central gate);
+/// - the formatter's
+///   [`requirement_status_for`](crate::lsp_helpers::RequirementResolution::requirement_status_for)
+///   reports the declared requirement as [`Outdated`](crate::lsp_helpers::RequirementStatus::Outdated)
+///   — the same predicate the diagnostics pipeline's outdated rule calls, though that rule
+///   also gates on `formatter.can_resolve_source`, which this planner does not check, so the
+///   two counts can diverge for a dependency whose source this ecosystem cannot resolve;
+///
+/// An `Outdated` dependency is then dropped as
+/// [`Unplannable`](crate::edit::UpdateCandidate::Unplannable) — neither counted nor edited —
+/// when any of these hold:
+/// - the cached `latest` fails the `is_safe_version_string` gate
+///   ([`UnplannableReason::UnsafeLatestVersion`](crate::edit::UnplannableReason::UnsafeLatestVersion));
+/// - the **literal-span guard** (`literal_span_matches`) fails: `content` sliced over
+///   `version_range` must still be (up to whitespace and NuGet's bracket wrap) the literal
+///   text — [`Dependency::version_literal`](crate::Dependency::version_literal) when the
+///   ecosystem provides one (e.g. `deps-swift`, whose synthesized comparator requirement
+///   string diverges from the bare literal `version_range` spans), falling back to the
+///   declared requirement text otherwise. Some ecosystems point `version_range` at something
+///   that is not a version literal at all — a Maven `${property}` reference or a Gradle DSL
+///   variable/version-catalog alias (or GitHub Actions' TagIndex SHA ground truth, or
+///   GitLab CI's PinStyle overrides) — and rewriting those spans would corrupt the manifest
+///   instead of fixing it
+///   ([`UnplannableReason::NonLiteralSpan`](crate::edit::UnplannableReason::NonLiteralSpan));
+/// - the formatter's rewrite would be a no-op
+///   ([`UnplannableReason::NoOpRewrite`](crate::edit::UnplannableReason::NoOpRewrite)).
 ///
 /// Accepted edits are sorted by start position; a later edit whose start falls before the
 /// previous edit's end (an overlap — a `WorkspaceEdit` protocol violation) is dropped with

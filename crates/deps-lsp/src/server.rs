@@ -124,6 +124,41 @@ async fn warn_if_gitlab_instance_host_invalid(
     }
 }
 
+/// Snapshot of the resolved config values [`Backend::apply_resolved_config`] applies.
+///
+/// `DepsConfig` has no `Clone`, and `did_change_configuration` moves it into its write
+/// guard before the side effects below can run — this struct is the owned, borrow-free
+/// value both `initialize` and `did_change_configuration` derive via [`Self::from_config`]
+/// before that move, so the ten side-effect steps live in one place instead of two.
+struct ConfigSideEffects {
+    registries: deps_core::policy_config::RegistryRuntimeSettings,
+    network: deps_core::NetworkMode,
+    cache: deps_core::CacheMode,
+    cold_start_min_interval: std::time::Duration,
+    license_policy: deps_core::LicensePolicy,
+    typosquat_enabled: bool,
+    gossip_enabled: bool,
+}
+
+impl ConfigSideEffects {
+    /// Derives every resolved value [`Backend::apply_resolved_config`] needs from a
+    /// [`DepsConfig`], sharing `RegistriesConfig::resolve` (#1058 T009) with
+    /// `deps_engine::setup::EcosystemRuntime::from_policy`.
+    fn from_config(config: &DepsConfig) -> Self {
+        Self {
+            registries: config.policy.registries.resolve(),
+            network: deps_core::NetworkMode::from_offline_flag(config.policy.network.offline),
+            cache: deps_core::CacheMode::from_enabled_flag(config.policy.cache.enabled),
+            cold_start_min_interval: std::time::Duration::from_millis(
+                config.cold_start.rate_limit_ms,
+            ),
+            license_policy: config.policy.license_policy.to_policy(),
+            typosquat_enabled: config.policy.typosquat.enabled,
+            gossip_enabled: config.policy.gossip.enabled,
+        }
+    }
+}
+
 /// The `tower-lsp-server` [`LanguageServer`] implementation for `deps-lsp`.
 ///
 /// Holds the LSP client handle, per-document [`ServerState`], the live
@@ -150,6 +185,44 @@ impl Backend {
     #[doc(hidden)]
     pub const fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Applies the ten config-derived side effects shared by `initialize` and
+    /// `did_change_configuration`: registry/cache/network/license/typosquat/gossip flags,
+    /// plus the GitLab-host validation warning, in the order both call sites rely on.
+    async fn apply_resolved_config(&self, effects: ConfigSideEffects) {
+        self.state
+            .cache
+            .set_registry_policy(effects.registries.workspace_registries);
+        self.state.nuget_user_profile_sources.store(
+            effects.registries.nuget_user_profile_sources,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        #[cfg(feature = "gitlab-ci")]
+        if let Some(raw) = &effects.registries.gitlab_instance_host {
+            warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
+                .await;
+        }
+        *self
+            .state
+            .gitlab_instance_host
+            .write()
+            // The write below is a single infallible assignment, so this lock can never
+            // actually be poisoned; recover rather than propagate, for defense in depth.
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            effects.registries.gitlab_instance_host;
+        self.state.cache.set_offline(effects.network);
+        self.state.cache.set_cache_enabled(effects.cache);
+        self.state
+            .cold_start_limiter
+            .set_min_interval(effects.cold_start_min_interval);
+        // #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics call
+        // site (push and pull) reads the same resolved policy.
+        self.state.set_license_policy(effects.license_policy);
+        // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
+        self.state.set_typosquat_enabled(effects.typosquat_enabled);
+        // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
+        self.state.set_gossip_enabled(effects.gossip_enabled);
     }
 
     /// Handles opening a document using unified ecosystem registry.
@@ -644,57 +717,8 @@ impl LanguageServer for Backend {
             && let Some(config) = parse_config(init_options)
         {
             tracing::debug!("loaded configuration: {:?}", config);
-            // `resolve()` (#1058 T009) is the single derivation of these values, shared with
-            // `did_change_configuration` below and `EcosystemRuntime::from_policy` — only the
-            // side-effect application here (state/cache writes, gitlab warning) is adapter-specific.
-            let resolved = config.policy.registries.resolve();
-            self.state
-                .cache
-                .set_registry_policy(resolved.workspace_registries);
-            self.state.nuget_user_profile_sources.store(
-                resolved.nuget_user_profile_sources,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            #[cfg(feature = "gitlab-ci")]
-            if let Some(raw) = &resolved.gitlab_instance_host {
-                warn_if_gitlab_instance_host_invalid(
-                    &self.client,
-                    raw,
-                    &self.state.registry_policy,
-                )
-                .await;
-            }
-            *self
-                .state
-                .gitlab_instance_host
-                .write()
-                // The write below is a single infallible assignment, so this lock can never
-                // actually be poisoned; recover rather than propagate, for defense in depth.
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
-            self.state
-                .cache
-                .set_offline(deps_core::NetworkMode::from_offline_flag(
-                    config.policy.network.offline,
-                ));
-            self.state
-                .cache
-                .set_cache_enabled(deps_core::CacheMode::from_enabled_flag(
-                    config.policy.cache.enabled,
-                ));
-            self.state
-                .cold_start_limiter
-                .set_min_interval(std::time::Duration::from_millis(
-                    config.cold_start.rate_limit_ms,
-                ));
-            // #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics call
-            // site (push and pull) reads the same resolved policy.
-            self.state
-                .set_license_policy(config.policy.license_policy.to_policy());
-            // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
-            self.state
-                .set_typosquat_enabled(config.policy.typosquat.enabled);
-            // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
-            self.state.set_gossip_enabled(config.policy.gossip.enabled);
+            let effects = ConfigSideEffects::from_config(&config);
+            self.apply_resolved_config(effects).await;
             *self.config.write().await = config;
         }
 
@@ -834,20 +858,12 @@ impl LanguageServer for Backend {
         tracing::info!("configuration updated via workspace/didChangeConfiguration");
 
         // Captured before `config` is moved into the write guard below (`DepsConfig` has no
-        // `Clone`): applied *after* the swap but with no `.await` in between, so no other
-        // task can observe `self.config` reflecting the new value while these shared
-        // handles (M4) still reflect the old one.
-        //
-        // `resolve()` (#1058 T009) is the single derivation of these values, shared with
-        // `initialize` above — only the side-effect application below is adapter-specific.
-        let resolved = config.policy.registries.resolve();
-        let offline = config.policy.network.offline;
-        let cache_enabled = config.policy.cache.enabled;
-        let cold_start_rate_limit_ms = config.cold_start.rate_limit_ms;
-        // #660/#661 critic C1: see the mirroring call after the config swap below.
-        let license_policy = config.policy.license_policy.to_policy();
-        // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
-        let typosquat_enabled = config.policy.typosquat.enabled;
+        // `Clone`): `apply_resolved_config` runs after the swap and may itself await (the
+        // optional GitLab-host warning), so a reader could briefly observe the new
+        // `self.config` while these shared handles (M4) still reflect the old values —
+        // harmless, since each assignment `apply_resolved_config` makes is independently
+        // consistent and no caller depends on them landing atomically together.
+        let effects = ConfigSideEffects::from_config(&config);
         // Issue #1437 M1: read *before* the flag is overwritten below, so the enable
         // transition can be detected. `fetch_timeout_secs` bounds the trigger's own
         // pre-fetch spawn (an internal tuning value, read once here like every other
@@ -856,10 +872,11 @@ impl LanguageServer for Backend {
         // `trigger_typosquat_prefetch_for_open_documents` is called below, `self.config`
         // already holds this new value (the write guard has landed), so passing it directly
         // needs no separate snapshot here.
+        let typosquat_enabled = effects.typosquat_enabled;
         let was_typosquat_enabled = self.state.is_typosquat_enabled();
         let typosquat_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
-        let gossip_enabled = config.policy.gossip.enabled;
+        let gossip_enabled = effects.gossip_enabled;
         let was_gossip_enabled = self.state.is_gossip_enabled();
         let gossip_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
 
@@ -877,41 +894,9 @@ impl LanguageServer for Backend {
             scope
         };
 
-        self.state
-            .cache
-            .set_registry_policy(resolved.workspace_registries);
-        self.state.nuget_user_profile_sources.store(
-            resolved.nuget_user_profile_sources,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        #[cfg(feature = "gitlab-ci")]
-        if let Some(raw) = &resolved.gitlab_instance_host {
-            warn_if_gitlab_instance_host_invalid(&self.client, raw, &self.state.registry_policy)
-                .await;
-        }
-        *self
-            .state
-            .gitlab_instance_host
-            .write()
-            // The write below is a single infallible assignment, so this lock can never
-            // actually be poisoned; recover rather than propagate, for defense in depth.
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = resolved.gitlab_instance_host;
         // Must land before either refresh notification below, or the refresh re-renders
         // diagnostics under the stale flag values (critic M5).
-        self.state
-            .cache
-            .set_offline(deps_core::NetworkMode::from_offline_flag(offline));
-        self.state
-            .cache
-            .set_cache_enabled(deps_core::CacheMode::from_enabled_flag(cache_enabled));
-        self.state
-            .cold_start_limiter
-            .set_min_interval(std::time::Duration::from_millis(cold_start_rate_limit_ms));
-        // #660/#661 critic C1: mirrored onto `ServerState` so every diagnostics call site
-        // (push and pull) reads the same resolved policy.
-        self.state.set_license_policy(license_policy);
-        // Issue #1437: same rationale, for the typosquat-similarity diagnostic's opt-in flag.
-        self.state.set_typosquat_enabled(typosquat_enabled);
+        self.apply_resolved_config(effects).await;
         // Issue #1437 M1: an already-open document otherwise only picks up the signal on
         // its next edit or reopen — trigger it immediately on the disabled->enabled
         // transition specifically (not on every `did_change_configuration`, which would
@@ -926,7 +911,6 @@ impl LanguageServer for Backend {
             .await;
         }
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
-        self.state.set_gossip_enabled(gossip_enabled);
         if gossip_enabled && !was_gossip_enabled {
             trigger_gossip_prefetch_for_open_documents(
                 &self.state,

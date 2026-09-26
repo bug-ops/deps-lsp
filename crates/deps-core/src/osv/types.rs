@@ -15,6 +15,79 @@ use serde::{Deserialize, Serialize};
 use crate::ConcreteVersion;
 use crate::lsp_helpers::is_safe_version_string;
 
+/// The `package.ecosystem` value OSV.dev expects for a queried [`crate::EcosystemId`]
+/// (`crate::EcosystemId::osv_ecosystem`'s return type).
+///
+/// An exhaustive enum rather than `&'static str` (project rule: closed value sets are typed,
+/// not stringly-typed): the 11 OSV ecosystem names this crate actually queries with. Not every
+/// [`crate::EcosystemId`] variant has one — `GitlabCi` maps to `None` in
+/// `crate::EcosystemId::osv_ecosystem` — and this enum only enumerates the ones that do.
+/// [`Self::as_str`] is the single conversion to OSV's wire spelling, used at request-body
+/// construction and inbound `package.ecosystem` string comparisons.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::EcosystemId;
+/// use deps_core::osv::OsvEcosystem;
+///
+/// assert_eq!(EcosystemId::Cargo.osv_ecosystem(), Some(OsvEcosystem::CratesIo));
+/// assert_eq!(OsvEcosystem::CratesIo.as_str(), "crates.io");
+/// ```
+///
+/// `PartialOrd`/`Ord` are derived (declaration order, which carries no meaning of its own)
+/// only because [`crate::osv::OsvClient`]'s `query_cache` key tuple includes an
+/// `OsvEcosystem` and its `Ord`-bounded eviction heap (`cache_policy::evict_oldest_batch`)
+/// needs *some* total order to break ties — mirroring [`OsvVersion`]'s identical rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OsvEcosystem {
+    /// `crates.io` — Rust/Cargo.
+    CratesIo,
+    /// `npm` — shared by npm and Deno's `npm:` specifiers.
+    Npm,
+    /// `PyPI` — Python.
+    PyPI,
+    /// `Go` — Go modules.
+    Go,
+    /// `RubyGems` — Bundler.
+    RubyGems,
+    /// `Pub` — Dart.
+    Pub,
+    /// `Maven` — shared by Maven and Gradle.
+    Maven,
+    /// `Packagist` — PHP Composer.
+    Packagist,
+    /// `SwiftURL` — Swift Package Manager.
+    SwiftURL,
+    /// `NuGet` — .NET.
+    NuGet,
+    /// `GitHub Actions` — GitHub Actions workflows.
+    GitHubActions,
+}
+
+impl OsvEcosystem {
+    /// OSV.dev's wire spelling for this ecosystem — the only conversion point to a plain
+    /// string, used at the HTTP request-body boundary and for comparing against
+    /// `OsvPackage::ecosystem` (a `String` since it is deserialized from arbitrary
+    /// OSV-supplied values, not produced from this enum).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CratesIo => "crates.io",
+            Self::Npm => "npm",
+            Self::PyPI => "PyPI",
+            Self::Go => "Go",
+            Self::RubyGems => "RubyGems",
+            Self::Pub => "Pub",
+            Self::Maven => "Maven",
+            Self::Packagist => "Packagist",
+            Self::SwiftURL => "SwiftURL",
+            Self::NuGet => "NuGet",
+            Self::GitHubActions => "GitHub Actions",
+        }
+    }
+}
+
 /// A version string in OSV.dev's own wire spelling — distinct from [`ConcreteVersion`], the
 /// ecosystem-native spelling, so the two can never be silently swapped at a call site
 /// (issue #1423).
@@ -1642,7 +1715,7 @@ impl OsvVulnRecord {
     /// matches (or omits) before `fixed_versions`/severity are extracted —
     /// otherwise a stranger package's fix version or severity could leak
     /// into this one's rendering.
-    pub(super) fn into_advisory(self, osv_name: &str, osv_eco: &str) -> Option<Advisory> {
+    pub(super) fn into_advisory(self, osv_name: &str, osv_eco: OsvEcosystem) -> Option<Advisory> {
         if !is_valid_osv_id(&self.id) {
             tracing::warn!(id = %self.id, "OSV record has a malformed id, dropping");
             return None;
@@ -1654,7 +1727,7 @@ impl OsvVulnRecord {
             .filter(|a| {
                 a.package
                     .as_ref()
-                    .is_none_or(|p| p.name == osv_name && p.ecosystem == osv_eco)
+                    .is_none_or(|p| p.name == osv_name && p.ecosystem == osv_eco.as_str())
             })
             .collect();
         // Every `affected[]` entry named a different package: OSV returned
@@ -1664,7 +1737,7 @@ impl OsvVulnRecord {
         let used_fallback_all = relevant.is_empty() && !self.affected.is_empty();
         let relevant: Vec<&OsvAffected> = if used_fallback_all {
             tracing::warn!(
-                id = %self.id, osv_name, osv_eco,
+                id = %self.id, osv_name, osv_eco = osv_eco.as_str(),
                 "no affected[] entry matched the queried package; using all entries"
             );
             self.affected.iter().collect()
@@ -2132,7 +2205,11 @@ mod osv_version_validation_tests {
             database_specific: None,
             affected: vec![],
         };
-        assert!(record.into_advisory("pkg", "crates.io").is_none());
+        assert!(
+            record
+                .into_advisory("pkg", OsvEcosystem::CratesIo)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2143,7 +2220,7 @@ mod osv_version_validation_tests {
         // verbatim into a `TextEdit`.
         let record = record_with_fixed(&["1.0.0", "1.0.0\", git = \"https://evil/x"]);
         let advisory = record
-            .into_advisory("pkg", "crates.io")
+            .into_advisory("pkg", OsvEcosystem::CratesIo)
             .expect("valid id, should still resolve");
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
@@ -2153,7 +2230,7 @@ mod osv_version_validation_tests {
     fn fixed_version_over_length_cap_is_dropped() {
         let long_version = format!("1.0.0-{}", "a".repeat(64));
         let record = record_with_fixed(&["1.0.0", &long_version]);
-        let advisory = record.into_advisory("pkg", "crates.io").unwrap();
+        let advisory = record.into_advisory("pkg", OsvEcosystem::CratesIo).unwrap();
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
     }
@@ -2193,7 +2270,7 @@ mod osv_version_validation_tests {
         };
 
         let advisory = record
-            .into_advisory("requests", "PyPI")
+            .into_advisory("requests", OsvEcosystem::PyPI)
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("2.31.0")]);
@@ -2234,7 +2311,7 @@ mod osv_version_validation_tests {
         };
         let advisory = Arc::new(
             record
-                .into_advisory("requests", "PyPI")
+                .into_advisory("requests", OsvEcosystem::PyPI)
                 .expect("valid id, should resolve"),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
@@ -2269,7 +2346,7 @@ mod osv_version_validation_tests {
             }],
         };
         let advisory = record
-            .into_advisory("pkg", "crates.io")
+            .into_advisory("pkg", OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
         assert!(
             advisory.fixed_versions.is_empty(),
@@ -2308,7 +2385,7 @@ mod osv_version_validation_tests {
         };
 
         let advisory = record
-            .into_advisory("pkg", "crates.io")
+            .into_advisory("pkg", OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert!(advisory.fixed_versions.is_empty());
@@ -2340,7 +2417,7 @@ mod osv_version_validation_tests {
     fn every_fixed_version_malformed_yields_empty_fixed_versions_not_a_dropped_advisory() {
         let record = record_with_fixed(&["1.0.0\nEvil"]);
         let advisory = record
-            .into_advisory("pkg", "crates.io")
+            .into_advisory("pkg", OsvEcosystem::CratesIo)
             .expect("the advisory itself is still valid, just with no usable fix");
 
         assert!(advisory.fixed_versions.is_empty());
@@ -2410,7 +2487,7 @@ mod informational_record_tests {
     fn live_yaml_rust_unmaintained_record_classifies_as_informational() {
         let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
         let advisory = record
-            .into_advisory("yaml-rust", "crates.io")
+            .into_advisory("yaml-rust", OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.severity, VulnSeverity::Informational);
@@ -2435,7 +2512,7 @@ mod informational_record_tests {
     fn into_advisory_rejects_informational_from_fallback_all_entries() {
         let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
         let advisory = record
-            .into_advisory("some-other-crate", "crates.io")
+            .into_advisory("some-other-crate", OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_ne!(advisory.severity, VulnSeverity::Informational);
@@ -2457,7 +2534,7 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory("yaml-rust", "crates.io")
+            .into_advisory("yaml-rust", OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_ne!(advisory.severity, VulnSeverity::Informational);
@@ -2481,7 +2558,7 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory("atty", "crates.io")
+            .into_advisory("atty", OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_ne!(
@@ -2513,7 +2590,7 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory("yaml-rust", "crates.io")
+            .into_advisory("yaml-rust", OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.severity, VulnSeverity::Unknown);
