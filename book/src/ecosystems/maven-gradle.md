@@ -70,6 +70,31 @@ vulnerability scanning against the public artifact coordinates (resolves #1202).
 system-scope dependency with a missing or empty `<systemPath>` still falls back to
 Central-resolvable, since scope alone isn't a locally-provided binding without a path.
 
+A `<repositories>/<repository><url>file://...</url>` declaration is a second, independent
+non-registry source: since Maven's `<repository>` element has no per-package binding (every
+declared repository is tried, in order, for any dependency), each dependency in that
+`pom.xml` is individually probed against the standard Maven repository layout
+(`<group-path>/<artifact>/<version>/<artifact>-<version>.jar`) under every declared `file://`
+repository directory, and only classified as non-registry when its jar is actually found
+there (resolves #1503). A dependency with no matching jar under any `file://` repository — an
+implicit Maven Central dependency declared in the same file, for example — keeps its normal
+Central-resolvable classification; a version-range requirement (e.g. `[1.0,2.0)`) and a
+`<plugin>` entry (which resolves through the separate `<pluginRepositories>` config) are
+never probed this way. `${project.basedir}` (the pom.xml's own containing directory) resolves
+correctly in the repository URL, but a `file://` URL that carries a host — a potential
+Windows UNC path — is rejected outright rather than probed, since resolving it could make
+Windows silently attempt SMB authentication against that host.
+
+**Known limitation**: a `file://` repository that happens to mirror or cache Maven Central
+(e.g. a local `~/.m2/repository` cache or an offline CI mirror declared as a `<repository>`)
+causes every dependency whose jar is actually cached there to lose OSV/outdated coverage,
+even though it is really a Central-sourced dependency — the probe has no way to distinguish
+"genuinely local-only" from "a local mirror of a public registry." The probing pass also
+spends a bounded total budget of filesystem checks across the whole document; once
+exhausted, every remaining dependency keeps its current (usually `Registry`) classification,
+so a genuinely local dependency declared very late in an unusually large `pom.xml` may be
+missed.
+
 **Gradle**: Gradle has no per-dependency local-source syntax analogous to Maven's
 `systemPath` (`project(":core")`/`files()`/`fileTree()` dependencies are deliberately not
 surfaced as version-checkable dependencies at all, so no Gradle dependency ever carries a
