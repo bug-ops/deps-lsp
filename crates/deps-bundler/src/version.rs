@@ -112,10 +112,33 @@ fn tokenize(version: &str) -> Vec<Token> {
 /// porting the pattern as a literal `Regex`: it finds the smallest index `i` such that the
 /// byte before `i` is a letter or `.` and every byte from `i` onward is `.`/`0`, matching
 /// Ruby's leftmost-match semantics for an anchored-at-end pattern.
+///
+/// The "every byte from `i` onward is `.`/`0`" test is precomputed once as `run_start` (the
+/// position right after the last non-`.`/`0` byte) rather than rescanned per candidate `i` —
+/// `bytes[i..].all(|b| b == b'.' || b == b'0')` holds iff `i >= run_start`, so this is O(n)
+/// total instead of O(n^2) on adversarial input (#1472).
 // `i` is a byte offset from a single-pass ASCII scan, always a char boundary; `i` ranges
 // `1..bytes.len()` from the loop.
 #[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn strip_trailing_padding(version: &str) -> &str {
+    let bytes = version.as_bytes();
+    let run_start = bytes
+        .iter()
+        .rposition(|&b| b != b'.' && b != b'0')
+        .map_or(0, |p| p + 1);
+    for i in run_start.max(1)..bytes.len() {
+        let prev = bytes[i - 1];
+        if prev.is_ascii_alphabetic() || prev == b'.' {
+            return &version[..i];
+        }
+    }
+    version
+}
+
+#[cfg(test)]
+/// Pre-#1472 reference implementation, kept only for the oracle-equivalence test.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
+fn strip_trailing_padding_reference(version: &str) -> &str {
     let bytes = version.as_bytes();
     for i in 1..bytes.len() {
         let prev = bytes[i - 1];
@@ -135,10 +158,41 @@ fn strip_trailing_padding(version: &str) -> &str {
 /// second zero-padding run elsewhere in the string is left untouched). E.g.
 /// `"1.pre.0.beta1"` -> `"1.pre.beta1"`, so a padding zero segment right before a prerelease
 /// tag does not become its own token (#331).
-// `i`/`end` are byte offsets from a single-pass ASCII scan, always char boundaries; `i`
+///
+/// The run end is cached in `run_end` instead of rescanned via `take_while` at every
+/// candidate `i`: within the same contiguous `.`/`0` run, `take_while` from any `i` in that
+/// run stops at the same end position, so it is computed once per run rather than once per
+/// `i`, making each byte scanned once overall instead of O(n^2) on adversarial input (#1472).
+// `i`/`run_end` are byte offsets from a single-pass ASCII scan, always char boundaries; `i`
 // ranges `0..bytes.len()` from the loop.
 #[allow(clippy::string_slice, clippy::indexing_slicing)]
 fn strip_padding_before_tag(version: &str) -> String {
+    let bytes = version.as_bytes();
+    let mut run_end = 0;
+    for i in 0..bytes.len() {
+        if i > 0 && bytes[i - 1] != b'.' {
+            continue;
+        }
+        if bytes[i] != b'.' && bytes[i] != b'0' {
+            continue;
+        }
+        if i >= run_end {
+            run_end = i + bytes[i..]
+                .iter()
+                .take_while(|b| **b == b'.' || **b == b'0')
+                .count();
+        }
+        if bytes.get(run_end).is_some_and(u8::is_ascii_alphabetic) {
+            return format!("{}{}", &version[..i], &version[run_end..]);
+        }
+    }
+    version.to_string()
+}
+
+#[cfg(test)]
+/// Pre-#1472 reference implementation, kept only for the oracle-equivalence test.
+#[allow(clippy::string_slice, clippy::indexing_slicing)]
+fn strip_padding_before_tag_reference(version: &str) -> String {
     let bytes = version.as_bytes();
     for i in 0..bytes.len() {
         if i > 0 && bytes[i - 1] != b'.' {
@@ -260,16 +314,26 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 /// ">= 5.0", "< 6.0"`), which `deps-bundler`'s parser joins into a single `", "`-separated
 /// [`crate::types::BundlerDependency::version_req`] string (#1366) — mirroring RubyGems'
 /// `Gem::Requirement`, which is satisfied only when *every* declared constraint matches. Splits
-/// on the first top-level comma and recurses, ANDing each side, rather than parsing the whole
-/// string in one pass: a version string never contains a comma, so splitting is unambiguous, and
-/// this keeps the single-constraint fast path (the overwhelming common case) untouched below.
+/// on every top-level comma and ANDs each part, rather than parsing the whole string in one
+/// pass: a version string never contains a comma, so splitting is unambiguous, and this keeps
+/// the single-constraint fast path (the overwhelming common case) untouched below.
+///
+/// Iterates instead of recursing once per comma so that an adversarial requirement with a very
+/// large number of comma-separated constraints cannot stack-overflow a debug build (#1472 LOW):
+/// each split part is trimmed independently, matching the prior recursive trim-per-call
+/// behavior exactly, and an empty part (e.g. a trailing comma) still fails closed via the same
+/// final `is_valid_rubygems_version` check.
 pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
-    let req = requirement.trim();
+    requirement
+        .trim()
+        .split(',')
+        .all(|part| single_constraint_matches(version, part))
+}
 
-    if let Some((first, rest)) = req.split_once(',') {
-        return version_matches_requirement(version, first)
-            && version_matches_requirement(version, rest);
-    }
+/// A single, non-comma-separated constraint check — the body [`version_matches_requirement`]
+/// applies to each comma-separated part of a requirement.
+fn single_constraint_matches(version: &str, requirement: &str) -> bool {
+    let req = requirement.trim();
 
     if req == "*" {
         return true;
@@ -813,5 +877,61 @@ mod tests {
         // instead, matching their pre-#345 raw-string-equality behavior.
         assert!(!version_matches_requirement("1.0.0", "= 1.0.0!!!"));
         assert!(!version_matches_requirement("1.0.0", "1.0.0!!!"));
+    }
+
+    /// Oracle-equivalence test for #1472: the linear rewrites of `strip_trailing_padding` and
+    /// `strip_padding_before_tag` must agree with their pre-#1472 quadratic reference bodies on
+    /// every string over the alphabet that exercises every branch (`.`, `0`, a non-zero digit,
+    /// and a letter), up to length 8 (4 + 4^2 + ... + 4^8 = 87,380 strings per function).
+    #[test]
+    fn test_canonicalize_helpers_match_reference_exhaustively() {
+        const ALPHABET: [char; 4] = ['.', '0', '1', 'a'];
+        const MAX_LEN: usize = 8;
+
+        let mut strings: Vec<String> = ALPHABET.iter().map(|c| c.to_string()).collect();
+        let mut checked = 0usize;
+        for len in 1..=MAX_LEN {
+            for s in &strings {
+                assert_eq!(
+                    strip_trailing_padding(s),
+                    strip_trailing_padding_reference(s),
+                    "strip_trailing_padding mismatch on {s:?}"
+                );
+                assert_eq!(
+                    strip_padding_before_tag(s),
+                    strip_padding_before_tag_reference(s),
+                    "strip_padding_before_tag mismatch on {s:?}"
+                );
+                checked += 1;
+            }
+            if len < MAX_LEN {
+                strings = strings
+                    .iter()
+                    .flat_map(|s| ALPHABET.iter().map(move |c| format!("{s}{c}")))
+                    .collect();
+            }
+        }
+        assert_eq!(checked, 87_380);
+    }
+
+    /// Perf regression test for #1472: both canonicalization helpers used to be O(n^2), taking
+    /// seconds on a 200KB adversarial input in release builds. The linear rewrite must stay well
+    /// under a generous, non-flaky bound even on slow CI runners (Windows, coverage builds).
+    #[test]
+    fn test_compare_versions_linear_on_adversarial_input() {
+        let trailing_shape = format!("1{}", ".0".repeat(100_000));
+        let tag_shape = format!("a.{}1", "0.".repeat(100_000));
+
+        let start = std::time::Instant::now();
+        compare_versions("1.0.0", &trailing_shape);
+        compare_versions(&trailing_shape, "1.0.0");
+        compare_versions("1.0.0", &tag_shape);
+        compare_versions(&tag_shape, "1.0.0");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "compare_versions took {elapsed:?} on adversarial input, expected well under 2s"
+        );
     }
 }

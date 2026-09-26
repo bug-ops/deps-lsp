@@ -53,6 +53,10 @@ pub use diagnostics::{
     sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
     truncate_for_diagnostic,
 };
+// `pub(crate)` (matching the function's own visibility) so `edit.rs` and `in_use_version.rs`
+// can share the same oversized-requirement bound `diagnostics.rs`'s own gates use, rather than
+// duplicating the length check at each call site (#1472).
+pub(crate) use diagnostics::requirement_is_oversized;
 // `pub(crate)` (not `pub`, matching the constant's own visibility) so `completion.rs` can
 // share this bound with `inlay_hints`/`hover` rather than declaring a duplicate cap.
 // `completion` is itself `#[cfg(feature = "lsp-responses")]` (see `lib.rs`) and is this

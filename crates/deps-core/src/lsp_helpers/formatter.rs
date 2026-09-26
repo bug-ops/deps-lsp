@@ -407,6 +407,14 @@ pub trait RequirementResolution: Send + Sync {
         if self.requirement_is_unresolved(requirement) {
             return RequirementStatus::Unresolved;
         }
+        // #1472 defense-in-depth: an oversized requirement is unmodellable, not verified
+        // up to date or outdated — same suppression semantics as the unsatisfiable-diagnostic
+        // gate. This is the sole production caller of `is_requirement_up_to_date`, so gating
+        // here also covers callers of `requirement_status_for`'s default (which forwards to
+        // this method).
+        if super::requirement_is_oversized(requirement) {
+            return RequirementStatus::Unresolved;
+        }
         if self.is_requirement_up_to_date(requirement, latest) {
             RequirementStatus::UpToDate
         } else {
@@ -1033,4 +1041,33 @@ impl<
         + OsvNaming,
 > EcosystemFormatter for T
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::lsp_helpers::test_support::MOCK_FORMATTER;
+
+    /// #1472 defense-in-depth: an oversized requirement must not reach `is_requirement_up_to_date`
+    /// at all — the default `requirement_status` suppresses it as `Unresolved`, same as an
+    /// unresolved placeholder, rather than compiling/comparing it.
+    #[test]
+    fn test_requirement_status_oversized_requirement_is_unresolved() {
+        let oversized = VersionReq::new("1".repeat(300));
+        let latest = ConcreteVersion::new("1.0.0");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&oversized, &latest),
+            RequirementStatus::Unresolved
+        );
+    }
+
+    #[test]
+    fn test_requirement_status_ordinary_requirement_unaffected() {
+        let requirement = VersionReq::new("1.0.0");
+        let latest = ConcreteVersion::new("1.0.0");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &latest),
+            RequirementStatus::UpToDate
+        );
+    }
 }
