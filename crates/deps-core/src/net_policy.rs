@@ -973,6 +973,13 @@ pub enum RegistryRejectionReason {
     /// DPAPI-encrypted `<Password>`, issue #1442) — permanently out of scope, not a transient
     /// binding failure, so kept distinct from [`Self::HasCredentials`].
     EncryptedCredentialUnsupported,
+    /// A `<packageSourceMapping>`-routed package has no usable hop at all because every key in
+    /// its resolved mapping group is a feed kind this server does not support (NuGet's V2
+    /// `protocolVersion` or a local/UNC path feed, issue #1504) — never surfaced when a
+    /// *different* key in the same group already resolves to a usable hop (the package still
+    /// resolves fine in that case), nor for a plain (unmapped) source, where the same reason
+    /// is one candidate among many and reporting it would be pure noise.
+    UnsupportedFeedKind,
 }
 
 impl std::fmt::Display for RegistryRejectionReason {
@@ -991,6 +998,7 @@ impl std::fmt::Display for RegistryRejectionReason {
             Self::EncryptedCredentialUnsupported => {
                 "uses an encrypted credential, which is not supported"
             }
+            Self::UnsupportedFeedKind => "uses a feed kind that is not supported",
         })
     }
 }

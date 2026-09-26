@@ -1,5 +1,5 @@
 //! Background pre-fetch of deps.dev GOSSIP cooldown/low-usage findings per declared
-//! dependency (issue #1456, spec 072) — mirrors `document::osv_scan::run_typosquat_prefetch`'s
+//! dependency (issue #1456, spec 072) — mirrors `document::typosquat::run_typosquat_prefetch`'s
 //! shape closely, but issues one `GetFindingsBatch` POST for the whole document (via
 //! [`deps_core::lsp_helpers::fetch_gossip_findings_batch`]) rather than one call per
 //! dependency.
@@ -17,7 +17,7 @@ use tower_lsp_server::ls_types::Uri;
 use tracing::Instrument;
 
 /// Ceiling on the GOSSIP pre-fetch's overall timeout, independent of the configured
-/// `fetch_timeout_secs` — mirrors [`super::osv_scan`]'s `TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS`
+/// `fetch_timeout_secs` — mirrors [`super::typosquat`]'s `TYPOSQUAT_PREFETCH_TIMEOUT_CEILING_SECS`
 /// exactly, bounding one document's whole batch call so a pathological manifest or a slow
 /// deps.dev response can't leave this background task running indefinitely.
 const GOSSIP_PREFETCH_TIMEOUT_CEILING_SECS: u64 = 30;
@@ -309,7 +309,7 @@ async fn run_gossip_mismatch_refetch(
 }
 
 /// Issue #1456: `run_gossip_prefetch`'s own gates, mirroring
-/// `osv_scan::typosquat_prefetch_tests`'s "never touches `DocumentState` at all" style for
+/// `typosquat::tests::typosquat_prefetch_tests`'s "never touches `DocumentState` at all" style for
 /// the disabled/offline/missing-document no-op cases.
 #[cfg(all(test, feature = "npm"))]
 mod tests {

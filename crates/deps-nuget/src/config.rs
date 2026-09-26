@@ -814,8 +814,7 @@ impl NuGetConfig {
     /// credential (see [`RegistryRejectionClassifier for
     /// NuGetFeedUrlError`](NuGetFeedUrlError)'s own doc for which variants classify). The two
     /// methods are disjoint per entry: [`InvalidEntry`]'s `blocked_class` and `rejection_reason`
-    /// never both return `Some` for the same error, and a
-    /// `Disabled`/`UnsupportedProtocolVersion`/`LocalFeedUnsupported` entry returns `None` from
+    /// never both return `Some` for the same error, and a `Disabled` entry returns `None` from
     /// both, so no source is ever double-reported and no deliberately-quiet rejection is
     /// promoted to a diagnostic.
     ///
@@ -823,10 +822,22 @@ impl NuGetConfig {
     /// (`MAX_REJECTED_SOURCES_PER_PLAIN_CHAIN`), and the same fan-out reasoning as
     /// [`Self::blocked_class_for`] — see that method's doc.
     ///
-    // TODO(critic #1442 M4, deferred): the mapping branch below reports nothing for a package
-    // mapped only to a `UnsupportedProtocolVersion`/`LocalFeedUnsupported` source, unlike the
-    // plain chain where that silence is deliberate fan-out avoidance — a mapping match is
-    // already a single, low-noise signal, so this is a real (if minor, deferred) gap.
+    /// The mapping branch additionally surfaces
+    /// [`RegistryRejectionReason::UnsupportedFeedKind`] when *every* key in the resolved
+    /// mapping group is an `UnsupportedProtocolVersion`/`LocalFeedUnsupported` source, i.e.
+    /// `package` is mapped only to sources of that kind and has no usable hop at all (issue
+    /// #1504, resolving critic #1442 M4's deferred gap). Checked only after the generic
+    /// classifier above finds nothing across the whole group, and gated on
+    /// `hops_for_mapping_keys` returning empty (code-review S1/S2 on the original #1504 fix):
+    /// unlike [`Self::blocked_class_for`] — which reports a blocked mapped source
+    /// regardless of other usable hops, for a dependency-confusion reason that does not apply
+    /// here — reporting `UnsupportedFeedKind` while a *different* key in the same group
+    /// already serves the package would be a spurious warning for a working config, not a
+    /// gap to close. This is also why the fallback is a fully separate pass over `keys`
+    /// rather than folded into the same `find_map` as the generic classifier: folding it in
+    /// would let an earlier unsupported-feed-kind key shadow a later key's own, genuinely
+    /// actionable rejection reason (e.g. a non-https scheme) — see
+    /// `test_rejected_reason_for_mapping_later_key_not_shadowed_by_earlier_quiet_key`.
     #[must_use]
     pub fn rejected_reason_for(&self, package: &PackageName) -> Vec<RejectedSourceClass> {
         if !self.mapping.is_empty() {
@@ -834,23 +845,39 @@ impl NuGetConfig {
             let Some(keys) = self.mapping.resolve_keys_for(&name_lower) else {
                 return Vec::new();
             };
-            return keys
-                .iter()
-                .find_map(|key| {
-                    let entry = resolve_mapping_source_key(key, &self.sources)?;
-                    let (reason, raw_value) = entry
-                        .value
-                        .as_ref()
-                        .err()
-                        .and_then(InvalidEntry::rejection_reason)?;
-                    Some(RejectedSourceClass {
-                        reason,
-                        raw_value,
-                        declaration_key: format!("source:{}", entry.key),
-                    })
+            if let Some(class) = keys.iter().find_map(|key| {
+                let entry = resolve_mapping_source_key(key, &self.sources)?;
+                let (reason, raw_value) = entry
+                    .value
+                    .as_ref()
+                    .err()
+                    .and_then(InvalidEntry::rejection_reason)?;
+                Some(RejectedSourceClass {
+                    reason,
+                    raw_value,
+                    declaration_key: format!("source:{}", entry.key),
                 })
-                .into_iter()
-                .collect();
+            }) {
+                return vec![class];
+            }
+            if self.hops_for_mapping_keys(&keys).is_empty() {
+                return keys
+                    .iter()
+                    .find_map(|key| {
+                        let entry = resolve_mapping_source_key(key, &self.sources)?;
+                        let invalid = entry.value.as_ref().err()?;
+                        let (reason, raw_value) =
+                            Self::mapped_unsupported_feed_kind_reason(invalid)?;
+                        Some(RejectedSourceClass {
+                            reason,
+                            raw_value,
+                            declaration_key: format!("source:{}", entry.key),
+                        })
+                    })
+                    .into_iter()
+                    .collect();
+            }
+            return Vec::new();
         }
         self.sources
             .iter()
@@ -868,6 +895,27 @@ impl NuGetConfig {
             })
             .take(MAX_REJECTED_SOURCES_PER_PLAIN_CHAIN)
             .collect()
+    }
+
+    /// Mapping-branch-only fallback for [`Self::rejected_reason_for`] (issue #1504): recovers a
+    /// reason for exactly the two [`NuGetFeedUrlError`] variants
+    /// [`InvalidEntry::rejection_reason`] classifies as
+    /// [`RejectionOutcome::IntentionallySilent`](deps_core::net_policy::RejectionOutcome::IntentionallySilent)
+    /// — see [`Self::rejected_reason_for`]'s own doc for why that silence does not apply when
+    /// no key in the mapped group resolves to a usable hop. `None` for every other reason,
+    /// since those already surface (or are deliberately excluded, for the blocked-host case)
+    /// through the generic classifier.
+    fn mapped_unsupported_feed_kind_reason(
+        invalid: &InvalidEntry,
+    ) -> Option<(RegistryRejectionReason, String)> {
+        match invalid.reason {
+            NuGetFeedUrlError::UnsupportedProtocolVersion(_)
+            | NuGetFeedUrlError::LocalFeedUnsupported => Some((
+                RegistryRejectionReason::UnsupportedFeedKind,
+                invalid.raw.to_string(),
+            )),
+            _ => None,
+        }
     }
 
     fn resolve_via_mapping(&self, package: &PackageName) -> DependencySource {
@@ -3127,9 +3175,10 @@ mod tests {
     /// over every key in the resolved match group — this proves it classifies *per key*,
     /// continuing past a deliberately-quiet earlier key to an actionable later one, rather than
     /// stopping at the first *matched source* (declared entry) regardless of its classification.
-    /// `Legacy` (first key, `protocolVersion="2"`, deliberately quiet — see
-    /// `RegistryRejectionClassifier for NuGetFeedUrlError`'s doc) must not shadow `Insecure`
-    /// (second key, non-https, actionable).
+    /// `Disabled` (first key, deliberately quiet — see
+    /// `RegistryRejectionClassifier for NuGetFeedUrlError`'s doc; unlike `UnsupportedProtocolVersion`/
+    /// `LocalFeedUnsupported`, #1504 does not affect this classification) must not shadow
+    /// `Insecure` (second key, non-https, actionable).
     #[test]
     fn test_rejected_reason_for_mapping_later_key_not_shadowed_by_earlier_quiet_key() {
         let _guard = deps_core::fs_probe::snapshot_guard();
@@ -3155,6 +3204,11 @@ mod tests {
         let policy = all_policy();
         let config = resolve(dir.path(), &cache, &policy);
 
+        // #1504 code-review S1: `Legacy` (protocolVersion="2") does classify under the new
+        // `UnsupportedFeedKind` fallback, but only when *no* key in the group has a usable
+        // hop — here `Insecure` still resolves to a hop (its own rejection is a diagnostic,
+        // not an absence of a hop), so the fallback must never run, and `Insecure`'s own
+        // actionable `NotHttps` rejection must surface undisturbed via the generic pass.
         let occurrence = only_rejected(
             config.rejected_reason_for(&pkg("MyCompany.Internal")),
             "the later key's actionable rejection must surface despite an earlier quiet key \
@@ -3162,6 +3216,159 @@ mod tests {
         );
         assert_eq!(occurrence.reason, RegistryRejectionReason::NotHttps);
         assert_eq!(occurrence.declaration_key, "source:Insecure");
+    }
+
+    /// #1442 code review finding #2, mirrored for a `Disabled` (rather than
+    /// `UnsupportedProtocolVersion`) quiet key — `Disabled` has no #1504 fallback at all, so
+    /// this is the plainer "generic classifier skips a quiet key" case the test above used
+    /// before #1504 introduced the `UnsupportedFeedKind` fallback for the other quiet reasons.
+    #[test]
+    fn test_rejected_reason_for_mapping_later_key_not_shadowed_by_earlier_disabled_key() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="DisabledFeed" value="https://corp.example/v2/index.json" />
+                    <add key="Insecure" value="http://corp.example/v3/index.json" />
+                </packageSources>
+                <disabledPackageSources>
+                    <add key="DisabledFeed" value="true" />
+                </disabledPackageSources>
+                <packageSourceMapping>
+                    <packageSource key="DisabledFeed">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                    <packageSource key="Insecure">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("MyCompany.Internal")),
+            "the later key's actionable rejection must surface despite an earlier disabled \
+             key in the same match group",
+        );
+        assert_eq!(occurrence.reason, RegistryRejectionReason::NotHttps);
+        assert_eq!(occurrence.declaration_key, "source:Insecure");
+    }
+
+    /// #1504 code-review S2: `UnsupportedFeedKind` must not fire when a *different* mapped
+    /// key already provides a usable hop — unlike `blocked_class_for`'s dependency-confusion
+    /// rationale (which reports a blocked mapped source regardless of other hops), there is
+    /// no security reason to warn about a benign unsupported-protocol/local-feed source when
+    /// the package still resolves fine through another mapped key.
+    #[test]
+    fn test_rejected_reason_for_mapping_unsupported_protocol_version_with_working_hop_not_reported()
+    {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Legacy" value="https://corp.example/v2/index.json" protocolVersion="2" />
+                    <add key="Good" value="https://corp.example/v3/index.json" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="Legacy">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                    <packageSource key="Good">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        assert!(
+            config
+                .rejected_reason_for(&pkg("MyCompany.Internal"))
+                .is_empty(),
+            "a working hop from a different mapped key must suppress the UnsupportedFeedKind \
+             fallback, since the package resolves fine"
+        );
+    }
+
+    /// #1504 (critic #1442 M4's deferred gap): unlike the plain chain
+    /// (`test_rejected_reason_for_unsupported_shapes_not_reported`), a package mapped only to
+    /// a `protocolVersion="2"` source must surface `UnsupportedFeedKind` — a mapping match is
+    /// a single, low-noise signal per package, so the plain chain's fan-out-avoidance
+    /// rationale for staying silent does not apply.
+    #[test]
+    fn test_rejected_reason_for_mapping_unsupported_protocol_version() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Legacy" value="https://corp.example/v2/index.json" protocolVersion="2" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="Legacy">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("MyCompany.Internal")),
+            "a mapped-only unsupported-protocol-version source must surface, unlike the plain \
+             chain",
+        );
+        assert_eq!(
+            occurrence.reason,
+            RegistryRejectionReason::UnsupportedFeedKind
+        );
+        assert_eq!(occurrence.declaration_key, "source:Legacy");
+    }
+
+    /// #1504: mirrors the protocol-version case above for a local/UNC path feed, the other
+    /// variant `mapped_unsupported_feed_kind_reason` classifies.
+    #[test]
+    fn test_rejected_reason_for_mapping_local_feed_unsupported() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let dir = tempfile::tempdir().unwrap();
+        write_config(
+            dir.path(),
+            r#"<configuration>
+                <packageSources>
+                    <add key="Local" value="../packages" />
+                </packageSources>
+                <packageSourceMapping>
+                    <packageSource key="Local">
+                        <package pattern="MyCompany.*" />
+                    </packageSource>
+                </packageSourceMapping>
+            </configuration>"#,
+        );
+        let cache = NuGetConfigCache::new();
+        let policy = all_policy();
+        let config = resolve(dir.path(), &cache, &policy);
+
+        let occurrence = only_rejected(
+            config.rejected_reason_for(&pkg("MyCompany.Internal")),
+            "a mapped-only local-feed source must surface, unlike the plain chain",
+        );
+        assert_eq!(
+            occurrence.reason,
+            RegistryRejectionReason::UnsupportedFeedKind
+        );
+        assert_eq!(occurrence.declaration_key, "source:Local");
     }
 
     /// #1442: a source named under `<packageSourceCredentials>` is dropped fail-closed as

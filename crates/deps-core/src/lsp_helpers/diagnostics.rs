@@ -1578,8 +1578,10 @@ fn build_rejected_registry_diagnostic(occurrence: &RejectedRegistryOccurrence) -
         ),
     )
     // impl-critic M1 (#1438 code review): `Warning`, not `Information` like the sibling
-    // `BlockedHost` diagnostic — every reason here is an unintended misconfiguration leaving
-    // the dependency unchecked, not `BlockedHost`'s deliberate policy decision.
+    // `BlockedHost` diagnostic — every reason here either is itself an unintended
+    // misconfiguration, or (NuGet's `UnsupportedFeedKind`, issue #1504) is only ever reported
+    // when it leaves the dependency with no usable source at all — neither is `BlockedHost`'s
+    // deliberate policy decision, so both warrant the same severity.
     .with_severity(Severity::Warning)
 }
 
@@ -1746,7 +1748,7 @@ fn apply_license_policy_rule(diagnostics: &mut Vec<Diagnostic>, ctx: &RuleContex
 /// R2b — typosquat-suspect declared-dependency signal (issue #1437, spec 071).
 ///
 /// Reads `ctx.versions.typosquat_prefetch`, a background pre-fetch
-/// (`deps-lsp::document::osv_scan::run_typosquat_prefetch`) merged into `VersionData`
+/// (`deps-lsp::document::typosquat::run_typosquat_prefetch`) merged into `VersionData`
 /// before this pipeline runs — see that field's doc for why this lives directly inside
 /// [`generate_diagnostics_from_cache`] rather than behind `Ecosystem::generate_diagnostics`'s
 /// default impl (issue #1437 security-review finding: an ecosystem override that calls
@@ -1808,7 +1810,7 @@ const TYPOSQUAT_FETCH_CONCURRENCY: usize = 8;
 /// eligible declared dependency's evaluation actually completed (issue #1463).
 ///
 /// A caller deciding whether it may treat this fan-out as a finished check (versus one that
-/// must be retried later, e.g. `deps-lsp::document::osv_scan::run_typosquat_prefetch`'s
+/// must be retried later, e.g. `deps-lsp::document::typosquat::run_typosquat_prefetch`'s
 /// debounced-edit gate) needs [`completeness`](Self::completeness) — `signals` alone cannot
 /// distinguish "checked every eligible dependency, none were suspects" from "deps.dev was
 /// unreachable for at least one of them".
@@ -1829,7 +1831,7 @@ pub struct TyposquatFetchOutcome {
 ///
 /// **Not** called from this diagnostics pipeline itself (NFR-002: diagnostics generation
 /// must never `.await` a deps.dev fan-out inline) — the sole caller is
-/// `deps-lsp::document::osv_scan::run_typosquat_prefetch`, a background document-lifecycle
+/// `deps-lsp::document::typosquat::run_typosquat_prefetch`, a background document-lifecycle
 /// task that merges the result into `deps-lsp`'s own `DocumentState::signals.typosquats` map,
 /// from which [`VersionData::typosquat_prefetch`] is populated synchronously before
 /// [`generate_diagnostics_from_cache`] runs — see that field's doc for the full picture and
@@ -4272,6 +4274,10 @@ mod tests {
             (
                 RegistryRejectionReason::EncryptedCredentialUnsupported,
                 "encrypted credential",
+            ),
+            (
+                RegistryRejectionReason::UnsupportedFeedKind,
+                "feed kind that is not supported",
             ),
         ] {
             let rejected_diagnostic =
