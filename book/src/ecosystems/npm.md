@@ -154,6 +154,12 @@ since that would let the "Update all outdated dependencies" quick-fix silently
 overwrite `"react": "catalog:"` with a literal version, destroying the catalog
 reference.
 
+A catalog entry whose value exceeds a length cap (256 bytes) is rejected
+before it is even parsed as a semver range, closing a resource-exhaustion
+vector in an unbounded `pnpm-workspace.yaml` entry — unlike the other
+fail-closed cases above, this one *does* surface a diagnostic, since no real
+catalog entry approaches this length.
+
 **Both a top-level `catalog:` block and a `catalogs.default:` section present**
 is treated as unresolvable for *every* `catalog:` specifier in the workspace
 (not only default-catalog references) — matching pnpm's own

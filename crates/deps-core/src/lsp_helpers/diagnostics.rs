@@ -525,18 +525,29 @@ where
     Some(Box::new(matcher(requirement.to_string())))
 }
 
-/// Requirement strings longer than this are rejected by [`requirement_is_unsatisfiable`]
-/// before compilation, rather than compiled and scanned. No real manifest requirement in any
-/// supported ecosystem approaches this length; it exists solely to bound the cost of an
-/// adversarial or corrupted requirement string. All eleven ecosystems' `compile_requirement`
-/// implementations now parse `requirement` exactly once per dependency and reuse the parsed
-/// form across every candidate in `matches` — Maven/Gradle/NuGet's `RequirementMatcher`s were
-/// the last holdouts re-parsing per candidate, fixed alongside this comment — so the scan
-/// itself is O(`available.len()`) in the size of the candidate list, not the requirement.
-/// This cap stays as defense-in-depth against the one-time parse cost: Maven's range union
-/// can still degrade non-linearly on a pathological multi-KB comma union, and a stray
-/// oversized string is never a real requirement, only a corrupted or adversarial one.
-const MAX_REQUIREMENT_LEN: usize = 256;
+/// Requirement strings longer than this are rejected before compilation, rather than
+/// compiled and scanned.
+///
+/// Enforced by [`requirement_is_unsatisfiable`] before it calls
+/// [`RequirementResolution::compile_requirement`](super::RequirementResolution::compile_requirement).
+/// No real manifest requirement in any supported ecosystem approaches this length; it exists
+/// solely to bound the cost of an adversarial or corrupted requirement string. All eleven
+/// ecosystems' `compile_requirement` implementations now parse `requirement` exactly once per
+/// dependency and reuse the parsed form across every candidate in `matches` —
+/// Maven/Gradle/NuGet's `RequirementMatcher`s were the last holdouts re-parsing per candidate,
+/// fixed alongside this comment — so the scan itself is O(`available.len()`) in the size of
+/// the candidate list, not the requirement. This cap stays as defense-in-depth against the
+/// one-time parse cost: Maven's range union can still degrade non-linearly on a pathological
+/// multi-KB comma union, and a stray oversized string is never a real requirement, only a
+/// corrupted or adversarial one.
+///
+/// `pub` (#1483): also reused outside `deps-core` by any ecosystem-specific requirement
+/// source that reaches its own range parser through a path other than `compile_requirement`
+/// — e.g. `deps-npm`'s pnpm `catalog:` resolver, which calls `node_semver::Range::parse`
+/// directly on a workspace-file-sourced string rather than through `compile_requirement`, and
+/// so needs the same cap applied at its own call site instead of duplicating a second
+/// constant (cross-ecosystem consistency rule, workspace `CLAUDE.md`).
+pub const MAX_REQUIREMENT_LEN: usize = 256;
 
 /// Reports whether `requirement`'s string exceeds [`MAX_REQUIREMENT_LEN`] — the same
 /// "unmodellable, so suppressed rather than compiled and scanned" bound
