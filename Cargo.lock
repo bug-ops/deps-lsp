@@ -612,6 +612,7 @@ dependencies = [
  "ignore",
  "insta",
  "jsonschema",
+ "mockito",
  "serde",
  "serde-sarif",
  "serde_json",

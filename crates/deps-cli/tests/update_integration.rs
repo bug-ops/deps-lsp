@@ -230,6 +230,7 @@ fn applied_plan(range: Range, new_text: &str) -> UpdatePlan {
             }),
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
+            gossip_excluded_version: None,
         }],
     }
 }

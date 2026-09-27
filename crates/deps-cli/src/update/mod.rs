@@ -58,6 +58,13 @@ pub struct PlannedUpdateItem {
     /// there is reported via <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code>
     /// instead).
     pub ignore_rule_overridden: bool,
+    /// A newer version excluded from this item's [`Self::target`] by an active GOSSIP cooldown
+    /// finding (issue #1521 item 1) — mirrors `check`'s identical
+    /// [`deps_core::lsp_helpers::PackageVersions::gossip_excluded_version`] attribution
+    /// (`crate::report::to_finding`). Populated only for [`Outcome::Applied`] items in default
+    /// mode; always `None` under `--security-only`, whose fix target never reads a
+    /// GOSSIP-filtered `latest` at all.
+    pub gossip_excluded_version: Option<deps_core::ConcreteVersion>,
 }
 
 /// A dependency's disposition within an [`UpdatePlan`].
@@ -119,6 +126,17 @@ pub enum SkipReason {
     /// (see [`dedup_applied_items`]) — a report never claims `applied` for something that was
     /// not actually written (critic finding M2).
     OverlapsAnotherEdit,
+    /// The selected update target was published more recently than `freshness.cooldown_secs`
+    /// allows (issue #1525). The per-version publish-time list needed to instead fall back to
+    /// an older, already-cooled-down candidate — the way spec 074's GOSSIP filter does for its
+    /// own signal — is not available at this planner layer (`PackageVersions` only carries
+    /// `latest`'s own `published_at`, not every candidate's), so this dependency is simply left
+    /// alone for this run rather than risking a downgrade guess (critique D1 tracks the
+    /// fallback as a follow-up). **Not guaranteed to self-resolve**: a package that publishes
+    /// at least once per cooldown window can stay skipped indefinitely — it only clears once a
+    /// release survives long enough for its age to exceed `cooldown_secs` without a newer
+    /// release replacing it.
+    WithinFreshnessCooldown,
 }
 
 /// Why a `--security-only` candidate could not be fixed.
@@ -182,6 +200,9 @@ impl PlannedUpdateItem {
             Outcome::Skipped(SkipReason::OverlapsAnotherEdit) => {
                 "this edit's span overlapped another item's and was dropped"
             }
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown) => {
+                "the selected update target was published within the freshness cooldown window"
+            }
             Outcome::RequiresLockfileUpdate => {
                 "declared requirement already admits the fix target; regenerate the lock file (see #1116)"
             }
@@ -193,11 +214,18 @@ impl PlannedUpdateItem {
             }
             Outcome::Unfixable(UnfixableReason::Yanked) => "the fix target is yanked",
         };
+        let mut reason = base.to_string();
         if self.ignore_rule_overridden {
-            format!("{base} (a matching [update].ignore rule was overridden by --security-only)")
-        } else {
-            base.to_string()
+            reason.push_str(" (a matching [update].ignore rule was overridden by --security-only)");
         }
+        // Issue #1521 item 1: mirrors `crate::report::to_finding`'s identical GOSSIP-cooldown
+        // message attribution for `check`.
+        if self.gossip_excluded_version.is_some() {
+            reason.push_str(
+                " (a newer version was excluded from this pick by an active GOSSIP cooldown finding)",
+            );
+        }
+        reason
     }
 }
 
@@ -213,6 +241,80 @@ pub fn is_requested(
         || package_filter.iter().any(|name| {
             formatter.normalize_package_name(&PackageName::new(name.clone())) == normalized_name
         })
+}
+
+/// Whether `normalized_name`'s (or, failing that, `raw_name`'s) cached registry `latest` was
+/// published within `freshness.cooldown_secs` of `now` (issue #1525).
+///
+/// `collect_update_candidates` has no equivalent gate: `freshness.cooldown_secs` otherwise only
+/// ever rewords a downstream hover/diagnostic/completion message, never excludes a version from
+/// being `latest` (see `PackageVersions::gossip_excluded_version`'s doc for that round-1
+/// correction, made for GOSSIP's own distinct signal). `false` whenever `freshness.enabled` is
+/// off or the registry never reported a publish time for `latest` (most ecosystems today), so
+/// this degrades to a silent no-op rather than an error.
+///
+/// **Deliberate divergences, documented rather than reconciled (critique M2/Q1):**
+/// - `check`'s `apply_outdated_rule` (`deps-core/src/lsp_helpers/diagnostics.rs`) lets a
+///   definitive GOSSIP verdict (`Active`/`NotActive`) supersede this same local heuristic when
+///   rendering its `Outdated` message; this function applies the local heuristic
+///   unconditionally, independent of any GOSSIP verdict. Reconciling the two would need a
+///   GOSSIP-verdict signal threaded into `ManifestAnalysis` beyond the `gossip_excluded_version`
+///   attribution already carried — out of scope for this fix; a `check` vs. `update` cooldown
+///   message can therefore legitimately differ for the same dependency.
+/// - `deps-lsp`'s "update to latest" code action (`deps_core::edit::collect_update_edits`, the
+///   `collect_update_candidates` sibling that drops the `Unplannable` arm) does **not** gain
+///   this filter — it stays scoped to `deps-cli update`'s planner only, so an editor quick-fix
+///   can still offer a version this command would skip as too fresh.
+//
+// TODO(critic): this is a full skip, not a fallback to the newest already-cooled-down
+// candidate the way GOSSIP's floor-protected filter (`deps-engine/src/classify/fetch.rs`)
+// does for its own signal — starves a package that publishes at least once per cooldown
+// window (it never becomes an update target). A real fallback needs a per-version
+// publish-time list threaded from the fetch layer, which `PackageVersions` does not carry
+// today (only `latest`'s own `published_at`) — tracked as a follow-up issue (critique D1).
+fn within_freshness_cooldown(
+    analysis: &ManifestAnalysis,
+    normalized_name: &str,
+    raw_name: &str,
+    freshness: deps_core::FreshnessSettings,
+    now: deps_core::PublishTime,
+) -> bool {
+    freshness.enabled
+        && cached_package_versions(analysis, normalized_name, raw_name)
+            .and_then(|v| v.published_at)
+            .is_some_and(|published_at| {
+                deps_core::is_within_cooldown(
+                    published_at.age_secs_from(now),
+                    freshness.cooldown_secs,
+                )
+            })
+}
+
+/// The cached registry data for `normalized_name` (or, failing that, `raw_name`) — the shared
+/// lookup [`within_freshness_cooldown`] and [`gossip_excluded_version`] both need (code-review
+/// finding: previously each ran this same two-step `HashMap` lookup independently).
+fn cached_package_versions<'a>(
+    analysis: &'a ManifestAnalysis,
+    normalized_name: &str,
+    raw_name: &str,
+) -> Option<&'a deps_core::lsp_helpers::PackageVersions> {
+    analysis
+        .cached_versions
+        .get(normalized_name)
+        .or_else(|| analysis.cached_versions.get(raw_name))
+}
+
+/// The version [`deps_core::lsp_helpers::PackageVersions::gossip_excluded_version`] recorded
+/// for `normalized_name` (or, failing that, `raw_name`), when the registry fetch's spec 074
+/// GOSSIP-cooldown filter held one back from being `latest` (issue #1521 item 1) — mirrors
+/// `crate::report::to_finding`'s identical lookup for `check`'s own attribution.
+fn gossip_excluded_version(
+    analysis: &ManifestAnalysis,
+    normalized_name: &str,
+    raw_name: &str,
+) -> Option<deps_core::ConcreteVersion> {
+    cached_package_versions(analysis, normalized_name, raw_name)
+        .and_then(|v| v.gossip_excluded_version.clone())
 }
 
 /// Default-mode planner: every dependency [`deps_core::edit::collect_update_candidates`]
@@ -307,7 +409,15 @@ pub fn is_requested(
 ///     license_fetch_incomplete: false,
 /// };
 ///
-/// let plan = plan_updates(&analysis, content, &MockFormatter, &[], &IgnoreRules::empty());
+/// let plan = plan_updates(
+///     &analysis,
+///     content,
+///     &MockFormatter,
+///     &[],
+///     &IgnoreRules::empty(),
+///     deps_core::FreshnessSettings::default(),
+///     deps_core::PublishTime::now(),
+/// );
 ///
 /// assert_eq!(plan.items.len(), 1);
 /// assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
@@ -320,6 +430,8 @@ pub fn plan_updates(
     formatter: &dyn EcosystemFormatter,
     package_filter: &[String],
     ignore_rules: &IgnoreRules,
+    freshness: deps_core::FreshnessSettings,
+    now: deps_core::PublishTime,
 ) -> UpdatePlan {
     let candidates = deps_core::edit::collect_update_candidates(
         analysis.parse_result.as_ref(),
@@ -350,6 +462,13 @@ pub fn plan_updates(
         .into_iter()
         .map(|p| {
             let target = p.target.as_str().to_string();
+            // Critique M1: computed once, up front, and attached to every disposition below
+            // (not just `Applied`) — this is a property of the candidate's resolved registry
+            // data, independent of why the run didn't end up writing an edit. Previously only
+            // the `Applied` branch set this, so a cooldown skip on a GOSSIP-substituted target
+            // silently dropped the GOSSIP attribution entirely.
+            let gossip_excluded_version =
+                gossip_excluded_version(analysis, &p.normalized_name, &p.name);
 
             if !is_requested(package_filter, &p.normalized_name, formatter) {
                 return PlannedUpdateItem {
@@ -359,6 +478,7 @@ pub fn plan_updates(
                     outcome: Outcome::Skipped(SkipReason::NotRequested),
                     advisory_ids: Vec::new(),
                     ignore_rule_overridden: false,
+                    gossip_excluded_version,
                 };
             }
 
@@ -371,6 +491,19 @@ pub fn plan_updates(
                     outcome: Outcome::Skipped(reason),
                     advisory_ids: Vec::new(),
                     ignore_rule_overridden: false,
+                    gossip_excluded_version,
+                };
+            }
+
+            if within_freshness_cooldown(analysis, &p.normalized_name, &p.name, freshness, now) {
+                return PlannedUpdateItem {
+                    name: p.name,
+                    current: p.current,
+                    target,
+                    outcome: Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+                    advisory_ids: Vec::new(),
+                    ignore_rule_overridden: false,
+                    gossip_excluded_version,
                 };
             }
 
@@ -381,6 +514,7 @@ pub fn plan_updates(
                 outcome: Outcome::Applied(p.edit),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
+                gossip_excluded_version,
             }
         })
         .collect();
@@ -394,12 +528,30 @@ pub fn plan_updates(
         // here (the candidate never got far enough to have one), so this matches an
         // unplannable candidate against `UpdateKind::Unknown`, the same fail-closed treatment
         // `skip_reason`'s own doc already gives a truly unclassifiable update.
+        let gossip_excluded_version = gossip_excluded_version(analysis, &normalized_name, &name);
         let outcome = if !is_requested(package_filter, &normalized_name, formatter) {
             Outcome::Skipped(SkipReason::NotRequested)
         } else if let Some(rule_reason) =
             ignore_rules.skip_reason(&normalized_name, UpdateKind::Unknown)
         {
             Outcome::Skipped(rule_reason)
+        } else if !matches!(
+            reason,
+            deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                | deps_core::edit::UnplannableReason::LatestUnverified
+        ) && within_freshness_cooldown(analysis, &normalized_name, &name, freshness, now)
+        {
+            // Critique M3: a locally-fresh `latest` that also failed to become a writable edit
+            // (an unsafe version string, a non-literal span, a no-op rewrite) gets the same
+            // clean cooldown skip a `Planned` candidate would — whether an edit happens to be
+            // mechanically plannable is orthogonal to whether the version is even a real
+            // recommendation yet. `LatestFlaggedByOsv`/`LatestUnverified` are the two
+            // exceptions (code-review finding, post-M3): per `UnplannableReason::LatestUnverified`'s
+            // own doc, an unverified version "fails closed the same way `LatestFlaggedByOsv`
+            // does... never distinguishable from a flagged one at write time" — demoting only
+            // the flagged case to a routine cooldown pause while still letting the unverified
+            // case through would silently violate that same fail-closed guarantee.
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown)
         } else {
             Outcome::Skipped(SkipReason::NotSafelyEditable(reason))
         };
@@ -410,6 +562,7 @@ pub fn plan_updates(
             outcome,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
+            gossip_excluded_version,
         });
     }
 
@@ -610,6 +763,35 @@ mod tests {
         }
     }
 
+    /// [`plan_updates`] with freshness cooldown filtering disabled — the pre-#1525 behavior
+    /// every test not specifically about that filter wants.
+    ///
+    /// Critique M5: actually passes `enabled: false`, not [`deps_core::FreshnessSettings::default`]
+    /// (which is `enabled: true` — a prior version of this helper passed that and only
+    /// happened to work because every fixture omitted `published_at`; a fixture that later set
+    /// one via [`PackageVersions::with_published_at`] would have been silently skipped instead
+    /// of applied).
+    fn plan_updates_no_cooldown(
+        analysis: &ManifestAnalysis,
+        content: &str,
+        formatter: &dyn EcosystemFormatter,
+        package_filter: &[String],
+        ignore_rules: &IgnoreRules,
+    ) -> UpdatePlan {
+        plan_updates(
+            analysis,
+            content,
+            formatter,
+            package_filter,
+            ignore_rules,
+            deps_core::FreshnessSettings {
+                enabled: false,
+                cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+            },
+            deps_core::PublishTime::now(),
+        )
+    }
+
     fn test_analysis(
         deps: Vec<TestDep>,
         cached: HashMap<PackageName, PackageVersions>,
@@ -641,6 +823,190 @@ mod tests {
         let mut map = HashMap::new();
         map.insert(PackageName::new(name), PackageVersions::latest_only(latest));
         map
+    }
+
+    /// Issue #1525: a `latest` published within `freshness.cooldown_secs` of `now` must be
+    /// skipped as the update target in default mode, not silently applied — the empirically
+    /// verified bug (`deps-cli update --cooldown N --dry-run` had no effect at all).
+    #[test]
+    fn test_plan_updates_within_freshness_cooldown_is_skipped() {
+        let content = "serde = \"1.0.0\"\n";
+        let now = deps_core::PublishTime::from_unix_secs(10_000);
+        let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old
+        let mut versions = cached("serde", "1.2.0");
+        versions.insert(
+            PackageName::new("serde"),
+            PackageVersions::latest_only("1.2.0").with_published_at(published_at),
+        );
+        let analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            deps_core::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 2_000, // wider than the 1000s age above
+            },
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown)
+        );
+        assert_eq!(
+            crate::exit::update_exit_code(&plan),
+            crate::exit::EXIT_CLEAN,
+            "an automatic freshness-cooldown pause must not fail the run"
+        );
+    }
+
+    /// The same fixture, but `freshness.enabled = false`: the cooldown filter must be a
+    /// complete no-op, mirroring how the local heuristic is opt-out everywhere else.
+    #[test]
+    fn test_plan_updates_freshness_disabled_ignores_cooldown() {
+        let content = "serde = \"1.0.0\"\n";
+        let now = deps_core::PublishTime::from_unix_secs(10_000);
+        let published_at = deps_core::PublishTime::from_unix_secs(9_000);
+        let mut versions = cached("serde", "1.2.0");
+        versions.insert(
+            PackageName::new("serde"),
+            PackageVersions::latest_only("1.2.0").with_published_at(published_at),
+        );
+        let analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            deps_core::FreshnessSettings {
+                enabled: false,
+                cooldown_secs: 2_000,
+            },
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
+    }
+
+    /// Issue #1521 item 1: `update`'s output must attribute a GOSSIP-cooldown-excluded newer
+    /// version on its `PlannedUpdateItem`, mirroring `check`'s equivalent message attribution.
+    #[test]
+    fn test_plan_updates_surfaces_gossip_excluded_version() {
+        let content = "serde = \"1.0.0\"\n";
+        let mut versions = cached("serde", "1.2.0");
+        versions.insert(
+            PackageName::new("serde"),
+            PackageVersions::latest_only("1.2.0")
+                .with_gossip_excluded_version(deps_core::ConcreteVersion::new("2.0.0")),
+        );
+        let analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+
+        let plan = plan_updates_no_cooldown(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
+        assert_eq!(
+            plan.items[0].gossip_excluded_version,
+            Some(deps_core::ConcreteVersion::new("2.0.0"))
+        );
+        // Tester finding: an exact-suffix assertion (not just `.contains`) catches future
+        // wording drift between this literal and `crate::report::to_finding`'s identical one.
+        assert_eq!(
+            plan.items[0].reason(),
+            "update applied (a newer version was excluded from this pick by an active GOSSIP cooldown finding)"
+        );
+    }
+
+    /// Critique M1: when both the local freshness cooldown and a GOSSIP cooldown exclusion
+    /// apply to the same candidate, the freshness skip wins the `outcome` decision (no
+    /// per-version publish-time list exists here to reconsider the pick), but the GOSSIP
+    /// attribution must still surface on the item — previously it was hardcoded to `None` on
+    /// every skip branch, silently dropping which version GOSSIP had already excluded.
+    #[test]
+    fn test_plan_updates_freshness_cooldown_takes_precedence_but_keeps_gossip_attribution() {
+        let content = "serde = \"1.0.0\"\n";
+        let now = deps_core::PublishTime::from_unix_secs(10_000);
+        let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old
+        let mut versions = cached("serde", "1.2.0");
+        versions.insert(
+            PackageName::new("serde"),
+            PackageVersions::latest_only("1.2.0")
+                .with_published_at(published_at)
+                .with_gossip_excluded_version(deps_core::ConcreteVersion::new("2.0.0")),
+        );
+        let analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            deps_core::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 2_000, // wider than the 1000s age above
+            },
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+            "the local cooldown skip must win the outcome decision"
+        );
+        assert_eq!(
+            plan.items[0].gossip_excluded_version,
+            Some(deps_core::ConcreteVersion::new("2.0.0")),
+            "the GOSSIP attribution must survive the cooldown skip, not be silently dropped"
+        );
+        let reason = plan.items[0].reason();
+        assert!(
+            reason.contains("freshness cooldown window") && reason.contains("GOSSIP cooldown"),
+            "got: {reason}"
+        );
     }
 
     /// US-001: multiple outdated dependencies, one already at latest.
@@ -677,7 +1043,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates(
+        let plan = plan_updates_no_cooldown(
             &analysis,
             content,
             &STUB_FORMATTER,
@@ -734,7 +1100,7 @@ mod tests {
         );
         analysis.latest_status = Some(latest_status);
 
-        let plan = plan_updates(
+        let plan = plan_updates_no_cooldown(
             &analysis,
             content,
             &STUB_FORMATTER,
@@ -755,6 +1121,182 @@ mod tests {
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_POLICY_VIOLATION,
             "a flagged latest must never exit clean"
+        );
+    }
+
+    /// Critique M3 (the `LatestFlaggedByOsv` exception): a locally-fresh `latest` that is
+    /// *also* OSV-flagged must still surface as `NotSafelyEditable(LatestFlaggedByOsv)` — the
+    /// cooldown skip's "not a real recommendation yet, wait" framing must never demote a
+    /// confirmed-malicious verdict to a routine, exit-0 pause.
+    #[test]
+    fn test_plan_updates_flagged_latest_is_never_masked_by_cooldown() {
+        use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+
+        let content = "serde = \"1.0.0\"\n";
+        let now = deps_core::PublishTime::from_unix_secs(10_000);
+        let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old, in-window
+        let mut versions = cached("serde", "1.2.0");
+        versions.insert(
+            PackageName::new("serde"),
+            PackageVersions::latest_only("1.2.0").with_published_at(published_at),
+        );
+        let mut analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            deps_core::test_util::vuln_key("serde"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.2.0".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+        analysis.latest_status = Some(latest_status);
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            deps_core::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 2_000,
+            },
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+            )),
+            "got: {:?}",
+            plan.items[0].outcome
+        );
+        assert_eq!(
+            crate::exit::update_exit_code(&plan),
+            crate::exit::EXIT_POLICY_VIOLATION,
+            "a flagged latest must never exit clean, even when also within cooldown"
+        );
+    }
+
+    /// Code-review finding (post-M3): `UnplannableReason::LatestUnverified`'s own doc says it
+    /// "fails closed the same way `LatestFlaggedByOsv` does... never distinguishable from a
+    /// flagged one at write time" — the M3 exception must therefore cover both variants, not
+    /// only `LatestFlaggedByOsv`. Before this fix, a locally-fresh `latest` with an unverified
+    /// OSV check was silently reclassified from `NotSafelyEditable(LatestUnverified)` (exit 1)
+    /// to `WithinFreshnessCooldown` (exit 0).
+    #[test]
+    fn test_plan_updates_unverified_latest_is_never_masked_by_cooldown() {
+        use deps_core::osv::LatestStatusMap;
+
+        let content = "serde = \"1.0.0\"\n";
+        let now = deps_core::PublishTime::from_unix_secs(10_000);
+        let published_at = deps_core::PublishTime::from_unix_secs(9_000); // 1000s old, in-window
+        let mut versions = cached("serde", "1.2.0");
+        versions.insert(
+            PackageName::new("serde"),
+            PackageVersions::latest_only("1.2.0").with_published_at(published_at),
+        );
+        let mut analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+        // `Some(&empty map)`: OSV checking is on, but nothing has verified this dependency's
+        // latest yet — the pre-phase-B state, distinct from `None` (checking disabled/offline).
+        analysis.latest_status = Some(LatestStatusMap::new());
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            deps_core::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 2_000,
+            },
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestUnverified
+            )),
+            "got: {:?}",
+            plan.items[0].outcome
+        );
+        assert_eq!(
+            crate::exit::update_exit_code(&plan),
+            crate::exit::EXIT_POLICY_VIOLATION,
+            "an unverified latest must never exit clean, even when also within cooldown"
+        );
+    }
+
+    /// Critique M3: an unplannable candidate whose `latest` is locally fresh gets the same
+    /// clean cooldown skip a `Planned` candidate would — whether an edit happens to be
+    /// mechanically writable is orthogonal to whether the version is even a real
+    /// recommendation yet.
+    #[test]
+    fn test_plan_updates_unplannable_candidate_within_cooldown_is_cooldown_skip_not_unsafe() {
+        let content = "tokio = \"weird\"\n"; // literal mismatch -> NonLiteralSpan, absent this fix
+        let now = deps_core::PublishTime::from_unix_secs(10_000);
+        let published_at = deps_core::PublishTime::from_unix_secs(9_000);
+        let versions_map = {
+            let mut map = cached("tokio", "2.0.0");
+            map.insert(
+                PackageName::new("tokio"),
+                PackageVersions::latest_only("2.0.0").with_published_at(published_at),
+            );
+            map
+        };
+        let analysis = test_analysis(
+            vec![test_dep(
+                "tokio",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions_map,
+        );
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            deps_core::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 2_000,
+            },
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+            "got: {:?}",
+            plan.items[0].outcome
+        );
+        assert_eq!(
+            crate::exit::update_exit_code(&plan),
+            crate::exit::EXIT_CLEAN,
+            "a cooldown-driven pause must exit clean even when the candidate was also unplannable"
         );
     }
 
@@ -779,7 +1321,7 @@ mod tests {
         // latest yet — the pre-phase-B state, distinct from `None` (checking disabled/offline).
         analysis.latest_status = Some(LatestStatusMap::new());
 
-        let plan = plan_updates(
+        let plan = plan_updates_no_cooldown(
             &analysis,
             content,
             &STUB_FORMATTER,
@@ -828,7 +1370,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates(
+        let plan = plan_updates_no_cooldown(
             &analysis,
             content,
             &STUB_FORMATTER,
@@ -866,7 +1408,8 @@ mod tests {
             &STUB_FORMATTER,
         );
 
-        let plan = plan_updates(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
+        let plan =
+            plan_updates_no_cooldown(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
         assert!(matches!(
@@ -901,7 +1444,8 @@ mod tests {
             &STUB_FORMATTER,
         );
 
-        let plan = plan_updates(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
+        let plan =
+            plan_updates_no_cooldown(&analysis, content, &STUB_FORMATTER, &[], &ignore_rules);
 
         assert_eq!(plan.items.len(), 1);
         assert!(
@@ -930,7 +1474,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates(
+        let plan = plan_updates_no_cooldown(
             &analysis,
             content,
             &STUB_FORMATTER,
@@ -963,7 +1507,7 @@ mod tests {
             versions,
         );
 
-        let plan = plan_updates(
+        let plan = plan_updates_no_cooldown(
             &analysis,
             content,
             &STUB_FORMATTER,
@@ -1010,6 +1554,7 @@ mod tests {
                 }),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
+                gossip_excluded_version: None,
             }],
         };
 
@@ -1043,6 +1588,7 @@ mod tests {
                 }),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
+                gossip_excluded_version: None,
             }],
         };
 
@@ -1076,6 +1622,7 @@ mod tests {
                 }),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
+                gossip_excluded_version: None,
             }],
         };
 
@@ -1106,6 +1653,7 @@ mod tests {
                 outcome: Outcome::Skipped(SkipReason::IgnoreRule),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
+                gossip_excluded_version: None,
             }],
         };
 
@@ -1136,6 +1684,7 @@ mod tests {
             }),
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
+            gossip_excluded_version: None,
         }
     }
 

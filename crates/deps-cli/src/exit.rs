@@ -82,9 +82,14 @@ pub fn exit_code(
 /// as amended by S3 — see below).
 ///
 /// `0` if every item is [`Outcome::Applied`], the plan was empty (nothing eligible), or every
-/// non-`Applied` item is a deliberate operator exclusion
+/// non-`Applied` item is a deliberate exclusion
 /// (<code>[Outcome::Skipped]([SkipReason::NotRequested])</code> — a `--package` narrowing —
-/// or <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code> — a `[update].ignore` match).
+/// <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code> — a `[update].ignore` match — or
+/// <code>[Outcome::Skipped]([SkipReason::WithinFreshnessCooldown])</code>, issue #1525's
+/// automatic, policy-driven pause rather than a failed fix attempt — **not guaranteed to
+/// self-resolve**: it clears only once a release survives long enough to age past the cooldown
+/// window without a newer release replacing it, so a package publishing at least once per
+/// window can stay skipped indefinitely (see [`SkipReason::WithinFreshnessCooldown`]'s own doc)).
 /// `1` if at least one item is
 /// <code>[Outcome::Skipped]([SkipReason::NotSafelyEditable])</code>,
 /// [`Outcome::RequiresLockfileUpdate`], or [`Outcome::Unfixable`] — these represent something
@@ -115,7 +120,11 @@ pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
         !matches!(
             item.outcome,
             Outcome::Applied(_)
-                | Outcome::Skipped(SkipReason::NotRequested | SkipReason::IgnoreRule)
+                | Outcome::Skipped(
+                    SkipReason::NotRequested
+                        | SkipReason::IgnoreRule
+                        | SkipReason::WithinFreshnessCooldown
+                )
         )
     });
     if has_unresolved_item {
@@ -233,6 +242,7 @@ mod tests {
             outcome,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
+            gossip_excluded_version: None,
         }
     }
 
@@ -306,6 +316,19 @@ mod tests {
             ))],
         };
         assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
+    }
+
+    /// Issue #1525: an automatic freshness-cooldown pause is a policy-driven exclusion, not a
+    /// failed fix attempt — must not fail the run any more than `NotRequested`/`IgnoreRule` do.
+    #[test]
+    fn test_update_exit_code_within_freshness_cooldown_skip_alone_is_clean() {
+        let plan = UpdatePlan {
+            items: vec![
+                update_item(applied()),
+                update_item(Outcome::Skipped(SkipReason::WithinFreshnessCooldown)),
+            ],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
     }
 
     #[test]
