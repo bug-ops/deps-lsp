@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `lsp_helpers::{FallbackEditVerdict, FallbackEditRejection, fallback_edit_excludes_newer}`, `edit::{ManifestReparse, EcosystemReparse}`, and `ecosystem::parse_manifest_now` — a two-phase, re-parse-based guard deciding whether a cooldown-fallback edit is safe to write, applied uniformly across all 14 ecosystems (part of #1544) (#1581)
 
 ### Security
+- **deps-core**: `fallback_edit_excludes_newer`'s two `compile_requirement` call sites now gate on `requirement_is_oversized` first, closing the same CWE-400 class #1472/#1579 closed elsewhere (resolves #1580)
 - **deps-cli, deps-core**: `deps-cli update --security-only`'s `NoOpRewrite` classification now gates on `requirement_is_oversized` before calling `compile_requirement`, closing the same CWE-400 class #1472 closed elsewhere (resolves #1578) (#1579)
 - **deps-core**: closes two defense-in-depth SSRF/HTTPS gaps — a userinfo-spoofed loopback host (e.g. `http://localhost:80@evil.com/`) could bypass the test-util HTTPS carve-out, and `HostClass` misclassified the RFC 8215 NAT64 local-use prefix, `0.0.0.0/8`, `192.0.0.0/24`, `fec0::/10`, and the Alibaba Cloud metadata address as `Global`/unwrapped (resolves #1562) (#1567)
 - **deps-core, deps-lsp, deps-engine**: code actions and completion now independently OSV-check every version offered as an "update to X" item, not only `latest`, excluding a flagged or unverified candidate the same way an unsafe `latest` is already excluded (resolves #1524) (#1530)
