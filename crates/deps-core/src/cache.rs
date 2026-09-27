@@ -177,30 +177,35 @@ impl BodyLimit {
     }
 }
 
-/// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`), with any scheme
-/// and an optional port — the shape every `mockito::Server` binds to.
+/// Whether `url`'s host is loopback (`127.0.0.1`, `localhost`, or `::1`), with an
+/// `http`/`https` scheme and an optional port — the shape every `mockito::Server` binds to.
 ///
 /// Only compiled into test builds (see [`ensure_https`]): a non-loopback host must never
 /// be allowed to bypass the HTTPS requirement, even under `cfg(test)`/`test-util`. See
-/// [`crate::net_policy::validate_index_url`]'s own private loopback check for the
-/// counterpart used on parsed `url::Url` values — kept separate rather than merged, since
-/// this one takes a raw `&str` on `ensure_https`'s hot path and has looser (any-scheme)
-/// semantics.
+/// [`crate::net_policy::validate_index_url`]'s own private loopback check (`is_loopback_url`)
+/// for the counterpart this was modeled on — the two have since diverged: this function
+/// strips the brackets [`Url::host_str`] keeps around an IPv6 literal (`"[::1]"`) before
+/// comparing, while `is_loopback_url` compares the bracketed form directly and so never
+/// actually matches an IPv6 loopback host (pre-existing, out of scope for #1562).
+///
+/// Parses with [`Url::parse`] and compares [`Url::host_str`] rather than splitting the raw
+/// string on `:` — a naive split misreads userinfo as the host boundary (e.g.
+/// `http://localhost:80@evil.com/x`'s actual host is `evil.com`, but splitting on the first
+/// `:` yields `localhost`), which let a public HTTP host bypass the HTTPS requirement by
+/// prefixing a loopback-looking userinfo (#1562).
 #[cfg(any(test, feature = "test-util"))]
 fn is_loopback_host(url: &str) -> bool {
-    let Some(rest) = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))
-    else {
+    let Ok(parsed) = Url::parse(url) else {
         return false;
     };
-    let host_and_port = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = if let Some(bracketed) = host_and_port.strip_prefix('[') {
-        bracketed.split(']').next().unwrap_or("")
-    } else {
-        host_and_port.split(':').next().unwrap_or("")
-    };
-    matches!(host, "127.0.0.1" | "localhost" | "::1")
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    // `Url::host_str` keeps the brackets on an IPv6 literal (`"[::1]"`, not `"::1"`).
+    let host = parsed
+        .host_str()
+        .map(|h| h.trim_start_matches('[').trim_end_matches(']'));
+    matches!(host, Some("127.0.0.1" | "localhost" | "::1"))
 }
 
 /// Validates that a URL uses HTTPS protocol.
@@ -405,9 +410,9 @@ impl AddrGuard {
 /// policy-independent — it does not consult `guard` at all, since
 /// [`HostClass::never_a_registry`](crate::net_policy::HostClass::never_a_registry)
 /// is deliberately narrower than any workspace-registry policy setting: it blocks only the
-/// classes (loopback, link-local, cloud metadata, unspecified) that are never a legitimate
-/// registry redirect target for *any* ecosystem, benefiting every one of the eleven crates
-/// sharing the baseline client, not only Cargo's workspace-declared indexes.
+/// classes (loopback, link-local, cloud metadata, unspecified, reserved) that are never a
+/// legitimate registry redirect target for *any* ecosystem, benefiting every one of the eleven
+/// crates sharing the baseline client, not only Cargo's workspace-declared indexes.
 ///
 /// `guard`'s own [`AddrGuard::tier_allows`] term additionally rejects a hop whose target class
 /// the *tier* does not allow — under [`AddrGuard::Baseline`] this term is constant `false`, so
@@ -600,8 +605,8 @@ impl std::fmt::Debug for TestLookup {
 /// This resolver's guard tier decides how much a resolved address is scrutinized: under
 /// [`AddrGuard::Baseline`] this enforces only the policy-independent
 /// [`crate::net_policy::HostClass::never_a_registry`] tier (loopback, link-local,
-/// cloud-metadata, unspecified), the same tier [`hop_targets_blocked_host`] already applies —
-/// closing issue #449's filed exploit (cloud-metadata rebinding) but not full `PublicOnly`
+/// cloud-metadata, unspecified, reserved), the same tier [`hop_targets_blocked_host`] already
+/// applies — closing issue #449's filed exploit (cloud-metadata rebinding) but not full `PublicOnly`
 /// semantics. Under [`AddrGuard::WorkspaceDeclared`], [`validate_resolved_addrs`] additionally
 /// rejects any resolved address outside the snapshotted [`crate::net_policy::WorkspaceRegistryAccess`]
 /// policy's allowed classes — closing issue #455 (a workspace-declared name that legitimately
@@ -2281,6 +2286,14 @@ mod tests {
     #[test]
     fn test_ensure_https_accepts_bracketed_ipv6_loopback() {
         assert!(ensure_https("http://[::1]:1234/x").is_ok());
+    }
+
+    // #1562: a naive `:`-split misread userinfo as the host boundary, so a loopback-looking
+    // userinfo let a plain-HTTP request to a public host slip past the HTTPS requirement.
+    #[test]
+    fn test_ensure_https_rejects_userinfo_spoofed_loopback() {
+        assert!(ensure_https("http://localhost:80@evil.com/x").is_err());
+        assert!(ensure_https("http://localhost:@evil.com/").is_err());
     }
 
     // reqwest's `Attempt` has no public constructor, so the redirect closure can't be
