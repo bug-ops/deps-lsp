@@ -554,6 +554,40 @@ mod tests {
         );
     }
 
+    /// #1590 (split from #1571's PyPI/Composer/Bundler fix, PR #1589): Maven has no literal
+    /// `!=` operator, but a disjoint range union punches the same kind of hole —
+    /// `[1.0,1.5),(1.5,2.0)` bans exactly `1.5.0`. NO listed `available` entry strictly newer
+    /// than the excluded `1.5.0` fallback matches R0 either (`2.0.0` also fails the exclusive
+    /// `2.0` ceiling), mirroring PR #1589's vacuous-case shape: a purely structural "does
+    /// something newer also match" scan is vacuous here, so this only rejects because
+    /// `MavenMatcher::explicitly_excludes` asks the range union's shape directly.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_disjoint_range_excluded_fallback_vacuous_case()
+     {
+        let ecosystem = MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "<project><dependencies><dependency><groupId>com.acme</groupId>\
+             <artifactId>pkg</artifactId><version>[1.0,1.5),(1.5,2.0)</version></dependency>\
+             </dependencies></project>"
+            .to_string();
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &MavenFormatter,
+            &uri,
+            &content,
+            "com.acme:pkg",
+            "1.5.0",
+            &["2.0.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_manifest_filenames/test_as_any
     // family. Maven has no lock file format, so `lockfile_filenames` is omitted here;

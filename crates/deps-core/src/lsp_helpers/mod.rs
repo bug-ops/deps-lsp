@@ -3333,23 +3333,28 @@ pub trait RequirementMatcher: Send + Sync {
     /// ```
     fn strict_prerelease_exclusion(&self) -> bool;
 
-    /// Whether this requirement's own grammar contains an explicit exclusion term (PyPI's
-    /// `!=`/`!=X.*`, Composer's `!=`, Bundler's `!=`) that individually bans exactly `version`,
-    /// independent of whether `version` would otherwise fall inside the requirement's nominal
-    /// range.
+    /// Whether this requirement's own grammar punches a hole that individually bans exactly
+    /// `version`, independent of whether `version` would otherwise fall inside the
+    /// requirement's nominal range — whether via a literal exclusion term (PyPI's `!=`/`!=X.*`,
+    /// Composer's `!=`, Bundler's `!=`) or, for a grammar with no such operator, a gap between
+    /// two segments of a disjoint range union (Maven's `[1.0,1.5),(1.5,2.0)`, which bans exactly
+    /// `1.5.0`).
     ///
-    /// Fix-cycle (#1571): [`crate::lsp_helpers::fallback_edit_excludes_newer`]'s
+    /// Fix-cycle (#1571, generalized by #1590): [`crate::lsp_helpers::fallback_edit_excludes_newer`]'s
     /// `OriginalExcludesFallback` check needs this as an intensional signal — scanning
-    /// `available` for "does some newer entry also match" cannot distinguish a `!=`-punched
+    /// `available` for "does some newer entry also match" cannot distinguish a punched-out
     /// hole from a fallback that legitimately exceeds the requirement's ceiling, since both
     /// produce the same `matches(fallback) == Some(false)` result and, when no newer entry
     /// happens to be listed in `available` either, the identical "nothing newer matches" scan
     /// outcome (critic-reproduced: `>=1.0,!=1.5.0,<2.0` and `>=1.0,<1.5` give the same verdict
     /// over `available = [2.0.0, 1.5.0, 1.0.0]` unless the matcher is asked directly).
     ///
-    /// Default `false` — most ecosystems have no such operator (range/caret/tilde bounds only
-    /// ever exclude by falling outside an interval, never by naming one banned value inside
-    /// it). Only a matcher whose grammar has a real `!=`-style term overrides this.
+    /// Default `false` — most ecosystems have no such shape (range/caret/tilde bounds only ever
+    /// exclude by falling outside an interval, never by naming or gapping out one banned value
+    /// inside it). A matcher overrides this exactly when its grammar CAN express such a hole —
+    /// via a literal `!=`-style term, or, lacking one, via a gap between disjoint range/union
+    /// segments — something `matches()` alone cannot surface as "explicitly banned" rather than
+    /// "merely out of range".
     ///
     /// # Examples
     ///
