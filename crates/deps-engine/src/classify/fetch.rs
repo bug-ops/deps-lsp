@@ -859,13 +859,10 @@ async fn fetch_and_classify_package(
             let now = deps_core::freshness::PublishTime::now();
             // Shared gate (spec 075 FR-005/T000, DRY) — already required `Some` + active, so
             // behavior here is unchanged; only the ad-hoc closure is replaced.
-            let is_gossip_cooldown = |version: &ConcreteVersion| {
+            let unfiltered_pick_flagged = unfiltered_pick_version.as_ref().is_some_and(|version| {
                 deps_core::lsp_helpers::gossip_cooldown_for(gossip, &name, version.as_str(), now)
                     == deps_core::lsp_helpers::GossipCooldownLookup::Active
-            };
-            let unfiltered_pick_flagged = unfiltered_pick_version
-                .as_ref()
-                .is_some_and(&is_gossip_cooldown);
+            });
 
             // Spec 075 FR-001/FR-002 (T001): computed unconditionally whenever freshness is
             // enabled, before `versions` is consumed below — read-time disposition
@@ -888,86 +885,19 @@ async fn fetch_and_classify_package(
 
             // The resolved pick (or `None`, meaning the `get_latest_matching_from` fallback
             // below runs) and the FR-005 attribution field.
-            type IndexedVersion = (usize, Box<dyn Version>);
-
-            let (list_pick, gossip_excluded_version): (
-                Option<Box<dyn Version>>,
-                Option<ConcreteVersion>,
-            ) = if unfiltered_pick_flagged {
-                // Protect floor (FR-003b: no-op when no in-use version resolved) — shared with
-                // `compute_cooldown_fallback`'s own D2 floor (issue #1551 finding 2).
-                let protect_floor = in_use_floor(&in_use_versions, &versions);
-
-                match protect_floor {
-                    None => (
-                        unfiltered_pick_idx.and_then(|idx| versions.into_iter().nth(idx)),
-                        None,
-                    ),
-                    Some(floor) => {
-                        // Keep each candidate's original index alongside it (parallel
-                        // `filtered_indices`/`filtered_versions`, since `select_latest_matching`
-                        // needs a plain slice) so the final pick's position can be checked
-                        // against `floor` (FR-003e) and the unfiltered pick recovered by index,
-                        // not version string (avoids matching the wrong duplicate-string entry).
-                        let mut filtered_indices: Vec<usize> = Vec::new();
-                        let mut filtered_versions: Vec<Box<dyn Version>> = Vec::new();
-                        let mut dropped: Vec<IndexedVersion> = Vec::new();
-                        for (idx, v) in versions.into_iter().enumerate() {
-                            if idx >= floor || !is_gossip_cooldown(v.version_string()) {
-                                filtered_indices.push(idx);
-                                filtered_versions.push(v);
-                            } else {
-                                dropped.push((idx, v));
-                            }
-                        }
-
-                        let filtered_pick_idx = registry.select_latest_matching(
-                            &filtered_versions,
-                            wildcard_req,
-                            selection_context,
-                        );
-                        // Reject a filtered pick older than the floor (FR-003e) — a downgrade.
-                        let pick_at_or_above_floor = filtered_pick_idx
-                            .and_then(|idx| filtered_indices.get(idx))
-                            .is_some_and(|original_idx| *original_idx <= floor);
-
-                        if pick_at_or_above_floor {
-                            let filtered_pick_version = filtered_pick_idx
-                                .and_then(|idx| filtered_versions.get(idx))
-                                .map(|v| v.version_string().clone());
-                            let excluded = (filtered_pick_version != unfiltered_pick_version)
-                                .then(|| unfiltered_pick_version.clone())
-                                .flatten();
-                            (
-                                filtered_pick_idx
-                                    .and_then(|idx| filtered_versions.into_iter().nth(idx)),
-                                excluded,
-                            )
-                        } else {
-                            // No acceptable pick (FR-003d/e) — recover the unfiltered pick by
-                            // its original index (dropped, or defensively filtered_versions).
-                            let recovered = unfiltered_pick_idx.and_then(|target| {
-                                dropped
-                                    .iter()
-                                    .position(|(idx, _)| *idx == target)
-                                    .map(|i| dropped.swap_remove(i).1)
-                                    .or_else(|| {
-                                        filtered_indices
-                                            .iter()
-                                            .position(|idx| *idx == target)
-                                            .map(|i| filtered_versions.swap_remove(i))
-                                    })
-                            });
-                            (recovered, None)
-                        }
-                    }
-                }
-            } else {
-                (
-                    unfiltered_pick_idx.and_then(|idx| versions.into_iter().nth(idx)),
-                    None,
-                )
-            };
+            let (list_pick, gossip_excluded_version) = gossip_floor_protected_pick(
+                registry,
+                versions,
+                &in_use_versions,
+                wildcard_req,
+                *selection_context,
+                unfiltered_pick_idx,
+                unfiltered_pick_version,
+                unfiltered_pick_flagged,
+                gossip,
+                &name,
+                now,
+            );
 
             // `selection_context` is threaded through so a registry with manifest-level
             // stability state (Composer's `minimum-stability`, #424 S1) can apply it — already
@@ -985,68 +915,15 @@ async fn fetch_and_classify_package(
                 // a registry with an incomplete list endpoint (Go's `/@v/list`, which never
                 // enumerates pseudo-versions) may need the more complete `get_latest_matching`
                 // (Go's `/@latest`). Costs a second network call, only in this rare case.
-                let fallback = tokio::time::timeout(
+                get_latest_matching_fallback(
+                    registry,
+                    &name,
+                    &source,
+                    wildcard_req,
+                    *selection_context,
                     timeout,
-                    registry.get_latest_matching_from(
-                        &name,
-                        &source,
-                        wildcard_req,
-                        selection_context,
-                    ),
                 )
-                .await;
-                match fallback {
-                    Ok(Ok(Some(v))) => {
-                        tracing::debug!(
-                            package = %name.for_tracing(),
-                            version = %v.version_string(),
-                            "fetched via get_latest_matching fallback"
-                        );
-                        Pick::resolved(v.as_ref())
-                    }
-                    Ok(Ok(None)) => {
-                        tracing::debug!(package = %name.for_tracing(), "no version found");
-                        // Both the list-based pick and this fallback succeeded and found
-                        // nothing — the package exists but has zero comparable versions
-                        // (#550). Distinct from every branch below that produces `Failed`.
-                        Pick::Unresolved(PackageStatus::NoComparableVersions)
-                    }
-                    Ok(Err(e)) => {
-                        tracing::warn!(
-                            package = %name.for_tracing(),
-                            error = %e,
-                            "fetch fallback failed"
-                        );
-                        // A genuine not-found (the registry was successfully asked and
-                        // said "no such package") is not a fetch failure — only an
-                        // unanswerable request is (#267 C1).
-                        if e.is_not_found() {
-                            Pick::Unresolved(PackageStatus::NotFound {
-                                message: e.to_string(),
-                            })
-                        } else {
-                            Pick::Unresolved(PackageStatus::Failed {
-                                failure: e.fetch_failure(),
-                                message: e.to_string(),
-                            })
-                        }
-                    }
-                    Err(_) => {
-                        tracing::warn!(
-                            package = %name.for_tracing(),
-                            "fetch fallback timed out ({}s)",
-                            timeout.as_secs()
-                        );
-                        Pick::Unresolved(PackageStatus::Failed {
-                            failure: FetchFailure::Transient,
-                            message: format!(
-                                "{}: registry request timed out after {}s",
-                                name.for_tracing(),
-                                timeout.as_secs()
-                            ),
-                        })
-                    }
-                }
+                .await
             };
 
             let resolved: Option<&ResolvedPick> = match &pick {
@@ -1158,6 +1035,180 @@ async fn fetch_and_classify_package(
         name,
         status,
         yanked,
+    }
+}
+
+/// GOSSIP-cooldown floor-protected re-filter of the list-based pick (spec 074 FR-003),
+/// extracted from [`fetch_and_classify_package`] (issue #1560): when the unfiltered pick
+/// isn't cooldown-flagged, it is returned unchanged; otherwise candidates below the in-use
+/// floor are filtered out and re-ranked, falling back to the unfiltered pick when no
+/// acceptable filtered candidate remains (FR-003d/e). History in
+/// specs/074-deps-cli-gossip-parity/spec.md, not restated here.
+///
+/// Returns the final list-based pick (`None` means the `get_latest_matching_from` fallback
+/// must run) and the FR-005 attribution field (the version excluded by the floor filter, when
+/// one was).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every parameter is either data already owned by the caller (versions, the \
+              in-use floor inputs) or a piece of the unfiltered pick the caller computed \
+              once and must not recompute here — grouping into a struct would only move, \
+              not reduce, the parameter count"
+)]
+fn gossip_floor_protected_pick(
+    registry: &dyn Registry,
+    versions: Vec<Box<dyn Version>>,
+    in_use_versions: &[String],
+    wildcard_req: &VersionReq,
+    selection_context: deps_core::SelectionContext,
+    unfiltered_pick_idx: Option<usize>,
+    unfiltered_pick_version: Option<ConcreteVersion>,
+    unfiltered_pick_flagged: bool,
+    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
+    name: &PackageName,
+    now: deps_core::freshness::PublishTime,
+) -> (Option<Box<dyn Version>>, Option<ConcreteVersion>) {
+    if !unfiltered_pick_flagged {
+        return (
+            unfiltered_pick_idx.and_then(|idx| versions.into_iter().nth(idx)),
+            None,
+        );
+    }
+
+    let is_gossip_cooldown = |version: &ConcreteVersion| {
+        deps_core::lsp_helpers::gossip_cooldown_for(gossip, name, version.as_str(), now)
+            == deps_core::lsp_helpers::GossipCooldownLookup::Active
+    };
+
+    // Protect floor (FR-003b: no-op when no in-use version resolved) — shared with
+    // `compute_cooldown_fallback`'s own D2 floor (issue #1551 finding 2).
+    let Some(floor) = in_use_floor(in_use_versions, &versions) else {
+        return (
+            unfiltered_pick_idx.and_then(|idx| versions.into_iter().nth(idx)),
+            None,
+        );
+    };
+
+    // Keep each candidate's original index alongside it (parallel
+    // `filtered_indices`/`filtered_versions`, since `select_latest_matching` needs a plain
+    // slice) so the final pick's position can be checked against `floor` (FR-003e) and the
+    // unfiltered pick recovered by index, not version string (avoids matching the wrong
+    // duplicate-string entry).
+    type IndexedVersion = (usize, Box<dyn Version>);
+    let mut filtered_indices: Vec<usize> = Vec::new();
+    let mut filtered_versions: Vec<Box<dyn Version>> = Vec::new();
+    let mut dropped: Vec<IndexedVersion> = Vec::new();
+    for (idx, v) in versions.into_iter().enumerate() {
+        if idx >= floor || !is_gossip_cooldown(v.version_string()) {
+            filtered_indices.push(idx);
+            filtered_versions.push(v);
+        } else {
+            dropped.push((idx, v));
+        }
+    }
+
+    let filtered_pick_idx =
+        registry.select_latest_matching(&filtered_versions, wildcard_req, &selection_context);
+    // Reject a filtered pick older than the floor (FR-003e) — a downgrade.
+    let pick_at_or_above_floor = filtered_pick_idx
+        .and_then(|idx| filtered_indices.get(idx))
+        .is_some_and(|original_idx| *original_idx <= floor);
+
+    if pick_at_or_above_floor {
+        let filtered_pick_version = filtered_pick_idx
+            .and_then(|idx| filtered_versions.get(idx))
+            .map(|v| v.version_string().clone());
+        let excluded = (filtered_pick_version != unfiltered_pick_version)
+            .then(|| unfiltered_pick_version.clone())
+            .flatten();
+        (
+            filtered_pick_idx.and_then(|idx| filtered_versions.into_iter().nth(idx)),
+            excluded,
+        )
+    } else {
+        // No acceptable pick (FR-003d/e) — recover the unfiltered pick by its original
+        // index (dropped, or defensively filtered_versions).
+        let recovered = unfiltered_pick_idx.and_then(|target| {
+            dropped
+                .iter()
+                .position(|(idx, _)| *idx == target)
+                .map(|i| dropped.swap_remove(i).1)
+                .or_else(|| {
+                    filtered_indices
+                        .iter()
+                        .position(|idx| *idx == target)
+                        .map(|i| filtered_versions.swap_remove(i))
+                })
+        });
+        (recovered, None)
+    }
+}
+
+/// `get_latest_matching_from` network fallback, extracted from
+/// [`fetch_and_classify_package`] (issue #1560): run only when the list-based pick found
+/// nothing, for a registry with an incomplete list endpoint (Go's `/@v/list`, which never
+/// enumerates pseudo-versions) that may still answer through the more complete
+/// `get_latest_matching` (Go's `/@latest`). Costs a second network call, only in this rare
+/// case.
+async fn get_latest_matching_fallback(
+    registry: &dyn Registry,
+    name: &PackageName,
+    source: &deps_core::parser::DependencySource,
+    wildcard_req: &VersionReq,
+    selection_context: deps_core::SelectionContext,
+    timeout: Duration,
+) -> Pick {
+    let fallback = tokio::time::timeout(
+        timeout,
+        registry.get_latest_matching_from(name, source, wildcard_req, &selection_context),
+    )
+    .await;
+    match fallback {
+        Ok(Ok(Some(v))) => {
+            tracing::debug!(
+                package = %name.for_tracing(),
+                version = %v.version_string(),
+                "fetched via get_latest_matching fallback"
+            );
+            Pick::resolved(v.as_ref())
+        }
+        Ok(Ok(None)) => {
+            tracing::debug!(package = %name.for_tracing(), "no version found");
+            // Both the list-based pick and this fallback succeeded and found nothing — the
+            // package exists but has zero comparable versions (#550). Distinct from every
+            // branch below that produces `Failed`.
+            Pick::Unresolved(PackageStatus::NoComparableVersions)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                package = %name.for_tracing(),
+                error = %e,
+                "fetch fallback failed"
+            );
+            // A genuine not-found (the registry was successfully asked and said "no such
+            // package") is not a fetch failure — only an unanswerable request is (#267 C1).
+            if e.is_not_found() {
+                Pick::Unresolved(PackageStatus::NotFound {
+                    message: e.to_string(),
+                })
+            } else {
+                Pick::Unresolved(PackageStatus::Failed {
+                    failure: e.fetch_failure(),
+                    message: e.to_string(),
+                })
+            }
+        }
+        Err(_) => {
+            tracing::warn!(package = %name.for_tracing(), "fetch fallback timed out ({}s)", timeout.as_secs());
+            Pick::Unresolved(PackageStatus::Failed {
+                failure: FetchFailure::Transient,
+                message: format!(
+                    "{}: registry request timed out after {}s",
+                    name.for_tracing(),
+                    timeout.as_secs()
+                ),
+            })
+        }
     }
 }
 

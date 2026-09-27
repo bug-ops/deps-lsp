@@ -115,6 +115,7 @@ pub fn vuln_key(name: &str) -> crate::osv::VulnKey {
 /// assert_eq!(meta.latest_version().as_str(), "1.0.214");
 /// assert_eq!(meta.description(), None);
 /// ```
+#[derive(Clone)]
 pub struct MockMetadata {
     name: crate::PackageName,
     latest_version: crate::ConcreteVersion,
@@ -154,6 +155,275 @@ impl crate::Metadata for MockMetadata {
 
     fn latest_version(&self) -> &crate::ConcreteVersion {
         &self.latest_version
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// [`MockVersion`]'s `is_prerelease` behavior — see [`MockVersion::with_prerelease`].
+///
+/// Defaults to [`Self::MarkerDefault`] rather than hardcoding `false`: [`crate::Version`]'s
+/// own provided `is_prerelease` method delegates to
+/// [`crate::has_default_prerelease_marker`] against the version string, and a `MockVersion`
+/// that silently returned `false` for e.g. `"1.0.0-rc.1"` would diverge from every real
+/// `Version` implementor that doesn't override this method — the exact defect class this
+/// fixture exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Prerelease {
+    /// Delegates to [`crate::has_default_prerelease_marker`] against the version string,
+    /// matching [`crate::Version::is_prerelease`]'s own provided-method default.
+    MarkerDefault,
+    /// Hardcoded, ignoring the version string.
+    Forced(bool),
+}
+
+/// A configurable [`crate::Version`] fixture (issue #1559).
+///
+/// Replaces the ~15-line `impl Version for MockVersion`/`SomeNameVersion` blocks hand-copied
+/// per test file across `deps-engine`, `deps-lsp`, and `deps-maven`. Every field beyond
+/// [`Self::new`]'s version defaults to the same value the trait's own provided methods
+/// return, so a fixture that only cares about the version string needs no builder call at
+/// all.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::Version;
+/// use deps_core::RemovalStatus;
+/// use deps_core::test_util::MockVersion;
+///
+/// let v = MockVersion::new("1.2.3").yanked(true);
+/// assert_eq!(v.version_string().as_str(), "1.2.3");
+/// assert_eq!(v.removal_status(), RemovalStatus::Yanked);
+/// ```
+#[derive(Debug, Clone)]
+pub struct MockVersion {
+    version: crate::ConcreteVersion,
+    published_at: Option<crate::freshness::PublishTime>,
+    removal_status: crate::RemovalStatus,
+    prerelease: Prerelease,
+    license: Vec<String>,
+}
+
+impl MockVersion {
+    /// Builds a fixture reporting `version`; every other [`crate::Version`] field defaults
+    /// to that trait's own provided-method default (not yanked/deprecated, marker-based
+    /// prerelease detection, no publish time, no license).
+    #[must_use]
+    pub fn new(version: impl Into<crate::ConcreteVersion>) -> Self {
+        Self {
+            version: version.into(),
+            published_at: None,
+            removal_status: crate::RemovalStatus::Available,
+            prerelease: Prerelease::MarkerDefault,
+            license: Vec::new(),
+        }
+    }
+
+    /// Sets [`crate::Version::published_at`]'s return value.
+    #[must_use]
+    pub const fn with_published_at(mut self, published_at: crate::freshness::PublishTime) -> Self {
+        self.published_at = Some(published_at);
+        self
+    }
+
+    /// Sets [`crate::Version::removal_status`]'s return value directly.
+    #[must_use]
+    pub const fn with_removal_status(mut self, removal_status: crate::RemovalStatus) -> Self {
+        self.removal_status = removal_status;
+        self
+    }
+
+    /// Convenience over [`Self::with_removal_status`] for the common yanked/not-yanked case.
+    #[must_use]
+    pub fn yanked(mut self, yanked: bool) -> Self {
+        self.removal_status = crate::RemovalStatus::from_yanked(yanked);
+        self
+    }
+
+    /// Forces [`crate::Version::is_prerelease`]'s return value, overriding the default
+    /// marker-based detection against the version string.
+    #[must_use]
+    pub const fn with_prerelease(mut self, prerelease: bool) -> Self {
+        self.prerelease = Prerelease::Forced(prerelease);
+        self
+    }
+
+    /// Sets [`crate::Version::license`]'s return value.
+    #[must_use]
+    pub fn with_license(mut self, license: Vec<String>) -> Self {
+        self.license = license;
+        self
+    }
+}
+
+impl crate::Version for MockVersion {
+    fn version_string(&self) -> &crate::ConcreteVersion {
+        &self.version
+    }
+
+    fn removal_status(&self) -> crate::RemovalStatus {
+        self.removal_status
+    }
+
+    fn is_prerelease(&self) -> bool {
+        match self.prerelease {
+            Prerelease::MarkerDefault => {
+                crate::has_default_prerelease_marker(self.version.as_str())
+            }
+            Prerelease::Forced(forced) => forced,
+        }
+    }
+
+    fn published_at(&self) -> Option<crate::freshness::PublishTime> {
+        self.published_at
+    }
+
+    fn license(&self) -> &[String] {
+        &self.license
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// What [`MockRegistry`]'s `search_raw` does when called — see [`MockRegistry::with_search`].
+pub enum SearchBehavior {
+    /// Returns an empty result list — the common case for a fixture whose test never
+    /// exercises search.
+    Empty,
+    /// Returns these fixed results.
+    Results(Vec<MockMetadata>),
+    /// Panics with this message, synchronously, before any future is even constructed — for
+    /// asserting a caller's guard short-circuits before ever reaching the registry (e.g. a
+    /// prefix-length gate that must reject before calling `search`).
+    Panic(&'static str),
+}
+
+/// A configurable [`crate::Registry`] fixture (issue #1559).
+///
+/// Replaces the ~30-40 line `impl Registry for ...` doubles duplicated across
+/// `deps-engine`'s, `deps-lsp`'s, and `deps-maven`'s test modules for the common "fixed
+/// version list plus fixed/empty/panicking search" shape.
+///
+/// `get_latest_matching`/`select_latest_matching` both pick the first
+/// version in [`Self::with_versions`]'s list whose [`crate::Version::removal_status`]
+/// doesn't [`crate::RemovalStatus::blocks_resolution`] — the same "versions sorted
+/// newest-first" convention every real registry documents, so a test controls which
+/// version is "latest" purely through list order.
+///
+/// Keep a bespoke `impl Registry` where a test genuinely needs custom selection or
+/// error-injection logic this fixture doesn't model (a registry that times out, fails, or
+/// diverges between `get_versions` and `get_latest_matching` per package) — e.g.
+/// `deps-engine`'s `NoListPickRegistry`, which reproduces Go's `/@v/list` divergence.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::Registry;
+/// use deps_core::PackageName;
+/// use deps_core::SelectionContext;
+/// use deps_core::VersionReq;
+/// use deps_core::test_util::{MockRegistry, MockVersion};
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let registry = MockRegistry::new().with_versions(vec![MockVersion::new("1.2.3")]);
+///     let versions = registry.get_versions(&PackageName::new("pkg")).await.unwrap();
+///     assert_eq!(versions.len(), 1);
+/// }
+/// ```
+#[derive(Default)]
+pub struct MockRegistry {
+    versions: Vec<MockVersion>,
+    search: Option<SearchBehavior>,
+}
+
+impl MockRegistry {
+    /// A registry with no versions and an empty search result — the `NoopRegistry`/
+    /// `StubRegistry` shape most tests that never exercise a registry at all reach for.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the fixed version list `get_versions`/`get_latest_matching`/
+    /// `select_latest_matching` serve — sorted newest-first, per
+    /// [`crate::Registry::get_versions`]'s own contract.
+    #[must_use]
+    pub fn with_versions(mut self, versions: Vec<MockVersion>) -> Self {
+        self.versions = versions;
+        self
+    }
+
+    /// Sets what `search_raw` does when called — see [`SearchBehavior`].
+    #[must_use]
+    pub fn with_search(mut self, search: SearchBehavior) -> Self {
+        self.search = Some(search);
+        self
+    }
+}
+
+impl crate::Registry for MockRegistry {
+    fn get_versions<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::Result<Vec<Box<dyn crate::Version>>>> {
+        let versions: Vec<Box<dyn crate::Version>> = self
+            .versions
+            .iter()
+            .cloned()
+            .map(|v| Box::new(v) as Box<dyn crate::Version>)
+            .collect();
+        Box::pin(async move { Ok(versions) })
+    }
+
+    fn get_latest_matching<'a>(
+        &'a self,
+        _name: &'a crate::PackageName,
+        _req: &'a crate::VersionReq,
+        _selection_context: &'a crate::SelectionContext,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::Result<Option<Box<dyn crate::Version>>>> {
+        let picked: Option<Box<dyn crate::Version>> = self
+            .versions
+            .iter()
+            .find(|v| !v.removal_status.blocks_resolution())
+            .cloned()
+            .map(|v| Box::new(v) as Box<dyn crate::Version>);
+        Box::pin(async move { Ok(picked) })
+    }
+
+    fn search_raw<'a>(
+        &'a self,
+        _query: &'a str,
+        _limit: usize,
+    ) -> crate::ecosystem::BoxFuture<'a, crate::Result<Vec<Box<dyn crate::Metadata>>>> {
+        match self.search.as_ref().unwrap_or(&SearchBehavior::Empty) {
+            SearchBehavior::Empty => Box::pin(async move { Ok(vec![]) }),
+            SearchBehavior::Results(results) => {
+                let results: Vec<Box<dyn crate::Metadata>> = results
+                    .iter()
+                    .cloned()
+                    .map(|m| Box::new(m) as Box<dyn crate::Metadata>)
+                    .collect();
+                Box::pin(async move { Ok(results) })
+            }
+            SearchBehavior::Panic(msg) => panic!("{msg}"),
+        }
+    }
+
+    fn select_latest_matching(
+        &self,
+        versions: &[Box<dyn crate::Version>],
+        _req: &crate::VersionReq,
+        _selection_context: &crate::SelectionContext,
+    ) -> Option<usize> {
+        versions
+            .iter()
+            .position(|v| !v.removal_status().blocks_resolution())
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

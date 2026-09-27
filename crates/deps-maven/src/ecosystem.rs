@@ -1298,16 +1298,6 @@ mod tests {
         /// wrapping and `filter_text` reasoning from `VersionReplacement`'s own doc.
         #[test]
         fn test_self_closing_version_replacement_applies_to_produce_valid_xml() {
-            struct MockVersion(deps_core::ConcreteVersion);
-            impl deps_core::Version for MockVersion {
-                fn version_string(&self) -> &deps_core::ConcreteVersion {
-                    &self.0
-                }
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
-                }
-            }
-
             for (tag, indent) in [
                 ("<version/>", "      "),
                 ("<version />", "  "),
@@ -1327,7 +1317,7 @@ mod tests {
                     replaced_text: tag.to_string(),
                 };
 
-                let version = MockVersion("1.2.3".into());
+                let version = deps_core::test_util::MockVersion::new("1.2.3");
                 let display_item = deps_core::completion::VersionDisplayItem::new(
                     &version,
                     &deps_core::PackageName::new("com.example:foo"),
@@ -1375,16 +1365,6 @@ mod tests {
         /// it never asserted the untouched sibling lines either (tester/impl-critic finding).
         #[test]
         fn test_self_closing_version_replacement_leaves_sibling_lines_byte_identical() {
-            struct MockVersion(deps_core::ConcreteVersion);
-            impl deps_core::Version for MockVersion {
-                fn version_string(&self) -> &deps_core::ConcreteVersion {
-                    &self.0
-                }
-                fn as_any(&self) -> &dyn std::any::Any {
-                    self
-                }
-            }
-
             let source = "<project>\n  <dependencies>\n    <dependency>\n      \
                        <groupId>com.example</groupId>\n      <artifactId>foo</artifactId>\n      \
                        <scope>test</scope>\n      <version/>\n    </dependency>\n  \
@@ -1412,7 +1392,7 @@ mod tests {
                 trail: "</version>".to_string(),
                 replaced_text: value.to_string(),
             };
-            let version = MockVersion("1.2.3".into());
+            let version = deps_core::test_util::MockVersion::new("1.2.3");
             let display_item = deps_core::completion::VersionDisplayItem::new(
                 &version,
                 &deps_core::PackageName::new("com.example:foo"),
@@ -2273,51 +2253,8 @@ mod tests {
         /// arm calls, substituting a mock registry for the real network-backed one.
         #[tokio::test]
         async fn test_complete_self_closing_version_threads_replacement_through_mock_registry() {
-            struct MockVersion(deps_core::ConcreteVersion);
-            impl deps_core::Version for MockVersion {
-                fn version_string(&self) -> &deps_core::ConcreteVersion {
-                    &self.0
-                }
-                fn as_any(&self) -> &dyn Any {
-                    self
-                }
-            }
-
-            struct MockRegistry;
-            impl deps_core::Registry for MockRegistry {
-                fn get_versions<'a>(
-                    &'a self,
-                    _name: &'a deps_core::PackageName,
-                ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>>
-                {
-                    let versions: Vec<Box<dyn deps_core::Version>> =
-                        vec![Box::new(MockVersion("1.2.3".into()))];
-                    Box::pin(async move { Ok(versions) })
-                }
-
-                fn get_latest_matching<'a>(
-                    &'a self,
-                    _name: &'a deps_core::PackageName,
-                    _req: &'a deps_core::VersionReq,
-                    _selection_context: &'a deps_core::SelectionContext,
-                ) -> deps_core::ecosystem::BoxFuture<'a, Result<Option<Box<dyn deps_core::Version>>>>
-                {
-                    Box::pin(async move { Ok(None) })
-                }
-
-                fn search_raw<'a>(
-                    &'a self,
-                    _query: &'a str,
-                    _limit: usize,
-                ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Metadata>>>>
-                {
-                    Box::pin(async move { Ok(vec![]) })
-                }
-
-                fn as_any(&self) -> &dyn Any {
-                    self
-                }
-            }
+            let registry = deps_core::test_util::MockRegistry::new()
+                .with_versions(vec![deps_core::test_util::MockVersion::new("1.2.3")]);
 
             let xml = r"<project>
   <dependencies>
@@ -2339,7 +2276,7 @@ mod tests {
             };
 
             let items = complete_self_closing_version(
-                &MockRegistry,
+                &registry,
                 &MavenFormatter,
                 &parse_result,
                 position,
