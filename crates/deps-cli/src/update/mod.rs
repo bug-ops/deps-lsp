@@ -12,7 +12,8 @@ use deps_core::edit::{
     classify_update, collect_update_candidates, dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
-    CooldownDisposition, EcosystemFormatter, LatestVerdict, cooldown_disposition, latest_verdict,
+    CooldownDisposition, EcosystemFormatter, LatestVerdict, PackageVersions, cooldown_disposition,
+    latest_verdict,
 };
 use std::collections::HashMap;
 
@@ -202,6 +203,43 @@ impl Outcome {
 }
 
 impl PlannedUpdateItem {
+    /// Builds a `PlannedUpdateItem` from its already-computed fields.
+    ///
+    /// Replaces the near-identical hand-rolled struct literals `security.rs`'s four
+    /// terminal-outcome builders and this module's own `resolve_occurrence` `build` closure
+    /// previously each constructed independently (issue #1551 finding 5) — a field change
+    /// affecting those two call sites now only requires touching this constructor. Fields stay
+    /// `pub` and other construction sites remain plain struct literals (e.g. `deps-cli`'s
+    /// `exit.rs`, this module's own tests, and the doctest above) — this constructor does not
+    /// make the type `#[non_exhaustive]` or migrate every existing literal to it.
+    #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one parameter per struct field (mirrors FetchResult::new/CooldownFallback::new's \
+                  identical constructor-over-builder precedent elsewhere in the workspace)"
+    )]
+    pub fn new(
+        name: String,
+        current: String,
+        target: String,
+        outcome: Outcome,
+        advisory_ids: Vec<String>,
+        ignore_rule_overridden: bool,
+        gossip_excluded_version: Option<deps_core::ConcreteVersion>,
+        cooldown_fallback: Option<CooldownFallbackNote>,
+    ) -> Self {
+        Self {
+            name,
+            current,
+            target,
+            outcome,
+            advisory_ids,
+            ignore_rule_overridden,
+            gossip_excluded_version,
+            cooldown_fallback,
+        }
+    }
+
     /// A one-line human-readable reason for [`Self::outcome`] (FR-021's `reason` field).
     #[must_use]
     pub fn reason(&self) -> String {
@@ -339,6 +377,50 @@ fn gossip_excluded_version(
         .and_then(|v| v.gossip_excluded_version.clone())
 }
 
+/// Spec 075 FR-007/FR-008/FR-010: the fallback-substituted view [`plan_updates`] feeds through
+/// [`collect_update_candidates`] alongside the real `latest` view — only `latest` swapped for
+/// each dependency's stored cooldown-fallback candidate, when one exists.
+///
+/// Reuses [`ManifestAnalysis::cooldown_fallback_view`] when `analyze_manifest` already built it
+/// for its own FR-010 OSV round, rather than recomputing an identical view from scratch (issue
+/// #1551 finding 3) — that field already carries the same "something actually changed" gate
+/// `analyze_manifest`'s own OSV round applies (NFR-004: zero extra work when nothing is
+/// cooldown-blocked with a usable fallback). When the field was never populated (a caller that
+/// built [`ManifestAnalysis`] directly, e.g. this module's own tests), the identical gate is
+/// applied here instead of computing the view unconditionally — `None` either way means
+/// `plan_updates` skips [`collect_update_candidates`]'s full-manifest pass over the fallback
+/// view entirely, since [`resolve_occurrence`] only ever consults it when a dependency's own
+/// [`cooldown_disposition`] is `Blocked { fallback: Some(_), .. }`.
+///
+/// The reuse path (impl-critic m3) does *not* re-apply `freshness`/`now` to the already-built
+/// view — it relies on the caller passing the same values `analyze_manifest` used to build it,
+/// the same invariant [`ManifestAnalysis::now`]'s own doc already requires of every
+/// `plan_updates` caller. A caller that violates it only affects this reuse path, never the
+/// recompute-and-gate fallback below, which always uses its own `freshness`/`now` arguments.
+fn resolve_cooldown_fallback_view(
+    analysis: &ManifestAnalysis,
+    freshness: deps_core::FreshnessSettings,
+    now: deps_core::PublishTime,
+) -> Option<HashMap<PackageName, PackageVersions>> {
+    if let Some(view) = analysis.cooldown_fallback_view.as_ref() {
+        return Some(view.clone());
+    }
+    let view = crate::analyze::cooldown_fallback_view(
+        &analysis.cached_versions,
+        Some(&analysis.gossip_findings),
+        freshness,
+        now,
+    );
+    view.iter()
+        .any(|(name, v)| {
+            analysis
+                .cached_versions
+                .get(name)
+                .is_none_or(|c| c.latest != v.latest)
+        })
+        .then_some(view)
+}
+
 /// Default-mode planner: every dependency [`deps_core::edit::collect_update_candidates`]
 /// considers, narrowed by `--package` and `[update].ignore` (FR-003, FR-005, FR-006, FR-007).
 ///
@@ -424,6 +506,7 @@ fn gossip_excluded_version(
 ///     vulnerabilities: None,
 ///     latest_status: None,
 ///     fallback_status: None,
+///     cooldown_fallback_view: None,
 ///     gossip_findings: HashMap::new(),
 ///     licenses: HashMap::new(),
 ///     license_policy: deps_core::licenses::LicensePolicy::default(),
@@ -470,25 +553,29 @@ pub fn plan_updates(
     // exact same planner — so a fallback candidate is verified/planned identically to `latest`,
     // never through a separate code path. Only occurrences already present in
     // `latest_candidates` (i.e. `Outdated` against real `latest`) ever look this up (FR-008).
-    let fallback_view = crate::analyze::cooldown_fallback_view(
-        &analysis.cached_versions,
-        Some(&analysis.gossip_findings),
-        freshness,
-        now,
-    );
-    let mut fallback_version_data =
-        deps_core::VersionData::new(&fallback_view, &analysis.resolved_versions)
-            .with_resolved_version_candidates(&analysis.resolved_version_candidates)
-            .with_ecosystem(analysis.ecosystem_id);
-    if let Some(fallback_status) = analysis.fallback_status.as_ref() {
-        fallback_version_data = fallback_version_data.with_latest_status(fallback_status);
-    }
-    let fallback_candidates = collect_update_candidates(
-        analysis.parse_result.as_ref(),
-        content,
-        fallback_version_data,
-        formatter,
-    );
+    // `resolve_cooldown_fallback_view` reuses `analysis.cooldown_fallback_view` when
+    // `analyze_manifest` already built it (issue #1551 finding 3), and gates the
+    // `collect_update_candidates` pass below on the same "something actually changed" check
+    // either way — `None` means no dependency is cooldown-blocked with a usable fallback.
+    let fallback_view = resolve_cooldown_fallback_view(analysis, freshness, now);
+    let fallback_candidates = match fallback_view.as_ref() {
+        Some(view) => {
+            let mut fallback_version_data =
+                deps_core::VersionData::new(view, &analysis.resolved_versions)
+                    .with_resolved_version_candidates(&analysis.resolved_version_candidates)
+                    .with_ecosystem(analysis.ecosystem_id);
+            if let Some(fallback_status) = analysis.fallback_status.as_ref() {
+                fallback_version_data = fallback_version_data.with_latest_status(fallback_status);
+            }
+            collect_update_candidates(
+                analysis.parse_result.as_ref(),
+                content,
+                fallback_version_data,
+                formatter,
+            )
+        }
+        None => Vec::new(),
+    };
 
     // Base identity every dependency carries unconditionally — `(normalized_name, name_range)`
     // — grouped (not collapsed) so a genuine collision (two dependencies sharing both, e.g.
@@ -780,21 +867,22 @@ fn resolve_occurrence(
     let gossip_excluded = gossip_excluded_version(analysis, &normalized_name, &name);
     let fallback_candidate = fallback_by_key.remove(&key);
 
-    let build =
-        |current: String,
-         target: String,
-         outcome: Outcome,
-         advisory_ids: Vec<String>,
-         cooldown_fallback: Option<CooldownFallbackNote>| PlannedUpdateItem {
-            name: name.clone(),
+    let build = |current: String,
+                 target: String,
+                 outcome: Outcome,
+                 advisory_ids: Vec<String>,
+                 cooldown_fallback: Option<CooldownFallbackNote>| {
+        PlannedUpdateItem::new(
+            name.clone(),
             current,
             target,
             outcome,
             advisory_ids,
-            ignore_rule_overridden: false,
-            gossip_excluded_version: gossip_excluded.clone(),
+            false,
+            gossip_excluded.clone(),
             cooldown_fallback,
-        };
+        )
+    };
 
     if !is_requested(package_filter, &normalized_name, formatter) {
         let (current, target) = latest_current_target(&latest_candidate);
@@ -1268,6 +1356,7 @@ mod tests {
             vulnerabilities: None,
             latest_status: None,
             fallback_status: None,
+            cooldown_fallback_view: None,
             gossip_findings: HashMap::new(),
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),

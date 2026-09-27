@@ -198,6 +198,15 @@ pub struct ManifestAnalysis {
     /// check is disabled/offline, or no dependency has a stored fallback candidate to verify
     /// (NFR-004: this round costs zero extra network calls in that case).
     pub fallback_status: Option<LatestStatusMap>,
+    /// Spec 075 FR-010's fallback-substituted view of [`Self::cached_versions`] (only
+    /// `latest` swapped for each dependency's stored cooldown-fallback candidate, when one
+    /// exists) — the exact view this OSV round already built to verify a fallback candidate
+    /// against, retained here so `deps-cli update`'s planner (`plan_updates`) can reuse it
+    /// instead of recomputing an identical `cooldown_fallback_view` from scratch (issue
+    /// #1551 finding 3). Same gate as [`Self::fallback_status`]: `None` when
+    /// [`AnalysisScope::cooldown_fallback`] is `false`, or no dependency's [`cooldown_disposition`]
+    /// actually differs from [`Self::cached_versions`] (NFR-004: nothing to substitute).
+    pub cooldown_fallback_view: Option<HashMap<PackageName, PackageVersions>>,
     /// Already-computed GOSSIP findings (spec 074/075 FR-006), retained here instead of being
     /// discarded after the registry fetch — fixes `check`'s dead `with_gossip_prefetch` branch
     /// (`ManifestAnalysis::version_data` never called it before this field existed), so `check`
@@ -679,6 +688,7 @@ pub async fn analyze_manifest(
         vulnerabilities,
         latest_status,
         fallback_status,
+        cooldown_fallback_view: cooldown_fallback_view_map,
         gossip_findings,
         licenses,
         license_policy,
@@ -779,6 +789,7 @@ mod has_unverified_latest_check_tests {
             vulnerabilities: None,
             latest_status: Some(LatestStatusMap::new()),
             fallback_status: None,
+            cooldown_fallback_view: None,
             gossip_findings: HashMap::new(),
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
