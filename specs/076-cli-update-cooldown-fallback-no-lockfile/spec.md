@@ -262,8 +262,11 @@ investigation (2026-09-27, four design rounds, final critic handoff
 >   literal "only when `Blocked`" is superseded by that behavior. §11 item 2 is obsolete.
 > - **FR-024 known limitation.** Composer's `parse_manifest` genuinely awaits (`LockFileCache::get_or_parse`
 >   → `tokio::fs::metadata`) when the manifest declares a bare vcs/path/artifact repository and a
->   `composer.lock` exists. `parse_manifest_now` then sees `Pending` → `ReparseFailed` → fail closed. This is
->   deterministic, runtime-flavor-independent, and pinned by a test. Follow-up issue filed per §11.
+>   `composer.lock` exists. `parse_manifest_now`'s single `now_or_never()` poll usually still sees
+>   `Pending` → `ReparseFailed` → fail closed, but this is a scheduler race, not a guarantee (observed
+>   to resolve `Writable` instead on Linux CI) — both outcomes are safe, since a `Writable` result means
+>   the re-parse happened to complete and was validated normally. Pinned by a test that accepts either
+>   outcome. Follow-up issue filed per §11.
 
 ## 4. Non-Functional Requirements
 
