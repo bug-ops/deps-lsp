@@ -1262,24 +1262,7 @@ where
 mod tests {
     use super::*;
 
-    struct MockVersion {
-        version: ConcreteVersion,
-        yanked: bool,
-    }
-
-    impl Version for MockVersion {
-        fn version_string(&self) -> &ConcreteVersion {
-            &self.version
-        }
-
-        fn removal_status(&self) -> RemovalStatus {
-            RemovalStatus::from_yanked(self.yanked)
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
+    use crate::test_util::MockVersion;
 
     /// A [`Registry`] whose `search_raw` records whether it was called, for
     /// [`dyn_registry_search_rejects_credential_bearing_query_before_calling_search_raw`]
@@ -1374,20 +1357,14 @@ mod tests {
 
     #[test]
     fn test_version_default_features() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("1.0.0").yanked(false);
 
         assert_eq!(version.features(), Vec::<String>::new());
     }
 
     #[test]
     fn test_version_trait_object() {
-        let version = MockVersion {
-            version: "1.2.3".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("1.2.3").yanked(false);
 
         let boxed: Box<dyn Version> = Box::new(version);
         assert_eq!(boxed.version_string().as_str(), "1.2.3");
@@ -1396,10 +1373,7 @@ mod tests {
 
     #[test]
     fn test_version_downcast() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: true,
-        };
+        let version = MockVersion::new("1.0.0").yanked(true);
 
         let boxed: Box<dyn Version> = Box::new(version);
         let any = boxed.as_any();
@@ -1499,114 +1473,75 @@ mod tests {
 
     #[test]
     fn test_is_prerelease_alpha() {
-        let version = MockVersion {
-            version: "4.0.0-alpha.13".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("4.0.0-alpha.13").yanked(false);
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_beta() {
-        let version = MockVersion {
-            version: "2.0.0-beta.1".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("2.0.0-beta.1").yanked(false);
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_rc() {
-        let version = MockVersion {
-            version: "1.5.0-rc.2".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("1.5.0-rc.2").yanked(false);
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_dev() {
-        let version = MockVersion {
-            version: "3.0.0-dev".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("3.0.0-dev").yanked(false);
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_canary() {
-        let version = MockVersion {
-            version: "5.0.0-canary".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("5.0.0-canary").yanked(false);
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_prerelease_nightly() {
-        let version = MockVersion {
-            version: "6.0.0-nightly".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("6.0.0-nightly").yanked(false);
         assert!(version.is_prerelease());
     }
 
     #[test]
     fn test_is_not_prerelease_stable() {
-        let version = MockVersion {
-            version: "1.2.3".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("1.2.3").yanked(false);
         assert!(!version.is_prerelease());
     }
 
     #[test]
     fn test_is_not_prerelease_patch() {
-        let version = MockVersion {
-            version: "1.0.214".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("1.0.214").yanked(false);
         assert!(!version.is_prerelease());
     }
 
     #[test]
     fn test_is_stable_true() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("1.0.0").yanked(false);
         assert!(version.is_stable());
     }
 
     #[test]
     fn test_is_stable_false_yanked() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: true,
-        };
+        let version = MockVersion::new("1.0.0").yanked(true);
         assert!(!version.is_stable());
     }
 
     #[test]
     fn test_is_stable_false_prerelease() {
-        let version = MockVersion {
-            version: "1.0.0-alpha.1".into(),
-            yanked: false,
-        };
+        let version = MockVersion::new("1.0.0-alpha.1").yanked(false);
         assert!(!version.is_stable());
     }
 
     #[test]
     fn test_find_latest_stable_skips_prerelease() {
         let versions: Vec<Box<dyn Version>> = vec![
-            Box::new(MockVersion {
-                version: "2.0.0-alpha.1".into(),
-                yanked: false,
-            }),
-            Box::new(MockVersion {
-                version: "1.5.0".into(),
-                yanked: false,
-            }),
+            Box::new(MockVersion::new("2.0.0-alpha.1").yanked(false)),
+            Box::new(MockVersion::new("1.5.0").yanked(false)),
         ];
         let latest = super::find_latest_stable(&versions);
         assert_eq!(latest.map(|v| v.version_string().as_str()), Some("1.5.0"));
@@ -1615,14 +1550,8 @@ mod tests {
     #[test]
     fn test_find_latest_stable_skips_yanked() {
         let versions: Vec<Box<dyn Version>> = vec![
-            Box::new(MockVersion {
-                version: "2.0.0".into(),
-                yanked: true,
-            }),
-            Box::new(MockVersion {
-                version: "1.5.0".into(),
-                yanked: false,
-            }),
+            Box::new(MockVersion::new("2.0.0").yanked(true)),
+            Box::new(MockVersion::new("1.5.0").yanked(false)),
         ];
         let latest = super::find_latest_stable(&versions);
         assert_eq!(latest.map(|v| v.version_string().as_str()), Some("1.5.0"));
@@ -1631,22 +1560,10 @@ mod tests {
     #[test]
     fn test_find_latest_stable_returns_first_stable() {
         let versions: Vec<Box<dyn Version>> = vec![
-            Box::new(MockVersion {
-                version: "3.0.0-beta.1".into(),
-                yanked: false,
-            }),
-            Box::new(MockVersion {
-                version: "2.0.0".into(),
-                yanked: true,
-            }),
-            Box::new(MockVersion {
-                version: "1.5.0".into(),
-                yanked: false,
-            }),
-            Box::new(MockVersion {
-                version: "1.4.0".into(),
-                yanked: false,
-            }),
+            Box::new(MockVersion::new("3.0.0-beta.1").yanked(false)),
+            Box::new(MockVersion::new("2.0.0").yanked(true)),
+            Box::new(MockVersion::new("1.5.0").yanked(false)),
+            Box::new(MockVersion::new("1.4.0").yanked(false)),
         ];
         let latest = super::find_latest_stable(&versions);
         assert_eq!(latest.map(|v| v.version_string().as_str()), Some("1.5.0"));
@@ -1662,14 +1579,8 @@ mod tests {
     #[test]
     fn test_find_latest_stable_no_stable_versions() {
         let versions: Vec<Box<dyn Version>> = vec![
-            Box::new(MockVersion {
-                version: "2.0.0-alpha.1".into(),
-                yanked: false,
-            }),
-            Box::new(MockVersion {
-                version: "1.0.0".into(),
-                yanked: true,
-            }),
+            Box::new(MockVersion::new("2.0.0-alpha.1").yanked(false)),
+            Box::new(MockVersion::new("1.0.0").yanked(true)),
         ];
         let latest = super::find_latest_stable(&versions);
         assert!(latest.is_none());
