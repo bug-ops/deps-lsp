@@ -216,10 +216,14 @@ impl BodyLimit {
 /// Only compiled into test builds (see [`ensure_https`]): a non-loopback host must never
 /// be allowed to bypass the HTTPS requirement, even under `cfg(test)`/`test-util`. See
 /// [`crate::net_policy::validate_index_url`]'s own private loopback check (`is_loopback_url`)
-/// for the counterpart this was modeled on — the two have since diverged: this function
-/// strips the brackets [`Url::host_str`] keeps around an IPv6 literal (`"[::1]"`) before
-/// comparing, while `is_loopback_url` compares the bracketed form directly and so never
-/// actually matches an IPv6 loopback host (pre-existing, out of scope for #1562).
+/// for the counterpart this was modeled on — `is_loopback_url` now matches [`Url::host`]'s
+/// structured `Host` enum (`Ipv6Addr::LOCALHOST` comparison, #1568) rather than comparing the
+/// bracketed string form, closing the IPv6-loopback gap this doc used to describe as
+/// pre-existing/out of scope. The two still differ in accepted scheme: this
+/// function matches both `http` and `https` (symmetric with [`ensure_https`]'s own scheme
+/// check), while `is_loopback_url` only ever matches `http` — its caller already treats
+/// `https` as satisfying the requirement outright, so an `https` loopback host has no need for
+/// the carve-out.
 ///
 /// Parses with [`Url::parse`] and compares [`Url::host_str`] rather than splitting the raw
 /// string on `:` — a naive split misreads userinfo as the host boundary (e.g.

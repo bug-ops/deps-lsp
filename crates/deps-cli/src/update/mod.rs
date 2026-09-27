@@ -184,6 +184,14 @@ pub enum UnfixableReason {
     /// The fix target is present in the registry's yanked list with a status that
     /// [`deps_core::RemovalStatus::blocks_resolution`] (FR-012).
     Yanked,
+    /// The declared requirement has a shape the formatter has no single unambiguous rewrite
+    /// for (e.g. a compound comma-separated Cargo requirement, #1566) *and* a requirement
+    /// matcher exists that has already confirmed the declared requirement does not admit the
+    /// fix target — distinct from [`Outcome::RequiresLockfileUpdate`], which means the
+    /// requirement already admits the fix and nothing needs rewriting at all. Conflating the
+    /// two would tell the operator to regenerate the lock file for a dependency that is still
+    /// vulnerable (#1566 S1).
+    UnsupportedRequirementShape,
 }
 
 impl Outcome {
@@ -304,6 +312,9 @@ impl PlannedUpdateItem {
                 "registry fetch for this dependency failed or returned no data"
             }
             Outcome::Unfixable(UnfixableReason::Yanked) => "the fix target is yanked",
+            Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape) => {
+                "the declared requirement's syntax has no safe single-value rewrite and does not already admit the fix version — manual edit required"
+            }
         };
         let mut reason = base.to_string();
         if self.ignore_rule_overridden {
