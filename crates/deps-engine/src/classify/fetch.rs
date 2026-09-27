@@ -5477,6 +5477,36 @@ mod tests {
             assert_eq!(fallback.version.as_str(), "1.1.0");
         }
 
+        /// Issue #1564 repro (crates.io `bevy_brp_mcp`-shaped): a prerelease newest (excluded),
+        /// a within-cooldown stable `latest` candidate, a cleared candidate one patch below it,
+        /// and the in-use floor. Empirically confirms/refutes the reporter's hypothesis that
+        /// `compute_cooldown_fallback` itself never finds a fallback here — it does; the actual
+        /// bug (fixed separately) was downstream in `deps-cli update`'s own
+        /// `fallback_satisfies_requirement` planner guard, not this engine-level computation.
+        #[tokio::test]
+        async fn permissive_range_repro_1564_still_computes_the_cleared_fallback() {
+            let now = PublishTime::now();
+            let cooldown_secs = 3 * 24 * 60 * 60;
+            let recent = PublishTime::from_unix_secs(now.as_unix_secs() - 60); // within cooldown
+            let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60); // cleared
+
+            let versions = vec![
+                MockVersion::new("0.23.0-rc.1", recent).prerelease(),
+                MockVersion::new("0.22.8", recent),
+                MockVersion::new("0.22.7", old),
+                MockVersion::new("0.22.6", old), // in-use floor
+            ];
+
+            let package_versions = fetch_pkg(versions, vec!["0.22.6"], cooldown_secs)
+                .await
+                .expect("pkg must resolve");
+
+            let fallback = package_versions
+                .cooldown_fallback
+                .expect("a safe, cooldown-cleared, above-floor candidate must be recovered");
+            assert_eq!(fallback.version.as_str(), "0.22.7");
+        }
+
         /// Fix-cycle item 5/S5: the newest cooldown-cleared candidate by publish date is a
         /// prerelease (a canary/nightly a frequent publisher ships between stable releases).
         /// Ranking through `registry.select_latest_matching` over the cooled subset — instead
