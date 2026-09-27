@@ -27,6 +27,12 @@ use crate::position::Range;
 /// validation at all) — see this type's `Deserialize` impl doc for why an out-of-range
 /// integer clamps to the nearest defined variant instead of failing deserialization.
 ///
+/// Declaration order doubles as the canonical severity ordering (`Error` most severe,
+/// `Hint` least) — the single source of truth every ranking/sorting call site in the
+/// workspace should derive from via `Ord`/`PartialOrd` rather than hand-rolling its own
+/// numeric rank (issue #1532 code-review finding 1: two independently hand-rolled, oppositely
+/// signed rank functions had drifted apart before this derive was added).
+///
 /// # Examples
 ///
 /// ```
@@ -35,8 +41,14 @@ use crate::position::Range;
 /// let severity = Severity::Warning;
 /// assert_eq!(severity, Severity::Warning);
 /// assert_ne!(severity, Severity::Error);
+///
+/// // `Error` is the most severe, `Hint` the least — matches the LSP wire ordering
+/// // (`Severity`'s `Serialize` impl uses the same `1..=4` encoding).
+/// assert!(Severity::Error < Severity::Warning);
+/// assert!(Severity::Warning < Severity::Information);
+/// assert!(Severity::Information < Severity::Hint);
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Severity {
     /// Reports an error.
     Error,
