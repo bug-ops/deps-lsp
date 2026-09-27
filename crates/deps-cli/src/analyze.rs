@@ -51,10 +51,12 @@ const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 /// let update_default_mode = AnalysisScope::update_default();
 /// assert!(!update_default_mode.licenses);
 /// assert!(!update_default_mode.vulnerabilities);
+/// assert!(update_default_mode.gossip);
 ///
 /// let update_security_only = AnalysisScope::vulnerabilities_only();
 /// assert!(!update_security_only.licenses);
 /// assert!(update_security_only.vulnerabilities);
+/// assert!(!update_security_only.gossip);
 /// ```
 #[derive(Debug, Clone, Copy)]
 pub struct AnalysisScope {
@@ -66,6 +68,18 @@ pub struct AnalysisScope {
     /// `diagnostics.vulnerabilities_enabled`/`network.offline` policy gates either way. `check`
     /// and `update --security-only` both need this; `update`'s default mode does not.
     pub vulnerabilities: bool,
+    /// Whether to run the spec 074 GOSSIP prefetch, subject to the existing `[gossip].enabled`
+    /// policy gate either way (issue #1521 item 4). **Deliberately independent of
+    /// `[freshness].enabled`** — spec 074 FR-002/FR-009/NFR-004 enumerate GOSSIP's gates
+    /// exhaustively (`[gossip].enabled`, not offline, a `deps_dev_system`-covered ecosystem, a
+    /// public-registry-content source) and never include freshness; GOSSIP and the local
+    /// `freshness.cooldown_secs` heuristic are deliberately independent signals (NFR-004),
+    /// mirroring `deps-lsp`'s own `run_gossip_prefetch`, which likewise gates only on
+    /// `is_gossip_enabled()`/offline. `false` under `update --security-only`: that mode's fix
+    /// target comes from the advisory's `recommended_fix()`, never the freshness/GOSSIP-filtered
+    /// registry pick (FR-014), so the prefetch's result would never be read — an avoidable
+    /// network call.
+    pub gossip: bool,
 }
 
 impl AnalysisScope {
@@ -76,15 +90,18 @@ impl AnalysisScope {
         Self {
             licenses: true,
             vulnerabilities: true,
+            gossip: true,
         }
     }
 
-    /// Only the OSV scan runs — `deps-cli update --security-only`'s scope.
+    /// Only the OSV scan runs — `deps-cli update --security-only`'s scope. `gossip` is `false`
+    /// (issue #1521 item 4): see [`Self::gossip`]'s doc.
     #[must_use]
     pub const fn vulnerabilities_only() -> Self {
         Self {
             licenses: false,
             vulnerabilities: true,
+            gossip: false,
         }
     }
 
@@ -93,12 +110,14 @@ impl AnalysisScope {
     /// its pre-#1517 name) since [`analyze_manifest`] still unconditionally runs the OSV
     /// **latest-check** (issue #1517) regardless of this scope: `update`'s default mode
     /// must never write a flagged/unverified `latest` into the manifest, so that check is
-    /// not one of the two phases this scope can opt out of.
+    /// not one of the two phases this scope can opt out of. `gossip` is `true`: default mode
+    /// is exactly the consumer spec 074's cooldown filter exists for.
     #[must_use]
     pub const fn update_default() -> Self {
         Self {
             licenses: false,
             vulnerabilities: false,
+            gossip: true,
         }
     }
 }
@@ -312,7 +331,10 @@ pub async fn analyze_manifest(
     // own "prefetch once, thread the result through" shape below. `None` when
     // `!ctx.policy.gossip.enabled` short-circuits `fetch_gossip_findings_batch` before any
     // HTTP call (FR-009) — construction of `ctx.deps_dev` itself is unconditional (FR-001).
-    let gossip_client = ctx.policy.gossip.enabled.then_some(&ctx.deps_dev);
+    // Issue #1521 item 4: also `None` under `scope.gossip == false` (`update --security-only`,
+    // whose fix target never reads a GOSSIP-filtered `latest` at all) — see `AnalysisScope::gossip`'s
+    // doc for why this is *not* additionally gated on `ctx.policy.freshness.enabled`.
+    let gossip_client = (scope.gossip && ctx.policy.gossip.enabled).then_some(&ctx.deps_dev);
     let gossip_findings = deps_core::lsp_helpers::fetch_gossip_findings_batch(
         ecosystem_id,
         parse_result.as_ref(),

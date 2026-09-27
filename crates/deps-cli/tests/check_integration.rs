@@ -967,3 +967,311 @@ mod tier3_wiring_regression {
         .expect("analyze_manifest must not fail for this fixture");
     }
 }
+
+/// Issue #1521 item 2: `deps-engine`'s `gossip_cooldown_filter_tests` thoroughly cover spec
+/// 074's version-selection filter against a hand-constructed `GossipFindings` map, but nothing
+/// exercised the prefetch *call itself* at `deps-cli::analyze::analyze_manifest`'s call site —
+/// its ecosystem/offline/opt-in gating and `EcosystemId` -> `DepsDevSystem` mapping. Mirrors
+/// `tier3_wiring_regression`'s shape (a network-free `Ecosystem` double plus a real assertion
+/// that the wiring was — or, for the negative cases, was not — reached), but against a
+/// `mockito`-backed `DepsDevClient::for_test` instead of an offline `HttpCache`, since GOSSIP's
+/// gate is opt-in (`[gossip].enabled`) rather than offline-default.
+mod gossip_prefetch_wiring_regression {
+    use super::*;
+    use deps_core::Metadata;
+    use deps_core::ecosystem::BoxFuture;
+    use deps_core::ecosystem::private::Sealed;
+    use deps_core::policy_config::{DiagnosticsConfig, GossipConfig};
+    use deps_core::{
+        Dependency, Ecosystem, EcosystemId, PackageName, ParseResult, Registry, VersionReq,
+    };
+    use deps_engine::test_util::{StubRegistry, TestTier3Ecosystem};
+    use std::any::Any;
+
+    struct StubDep {
+        name: PackageName,
+    }
+    impl Dependency for StubDep {
+        fn name(&self) -> &PackageName {
+            &self.name
+        }
+        fn name_range(&self) -> deps_core::position::Range {
+            deps_core::position::Range::default()
+        }
+        fn version_requirement(&self) -> Option<&VersionReq> {
+            None
+        }
+        fn version_range(&self) -> Option<deps_core::position::Range> {
+            None
+        }
+        fn source(&self) -> deps_core::parser::DependencySource {
+            deps_core::parser::DependencySource::Registry
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct StubParseResult {
+        dep: StubDep,
+        uri: url::Url,
+    }
+    impl ParseResult for StubParseResult {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            vec![&self.dep]
+        }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &url::Url {
+            &self.uri
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A GOSSIP-covered (`EcosystemId::Cargo`) `Ecosystem` double whose registry never
+    /// touches the network (reuses [`StubRegistry`]). [`TestTier3Ecosystem`] can't stand in
+    /// for the positive-wiring case below since it hardcodes `EcosystemId::Dart`, one of the
+    /// seven ecosystems `deps_dev_system` deliberately does *not* cover.
+    struct CoveredEcosystem;
+    impl Sealed for CoveredEcosystem {}
+    impl Ecosystem for CoveredEcosystem {
+        fn ecosystem_id(&self) -> EcosystemId {
+            EcosystemId::Cargo
+        }
+        fn display_name(&self) -> &'static str {
+            "test-gossip-covered"
+        }
+        fn manifest_filenames(&self) -> &[&'static str] {
+            &[]
+        }
+        fn parse_manifest<'a>(
+            &'a self,
+            _content: &'a str,
+            uri: &'a url::Url,
+        ) -> BoxFuture<'a, deps_core::Result<Box<dyn ParseResult>>> {
+            let uri = uri.clone();
+            Box::pin(async move {
+                Ok(Box::new(StubParseResult {
+                    dep: StubDep {
+                        name: PackageName::new("dep-0"),
+                    },
+                    uri,
+                }) as Box<dyn ParseResult>)
+            })
+        }
+        fn registry(&self) -> Arc<dyn Registry> {
+            Arc::new(StubRegistry)
+        }
+        fn formatter(&self) -> &dyn deps_core::lsp_helpers::EcosystemFormatter {
+            &deps_core::test_util::StubFormatter::DEFAULT
+        }
+        fn completion_insert_text(&self, _metadata: &dyn Metadata) -> Option<String> {
+            None
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// A [`CheckContext`] whose `deps_dev` client is `mockito`-backed instead of pointed at
+    /// the real deps.dev API, otherwise identical to `tier3_wiring_regression::wiring_test_context`.
+    fn mock_gossip_context(policy: PolicyConfig, deps_dev_base_url: String) -> CheckContext {
+        let cache = Arc::new(HttpCache::new());
+        CheckContext {
+            cache: Arc::clone(&cache),
+            osv: Arc::new(OsvClient::new(Arc::clone(&cache))),
+            deps_dev: Arc::new(deps_core::DepsDevClient::for_test(cache, deps_dev_base_url)),
+            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            policy,
+        }
+    }
+
+    fn covered_ecosystem_manifest_path() -> std::path::PathBuf {
+        let url = deps_core::test_util::test_uri("/test/manifest.toml");
+        url.to_file_path().expect("file-scheme uri")
+    }
+
+    fn no_osv_policy() -> PolicyConfig {
+        PolicyConfig {
+            diagnostics: DiagnosticsConfig::new().with_vulnerabilities_enabled(false),
+            ..PolicyConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn analyze_manifest_reaches_gossip_prefetch_for_a_covered_ecosystem_when_enabled() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            // Critique M6(a): asserts the request body actually names `CoveredEcosystem`'s
+            // `EcosystemId::Cargo` as deps.dev's uppercase `"CARGO"` system — without this,
+            // the module doc's claim of covering the `EcosystemId` -> `DepsDevSystem` mapping
+            // was unverified; a caller passing the wrong `system` would still make this test
+            // pass since the earlier version only checked that *a* request arrived.
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "requests": [{"packageKey": {"system": "CARGO"}}]
+            })))
+            .with_status(200)
+            .with_body(r#"{"responses":[],"nextPageToken":""}"#)
+            .create_async()
+            .await;
+
+        let policy = PolicyConfig {
+            gossip: GossipConfig::new().with_enabled(true),
+            ..no_osv_policy()
+        };
+        let ctx = mock_gossip_context(policy, server.url());
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(CoveredEcosystem);
+        let manifest_path = covered_ecosystem_manifest_path();
+
+        deps_cli::analyze::analyze_manifest(
+            &ecosystem,
+            &manifest_path,
+            "unused",
+            &ctx,
+            deps_cli::analyze::AnalysisScope::update_default(),
+        )
+        .await
+        .expect("analyze_manifest must not fail for this fixture");
+
+        mock.assert_async().await;
+    }
+
+    /// Critique M6(a): the offline gate was previously untested — `[gossip].enabled = true`
+    /// alone must not fire the prefetch when `network.offline` is also set.
+    #[tokio::test]
+    async fn analyze_manifest_skips_gossip_prefetch_when_offline() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(r#"{"responses":[],"nextPageToken":""}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let policy = PolicyConfig {
+            gossip: GossipConfig::new().with_enabled(true),
+            network: deps_core::policy_config::NetworkConfig::new().with_offline(true),
+            ..no_osv_policy()
+        };
+        let ctx = mock_gossip_context(policy, server.url());
+        // `HttpCache::new()` (used by `mock_gossip_context`) defaults to online — the offline
+        // signal `fetch_gossip_findings_batch` actually reads comes from `ctx.policy.network`,
+        // routed through `analyze_manifest`'s own offline plumbing, not the cache's own flag.
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(CoveredEcosystem);
+        let manifest_path = covered_ecosystem_manifest_path();
+
+        deps_cli::analyze::analyze_manifest(
+            &ecosystem,
+            &manifest_path,
+            "unused",
+            &ctx,
+            deps_cli::analyze::AnalysisScope::update_default(),
+        )
+        .await
+        .expect("analyze_manifest must not fail for this fixture");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn analyze_manifest_skips_gossip_prefetch_for_an_uncovered_ecosystem() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(r#"{"responses":[],"nextPageToken":""}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let policy = PolicyConfig {
+            gossip: GossipConfig::new().with_enabled(true),
+            ..no_osv_policy()
+        };
+        let ctx = mock_gossip_context(policy, server.url());
+        // `EcosystemId::Dart` — not one of the 7 `deps_dev_system`-covered systems.
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(TestTier3Ecosystem::returning(Vec::new()));
+        let manifest_path = covered_ecosystem_manifest_path();
+
+        deps_cli::analyze::analyze_manifest(
+            &ecosystem,
+            &manifest_path,
+            "unused",
+            &ctx,
+            deps_cli::analyze::AnalysisScope::update_default(),
+        )
+        .await
+        .expect("analyze_manifest must not fail for this fixture");
+
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn analyze_manifest_skips_gossip_prefetch_when_gossip_disabled() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(r#"{"responses":[],"nextPageToken":""}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        // `[gossip].enabled` defaults to `false` — `no_osv_policy()` leaves it untouched.
+        let ctx = mock_gossip_context(no_osv_policy(), server.url());
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(CoveredEcosystem);
+        let manifest_path = covered_ecosystem_manifest_path();
+
+        deps_cli::analyze::analyze_manifest(
+            &ecosystem,
+            &manifest_path,
+            "unused",
+            &ctx,
+            deps_cli::analyze::AnalysisScope::update_default(),
+        )
+        .await
+        .expect("analyze_manifest must not fail for this fixture");
+
+        mock.assert_async().await;
+    }
+
+    /// Issue #1521 item 4: `update --security-only`'s `AnalysisScope::vulnerabilities_only()`
+    /// must skip the GOSSIP prefetch even with `[gossip].enabled = true` — that mode's fix
+    /// target never reads a GOSSIP-filtered `latest` at all.
+    #[tokio::test]
+    async fn analyze_manifest_skips_gossip_prefetch_under_security_only_scope() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v3alpha/findingsbatch")
+            .with_status(200)
+            .with_body(r#"{"responses":[],"nextPageToken":""}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        let policy = PolicyConfig {
+            gossip: GossipConfig::new().with_enabled(true),
+            ..no_osv_policy()
+        };
+        let ctx = mock_gossip_context(policy, server.url());
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(CoveredEcosystem);
+        let manifest_path = covered_ecosystem_manifest_path();
+
+        deps_cli::analyze::analyze_manifest(
+            &ecosystem,
+            &manifest_path,
+            "unused",
+            &ctx,
+            deps_cli::analyze::AnalysisScope::vulnerabilities_only(),
+        )
+        .await
+        .expect("analyze_manifest must not fail for this fixture");
+
+        mock.assert_async().await;
+    }
+}

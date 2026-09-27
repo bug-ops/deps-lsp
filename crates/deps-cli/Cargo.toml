@@ -93,4 +93,9 @@ deps-core = { workspace = true, features = ["test-util"] }
 deps-engine = { workspace = true, features = ["test-util"] }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonschema = { workspace = true }
+# `check_integration.rs`'s `gossip_prefetch_wiring_regression` module (issue #1521 item 2) —
+# a `mockito`-backed `DepsDevClient::for_test` to prove `analyze_manifest` actually reaches
+# `fetch_gossip_findings_batch`'s ecosystem/offline/opt-in gates, mirroring `deps-core`'s own
+# `mock_client()` test helper for the same endpoint.
+mockito = { workspace = true }
 tempfile = { workspace = true }

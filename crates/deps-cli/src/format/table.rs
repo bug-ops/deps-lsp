@@ -242,6 +242,7 @@ mod tests {
             outcome,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
+            gossip_excluded_version: None,
         }
     }
 

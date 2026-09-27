@@ -376,14 +376,13 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
     // freshness-filtered registry pick. Warn, don't reject; comparing the final resolved
     // `policy` value (after `apply_overrides`) against the default catches both sources
     // uniformly instead of checking `args.cooldown` alone.
-    //
-    // Spec 074 FR-006: GOSSIP's fetch-level cooldown exclusion (FR-003) is, for the exact
-    // same reason, equally without effect under `--security-only` — extended here rather
-    // than as a second independent warning so both no-op cooldown sources are named in one
-    // place when both apply.
+    let freshness_non_default =
+        policy.freshness.cooldown_secs != PolicyConfig::default().freshness.cooldown_secs;
     if args.security_only {
-        let freshness_non_default =
-            policy.freshness.cooldown_secs != PolicyConfig::default().freshness.cooldown_secs;
+        // Spec 074 FR-006: GOSSIP's fetch-level cooldown exclusion (FR-003) is, for the exact
+        // same reason, equally without effect under `--security-only` — extended here rather
+        // than as a second independent warning so both no-op cooldown sources are named in one
+        // place when both apply.
         let gossip_enabled = policy.gossip.enabled;
         let source = match (freshness_non_default, gossip_enabled) {
             (true, true) => Some("a non-default freshness cooldown and GOSSIP"),
@@ -396,6 +395,17 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
                 "deps-cli: warning: {source} has no effect under --security-only (the fix target comes from the advisory, not the freshness/GOSSIP-filtered registry pick)"
             );
         }
+    } else if freshness_non_default && !policy.freshness.enabled {
+        // Critique M4: a non-default `freshness.cooldown_secs` (from `--cooldown` or an
+        // explicit `--config`'s `[freshness]` section) is silently a no-op once
+        // `[freshness].enabled = false` — `within_freshness_cooldown` gates on `enabled`
+        // before ever reading `cooldown_secs`. Consistent with `check`'s existing
+        // `enabled`-gated cooldown badge, but an explicit override having zero effect with no
+        // signal at all is surprising enough to warn about, unlike `--security-only`'s
+        // structural (never-applicable) case above.
+        eprintln!(
+            "deps-cli: warning: a non-default freshness cooldown has no effect because [freshness].enabled is false"
+        );
     }
 
     // FR-015: hard-error rather than silently scanning zero dependencies and exiting 0.
@@ -595,7 +605,15 @@ async fn run_update(
         )
         .await
     } else {
-        update::plan_updates(&analysis, &content, formatter, &args.package, &ignore_rules)
+        update::plan_updates(
+            &analysis,
+            &content,
+            formatter,
+            &args.package,
+            &ignore_rules,
+            ctx.policy.freshness.to_settings(),
+            deps_core::PublishTime::now(),
+        )
     };
     // M2: must run before the plan is reported/rendered — `plan_security_updates` does not
     // dedup its own `Applied` items, so this demotes any edit that would be dropped by

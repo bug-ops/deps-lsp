@@ -304,6 +304,7 @@ mod tests {
             outcome,
             advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],
             ignore_rule_overridden: false,
+            gossip_excluded_version: None,
         }
     }
 

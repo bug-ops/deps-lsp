@@ -360,6 +360,9 @@ fn classify_vulnerable_dependency(
             outcome: Outcome::Applied(planned.edit),
             advisory_ids: fix.advisory_ids,
             ignore_rule_overridden,
+            // FR-014: `--security-only`'s fix target comes from the advisory, never a
+            // GOSSIP-filtered registry `latest` (issue #1521 item 1).
+            gossip_excluded_version: None,
         },
         // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
         // forward to the fix target — see `requirement_already_resolves_to`'s and
@@ -431,6 +434,7 @@ fn skipped_not_requested(
         outcome: Outcome::Skipped(crate::update::SkipReason::NotRequested),
         advisory_ids: Vec::new(),
         ignore_rule_overridden: false,
+        gossip_excluded_version: None,
     }
 }
 
@@ -447,6 +451,7 @@ fn unfixable_item(
         outcome: Outcome::Unfixable(reason),
         advisory_ids: Vec::new(),
         ignore_rule_overridden,
+        gossip_excluded_version: None,
     }
 }
 
@@ -464,6 +469,7 @@ fn requires_lockfile_update_item(
         outcome: Outcome::RequiresLockfileUpdate,
         advisory_ids: advisory_ids.to_vec(),
         ignore_rule_overridden,
+        gossip_excluded_version: None,
     }
 }
 
