@@ -342,6 +342,40 @@ impl RequirementResolution for GithubActionsFormatter {
         self.sha_pin_status_from_tag_index(dep, latest)
             .unwrap_or_else(|| self.requirement_status(requirement, latest))
     }
+
+    /// #1556: a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`) is a real,
+    /// concrete version regardless of whether the pin's trailing `# comment` happens to
+    /// have the full `major.minor.patch` shape [`deps_core::lsp_helpers::concrete_pin_version`]
+    /// requires — a moving-major comment (`# v1`), a literal tool-name comment
+    /// (`# cargo-deny`), or no comment at all all resolve here the same way a full
+    /// `# v4.2.0` comment already did before this existed.
+    ///
+    /// Not gated on `comment_tag` the way `Self::sha_pin_status_from_tag_index` is: that
+    /// method only needs to *distrust* a human-written comment when one exists, but this
+    /// method's job is finding a version at all, so a commentless SHA pin (whose raw SHA is
+    /// its own `version_req`) is just as eligible. `None` on any `TagIndex` miss (cold
+    /// cache, or a SHA no currently-fetched tag points at) — the honest "unknown", not a
+    /// fabricated version.
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ConcreteVersion> {
+        let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
+        if !matches!(gha_dep.pin, Some(PinStyle::Sha { .. })) {
+            return None;
+        }
+        let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
+        if !is_full_sha(sha) {
+            return None;
+        }
+        let tag = self.tag_index.get(dep.name())?.sha_to_tag.get(sha)?.clone();
+        Some(ConcreteVersion::new(tag))
+    }
+
+    /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
+    /// fetch, not before — see [`RequirementResolution::resolved_pin_version_depends_on_registry_fetch`].
+    ///
+    /// [`GithubActionsRegistry`]: crate::registry::GithubActionsRegistry
+    fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
+        true
+    }
 }
 
 impl GithubActionsFormatter {
@@ -978,6 +1012,121 @@ mod tests {
             fmt.requirement_status_for(&d, &VersionReq::new("v4"), &ConcreteVersion::new("v4.3.1")),
             RequirementStatus::UpToDate,
             "no TagIndex entry: falls back to the comment-trusting path"
+        );
+    }
+
+    // --- #1556: resolved_pin_version ---
+
+    /// A moving-major comment (`# v1`) fails `concrete_pin_version`'s full-semver shape
+    /// check on its own, but a `TagIndex`-confirmed SHA must still resolve to the real tag.
+    #[test]
+    fn test_resolved_pin_version_sha_pin_moving_major_comment_resolves_via_tag_index() {
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "v1".to_string());
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v1".to_string()),
+            }),
+            "actions/checkout",
+            Some(format!("{sha} # v1").as_str()),
+        );
+
+        assert_eq!(
+            fmt.resolved_pin_version(&d),
+            Some(ConcreteVersion::new("v1"))
+        );
+    }
+
+    /// A literal tool-name comment (`# cargo-deny`) isn't tag-shaped at all, so it never
+    /// even becomes a `comment_tag` (`crate::types::sha_pin_raw_sha` falls back to the raw
+    /// SHA) — must still resolve via the `TagIndex`, matching #551's identical literal-tag
+    /// convention.
+    #[test]
+    fn test_resolved_pin_version_sha_pin_literal_comment_resolves_via_tag_index() {
+        let sha = "b".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "cargo-deny".to_string());
+        fmt.tag_index
+            .insert(PackageName::new("taiki-e/install-action"), Arc::new(index));
+
+        let mut d = dep(
+            Some(PinStyle::Sha { comment_tag: None }),
+            "taiki-e/install-action",
+            Some(format!("{sha} # cargo-deny").as_str()),
+        );
+        d.version_req = Some(sha.into());
+
+        assert_eq!(
+            fmt.resolved_pin_version(&d),
+            Some(ConcreteVersion::new("cargo-deny"))
+        );
+    }
+
+    /// A commentless SHA pin (`version_req` is the bare SHA itself) must resolve exactly
+    /// the same way — `resolved_pin_version` isn't gated on a comment existing at all.
+    #[test]
+    fn test_resolved_pin_version_commentless_sha_pin_resolves_via_tag_index() {
+        let sha = "c".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "v4.2.0".to_string());
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        let mut d = dep(
+            Some(PinStyle::Sha { comment_tag: None }),
+            "actions/checkout",
+            None,
+        );
+        d.version_req = Some(sha.into());
+
+        assert_eq!(
+            fmt.resolved_pin_version(&d),
+            Some(ConcreteVersion::new("v4.2.0"))
+        );
+    }
+
+    /// Cold cache (no `TagIndex` entry for this SHA yet) must stay the honest `None` — never
+    /// fabricate a version.
+    #[test]
+    fn test_resolved_pin_version_sha_pin_tag_index_miss_returns_none() {
+        let sha = "d".repeat(40);
+        let fmt = formatter();
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v1".to_string()),
+            }),
+            "actions/checkout",
+            Some(format!("{sha} # v1").as_str()),
+        );
+
+        assert_eq!(fmt.resolved_pin_version(&d), None);
+    }
+
+    /// A `Tag`/`Branch` pin has no SHA to resolve at all — must stay `None`, leaving
+    /// `concrete_pin_version`'s own text-shape ladder as the sole source for those pins.
+    #[test]
+    fn test_resolved_pin_version_non_sha_pin_returns_none() {
+        let fmt = formatter();
+        assert_eq!(
+            fmt.resolved_pin_version(&dep(Some(PinStyle::Tag), "actions/checkout", None)),
+            None
+        );
+        assert_eq!(
+            fmt.resolved_pin_version(&dep(Some(PinStyle::Branch), "dev/tool", None)),
+            None
         );
     }
 

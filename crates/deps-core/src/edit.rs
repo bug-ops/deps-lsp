@@ -1730,6 +1730,77 @@ mod tests {
             let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
             assert!(candidates.is_empty());
         }
+
+        /// #1556 N3 (review): `current` in `collect_update_candidates` — the value
+        /// `deps-cli update --update-types` feeds into `classify_update` — now flows through
+        /// `resolve_in_use_version`, so a GitHub Actions SHA pin whose `resolved_pin_version`
+        /// hook resolves to a full-semver tag now classifies as a real `UpdateKind` instead of
+        /// `Unknown`. This is a genuine, user-visible CLI behavior change introduced by this
+        /// PR's core fix that had zero coverage before: `test_classify_update_github_actions_
+        /// sha_pin_is_unknown` only calls `classify_update` directly on two raw SHA strings and
+        /// never goes through `resolve_in_use_version`/`resolved_pin_version` at all — that test
+        /// still covers the unresolved case (the hook returning nothing) and must keep passing
+        /// unchanged.
+        #[test]
+        fn test_collect_update_candidates_github_actions_sha_pin_current_resolves_via_hook() {
+            struct ShaPinResolvedFormatter;
+            impl crate::lsp_helpers::PackageNaming for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::PackageRendering for ShaPinResolvedFormatter {
+                fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                    version.to_string()
+                }
+                fn package_url(&self, name: &PackageName) -> String {
+                    name.as_str().to_string()
+                }
+            }
+            impl crate::lsp_helpers::RequirementResolution for ShaPinResolvedFormatter {
+                fn is_requirement_up_to_date(
+                    &self,
+                    _requirement: &crate::VersionReq,
+                    _latest: &ConcreteVersion,
+                ) -> bool {
+                    false
+                }
+                fn resolved_pin_version(&self, _dep: &dyn Dependency) -> Option<ConcreteVersion> {
+                    Some(ConcreteVersion::new("v1.3.0"))
+                }
+            }
+            impl crate::lsp_helpers::DiagnosticMessages for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::DiagnosticPolicy for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::SourcePolicy for ShaPinResolvedFormatter {}
+            impl crate::lsp_helpers::OsvNaming for ShaPinResolvedFormatter {}
+
+            let sha = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2";
+            let content = format!("actions/checkout = \"{sha}\"\n");
+            let sha_start = u32::try_from(content.find(sha).unwrap()).unwrap();
+            let sha_end = sha_start + u32::try_from(sha.len()).unwrap();
+            let pr = parse_result(vec![dep(
+                "actions/checkout",
+                sha,
+                range(0, sha_start, 0, sha_end),
+            )]);
+            let mut cached = HashMap::new();
+            cached.insert(
+                "actions/checkout".into(),
+                PackageVersions::latest_only("v1.4.0"),
+            );
+            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            let versions =
+                VersionData::new(&cached, &resolved).with_ecosystem(EcosystemId::GithubActions);
+
+            let candidates =
+                collect_update_candidates(&pr, &content, versions, &ShaPinResolvedFormatter);
+
+            assert_eq!(candidates.len(), 1, "{candidates:?}");
+            let UpdateCandidate::Planned(planned) = &candidates[0] else {
+                panic!("expected a planned update, got {:?}", candidates[0]);
+            };
+            assert_eq!(planned.current, "v1.3.0");
+            assert_eq!(
+                classify_update(&planned.current, planned.target.as_str()),
+                UpdateKind::Minor
+            );
+        }
     }
 
     // --- plan_vulnerability_fix: #1344 requirement-already-admits-fix gate, #1347

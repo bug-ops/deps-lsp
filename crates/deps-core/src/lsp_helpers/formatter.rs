@@ -604,6 +604,55 @@ pub trait RequirementResolution: Send + Sync {
         let _ = dep;
         false
     }
+
+    /// An ecosystem-resolved concrete version for `dep`, sourced from out-of-band
+    /// resolution data this ecosystem already holds elsewhere — rather than reconstructed
+    /// from the manifest requirement text alone the way
+    /// [`crate::lsp_helpers::concrete_pin_version`] must.
+    ///
+    /// GitHub Actions is the motivating case (#1556): a SHA-pinned `uses:` step's exact
+    /// version is knowable from [`crate::lsp_helpers::TagIndex::sha_to_tag`] — resolved via
+    /// the same live tags fetch that already backs hover's `**Resolved**` line and the "Pin
+    /// to commit SHA" quickfix — even when the pin's trailing `# comment` fails
+    /// `concrete_pin_version`'s text-shape check (a moving-major-tag comment, a literal
+    /// tool-name comment, or no comment at all). Overriding this lets such a dependency
+    /// still reach a real OSV vulnerability scan, hover, and inlay hints instead of being
+    /// skipped as unresolvable.
+    ///
+    /// Consulted by [`crate::lsp_helpers::resolve_in_use_version`] between its lock-file
+    /// step and its final `concrete_pin_version` text fallback: a lock-file-resolved
+    /// version, when one exists, still wins over this hook (impl-critic M2 — an
+    /// ecosystem's own out-of-band resolution must only fill a gap the lock file leaves
+    /// open, never silently supersede a stronger existing resolution source), but a `Some`
+    /// here wins over the blind manifest-text guess below it, since it is still strictly
+    /// more trustworthy than text alone. Its own output is not trusted verbatim either: the
+    /// caller re-applies the identical full-version shape gate manifest text goes through
+    /// (`concrete_pin_version`), since this hook can itself resolve to a
+    /// moving/partial name (#1556 impl-critic S1).
+    ///
+    /// Default: `None` — every ecosystem's manifest requirement text is authoritative until
+    /// it opts in.
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ConcreteVersion> {
+        let _ = dep;
+        None
+    }
+
+    /// Whether [`Self::resolved_pin_version`] may only start returning `Some` for a given
+    /// dependency once this ecosystem's own registry fetch completes (e.g. GitHub Actions'/
+    /// GitLab CI's `TagIndex`, populated as a side effect of `Registry::get_versions` — not
+    /// present yet at document-open/edit time).
+    ///
+    /// Default: `false` — every ecosystem whose `resolved_pin_version` stays `None`
+    /// unconditionally, or is already sourced from data available before any fetch, has
+    /// nothing to wait for. An ecosystem overriding `resolved_pin_version` with a value
+    /// sourced from its own registry fetch MUST override this to `true`, or `deps-lsp`'s OSV
+    /// phase A scan — spawned concurrently with, not after, that fetch — can run on a cold
+    /// first open/edit, skip a dependency as unresolvable, and never re-check it once the
+    /// fetch actually lands (#1556 critic S2): `deps-lsp` uses this flag to know when it must
+    /// re-run the OSV scan pipeline after that fetch completes.
+    fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
+        false
+    }
 }
 
 /// Static wording for diagnostics and hover about yanked/deprecated package state.

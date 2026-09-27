@@ -164,6 +164,76 @@ pub(crate) async fn rescan_after_resolved_version_change(
     .await;
 }
 
+/// Re-runs the OSV phase A/B pipeline once more and commits its result, when needed, right
+/// after a registry fetch this document just awaited (#1556 critic S2).
+///
+/// [`run_osv_scan_phase_a`] builds its scan targets from whatever the document holds the
+/// moment it starts, but callers spawn it *concurrently with*, not after, the registry fetch
+/// that (for GitHub Actions/GitLab CI) populates `TagIndex` — see
+/// [`deps_core::lsp_helpers::RequirementResolution::resolved_pin_version_depends_on_registry_fetch`].
+/// On a cold first open/edit this races that fetch: phase A can snapshot an empty `TagIndex`,
+/// skip a dependency as [`deps_core::osv::SkipReason::NoConcreteVersion`], and nothing
+/// re-checks it once the fetch actually lands, so the diagnostic stays wrong for the rest of
+/// the session.
+///
+/// Cheap no-op in the overwhelmingly common case: returns immediately unless both (a) this
+/// ecosystem's formatter opts into
+/// `resolved_pin_version_depends_on_registry_fetch` and (b) the document's just-committed
+/// vulnerability map actually left something skipped as `NoConcreteVersion` — most
+/// ecosystems and most documents hit neither. When it does run, it mirrors
+/// [`rescan_after_resolved_version_change`]'s "run phase A, then phase B, then commit" shape
+/// exactly, plus the same hint/code-lens republish
+/// [`super::lifecycle`]'s ordinary commit path gives a phase-B commit, since this can be the
+/// first time accurate results are available for this document.
+pub(crate) async fn rescan_osv_if_tag_index_now_warm(
+    uri: &Uri,
+    state: &Arc<ServerState>,
+    client: &tower_lsp_server::Client,
+    ecosystem: &Arc<dyn Ecosystem>,
+    fetch_timeout_secs: u64,
+) {
+    if !ecosystem
+        .formatter()
+        .resolved_pin_version_depends_on_registry_fetch()
+    {
+        return;
+    }
+
+    let left_unresolved = state.get_document(uri).is_some_and(|doc| {
+        doc.signals.vulnerabilities.values().any(|outcome| {
+            matches!(
+                outcome,
+                deps_core::osv::ScanOutcome::Skipped(deps_core::osv::SkipReason::NoConcreteVersion)
+            )
+        })
+    });
+    if !left_unresolved {
+        return;
+    }
+
+    let Some(phase_a_result) = run_osv_scan_phase_a(
+        uri.clone(),
+        Arc::clone(state),
+        Arc::clone(ecosystem),
+        fetch_timeout_secs,
+    )
+    .await
+    else {
+        return;
+    };
+
+    run_osv_phase_b_and_commit(
+        uri,
+        state,
+        ecosystem.ecosystem_id(),
+        ecosystem.formatter(),
+        fetch_timeout_secs,
+        phase_a_result,
+    )
+    .await;
+    state.spawn_refresh_requests(client);
+}
+
 /// Background pre-fetch of each dependency's license, for whichever ecosystems
 /// override [`deps_core::Ecosystem::fetch_license`] (issue #660/#688, spec 010 plan §1
 /// tier 3) — today, pub.dev's `/score` endpoint (Dart), the GitHub repository API
@@ -1505,6 +1575,187 @@ mod tests {
                 Some(ScanOutcome::Skipped(SkipReason::UnmappableName)),
                 "R1's stale commit (snapshotted against the closed document instance) must \
                  not overwrite the freshly-reopened instance's own result — got: {:?}",
+                doc.signals.vulnerabilities
+            );
+        }
+    }
+
+    /// #1556 critic S2/S3: `rescan_osv_if_tag_index_now_warm`.
+    #[cfg(feature = "github-actions")]
+    mod tag_index_rescan_tests {
+        use super::super::super::state::DocumentState;
+        use super::*;
+        use deps_core::lsp_helpers::{CommitSha, TagIndex};
+        use deps_core::osv::OsvClient;
+        use deps_github_actions::{GithubActionsEcosystem, GithubActionsRegistry};
+        use std::assert_matches;
+
+        /// A cold first open (empty `TagIndex`, mirroring phase A racing ahead of the tags
+        /// fetch) must not be a permanent skip: once the fetch that would populate
+        /// `TagIndex` lands, `rescan_osv_if_tag_index_now_warm` must re-run the pipeline and
+        /// replace the stale `Skipped(NoConcreteVersion)` with a real result — and (S3) do
+        /// so under the exact same `VulnKey`, proving no cold-keyed entry is left orphaned
+        /// behind by the warm commit's full-replace (`DocumentState::update_vulnerabilities`).
+        #[tokio::test]
+        async fn rescan_replaces_cold_skip_with_warm_result_under_the_same_key() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect(1)
+                .create_async()
+                .await;
+
+            let mut state = ServerState::new();
+            state.osv = Arc::new(OsvClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            ));
+            let state = Arc::new(state);
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let sha = "f".repeat(40);
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v1\n");
+
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
+                deps_core::HttpCache::new(),
+            )));
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let doc_state = DocumentState::new_from_parse_result(
+                EcosystemId::GithubActions,
+                content,
+                parse_result,
+            );
+            state.update_document(uri.clone(), doc_state);
+
+            // Cold: `TagIndex` is empty, exactly as it is before this ecosystem's own tags
+            // fetch has ever run.
+            let cold_phase_a =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect("a SHA-pinned step must still produce a phase-A result");
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                cold_phase_a,
+            )
+            .await;
+
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            {
+                let doc = state.get_document(&uri).unwrap();
+                assert_matches!(
+                    doc.signals.vulnerabilities.get(&key),
+                    Some(deps_core::osv::ScanOutcome::Skipped(
+                        deps_core::osv::SkipReason::NoConcreteVersion
+                    )),
+                    "cold TagIndex: expected the SHA pin to be skipped, got: {:?}",
+                    doc.signals.vulnerabilities
+                );
+            }
+
+            // Warm: the tags fetch that would normally populate `TagIndex` lands now.
+            let registry = ecosystem.registry();
+            let gha_registry = registry
+                .as_any()
+                .downcast_ref::<GithubActionsRegistry>()
+                .expect("GithubActionsEcosystem::registry() must return a GithubActionsRegistry");
+            let mut index = TagIndex::default();
+            index
+                .sha_to_tag
+                .insert(CommitSha::parse(&sha).unwrap(), "v1.3.0".to_string());
+            gha_registry
+                .tag_index()
+                .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_matches!(
+                doc.signals.vulnerabilities.get(&key),
+                Some(deps_core::osv::ScanOutcome::Clean),
+                "warm rescan must replace the stale skip under the SAME key with a real \
+                 result: {:?}",
+                doc.signals.vulnerabilities
+            );
+            assert_eq!(
+                doc.signals.vulnerabilities.len(),
+                1,
+                "the rescan's full-replace commit must leave no leftover stale entry \
+                 behind: {:?}",
+                doc.signals.vulnerabilities
+            );
+        }
+
+        /// No-op guard: an ecosystem that doesn't override
+        /// `resolved_pin_version_depends_on_registry_fetch` (the vast majority) must never
+        /// pay for a rescan, even when something was genuinely skipped for an unrelated
+        /// reason.
+        #[cfg(feature = "cargo")]
+        #[tokio::test]
+        async fn rescan_is_a_no_op_for_an_ecosystem_that_does_not_opt_in() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let state = Arc::new(ServerState::new());
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = "[dependencies]\nserde = \"^1.0\"\n".to_string();
+            let ecosystem = state
+                .ecosystem_registry
+                .for_uri(&url)
+                .expect("Cargo ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            state.update_document(uri.clone(), doc_state);
+
+            let phase_a =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect("a caret range with no lock file must still produce a phase-A result");
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                phase_a,
+            )
+            .await;
+
+            let key = deps_core::test_util::vuln_key("serde");
+            let before_len = state
+                .get_document(&uri)
+                .unwrap()
+                .signals
+                .vulnerabilities
+                .len();
+
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_eq!(
+                doc.signals.vulnerabilities.len(),
+                before_len,
+                "an ecosystem that never overrides resolved_pin_version_depends_on_registry_fetch \
+                 must not trigger a rescan"
+            );
+            assert_matches!(
+                doc.signals.vulnerabilities.get(&key),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::NoConcreteVersion
+                )),
+                "the pre-existing skip must survive untouched: {:?}",
                 doc.signals.vulnerabilities
             );
         }
