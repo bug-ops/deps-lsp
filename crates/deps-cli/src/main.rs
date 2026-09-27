@@ -606,10 +606,17 @@ async fn run_update(
         )
         .await
     } else {
+        // Spec 076 FR-024/T004: production `ManifestReparse`, driving the fallback-edit guard's
+        // re-parse through the same resolved ecosystem/URI this analysis already used.
+        let reparse = deps_core::edit::EcosystemReparse {
+            ecosystem: manifest.ecosystem.as_ref(),
+            uri: &analysis.uri,
+        };
         update::plan_updates(
             &analysis,
             &content,
             formatter,
+            &reparse,
             &args.package,
             &ignore_rules,
             ctx.policy.freshness.to_freshness(),

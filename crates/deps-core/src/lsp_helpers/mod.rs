@@ -375,6 +375,307 @@ pub fn cooldown_disposition<'a>(
     }
 }
 
+/// Result of [`fallback_edit_excludes_newer`] (spec 076 FR-023): whether the ecosystem's
+/// default-rendered fallback edit is safe to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackEditVerdict {
+    /// The edit is safe: applying and re-parsing it still excludes every known `available`
+    /// version newer than the fallback candidate.
+    Writable,
+    /// The edit was rejected — see [`FallbackEditRejection`] for which check failed.
+    Rejected(FallbackEditRejection),
+}
+
+/// Which [`fallback_edit_excludes_newer`] check rejected the fallback edit, in evaluation
+/// order (first failure wins; phase 2 is only reached once every phase-1 check passes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackEditRejection {
+    /// Precondition (round-4 critic D5, fix-cycle M2): `candidate`'s span does not equal this
+    /// occurrence's own `Dependency::version_range()` — the edit was built for a different
+    /// occurrence (or a stale one), so nothing below is meaningful for THIS dependency.
+    /// Production always passes equality (the edit is always built from the same dependency's
+    /// own `version_range()`); this guards the public API against a caller passing a
+    /// mismatched edit.
+    CandidateSpanMismatch,
+    /// Fix-cycle (issue #1561/CWE-1284 class): `fallback` itself is absent from `available` —
+    /// a stale or inconsistent candidate computed against a version list that has since
+    /// changed. Checked once, shared by both d0 and d1, before either can read `fallback`'s
+    /// position: never infer "not a downgrade" from the absence of evidence.
+    FallbackUnlisted,
+    /// Phase 1, a0: the ORIGINAL declared requirement has no compiled matcher (e.g. GitHub
+    /// Actions/GitLab CI tag pins) — unchanged from spec 075.
+    OriginalUncompilable,
+    /// Phase 1, c0: the original requirement already reads the fallback as current (a
+    /// below-floor fallback, e.g. NuGet's bare-floor shape).
+    OriginalAlreadyUpToDate,
+    /// Phase 1, d0: the original requirement's own floor (the OLDEST `available` entry it
+    /// still matches) is newer than `fallback` — writing it would be a downgrade below what R0
+    /// already resolves to, or no listed entry evidences the floor at all (issues #1564/#1561:
+    /// fixed from an earlier "reject if anything newer also matches" reading, which rejected
+    /// nearly every permissive/auto-following requirement, and from a "no evidence means safe"
+    /// vacuous accept on an unlisted declared pin).
+    OriginalResolvesPastFallback,
+    /// The edited manifest could not be re-parsed (FR-024) — e.g. Composer's genuinely-awaiting
+    /// `parse_manifest` for a bare vcs/path/artifact repository plus a lockfile.
+    ReparseFailed,
+    /// The re-parsed manifest did not contain exactly one dependency matching this occurrence's
+    /// `(normalized name, version_range.start)`.
+    OccurrenceNotUnique,
+    /// Phase 2, a1: the re-parsed, EDITED requirement has no compiled matcher.
+    EditedUncompilable,
+    /// Phase 2, b1: the edited requirement's matcher does not accept the fallback itself — the
+    /// written edit does not actually express the fallback version.
+    EditedExcludesFallback,
+    /// Phase 2, d1: the edited (WRITTEN) requirement admits some `available` entry strictly
+    /// newer than the fallback — the edit auto-follows back into an in-cooldown version. Unlike
+    /// d0, this is NOT a floor comparison: an auto-following range (Cargo's caret, Dart's caret,
+    /// PyPI's default `>=X,<next`) has its floor AT the fallback itself by construction (the
+    /// edit was rendered FROM `fallback`), so a floor check alone would never catch a range that
+    /// also admits something newer above it — exactly the case round-1 critic S1 exists to
+    /// reject (spec 076 §1's documented, intentional fail-closed outcome for these ecosystems).
+    EditedAdmitsNewer,
+}
+
+/// Spec 076 FR-023/FR-024: THE uniform guard deciding whether a cooldown-fallback candidate's
+/// default-rendered edit is safe to write.
+///
+/// Applied identically to spec 075's lockfile-resolved path and spec 076's no-lockfile path —
+/// no per-ecosystem override or retry (FR-025).
+///
+/// Two phases, evaluated in this exact order, first failure wins:
+///
+/// - **Phase 1**, on `R0 = dep.version_requirement()` (the ORIGINAL declared requirement, no
+///   parse needed): a0 `compile_requirement(R0)` must be `Some`; c0
+///   `is_requirement_up_to_date(R0, fallback)` must be `false` (closes a NuGet bare-floor gap,
+///   spec 076 round-1 critic S2); d0 no `available` entry STRICTLY newer than `fallback` may
+///   satisfy `requirement_already_resolves_to(R0, entry)` (anti-downgrade — writing `fallback`
+///   must not move resolution backward relative to what R0 already resolves to).
+/// - **Re-parse** (only if phase 1 passes, FR-024): `candidate` is applied to a scratch copy of
+///   `content`, the copy is re-parsed via `reparse`, and the edited occurrence is located by
+///   `(formatter.normalize_package_name(dep.name()), version_range().start)` — NOT `name_range`,
+///   since some grammars (NuGet's `Version`-before-`Include` attribute order, Maven's XML
+///   element order, Gradle's map notation) put the version before the name, so `name_range`
+///   would shift under the edit and silently fail closed. Exactly one match is required; zero
+///   or more than one is [`FallbackEditRejection::OccurrenceNotUnique`].
+/// - **Phase 2**, on `R1` = the located occurrence's re-parsed requirement: a1
+///   `compile_requirement(R1)` must be `Some`; b1 R1's matcher must accept `fallback` itself
+///   (`Some(true)`) — proving the written edit actually expresses `fallback`, failing closed for
+///   an unmodellable/unsatisfiable written requirement; d1 no `available` entry STRICTLY newer
+///   than `fallback` may satisfy `requirement_already_resolves_to(R1, entry)` (the edit must not
+///   auto-follow back into a known newer, still-in-cooldown version).
+///
+/// Yanked entries in `available` are NOT excluded from the d0/d1 scans — conservative,
+/// fail-closed: a yanked newer version admitted by the requirement still rejects the fallback.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::ManifestEdit;
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, FallbackEditRejection, FallbackEditVerdict,
+///     OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
+///     SourcePolicy, fallback_edit_excludes_newer,
+/// };
+/// use deps_core::position::{Position, Range};
+/// use deps_core::{ConcreteVersion, Dependency, PackageName, ParseResult, VersionReq};
+///
+/// struct ExactMatcher(String);
+/// impl RequirementMatcher for ExactMatcher {
+///     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+///         Some(version.as_str() == self.0)
+///     }
+///     fn strict_prerelease_exclusion(&self) -> bool {
+///         false
+///     }
+/// }
+///
+/// struct ExactFormatter;
+/// impl PackageNaming for ExactFormatter {}
+/// impl PackageRendering for ExactFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for ExactFormatter {
+///     fn compile_requirement(
+///         &self,
+///         requirement: &VersionReq,
+///     ) -> Option<Box<dyn RequirementMatcher>> {
+///         Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
+///     }
+/// }
+/// impl DiagnosticMessages for ExactFormatter {}
+/// impl DiagnosticPolicy for ExactFormatter {}
+/// impl SourcePolicy for ExactFormatter {}
+/// impl OsvNaming for ExactFormatter {}
+///
+/// struct ExactDependency;
+/// impl Dependency for ExactDependency {
+///     fn name(&self) -> &PackageName {
+///         static NAME: std::sync::LazyLock<PackageName> =
+///             std::sync::LazyLock::new(|| PackageName::new("pkg"));
+///         &NAME
+///     }
+///     fn name_range(&self) -> Range {
+///         Range::default()
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         static REQ: std::sync::LazyLock<VersionReq> =
+///             std::sync::LazyLock::new(|| VersionReq::new("1.0.0"));
+///         Some(&REQ)
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         Some(Range::new(Position::new(0, 0), Position::new(0, 6)))
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn std::any::Any {
+///         self
+///     }
+/// }
+///
+/// let formatter = ExactFormatter;
+/// let dep = ExactDependency;
+/// let candidate = ManifestEdit {
+///     range: Range::new(Position::new(0, 0), Position::new(0, 6)),
+///     new_text: "1.1.0".to_string(),
+/// };
+/// let fallback = ConcreteVersion::new("1.1.0");
+/// let available = [ConcreteVersion::new("1.1.0"), ConcreteVersion::new("1.0.0")];
+/// // A stub `ManifestReparse` that always fails — demonstrates the fail-closed re-parse gate.
+/// let reparse = |_content: &str| -> Option<Box<dyn ParseResult>> { None };
+///
+/// let verdict = fallback_edit_excludes_newer(
+///     &formatter,
+///     &reparse,
+///     "1.0.0",
+///     &dep,
+///     &candidate,
+///     &fallback,
+///     &available,
+/// );
+/// assert_eq!(
+///     verdict,
+///     FallbackEditVerdict::Rejected(FallbackEditRejection::ReparseFailed)
+/// );
+/// ```
+#[must_use]
+pub fn fallback_edit_excludes_newer(
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    reparse: &dyn crate::edit::ManifestReparse,
+    content: &str,
+    dep: &dyn Dependency,
+    candidate: &crate::edit::ManifestEdit,
+    fallback: &ConcreteVersion,
+    available: &[ConcreteVersion],
+) -> FallbackEditVerdict {
+    use FallbackEditRejection::{
+        CandidateSpanMismatch, EditedAdmitsNewer, EditedExcludesFallback, EditedUncompilable,
+        FallbackUnlisted, OccurrenceNotUnique, OriginalAlreadyUpToDate,
+        OriginalResolvesPastFallback, OriginalUncompilable, ReparseFailed,
+    };
+
+    // Precondition (D5, fix-cycle M2): `candidate` must target THIS occurrence's own span.
+    if Some(candidate.range) != dep.version_range() {
+        return FallbackEditVerdict::Rejected(CandidateSpanMismatch);
+    }
+
+    // Phase 1: R0, the ORIGINAL declared requirement — no parse needed.
+    let Some(r0) = dep.version_requirement() else {
+        return FallbackEditVerdict::Rejected(OriginalUncompilable);
+    };
+    let Some(r0_matcher) = formatter.compile_requirement(r0) else {
+        return FallbackEditVerdict::Rejected(OriginalUncompilable);
+    };
+
+    // Fix-cycle (issues #1564/#1561, CWE-1284 class): `fallback`'s own position is looked up
+    // ONCE here and shared by d0/d1 below — fails closed instead of letting a "no evidence"
+    // absence read as "safe" the way `available.iter().take_while(|v| *v != fallback)` did when
+    // `fallback` was never found at all (it would scan to the end without ever short-circuiting,
+    // silently changing what the scan even means). Ordered after a0 so an ecosystem with no
+    // compiled requirement model (GitHub Actions, GitLab CI) logs the more informative
+    // `OriginalUncompilable` instead of `FallbackUnlisted` — same final `Rejected` outcome either
+    // way, this only affects the `tracing::debug!` reason.
+    let Some(fallback_pos) = available.iter().position(|v| v == fallback) else {
+        return FallbackEditVerdict::Rejected(FallbackUnlisted);
+    };
+
+    if formatter.is_requirement_up_to_date(r0, fallback) {
+        return FallbackEditVerdict::Rejected(OriginalAlreadyUpToDate);
+    }
+    // d0 (issues #1564/#1561 fix, matching #1565's shipped floor-comparison exactly): a FLOOR
+    // comparison over R0's raw admitted-set membership (`compile_requirement(..).matches`), not
+    // "does anything newer also match" and NOT `requirement_already_resolves_to` — that stricter
+    // predicate is deliberately always `false` for a floor-shaped requirement (NuGet's bare
+    // `Version="1.0.0"`, see its `requirement_already_resolves_to` doc), which would make this
+    // scan find no floor at all and fail closed on every floor-type ecosystem. `available` is
+    // newest-first, so the requirement's own floor — the OLDEST entry it still admits — sits at
+    // the LARGEST matching index. Accept iff that floor is at or after `fallback`'s own index
+    // (`fallback` is not older than what R0, left unedited, already resolves to); `None`
+    // (nothing evidences the floor at all, e.g. an unlisted declared pin) fails closed the same
+    // as a floor strictly newer than `fallback`.
+    let r0_floor = available
+        .iter()
+        .rposition(|v| r0_matcher.matches(v) == Some(true));
+    if r0_floor.is_none_or(|floor| floor < fallback_pos) {
+        return FallbackEditVerdict::Rejected(OriginalResolvesPastFallback);
+    }
+
+    // Re-parse (FR-024): apply the candidate edit to a scratch copy and re-parse it.
+    let edited_content = crate::edit::apply_edits(content, std::slice::from_ref(candidate));
+    let Some(parsed) = reparse.reparse(&edited_content) else {
+        return FallbackEditVerdict::Rejected(ReparseFailed);
+    };
+
+    // Locate the edited occurrence by (normalized name, version_range().start) — invariant
+    // under an edit that only changes text at or after it, unlike `name_range` (round-4 critic
+    // M3: NuGet/Maven/Gradle grammars can put the version before the name).
+    let key = formatter.normalize_package_name(dep.name());
+    let orig_start = dep.version_range().map(|r| r.start);
+    let mut candidates = parsed.dependencies().into_iter().filter(|edited_dep| {
+        formatter.normalize_package_name(edited_dep.name()) == key
+            && edited_dep.version_range().map(|r| r.start) == orig_start
+    });
+    let Some(edited_dep) = candidates.next() else {
+        return FallbackEditVerdict::Rejected(OccurrenceNotUnique);
+    };
+    if candidates.next().is_some() {
+        return FallbackEditVerdict::Rejected(OccurrenceNotUnique);
+    }
+
+    // Phase 2: R1, the re-parsed EDITED requirement.
+    let Some(r1) = edited_dep.version_requirement() else {
+        return FallbackEditVerdict::Rejected(EditedUncompilable);
+    };
+    let Some(matcher) = formatter.compile_requirement(r1) else {
+        return FallbackEditVerdict::Rejected(EditedUncompilable);
+    };
+    if matcher.matches(fallback) != Some(true) {
+        return FallbackEditVerdict::Rejected(EditedExcludesFallback);
+    }
+    // d1 (round-1 critic S1) is deliberately NOT the d0 floor comparison: an auto-following
+    // range's floor sits at `fallback` itself by construction (the edit was rendered FROM
+    // `fallback`), so a floor check alone would never see that the SAME range also admits an
+    // entry strictly newer — the auto-follow case this check exists to catch. `fallback_pos` is
+    // `available.iter().position(..)`'s own result, so it is always `<= available.len()` and the
+    // slice below (every entry strictly newer than `fallback`, since `available` is newest-first)
+    // never panics — exact, not the fragile `take_while(|v| *v != fallback)` this replaced.
+    #[allow(clippy::indexing_slicing)]
+    let strictly_newer = &available[..fallback_pos];
+    if strictly_newer
+        .iter()
+        .any(|v| formatter.requirement_already_resolves_to(r1, v))
+    {
+        return FallbackEditVerdict::Rejected(EditedAdmitsNewer);
+    }
+
+    FallbackEditVerdict::Writable
+}
+
 /// Registry version data for one package, fetched together in a single round trip.
 ///
 /// `latest` and `available` are deliberately asymmetric — this is load-bearing, not an
@@ -5745,5 +6046,475 @@ mod tests {
             ),
             LatestVerdict::Unverified
         );
+    }
+
+    /// Spec 076 SC-014: `fallback_edit_excludes_newer`, one test per [`FallbackEditRejection`]
+    /// variant plus `Writable`. `deps-core` cannot depend on the ecosystem crates, so this
+    /// module uses two stub formatters (a semver-backed stub mirroring Cargo's real semantics,
+    /// and a NuGet-floor stub) — the same probe values are pinned against REAL formatters in
+    /// `deps-cargo`/`deps-nuget` as part of T005/SC-018.
+    mod fallback_edit_excludes_newer_tests {
+        use super::*;
+        use crate::ParseResult;
+        use crate::edit::{ManifestEdit, ManifestReparse};
+        use crate::position::Position;
+
+        /// Real-semver-backed matcher, mirroring Cargo's actual resolution semantics.
+        struct SemverMatcher(semver::VersionReq);
+        impl RequirementMatcher for SemverMatcher {
+            fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+                semver::Version::parse(version.as_str())
+                    .ok()
+                    .map(|v| self.0.matches(&v))
+            }
+            fn strict_prerelease_exclusion(&self) -> bool {
+                true
+            }
+        }
+
+        /// SC-014's "semver-backed stub": real `semver::VersionReq` compilation, default
+        /// `is_requirement_up_to_date`/`requirement_already_resolves_to` (Cargo-like).
+        struct SemverFormatter;
+        impl PackageNaming for SemverFormatter {}
+        impl PackageRendering for SemverFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for SemverFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                semver::VersionReq::parse(requirement.as_str())
+                    .ok()
+                    .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+            }
+        }
+        impl DiagnosticMessages for SemverFormatter {}
+        impl DiagnosticPolicy for SemverFormatter {}
+        impl SourcePolicy for SemverFormatter {}
+        impl OsvNaming for SemverFormatter {}
+
+        /// Same as [`SemverFormatter`], but `compile_requirement` fails for the literal text
+        /// `"uncompilable"` — isolates the a1 `EditedUncompilable` check from a0, which a
+        /// formatter that always fails to compile could not do (phase 1 would reject first).
+        struct SelectivelyUncompilableFormatter;
+        impl PackageNaming for SelectivelyUncompilableFormatter {}
+        impl PackageRendering for SelectivelyUncompilableFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for SelectivelyUncompilableFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                if requirement.as_str() == "uncompilable" {
+                    return None;
+                }
+                semver::VersionReq::parse(requirement.as_str())
+                    .ok()
+                    .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+            }
+        }
+        impl DiagnosticMessages for SelectivelyUncompilableFormatter {}
+        impl DiagnosticPolicy for SelectivelyUncompilableFormatter {}
+        impl SourcePolicy for SelectivelyUncompilableFormatter {}
+        impl OsvNaming for SelectivelyUncompilableFormatter {}
+
+        /// A formatter with no `compile_requirement` override at all (trait default `None`) —
+        /// for the a0 `OriginalUncompilable` check.
+        struct NoCompileFormatter;
+        impl PackageNaming for NoCompileFormatter {}
+        impl PackageRendering for NoCompileFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for NoCompileFormatter {}
+        impl DiagnosticMessages for NoCompileFormatter {}
+        impl DiagnosticPolicy for NoCompileFormatter {}
+        impl SourcePolicy for NoCompileFormatter {}
+        impl OsvNaming for NoCompileFormatter {}
+
+        /// A floor matcher: `matches` is membership at-or-above the floor (mirrors NuGet's
+        /// bare `Version="X"` shape), but resolution never goes below OR above the floor
+        /// itself — a floor always resolves to its own lowest member.
+        struct NugetFloorMatcher(semver::Version);
+        impl RequirementMatcher for NugetFloorMatcher {
+            fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+                semver::Version::parse(version.as_str())
+                    .ok()
+                    .map(|v| v >= self.0)
+            }
+            fn strict_prerelease_exclusion(&self) -> bool {
+                false
+            }
+        }
+
+        /// SC-014's "NuGet-floor stub" (spec 076 M2): `is_requirement_up_to_date` and
+        /// `requirement_already_resolves_to` overridden with the floor rule — floor at or
+        /// above target is up to date; a floor resolves ONLY to itself, never forward.
+        struct NugetFloorFormatter;
+        impl PackageNaming for NugetFloorFormatter {}
+        impl PackageRendering for NugetFloorFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for NugetFloorFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                semver::Version::parse(requirement.as_str())
+                    .ok()
+                    .map(|floor| Box::new(NugetFloorMatcher(floor)) as Box<dyn RequirementMatcher>)
+            }
+            fn is_requirement_up_to_date(
+                &self,
+                requirement: &VersionReq,
+                latest: &ConcreteVersion,
+            ) -> bool {
+                semver::Version::parse(requirement.as_str())
+                    .ok()
+                    .zip(semver::Version::parse(latest.as_str()).ok())
+                    .is_some_and(|(floor, latest)| floor >= latest)
+            }
+            fn requirement_already_resolves_to(
+                &self,
+                requirement: &VersionReq,
+                target: &ConcreteVersion,
+            ) -> bool {
+                semver::Version::parse(requirement.as_str())
+                    .ok()
+                    .zip(semver::Version::parse(target.as_str()).ok())
+                    .is_some_and(|(floor, target)| floor == target)
+            }
+        }
+        impl DiagnosticMessages for NugetFloorFormatter {}
+        impl DiagnosticPolicy for NugetFloorFormatter {}
+        impl SourcePolicy for NugetFloorFormatter {}
+        impl OsvNaming for NugetFloorFormatter {}
+
+        struct StubDep {
+            name: PackageName,
+            requirement: Option<VersionReq>,
+            version_start: Position,
+        }
+        impl Dependency for StubDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                Range::default()
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                self.requirement.as_ref()
+            }
+            fn version_range(&self) -> Option<Range> {
+                Some(Range::new(self.version_start, self.version_start))
+            }
+            fn source(&self) -> crate::parser::DependencySource {
+                crate::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        struct StubParseResult {
+            deps: Vec<StubDep>,
+            uri: url::Url,
+        }
+        impl ParseResult for StubParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        fn dep(requirement: &str) -> StubDep {
+            StubDep {
+                name: pkg("pkg"),
+                requirement: Some(VersionReq::new(requirement)),
+                version_start: Position::new(0, 0),
+            }
+        }
+
+        /// Matches `dep()`'s own `version_range()` (a zero-width span at `version_start`) so
+        /// the D5 `CandidateSpanMismatch` precondition passes for every test that isn't
+        /// specifically exercising it.
+        fn edit() -> ManifestEdit {
+            ManifestEdit {
+                range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                new_text: "x".to_string(),
+            }
+        }
+
+        fn versions(strs: &[&str]) -> Vec<ConcreteVersion> {
+            strs.iter().map(|s| ConcreteVersion::new(*s)).collect()
+        }
+
+        fn reparsed_to(requirement: &str) -> impl ManifestReparse {
+            let requirement = requirement.to_string();
+            move |_content: &str| -> Option<Box<dyn ParseResult>> {
+                Some(Box::new(StubParseResult {
+                    deps: vec![StubDep {
+                        name: pkg("pkg"),
+                        requirement: Some(VersionReq::new(requirement.as_str())),
+                        version_start: Position::new(0, 0),
+                    }],
+                    uri: crate::test_util::test_uri("/test/manifest.toml"),
+                }))
+            }
+        }
+
+        #[test]
+        fn original_uncompilable_a0() {
+            let verdict = fallback_edit_excludes_newer(
+                &NoCompileFormatter,
+                &reparsed_to("1.1.0"),
+                "content",
+                &dep("^1.0"),
+                &edit(),
+                &ConcreteVersion::new("1.1.0"),
+                &versions(&["1.1.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::OriginalUncompilable)
+            );
+        }
+
+        #[test]
+        fn original_already_up_to_date_c0() {
+            // NuGet-shaped floor `2.0.0`; a fallback below the floor is already "up to date".
+            let verdict = fallback_edit_excludes_newer(
+                &NugetFloorFormatter,
+                &reparsed_to("1.9.0"),
+                "content",
+                &dep("2.0.0"),
+                &edit(),
+                &ConcreteVersion::new("1.9.0"),
+                &versions(&["1.9.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::OriginalAlreadyUpToDate)
+            );
+        }
+
+        #[test]
+        fn original_resolves_past_fallback_d0() {
+            // Absent-path downgrade: unedited `^2.0` already resolves to 2.0.0, strictly newer
+            // than the 1.9.0 fallback.
+            let verdict = fallback_edit_excludes_newer(
+                &SemverFormatter,
+                &reparsed_to("1.9.0"),
+                "content",
+                &dep("^2.0"),
+                &edit(),
+                &ConcreteVersion::new("1.9.0"),
+                &versions(&["2.0.0", "1.9.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::OriginalResolvesPastFallback)
+            );
+        }
+
+        #[test]
+        fn reparse_failed() {
+            // R0 "1.0" is a caret [1.0.0,2.0.0) — fallback 1.5.0 sits at its own floor (the
+            // only listed entry, matching), so phase 1 passes and re-parse is actually reached.
+            let reparse = |_content: &str| -> Option<Box<dyn ParseResult>> { None };
+            let verdict = fallback_edit_excludes_newer(
+                &SemverFormatter,
+                &reparse,
+                "content",
+                &dep("1.0"),
+                &edit(),
+                &ConcreteVersion::new("1.5.0"),
+                &versions(&["1.5.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::ReparseFailed)
+            );
+        }
+
+        #[test]
+        fn occurrence_not_unique() {
+            let reparse = |_content: &str| -> Option<Box<dyn ParseResult>> {
+                Some(Box::new(StubParseResult {
+                    deps: vec![
+                        StubDep {
+                            name: pkg("pkg"),
+                            requirement: Some(VersionReq::new("1.5.0")),
+                            version_start: Position::new(0, 0),
+                        },
+                        StubDep {
+                            name: pkg("pkg"),
+                            requirement: Some(VersionReq::new("1.5.0")),
+                            version_start: Position::new(0, 0),
+                        },
+                    ],
+                    uri: crate::test_util::test_uri("/test/manifest.toml"),
+                }) as Box<dyn ParseResult>)
+            };
+            let verdict = fallback_edit_excludes_newer(
+                &SemverFormatter,
+                &reparse,
+                "content",
+                &dep("1.0"),
+                &edit(),
+                &ConcreteVersion::new("1.5.0"),
+                &versions(&["1.5.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::OccurrenceNotUnique)
+            );
+        }
+
+        #[test]
+        fn edited_uncompilable_a1() {
+            let verdict = fallback_edit_excludes_newer(
+                &SelectivelyUncompilableFormatter,
+                &reparsed_to("uncompilable"),
+                "content",
+                &dep("1.0"),
+                &edit(),
+                &ConcreteVersion::new("1.5.0"),
+                &versions(&["1.5.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::EditedUncompilable)
+            );
+        }
+
+        #[test]
+        fn edited_excludes_fallback_b1() {
+            // The re-parse stub yields an unsatisfiable-for-the-fallback `^5` — round-1 critic
+            // M5: the written edit must actually express the fallback, not merely compile.
+            let verdict = fallback_edit_excludes_newer(
+                &SemverFormatter,
+                &reparsed_to("^5"),
+                "content",
+                &dep("1.0"),
+                &edit(),
+                &ConcreteVersion::new("1.5.0"),
+                &versions(&["1.5.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::EditedExcludesFallback)
+            );
+        }
+
+        #[test]
+        fn edited_admits_newer_d1() {
+            // R0 "2.0.0" is a caret [2.0.0,3.0.0), whose floor (2.0.1, the only listed match
+            // at or above the fallback's own position) is at the fallback — phase 1 passes.
+            // The re-parsed edit "2.0.1" is ALSO a caret ([2.0.1,3.0.0)), which still admits
+            // the fresh 2.1.0 — d1 must reject that auto-follow regardless of d0's own verdict.
+            let verdict = fallback_edit_excludes_newer(
+                &SemverFormatter,
+                &reparsed_to("2.0.1"),
+                "content",
+                &dep("2.0.0"),
+                &edit(),
+                &ConcreteVersion::new("2.0.1"),
+                &versions(&["2.1.0", "2.0.1"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::EditedAdmitsNewer)
+            );
+        }
+
+        #[test]
+        fn writable() {
+            let verdict = fallback_edit_excludes_newer(
+                &SemverFormatter,
+                &reparsed_to("^2.5.0"),
+                "content",
+                &dep("2.0"),
+                &edit(),
+                &ConcreteVersion::new("2.5.0"),
+                &versions(&["3.0.0", "2.5.0"]),
+            );
+            assert_eq!(verdict, FallbackEditVerdict::Writable);
+        }
+
+        /// Spec 076 M2: the d0 `resolves_to` loosening for a NuGet `Located` floor. Spec 075
+        /// rejected this (raw `matches` sees the floor as admitting the fresh version); this
+        /// guard writes it, since a floor resolves only to its own lowest member.
+        #[test]
+        fn nuget_located_floor_loosening_is_writable() {
+            // The floor's own value ("1.0.0") must be listed for the fix-cycle floor-comparison
+            // scan to find it — realistic for production `available` (every published version,
+            // unfiltered), since the floor is the user's own already-published declared pin.
+            let verdict = fallback_edit_excludes_newer(
+                &NugetFloorFormatter,
+                &reparsed_to("1.1.0"),
+                "content",
+                &dep("1.0.0"),
+                &edit(),
+                &ConcreteVersion::new("1.1.0"),
+                &versions(&["1.2.0", "1.1.0", "1.0.0"]),
+            );
+            assert_eq!(verdict, FallbackEditVerdict::Writable);
+        }
+
+        /// Fix-cycle (impl-critic M2, D5 precondition): a `candidate` whose range does not
+        /// equal this occurrence's own `version_range()` (e.g. an edit built for a different
+        /// line) must be rejected before any check reads it — not silently treated as
+        /// `Writable` just because R0/R1 happen to agree (a NuGet-floor R0 that already equals
+        /// its own fallback resolves to `Writable` under every other check here).
+        #[test]
+        fn candidate_span_mismatch_is_rejected() {
+            let mismatched_candidate = ManifestEdit {
+                range: Range::new(Position::new(1, 0), Position::new(1, 0)),
+                new_text: "1.1.0".to_string(),
+            };
+            let verdict = fallback_edit_excludes_newer(
+                &NugetFloorFormatter,
+                &reparsed_to("1.1.0"),
+                "content",
+                &dep("1.0.0"),
+                &mismatched_candidate,
+                &ConcreteVersion::new("1.1.0"),
+                &versions(&["1.2.0", "1.1.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::CandidateSpanMismatch)
+            );
+        }
     }
 }

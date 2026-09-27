@@ -360,6 +360,73 @@ pub fn apply_edits(content: &str, edits: &[ManifestEdit]) -> String {
     result
 }
 
+/// Re-parses manifest text, abstracting over the production path.
+///
+/// [`EcosystemReparse`]/[`crate::ecosystem::parse_manifest_now`] is the production impl, so
+/// [`crate::lsp_helpers::fallback_edit_excludes_newer`] (spec 076 FR-024) can be unit-tested
+/// with a stub instead of a real ecosystem parser.
+///
+/// FR-024's guard validates the manifest's EFFECTIVE post-edit requirement, not the replacement
+/// span's own text in isolation — some grammars (Swift's `from:`/`.exact`/`.upToNextMinor`
+/// labels, Bundler's multi-constraint literals) build the effective requirement from context
+/// outside the edited span, so only re-parsing the whole edited document proves what the edit
+/// actually expresses.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::ManifestReparse;
+///
+/// let reparse = |_content: &str| None;
+/// assert!(reparse.reparse("anything").is_none());
+/// ```
+pub trait ManifestReparse {
+    /// Re-parses `content` (an edited scratch copy of a manifest), or `None` if it could not be
+    /// parsed (fail closed).
+    fn reparse(&self, content: &str) -> Option<Box<dyn ParseResult>>;
+}
+
+/// Blanket impl so a test can pass a plain closure as a [`ManifestReparse`] instead of defining
+/// a stub type.
+impl<F: Fn(&str) -> Option<Box<dyn ParseResult>>> ManifestReparse for F {
+    fn reparse(&self, content: &str) -> Option<Box<dyn ParseResult>> {
+        self(content)
+    }
+}
+
+/// Production [`ManifestReparse`]: re-parses via [`crate::ecosystem::parse_manifest_now`].
+///
+/// That is the synchronous, dependency-count-capped sibling of
+/// [`crate::ecosystem::parse_manifest_blocking`] (spec 076 FR-024).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::edit::{EcosystemReparse, ManifestReparse};
+/// use deps_core::Ecosystem;
+/// use url::Url;
+///
+/// # fn example(ecosystem: &dyn Ecosystem, uri: Url) {
+/// let reparse = EcosystemReparse {
+///     ecosystem,
+///     uri: &uri,
+/// };
+/// let _ = reparse.reparse("content");
+/// # }
+/// ```
+pub struct EcosystemReparse<'a> {
+    /// The ecosystem to re-parse through.
+    pub ecosystem: &'a dyn crate::Ecosystem,
+    /// The manifest document's URI, for position tracking.
+    pub uri: &'a url::Url,
+}
+
+impl ManifestReparse for EcosystemReparse<'_> {
+    fn reparse(&self, content: &str) -> Option<Box<dyn ParseResult>> {
+        crate::ecosystem::parse_manifest_now(self.ecosystem, content, self.uri)
+    }
+}
+
 /// The magnitude of a version bump, per semver-shaped leading-numeric-segment comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateKind {

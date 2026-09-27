@@ -214,6 +214,50 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Dart's REAL
+    /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes an
+    /// explicit `^{version}` — an auto-following range like Cargo's caret — so FR-025's rule
+    /// is conditional on the fresh version's position, both sub-cases pinned (round-4 critic
+    /// M5).
+    async fn fallback_edit_outcome(
+        fallback: &str,
+        available: &[&str],
+    ) -> deps_core::lsp_helpers::FallbackEditVerdict {
+        let ecosystem = DartEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "name: app\ndependencies:\n  pkg: ^0.9.0\n".to_string();
+        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+        deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &DartFormatter,
+            &uri,
+            &content,
+            "pkg",
+            fallback,
+            available,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_d1_in_range_caret_admission() {
+        // The written edit ("^1.1.0") auto-follows into the fresh in-range 1.5.0.
+        assert_eq!(
+            fallback_edit_outcome("1.1.0", &["1.5.0", "1.1.0", "0.9.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_out_of_range() {
+        // The written edit ("^1.1.0") excludes the fresh out-of-range (major-bump) 3.0.0.
+        assert_eq!(
+            fallback_edit_outcome("1.1.0", &["3.0.0", "1.1.0", "0.9.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
     // test_ecosystem_lockfile_filenames/test_as_any family.

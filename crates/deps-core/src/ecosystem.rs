@@ -71,9 +71,15 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 ///
 /// `Handle::block_on` called from inside a `spawn_blocking` closure is a documented,
 /// supported tokio pattern (distinct from `Runtime::block_on`, which panics if called from
-/// within a runtime). Since the future never actually yields (`Poll::Pending`), `block_on`
-/// resolves on the first poll — negligible overhead beyond the `spawn_blocking` thread-hop
-/// itself.
+/// within a runtime). Almost every implementation's future never actually yields
+/// (`Poll::Pending`), so `block_on` resolves on the first poll for those — negligible overhead
+/// beyond the `spawn_blocking` thread-hop itself. **Correction (spec 076 round-1 critic L1):**
+/// this is not universally true — Composer's `parse_manifest` genuinely awaits
+/// (`LockFileCache::get_or_parse` → `tokio::fs::metadata`) when the manifest declares a bare
+/// vcs/path/artifact repository and a `composer.lock` exists. `block_on` still resolves
+/// correctly here since it runs inside `spawn_blocking` on a real tokio worker thread, but
+/// [`parse_manifest_now`]'s `now_or_never()` cannot drive that same await to completion — see
+/// its own doc.
 ///
 /// # Errors
 ///
@@ -112,6 +118,71 @@ pub async fn parse_manifest_blocking(
     // rather than each ecosystem crate's own parser bounding its dependency count
     // independently.
     Ok(crate::dependency_cap::cap_dependencies(
+        parsed,
+        crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+    ))
+}
+
+/// Synchronous sibling of [`parse_manifest_blocking`], for a caller that cannot `.await`.
+///
+/// Spec 076 FR-024: the fallback-edit re-parse guard, evaluated inside `deps-cli`'s synchronous
+/// planner. Drives [`Ecosystem::parse_manifest`] via [`futures::FutureExt::now_or_never`]
+/// instead of spawning onto the blocking-thread pool, then applies the SAME
+/// [`crate::dependency_cap::cap_dependencies`] chokepoint [`parse_manifest_blocking`] applies —
+/// a raw `now_or_never()` call site with no cap would otherwise be a second, uncapped parse
+/// entry point (round-3 critic M2, #796).
+///
+/// Returns `None` when called outside a tokio runtime context, when the future does not
+/// resolve on its first poll (`Pending`), or when the parse itself fails. Per
+/// [`Ecosystem::parse_manifest`]'s documented invariant, almost every implementation resolves
+/// immediately — but Composer's genuinely awaits in one narrow case (bare vcs/path/artifact
+/// repository plus a `composer.lock`, see [`parse_manifest_blocking`]'s doc), and this function
+/// fails closed (`None`) for that subset rather than blocking the caller's own async runtime to
+/// drive it to completion. Polling that same await with no tokio runtime entered at all would
+/// otherwise panic ("there is no reactor running") instead of returning `None` — this function
+/// checks for a current runtime handle first specifically to keep the `None` contract a true
+/// fail-closed guarantee, not merely a fail-closed guarantee "as long as a runtime happens to be
+/// active".
+///
+/// **Re-parse is not pure** (spec 076 round-4 critic M4): Cargo, Go, Deno, and npm's
+/// `parse_manifest` register alternate indices or GOPROXY chains into shared context as a side
+/// effect, and Cargo, NuGet, and Gradle perform synchronous disk reads for ancestor config
+/// files. This is safe to call repeatedly only because registration is idempotent — keyed by
+/// URL or chain key via `register_capped`/`register_capped_with_occupied` — so re-parsing the
+/// same document twice (once for the original content, once for an edited scratch copy) never
+/// duplicates a registration.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::Ecosystem;
+/// use url::Url;
+///
+/// # fn example(ecosystem: &dyn Ecosystem, uri: Url) {
+/// if let Some(parsed) = deps_core::ecosystem::parse_manifest_now(ecosystem, "content", &uri) {
+///     println!("{} dependencies", parsed.dependencies().len());
+/// }
+/// # }
+/// ```
+pub fn parse_manifest_now(
+    ecosystem: &dyn Ecosystem,
+    content: &str,
+    uri: &url::Url,
+) -> Option<Box<dyn ParseResult>> {
+    use futures::FutureExt;
+
+    // Fail closed instead of panicking when called outside a tokio runtime context (fix-cycle
+    // security LOW-1): Composer's `parse_manifest` genuinely awaits `tokio::fs::metadata` in
+    // its bare-repo + `composer.lock` case (see this fn's doc), which panics ("there is no
+    // reactor running") if polled with no runtime entered — this check turns that into a
+    // documented `None`, never a crash.
+    tokio::runtime::Handle::try_current().ok()?;
+
+    let parsed = ecosystem
+        .parse_manifest(content, uri)
+        .now_or_never()?
+        .ok()?;
+    Some(crate::dependency_cap::cap_dependencies(
         parsed,
         crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
     ))
@@ -2240,6 +2311,122 @@ mod tests {
             }
             other => panic!("Expected ParseError, got: {other:?}"),
         }
+    }
+
+    /// Spec 076 SC-016 (T002): `parse_manifest_now` applies the SAME `cap_dependencies`
+    /// chokepoint `parse_manifest_blocking`'s async path applies — a raw `now_or_never()` call
+    /// site with no cap would otherwise be a second, uncapped parse entry point (round-3 critic
+    /// M2, #796).
+    // `#[tokio::test]` (fix-cycle security LOW-1 follow-up), not a plain `#[test]`: the new
+    // runtime-handle guard in `parse_manifest_now` needs a current tokio runtime, or this would
+    // fail for the wrong reason (no runtime) instead of exercising the cap.
+    #[tokio::test]
+    async fn test_parse_manifest_now_caps_dependencies_over_the_ceiling() {
+        // `now_or_never()` polls on the CURRENT thread (no `spawn_blocking` hop), so
+        // `calling_thread` is set to a different, foreign thread's id — this stub's assertion
+        // exists only for `parse_manifest_blocking`'s own off-thread test above.
+        let foreign_thread = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        let ecosystem = StubEcosystem {
+            calling_thread: foreign_thread,
+            should_panic: false,
+            dep_count: crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1,
+        };
+        let uri = crate::test_util::test_uri("/test/manifest.toml");
+
+        let parsed = parse_manifest_now(&ecosystem, "content", &uri)
+            .expect("an immediately-ready parse must resolve on the first poll");
+
+        assert_eq!(
+            parsed.dependencies().len(),
+            crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT
+        );
+        assert_eq!(
+            parsed.dependency_truncation(),
+            Some((
+                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
+                crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT + 1
+            ))
+        );
+    }
+
+    /// Spec 076 FR-024 known limitation (Composer's genuinely-awaiting `parse_manifest`):
+    /// `parse_manifest_now` fails closed (`None`) rather than blocking, when the future does
+    /// not resolve on its first poll. Deliberately `#[tokio::test]` (fix-cycle security LOW-1
+    /// follow-up), not a plain `#[test]`: a bare `#[test]` has no current tokio runtime handle
+    /// either, so it would pass for the WRONG reason (the new runtime-handle guard below, not
+    /// the `Pending`-future path this test names) — see
+    /// `test_parse_manifest_now_returns_none_outside_a_tokio_runtime` for that case.
+    #[tokio::test]
+    async fn test_parse_manifest_now_returns_none_for_a_pending_future() {
+        struct PendingEcosystem;
+        impl private::Sealed for PendingEcosystem {}
+        impl Ecosystem for PendingEcosystem {
+            fn ecosystem_id(&self) -> EcosystemId {
+                EcosystemId::Composer
+            }
+            fn display_name(&self) -> &'static str {
+                "pending-stub"
+            }
+            fn manifest_filenames(&self) -> &[&'static str] {
+                &[]
+            }
+            fn parse_manifest<'a>(
+                &'a self,
+                _content: &'a str,
+                _uri: &'a url::Url,
+            ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>> {
+                Box::pin(std::future::pending())
+            }
+            fn registry(&self) -> Arc<dyn crate::Registry> {
+                unimplemented!()
+            }
+            fn formatter(&self) -> &dyn crate::lsp_helpers::EcosystemFormatter {
+                unimplemented!()
+            }
+            fn complete_version<'a>(
+                &'a self,
+                _request: crate::completion::CompletionRequest<'a>,
+                _package_name: crate::PackageName,
+                _prefix: String,
+            ) -> BoxFuture<'a, Completions> {
+                unimplemented!()
+            }
+            fn completion_insert_text(&self, _metadata: &dyn crate::Metadata) -> Option<String> {
+                unimplemented!()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let ecosystem = PendingEcosystem;
+        let uri = crate::test_util::test_uri("/test/manifest.toml");
+
+        assert!(parse_manifest_now(&ecosystem, "content", &uri).is_none());
+    }
+
+    /// Fix-cycle (security LOW-1): `parse_manifest_now` must fail closed (`None`), never
+    /// panic, when called with no tokio runtime entered at all — reproduces the
+    /// "there is no reactor running" panic security's live probe found for Composer's
+    /// genuinely-awaiting path, and proves the runtime-handle guard now catches it before ever
+    /// polling the future. Deliberately a plain `#[test]` (no runtime).
+    #[test]
+    fn test_parse_manifest_now_returns_none_outside_a_tokio_runtime() {
+        let ecosystem: Arc<dyn Ecosystem> = Arc::new(StubEcosystem {
+            calling_thread: std::thread::current().id(),
+            should_panic: false,
+            dep_count: 0,
+        });
+        let uri = crate::test_util::test_uri("/test/manifest.toml");
+
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this test must run with no ambient tokio runtime for the assertion below to mean \
+             anything"
+        );
+        assert!(parse_manifest_now(ecosystem.as_ref(), "content", &uri).is_none());
     }
 
     crate::debug_redaction_conformance!(

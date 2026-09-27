@@ -720,6 +720,53 @@ mod tests {
     use crate::types::EndpointKind;
     use dashmap::DashMap;
 
+    /// Spec 076 FR-025/SC-018 (T005): GitLab CI has no compiled requirement model at all —
+    /// `fallback_edit_excludes_newer`'s check a0 (`OriginalUncompilable`) rejects it before
+    /// this spec's rule is ever reached, unchanged, existing behavior from spec 075, not a new
+    /// fail-closed case this spec introduces.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_a0_uncompilable() {
+        let cache = Arc::new(HttpCache::new());
+        let ecosystem = GitlabCiEcosystem::new(cache);
+        let content = "include:\n  - component: gitlab.com/org/proj/comp@1.0.0\n".to_string();
+        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+        let parsed = ecosystem
+            .parse_manifest(&content, &uri)
+            .await
+            .expect("manifest must parse");
+        let dep = parsed
+            .dependencies()
+            .into_iter()
+            .next()
+            .expect("at least one dependency");
+        let candidate = deps_core::edit::ManifestEdit {
+            range: dep.version_range().expect("version range"),
+            new_text: "1.1.0".to_string(),
+        };
+        let reparse = deps_core::edit::EcosystemReparse {
+            ecosystem: &ecosystem,
+            uri: &uri,
+        };
+        let fallback = deps_core::ConcreteVersion::new("1.1.0");
+        let available = [deps_core::ConcreteVersion::new("1.2.0"), fallback.clone()];
+
+        let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
+            ecosystem.formatter(),
+            &reparse,
+            &content,
+            dep,
+            &candidate,
+            &fallback,
+            &available,
+        );
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalUncompilable
+            )
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id_and_display_name
     // and test_as_any. `lockfile_filenames()` is omitted — GitLab CI pipelines have no lock
     // file concept (no `LockFileProvider` impl in this crate); `no_lockfile_support: true;`

@@ -312,6 +312,31 @@ mod tests {
         deps_core::PackageName::new(s)
     }
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Deno's REAL
+    /// formatter and a real `EcosystemReparse`. Like npm, Deno's `compile_requirement` shares
+    /// `deps_npm::compile_node_semver_range`, whose default bare-version rendering is exact
+    /// (not auto-following), so FR-025's rule is unconditional — one assertion suffices.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
+        let ecosystem = DenoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"imports": {"@std/fs": "jsr:@std/fs@^1.0.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/deno.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &DenoFormatter,
+            &uri,
+            &content,
+            "jsr:@std/fs",
+            "2.0.0",
+            &["2.1.0", "2.0.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id/
     // test_ecosystem_display_name/test_ecosystem_manifest_filenames/test_as_any.
     // `lockfile_filenames` is omitted — deno.lock resolved-version parsing is a documented

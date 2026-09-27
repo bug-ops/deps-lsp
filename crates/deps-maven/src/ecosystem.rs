@@ -526,6 +526,34 @@ fn extract_prefix(line: &str, character: u32) -> (&str, Option<&str>) {
 mod tests {
     use super::*;
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Maven's REAL
+    /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes a bare
+    /// exact version, which Maven treats as an exact pin (not an auto-following range) —
+    /// FR-025's rule is unconditional, one assertion suffices.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
+        let ecosystem = MavenEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "<project><dependencies><dependency><groupId>com.acme</groupId>\
+             <artifactId>pkg</artifactId><version>1.0.0</version></dependency></dependencies>\
+             </project>"
+            .to_string();
+        let uri = deps_core::test_util::test_uri("/test/pom.xml");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &MavenFormatter,
+            &uri,
+            &content,
+            "com.acme:pkg",
+            "1.1.0",
+            &["1.2.0", "1.1.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_manifest_filenames/test_as_any
     // family. Maven has no lock file format, so `lockfile_filenames` is omitted here;

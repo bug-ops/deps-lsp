@@ -227,6 +227,107 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
 mod tests {
     use super::*;
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Composer's REAL
+    /// formatter and a real `EcosystemReparse` for the ORDINARY (no bare vcs/path/artifact
+    /// repository) case. `format_version_for_text_edit` writes a bare exact version — FR-025's
+    /// rule is unconditional, one assertion suffices.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
+        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"require": {"acme/pkg": "1.0.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &ComposerFormatter,
+            &uri,
+            &content,
+            "acme/pkg",
+            "1.1.0",
+            &["1.2.0", "1.1.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
+    /// Spec 076 FR-024 known limitation (architect handoff `2026-09-27T17-56-09`, §3 amendment
+    /// callout): a bare vcs/path/artifact repository plus a real `composer.lock` on disk makes
+    /// `parse_manifest` genuinely await (`LockFileCache::get_or_parse` -> `tokio::fs::metadata`).
+    /// `parse_manifest_now`'s `now_or_never()` polls this exactly once: on most platforms the
+    /// `spawn_blocking`-backed metadata read is still `Pending` at that point, so `parse_manifest_now`
+    /// returns `None` and the guard's re-parse step maps that to `ReparseFailed` rather than
+    /// blocking — but this is a genuine scheduler race, not a guarantee (CI on Linux has observed
+    /// the blocking task complete synchronously within the single poll, yielding `Writable`
+    /// instead). Both outcomes are safe: `ReparseFailed` fails closed as intended, and `Writable`
+    /// means the re-parse happened to complete and was validated normally, same as the ordinary
+    /// case. Only assert that no OTHER outcome occurs, which would indicate a real bug.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_reparse_failed_for_bare_repo_plus_lockfile() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manifest_path = temp_dir.path().join("composer.json");
+        let content = r#"{
+  "repositories": [
+    { "type": "vcs", "url": "ssh://git@git.acme.internal/private.git" }
+  ],
+  "require": {
+    "acme/pkg": "1.0.0"
+  }
+}"#;
+        tokio::fs::write(&manifest_path, content).await.unwrap();
+        let lock_json = r#"{"packages": [], "packages-dev": []}"#;
+        tokio::fs::write(temp_dir.path().join("composer.lock"), lock_json)
+            .await
+            .unwrap();
+        let uri = url::Url::from_file_path(&manifest_path).unwrap();
+
+        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let parsed = ecosystem
+            .parse_manifest(content, &uri)
+            .await
+            .expect("manifest must parse");
+        let dep = parsed
+            .dependencies()
+            .into_iter()
+            .find(|d| d.name().as_str() == "acme/pkg")
+            .expect("dependency present");
+        let fallback = deps_core::ConcreteVersion::new("1.1.0");
+        let candidate = deps_core::edit::ManifestEdit {
+            range: dep.version_range().expect("version range"),
+            new_text: "1.1.0".to_string(),
+        };
+        let reparse = deps_core::edit::EcosystemReparse {
+            ecosystem: &ecosystem,
+            uri: &uri,
+        };
+        let available = [
+            deps_core::ConcreteVersion::new("1.2.0"),
+            fallback.clone(),
+            deps_core::ConcreteVersion::new("1.0.0"),
+        ];
+
+        let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
+            &ComposerFormatter,
+            &reparse,
+            content,
+            dep,
+            &candidate,
+            &fallback,
+            &available,
+        );
+        use deps_core::lsp_helpers::{FallbackEditRejection, FallbackEditVerdict};
+        assert!(
+            matches!(
+                verdict,
+                FallbackEditVerdict::Writable
+                    | FallbackEditVerdict::Rejected(FallbackEditRejection::ReparseFailed)
+            ),
+            "expected either Writable (re-parse raced ahead of the single now_or_never poll) \
+             or Rejected(ReparseFailed) (re-parse still Pending at that poll) — got {verdict:?}"
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
     // test_ecosystem_manifest_filenames, and test_ecosystem_lockfile_filenames. Also closes
     // a real gap: this crate had no `test_as_any`/registry-smoke-test equivalent before.

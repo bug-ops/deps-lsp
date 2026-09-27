@@ -495,6 +495,89 @@ mod tests {
         assert!(eco.lockfile_provider().is_some());
     }
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against NuGet's REAL
+    /// formatter and a real `EcosystemReparse`, pinning the exact probe values architect/critic
+    /// review verified empirically (spec 076 tasks.md T003's "Test location" note). NuGet's
+    /// bare requirement is a floor, not an auto-following range, so its outcome is
+    /// unconditional (not FR-025's Cargo-style in/out-of-range split).
+    async fn fallback_edit_outcome(
+        req: &str,
+        fallback: &str,
+        available: &[&str],
+    ) -> deps_core::lsp_helpers::FallbackEditVerdict {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NuGetEcosystem::new(cache);
+        let content = format!(
+            r#"<Project><ItemGroup><PackageReference Include="pkg" Version="{req}" /></ItemGroup></Project>"#
+        );
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &NuGetFormatter,
+            &uri,
+            &content,
+            "pkg",
+            fallback,
+            available,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_c0_below_floor() {
+        // Bare floor "2.0.0" already reads a below-floor 1.9.0 fallback as current.
+        assert_eq!(
+            fallback_edit_outcome("2.0.0", "1.9.0", &["1.9.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalAlreadyUpToDate
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_m2_located_floor_loosening_writable() {
+        // Spec 076 M2: a floor resolves ONLY to its own lowest member, never forward — spec
+        // 075's `matches`-based guard rejected this (the floor admits 1.2.0); this guard
+        // writes it, since `requirement_already_resolves_to` correctly says a floor never
+        // resolves past its own value. The floor's own value ("1.0.0") must be listed for the
+        // fix-cycle floor-comparison scan to find it — realistic for production `available`
+        // (every published version, unfiltered), since the floor is the user's own
+        // already-published declared pin.
+        assert_eq!(
+            fallback_edit_outcome("1.0.0", "1.1.0", &["1.2.0", "1.1.0", "1.0.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
+    /// Spec 076 SC-017/FR-024 (round-4 critic M3): the re-parse occurrence lookup is
+    /// `(normalized name, version_range.start)`, NOT `name_range` — NuGet's attribute order
+    /// (`Version` before `Include`) would silently fail closed under a `name_range`-based
+    /// lookup, since the edit shifts everything after it on the line, including a
+    /// `name_range` that comes AFTER the edited `Version` attribute.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_sc017_version_before_include_lookup() {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = NuGetEcosystem::new(cache);
+        let content = r#"<Project><ItemGroup><PackageReference Version="1.0.0" Include="pkg" /></ItemGroup></Project>"#;
+        let uri = deps_core::test_util::test_uri("/test/App.csproj");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &NuGetFormatter,
+            &uri,
+            content,
+            "pkg",
+            "1.1.0",
+            &["1.2.0", "1.1.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     #[tokio::test]
     async fn test_parse_manifest_csproj() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why

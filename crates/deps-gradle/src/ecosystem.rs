@@ -334,6 +334,31 @@ mod tests {
         Arc::new(deps_core::HttpCache::new())
     }
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Gradle's REAL
+    /// formatter and a real `EcosystemReparse`. `format_version_for_text_edit` writes a bare
+    /// exact version, which Gradle treats as an exact pin (not an auto-following range) —
+    /// FR-025's rule is unconditional, one assertion suffices.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
+        let ecosystem = GradleEcosystem::new(make_cache());
+        let content = "dependencies { implementation \"com.acme:pkg:1.0.0\" }\n".to_string();
+        let uri = deps_core::test_util::test_uri("/test/build.gradle");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &GradleFormatter,
+            &uri,
+            &content,
+            "com.acme:pkg",
+            "1.1.0",
+            &["1.2.0", "1.1.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing the individual hand-written tests.
     // `no_lockfile_support: true;` (#782 gap 2) covers Gradle having no lock file format.
     deps_core::ecosystem_conformance! {
