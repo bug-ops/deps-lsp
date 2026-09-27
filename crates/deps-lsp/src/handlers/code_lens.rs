@@ -47,10 +47,10 @@ pub async fn handle_code_lens(
         return vec![];
     }
 
-    let (offline, severities) = {
+    let (network, severities) = {
         let config = config.read().await;
         (
-            config.policy.network.offline,
+            config.policy.network.mode(),
             config.policy.diagnostics.to_severities(),
         )
     };
@@ -73,7 +73,7 @@ pub async fn handle_code_lens(
                 .signals
                 .snapshot()
                 .with_vulnerabilities()
-                .with_latest_status(severities.vulnerabilities_enabled && !offline)
+                .with_latest_status(severities.vulnerabilities_enabled && network.is_online())
                 .finish();
             Some((
                 ecosystem,
@@ -100,7 +100,7 @@ pub async fn handle_code_lens(
     // gate disambiguate duplicate dependency names, mirroring every other renderer.
     let versions = snapshot
         .version_data()
-        .with_offline(offline)
+        .with_network(network)
         .with_ecosystem(ecosystem_id);
     let mut lenses = ecosystem
         .generate_code_lenses(

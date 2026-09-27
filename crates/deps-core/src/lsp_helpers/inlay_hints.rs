@@ -123,7 +123,7 @@ pub fn generate_inlay_hints(
             // Issue #483 I5/SEC-2: never discard a purely-local, lockfile-derived
             // `resolved_version` just because the registry side is unknown while
             // offline — show it alongside the marker rather than replacing it.
-            if config.offline {
+            if config.network.is_offline() {
                 let label = resolved_version.as_ref().map_or_else(
                     || "📴".to_string(),
                     |resolved| format!("📴 {}", sanitize_hint_version(resolved.as_str())),
@@ -271,7 +271,7 @@ pub fn generate_inlay_hints(
         // Issue #483 I5/SEC-2: `latest` here may be a warm-cache value fetched before an
         // online -> offline flip — without this, the badge is indistinguishable from live
         // data on this always-visible inline surface.
-        let label_text = if config.offline {
+        let label_text = if config.network.is_offline() {
             format!("{label_text} 📴")
         } else {
             label_text
@@ -320,7 +320,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockMixedParseResult {
@@ -372,7 +372,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: true,
+            network: crate::NetworkMode::Offline,
         };
 
         let parse_result = MockMixedParseResult {
@@ -425,7 +425,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockMixedParseResult {
@@ -468,7 +468,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -520,7 +520,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -595,7 +595,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -667,7 +667,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -719,7 +719,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -779,7 +779,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -832,7 +832,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -883,7 +883,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: false,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -964,7 +964,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -1017,7 +1017,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -1069,7 +1069,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -1121,7 +1121,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -1173,7 +1173,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: true,
+            network: crate::NetworkMode::Offline,
         };
 
         let parse_result = MockParseResult {
@@ -1219,7 +1219,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: true,
+            network: crate::NetworkMode::Offline,
         };
 
         let parse_result = MockParseResult {
@@ -1267,7 +1267,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: true,
+            network: crate::NetworkMode::Offline,
         };
 
         let parse_result = MockParseResult {
@@ -1318,7 +1318,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: true,
+            network: crate::NetworkMode::Offline,
         };
 
         let parse_result = MockParseResult {
@@ -1371,7 +1371,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -1425,7 +1425,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -1482,7 +1482,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {
@@ -1539,7 +1539,7 @@ mod tests {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
 
         let parse_result = MockParseResult {

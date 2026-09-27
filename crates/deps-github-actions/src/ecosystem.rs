@@ -1505,7 +1505,8 @@ mod tests {
                 .generate_hover(
                     parse_result.as_ref(),
                     position,
-                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::VersionData::new(&cached, &resolved)
+                        .with_network(deps_core::NetworkMode::Offline),
                     deps_core::FreshnessSettings::default(),
                 )
                 .await
@@ -1540,7 +1541,8 @@ mod tests {
                 .generate_hover(
                     parse_result.as_ref(),
                     position,
-                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::VersionData::new(&cached, &resolved)
+                        .with_network(deps_core::NetworkMode::Offline),
                     deps_core::FreshnessSettings::default(),
                 )
                 .await
@@ -1657,7 +1659,8 @@ mod tests {
                 .generate_hover(
                     parse_result.as_ref(),
                     position,
-                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::VersionData::new(&cached, &resolved)
+                        .with_network(deps_core::NetworkMode::Offline),
                     deps_core::FreshnessSettings::default(),
                 )
                 .await
@@ -1710,7 +1713,8 @@ mod tests {
                 .generate_hover(
                     parse_result.as_ref(),
                     position,
-                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::VersionData::new(&cached, &resolved)
+                        .with_network(deps_core::NetworkMode::Offline),
                     deps_core::FreshnessSettings::default(),
                 )
                 .await

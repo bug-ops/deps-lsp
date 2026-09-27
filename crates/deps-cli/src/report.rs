@@ -416,7 +416,7 @@ pub async fn check_manifest(
             analysis.parse_result.as_ref(),
             analysis.version_data(),
             &analysis.uri,
-            ctx.policy.freshness.to_settings(),
+            ctx.policy.freshness.to_freshness(),
             severities,
         )
         .await;
@@ -1570,7 +1570,7 @@ mod tests {
             licenses: HashMap::new(),
             license_policy: deps_core::licenses::LicensePolicy::default(),
             license_source: deps_core::LicenseSource::default(),
-            offline: false,
+            network: deps_core::NetworkMode::Online,
             fetch_failed: HashSet::new(),
             registry_unreachable: false,
             license_fetch_incomplete: false,

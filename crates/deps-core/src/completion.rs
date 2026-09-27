@@ -17,12 +17,13 @@
 //! [`crate::Ecosystem::complete_version`], [`crate::Ecosystem::complete_feature`].
 
 use crate::lsp_helpers::{
-    MAX_VERSION_DIAGNOSTIC_CHARS, escape_markdown, is_safe_registry_url, is_safe_version_string,
-    replace_markdown_unsafe_chars, truncate_for_diagnostic, warn_rejected_value,
+    CooldownPrecedence, MAX_VERSION_DIAGNOSTIC_CHARS, escape_markdown, is_safe_registry_url,
+    is_safe_version_string, local_cooldown_precedence, replace_markdown_unsafe_chars,
+    truncate_for_diagnostic, warn_rejected_value,
 };
 use crate::{
     ConcreteVersion, FreshnessSettings, Metadata, PackageName, ParseResult, PublishTime, Version,
-    format_relative_age, is_within_cooldown,
+    format_relative_age,
 };
 use tower_lsp_server::ls_types::{
     CompletionItem, CompletionItemKind, CompletionItemLabelDetails, CompletionTextEdit,
@@ -1145,10 +1146,10 @@ impl VersionReplacement {
 /// * `now` - Current instant, injected explicitly rather than read internally, so every
 ///   item in the same completion response has its age computed against one consistent
 ///   instant instead of drifting mid-request.
-/// * `freshness` - Whether to render a relative age at all (`enabled`), and the cooldown
-///   window (`cooldown_secs`) a candidate still within it is badged against (issue #1456,
-///   spec 072 FR-006) — completion's own default-on, GOSSIP-free cooldown baseline; see
-///   this function's `# Format` section below.
+/// * `freshness` - Whether to render a relative age at all, and if so the cooldown window a
+///   candidate still within it is badged against (issue #1456, spec 072 FR-006) —
+///   completion's own default-on, GOSSIP-free cooldown baseline; see this function's
+///   `# Format` section below.
 ///
 /// # Returns
 ///
@@ -1159,9 +1160,9 @@ impl VersionReplacement {
 /// - Label: `"version"` or `"version (latest)"` for the latest version
 /// - Detail: `"Update package_name to version"`
 /// - Label details: a greyed-out relative age (e.g. `"2 hours ago"`, or `"⏳ 2 hours ago"`
-///   when still within `freshness.cooldown_secs` — issue #1456, spec 072 FR-006's local
+///   when still within the freshness cooldown window — issue #1456, spec 072 FR-006's local
 ///   per-candidate cooldown baseline) when `display_item.published_at` is known and
-///   `freshness.enabled` is `true`; omitted entirely otherwise
+///   `freshness.is_enabled()` is `true`; omitted entirely otherwise
 /// - Preselect: `true` for latest version, `false` otherwise
 /// - Sort: Index-based (00000, 00001, etc.)
 ///
@@ -1204,24 +1205,22 @@ pub fn build_version_completion(
     let sort_text = format!("{:05}", display_item.index);
 
     // Issue #1456, spec 072 FR-006: completion's own default-on cooldown baseline — the
-    // local `is_within_cooldown` heuristic per candidate, honoring the same
-    // `FreshnessSettings.enabled`/`cooldown_secs` knobs already threaded in here. No GOSSIP
-    // data is ever read in this module (N6b: `generate_completions` has no
-    // `VersionData`/prefetch channel, and `handlers/completion.rs` cannot hold a `DashMap`
-    // shard reference across an await, issue #319) — this is the *only* signal completion
-    // ever shows.
-    let within_cooldown = freshness
-        .enabled
-        .then_some(display_item.published_at)
-        .flatten()
-        .is_some_and(|published_at| {
-            is_within_cooldown(published_at.age_secs_from(now), freshness.cooldown_secs)
-        });
+    // local heuristic per candidate ([`local_cooldown_precedence`]), honoring the same
+    // `FreshnessSettings` knobs already threaded in here. No GOSSIP data is ever read in
+    // this module (N6b: `generate_completions` has no `VersionData`/prefetch channel, and
+    // `handlers/completion.rs` cannot hold a `DashMap` shard reference across an await,
+    // issue #319) — this is the *only* signal completion ever shows.
+    let within_cooldown = freshness.cooldown().is_some_and(|window| {
+        matches!(
+            local_cooldown_precedence(display_item.published_at, window, now),
+            CooldownPrecedence::Blocked(_)
+        )
+    });
 
     // Greyed-out label suffix; unlike `label`, it never participates in filter matching,
     // so adding it cannot change which items match a typed prefix (FR-006).
     let label_details = freshness
-        .enabled
+        .is_enabled()
         .then_some(display_item.published_at)
         .flatten()
         .map(|published_at| CompletionItemLabelDetails {
@@ -6430,7 +6429,7 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_label_details_absent_when_freshness_disabled() {
-        // `freshness.enabled: false` must suppress label_details even when
+        // `FreshnessSettings::Disabled` must suppress label_details even when
         // published_at is known — the escape hatch must be all-or-nothing.
         let now = PublishTime::from_unix_secs(10_000);
         let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
@@ -6440,15 +6439,7 @@ mod tests {
         };
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
-        let item = build_version_completion(
-            &display_item,
-            None,
-            now,
-            FreshnessSettings {
-                enabled: false,
-                ..FreshnessSettings::default()
-            },
-        );
+        let item = build_version_completion(&display_item, None, now, FreshnessSettings::Disabled);
 
         assert!(item.label_details.is_none());
     }
@@ -6492,10 +6483,10 @@ mod tests {
         assert!(!details.detail.unwrap().contains('⏳'));
     }
 
-    /// A custom, shorter `cooldown_secs` narrows the badge window — an age just past a
+    /// A custom, shorter cooldown window narrows the badge window — an age just past a
     /// 1-hour cooldown must not be badged even though it would be under the 3-day default.
     #[test]
-    fn test_build_version_completion_respects_custom_cooldown_secs() {
+    fn test_build_version_completion_respects_custom_cooldown_window() {
         let now = PublishTime::from_unix_secs(10_000);
         let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
         let version = MockVersionWithAge {
@@ -6508,9 +6499,9 @@ mod tests {
             &display_item,
             None,
             now,
-            FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 3600, // 1 hour — 2 hours ago is outside this window
+            FreshnessSettings::Enabled {
+                // 1 hour — 2 hours ago is outside this window
+                cooldown: crate::CooldownWindow::from_secs(3600),
             },
         );
 

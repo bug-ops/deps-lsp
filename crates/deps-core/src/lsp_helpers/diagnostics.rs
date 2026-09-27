@@ -1241,7 +1241,7 @@ fn offline_notice(
     versions: VersionData<'_>,
     deps: &[&dyn Dependency],
 ) {
-    if versions.offline && !deps.is_empty() {
+    if versions.network.is_offline() && !deps.is_empty() {
         diagnostics.push(
             Diagnostic::new(
                 Range {
@@ -1320,7 +1320,7 @@ fn skip_reason_notice(
     uri: &url::Url,
     vuln_keys: Option<&crate::osv::VulnKeys>,
 ) {
-    if versions.offline {
+    if versions.network.is_offline() {
         return;
     }
     let Some(vulnerabilities) = versions.vulnerabilities else {
@@ -1874,10 +1874,11 @@ pub struct TyposquatFetchOutcome {
 /// from outside this crate (`deps-lsp`).
 ///
 /// Zero HTTP requests when `client` is `None` (FR-009: `policy.typosquat.enabled` is
-/// `false`), `offline` is set, or `ecosystem_id` is one of the seven ecosystems
-/// `deps_dev_system` doesn't cover (FR-002) — all checked before any dependency name is
-/// even collected; each such early-out reports [`FetchCompleteness::Complete`], since none of
-/// them is a transient condition a retry could resolve.
+/// `false`), `network` is [`NetworkMode::Offline`](crate::NetworkMode::Offline), or
+/// `ecosystem_id` is one of the seven ecosystems `deps_dev_system` doesn't cover (FR-002) —
+/// all checked before any dependency name is even collected; each such early-out reports
+/// [`FetchCompleteness::Complete`], since none of them is a transient condition a retry
+/// could resolve.
 ///
 /// `formatter.source_is_public_registry_content(&dep.source())` gates each dependency
 /// individually (security review finding, issue #1437): a private/internal/git/path
@@ -1889,7 +1890,7 @@ pub async fn fetch_typosquat_signals(
     ecosystem_id: EcosystemId,
     parse_result: &dyn ParseResult,
     formatter: &dyn EcosystemFormatter,
-    offline: bool,
+    network: crate::NetworkMode,
     client: Option<&Arc<DepsDevClient>>,
 ) -> TyposquatFetchOutcome {
     let complete = TyposquatFetchOutcome {
@@ -1900,7 +1901,7 @@ pub async fn fetch_typosquat_signals(
     let Some(client) = client else {
         return complete;
     };
-    if offline {
+    if network.is_offline() {
         return complete;
     }
     let Some(system) = deps_dev_system(ecosystem_id) else {
@@ -1962,8 +1963,9 @@ pub async fn fetch_typosquat_signals(
 /// not `pub(crate)`: called from outside this crate (`deps-lsp`).
 ///
 /// Zero HTTP requests when `client` is `None` (`policy.gossip.enabled` is `false`),
-/// `offline` is set, or `ecosystem_id` is one of the seven ecosystems `deps_dev_system`
-/// doesn't cover — all checked before any dependency name is even collected.
+/// `network` is [`NetworkMode::Offline`](crate::NetworkMode::Offline), or `ecosystem_id`
+/// is one of the seven ecosystems `deps_dev_system` doesn't cover — all checked before
+/// any dependency name is even collected.
 ///
 /// `formatter.source_is_public_registry_content(&dep.source())` gates each dependency
 /// individually, mirroring [`fetch_typosquat_signals`]'s identical per-dependency privacy
@@ -1972,7 +1974,7 @@ pub async fn fetch_gossip_findings_batch(
     ecosystem_id: EcosystemId,
     parse_result: &dyn ParseResult,
     formatter: &dyn EcosystemFormatter,
-    offline: bool,
+    network: crate::NetworkMode,
     client: Option<&Arc<DepsDevClient>>,
 ) -> HashMap<PackageName, crate::GossipFindings> {
     let mut result = HashMap::new();
@@ -1980,7 +1982,7 @@ pub async fn fetch_gossip_findings_batch(
     let Some(client) = client else {
         return result;
     };
-    if offline {
+    if network.is_offline() {
         return result;
     }
     let Some(system) = deps_dev_system(ecosystem_id) else {
@@ -2257,7 +2259,7 @@ fn apply_unknown_package_rule(
                 .with_severity(ctx.severities.unknown),
             );
         }
-        Ok(()) if fetch_failure.is_some() && ctx.versions.offline => {}
+        Ok(()) if fetch_failure.is_some() && ctx.versions.network.is_offline() => {}
         Ok(()) if fetch_failure.is_some() => {
             let redacted_name = redact_name_for_diagnostic(dep.name());
             let message = match fetch_failure {
@@ -2458,10 +2460,11 @@ fn apply_yanked_only_rule(
 ///
 /// `status` = `Unresolved` unless `dep.version_requirement()` is `Some` **and**
 /// `can_resolve_source` (#248); otherwise `formatter.requirement_status(req, latest)`.
-/// Fires on `RequirementStatus::Outdated`. Message-only cooldown differentiation
-/// gated on `ctx.freshness.enabled` + `package_versions.published_at` +
-/// `is_within_cooldown(age, cooldown_secs)`; **severity is identical in both cases**
-/// (already the floor — see the module docs).
+/// Fires on `RequirementStatus::Outdated`. Message-only cooldown differentiation via
+/// [`cooldown_disposition`], gated on `ctx.freshness` being
+/// [`FreshnessSettings::Enabled`](crate::FreshnessSettings::Enabled) +
+/// `package_versions.published_at`; **severity is identical in both cases** (already
+/// the floor — see the module docs).
 ///
 /// `RequirementStatus::UpToDate` is not simply "nothing to report" (#1526, resolving the
 /// `#1517 D1` TODO formerly here): see
@@ -5027,7 +5030,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_outcomes(&outcomes)
-                .with_offline(true),
+                .with_network(crate::NetworkMode::Offline),
             &formatter,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
@@ -5081,7 +5084,8 @@ mod tests {
 
         let diagnostics = generate_diagnostics_from_cache(
             &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions).with_offline(true),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_network(crate::NetworkMode::Offline),
             &formatter,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
@@ -5234,7 +5238,7 @@ mod tests {
             &parse_result,
             VersionData::new(&cached_versions, &resolved_versions)
                 .with_vulnerabilities(&vulns)
-                .with_offline(true),
+                .with_network(crate::NetworkMode::Offline),
             &formatter,
             parse_result.uri(),
             crate::freshness::FreshnessSettings::default(),
@@ -7289,7 +7293,7 @@ mod tests {
         assert_eq!(diagnostics[0].message(), "Newer version available: 2.0.0");
     }
 
-    /// `freshness.enabled: false` suppresses the cooldown differentiation even when the
+    /// `FreshnessSettings::Disabled` suppresses the cooldown differentiation even when the
     /// publish age would otherwise qualify.
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_freshness_disabled_plain_message() {
@@ -7329,10 +7333,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             parse_result.uri(),
-            crate::freshness::FreshnessSettings {
-                enabled: false,
-                ..crate::freshness::FreshnessSettings::default()
-            },
+            crate::freshness::FreshnessSettings::Disabled,
             DiagnosticSeverities::default(),
             PublishTime::now(),
         );
@@ -7342,8 +7343,8 @@ mod tests {
     }
 
     /// Deterministic boundary test (issue #227 M4): `now` is threaded in as a parameter
-    /// rather than read internally, so `published_at`/`now`/`cooldown_secs` can be pinned
-    /// to fixed absolute values with no wall-clock dependency. `age == cooldown_secs`
+    /// rather than read internally, so `published_at`/`now`/the cooldown window can be pinned
+    /// to fixed absolute values with no wall-clock dependency. `age == cooldown window`
     /// exactly must NOT be within cooldown — the bound is exclusive (`age < cooldown`).
     #[test]
     fn test_generate_diagnostics_from_cache_outdated_cooldown_boundary_is_exclusive() {
@@ -7385,9 +7386,8 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             parse_result.uri(),
-            crate::freshness::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: COOLDOWN_SECS,
+            crate::freshness::FreshnessSettings::Enabled {
+                cooldown: crate::CooldownWindow::from_secs(COOLDOWN_SECS),
             },
             DiagnosticSeverities::default(),
             now,
@@ -7397,7 +7397,7 @@ mod tests {
         assert_eq!(
             diagnostics[0].message(),
             "Newer version available: 2.0.0",
-            "age exactly equal to cooldown_secs must not be within cooldown"
+            "age exactly equal to the cooldown window must not be within cooldown"
         );
     }
 
@@ -7442,9 +7442,8 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &formatter,
             parse_result.uri(),
-            crate::freshness::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: COOLDOWN_SECS,
+            crate::freshness::FreshnessSettings::Enabled {
+                cooldown: crate::CooldownWindow::from_secs(COOLDOWN_SECS),
             },
             DiagnosticSeverities::default(),
             now,
@@ -7454,7 +7453,7 @@ mod tests {
         assert_eq!(
             diagnostics[0].message(),
             "Newer version available: 2.0.0 (published 1 minute ago — still within the release cooldown window)",
-            "age == cooldown_secs - 1 must be within cooldown"
+            "age == cooldown window - 1 must be within cooldown"
         );
     }
 
@@ -11614,7 +11613,7 @@ mod tests {
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
-                false,
+                crate::NetworkMode::Online,
                 None,
             )
             .await;
@@ -11646,7 +11645,7 @@ mod tests {
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
-                true,
+                crate::NetworkMode::Offline,
                 Some(&client),
             )
             .await;
@@ -11674,7 +11673,7 @@ mod tests {
                 EcosystemId::Deno,
                 &parse_result,
                 &MOCK_FORMATTER,
-                false,
+                crate::NetworkMode::Online,
                 Some(&client),
             )
             .await;
@@ -11742,7 +11741,7 @@ mod tests {
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
-                false,
+                crate::NetworkMode::Online,
                 Some(&client),
             )
             .await;
@@ -11776,7 +11775,7 @@ mod tests {
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
-                false,
+                crate::NetworkMode::Online,
                 Some(&client),
             )
             .await;
@@ -11815,7 +11814,7 @@ mod tests {
                 EcosystemId::Npm,
                 &parse_result,
                 &MOCK_FORMATTER,
-                false,
+                crate::NetworkMode::Online,
                 Some(&client),
             )
             .await;

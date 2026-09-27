@@ -698,11 +698,12 @@ pub struct EcosystemConfig {
     pub loading_text: String,
     /// Whether to show loading hints in inlay hints
     pub show_loading_hints: bool,
-    /// Whether `network.offline` is set (issue #483): when `true` and no cached latest
-    /// version exists for a dependency, [`crate::lsp_helpers::generate_inlay_hints`]
-    /// shows an offline marker instead of silently falling back to the resolved-version
-    /// display, which would otherwise look identical to a normal pre-fetch state.
-    pub offline: bool,
+    /// The current [`crate::NetworkMode`] (issue #483): when [`crate::NetworkMode::Offline`]
+    /// and no cached latest version exists for a dependency,
+    /// [`crate::lsp_helpers::generate_inlay_hints`] shows an offline marker instead of
+    /// silently falling back to the resolved-version display, which would otherwise look
+    /// identical to a normal pre-fetch state.
+    pub network: crate::NetworkMode,
 }
 
 impl Default for EcosystemConfig {
@@ -721,10 +722,10 @@ impl EcosystemConfig {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::EcosystemConfig;
+    /// use deps_core::{EcosystemConfig, NetworkMode};
     ///
-    /// let config = EcosystemConfig::new().with_offline(true);
-    /// assert!(config.offline);
+    /// let config = EcosystemConfig::new().with_network(NetworkMode::Offline);
+    /// assert_eq!(config.network, NetworkMode::Offline);
     /// ```
     #[must_use]
     pub fn new() -> Self {
@@ -734,7 +735,7 @@ impl EcosystemConfig {
             needs_update_text: "❌ {}".to_string(),
             loading_text: "⏳".to_string(),
             show_loading_hints: true,
-            offline: false,
+            network: crate::NetworkMode::Online,
         }
     }
 
@@ -773,10 +774,10 @@ impl EcosystemConfig {
         self
     }
 
-    /// Overrides [`Self::offline`]. See [`Self::new`].
+    /// Overrides [`Self::network`]. See [`Self::new`].
     #[must_use]
-    pub const fn with_offline(mut self, offline: bool) -> Self {
-        self.offline = offline;
+    pub const fn with_network(mut self, network: crate::NetworkMode) -> Self {
+        self.network = network;
         self
     }
 }
@@ -1367,7 +1368,7 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// on their own XML/Groovy context type instead of
     /// [`crate::completion::CompletionContext`].
     ///
-    /// `freshness.enabled` gates whether version completion items carry a
+    /// `freshness.is_enabled()` gates whether version completion items carry a
     /// relative-age `label_details` suffix (issue #145); implementations that
     /// delegate to [`crate::completion::complete_versions_at_position`] get this for
     /// free by threading `freshness` through.
@@ -1832,7 +1833,7 @@ mod tests {
             needs_update_text: "Update to {}".to_string(),
             loading_text: "Loading...".to_string(),
             show_loading_hints: false,
-            offline: false,
+            network: crate::NetworkMode::Online,
         };
         assert!(!config.show_up_to_date_hints);
         assert_eq!(config.up_to_date_text, "OK");

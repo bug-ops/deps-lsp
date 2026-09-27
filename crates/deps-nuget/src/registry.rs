@@ -731,18 +731,12 @@ impl NuGetRegistry {
     /// Returns an error if the service index cannot be resolved or the flat-container
     /// request fails.
     pub async fn get_versions(&self, name: &str) -> Result<Vec<NuGetVersion>> {
-        self.get_versions_with(
-            name,
-            deps_core::FreshnessSettings {
-                enabled: false,
-                ..Default::default()
-            },
-        )
-        .await
+        self.get_versions_with(name, deps_core::FreshnessSettings::Disabled)
+            .await
     }
 
     /// Same as [`Self::get_versions`], but attaches [`NuGetVersion::published_at`]
-    /// from the registration hive when `freshness.enabled` and the feed exposes a
+    /// from the registration hive when `freshness.is_enabled()` and the feed exposes a
     /// `RegistrationsBaseUrl` resource.
     ///
     /// Takes [`deps_core::FreshnessSettings`] (not a bare `bool`) so this inherent method's
@@ -783,7 +777,7 @@ impl NuGetRegistry {
         let index = self.service_index().await?;
         let flat_url = flat_container_url(&index.package_base_address, name_segment);
         let flat_trusted_prefix = format!("{}/", index.package_base_address);
-        let registration_base = if freshness.enabled {
+        let registration_base = if freshness.is_enabled() {
             index.registrations_base_url.clone()
         } else {
             None
@@ -1363,9 +1357,10 @@ mod tests {
     use std::assert_matches;
 
     fn freshness(enabled: bool) -> deps_core::FreshnessSettings {
-        deps_core::FreshnessSettings {
-            enabled,
-            ..Default::default()
+        if enabled {
+            deps_core::FreshnessSettings::default()
+        } else {
+            deps_core::FreshnessSettings::Disabled
         }
     }
 

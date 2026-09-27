@@ -48,15 +48,15 @@ pub async fn handle_completion(
     );
 
     // Acquires the config RwLock before the DashMap shard guard, never the reverse
-    // (matches hover.rs/diagnostics.rs). `vulnerabilities_enabled`/`offline` feed the OSV
+    // (matches hover.rs/diagnostics.rs). `vulnerabilities_enabled`/`network` feed the OSV
     // latest-verdict gate below (issue #1517 critique S1/S3) — same pair every other
     // renderer reads before deciding whether `latest_status` applies at all.
-    let (freshness, vulnerabilities_enabled, offline) = {
+    let (freshness, vulnerabilities_enabled, network) = {
         let config = config.read().await;
         (
-            config.policy.freshness.to_settings(),
+            config.policy.freshness.to_freshness(),
             config.policy.diagnostics.vulnerabilities_enabled,
-            config.policy.network.offline,
+            config.policy.network.mode(),
         )
     };
 
@@ -208,7 +208,7 @@ pub async fn handle_completion(
         &state,
         uri,
         position,
-        vulnerabilities_enabled && !offline,
+        vulnerabilities_enabled && network.is_online(),
         origin,
         &mut items,
     );
@@ -249,8 +249,8 @@ pub async fn handle_completion(
 /// functions every other renderer calls) closes both: an absent/stale entry resolves to
 /// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail closed), not "untouched".
 ///
-/// `vulnerabilities_enabled` (`policy.diagnostics.vulnerabilities_enabled && !offline`, resolved
-/// by the caller) selects whether `Some(&doc.signals.latest_status)`/`Some(&doc.signals.
+/// `vulnerabilities_enabled` (`policy.diagnostics.vulnerabilities_enabled && network.is_online()`,
+/// resolved by the caller) selects whether `Some(&doc.signals.latest_status)`/`Some(&doc.signals.
 /// candidate_status)` or `None` is passed to `latest_verdict`/`candidate_verdict` — mirrors
 /// `SignalsSnapshotBuilder::with_latest_status`'s same gate (issue #1517 design point 7):
 /// `None` means OSV checking does not apply to this scan at all (`NotApplicable`), while
@@ -1284,7 +1284,8 @@ mod tests {
     }
 
     /// When OSV checking does not apply to this scan at all (`vulnerabilities_enabled` false,
-    /// mirroring `policy.diagnostics.vulnerabilities_enabled && !offline` resolving to false),
+    /// mirroring `policy.diagnostics.vulnerabilities_enabled && network.is_online()` resolving
+    /// to false),
     /// the verdict must be `NotApplicable`, not `Unverified` — the preselected item is left
     /// exactly as the ecosystem produced it, matching every other renderer's identical gate.
     #[cfg(feature = "cargo")]
@@ -1961,7 +1962,7 @@ mod tests {
     }
 
     /// Issue #227 tester gap: `build_version_completion`'s `label_details`
-    /// present/absent-when-`freshness.enabled`-toggles behavior is already unit-tested
+    /// present/absent-when-`freshness.is_enabled()`-toggles behavior is already unit-tested
     /// directly in `deps_core::completion` — this test covers the piece that isn't: that
     /// `handle_completion` (`completion.rs:47`) re-reads `config.policy.freshness` on *every*
     /// call, so a `workspace/didChangeConfiguration`-driven config update (simulated here
@@ -2010,7 +2011,7 @@ mod tests {
         }
 
         /// Stands in for a real ecosystem's `generate_completions`, echoing whatever
-        /// `freshness.enabled` it was called with into `label_details` — exactly the
+        /// `freshness.is_enabled()` it was called with into `label_details` — exactly the
         /// signal real ecosystems derive from `build_version_completion`, without
         /// needing a real registry fetch or parsed manifest.
         struct FreshnessEchoEcosystem;
@@ -2051,7 +2052,7 @@ mod tests {
                     vec![CompletionItem {
                         label: "1.0.0".to_string(),
                         kind: Some(CompletionItemKind::VALUE),
-                        label_details: freshness.enabled.then(|| CompletionItemLabelDetails {
+                        label_details: freshness.is_enabled().then(|| CompletionItemLabelDetails {
                             detail: Some("  1 hour ago".to_string()),
                             description: None,
                         }),

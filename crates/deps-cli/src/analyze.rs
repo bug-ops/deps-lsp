@@ -220,8 +220,8 @@ pub struct ManifestAnalysis {
     pub license_policy: LicensePolicy,
     /// How license strings were sourced (registry-declared SPDX vs. free text).
     pub license_source: LicenseSource,
-    /// Whether `network.offline` was set for this run.
-    pub offline: bool,
+    /// The [`deps_core::NetworkMode`] set for this run.
+    pub network: deps_core::NetworkMode,
     /// Raw package names whose registry fetch errored or timed out (`FetchResult::fetch_failed`,
     /// captured before [`apply_fetch_outcomes`] consumes it) — the two-signal input
     /// `deps-cli update --security-only`'s `Unfixable` classification needs (FR-011): a
@@ -242,7 +242,7 @@ impl ManifestAnalysis {
             .with_resolved_version_candidates(&self.resolved_version_candidates)
             .with_outcomes(&self.outcomes)
             .with_ecosystem(self.ecosystem_id)
-            .with_offline(self.offline)
+            .with_network(self.network)
             .with_license_source(self.license_source)
             .with_license_policy(&self.license_policy)
             .with_license_prefetch(&self.licenses)
@@ -429,12 +429,13 @@ pub async fn analyze_manifest(
     // Issue #1521 item 4: also `None` under `scope.gossip == false` (`update --security-only`,
     // whose fix target never reads a GOSSIP-filtered `latest` at all) — see `AnalysisScope::gossip`'s
     // doc for why this is *not* additionally gated on `ctx.policy.freshness.enabled`.
+    let network = ctx.policy.network.mode();
     let gossip_client = (scope.gossip && ctx.policy.gossip.enabled).then_some(&ctx.deps_dev);
     let gossip_findings = deps_core::lsp_helpers::fetch_gossip_findings_batch(
         ecosystem_id,
         parse_result.as_ref(),
         formatter,
-        ctx.policy.network.offline,
+        network,
         gossip_client,
     )
     .await;
@@ -444,7 +445,7 @@ pub async fn analyze_manifest(
         prep.dep_sources,
         &prep.in_use,
         None,
-        ctx.policy.freshness.to_settings(),
+        ctx.policy.freshness.to_freshness(),
         ctx.policy.cache.fetch_timeout_secs,
         ctx.policy.cache.max_concurrent_fetches,
         &prep.selection_context,
@@ -453,7 +454,7 @@ pub async fn analyze_manifest(
     .await;
     // `fetch_failed` (genuine failures only), not `failure_summary`'s count, which also
     // includes not-found lookups — using that here made a typo'd dependency exit 2 every run.
-    let registry_unreachable = !ctx.policy.network.offline && !fetch_result.fetch_failed.is_empty();
+    let registry_unreachable = network.is_online() && !fetch_result.fetch_failed.is_empty();
     // Captured before `apply_fetch_outcomes` consumes `fetch_result.fetch_failed` below —
     // `deps-cli update --security-only`'s FR-011 two-signal `Unfixable` rule needs the raw
     // set independently of the yanked/deprecation-merged `DependencyOutcomes`.
@@ -504,7 +505,7 @@ pub async fn analyze_manifest(
     // unauthenticated 60 req/h GitHub budget among others for nothing. `scope.licenses` adds a
     // second, caller-declared reason to skip this entirely (code review finding 6) — no
     // `update` mode ever reads `ManifestAnalysis::licenses`.
-    let run_tier3_prefetch = scope.licenses && !ctx.policy.network.offline;
+    let run_tier3_prefetch = scope.licenses && network.is_online();
     let tier3_license_fetch = async {
         if run_tier3_prefetch {
             prefetch_tier3_licenses(
@@ -527,7 +528,7 @@ pub async fn analyze_manifest(
     // paying for a scan nothing consumes.
     let run_osv_scan = scope.vulnerabilities
         && ctx.policy.diagnostics.vulnerabilities_enabled
-        && !ctx.policy.network.offline;
+        && network.is_online();
     let osv_scan = async {
         if run_osv_scan {
             let (targets, skipped) = build_scan_targets(
@@ -558,8 +559,7 @@ pub async fn analyze_manifest(
     // `update`'s default mode never reads `ManifestAnalysis::vulnerabilities`, but it always
     // needs to know whether the `latest` it's about to write is itself safe. Still gated on
     // the same `vulnerabilities_enabled`/`!offline` policy every other OSV call respects.
-    let run_latest_check =
-        ctx.policy.diagnostics.vulnerabilities_enabled && !ctx.policy.network.offline;
+    let run_latest_check = ctx.policy.diagnostics.vulnerabilities_enabled && network.is_online();
 
     // Spec 075 FR-010: the fallback-candidate OSV round only fires when
     // `scope.cooldown_fallback` is set AND at least one dependency's `cooldown_disposition`
@@ -571,7 +571,7 @@ pub async fn analyze_manifest(
             cooldown_fallback_view(
                 &cached_versions,
                 Some(&gossip_findings),
-                ctx.policy.freshness.to_settings(),
+                ctx.policy.freshness.to_freshness(),
                 now,
             )
         })
@@ -693,7 +693,7 @@ pub async fn analyze_manifest(
         licenses,
         license_policy,
         license_source: ecosystem.license_source(),
-        offline: ctx.policy.network.offline,
+        network,
         fetch_failed,
         registry_unreachable,
         license_fetch_incomplete,
@@ -794,7 +794,7 @@ mod has_unverified_latest_check_tests {
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
             license_source: deps_core::LicenseSource::default(),
-            offline: false,
+            network: deps_core::NetworkMode::Online,
             fetch_failed: HashSet::new(),
             registry_unreachable: false,
             license_fetch_incomplete: false,

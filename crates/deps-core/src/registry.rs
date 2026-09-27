@@ -153,7 +153,7 @@ pub trait Registry: Send + Sync {
 
     /// Like [`get_versions`](Self::get_versions), but lets a registry that can obtain
     /// [`Version::published_at`] only through an *extra* request gate that request behind
-    /// `freshness.enabled` instead of always paying for it.
+    /// `freshness.is_enabled()` instead of always paying for it.
     ///
     /// Implementors overriding this method MUST keep every other aspect of
     /// [`get_versions`](Self::get_versions)'s behavior — set, order, and content of the

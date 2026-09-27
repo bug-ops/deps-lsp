@@ -541,10 +541,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
             registry.get_versions_from(
                 dep.name(),
                 &dep_source,
-                crate::freshness::FreshnessSettings {
-                    enabled: false,
-                    ..Default::default()
-                },
+                crate::freshness::FreshnessSettings::Disabled,
             ),
             dep.name(),
             "code action",

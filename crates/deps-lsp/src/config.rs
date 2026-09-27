@@ -1172,13 +1172,23 @@ mod tests {
     }
 
     #[test]
-    fn test_freshness_config_to_settings() {
+    fn test_freshness_config_to_freshness() {
         let config = FreshnessConfig::new()
             .with_enabled(false)
             .with_cooldown_secs(1800);
-        let settings = config.to_settings();
-        assert!(!settings.enabled);
-        assert_eq!(settings.cooldown_secs, 1800);
+        let settings = config.to_freshness();
+        assert!(!settings.is_enabled());
+        assert_eq!(settings.cooldown(), None);
+
+        let enabled_config = FreshnessConfig::new()
+            .with_enabled(true)
+            .with_cooldown_secs(1800);
+        let enabled_settings = enabled_config.to_freshness();
+        assert!(enabled_settings.is_enabled());
+        assert_eq!(
+            enabled_settings.cooldown(),
+            Some(deps_core::CooldownWindow::from_secs(1800))
+        );
     }
 
     #[test]

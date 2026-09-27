@@ -83,6 +83,39 @@ impl NetworkMode {
     pub fn from_offline_flag(offline: bool) -> Self {
         if offline { Self::Offline } else { Self::Online }
     }
+
+    /// Whether outbound network requests may be attempted (`self` is [`Self::Online`]).
+    ///
+    /// Centralizes the `network == NetworkMode::Online` check every call site otherwise
+    /// reimplements inline (issue #1557 code-review finding).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::NetworkMode;
+    ///
+    /// assert!(NetworkMode::Online.is_online());
+    /// assert!(!NetworkMode::Offline.is_online());
+    /// ```
+    #[must_use]
+    pub const fn is_online(self) -> bool {
+        matches!(self, Self::Online)
+    }
+
+    /// Whether outbound network requests are blocked (`self` is [`Self::Offline`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::NetworkMode;
+    ///
+    /// assert!(NetworkMode::Offline.is_offline());
+    /// assert!(!NetworkMode::Online.is_offline());
+    /// ```
+    #[must_use]
+    pub const fn is_offline(self) -> bool {
+        matches!(self, Self::Offline)
+    }
 }
 
 /// Whether [`HttpCache`] uses its entry-map cache to serve warm entries (issue #482).

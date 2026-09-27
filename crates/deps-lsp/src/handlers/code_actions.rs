@@ -29,13 +29,14 @@ pub async fn handle_code_actions(
         return vec![];
     }
 
-    let (offline, vulnerabilities_enabled) = {
+    let (network, vulnerabilities_enabled) = {
         let config = config.read().await;
         (
-            config.policy.network.offline,
+            config.policy.network.mode(),
             config.policy.diagnostics.vulnerabilities_enabled,
         )
     };
+    let online = network.is_online();
 
     // Release the DashMap shard `Ref` before awaiting `generate_code_actions`'s registry
     // fetch — holding it across the await would block a concurrent `documents.get_mut` on
@@ -49,8 +50,8 @@ pub async fn handle_code_actions(
                 .snapshot()
                 .with_resolved_version_candidates()
                 .with_vulnerabilities()
-                .with_latest_status(vulnerabilities_enabled && !offline)
-                .with_candidate_status(vulnerabilities_enabled && !offline)
+                .with_latest_status(vulnerabilities_enabled && online)
+                .with_candidate_status(vulnerabilities_enabled && online)
                 .with_outcomes()
                 .finish();
             Some((
@@ -77,7 +78,7 @@ pub async fn handle_code_actions(
     let version_data = snapshot
         .version_data()
         .with_ecosystem(ecosystem_id)
-        .with_offline(offline);
+        .with_network(network);
     let mut actions = ecosystem
         .generate_code_actions(
             parse_result.as_ref(),

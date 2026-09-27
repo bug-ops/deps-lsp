@@ -92,7 +92,7 @@ pub(crate) fn document_dependency_count(state: &ServerState, uri: &Uri) -> usize
 pub(crate) struct DiagnosticsSnapshot {
     pub(crate) freshness: deps_core::FreshnessSettings,
     pub(crate) severities: deps_core::DiagnosticSeverities,
-    pub(crate) offline: bool,
+    pub(crate) network: deps_core::NetworkMode,
     pub(crate) fetch_timeout_secs: u64,
     pub(crate) max_concurrent_fetches: usize,
 }
@@ -101,9 +101,9 @@ impl DiagnosticsSnapshot {
     /// Builds a snapshot from the currently loaded [`DepsConfig`].
     pub(crate) fn from_config(config: &DepsConfig) -> Self {
         Self {
-            freshness: config.policy.freshness.to_settings(),
+            freshness: config.policy.freshness.to_freshness(),
             severities: config.policy.diagnostics.to_severities(),
-            offline: config.policy.network.offline,
+            network: config.policy.network.mode(),
             fetch_timeout_secs: config.policy.cache.fetch_timeout_secs,
             max_concurrent_fetches: config.policy.cache.max_concurrent_fetches,
         }
@@ -137,7 +137,7 @@ pub(crate) async fn publish_document_diagnostics(
         uri,
         snapshot.freshness,
         snapshot.severities,
-        snapshot.offline,
+        snapshot.network,
         ceiling,
     )
     .await;
@@ -191,7 +191,7 @@ pub async fn handle_diagnostics(
         uri,
         snapshot.freshness,
         snapshot.severities,
-        snapshot.offline,
+        snapshot.network,
         ceiling,
     )
     .await
@@ -218,7 +218,7 @@ pub(crate) async fn generate_diagnostics_internal(
     uri: &Uri,
     freshness: deps_core::FreshnessSettings,
     severities: deps_core::DiagnosticSeverities,
-    offline: bool,
+    network: deps_core::NetworkMode,
     loading_ceiling: Duration,
 ) -> Vec<Diagnostic> {
     // Skip diagnostics while versions are loading, up to `loading_ceiling` (#632): if the
@@ -269,12 +269,13 @@ pub(crate) async fn generate_diagnostics_internal(
         // `with_document` or after it returns — this is at least as tight a window against a
         // concurrent flag flip as the pre-refactor read site (right after releasing this
         // same lock), and tighter than reading before entering the closure would be.
-        let typosquat_visibility = if state.is_typosquat_enabled() && !offline {
+        let online = network.is_online();
+        let typosquat_visibility = if state.is_typosquat_enabled() && online {
             PrefetchVisibility::Render
         } else {
             PrefetchVisibility::Suppress
         };
-        let gossip_visibility = if state.is_gossip_enabled() && !offline {
+        let gossip_visibility = if state.is_gossip_enabled() && online {
             PrefetchVisibility::Render
         } else {
             PrefetchVisibility::Suppress
@@ -284,7 +285,7 @@ pub(crate) async fn generate_diagnostics_internal(
             .snapshot()
             .with_resolved_version_candidates()
             .with_vulnerabilities()
-            .with_latest_status(severities.vulnerabilities_enabled && !offline)
+            .with_latest_status(severities.vulnerabilities_enabled && online)
             .with_outcomes()
             .with_license_prefetch()
             .with_typosquat_prefetch(typosquat_visibility)
@@ -314,7 +315,7 @@ pub(crate) async fn generate_diagnostics_internal(
     let version_data = snapshot
         .version_data()
         .with_ecosystem(ecosystem_id)
-        .with_offline(offline)
+        .with_network(network)
         .with_license_source(ecosystem.license_source())
         .with_license_policy(&policy);
 
@@ -401,7 +402,7 @@ mod tests {
             deps_core::EcosystemId::Npm,
             parse_result,
             ecosystem.formatter(),
-            false,
+            deps_core::NetworkMode::Online,
             Some(&mocked_deps_dev),
         )
         .await;
@@ -516,7 +517,7 @@ mod tests {
                 &uri,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
-                false,
+                deps_core::NetworkMode::Online,
                 MIN_LOADING_CEILING,
             ),
         )
@@ -589,7 +590,7 @@ mod tests {
             &uri,
             deps_core::FreshnessSettings::default(),
             deps_core::DiagnosticSeverities::default(),
-            false,
+            deps_core::NetworkMode::Online,
             MIN_LOADING_CEILING,
         )
         .await;
@@ -653,7 +654,7 @@ mod tests {
             &uri,
             deps_core::FreshnessSettings::default(),
             deps_core::DiagnosticSeverities::default(),
-            true,
+            deps_core::NetworkMode::Offline,
             MIN_LOADING_CEILING,
         )
         .await;
@@ -1105,7 +1106,7 @@ serde = "1.0.0"
                 &uri,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
-                false,
+                deps_core::NetworkMode::Online,
                 std::time::Duration::from_millis(1),
             )
             .await;
@@ -1162,7 +1163,7 @@ serde = "1.0.0"
                 &uri,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
-                false,
+                deps_core::NetworkMode::Online,
                 std::time::Duration::from_millis(1),
             )
             .await;
@@ -1219,7 +1220,7 @@ serde = "1.0.0"
                 &uri,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
-                false,
+                deps_core::NetworkMode::Online,
                 std::time::Duration::from_secs(60),
             )
             .await;
@@ -2038,7 +2039,7 @@ dependencies = ["requests>=2.0.0"]
                 &uri,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
-                false,
+                deps_core::NetworkMode::Online,
                 std::time::Duration::from_secs(60),
             )
             .await;
