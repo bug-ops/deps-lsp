@@ -3,12 +3,6 @@
 //! This module implements the `Ecosystem` trait for npm/JavaScript projects,
 //! providing LSP functionality for `package.json` files.
 
-use std::any::Any;
-use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
-use url::Url;
-
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
@@ -18,17 +12,21 @@ use deps_core::{
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::{DiagnosticSeverities, EcosystemFormatter},
 };
+use std::any::Any;
+use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use url::Url;
 
 use crate::config::NpmParseContext;
 use crate::formatter::NpmFormatter;
 use crate::registry::NpmRegistry;
 use crate::types::NpmDependency;
 
-/// Leading version-constraint operators stripped from a completion prefix before
-/// matching it against registry versions: `node-semver`'s caret, tilde, comparison, and
-/// wildcard operators. No `!` — `node-semver` ranges have no `!=` operator (#1137).
 #[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
+mod lsp;
+#[cfg(feature = "lsp-responses")]
+use lsp::{VERSION_OPERATOR_CHARS, catalog_hover_line};
 
 /// npm ecosystem implementation.
 ///
@@ -335,20 +333,6 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
     ))
 }
 
-/// Renders the `**Catalog**` hover line for `dep`, or `None` for a non-catalog dependency.
-///
-/// `` `catalog:react17` → `^17.0.2` `` when resolved; the outcome's own message otherwise
-/// (including [`crate::catalog::CatalogOutcome::NonSemverEntry`], which gets no diagnostic but
-/// still deserves a hover explanation of why no version comparison ran).
-#[cfg(feature = "lsp-responses")]
-fn catalog_hover_line(dep: &NpmDependency) -> Option<String> {
-    let origin = dep.catalog.as_ref()?;
-    Some(format!(
-        "\n**Catalog**: {}\n",
-        origin.hover_detail(dep.name.as_str())
-    ))
-}
-
 /// One diagnostic per catalog-referencing dependency whose outcome carries a message (spec 046
 /// FR-005/FR-006) — `None` from [`crate::catalog::CatalogOrigin::diagnostic_message`] (resolved,
 /// or a non-semver entry) contributes nothing.
@@ -376,67 +360,11 @@ fn catalog_diagnostics(parse_result: &dyn ParseResultTrait, severity: Severity) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::EcosystemConfig;
     use deps_core::VersionData;
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::parser::DependencySource;
-
-    #[cfg(feature = "lsp-responses")]
-    deps_core::complete_versions_test_shim!(NpmEcosystem);
     use std::collections::HashMap;
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    struct MockParseResult {
-        dependencies: Vec<crate::types::NpmDependency>,
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    impl deps_core::ParseResult for MockParseResult {
-        fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-            self.dependencies
-                .iter()
-                .map(|d| d as &dyn deps_core::Dependency)
-                .collect()
-        }
-
-        fn workspace_root(&self) -> Option<&std::path::Path> {
-            None
-        }
-
-        fn uri(&self) -> &Url {
-            static URI: std::sync::LazyLock<Url> =
-                std::sync::LazyLock::new(|| deps_core::test_util::test_uri("/test/package.json"));
-            &URI
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    /// Builds an `NpmDependency` with a `version_range` at `line`, whose start position is
-    /// what `complete_versions` (position-based, issue #599) looks up `parse_result` by.
-    #[cfg(feature = "lsp-responses")]
-    fn dep_with_source(
-        name: &str,
-        source: DependencySource,
-        line: u32,
-    ) -> crate::types::NpmDependency {
-        crate::types::NpmDependency {
-            name: pkg(name),
-            name_range: Range::default().into(),
-            version_req: None,
-            version_range: Some(Range::new(Position::new(line, 0), Position::new(line, 10)).into()),
-            section: crate::types::NpmDependencySection::Dependencies,
-            source,
-            catalog: None,
-            package: None,
-        }
     }
 
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests.
@@ -488,37 +416,6 @@ mod tests {
             }}"#;
     }
 
-    // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod npm_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`node-semver`'s operator set), so an edit to one without the other
-    // fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod npm_operator_chars_conformance;
-        ecosystem: "npm";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['^', '~', '=', '<', '>', '*'];
-    }
-
     #[test]
     fn test_ecosystem_watched_config_filenames() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -527,302 +424,6 @@ mod tests {
             ecosystem.watched_config_filenames(),
             &["pnpm-workspace.yaml", ".npmrc"]
         );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_has_real_range() {
-        // Regression test for #232: the textEdit range for a package-name completion
-        // must be the real name token span, not the (0,0)-(0,0) placeholder.
-        //
-        // `parse_manifest` transitively touches fs_probe (via `catalog::load`); see
-        // `fs_probe::snapshot_guard`'s doc.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let content = "{\n  \"dependencies\": {\n    \"express\": \"^4.18.2\"\n  }\n}";
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(2, 8); // cursor after "exp" in "express"
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        match context {
-            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                assert_eq!(prefix, "exp");
-                assert_ne!(range, Range::default());
-                assert_eq!(range, Range::new(Position::new(2, 5), Position::new(2, 12)));
-            }
-            other => panic!("Expected PackageName context, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_one_past_name_end_does_not_consume_closing_quote()
-    {
-        // Regression test for a bug introduced by an earlier #232 fix attempt: a cursor one
-        // column past "express"'s name_range (byte/char 12, i.e. sitting right at/after the
-        // closing quote of `"express"`) must never produce a PackageName textEdit range that
-        // extends into the closing quote — applying such an edit would delete the quote and
-        // corrupt the JSON.
-        //
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let content = "{\n  \"dependencies\": {\n    \"express\": \"^4.18.2\"\n  }\n}";
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(2, 13); // one column past name_range.end (12)
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        if let deps_core::completion::CompletionContext::PackageName { range, .. } = context {
-            panic!(
-                "expected this position not to match PackageName context (it is past the \
-                 name's own span and the range must not be widened to reach it), got {range:?}"
-            );
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_package_names_real_search() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_package_names("expre", Range::default())
-            .await;
-        // #1283: npm's `-/v1/search` tokenizes rather than prefix-matches, so "express" is
-        // not guaranteed among the results for a partial prefix — verified live against
-        // "expre", "expr", "exp", and "expres": none surface "express" itself, only the
-        // full name does. Assert the shape every live result must have instead of pinning
-        // to one package name (the production symptom of this drift is tracked separately
-        // in #1282; this only fixes the test's assertion).
-        assert!(!results.is_empty(), "expected non-empty search results");
-        // Query relevance, without re-pinning to one exact package: a regression where the
-        // search endpoint ignores the query entirely (wrong endpoint, dropped query param)
-        // would return arbitrary well-formed packages sharing none of the query's letters —
-        // vanishingly unlikely across 20 real results if the query is actually honored.
-        assert!(
-            results
-                .iter()
-                .any(|r| r.label.to_lowercase().contains("expr")),
-            "expected at least one result related to query 'expre', got: {:?}",
-            results.iter().map(|r| &r.label).collect::<Vec<_>>()
-        );
-        for item in &results {
-            // `detail` is `None` only when the registry's `latest_version` came back empty
-            // (`build_package_completion`), so this genuinely catches npm search-response
-            // version-field drift — unlike `label`/`documentation`, which the shared
-            // completion builder already guarantees non-empty/`Some` for every item
-            // reaching here, regardless of what the live response contains.
-            assert!(
-                item.detail.is_some(),
-                "completion item '{}' is missing a version detail",
-                item.label
-            );
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_versions_real() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let dep = dep_with_source("express", DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "4.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("4.")));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_versions_with_operator() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let dep = dep_with_source("express", DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "^4.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("4.")));
-    }
-
-    /// Sentinel package name for a package that does not exist in the registry (#1038): every
-    /// "unknown package" completion test below shares it, resolved against a mockito 404 via
-    /// [`mock_unknown_package_ecosystem`] rather than the live registry.
-    #[cfg(feature = "lsp-responses")]
-    const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
-
-    /// Builds an [`NpmEcosystem`] wired to a mockito server that 404s [`UNKNOWN_PACKAGE`]
-    /// (#1038), plus the `Mock`/`ServerGuard` handles the caller must keep alive and assert
-    /// on — shared by every "unknown package" completion test below to avoid repeating the
-    /// same live-registry-avoiding wiring per test. A regression that makes zero requests
-    /// (and so also produces an empty result) can no longer pass vacuously, since
-    /// `mock.assert_async()` requires the request to actually have been made.
-    #[cfg(feature = "lsp-responses")]
-    async fn mock_unknown_package_ecosystem() -> (mockito::ServerGuard, mockito::Mock, NpmEcosystem)
-    {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", format!("/{UNKNOWN_PACKAGE}").as_str())
-            .with_status(404)
-            .create_async()
-            .await;
-        let registry = NpmRegistry::with_public_base_for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-        );
-        (
-            server,
-            mock,
-            NpmEcosystem::with_registry(Arc::new(registry)),
-        )
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unknown_package() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
-        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_package_names_special_characters() {
-        // #1055: was a live, unmocked search that asserted the tautology
-        // `results.is_empty() || !results.is_empty()`. Mock the search endpoint and assert on
-        // the actual returned completion (issue #1038's mocking pattern).
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/-/v1/search")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(
-                r#"{"objects": [{"package": {"name": "@types/node", "version": "20.0.0"}}]}"#,
-            )
-            .create_async()
-            .await;
-        let registry = NpmRegistry::with_public_base_for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-        );
-        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
-
-        let results = ecosystem
-            .complete_package_names("@type", Range::default())
-            .await;
-        mock.assert_async().await;
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].label, "@types/node");
-    }
-
-    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
-    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
-    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
-    /// matching versions and asserts the count is exactly the real cap.
-    ///
-    /// Freshness is explicitly disabled: `NpmRegistry::get_versions_with` issues a second,
-    /// differently-`Accept`-headered request to the same packument URL when it's enabled,
-    /// which `mockito`'s default path-only matching would double-count against this single
-    /// mock — orthogonal to what this test verifies.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_capped_at_max_completion_versions() {
-        let mut server = mockito::Server::new_async().await;
-        let versions_body = format!(
-            r#"{{"versions": {{{}}}}}"#,
-            (0..8)
-                .map(|i| format!(r#""4.0.{i}": {{}}"#))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let mock = server
-            .mock("GET", "/express")
-            .with_status(200)
-            .with_body(versions_body)
-            .create_async()
-            .await;
-
-        let registry = NpmRegistry::with_public_base_for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-        );
-        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
-        let dep = dep_with_source("express", DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        // Test that we respect the display cap, not just some loose upper bound.
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "4",
-                deps_core::FreshnessSettings {
-                    enabled: false,
-                    cooldown_secs: 0,
-                },
-            )
-            .await;
-        mock.assert_async().await;
-        assert_eq!(results.len(), 5);
     }
 
     #[tokio::test]
@@ -883,231 +484,6 @@ mod tests {
 
         let provider = ecosystem.lockfile_provider();
         assert!(provider.is_some());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_inlay_hints_empty_dependencies() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-
-        let content = r#"{"dependencies": {}}"#;
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-        let config = EcosystemConfig::default();
-
-        let hints = ecosystem
-            .generate_inlay_hints(
-                parse_result.as_ref(),
-                VersionData::new(&cached_versions, &resolved_versions),
-                deps_core::LoadingState::Loaded,
-                &config,
-            )
-            .await;
-
-        assert!(hints.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_no_context() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-
-        let content = r#"{"name": "test"}"#;
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(completions.items.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_returns_versions() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-
-        // #1055: position 30 lands inside the `"4.0.0"` version literal — a `Version` context,
-        // not "feature" (npm has none) as this test's old name claimed. Mocks the `express`
-        // packument instead of the old unmocked, tautological assertion.
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/express")
-            .with_status(200)
-            .with_body(r#"{"versions": {"4.0.0": {}, "4.1.0": {}}}"#)
-            .expect_at_least(1)
-            .create_async()
-            .await;
-        let registry = NpmRegistry::with_public_base_for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-        );
-        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
-
-        let content = r#"{"dependencies": {"express": "4.0.0"}}"#;
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-
-        let position = Position {
-            line: 0,
-            character: 30,
-        };
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        mock.assert_async().await;
-        let labels: Vec<&str> = completions.items.iter().map(|i| i.label.as_str()).collect();
-        assert_eq!(
-            labels,
-            ["4.1.0 (latest)", "4.0.0"],
-            "newest-first, per the mocked packument"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_no_dependency_at_position() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-
-        let content = r#"{"name": "test"}"#;
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let hover = ecosystem
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                VersionData::new(&cached_versions, &resolved_versions),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(hover.is_none());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_code_actions_no_actions() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-
-        let content = r#"{"name": "test"}"#;
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-        let actions = ecosystem
-            .generate_code_actions(
-                parse_result.as_ref(),
-                position,
-                &uri,
-                VersionData::new(&cached_versions, &resolved_versions),
-                content,
-            )
-            .await;
-
-        assert!(actions.is_empty());
-    }
-
-    /// Critique M3: code actions/lens are deliberately suppressed for an `npm:`-aliased
-    /// dependency, not just untested. `version_range` still spans the whole literal
-    /// (`"npm:react@^17.0.0"`), but `version_requirement()` is only the real range
-    /// (`"^17.0.0"`) — `literal_span_matches` (`deps-core`'s shared code-action guard)
-    /// compares the two, sees a mismatch, and refuses to build a fix/refactor edit. This is
-    /// the safe outcome: a naive edit would write `"my-react": "18.2.0"`, destroying the
-    /// alias. Pinning this here so a future change to `version_literal()`/`version_range`
-    /// doesn't silently re-enable a destructive edit (see `NpmDependency`'s doc and
-    /// `deps_core::lsp_helpers::code_actions::generate_code_actions`'s guard).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_code_actions_suppressed_for_npm_alias() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/package.json");
-
-        let content = r#"{
-  "dependencies": {
-    "my-react": "npm:react@^17.0.0"
-  }
-}"#;
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert(
-            pkg("react"),
-            deps_core::lsp_helpers::PackageVersions::latest_only("18.2.0"),
-        );
-        let resolved_versions = HashMap::new();
-
-        // Inside the version literal's text on its line.
-        let position = Position::new(2, 20);
-        let actions = ecosystem
-            .generate_code_actions(
-                parse_result.as_ref(),
-                position,
-                &uri,
-                VersionData::new(&cached_versions, &resolved_versions),
-                content,
-            )
-            .await;
-
-        assert!(
-            actions.is_empty(),
-            "expected no fix/refactor action for an npm: alias, got {actions:?}"
-        );
     }
 
     #[tokio::test]
@@ -1249,363 +625,6 @@ mod tests {
         );
     }
 
-    /// #1038: was a live-registry round-trip against [`UNKNOWN_PACKAGE`] asserting only
-    /// `results.is_empty()` — vacuous under a dead network, since a regression that made zero
-    /// requests would produce the same empty result. Now mocked, with `mock.assert_async()`
-    /// requiring the request to actually have been made.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_empty_prefix() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
-        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        // Empty prefix should show non-deprecated versions (up to 20)
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_with_tilde_operator() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
-        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "~4.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_with_wildcard() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
-        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "*",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_with_less_than_operator() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
-        let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "<2.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    // --- issue #599: position-based version-completion source routing ---
-
-    /// Issue #599: two dependencies sharing one `PackageName` but resolving to different
-    /// sources no longer collapse into the old name-based "offer nothing for either" result
-    /// — cursor position now identifies exactly one dependency, so each occurrence routes
-    /// independently. Mirrors `deps_cargo::ecosystem`'s identical
-    /// `test_complete_versions_same_name_different_sources_routes_by_position` (issue #593).
-    ///
-    /// Both halves are required to discriminate pre-fix from post-fix behavior (impl-critic
-    /// finding C1): the alternate-occurrence assertion alone is empty under *both* the old
-    /// name-based `Ambiguous` collapse and the new position-based routing (an unregistered
-    /// alternate index fails closed either way), so it cannot fail on unfixed code by itself.
-    /// The registry-occurrence assertion is the discriminating half — pre-fix it also
-    /// collapsed to `Ambiguous` and returned empty; post-fix, cursor position resolves it
-    /// independently of the co-occurring `AlternateRegistry` entry and it reaches the (mocked)
-    /// public registry.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
-        let mut public_server = mockito::Server::new_async().await;
-        public_server
-            .mock("GET", "/@myorg/pkg")
-            .with_status(200)
-            .with_body(r#"{"versions": {"1.0.0": {}, "1.5.0": {}}}"#)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
-        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
-
-        let registry_dep = dep_with_source("@myorg/pkg", DependencySource::Registry, 0);
-        let registry_position = registry_dep.version_range.unwrap().start.into();
-        let alternate_dep = dep_with_source(
-            "@myorg/pkg",
-            DependencySource::AlternateRegistry {
-                index: "https://npm.pkg.github.com".to_string(),
-                mirrors_crates_io: false,
-            },
-            1,
-        );
-        let alternate_position = alternate_dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![registry_dep, alternate_dep],
-        };
-
-        // Resolves deterministically without network: the unregistered index fails closed
-        // with `PackageNotFound` before any HTTP call, proving its own source drove routing.
-        let alternate_results = ecosystem
-            .complete_versions(
-                &parse_result,
-                alternate_position,
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            alternate_results.is_empty(),
-            "unregistered alternate index must offer no completions"
-        );
-
-        // Discriminating assertion: the co-occurring `Registry`-sourced entry must still
-        // resolve via the mocked public registry, proving position (not the old name-based
-        // ambiguity) drives routing.
-        let registry_results = ecosystem
-            .complete_versions(
-                &parse_result,
-                registry_position,
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            !registry_results.is_empty(),
-            "the Registry-sourced occurrence must resolve despite a co-occurring, \
-             differently-sourced entry sharing its name"
-        );
-    }
-
-    /// FR-006 interaction: a `CustomRegistry`-resolved name (the fail-closed state) offers no
-    /// completions either.
-    ///
-    /// SC-004 requires *no public-registry request at all*, not merely an empty result — a
-    /// real, unmocked `registry.npmjs.org` client would pass this test's old
-    /// `results.is_empty()`-only assertion even if the fail-closed dispatch regressed and
-    /// fell through to `complete_versions_generic`, since that helper returns `vec![]` on
-    /// *any* `Err` (including a 404 from a nonexistent package name), not only on the
-    /// intended fail-closed arm. A mocked public registry with `.expect(0)` makes the
-    /// dispatch regression itself fail the test, not just its result shape.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_custom_registry_source_offers_nothing() {
-        let mut public_server = mockito::Server::new_async().await;
-        let public_mock = public_server
-            .mock("GET", mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(r#"{"versions": {"9.9.9": {}}}"#)
-            .expect(0)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
-        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
-        let dep = dep_with_source(
-            "@myorg/pkg",
-            DependencySource::CustomRegistry {
-                url: "not-a-valid-url".to_string(),
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(results.is_empty());
-        public_mock.assert_async().await;
-    }
-
-    /// An `AlternateRegistry` source whose index has no registered client offers no
-    /// completions — never a fall back to the public registry.
-    ///
-    /// Same SC-004 rationale as
-    /// `test_complete_versions_custom_registry_source_offers_nothing` above: a mocked public
-    /// registry with `.expect(0)` proves no request reaches it, which `results.is_empty()`
-    /// alone cannot.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unregistered_alternate_offers_nothing() {
-        let mut public_server = mockito::Server::new_async().await;
-        let public_mock = public_server
-            .mock("GET", mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(r#"{"versions": {"9.9.9": {}}}"#)
-            .expect(0)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
-        let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
-        let dep = dep_with_source(
-            "@myorg/pkg",
-            DependencySource::AlternateRegistry {
-                index: "https://never-registered.example".to_string(),
-                mirrors_crates_io: false,
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(results.is_empty());
-        public_mock.assert_async().await;
-    }
-
-    /// Issue #599 end-to-end: a registered alternate client's version completion routes there.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_routes_to_registered_alternate_client() {
-        let mut alt_server = mockito::Server::new_async().await;
-        alt_server
-            .mock("GET", "/@myorg/pkg")
-            .with_status(200)
-            .with_body(r#"{"versions": {"1.0.0": {}, "1.5.0": {}}}"#)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
-        let registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
-        let ecosystem = NpmEcosystem::with_registry(Arc::clone(&registry));
-
-        let policy = deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::All,
-        );
-        let index = crate::config::NpmRegistryIndex::new(&alt_server.url(), &policy).unwrap();
-        registry.register_alternate(index.clone());
-
-        let dep = dep_with_source(
-            "@myorg/pkg",
-            DependencySource::AlternateRegistry {
-                index: index.as_str().to_string(),
-                mirrors_crates_io: false,
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-    }
-
-    // --- pnpm catalogs (spec 046): generate_hover/generate_diagnostics overrides ---
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_appends_catalog_line_for_resolved_dependency() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(
-            root.path().join("pnpm-workspace.yaml"),
-            "catalog:\n  react: ^18.3.0\n",
-        )
-        .unwrap();
-        let manifest_path = root.path().join("package.json");
-        let uri = Url::from_file_path(&manifest_path).unwrap();
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let content = r#"{"dependencies": {"react": "catalog:"}}"#;
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-
-        let position = Position::new(0, 20); // inside "react"'s name
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-        let hover = ecosystem
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                VersionData::new(&cached_versions, &resolved_versions),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await
-            .expect("hover must fire for a catalog-resolved dependency");
-
-        let content = hover.markdown();
-        assert!(content.contains("**Requirement**"), "{content}");
-        assert!(content.contains("^18.3.0"), "{content}");
-        assert!(content.contains("**Catalog**"), "{content}");
-        assert!(content.contains("catalog:"), "{content}");
-    }
-
     #[tokio::test]
     async fn test_generate_diagnostics_reports_missing_catalog_entry() {
         // See the comment in `test_package_name_completion_context_has_real_range` on why
@@ -1648,23 +667,6 @@ mod tests {
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
     }
 
-    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
-    /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
-    /// trait method on realistic multi-line content.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = NpmEcosystem::new(cache);
-        let content = "{\n  \"name\": \"test\",\n  \"dependencies\": {\n    \"expr";
-        let line = content.lines().nth(3).unwrap();
-        let position = Position::new(3, line.chars().count() as u32);
-        assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position.into()),
-            Some("expr")
-        );
-    }
-
     #[test]
     fn test_is_in_dependencies_section_basic() {
         let content = "{\n  \"name\": \"test\",\n  \"dependencies\": {\n    \"express\"\n  }\n}";
@@ -1690,46 +692,6 @@ mod tests {
         // bare-inserting would duplicate the quote (`"express"express`). Suppressed, not guessed.
         let line = "    \"express\"";
         assert_eq!(extract_prefix(line, line.len() as u32), ("", false));
-    }
-
-    /// #729: a closed key (`"express"`, cursor past both quotes) must suppress the
-    /// completion entirely — the same "no safe text to offer" outcome as Maven's
-    /// non-`artifactId` open tag — which this trait method achieves by returning
-    /// `None`, same as "no completable position at all".
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_closed_key_is_suppressed() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NpmEcosystem::new(cache);
-        let content = "{\n  \"dependencies\": {\n    \"express\"";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            None
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_inside_open_key() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NpmEcosystem::new(cache);
-        let content = "{\n  \"dependencies\": {\n    \"expr";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_false_with_no_open_key() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NpmEcosystem::new(cache);
-        let content = "{\n  \"dependencies\": {\n    expr";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #729: `NpmEcosystem` has no `fallback_bare_insert_text` override — the default
@@ -1786,5 +748,1000 @@ mod tests {
             ecosystem.completion_insert_text(&meta),
             Some("\"express\": \"^4.18.2\"".to_string())
         );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    mod lsp_tests {
+        use super::*;
+
+        use deps_core::EcosystemConfig;
+
+        use deps_core::parser::DependencySource;
+
+        deps_core::complete_versions_test_shim!(NpmEcosystem);
+
+        struct MockParseResult {
+            dependencies: Vec<crate::types::NpmDependency>,
+        }
+
+        impl deps_core::ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+                self.dependencies
+                    .iter()
+                    .map(|d| d as &dyn deps_core::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+
+            fn uri(&self) -> &Url {
+                static URI: std::sync::LazyLock<Url> = std::sync::LazyLock::new(|| {
+                    deps_core::test_util::test_uri("/test/package.json")
+                });
+                &URI
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// Builds an `NpmDependency` with a `version_range` at `line`, whose start position is
+        /// what `complete_versions` (position-based, issue #599) looks up `parse_result` by.
+        fn dep_with_source(
+            name: &str,
+            source: DependencySource,
+            line: u32,
+        ) -> crate::types::NpmDependency {
+            crate::types::NpmDependency {
+                name: pkg(name),
+                name_range: Range::default().into(),
+                version_req: None,
+                version_range: Some(
+                    Range::new(Position::new(line, 0), Position::new(line, 10)).into(),
+                ),
+                section: crate::types::NpmDependencySection::Dependencies,
+                source,
+                catalog: None,
+                package: None,
+            }
+        }
+
+        // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
+        deps_core::completion_guard_conformance! {
+            mod npm_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (`node-semver`'s operator set), so an edit to one without the other
+        // fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod npm_operator_chars_conformance;
+            ecosystem: "npm";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['^', '~', '=', '<', '>', '*'];
+        }
+
+        #[tokio::test]
+        async fn test_package_name_completion_context_has_real_range() {
+            // Regression test for #232: the textEdit range for a package-name completion
+            // must be the real name token span, not the (0,0)-(0,0) placeholder.
+            //
+            // `parse_manifest` transitively touches fs_probe (via `catalog::load`); see
+            // `fs_probe::snapshot_guard`'s doc.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let content = "{\n  \"dependencies\": {\n    \"express\": \"^4.18.2\"\n  }\n}";
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(2, 8); // cursor after "exp" in "express"
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+
+            match context {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    assert_eq!(prefix, "exp");
+                    assert_ne!(range, Range::default());
+                    assert_eq!(range, Range::new(Position::new(2, 5), Position::new(2, 12)));
+                }
+                other => panic!("Expected PackageName context, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_package_name_completion_context_one_past_name_end_does_not_consume_closing_quote()
+         {
+            // Regression test for a bug introduced by an earlier #232 fix attempt: a cursor one
+            // column past "express"'s name_range (byte/char 12, i.e. sitting right at/after the
+            // closing quote of `"express"`) must never produce a PackageName textEdit range that
+            // extends into the closing quote — applying such an edit would delete the quote and
+            // corrupt the JSON.
+            //
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let content = "{\n  \"dependencies\": {\n    \"express\": \"^4.18.2\"\n  }\n}";
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(2, 13); // one column past name_range.end (12)
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+
+            if let deps_core::completion::CompletionContext::PackageName { range, .. } = context {
+                panic!(
+                    "expected this position not to match PackageName context (it is past the \
+                 name's own span and the range must not be widened to reach it), got {range:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_package_names_real_search() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+
+            let results = ecosystem
+                .complete_package_names("expre", Range::default())
+                .await;
+            // #1283: npm's `-/v1/search` tokenizes rather than prefix-matches, so "express" is
+            // not guaranteed among the results for a partial prefix — verified live against
+            // "expre", "expr", "exp", and "expres": none surface "express" itself, only the
+            // full name does. Assert the shape every live result must have instead of pinning
+            // to one package name (the production symptom of this drift is tracked separately
+            // in #1282; this only fixes the test's assertion).
+            assert!(!results.is_empty(), "expected non-empty search results");
+            // Query relevance, without re-pinning to one exact package: a regression where the
+            // search endpoint ignores the query entirely (wrong endpoint, dropped query param)
+            // would return arbitrary well-formed packages sharing none of the query's letters —
+            // vanishingly unlikely across 20 real results if the query is actually honored.
+            assert!(
+                results
+                    .iter()
+                    .any(|r| r.label.to_lowercase().contains("expr")),
+                "expected at least one result related to query 'expre', got: {:?}",
+                results.iter().map(|r| &r.label).collect::<Vec<_>>()
+            );
+            for item in &results {
+                // `detail` is `None` only when the registry's `latest_version` came back empty
+                // (`build_package_completion`), so this genuinely catches npm search-response
+                // version-field drift — unlike `label`/`documentation`, which the shared
+                // completion builder already guarantees non-empty/`Some` for every item
+                // reaching here, regardless of what the live response contains.
+                assert!(
+                    item.detail.is_some(),
+                    "completion item '{}' is missing a version detail",
+                    item.label
+                );
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_versions_real() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let dep = dep_with_source("express", DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "4.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("4.")));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_versions_with_operator() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let dep = dep_with_source("express", DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "^4.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("4.")));
+        }
+
+        /// Sentinel package name for a package that does not exist in the registry (#1038): every
+        /// "unknown package" completion test below shares it, resolved against a mockito 404 via
+        /// [`mock_unknown_package_ecosystem`] rather than the live registry.
+        const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
+
+        /// Builds an [`NpmEcosystem`] wired to a mockito server that 404s [`UNKNOWN_PACKAGE`]
+        /// (#1038), plus the `Mock`/`ServerGuard` handles the caller must keep alive and assert
+        /// on — shared by every "unknown package" completion test below to avoid repeating the
+        /// same live-registry-avoiding wiring per test. A regression that makes zero requests
+        /// (and so also produces an empty result) can no longer pass vacuously, since
+        /// `mock.assert_async()` requires the request to actually have been made.
+        async fn mock_unknown_package_ecosystem()
+        -> (mockito::ServerGuard, mockito::Mock, NpmEcosystem) {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", format!("/{UNKNOWN_PACKAGE}").as_str())
+                .with_status(404)
+                .create_async()
+                .await;
+            let registry = NpmRegistry::with_public_base_for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            );
+            (
+                server,
+                mock,
+                NpmEcosystem::with_registry(Arc::new(registry)),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_complete_versions_unknown_package() {
+            let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+            let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_complete_package_names_special_characters() {
+            // #1055: was a live, unmocked search that asserted the tautology
+            // `results.is_empty() || !results.is_empty()`. Mock the search endpoint and assert on
+            // the actual returned completion (issue #1038's mocking pattern).
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/-/v1/search")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(
+                    r#"{"objects": [{"package": {"name": "@types/node", "version": "20.0.0"}}]}"#,
+                )
+                .create_async()
+                .await;
+            let registry = NpmRegistry::with_public_base_for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            );
+            let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+
+            let results = ecosystem
+                .complete_package_names("@type", Range::default())
+                .await;
+            mock.assert_async().await;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].label, "@types/node");
+        }
+
+        /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+        /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+        /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+        /// matching versions and asserts the count is exactly the real cap.
+        ///
+        /// Freshness is explicitly disabled: `NpmRegistry::get_versions_with` issues a second,
+        /// differently-`Accept`-headered request to the same packument URL when it's enabled,
+        /// which `mockito`'s default path-only matching would double-count against this single
+        /// mock — orthogonal to what this test verifies.
+        #[tokio::test]
+        async fn test_complete_versions_capped_at_max_completion_versions() {
+            let mut server = mockito::Server::new_async().await;
+            let versions_body = format!(
+                r#"{{"versions": {{{}}}}}"#,
+                (0..8)
+                    .map(|i| format!(r#""4.0.{i}": {{}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            );
+            let mock = server
+                .mock("GET", "/express")
+                .with_status(200)
+                .with_body(versions_body)
+                .create_async()
+                .await;
+
+            let registry = NpmRegistry::with_public_base_for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            );
+            let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+            let dep = dep_with_source("express", DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            // Test that we respect the display cap, not just some loose upper bound.
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "4",
+                    deps_core::FreshnessSettings {
+                        enabled: false,
+                        cooldown_secs: 0,
+                    },
+                )
+                .await;
+            mock.assert_async().await;
+            assert_eq!(results.len(), 5);
+        }
+
+        #[tokio::test]
+        async fn test_generate_inlay_hints_empty_dependencies() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+
+            let content = r#"{"dependencies": {}}"#;
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let config = EcosystemConfig::default();
+
+            let hints = ecosystem
+                .generate_inlay_hints(
+                    parse_result.as_ref(),
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::LoadingState::Loaded,
+                    &config,
+                )
+                .await;
+
+            assert!(hints.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_no_context() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+
+            let content = r#"{"name": "test"}"#;
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position {
+                line: 0,
+                character: 0,
+            };
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(completions.items.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_version_context_returns_versions() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+
+            // #1055: position 30 lands inside the `"4.0.0"` version literal — a `Version` context,
+            // not "feature" (npm has none) as this test's old name claimed. Mocks the `express`
+            // packument instead of the old unmocked, tautological assertion.
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/express")
+                .with_status(200)
+                .with_body(r#"{"versions": {"4.0.0": {}, "4.1.0": {}}}"#)
+                .expect_at_least(1)
+                .create_async()
+                .await;
+            let registry = NpmRegistry::with_public_base_for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            );
+            let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+
+            let content = r#"{"dependencies": {"express": "4.0.0"}}"#;
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+            let position = Position {
+                line: 0,
+                character: 30,
+            };
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            mock.assert_async().await;
+            let labels: Vec<&str> = completions.items.iter().map(|i| i.label.as_str()).collect();
+            assert_eq!(
+                labels,
+                ["4.1.0 (latest)", "4.0.0"],
+                "newest-first, per the mocked packument"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_hover_no_dependency_at_position() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+
+            let content = r#"{"name": "test"}"#;
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position {
+                line: 0,
+                character: 0,
+            };
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+
+            let hover = ecosystem
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(hover.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_generate_code_actions_no_actions() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+
+            let content = r#"{"name": "test"}"#;
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position {
+                line: 0,
+                character: 0,
+            };
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let actions = ecosystem
+                .generate_code_actions(
+                    parse_result.as_ref(),
+                    position,
+                    &uri,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    content,
+                )
+                .await;
+
+            assert!(actions.is_empty());
+        }
+
+        /// Critique M3: code actions/lens are deliberately suppressed for an `npm:`-aliased
+        /// dependency, not just untested. `version_range` still spans the whole literal
+        /// (`"npm:react@^17.0.0"`), but `version_requirement()` is only the real range
+        /// (`"^17.0.0"`) — `literal_span_matches` (`deps-core`'s shared code-action guard)
+        /// compares the two, sees a mismatch, and refuses to build a fix/refactor edit. This is
+        /// the safe outcome: a naive edit would write `"my-react": "18.2.0"`, destroying the
+        /// alias. Pinning this here so a future change to `version_literal()`/`version_range`
+        /// doesn't silently re-enable a destructive edit (see `NpmDependency`'s doc and
+        /// `deps_core::lsp_helpers::code_actions::generate_code_actions`'s guard).
+        #[tokio::test]
+        async fn test_generate_code_actions_suppressed_for_npm_alias() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/package.json");
+
+            let content = r#"{
+  "dependencies": {
+    "my-react": "npm:react@^17.0.0"
+  }
+}"#;
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                pkg("react"),
+                deps_core::lsp_helpers::PackageVersions::latest_only("18.2.0"),
+            );
+            let resolved_versions = HashMap::new();
+
+            // Inside the version literal's text on its line.
+            let position = Position::new(2, 20);
+            let actions = ecosystem
+                .generate_code_actions(
+                    parse_result.as_ref(),
+                    position,
+                    &uri,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    content,
+                )
+                .await;
+
+            assert!(
+                actions.is_empty(),
+                "expected no fix/refactor action for an npm: alias, got {actions:?}"
+            );
+        }
+
+        /// #1038: was a live-registry round-trip against [`UNKNOWN_PACKAGE`] asserting only
+        /// `results.is_empty()` — vacuous under a dead network, since a regression that made zero
+        /// requests would produce the same empty result. Now mocked, with `mock.assert_async()`
+        /// requiring the request to actually have been made.
+        #[tokio::test]
+        async fn test_complete_versions_empty_prefix() {
+            let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+            let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            // Empty prefix should show non-deprecated versions (up to 20)
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+        #[tokio::test]
+        async fn test_complete_versions_with_tilde_operator() {
+            let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+            let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "~4.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+        #[tokio::test]
+        async fn test_complete_versions_with_wildcard() {
+            let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+            let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "*",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+        #[tokio::test]
+        async fn test_complete_versions_with_less_than_operator() {
+            let (_server, mock, ecosystem) = mock_unknown_package_ecosystem().await;
+            let dep = dep_with_source(UNKNOWN_PACKAGE, DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "<2.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        // --- issue #599: position-based version-completion source routing ---
+
+        /// Issue #599: two dependencies sharing one `PackageName` but resolving to different
+        /// sources no longer collapse into the old name-based "offer nothing for either" result
+        /// — cursor position now identifies exactly one dependency, so each occurrence routes
+        /// independently. Mirrors `deps_cargo::ecosystem`'s identical
+        /// `test_complete_versions_same_name_different_sources_routes_by_position` (issue #593).
+        ///
+        /// Both halves are required to discriminate pre-fix from post-fix behavior (impl-critic
+        /// finding C1): the alternate-occurrence assertion alone is empty under *both* the old
+        /// name-based `Ambiguous` collapse and the new position-based routing (an unregistered
+        /// alternate index fails closed either way), so it cannot fail on unfixed code by itself.
+        /// The registry-occurrence assertion is the discriminating half — pre-fix it also
+        /// collapsed to `Ambiguous` and returned empty; post-fix, cursor position resolves it
+        /// independently of the co-occurring `AlternateRegistry` entry and it reaches the (mocked)
+        /// public registry.
+        #[tokio::test]
+        async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+            let mut public_server = mockito::Server::new_async().await;
+            public_server
+                .mock("GET", "/@myorg/pkg")
+                .with_status(200)
+                .with_body(r#"{"versions": {"1.0.0": {}, "1.5.0": {}}}"#)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
+            let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+
+            let registry_dep = dep_with_source("@myorg/pkg", DependencySource::Registry, 0);
+            let registry_position = registry_dep.version_range.unwrap().start.into();
+            let alternate_dep = dep_with_source(
+                "@myorg/pkg",
+                DependencySource::AlternateRegistry {
+                    index: "https://npm.pkg.github.com".to_string(),
+                    mirrors_crates_io: false,
+                },
+                1,
+            );
+            let alternate_position = alternate_dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![registry_dep, alternate_dep],
+            };
+
+            // Resolves deterministically without network: the unregistered index fails closed
+            // with `PackageNotFound` before any HTTP call, proving its own source drove routing.
+            let alternate_results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    alternate_position,
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                alternate_results.is_empty(),
+                "unregistered alternate index must offer no completions"
+            );
+
+            // Discriminating assertion: the co-occurring `Registry`-sourced entry must still
+            // resolve via the mocked public registry, proving position (not the old name-based
+            // ambiguity) drives routing.
+            let registry_results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    registry_position,
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                !registry_results.is_empty(),
+                "the Registry-sourced occurrence must resolve despite a co-occurring, \
+             differently-sourced entry sharing its name"
+            );
+        }
+
+        /// FR-006 interaction: a `CustomRegistry`-resolved name (the fail-closed state) offers no
+        /// completions either.
+        ///
+        /// SC-004 requires *no public-registry request at all*, not merely an empty result — a
+        /// real, unmocked `registry.npmjs.org` client would pass this test's old
+        /// `results.is_empty()`-only assertion even if the fail-closed dispatch regressed and
+        /// fell through to `complete_versions_generic`, since that helper returns `vec![]` on
+        /// *any* `Err` (including a 404 from a nonexistent package name), not only on the
+        /// intended fail-closed arm. A mocked public registry with `.expect(0)` makes the
+        /// dispatch regression itself fail the test, not just its result shape.
+        #[tokio::test]
+        async fn test_complete_versions_custom_registry_source_offers_nothing() {
+            let mut public_server = mockito::Server::new_async().await;
+            let public_mock = public_server
+                .mock("GET", mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(r#"{"versions": {"9.9.9": {}}}"#)
+                .expect(0)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
+            let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+            let dep = dep_with_source(
+                "@myorg/pkg",
+                DependencySource::CustomRegistry {
+                    url: "not-a-valid-url".to_string(),
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(results.is_empty());
+            public_mock.assert_async().await;
+        }
+
+        /// An `AlternateRegistry` source whose index has no registered client offers no
+        /// completions — never a fall back to the public registry.
+        ///
+        /// Same SC-004 rationale as
+        /// `test_complete_versions_custom_registry_source_offers_nothing` above: a mocked public
+        /// registry with `.expect(0)` proves no request reaches it, which `results.is_empty()`
+        /// alone cannot.
+        #[tokio::test]
+        async fn test_complete_versions_unregistered_alternate_offers_nothing() {
+            let mut public_server = mockito::Server::new_async().await;
+            let public_mock = public_server
+                .mock("GET", mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(r#"{"versions": {"9.9.9": {}}}"#)
+                .expect(0)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = NpmRegistry::with_public_base_for_test(cache, public_server.url());
+            let ecosystem = NpmEcosystem::with_registry(Arc::new(registry));
+            let dep = dep_with_source(
+                "@myorg/pkg",
+                DependencySource::AlternateRegistry {
+                    index: "https://never-registered.example".to_string(),
+                    mirrors_crates_io: false,
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(results.is_empty());
+            public_mock.assert_async().await;
+        }
+
+        /// Issue #599 end-to-end: a registered alternate client's version completion routes there.
+        #[tokio::test]
+        async fn test_complete_versions_routes_to_registered_alternate_client() {
+            let mut alt_server = mockito::Server::new_async().await;
+            alt_server
+                .mock("GET", "/@myorg/pkg")
+                .with_status(200)
+                .with_body(r#"{"versions": {"1.0.0": {}, "1.5.0": {}}}"#)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+            let registry = Arc::new(NpmRegistry::new(Arc::clone(&cache)));
+            let ecosystem = NpmEcosystem::with_registry(Arc::clone(&registry));
+
+            let policy = deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            );
+            let index = crate::config::NpmRegistryIndex::new(&alt_server.url(), &policy).unwrap();
+            registry.register_alternate(index.clone());
+
+            let dep = dep_with_source(
+                "@myorg/pkg",
+                DependencySource::AlternateRegistry {
+                    index: index.as_str().to_string(),
+                    mirrors_crates_io: false,
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+        }
+
+        // --- pnpm catalogs (spec 046): generate_hover/generate_diagnostics overrides ---
+
+        #[tokio::test]
+        async fn test_generate_hover_appends_catalog_line_for_resolved_dependency() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(
+                root.path().join("pnpm-workspace.yaml"),
+                "catalog:\n  react: ^18.3.0\n",
+            )
+            .unwrap();
+            let manifest_path = root.path().join("package.json");
+            let uri = Url::from_file_path(&manifest_path).unwrap();
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let content = r#"{"dependencies": {"react": "catalog:"}}"#;
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+            let position = Position::new(0, 20); // inside "react"'s name
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let hover = ecosystem
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover must fire for a catalog-resolved dependency");
+
+            let content = hover.markdown();
+            assert!(content.contains("**Requirement**"), "{content}");
+            assert!(content.contains("^18.3.0"), "{content}");
+            assert!(content.contains("**Catalog**"), "{content}");
+            assert!(content.contains("catalog:"), "{content}");
+        }
+
+        /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+        /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
+        /// trait method on realistic multi-line content.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = NpmEcosystem::new(cache);
+            let content = "{\n  \"name\": \"test\",\n  \"dependencies\": {\n    \"expr";
+            let line = content.lines().nth(3).unwrap();
+            let position = Position::new(3, line.chars().count() as u32);
+            assert_eq!(
+                ecosystem.fallback_completion_prefix(content, position.into()),
+                Some("expr")
+            );
+        }
+
+        /// #729: a closed key (`"express"`, cursor past both quotes) must suppress the
+        /// completion entirely — the same "no safe text to offer" outcome as Maven's
+        /// non-`artifactId` open tag — which this trait method achieves by returning
+        /// `None`, same as "no completable position at all".
+        #[test]
+        fn test_fallback_completion_prefix_closed_key_is_suppressed() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NpmEcosystem::new(cache);
+            let content = "{\n  \"dependencies\": {\n    \"express\"";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                None
+            );
+        }
+
+        #[test]
+        fn test_fallback_completion_is_bare_inside_open_key() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NpmEcosystem::new(cache);
+            let content = "{\n  \"dependencies\": {\n    \"expr";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        #[test]
+        fn test_fallback_completion_is_bare_false_with_no_open_key() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NpmEcosystem::new(cache);
+            let content = "{\n  \"dependencies\": {\n    expr";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(!eco.fallback_completion_is_bare(content, position.into()));
+        }
     }
 }

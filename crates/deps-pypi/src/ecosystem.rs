@@ -21,13 +21,13 @@ use crate::formatter::PypiFormatter;
 use crate::parser::PypiParser;
 use crate::registry::PypiRegistry;
 
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions: PEP 508's `==`, `!=`, `<=`, `>=`, `<`, `>`, `~=` plus
-/// Poetry's caret (`^2.28`, `[tool.poetry.dependencies]`) — `^` was missing here despite
-/// `parser::pyproject::parse_poetry_dependencies` accepting caret constraints, so a Poetry
-/// manifest's completion silently fell back to an unfiltered list (#1137).
 #[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &['>', '<', '=', '~', '!', '^'];
+mod lsp;
+#[cfg(feature = "lsp-responses")]
+use lsp::{
+    VERSION_OPERATOR_CHARS, is_absolute_document_link_target, is_safe_document_link_target,
+    lexically_normalize,
+};
 
 /// Which manifest shape a URI's basename identifies, so `parse_manifest` can
 /// dispatch to the right parser method and report the right `file_type` on
@@ -567,104 +567,12 @@ fn extract_prefix(line: &str, character: u32) -> &str {
     last_quote.map_or("", |pos| &prefix[pos + 1..])
 }
 
-/// Whether `target` is safe to resolve into a clickable `DocumentLink`.
-///
-/// Rejects every ASCII control character (`char::is_control()`, the same gate
-/// [`deps_core::lsp_helpers::escape_markdown`] uses) plus the Unicode
-/// bidi/format characters that gate alone misses — RLO/LRO-family overrides
-/// (U+202A-U+202E, U+2066-U+2069), explicit directional marks (U+200E/U+200F),
-/// zero-width joiners/spaces (U+200B-U+200D, U+2060, U+FEFF), and the
-/// JS/JSON5 line terminators U+2028/U+2029. Without this, a target like
-/// `"safe.txt\u{202E}txt.evil"` renders right-to-left in the editor (reading
-/// as an innocuous `.txt` file) while the link actually opens `.evil` —
-/// link-target spoofing, not merely a cosmetic issue, since the resolved URI
-/// is exactly what the user's click opens.
-#[cfg(feature = "lsp-responses")]
-fn is_safe_document_link_target(target: &str) -> bool {
-    !target.is_empty()
-        && target.chars().all(|c| {
-            !c.is_control()
-                && !matches!(c,
-                    '\u{200B}'..='\u{200F}'
-                        | '\u{202A}'..='\u{202E}'
-                        | '\u{2060}'
-                        | '\u{2066}'..='\u{2069}'
-                        | '\u{2028}'
-                        | '\u{2029}'
-                        | '\u{FEFF}'
-                )
-        })
-}
-
-/// Whether `target` is written as an absolute filesystem path — a POSIX-style
-/// `/...`/`\...` root, or a Windows drive prefix (`C:\...`, `C:/...`, or the
-/// drive-*relative* `C:evil.txt`/bare `C:` forms).
-///
-/// Checked on the raw string rather than `std::path::Path::is_absolute()`: that method's
-/// notion of "absolute" is platform-dependent (a Windows drive prefix is not absolute per
-/// `Path` on a POSIX host), but `link.target` is manifest text that could name either
-/// path style regardless of which OS `deps-lsp` itself runs on. The drive-letter check
-/// deliberately has no separator requirement after the colon: per `std::path`'s own docs,
-/// `Path::join`ing a "prefix but no root" path (Windows' term for exactly this
-/// `C:evil.txt`/`C:` shape) onto any base discards the base entirely, same as a fully
-/// separator-rooted `C:\...` — requiring a separator here would let that variant silently
-/// bypass the whole guard on Windows (#937 finding C1). That base-discard is
-/// Windows-specific — on POSIX, `Path::join` treats `C:evil.txt` as an ordinary relative
-/// segment (`Path::new("/project").join("C:x") == "/project/C:x"`) — but this function has
-/// no way to know which platform authored the requirements file, so it rejects the shape
-/// uniformly rather than trusting the host OS's own `Path::join` semantics.
-#[cfg(feature = "lsp-responses")]
-fn is_absolute_document_link_target(target: &str) -> bool {
-    target.starts_with('/')
-        || target.starts_with('\\')
-        || matches!(target.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
-}
-
-/// Lexically resolves `.`/`..` components in `path` without touching the filesystem — no
-/// `canonicalize`, no symlink resolution, since `generate_document_links` never opens the
-/// target, only publishes it as a clickable `DocumentLink`.
-///
-/// Assumes `path` is rooted: a `..` with nothing left to pop is simply dropped rather
-/// than kept as a literal component — the same clamp-at-root behavior a real filesystem
-/// gives `/..`. Keeping it (a prior version of this function did) produces a non-canonical
-/// path like `/../etc/shadow`: still rejected by the workspace-root containment check
-/// today, but a misleading tooltip if that check is ever skipped (#937 finding C2). Every
-/// call site upholds the assumption: the join-target call always sees `base_dir.join(...)`
-/// (rooted, since `base_dir` comes from the manifest's own file URI), and the
-/// workspace-root call site filters through [`is_absolute_document_link_target`] first
-/// (#937 finding R2) rather than `Path::is_absolute()` — the latter is platform-dependent
-/// (a POSIX-style root like `/project` is not "absolute" per `Path` on Windows, only
-/// "has_root"), which would silently skip containment for exactly that shape on Windows. A
-/// relative `path` isn't rejected here either way, it just won't clamp to a meaningful
-/// root.
-#[cfg(feature = "lsp-responses")]
-fn lexically_normalize(path: &std::path::Path) -> std::path::PathBuf {
-    let mut result = std::path::PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => result.push(other),
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::EcosystemConfig;
     use deps_core::{VersionData, parser::DependencySource};
     use std::assert_matches;
     use std::collections::HashMap;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
-
-    #[cfg(feature = "lsp-responses")]
-    deps_core::complete_versions_test_shim!(PypiEcosystem);
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
@@ -719,63 +627,6 @@ mod tests {
              flask = \"<%= FLASK_VERSION %>\"\n\
              django = \"$(DJANGO_VERSION)\"\n\
              gunicorn = \"$(GUNICORN-VERSION)\"\n";
-    }
-
-    // #758: the shared completion-prefix-length guard
-    // (`deps_core::completion::complete_package_names_generic`), replacing
-    // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod pypi_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (PEP 508 plus Poetry's caret), so an edit to one without the other
-    // fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod pypi_operator_chars_conformance;
-        ecosystem: "pypi";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['>', '<', '=', '~', '!', '^'];
-    }
-
-    // #1136: a dependency whose only registry source is blocked by the default reachability
-    // policy (SSRF-class host) must yield zero version completions and never reach PyPI.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_source_gate_conformance! {
-        mod pypi_completion_source_gate_conformance;
-        build: async {
-            let mut server = mockito::Server::new_async().await;
-            let mock = server
-                .mock("GET", mockito::Matcher::Any)
-                .expect(0)
-                .create_async()
-                .await;
-            let cache = Arc::new(deps_core::HttpCache::new());
-            let registry = Arc::new(PypiRegistry::with_public_base_for_test(
-                Arc::clone(&cache),
-                server.url(),
-            ));
-            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
-            let eco = PypiEcosystem::with_policy(registry, policy);
-            (eco, mock, server)
-        };
-        manifest: "pyproject.toml" => "[[tool.poetry.source]]\nname = \"internal\"\nurl = \"https://169.254.169.254/simple\"\n\n[tool.poetry.dependencies]\nrequests = \"^2.28.0\"\n";
     }
 
     #[test]
@@ -849,334 +700,6 @@ mod tests {
         assert_eq!(result.dependencies().len(), 2);
     }
 
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_document_links_resolves_relative_target() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
-
-        let parse_result = ecosystem
-            .parse_manifest("-r base.txt\n", &uri)
-            .await
-            .unwrap();
-
-        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
-        assert_eq!(links.len(), 1);
-        let target = links[0].target.as_ref().unwrap();
-        assert!(target.path().as_str().ends_with("/project/base.txt"));
-        assert_eq!(
-            links[0].tooltip.as_deref(),
-            target.to_file_path().unwrap().to_str()
-        );
-    }
-
-    /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve a
-    /// document-link target against a real local directory — same guard gap class as
-    /// #1084/#1089's lock file fix, applied here to `generate_document_links`' base
-    /// directory resolution.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_document_links_rejects_malicious_uri() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let file_uri = deps_core::test_util::test_uri("/project/requirements.txt");
-        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
-
-        // `"file://attacker.example"` used to be a second prefix here. It was removed (#1090
-        // guard-gap follow-up): `deps_core::test_util::test_uri` builds a Windows-shaped
-        // absolute path (`C:/...`) on Windows CI, and when the path is
-        // Windows-drive-letter-shaped like that, a `file:` URI with a non-empty host cannot
-        // be represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
-        // parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host
-        // before `generate_document_links` (or any code holding only a `&Url`) can see it, so
-        // that sub-case asserted an unreachable invariant and failed on `windows-latest` CI.
-        // On Unix the path is never drive-letter-shaped, so the host survives parsing and the
-        // per-layer host guard stays live and testable there — this comment only concerns the
-        // Windows-shaped case, not a claim that the guard is dead on every platform. This
-        // exact bypass is guarded and tested platform-independently at the point where
-        // untrusted URIs are first parsed: `deps_lsp::lsp_types_interop::from_lsp_uri`, see
-        // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
-        let prefix = "https://attacker.example";
-        let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
-
-        let parse_result = ecosystem
-            .parse_manifest("-r base.txt\n", &uri)
-            .await
-            .unwrap();
-
-        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
-        assert!(
-            links.is_empty(),
-            "a malicious-scheme/host URI ({prefix}) must not resolve document link targets \
-             against a real directory"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_document_links_rejects_absolute_target() {
-        // #937: an absolute `-r`/`-c` target silently discards `base_dir` on
-        // `Path::join`, resolving to the absolute path verbatim instead of
-        // anything under the manifest's own directory.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
-
-        let parse_result = ecosystem
-            .parse_manifest("-r /etc/shadow\n", &uri)
-            .await
-            .unwrap();
-
-        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
-        assert!(links.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_document_links_rejects_windows_style_absolute_target() {
-        // #937: a Windows drive-letter prefix must be rejected even when
-        // `deps-lsp` itself runs on a POSIX host, where `Path::is_absolute()`
-        // would not recognize it as absolute.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
-
-        let parse_result = ecosystem
-            .parse_manifest("-r C:\\Windows\\System32\\config\\SAM\n", &uri)
-            .await
-            .unwrap();
-
-        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
-        assert!(links.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_document_links_allows_parent_dir_without_workspace_root() {
-        // `-r ../requirements-base.txt` is a standard, legitimate multi-directory pip
-        // layout (#937) — it must not be rejected outright the way an absolute path is,
-        // and with no workspace root known (pypi's `ParseResult::workspace_root` is
-        // always `None` today) there is nothing to contain it against.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
-
-        let parse_result = ecosystem
-            .parse_manifest("-r ../requirements-base.txt\n", &uri)
-            .await
-            .unwrap();
-
-        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
-        assert_eq!(links.len(), 1);
-        let target = links[0].target.as_ref().unwrap();
-        assert!(
-            target
-                .path()
-                .as_str()
-                .ends_with("/project/requirements-base.txt")
-        );
-    }
-
-    /// Builds a workspace-root `PathBuf` fixture that matches
-    /// [`deps_core::test_util::test_uri`]'s own platform handling: on Windows,
-    /// `test_uri` prepends `C:` to its POSIX-style input so `Uri::from_file_path`
-    /// accepts it (a drive-less path isn't a valid Windows file URI), so a
-    /// `workspace_root` fixture built from the same POSIX-style string must get the
-    /// same prefix — otherwise it and the `base_dir` derived from a `test_uri`
-    /// document (which *does* carry the drive) never share a common root, and the
-    /// containment check spuriously rejects every target on Windows.
-    #[cfg(feature = "lsp-responses")]
-    fn test_workspace_root(unix_path: &str) -> std::path::PathBuf {
-        #[cfg(windows)]
-        {
-            std::path::PathBuf::from(format!("C:{unix_path}"))
-        }
-        #[cfg(not(windows))]
-        {
-            std::path::PathBuf::from(unix_path)
-        }
-    }
-
-    /// A single-document-link `ParseResult` with an explicit `workspace_root`, used to
-    /// exercise the containment check directly (`parse_manifest` never produces a
-    /// non-`None` `workspace_root` for pypi today — see the field's own doc).
-    #[cfg(feature = "lsp-responses")]
-    fn parse_result_with_document_link(
-        uri: Url,
-        workspace_root: Option<std::path::PathBuf>,
-        target: &str,
-    ) -> crate::parser::ParseResult {
-        use deps_core::position::{Position as DomainPosition, Range as DomainRange};
-        crate::parser::ParseResult {
-            dependencies: Vec::new(),
-            workspace_root,
-            uri,
-            document_links: vec![crate::parser::RequirementRef {
-                range: DomainRange::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0)),
-                target: target.to_string(),
-            }],
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_document_links_rejects_escape_past_workspace_root() {
-        // #937: once a workspace root is known, a relative target with enough `../`
-        // segments to climb out of it entirely must be rejected — unlike a `..` that
-        // stays within the root (covered above), this is a real containment escape.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/sub/deep/requirements.txt");
-
-        let parse_result = parse_result_with_document_link(
-            uri.clone(),
-            Some(test_workspace_root("/project")),
-            "../../../../etc/shadow",
-        );
-
-        let links = ecosystem.generate_document_links(&parse_result, &uri);
-        assert!(links.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_document_links_accepts_path_that_climbs_to_root_then_reenters() {
-        // #937 (impl-critic C2/second pass): discriminates `lexically_normalize`'s
-        // pop-vs-push-back behavior on an unpoppable `..`, which the escape test above
-        // does not — both variants reject every input there. Base `/project/sub`, root
-        // `/project`, target `../../../project/x.txt`: after climbing past the root, the
-        // current (pop/drop) implementation normalizes to the clean, contained
-        // `/project/x.txt` (accepted, correctly — this genuinely resolves inside the
-        // root). The prior (push-back) implementation would instead have left a stray
-        // `..` component, normalizing to the non-canonical `/../project/x.txt`, which
-        // fails `starts_with("/project")` and gets wrongly rejected.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
-
-        let parse_result = parse_result_with_document_link(
-            uri.clone(),
-            Some(test_workspace_root("/project")),
-            "../../../project/x.txt",
-        );
-
-        let links = ecosystem.generate_document_links(&parse_result, &uri);
-        assert_eq!(links.len(), 1);
-        let target = links[0].target.as_ref().unwrap();
-        assert!(target.path().as_str().ends_with("/project/x.txt"));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_document_links_allows_parent_dir_with_workspace_root_set() {
-        // #937 (impl-critic C4): a legitimate `../` include that stays inside the
-        // workspace root must still be accepted once a root is known — the only other
-        // legitimate-`../` test (`..._allows_parent_dir_without_workspace_root`) runs with
-        // `workspace_root: None`, which skips the containment branch entirely.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
-
-        let parse_result = parse_result_with_document_link(
-            uri.clone(),
-            Some(test_workspace_root("/project")),
-            "../shared/req.txt",
-        );
-
-        let links = ecosystem.generate_document_links(&parse_result, &uri);
-        assert_eq!(links.len(), 1);
-        let target = links[0].target.as_ref().unwrap();
-        assert!(target.path().as_str().ends_with("/project/shared/req.txt"));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_document_links_rejects_bidi_override_target() {
-        // #452 S2 (security): a bidi override in the target text could make the
-        // rendered requirements.txt line read as an innocuous filename while the
-        // link itself opens something else entirely — link-target spoofing.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/project/requirements.txt");
-
-        let parse_result = ecosystem
-            .parse_manifest("-r safe.txt\u{202E}txt.evil\n", &uri)
-            .await
-            .unwrap();
-
-        let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
-        assert!(links.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_is_safe_document_link_target_rejects_invisible_unicode() {
-        for bad in [
-            "safe.txt\u{202E}txt.evil",
-            "a\u{200B}b.txt",
-            "a\u{2028}b.txt",
-            "a\u{FEFF}b.txt",
-            "a\nb.txt",
-        ] {
-            assert!(
-                !is_safe_document_link_target(bad),
-                "expected {bad:?} to be rejected"
-            );
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_is_safe_document_link_target_accepts_normal_paths() {
-        for good in [
-            "base.txt",
-            "../shared/constraints.txt",
-            "dev-requirements.txt",
-        ] {
-            assert!(is_safe_document_link_target(good));
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_is_absolute_document_link_target_detects_every_absolute_form() {
-        // #937 (impl-critic C1/C4): `C:evil.txt` and bare `C:` are Windows
-        // *drive-relative* paths — no separator after the colon — that still discard
-        // `base_dir` on `Path::join` exactly like a fully separator-rooted `C:\...` does.
-        for bad in [
-            "/etc/shadow",
-            "\\Windows\\System32",
-            "C:\\Windows\\System32\\config\\SAM",
-            "c:/Windows/System32",
-            "C:evil.txt",
-            "C:",
-            "\\\\server\\share\\secret.txt",
-            "//server/share/secret.txt",
-        ] {
-            assert!(
-                is_absolute_document_link_target(bad),
-                "expected {bad:?} to be treated as absolute"
-            );
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_is_absolute_document_link_target_accepts_relative_paths() {
-        for good in [
-            "base.txt",
-            "../shared/constraints.txt",
-            "dev-requirements.txt",
-        ] {
-            assert!(!is_absolute_document_link_target(good));
-        }
-    }
-
     #[tokio::test]
     async fn test_parse_manifest_pyproject_toml_unchanged() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -1222,710 +745,6 @@ mod tests {
         assert_matches!(
             err,
             deps_core::DepsError::ParseError { file_type, .. } if file_type == "pyproject.toml"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_has_real_range() {
-        // Regression test for #232: the textEdit range for a package-name completion
-        // must be the real name token span, not the (0,0)-(0,0) placeholder.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let content = "[dependency-groups]\ndev = [\"pytest>=8.0\", \"mypy>=1.0\"]\n";
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(1, 11); // cursor after "pyt" in "pytest"
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        match context {
-            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                assert_eq!(prefix, "pyt");
-                assert_ne!(range, Range::default());
-                assert_eq!(range, Range::new(Position::new(1, 8), Position::new(1, 14)));
-            }
-            other => panic!("Expected PackageName context, got {other:?}"),
-        }
-    }
-
-    /// #427 coverage gap: the actual bugfix — `generate_completions`'s
-    /// `PackageName` arm reporting `is_incomplete: true` for the truncated
-    /// package-name search index — was previously only verified via a hand-rolled
-    /// mock `Ecosystem` in `deps-lsp`'s handler tests, never on the real
-    /// `PypiEcosystem` dispatch. Same fixture/cursor as
-    /// `test_package_name_completion_context_has_real_range`, but calling
-    /// `generate_completions` directly (not `detect_completion_context`) so a
-    /// reversed condition or wrong-arm bug in the real dispatch would be caught.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_is_incomplete() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let content = "[dependency-groups]\ndev = [\"pytest>=8.0\", \"mypy>=1.0\"]\n";
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(1, 11); // cursor after "pyt" in "pytest"
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(
-            completions.is_incomplete,
-            "PackageName context must report is_incomplete: true, even with zero \
-             items on a cold-start index"
-        );
-    }
-
-    /// Builds a `PypiEcosystem` whose registry's search index is pointed at a
-    /// mock server rather than the real `pypi.org/simple/`, so package-name
-    /// completion (issue #419) can be exercised network-free.
-    #[cfg(feature = "lsp-responses")]
-    fn ecosystem_with_index_url(
-        cache: Arc<deps_core::HttpCache>,
-        index_url: String,
-    ) -> PypiEcosystem {
-        PypiEcosystem {
-            registry: Arc::new(PypiRegistry::with_index_url(cache, index_url)),
-            parser: PypiParser::new(),
-            formatter: PypiFormatter,
-            policy: Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        }
-    }
-
-    /// Polls `probe` until it returns a non-empty result or `attempts` polls have
-    /// elapsed, returning the last (possibly still empty) result. Used to wait out
-    /// the background index build without a flaky fixed sleep.
-    #[cfg(feature = "lsp-responses")]
-    async fn poll_until_nonempty<F, Fut>(mut probe: F, attempts: u32) -> Vec<CompletionItem>
-    where
-        F: FnMut() -> Fut,
-        Fut: std::future::Future<Output = Vec<CompletionItem>>,
-    {
-        for _ in 0..attempts {
-            let results = probe().await;
-            if !results.is_empty() {
-                return results;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-        probe().await
-    }
-
-    /// #419 regression: `test_complete_package_names_real_search` used to be
-    /// `#[ignore]`d (real network access, so never ran in CI). Rewritten
-    /// network-free against a mocked Simple API index: the first call is a cold
-    /// start (empty, index not built yet) and a later call — once the background
-    /// build finishes — finds `requests`.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_package_names_uses_index() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/simple/")
-            .with_status(200)
-            .with_body(crate::search::sample_index_body(&["requests"]))
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let index_url = format!("{}/simple/", server.url());
-        let ecosystem = ecosystem_with_index_url(cache, index_url);
-
-        let cold_start = ecosystem
-            .complete_package_names("reque", Range::default())
-            .await;
-        assert!(
-            cold_start.is_empty(),
-            "cold start must not block on the download"
-        );
-
-        let results = poll_until_nonempty(
-            || ecosystem.complete_package_names("reque", Range::default()),
-            100,
-        )
-        .await;
-        mock.assert_async().await;
-        assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.label == "requests"));
-    }
-
-    /// #419 S2 regression: a query using a different separator than the index's
-    /// normalized form (`zope.int`, PEP 503-normalized to `zope-int` server-side)
-    /// must come back with `filter_text` set to the *raw typed* prefix, not the
-    /// normalized `label`/`insert_text` — otherwise an LSP client's local
-    /// re-filtering (`zope.int` is not a subsequence of `zope-interface`) would
-    /// silently drop a result the server correctly matched.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_package_names_filter_text_matches_raw_typed_prefix() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/simple/")
-            .with_status(200)
-            .with_body(crate::search::sample_index_body(&["zope-interface"]))
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let index_url = format!("{}/simple/", server.url());
-        let ecosystem = ecosystem_with_index_url(cache, index_url);
-
-        let results = poll_until_nonempty(
-            || ecosystem.complete_package_names("zope.int", Range::default()),
-            100,
-        )
-        .await;
-
-        mock.assert_async().await;
-        let item = results
-            .iter()
-            .find(|r| r.label == "zope-interface")
-            .expect("zope-interface should be found via separator-normalized search");
-        assert_eq!(
-            item.filter_text,
-            Some("zope.int".to_string()),
-            "filter_text must be the raw typed prefix, not the normalized label"
-        );
-    }
-
-    /// #419 §4.6/Q2 regression: a *version* completion request (not a
-    /// package-name one) inside a Python manifest must warm the search index —
-    /// `PypiEcosystem::generate_completions` calls `warm_search_index` before
-    /// dispatching on completion context — and repeated requests must still
-    /// produce exactly one index-build fetch (single-flight + build-once).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_version_completion_triggers_exactly_one_index_build_attempt() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/simple/")
-            .with_status(200)
-            .with_body(crate::search::sample_index_body(&["requests"]))
-            .expect(1)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let index_url = format!("{}/simple/", server.url());
-        let ecosystem = ecosystem_with_index_url(cache, index_url);
-
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-        let content = "[project]\ndependencies = [\"requests>=2.0\"]\n";
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-
-        // Locate a cursor position that `detect_completion_context` actually
-        // resolves to a Version context, rather than hand-computing a column
-        // offset that would silently drift if the fixture line changes.
-        let version_line = content.lines().nth(1).unwrap();
-        let version_position = (0..=version_line.len() as u32)
-            .map(|character| tower_lsp_server::ls_types::Position::new(1, character))
-            .find(|&position| {
-                matches!(
-                    deps_core::completion::detect_completion_context(
-                        parse_result.as_ref(),
-                        position,
-                        content,
-                    ),
-                    deps_core::completion::CompletionContext::Version { .. }
-                )
-            })
-            .expect("fixture line must contain a Version completion context");
-
-        let mut last_completions = None;
-        for _ in 0..3 {
-            last_completions = Some(
-                ecosystem
-                    .generate_completions(
-                        parse_result.as_ref(),
-                        version_position,
-                        content,
-                        deps_core::FreshnessSettings::default(),
-                    )
-                    .await,
-            );
-        }
-        assert!(
-            !last_completions
-                .expect("loop ran at least once")
-                .is_incomplete,
-            "a Version completion context is always exhaustive, unlike PackageName's \
-             truncated index search"
-        );
-
-        // Give the (single-flight) background build a chance to finish.
-        let ready = poll_until_nonempty(
-            || ecosystem.complete_package_names("reque", Range::default()),
-            100,
-        )
-        .await;
-        assert!(
-            ready.iter().any(|r| r.label == "requests"),
-            "index should be ready and contain requests after warming"
-        );
-        mock.assert_async().await;
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_versions_real() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "2.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("2.")));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_versions_with_operator() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                ">=2.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("2.")));
-    }
-
-    /// Sentinel package name for a package that does not exist in the registry (#1038): every
-    /// "unknown package" completion test below shares it, resolved against a mockito 404 via
-    /// [`mock_unknown_package_ecosystem`] rather than the live `pypi.org`.
-    #[cfg(feature = "lsp-responses")]
-    const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
-
-    /// Builds a [`PypiEcosystem`] wired to a mockito server that 404s `name` (#1038), plus the
-    /// `Mock`/`ServerGuard` handles the caller must keep alive and assert on — shared by every
-    /// "unknown package" completion test below to avoid repeating the same
-    /// live-registry-avoiding wiring per test. A regression that makes zero requests (and so
-    /// also produces an empty result) can no longer pass vacuously, since
-    /// `mock.assert_async()` requires the request to actually have been made.
-    #[cfg(feature = "lsp-responses")]
-    async fn mock_unknown_package_ecosystem(
-        name: &str,
-    ) -> (mockito::ServerGuard, mockito::Mock, PypiEcosystem) {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", format!("/simple/{name}/").as_str())
-            .with_status(404)
-            .create_async()
-            .await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = PypiRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            format!("{}/simple", server.url()),
-        );
-        let ecosystem = PypiEcosystem::with_policy(
-            Arc::new(registry),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-        (server, mock, ecosystem)
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unknown_package() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem(UNKNOWN_PACKAGE).await;
-        let parse_result =
-            parse_result_with_dependency(UNKNOWN_PACKAGE, DependencySource::Registry);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "1.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// The single dependency `parse_result_with_dependency` constructs always has its
-    /// `version_range` start here — every call site below passes this as `complete_versions`'
-    /// `position` argument so the position-based lookup finds it.
-    #[cfg(feature = "lsp-responses")]
-    const DEP_POSITION: Position = Position {
-        line: 0,
-        character: 0,
-    };
-
-    /// A minimal single-dependency `ParseResult`, used to exercise `complete_versions`'
-    /// per-source routing (issue #593) — the dependency's `version_range` starts at
-    /// [`DEP_POSITION`].
-    #[cfg(feature = "lsp-responses")]
-    fn parse_result_with_dependency(
-        name: &str,
-        source: DependencySource,
-    ) -> crate::parser::ParseResult {
-        use deps_core::position::{Position as DomainPosition, Range};
-        crate::parser::ParseResult {
-            dependencies: vec![crate::types::PypiDependency {
-                name: pkg(name),
-                name_range: Range::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0)),
-                version_req: None,
-                version_range: Some(Range::new(DEP_POSITION.into(), DomainPosition::new(0, 10))),
-                extras: Vec::new(),
-                extras_range: None,
-                markers: None,
-                markers_range: None,
-                section: crate::types::PypiDependencySection::Requirements,
-                source,
-            }],
-            workspace_root: None,
-            uri: deps_core::test_util::test_uri("/test/requirements.txt"),
-            document_links: Vec::new(),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        }
-    }
-
-    /// Validator finding #1 (security H1 + impl-critic C1): a version-completion request for
-    /// an `AlternateRegistry`-sourced dependency must route through the resolved chain, never
-    /// through the root `Public`-tier client — fetching from the root would send the
-    /// dependency's name to `pypi.org` on every keystroke.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_alternate_registry_routes_through_chain() {
-        let mut alt_server = mockito::Server::new_async().await;
-        let alt_mock = alt_server
-            .mock("GET", "/simple/mypkg/")
-            .with_status(200)
-            .with_body(r#"{"versions": ["1.0.0", "2.0.0"], "files": []}"#)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
-        let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::All,
-        ));
-        let ecosystem = PypiEcosystem::with_policy(Arc::clone(&root), policy);
-
-        let base = crate::config::PypiIndexUrl::new(
-            &format!("{}/simple", alt_server.url()),
-            &deps_core::net_policy::RegistryAccessPolicy::new(
-                deps_core::net_policy::WorkspaceRegistryAccess::All,
-            ),
-        )
-        .unwrap();
-        let chain = crate::config::ResolvedChain {
-            key: "test-alt-chain".to_string(),
-            key_shape: deps_core::registry::KeyShape::Opaque,
-            hops: vec![base],
-            implicit_public_fallback: false,
-        };
-        PypiRegistry::register_alternate(&root, &chain);
-
-        let source = DependencySource::AlternateRegistry {
-            index: chain.key.clone(),
-            mirrors_crates_io: false,
-        };
-        let parse_result = parse_result_with_dependency("mypkg", source);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            !results.is_empty(),
-            "expected version completions fetched from the alternate index"
-        );
-        alt_mock.assert_async().await;
-    }
-
-    /// Validator finding #1: a `CustomRegistry`-sourced dependency (an invalid/blocked
-    /// explicit index, US-005) must offer no version completions at all — never falling back
-    /// to `pypi.org`, matching hover/diagnostics' existing fail-closed behavior for it
-    /// (SC-004).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_custom_registry_offers_nothing() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        let source = DependencySource::CustomRegistry {
-            url: "not-a-valid-url".to_string(),
-        };
-        let parse_result = parse_result_with_dependency("mypkg", source);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(results.is_empty());
-    }
-
-    /// Validator finding #1: an `AlternateRegistry` source whose chain was never registered
-    /// (or whose registration is now stale) offers nothing rather than falling back to the
-    /// root client.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unregistered_alternate_offers_nothing() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        let source = DependencySource::AlternateRegistry {
-            index: "pypi-chain:never-registered".to_string(),
-            mirrors_crates_io: false,
-        };
-        let parse_result = parse_result_with_dependency("mypkg", source);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(results.is_empty());
-    }
-
-    /// Issue #593: two dependencies sharing one `PackageName` but resolving to different
-    /// sources no longer collapse into the old name-based "offer nothing for either" result
-    /// — cursor position now identifies exactly one dependency, so each occurrence routes
-    /// independently through its own source.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-
-        use deps_core::position::{Position as DomainPosition, Range as DomainRange};
-
-        let mut registry_dep =
-            parse_result_with_dependency("shared-name", DependencySource::Registry)
-                .dependencies
-                .remove(0);
-        registry_dep.name_range =
-            DomainRange::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0));
-        registry_dep.version_range = Some(DomainRange::new(
-            DomainPosition::new(0, 0),
-            DomainPosition::new(0, 10),
-        ));
-
-        let mut alternate_dep = parse_result_with_dependency(
-            "shared-name",
-            DependencySource::AlternateRegistry {
-                index: "pypi-chain:never-registered".to_string(),
-                mirrors_crates_io: false,
-            },
-        )
-        .dependencies
-        .remove(0);
-        alternate_dep.name_range =
-            DomainRange::new(DomainPosition::new(1, 0), DomainPosition::new(1, 0));
-        alternate_dep.version_range = Some(DomainRange::new(
-            DomainPosition::new(1, 0),
-            DomainPosition::new(1, 10),
-        ));
-        let alternate_position = alternate_dep.version_range.unwrap().start;
-
-        let parse_result = crate::parser::ParseResult {
-            dependencies: vec![registry_dep, alternate_dep],
-            workspace_root: None,
-            uri: deps_core::test_util::test_uri("/test/requirements.txt"),
-            document_links: Vec::new(),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        // The alternate occurrence resolves deterministically without network: its chain was
-        // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
-        // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
-        // the routing.
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                alternate_position.into(),
-                "1",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            results.is_empty(),
-            "unregistered alternate chain must offer no completions"
-        );
-    }
-
-    /// #1066: was `assert!(results.is_empty() || !results.is_empty())` — a tautology that
-    /// could never fail identically whether cold-start behaved correctly, the network was
-    /// down, `complete_package_names` were replaced with `vec![]` unconditionally, or the
-    /// prefix-length gate rejected before the index was ever consulted. Mirrors
-    /// `test_complete_package_names_uses_index`: a mocked index proves the cold start is
-    /// genuinely empty (not just "empty for the wrong reason"), then `poll_until_nonempty` +
-    /// `mock.assert_async()` + a concrete label prove the index actually works once built.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_package_names_special_characters() {
-        // #1055: was a live, unmocked search index build that asserted the tautology
-        // `results.is_empty() || !results.is_empty()`. Mocked via the same
-        // `ecosystem_with_index_url`/`sample_index_body` seam `test_complete_package_names_uses_index`
-        // (issue #419) already established.
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/simple/")
-            .with_status(200)
-            .with_body(crate::search::sample_index_body(&["scikit-learn"]))
-            .expect_at_least(1)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let index_url = format!("{}/simple/", server.url());
-        let ecosystem = ecosystem_with_index_url(cache, index_url);
-
-        let cold_start = ecosystem
-            .complete_package_names("scikit-le", Range::default())
-            .await;
-        assert!(
-            cold_start.is_empty(),
-            "cold start must not block on the index download"
-        );
-
-        let results = poll_until_nonempty(
-            || ecosystem.complete_package_names("scikit-le", Range::default()),
-            100,
-        )
-        .await;
-        mock.assert_async().await;
-        assert!(results.iter().any(|r| r.label == "scikit-learn"));
-    }
-
-    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
-    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
-    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
-    /// matching versions and asserts the count is exactly the real cap.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_capped_at_max_completion_versions() {
-        let mut server = mockito::Server::new_async().await;
-        let versions = (0..8)
-            .map(|i| format!(r#""2.{i}.0""#))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mock = server
-            .mock("GET", "/simple/requests/")
-            .with_status(200)
-            .with_body(format!(r#"{{"versions": [{versions}], "files": []}}"#))
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = PypiRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            format!("{}/simple", server.url()),
-        );
-        let ecosystem = PypiEcosystem::with_policy(
-            Arc::new(registry),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-
-        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "2",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert_eq!(results.len(), 5);
-    }
-
-    /// End-to-end regression for #1137: a Poetry-style caret prefix (`^2.28`) must filter
-    /// completions to matching versions, not fall through `VERSION_OPERATOR_CHARS`'s strip
-    /// (which was previously missing `^`) into the unfiltered top-N fallback the issue
-    /// reported. `operator_chars_conformance!` above only proves the array *contains* `^`; it
-    /// does not exercise `complete_versions`/`complete_versions_generic_from` with a real
-    /// prefix, which is what actually reproduces the reported symptom.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_with_poetry_caret_operator_filters_matching_versions() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/simple/requests/")
-            .with_status(200)
-            .with_body(
-                r#"{"versions": ["1.0.0", "2.27.0", "2.28.0", "2.28.1", "2.29.0"], "files": []}"#,
-            )
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = PypiRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            format!("{}/simple", server.url()),
-        );
-        let ecosystem = PypiEcosystem::with_policy(
-            Arc::new(registry),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-
-        let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "^2.28",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-
-        assert_eq!(
-            results.len(),
-            2,
-            "expected only the two 2.28.x versions, got: {results:?}"
-        );
-        assert!(
-            results.iter().all(|r| r.label.starts_with("2.28")),
-            "a stripped `^` prefix must filter out 1.0.0/2.27.0/2.29.0, got: {results:?}"
         );
     }
 
@@ -1986,242 +805,6 @@ dependencies = []
         assert!(provider.is_some());
     }
 
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_inlay_hints_empty_dependencies() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-
-        let content = r"[project]
-dependencies = []
-";
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-        let config = EcosystemConfig::default();
-
-        let hints = ecosystem
-            .generate_inlay_hints(
-                parse_result.as_ref(),
-                VersionData::new(&cached_versions, &resolved_versions),
-                deps_core::LoadingState::Loaded,
-                &config,
-            )
-            .await;
-
-        assert!(hints.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_no_context() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-
-        let content = r#"[project]
-name = "test"
-"#;
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(completions.items.is_empty());
-        assert!(!completions.is_incomplete);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_returns_matches() {
-        // #1055: position (1, 20) lands inside the bare `requests` entry (no version
-        // specifier), which `detect_completion_context` resolves as a `PackageName` context,
-        // not a `Feature` one (pypi never overrides `complete_feature`) — so this previously
-        // drove an unmocked, live search-index build while asserting the tautology
-        // `completions.items.is_empty() || !completions.items.is_empty()`. Mocked via the same
-        // seam as `test_complete_package_names_uses_index` (#419).
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/simple/")
-            .with_status(200)
-            .with_body(crate::search::sample_index_body(&["requests"]))
-            .expect_at_least(1)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let index_url = format!("{}/simple/", server.url());
-        let ecosystem = ecosystem_with_index_url(cache, index_url);
-
-        let content = r#"[project]
-dependencies = ["requests"]
-"#;
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-
-        let position = Position {
-            line: 1,
-            character: 20,
-        };
-
-        let cold_start = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            cold_start.items.is_empty(),
-            "cold start must not block on the index download"
-        );
-
-        let completions = poll_until_nonempty(
-            || async {
-                ecosystem
-                    .generate_completions(
-                        parse_result.as_ref(),
-                        position,
-                        content,
-                        deps_core::FreshnessSettings::default(),
-                    )
-                    .await
-                    .items
-            },
-            100,
-        )
-        .await;
-
-        mock.assert_async().await;
-        assert!(completions.iter().any(|r| r.label == "requests"));
-    }
-
-    /// #1195 M4 regression: a bare `>` comparator (`this-package-does-not-exist-12345>2.0`)
-    /// has no `=` character anywhere on the line, so `deps-lsp`'s
-    /// `fallback_completion`-gate's `prefix.contains('=')` guard offers no protection —
-    /// before this PR, an empty `complete_versions` result at this position would fall
-    /// through to a raw-text package-name search for the literal string
-    /// `"this-package-does-not-exist-12345>2."`. Runs through the real parser and the real
-    /// `generate_completions` dispatch (not a synthetic `ParseResult`), with a mocked 404 so
-    /// the empty result is deterministic and `mock.assert_async()` proves the `Version`
-    /// context was actually reached rather than resolving to `None`/`Unresolved`.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_bare_comparator_version_empty_result_stamps_version_origin()
-    {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem(UNKNOWN_PACKAGE).await;
-
-        let content = format!("{UNKNOWN_PACKAGE}>2.0\n");
-        let uri = deps_core::test_util::test_uri("/test/requirements.txt");
-        let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
-        assert_eq!(
-            parse_result.dependencies().len(),
-            1,
-            "fixture must parse the bare `>` comparator as one dependency: {content}"
-        );
-
-        // Cursor between "2." and "0" — mid-typing, prefix "2.", no "=" on the line.
-        let cursor = u32::try_from(content.find("2.0").unwrap() + 2).unwrap();
-        let position = Position {
-            line: 0,
-            character: cursor,
-        };
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                &content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        mock.assert_async().await;
-        assert!(completions.items.is_empty());
-        assert_eq!(
-            completions.origin,
-            deps_core::completion::CompletionOrigin::Version,
-            "a bare `>` comparator has no `=` on the line — CompletionOrigin::Version, not \
-             the prefix.contains('=') guard, is what must stop deps-lsp's fallback here"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_no_dependency_at_position() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-
-        let content = r#"[project]
-name = "test"
-"#;
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let hover = ecosystem
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                VersionData::new(&cached_versions, &resolved_versions),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(hover.is_none());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_code_actions_no_actions() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = PypiEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-
-        let content = r#"[project]
-name = "test"
-"#;
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-        let actions = ecosystem
-            .generate_code_actions(
-                parse_result.as_ref(),
-                position,
-                &uri,
-                VersionData::new(&cached_versions, &resolved_versions),
-                content,
-            )
-            .await;
-
-        assert!(actions.is_empty());
-    }
-
     #[tokio::test]
     async fn test_generate_diagnostics_no_dependencies() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -2248,211 +831,6 @@ dependencies = []
             .await;
 
         assert!(diagnostics.is_empty());
-    }
-
-    /// #1038: was a live-registry round-trip asserting only `results.is_empty()` — vacuous
-    /// under a dead network, since a regression that made zero requests would produce the
-    /// same empty result. Now mocked, with `mock.assert_async()` requiring the request to
-    /// actually have been made.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_empty_prefix() {
-        let (_server, mock, ecosystem) =
-            mock_unknown_package_ecosystem("nonexistent-package").await;
-        let parse_result =
-            parse_result_with_dependency("nonexistent-package", DependencySource::Registry);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_with_tilde_operator() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem("nonexistent-pkg").await;
-        let parse_result =
-            parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "~=2.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_with_not_equal_operator() {
-        let (_server, mock, ecosystem) = mock_unknown_package_ecosystem("nonexistent-pkg").await;
-        let parse_result =
-            parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                DEP_POSITION,
-                "!=2.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// End-to-end regression for #212: a dotted package name declared as a
-    /// Poetry table key must resolve against its `poetry.lock` entry. Unlike
-    /// a PEP 621 fixture (which already worked before the fix, since
-    /// `pep508_rs::PackageName` normalizes at construction), the Poetry
-    /// table-key path takes the name verbatim from the TOML key — this is
-    /// the actual bug #212 fixes.
-    mod poetry_lockfile_regression_tests {
-        #[cfg(feature = "lsp-responses")]
-        use super::*;
-        #[cfg(feature = "lsp-responses")]
-        use crate::lockfile::PypiLockParser;
-        #[cfg(feature = "lsp-responses")]
-        use deps_core::PackageName;
-        #[cfg(feature = "lsp-responses")]
-        use deps_core::lockfile::LockFileProvider;
-
-        /// A registry mock returning an empty (but `Ok`) version list —
-        /// `generate_hover` requires a successful registry call before it
-        /// reaches the `versions.resolved`-driven "Current" line, but the
-        /// content of that call is irrelevant to this regression.
-        #[cfg(feature = "lsp-responses")]
-        struct EmptyOkRegistry;
-
-        #[cfg(feature = "lsp-responses")]
-        impl deps_core::Registry for EmptyOkRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
-            > {
-                Box::pin(async move { Ok(Vec::new()) })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
-            > {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<
-                'a,
-                deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
-            > {
-                Box::pin(async move { Ok(Vec::new()) })
-            }
-
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        #[cfg(feature = "lsp-responses")]
-        #[tokio::test]
-        async fn test_poetry_table_key_dotted_name_resolves_against_lockfile() {
-            let toml = "[tool.poetry.dependencies]\n\"zope.interface\" = \"^5.0\"\n";
-            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
-            let parser = PypiParser::new();
-            let parse_result = parser.parse_content(toml, &uri).unwrap();
-
-            // The raw TOML key is taken verbatim — unnormalized — confirming
-            // this fixture actually exercises the Poetry table-key path
-            // rather than a PEP 508 string path (which already normalizes).
-            assert_eq!(parse_result.dependencies[0].name, "zope.interface");
-            let dep_position = parse_result.dependencies[0].name_range.start;
-
-            // Real poetry.lock/uv.lock files store the canonical hyphenated
-            // form on write, never the dotted source name — a dotted lockfile
-            // fixture here would make the headline assertions pass even
-            // before the #212 fix (only an intermediate `contains_key`
-            // mechanics check would fail), so this must be hyphenated to
-            // actually discriminate pre/post fix.
-            let lockfile_content = "[[package]]\nname = \"zope-interface\"\nversion = \"5.2.0\"\n";
-            let temp_dir = tempfile::tempdir().unwrap();
-            let lockfile_path = temp_dir.path().join("poetry.lock");
-            std::fs::write(&lockfile_path, lockfile_content).unwrap();
-
-            let lock_parser = PypiLockParser;
-            let resolved_packages = lock_parser.parse_lockfile(&lockfile_path).await.unwrap();
-            let resolved_versions: HashMap<PackageName, deps_core::ConcreteVersion> =
-                resolved_packages
-                    .iter()
-                    .map(|(name, pkg)| {
-                        (PackageName::new(name.as_str()), pkg.version.clone().into())
-                    })
-                    .collect();
-            // Canonical PEP 503 normalization: both the lockfile key and the
-            // formatter-normalized manifest name land on "zope-interface".
-            assert!(resolved_versions.contains_key("zope-interface"));
-
-            let cached_versions: HashMap<PackageName, deps_core::PackageVersions> = HashMap::new();
-            let versions = VersionData::new(&cached_versions, &resolved_versions);
-            let formatter = PypiFormatter;
-
-            let hover = deps_core::lsp_helpers::generate_hover(
-                &parse_result,
-                dep_position.into(),
-                versions,
-                &EmptyOkRegistry,
-                &formatter,
-                deps_core::FreshnessSettings::default(),
-                deps_core::PublishTime::now(),
-            )
-            .await
-            .expect("hover should be produced for a dependency at its name position");
-
-            let markdown = hover.markdown();
-            assert!(
-                markdown.contains("**Current**") && markdown.contains("5.2.0"),
-                "hover should render the resolved lock file version: {markdown}"
-            );
-
-            let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
-                &parse_result,
-                versions,
-                &formatter,
-                parse_result.uri(),
-                deps_core::FreshnessSettings::default(),
-                deps_core::DiagnosticSeverities::default(),
-                deps_core::PublishTime::now(),
-            );
-            assert!(
-                diagnostics
-                    .iter()
-                    .all(|d| !d.message().contains("Unknown package")),
-                "no 'Unknown package' diagnostic should be emitted: {diagnostics:?}"
-            );
-        }
     }
 
     // --- T010: ecosystem wiring — parse_manifest registers resolved chains ---
@@ -2548,43 +926,6 @@ dependencies = []
             .downcast_ref::<crate::parser::ParseResult>()
             .unwrap();
         assert!(downcast.resolved_chains.is_empty());
-    }
-
-    /// Composition regression guard (#390 C5 bug class, mirrors the deleted
-    /// `deps-lsp` end-to-end test
-    /// `test_fallback_completion_pypi_project_array_query_has_no_leaked_quote`):
-    /// proves `line_at` + `is_in_pypi_project_dependencies_array` + quote-stripping
-    /// compose correctly through the real trait method on realistic multi-line
-    /// `pyproject.toml` content — the primitives were each individually correct in
-    /// isolation but their composition was the actual #390 bug.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition_project_array() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas";
-        let line = content.lines().nth(5).unwrap();
-        let position = Position::new(5, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            Some("flas")
-        );
-    }
-
-    /// Same composition, `[project.optional-dependencies]`'s real section-header
-    /// shape rather than the headerless primary `dependencies = [...]` array.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition_optional_dependencies() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    \"flas";
-        let line = content.lines().nth(3).unwrap();
-        let position = Position::new(3, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            Some("flas")
-        );
     }
 
     #[test]
@@ -2769,106 +1110,6 @@ dependencies = []
         );
     }
 
-    /// #737: zero quotes typed at all (`req` alone on its own line under
-    /// `dependencies = [...]`) must not be reported as bare — otherwise the fallback
-    /// path bare-inserts the unquoted name straight into the TOML array.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_false_with_no_quote_typed() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project]\ndependencies = [\n    \"pytest\",\n    req\n]\n";
-        let line = content.lines().nth(3).unwrap();
-        let position = Position::new(3, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    /// An already-open quote (`"req`, mid-typing) must still route to the bare insert
-    /// — this is the pre-#737 behavior and must not regress.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_true_with_open_quote() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project]\ndependencies = [\n    \"req";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    /// Same two states as the primary PEP 621 `dependencies = [...]` array, exercised
-    /// against `[project.optional-dependencies]` instead — coverage gap flagged in
-    /// #737 validation: only the primary array branch was previously tested.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_false_with_no_quote_typed_optional_dependencies() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    req\n]\n";
-        let line = content.lines().nth(3).unwrap();
-        let position = Position::new(3, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_true_with_open_quote_optional_dependencies() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project.optional-dependencies]\ndev = [\n    \"req";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    /// #737 critic S1: a `\"` preceded by an odd backslash run is an *escaped* quote,
-    /// not a real one — `count_real_quotes`/`open_quoted_tail` correctly report zero
-    /// real quotes here, so this must still route through `completion_insert_text`
-    /// (quoted insert), not the bare path. A naive `.contains('"')` check would
-    /// wrongly report `true` since the literal `"` character is present in the text.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_false_with_only_escaped_quote() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project]\ndependencies = [\n    \\\"req";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    /// #737 validation gap: multiple entries on one line, cursor after a bare trailing
-    /// candidate following an already-CLOSED quoted entry
-    /// (`dependencies = ["pytest", req]`). A naive `.contains('"')` check on the raw
-    /// line prefix would wrongly report `true` — the prior entry's quotes still appear
-    /// in the prefix — routing to bare-insert and reproducing #737's exact corruption
-    /// in a different manifest shape. `open_quoted_tail`'s escape-aware parity check
-    /// correctly reports `false` (an even, non-zero quote count means no string is
-    /// currently open).
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_false_with_multiple_deps_same_line() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project]\ndependencies = [\"pytest\", req]\n";
-        let cursor = "dependencies = [\"pytest\", req";
-        let position = Position::new(1, cursor.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    /// Same shape, with an escaped quote inside the prior closed entry — must not
-    /// misclassify the escape as a still-open string either.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_false_with_escaped_quote_in_prior_closed_entry_same_line() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = PypiEcosystem::new(cache);
-        let content = "[project]\ndependencies = [\"a\\\"b\", req]\n";
-        let cursor = "dependencies = [\"a\\\"b\", req";
-        let position = Position::new(1, cursor.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position.into()));
-    }
-
     /// #737 critic S2: pins the trait default `fallback_bare_insert_text` (bare
     /// `metadata.name()`) as the correct behavior for PyPI's open-quote case — PyPI has
     /// no override, unlike Maven's `group:artifact` split, so this must not regress
@@ -2886,5 +1127,1627 @@ dependencies = []
             eco.fallback_bare_insert_text(&meta),
             Some("requests".to_string())
         );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    mod lsp_tests {
+        use super::*;
+
+        /// End-to-end regression for #212: a dotted package name declared as a
+        /// Poetry table key must resolve against its `poetry.lock` entry. Unlike
+        /// a PEP 621 fixture (which already worked before the fix, since
+        /// `pep508_rs::PackageName` normalizes at construction), the Poetry
+        /// table-key path takes the name verbatim from the TOML key — this is
+        /// the actual bug #212 fixes.
+        mod poetry_lockfile_regression_tests {
+            use super::*;
+            use crate::lockfile::PypiLockParser;
+            use deps_core::PackageName;
+            use deps_core::lockfile::LockFileProvider;
+
+            /// A registry mock returning an empty (but `Ok`) version list —
+            /// `generate_hover` requires a successful registry call before it
+            /// reaches the `versions.resolved`-driven "Current" line, but the
+            /// content of that call is irrelevant to this regression.
+            struct EmptyOkRegistry;
+
+            impl deps_core::Registry for EmptyOkRegistry {
+                fn get_versions<'a>(
+                    &'a self,
+                    _name: &'a PackageName,
+                ) -> deps_core::ecosystem::BoxFuture<
+                    'a,
+                    deps_core::error::Result<Vec<Box<dyn deps_core::Version>>>,
+                > {
+                    Box::pin(async move { Ok(Vec::new()) })
+                }
+
+                fn get_latest_matching<'a>(
+                    &'a self,
+                    _name: &'a PackageName,
+                    _req: &'a deps_core::VersionReq,
+                    _selection_context: &'a deps_core::SelectionContext,
+                ) -> deps_core::ecosystem::BoxFuture<
+                    'a,
+                    deps_core::error::Result<Option<Box<dyn deps_core::Version>>>,
+                > {
+                    Box::pin(async move { Ok(None) })
+                }
+
+                fn search_raw<'a>(
+                    &'a self,
+                    _query: &'a str,
+                    _limit: usize,
+                ) -> deps_core::ecosystem::BoxFuture<
+                    'a,
+                    deps_core::error::Result<Vec<Box<dyn deps_core::Metadata>>>,
+                > {
+                    Box::pin(async move { Ok(Vec::new()) })
+                }
+
+                fn as_any(&self) -> &dyn std::any::Any {
+                    self
+                }
+            }
+
+            #[tokio::test]
+            async fn test_poetry_table_key_dotted_name_resolves_against_lockfile() {
+                let toml = "[tool.poetry.dependencies]\n\"zope.interface\" = \"^5.0\"\n";
+                let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+                let parser = PypiParser::new();
+                let parse_result = parser.parse_content(toml, &uri).unwrap();
+
+                // The raw TOML key is taken verbatim — unnormalized — confirming
+                // this fixture actually exercises the Poetry table-key path
+                // rather than a PEP 508 string path (which already normalizes).
+                assert_eq!(parse_result.dependencies[0].name, "zope.interface");
+                let dep_position = parse_result.dependencies[0].name_range.start;
+
+                // Real poetry.lock/uv.lock files store the canonical hyphenated
+                // form on write, never the dotted source name — a dotted lockfile
+                // fixture here would make the headline assertions pass even
+                // before the #212 fix (only an intermediate `contains_key`
+                // mechanics check would fail), so this must be hyphenated to
+                // actually discriminate pre/post fix.
+                let lockfile_content =
+                    "[[package]]\nname = \"zope-interface\"\nversion = \"5.2.0\"\n";
+                let temp_dir = tempfile::tempdir().unwrap();
+                let lockfile_path = temp_dir.path().join("poetry.lock");
+                std::fs::write(&lockfile_path, lockfile_content).unwrap();
+
+                let lock_parser = PypiLockParser;
+                let resolved_packages = lock_parser.parse_lockfile(&lockfile_path).await.unwrap();
+                let resolved_versions: HashMap<PackageName, deps_core::ConcreteVersion> =
+                    resolved_packages
+                        .iter()
+                        .map(|(name, pkg)| {
+                            (PackageName::new(name.as_str()), pkg.version.clone().into())
+                        })
+                        .collect();
+                // Canonical PEP 503 normalization: both the lockfile key and the
+                // formatter-normalized manifest name land on "zope-interface".
+                assert!(resolved_versions.contains_key("zope-interface"));
+
+                let cached_versions: HashMap<PackageName, deps_core::PackageVersions> =
+                    HashMap::new();
+                let versions = VersionData::new(&cached_versions, &resolved_versions);
+                let formatter = PypiFormatter;
+
+                let hover = deps_core::lsp_helpers::generate_hover(
+                    &parse_result,
+                    dep_position.into(),
+                    versions,
+                    &EmptyOkRegistry,
+                    &formatter,
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::PublishTime::now(),
+                )
+                .await
+                .expect("hover should be produced for a dependency at its name position");
+
+                let markdown = hover.markdown();
+                assert!(
+                    markdown.contains("**Current**") && markdown.contains("5.2.0"),
+                    "hover should render the resolved lock file version: {markdown}"
+                );
+
+                let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+                    &parse_result,
+                    versions,
+                    &formatter,
+                    parse_result.uri(),
+                    deps_core::FreshnessSettings::default(),
+                    deps_core::DiagnosticSeverities::default(),
+                    deps_core::PublishTime::now(),
+                );
+                assert!(
+                    diagnostics
+                        .iter()
+                        .all(|d| !d.message().contains("Unknown package")),
+                    "no 'Unknown package' diagnostic should be emitted: {diagnostics:?}"
+                );
+            }
+        }
+
+        use deps_core::EcosystemConfig;
+
+        use tower_lsp_server::ls_types::Position;
+
+        deps_core::complete_versions_test_shim!(PypiEcosystem);
+
+        // #758: the shared completion-prefix-length guard
+        // (`deps_core::completion::complete_package_names_generic`), replacing
+        // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+        deps_core::completion_guard_conformance! {
+            mod pypi_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (PEP 508 plus Poetry's caret), so an edit to one without the other
+        // fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod pypi_operator_chars_conformance;
+            ecosystem: "pypi";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['>', '<', '=', '~', '!', '^'];
+        }
+
+        // #1136: a dependency whose only registry source is blocked by the default reachability
+        // policy (SSRF-class host) must yield zero version completions and never reach PyPI.
+        deps_core::completion_source_gate_conformance! {
+            mod pypi_completion_source_gate_conformance;
+            build: async {
+                let mut server = mockito::Server::new_async().await;
+                let mock = server
+                    .mock("GET", mockito::Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let cache = Arc::new(deps_core::HttpCache::new());
+                let registry = Arc::new(PypiRegistry::with_public_base_for_test(
+                    Arc::clone(&cache),
+                    server.url(),
+                ));
+                let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
+                let eco = PypiEcosystem::with_policy(registry, policy);
+                (eco, mock, server)
+            };
+            manifest: "pyproject.toml" => "[[tool.poetry.source]]\nname = \"internal\"\nurl = \"https://169.254.169.254/simple\"\n\n[tool.poetry.dependencies]\nrequests = \"^2.28.0\"\n";
+        }
+
+        #[tokio::test]
+        async fn test_generate_document_links_resolves_relative_target() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+            let parse_result = ecosystem
+                .parse_manifest("-r base.txt\n", &uri)
+                .await
+                .unwrap();
+
+            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            assert_eq!(links.len(), 1);
+            let target = links[0].target.as_ref().unwrap();
+            assert!(target.path().as_str().ends_with("/project/base.txt"));
+            assert_eq!(
+                links[0].tooltip.as_deref(),
+                target.to_file_path().unwrap().to_str()
+            );
+        }
+
+        /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve a
+        /// document-link target against a real local directory — same guard gap class as
+        /// #1084/#1089's lock file fix, applied here to `generate_document_links`' base
+        /// directory resolution.
+        #[tokio::test]
+        async fn test_generate_document_links_rejects_malicious_uri() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let file_uri = deps_core::test_util::test_uri("/project/requirements.txt");
+            let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+            // `"file://attacker.example"` used to be a second prefix here. It was removed (#1090
+            // guard-gap follow-up): `deps_core::test_util::test_uri` builds a Windows-shaped
+            // absolute path (`C:/...`) on Windows CI, and when the path is
+            // Windows-drive-letter-shaped like that, a `file:` URI with a non-empty host cannot
+            // be represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+            // parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host
+            // before `generate_document_links` (or any code holding only a `&Url`) can see it, so
+            // that sub-case asserted an unreachable invariant and failed on `windows-latest` CI.
+            // On Unix the path is never drive-letter-shaped, so the host survives parsing and the
+            // per-layer host guard stays live and testable there — this comment only concerns the
+            // Windows-shaped case, not a claim that the guard is dead on every platform. This
+            // exact bypass is guarded and tested platform-independently at the point where
+            // untrusted URIs are first parsed: `deps_lsp::lsp_types_interop::from_lsp_uri`, see
+            // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+            let prefix = "https://attacker.example";
+            let uri: Url = format!("{prefix}{path_part}").parse().unwrap();
+
+            let parse_result = ecosystem
+                .parse_manifest("-r base.txt\n", &uri)
+                .await
+                .unwrap();
+
+            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            assert!(
+                links.is_empty(),
+                "a malicious-scheme/host URI ({prefix}) must not resolve document link targets \
+             against a real directory"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_document_links_rejects_absolute_target() {
+            // #937: an absolute `-r`/`-c` target silently discards `base_dir` on
+            // `Path::join`, resolving to the absolute path verbatim instead of
+            // anything under the manifest's own directory.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+            let parse_result = ecosystem
+                .parse_manifest("-r /etc/shadow\n", &uri)
+                .await
+                .unwrap();
+
+            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            assert!(links.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_document_links_rejects_windows_style_absolute_target() {
+            // #937: a Windows drive-letter prefix must be rejected even when
+            // `deps-lsp` itself runs on a POSIX host, where `Path::is_absolute()`
+            // would not recognize it as absolute.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+            let parse_result = ecosystem
+                .parse_manifest("-r C:\\Windows\\System32\\config\\SAM\n", &uri)
+                .await
+                .unwrap();
+
+            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            assert!(links.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_document_links_allows_parent_dir_without_workspace_root() {
+            // `-r ../requirements-base.txt` is a standard, legitimate multi-directory pip
+            // layout (#937) — it must not be rejected outright the way an absolute path is,
+            // and with no workspace root known (pypi's `ParseResult::workspace_root` is
+            // always `None` today) there is nothing to contain it against.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
+
+            let parse_result = ecosystem
+                .parse_manifest("-r ../requirements-base.txt\n", &uri)
+                .await
+                .unwrap();
+
+            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            assert_eq!(links.len(), 1);
+            let target = links[0].target.as_ref().unwrap();
+            assert!(
+                target
+                    .path()
+                    .as_str()
+                    .ends_with("/project/requirements-base.txt")
+            );
+        }
+
+        /// Builds a workspace-root `PathBuf` fixture that matches
+        /// [`deps_core::test_util::test_uri`]'s own platform handling: on Windows,
+        /// `test_uri` prepends `C:` to its POSIX-style input so `Uri::from_file_path`
+        /// accepts it (a drive-less path isn't a valid Windows file URI), so a
+        /// `workspace_root` fixture built from the same POSIX-style string must get the
+        /// same prefix — otherwise it and the `base_dir` derived from a `test_uri`
+        /// document (which *does* carry the drive) never share a common root, and the
+        /// containment check spuriously rejects every target on Windows.
+        fn test_workspace_root(unix_path: &str) -> std::path::PathBuf {
+            #[cfg(windows)]
+            {
+                std::path::PathBuf::from(format!("C:{unix_path}"))
+            }
+            #[cfg(not(windows))]
+            {
+                std::path::PathBuf::from(unix_path)
+            }
+        }
+
+        /// A single-document-link `ParseResult` with an explicit `workspace_root`, used to
+        /// exercise the containment check directly (`parse_manifest` never produces a
+        /// non-`None` `workspace_root` for pypi today — see the field's own doc).
+        fn parse_result_with_document_link(
+            uri: Url,
+            workspace_root: Option<std::path::PathBuf>,
+            target: &str,
+        ) -> crate::parser::ParseResult {
+            use deps_core::position::{Position as DomainPosition, Range as DomainRange};
+            crate::parser::ParseResult {
+                dependencies: Vec::new(),
+                workspace_root,
+                uri,
+                document_links: vec![crate::parser::RequirementRef {
+                    range: DomainRange::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0)),
+                    target: target.to_string(),
+                }],
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            }
+        }
+
+        #[test]
+        fn test_generate_document_links_rejects_escape_past_workspace_root() {
+            // #937: once a workspace root is known, a relative target with enough `../`
+            // segments to climb out of it entirely must be rejected — unlike a `..` that
+            // stays within the root (covered above), this is a real containment escape.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/sub/deep/requirements.txt");
+
+            let parse_result = parse_result_with_document_link(
+                uri.clone(),
+                Some(test_workspace_root("/project")),
+                "../../../../etc/shadow",
+            );
+
+            let links = ecosystem.generate_document_links(&parse_result, &uri);
+            assert!(links.is_empty());
+        }
+
+        #[test]
+        fn test_generate_document_links_accepts_path_that_climbs_to_root_then_reenters() {
+            // #937 (impl-critic C2/second pass): discriminates `lexically_normalize`'s
+            // pop-vs-push-back behavior on an unpoppable `..`, which the escape test above
+            // does not — both variants reject every input there. Base `/project/sub`, root
+            // `/project`, target `../../../project/x.txt`: after climbing past the root, the
+            // current (pop/drop) implementation normalizes to the clean, contained
+            // `/project/x.txt` (accepted, correctly — this genuinely resolves inside the
+            // root). The prior (push-back) implementation would instead have left a stray
+            // `..` component, normalizing to the non-canonical `/../project/x.txt`, which
+            // fails `starts_with("/project")` and gets wrongly rejected.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
+
+            let parse_result = parse_result_with_document_link(
+                uri.clone(),
+                Some(test_workspace_root("/project")),
+                "../../../project/x.txt",
+            );
+
+            let links = ecosystem.generate_document_links(&parse_result, &uri);
+            assert_eq!(links.len(), 1);
+            let target = links[0].target.as_ref().unwrap();
+            assert!(target.path().as_str().ends_with("/project/x.txt"));
+        }
+
+        #[test]
+        fn test_generate_document_links_allows_parent_dir_with_workspace_root_set() {
+            // #937 (impl-critic C4): a legitimate `../` include that stays inside the
+            // workspace root must still be accepted once a root is known — the only other
+            // legitimate-`../` test (`..._allows_parent_dir_without_workspace_root`) runs with
+            // `workspace_root: None`, which skips the containment branch entirely.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/sub/requirements.txt");
+
+            let parse_result = parse_result_with_document_link(
+                uri.clone(),
+                Some(test_workspace_root("/project")),
+                "../shared/req.txt",
+            );
+
+            let links = ecosystem.generate_document_links(&parse_result, &uri);
+            assert_eq!(links.len(), 1);
+            let target = links[0].target.as_ref().unwrap();
+            assert!(target.path().as_str().ends_with("/project/shared/req.txt"));
+        }
+
+        #[tokio::test]
+        async fn test_generate_document_links_rejects_bidi_override_target() {
+            // #452 S2 (security): a bidi override in the target text could make the
+            // rendered requirements.txt line read as an innocuous filename while the
+            // link itself opens something else entirely — link-target spoofing.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/project/requirements.txt");
+
+            let parse_result = ecosystem
+                .parse_manifest("-r safe.txt\u{202E}txt.evil\n", &uri)
+                .await
+                .unwrap();
+
+            let links = ecosystem.generate_document_links(parse_result.as_ref(), &uri);
+            assert!(links.is_empty());
+        }
+
+        #[test]
+        fn test_is_safe_document_link_target_rejects_invisible_unicode() {
+            for bad in [
+                "safe.txt\u{202E}txt.evil",
+                "a\u{200B}b.txt",
+                "a\u{2028}b.txt",
+                "a\u{FEFF}b.txt",
+                "a\nb.txt",
+            ] {
+                assert!(
+                    !is_safe_document_link_target(bad),
+                    "expected {bad:?} to be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn test_is_safe_document_link_target_accepts_normal_paths() {
+            for good in [
+                "base.txt",
+                "../shared/constraints.txt",
+                "dev-requirements.txt",
+            ] {
+                assert!(is_safe_document_link_target(good));
+            }
+        }
+
+        #[test]
+        fn test_is_absolute_document_link_target_detects_every_absolute_form() {
+            // #937 (impl-critic C1/C4): `C:evil.txt` and bare `C:` are Windows
+            // *drive-relative* paths — no separator after the colon — that still discard
+            // `base_dir` on `Path::join` exactly like a fully separator-rooted `C:\...` does.
+            for bad in [
+                "/etc/shadow",
+                "\\Windows\\System32",
+                "C:\\Windows\\System32\\config\\SAM",
+                "c:/Windows/System32",
+                "C:evil.txt",
+                "C:",
+                "\\\\server\\share\\secret.txt",
+                "//server/share/secret.txt",
+            ] {
+                assert!(
+                    is_absolute_document_link_target(bad),
+                    "expected {bad:?} to be treated as absolute"
+                );
+            }
+        }
+
+        #[test]
+        fn test_is_absolute_document_link_target_accepts_relative_paths() {
+            for good in [
+                "base.txt",
+                "../shared/constraints.txt",
+                "dev-requirements.txt",
+            ] {
+                assert!(!is_absolute_document_link_target(good));
+            }
+        }
+
+        #[tokio::test]
+        async fn test_package_name_completion_context_has_real_range() {
+            // Regression test for #232: the textEdit range for a package-name completion
+            // must be the real name token span, not the (0,0)-(0,0) placeholder.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let content = "[dependency-groups]\ndev = [\"pytest>=8.0\", \"mypy>=1.0\"]\n";
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(1, 11); // cursor after "pyt" in "pytest"
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+
+            match context {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    assert_eq!(prefix, "pyt");
+                    assert_ne!(range, Range::default());
+                    assert_eq!(range, Range::new(Position::new(1, 8), Position::new(1, 14)));
+                }
+                other => panic!("Expected PackageName context, got {other:?}"),
+            }
+        }
+
+        /// #427 coverage gap: the actual bugfix — `generate_completions`'s
+        /// `PackageName` arm reporting `is_incomplete: true` for the truncated
+        /// package-name search index — was previously only verified via a hand-rolled
+        /// mock `Ecosystem` in `deps-lsp`'s handler tests, never on the real
+        /// `PypiEcosystem` dispatch. Same fixture/cursor as
+        /// `test_package_name_completion_context_has_real_range`, but calling
+        /// `generate_completions` directly (not `detect_completion_context`) so a
+        /// reversed condition or wrong-arm bug in the real dispatch would be caught.
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_is_incomplete() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let content = "[dependency-groups]\ndev = [\"pytest>=8.0\", \"mypy>=1.0\"]\n";
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(1, 11); // cursor after "pyt" in "pytest"
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(
+                completions.is_incomplete,
+                "PackageName context must report is_incomplete: true, even with zero \
+             items on a cold-start index"
+            );
+        }
+
+        /// Builds a `PypiEcosystem` whose registry's search index is pointed at a
+        /// mock server rather than the real `pypi.org/simple/`, so package-name
+        /// completion (issue #419) can be exercised network-free.
+        fn ecosystem_with_index_url(
+            cache: Arc<deps_core::HttpCache>,
+            index_url: String,
+        ) -> PypiEcosystem {
+            PypiEcosystem {
+                registry: Arc::new(PypiRegistry::with_index_url(cache, index_url)),
+                parser: PypiParser::new(),
+                formatter: PypiFormatter,
+                policy: Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            }
+        }
+
+        /// Polls `probe` until it returns a non-empty result or `attempts` polls have
+        /// elapsed, returning the last (possibly still empty) result. Used to wait out
+        /// the background index build without a flaky fixed sleep.
+        async fn poll_until_nonempty<F, Fut>(mut probe: F, attempts: u32) -> Vec<CompletionItem>
+        where
+            F: FnMut() -> Fut,
+            Fut: std::future::Future<Output = Vec<CompletionItem>>,
+        {
+            for _ in 0..attempts {
+                let results = probe().await;
+                if !results.is_empty() {
+                    return results;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            probe().await
+        }
+
+        /// #419 regression: `test_complete_package_names_real_search` used to be
+        /// `#[ignore]`d (real network access, so never ran in CI). Rewritten
+        /// network-free against a mocked Simple API index: the first call is a cold
+        /// start (empty, index not built yet) and a later call — once the background
+        /// build finishes — finds `requests`.
+        #[tokio::test]
+        async fn test_complete_package_names_uses_index() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/simple/")
+                .with_status(200)
+                .with_body(crate::search::sample_index_body(&["requests"]))
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let index_url = format!("{}/simple/", server.url());
+            let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+            let cold_start = ecosystem
+                .complete_package_names("reque", Range::default())
+                .await;
+            assert!(
+                cold_start.is_empty(),
+                "cold start must not block on the download"
+            );
+
+            let results = poll_until_nonempty(
+                || ecosystem.complete_package_names("reque", Range::default()),
+                100,
+            )
+            .await;
+            mock.assert_async().await;
+            assert!(!results.is_empty());
+            assert!(results.iter().any(|r| r.label == "requests"));
+        }
+
+        /// #419 S2 regression: a query using a different separator than the index's
+        /// normalized form (`zope.int`, PEP 503-normalized to `zope-int` server-side)
+        /// must come back with `filter_text` set to the *raw typed* prefix, not the
+        /// normalized `label`/`insert_text` — otherwise an LSP client's local
+        /// re-filtering (`zope.int` is not a subsequence of `zope-interface`) would
+        /// silently drop a result the server correctly matched.
+        #[tokio::test]
+        async fn test_complete_package_names_filter_text_matches_raw_typed_prefix() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/simple/")
+                .with_status(200)
+                .with_body(crate::search::sample_index_body(&["zope-interface"]))
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let index_url = format!("{}/simple/", server.url());
+            let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+            let results = poll_until_nonempty(
+                || ecosystem.complete_package_names("zope.int", Range::default()),
+                100,
+            )
+            .await;
+
+            mock.assert_async().await;
+            let item = results
+                .iter()
+                .find(|r| r.label == "zope-interface")
+                .expect("zope-interface should be found via separator-normalized search");
+            assert_eq!(
+                item.filter_text,
+                Some("zope.int".to_string()),
+                "filter_text must be the raw typed prefix, not the normalized label"
+            );
+        }
+
+        /// #419 §4.6/Q2 regression: a *version* completion request (not a
+        /// package-name one) inside a Python manifest must warm the search index —
+        /// `PypiEcosystem::generate_completions` calls `warm_search_index` before
+        /// dispatching on completion context — and repeated requests must still
+        /// produce exactly one index-build fetch (single-flight + build-once).
+        #[tokio::test]
+        async fn test_version_completion_triggers_exactly_one_index_build_attempt() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/simple/")
+                .with_status(200)
+                .with_body(crate::search::sample_index_body(&["requests"]))
+                .expect(1)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let index_url = format!("{}/simple/", server.url());
+            let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let content = "[project]\ndependencies = [\"requests>=2.0\"]\n";
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+            // Locate a cursor position that `detect_completion_context` actually
+            // resolves to a Version context, rather than hand-computing a column
+            // offset that would silently drift if the fixture line changes.
+            let version_line = content.lines().nth(1).unwrap();
+            let version_position = (0..=version_line.len() as u32)
+                .map(|character| tower_lsp_server::ls_types::Position::new(1, character))
+                .find(|&position| {
+                    matches!(
+                        deps_core::completion::detect_completion_context(
+                            parse_result.as_ref(),
+                            position,
+                            content,
+                        ),
+                        deps_core::completion::CompletionContext::Version { .. }
+                    )
+                })
+                .expect("fixture line must contain a Version completion context");
+
+            let mut last_completions = None;
+            for _ in 0..3 {
+                last_completions = Some(
+                    ecosystem
+                        .generate_completions(
+                            parse_result.as_ref(),
+                            version_position,
+                            content,
+                            deps_core::FreshnessSettings::default(),
+                        )
+                        .await,
+                );
+            }
+            assert!(
+                !last_completions
+                    .expect("loop ran at least once")
+                    .is_incomplete,
+                "a Version completion context is always exhaustive, unlike PackageName's \
+             truncated index search"
+            );
+
+            // Give the (single-flight) background build a chance to finish.
+            let ready = poll_until_nonempty(
+                || ecosystem.complete_package_names("reque", Range::default()),
+                100,
+            )
+            .await;
+            assert!(
+                ready.iter().any(|r| r.label == "requests"),
+                "index should be ready and contain requests after warming"
+            );
+            mock.assert_async().await;
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_versions_real() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "2.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("2.")));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_versions_with_operator() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    ">=2.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("2.")));
+        }
+
+        /// Sentinel package name for a package that does not exist in the registry (#1038): every
+        /// "unknown package" completion test below shares it, resolved against a mockito 404 via
+        /// [`mock_unknown_package_ecosystem`] rather than the live `pypi.org`.
+        const UNKNOWN_PACKAGE: &str = "this-package-does-not-exist-12345";
+
+        /// Builds a [`PypiEcosystem`] wired to a mockito server that 404s `name` (#1038), plus the
+        /// `Mock`/`ServerGuard` handles the caller must keep alive and assert on — shared by every
+        /// "unknown package" completion test below to avoid repeating the same
+        /// live-registry-avoiding wiring per test. A regression that makes zero requests (and so
+        /// also produces an empty result) can no longer pass vacuously, since
+        /// `mock.assert_async()` requires the request to actually have been made.
+        async fn mock_unknown_package_ecosystem(
+            name: &str,
+        ) -> (mockito::ServerGuard, mockito::Mock, PypiEcosystem) {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", format!("/simple/{name}/").as_str())
+                .with_status(404)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = PypiRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                format!("{}/simple", server.url()),
+            );
+            let ecosystem = PypiEcosystem::with_policy(
+                Arc::new(registry),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+            (server, mock, ecosystem)
+        }
+
+        #[tokio::test]
+        async fn test_complete_versions_unknown_package() {
+            let (_server, mock, ecosystem) = mock_unknown_package_ecosystem(UNKNOWN_PACKAGE).await;
+            let parse_result =
+                parse_result_with_dependency(UNKNOWN_PACKAGE, DependencySource::Registry);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "1.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// The single dependency `parse_result_with_dependency` constructs always has its
+        /// `version_range` start here — every call site below passes this as `complete_versions`'
+        /// `position` argument so the position-based lookup finds it.
+        const DEP_POSITION: Position = Position {
+            line: 0,
+            character: 0,
+        };
+
+        /// A minimal single-dependency `ParseResult`, used to exercise `complete_versions`'
+        /// per-source routing (issue #593) — the dependency's `version_range` starts at
+        /// [`DEP_POSITION`].
+        fn parse_result_with_dependency(
+            name: &str,
+            source: DependencySource,
+        ) -> crate::parser::ParseResult {
+            use deps_core::position::{Position as DomainPosition, Range};
+            crate::parser::ParseResult {
+                dependencies: vec![crate::types::PypiDependency {
+                    name: pkg(name),
+                    name_range: Range::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0)),
+                    version_req: None,
+                    version_range: Some(Range::new(
+                        DEP_POSITION.into(),
+                        DomainPosition::new(0, 10),
+                    )),
+                    extras: Vec::new(),
+                    extras_range: None,
+                    markers: None,
+                    markers_range: None,
+                    section: crate::types::PypiDependencySection::Requirements,
+                    source,
+                }],
+                workspace_root: None,
+                uri: deps_core::test_util::test_uri("/test/requirements.txt"),
+                document_links: Vec::new(),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            }
+        }
+
+        /// Validator finding #1 (security H1 + impl-critic C1): a version-completion request for
+        /// an `AlternateRegistry`-sourced dependency must route through the resolved chain, never
+        /// through the root `Public`-tier client — fetching from the root would send the
+        /// dependency's name to `pypi.org` on every keystroke.
+        #[tokio::test]
+        async fn test_complete_versions_alternate_registry_routes_through_chain() {
+            let mut alt_server = mockito::Server::new_async().await;
+            let alt_mock = alt_server
+                .mock("GET", "/simple/mypkg/")
+                .with_status(200)
+                .with_body(r#"{"versions": ["1.0.0", "2.0.0"], "files": []}"#)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_registry_policy(deps_core::net_policy::WorkspaceRegistryAccess::All);
+            let root = Arc::new(PypiRegistry::new(Arc::clone(&cache)));
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            ));
+            let ecosystem = PypiEcosystem::with_policy(Arc::clone(&root), policy);
+
+            let base = crate::config::PypiIndexUrl::new(
+                &format!("{}/simple", alt_server.url()),
+                &deps_core::net_policy::RegistryAccessPolicy::new(
+                    deps_core::net_policy::WorkspaceRegistryAccess::All,
+                ),
+            )
+            .unwrap();
+            let chain = crate::config::ResolvedChain {
+                key: "test-alt-chain".to_string(),
+                key_shape: deps_core::registry::KeyShape::Opaque,
+                hops: vec![base],
+                implicit_public_fallback: false,
+            };
+            PypiRegistry::register_alternate(&root, &chain);
+
+            let source = DependencySource::AlternateRegistry {
+                index: chain.key.clone(),
+                mirrors_crates_io: false,
+            };
+            let parse_result = parse_result_with_dependency("mypkg", source);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                !results.is_empty(),
+                "expected version completions fetched from the alternate index"
+            );
+            alt_mock.assert_async().await;
+        }
+
+        /// Validator finding #1: a `CustomRegistry`-sourced dependency (an invalid/blocked
+        /// explicit index, US-005) must offer no version completions at all — never falling back
+        /// to `pypi.org`, matching hover/diagnostics' existing fail-closed behavior for it
+        /// (SC-004).
+        #[tokio::test]
+        async fn test_complete_versions_custom_registry_offers_nothing() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+
+            let source = DependencySource::CustomRegistry {
+                url: "not-a-valid-url".to_string(),
+            };
+            let parse_result = parse_result_with_dependency("mypkg", source);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(results.is_empty());
+        }
+
+        /// Validator finding #1: an `AlternateRegistry` source whose chain was never registered
+        /// (or whose registration is now stale) offers nothing rather than falling back to the
+        /// root client.
+        #[tokio::test]
+        async fn test_complete_versions_unregistered_alternate_offers_nothing() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+
+            let source = DependencySource::AlternateRegistry {
+                index: "pypi-chain:never-registered".to_string(),
+                mirrors_crates_io: false,
+            };
+            let parse_result = parse_result_with_dependency("mypkg", source);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(results.is_empty());
+        }
+
+        /// Issue #593: two dependencies sharing one `PackageName` but resolving to different
+        /// sources no longer collapse into the old name-based "offer nothing for either" result
+        /// — cursor position now identifies exactly one dependency, so each occurrence routes
+        /// independently through its own source.
+        #[tokio::test]
+        async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+
+            use deps_core::position::{Position as DomainPosition, Range as DomainRange};
+
+            let mut registry_dep =
+                parse_result_with_dependency("shared-name", DependencySource::Registry)
+                    .dependencies
+                    .remove(0);
+            registry_dep.name_range =
+                DomainRange::new(DomainPosition::new(0, 0), DomainPosition::new(0, 0));
+            registry_dep.version_range = Some(DomainRange::new(
+                DomainPosition::new(0, 0),
+                DomainPosition::new(0, 10),
+            ));
+
+            let mut alternate_dep = parse_result_with_dependency(
+                "shared-name",
+                DependencySource::AlternateRegistry {
+                    index: "pypi-chain:never-registered".to_string(),
+                    mirrors_crates_io: false,
+                },
+            )
+            .dependencies
+            .remove(0);
+            alternate_dep.name_range =
+                DomainRange::new(DomainPosition::new(1, 0), DomainPosition::new(1, 0));
+            alternate_dep.version_range = Some(DomainRange::new(
+                DomainPosition::new(1, 0),
+                DomainPosition::new(1, 10),
+            ));
+            let alternate_position = alternate_dep.version_range.unwrap().start;
+
+            let parse_result = crate::parser::ParseResult {
+                dependencies: vec![registry_dep, alternate_dep],
+                workspace_root: None,
+                uri: deps_core::test_util::test_uri("/test/requirements.txt"),
+                document_links: Vec::new(),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            // The alternate occurrence resolves deterministically without network: its chain was
+            // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
+            // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
+            // the routing.
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    alternate_position.into(),
+                    "1",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                results.is_empty(),
+                "unregistered alternate chain must offer no completions"
+            );
+        }
+
+        /// #1066: was `assert!(results.is_empty() || !results.is_empty())` — a tautology that
+        /// could never fail identically whether cold-start behaved correctly, the network was
+        /// down, `complete_package_names` were replaced with `vec![]` unconditionally, or the
+        /// prefix-length gate rejected before the index was ever consulted. Mirrors
+        /// `test_complete_package_names_uses_index`: a mocked index proves the cold start is
+        /// genuinely empty (not just "empty for the wrong reason"), then `poll_until_nonempty` +
+        /// `mock.assert_async()` + a concrete label prove the index actually works once built.
+        #[tokio::test]
+        async fn test_complete_package_names_special_characters() {
+            // #1055: was a live, unmocked search index build that asserted the tautology
+            // `results.is_empty() || !results.is_empty()`. Mocked via the same
+            // `ecosystem_with_index_url`/`sample_index_body` seam `test_complete_package_names_uses_index`
+            // (issue #419) already established.
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/simple/")
+                .with_status(200)
+                .with_body(crate::search::sample_index_body(&["scikit-learn"]))
+                .expect_at_least(1)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let index_url = format!("{}/simple/", server.url());
+            let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+            let cold_start = ecosystem
+                .complete_package_names("scikit-le", Range::default())
+                .await;
+            assert!(
+                cold_start.is_empty(),
+                "cold start must not block on the index download"
+            );
+
+            let results = poll_until_nonempty(
+                || ecosystem.complete_package_names("scikit-le", Range::default()),
+                100,
+            )
+            .await;
+            mock.assert_async().await;
+            assert!(results.iter().any(|r| r.label == "scikit-learn"));
+        }
+
+        /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+        /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+        /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+        /// matching versions and asserts the count is exactly the real cap.
+        #[tokio::test]
+        async fn test_complete_versions_capped_at_max_completion_versions() {
+            let mut server = mockito::Server::new_async().await;
+            let versions = (0..8)
+                .map(|i| format!(r#""2.{i}.0""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mock = server
+                .mock("GET", "/simple/requests/")
+                .with_status(200)
+                .with_body(format!(r#"{{"versions": [{versions}], "files": []}}"#))
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = PypiRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                format!("{}/simple", server.url()),
+            );
+            let ecosystem = PypiEcosystem::with_policy(
+                Arc::new(registry),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+
+            let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "2",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert_eq!(results.len(), 5);
+        }
+
+        /// End-to-end regression for #1137: a Poetry-style caret prefix (`^2.28`) must filter
+        /// completions to matching versions, not fall through `VERSION_OPERATOR_CHARS`'s strip
+        /// (which was previously missing `^`) into the unfiltered top-N fallback the issue
+        /// reported. `operator_chars_conformance!` above only proves the array *contains* `^`; it
+        /// does not exercise `complete_versions`/`complete_versions_generic_from` with a real
+        /// prefix, which is what actually reproduces the reported symptom.
+        #[tokio::test]
+        async fn test_complete_versions_with_poetry_caret_operator_filters_matching_versions() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                    .mock("GET", "/simple/requests/")
+                    .with_status(200)
+                    .with_body(
+                        r#"{"versions": ["1.0.0", "2.27.0", "2.28.0", "2.28.1", "2.29.0"], "files": []}"#,
+                    )
+                    .create_async()
+                    .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = PypiRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                format!("{}/simple", server.url()),
+            );
+            let ecosystem = PypiEcosystem::with_policy(
+                Arc::new(registry),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+
+            let parse_result = parse_result_with_dependency("requests", DependencySource::Registry);
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "^2.28",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+
+            assert_eq!(
+                results.len(),
+                2,
+                "expected only the two 2.28.x versions, got: {results:?}"
+            );
+            assert!(
+                results.iter().all(|r| r.label.starts_with("2.28")),
+                "a stripped `^` prefix must filter out 1.0.0/2.27.0/2.29.0, got: {results:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_inlay_hints_empty_dependencies() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+            let content = r"[project]
+dependencies = []
+";
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let config = EcosystemConfig::default();
+
+            let hints = ecosystem
+                .generate_inlay_hints(
+                    parse_result.as_ref(),
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::LoadingState::Loaded,
+                    &config,
+                )
+                .await;
+
+            assert!(hints.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_no_context() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+            let content = r#"[project]
+name = "test"
+"#;
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position {
+                line: 0,
+                character: 0,
+            };
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(completions.items.is_empty());
+            assert!(!completions.is_incomplete);
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_returns_matches() {
+            // #1055: position (1, 20) lands inside the bare `requests` entry (no version
+            // specifier), which `detect_completion_context` resolves as a `PackageName` context,
+            // not a `Feature` one (pypi never overrides `complete_feature`) — so this previously
+            // drove an unmocked, live search-index build while asserting the tautology
+            // `completions.items.is_empty() || !completions.items.is_empty()`. Mocked via the same
+            // seam as `test_complete_package_names_uses_index` (#419).
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/simple/")
+                .with_status(200)
+                .with_body(crate::search::sample_index_body(&["requests"]))
+                .expect_at_least(1)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let index_url = format!("{}/simple/", server.url());
+            let ecosystem = ecosystem_with_index_url(cache, index_url);
+
+            let content = r#"[project]
+dependencies = ["requests"]
+"#;
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+            let position = Position {
+                line: 1,
+                character: 20,
+            };
+
+            let cold_start = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                cold_start.items.is_empty(),
+                "cold start must not block on the index download"
+            );
+
+            let completions = poll_until_nonempty(
+                || async {
+                    ecosystem
+                        .generate_completions(
+                            parse_result.as_ref(),
+                            position,
+                            content,
+                            deps_core::FreshnessSettings::default(),
+                        )
+                        .await
+                        .items
+                },
+                100,
+            )
+            .await;
+
+            mock.assert_async().await;
+            assert!(completions.iter().any(|r| r.label == "requests"));
+        }
+
+        /// #1195 M4 regression: a bare `>` comparator (`this-package-does-not-exist-12345>2.0`)
+        /// has no `=` character anywhere on the line, so `deps-lsp`'s
+        /// `fallback_completion`-gate's `prefix.contains('=')` guard offers no protection —
+        /// before this PR, an empty `complete_versions` result at this position would fall
+        /// through to a raw-text package-name search for the literal string
+        /// `"this-package-does-not-exist-12345>2."`. Runs through the real parser and the real
+        /// `generate_completions` dispatch (not a synthetic `ParseResult`), with a mocked 404 so
+        /// the empty result is deterministic and `mock.assert_async()` proves the `Version`
+        /// context was actually reached rather than resolving to `None`/`Unresolved`.
+        #[tokio::test]
+        async fn test_generate_completions_bare_comparator_version_empty_result_stamps_version_origin()
+         {
+            let (_server, mock, ecosystem) = mock_unknown_package_ecosystem(UNKNOWN_PACKAGE).await;
+
+            let content = format!("{UNKNOWN_PACKAGE}>2.0\n");
+            let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+            let parse_result = ecosystem.parse_manifest(&content, &uri).await.unwrap();
+            assert_eq!(
+                parse_result.dependencies().len(),
+                1,
+                "fixture must parse the bare `>` comparator as one dependency: {content}"
+            );
+
+            // Cursor between "2." and "0" — mid-typing, prefix "2.", no "=" on the line.
+            let cursor = u32::try_from(content.find("2.0").unwrap() + 2).unwrap();
+            let position = Position {
+                line: 0,
+                character: cursor,
+            };
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    &content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            mock.assert_async().await;
+            assert!(completions.items.is_empty());
+            assert_eq!(
+                completions.origin,
+                deps_core::completion::CompletionOrigin::Version,
+                "a bare `>` comparator has no `=` on the line — CompletionOrigin::Version, not \
+             the prefix.contains('=') guard, is what must stop deps-lsp's fallback here"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_hover_no_dependency_at_position() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+            let content = r#"[project]
+name = "test"
+"#;
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position {
+                line: 0,
+                character: 0,
+            };
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+
+            let hover = ecosystem
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(hover.is_none());
+        }
+
+        #[tokio::test]
+        async fn test_generate_code_actions_no_actions() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = PypiEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/pyproject.toml");
+
+            let content = r#"[project]
+name = "test"
+"#;
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position {
+                line: 0,
+                character: 0,
+            };
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let actions = ecosystem
+                .generate_code_actions(
+                    parse_result.as_ref(),
+                    position,
+                    &uri,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    content,
+                )
+                .await;
+
+            assert!(actions.is_empty());
+        }
+
+        /// #1038: was a live-registry round-trip asserting only `results.is_empty()` — vacuous
+        /// under a dead network, since a regression that made zero requests would produce the
+        /// same empty result. Now mocked, with `mock.assert_async()` requiring the request to
+        /// actually have been made.
+        #[tokio::test]
+        async fn test_complete_versions_empty_prefix() {
+            let (_server, mock, ecosystem) =
+                mock_unknown_package_ecosystem("nonexistent-package").await;
+            let parse_result =
+                parse_result_with_dependency("nonexistent-package", DependencySource::Registry);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+        #[tokio::test]
+        async fn test_complete_versions_with_tilde_operator() {
+            let (_server, mock, ecosystem) =
+                mock_unknown_package_ecosystem("nonexistent-pkg").await;
+            let parse_result =
+                parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "~=2.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// #1038: see [`test_complete_versions_empty_prefix`]'s doc for why this is now mocked.
+        #[tokio::test]
+        async fn test_complete_versions_with_not_equal_operator() {
+            let (_server, mock, ecosystem) =
+                mock_unknown_package_ecosystem("nonexistent-pkg").await;
+            let parse_result =
+                parse_result_with_dependency("nonexistent-pkg", DependencySource::Registry);
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    DEP_POSITION,
+                    "!=2.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// Composition regression guard (#390 C5 bug class, mirrors the deleted
+        /// `deps-lsp` end-to-end test
+        /// `test_fallback_completion_pypi_project_array_query_has_no_leaked_quote`):
+        /// proves `line_at` + `is_in_pypi_project_dependencies_array` + quote-stripping
+        /// compose correctly through the real trait method on realistic multi-line
+        /// `pyproject.toml` content — the primitives were each individually correct in
+        /// isolation but their composition was the actual #390 bug.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition_project_array() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project]\nname = \"myapp\"\nversion = \"0.1.0\"\ndependencies = [\n    \"requests>=2.31.0\",\n    \"flas";
+            let line = content.lines().nth(5).unwrap();
+            let position = Position::new(5, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                Some("flas")
+            );
+        }
+
+        /// Same composition, `[project.optional-dependencies]`'s real section-header
+        /// shape rather than the headerless primary `dependencies = [...]` array.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition_optional_dependencies() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    \"flas";
+            let line = content.lines().nth(3).unwrap();
+            let position = Position::new(3, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                Some("flas")
+            );
+        }
+
+        /// #737: zero quotes typed at all (`req` alone on its own line under
+        /// `dependencies = [...]`) must not be reported as bare — otherwise the fallback
+        /// path bare-inserts the unquoted name straight into the TOML array.
+        #[test]
+        fn test_fallback_completion_is_bare_false_with_no_quote_typed() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project]\ndependencies = [\n    \"pytest\",\n    req\n]\n";
+            let line = content.lines().nth(3).unwrap();
+            let position = Position::new(3, line.chars().count() as u32);
+            assert!(!eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        /// An already-open quote (`"req`, mid-typing) must still route to the bare insert
+        /// — this is the pre-#737 behavior and must not regress.
+        #[test]
+        fn test_fallback_completion_is_bare_true_with_open_quote() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project]\ndependencies = [\n    \"req";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        /// Same two states as the primary PEP 621 `dependencies = [...]` array, exercised
+        /// against `[project.optional-dependencies]` instead — coverage gap flagged in
+        /// #737 validation: only the primary array branch was previously tested.
+        #[test]
+        fn test_fallback_completion_is_bare_false_with_no_quote_typed_optional_dependencies() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project.optional-dependencies]\ndev = [\n    \"pytest\",\n    req\n]\n";
+            let line = content.lines().nth(3).unwrap();
+            let position = Position::new(3, line.chars().count() as u32);
+            assert!(!eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        #[test]
+        fn test_fallback_completion_is_bare_true_with_open_quote_optional_dependencies() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project.optional-dependencies]\ndev = [\n    \"req";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        /// #737 critic S1: a `\"` preceded by an odd backslash run is an *escaped* quote,
+        /// not a real one — `count_real_quotes`/`open_quoted_tail` correctly report zero
+        /// real quotes here, so this must still route through `completion_insert_text`
+        /// (quoted insert), not the bare path. A naive `.contains('"')` check would
+        /// wrongly report `true` since the literal `"` character is present in the text.
+        #[test]
+        fn test_fallback_completion_is_bare_false_with_only_escaped_quote() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project]\ndependencies = [\n    \\\"req";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(!eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        /// #737 validation gap: multiple entries on one line, cursor after a bare trailing
+        /// candidate following an already-CLOSED quoted entry
+        /// (`dependencies = ["pytest", req]`). A naive `.contains('"')` check on the raw
+        /// line prefix would wrongly report `true` — the prior entry's quotes still appear
+        /// in the prefix — routing to bare-insert and reproducing #737's exact corruption
+        /// in a different manifest shape. `open_quoted_tail`'s escape-aware parity check
+        /// correctly reports `false` (an even, non-zero quote count means no string is
+        /// currently open).
+        #[test]
+        fn test_fallback_completion_is_bare_false_with_multiple_deps_same_line() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project]\ndependencies = [\"pytest\", req]\n";
+            let cursor = "dependencies = [\"pytest\", req";
+            let position = Position::new(1, cursor.chars().count() as u32);
+            assert!(!eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        /// Same shape, with an escaped quote inside the prior closed entry — must not
+        /// misclassify the escape as a still-open string either.
+        #[test]
+        fn test_fallback_completion_is_bare_false_with_escaped_quote_in_prior_closed_entry_same_line()
+         {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = PypiEcosystem::new(cache);
+            let content = "[project]\ndependencies = [\"a\\\"b\", req]\n";
+            let cursor = "dependencies = [\"a\\\"b\", req";
+            let position = Position::new(1, cursor.chars().count() as u32);
+            assert!(!eco.fallback_completion_is_bare(content, position.into()));
+        }
     }
 }

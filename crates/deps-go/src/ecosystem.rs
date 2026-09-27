@@ -3,6 +3,11 @@
 //! This module implements the `Ecosystem` trait for Go projects,
 //! providing LSP functionality for `go.mod` files.
 
+#[cfg(feature = "lsp-responses")]
+use deps_core::completion::Completions;
+use deps_core::{
+    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
+};
 use std::any::Any;
 #[cfg(feature = "lsp-responses")]
 use std::future::Future;
@@ -10,12 +15,6 @@ use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
 use tower_lsp_server::ls_types::{CompletionItem, Range};
 use url::Url;
-
-#[cfg(feature = "lsp-responses")]
-use deps_core::completion::Completions;
-use deps_core::{
-    Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
-};
 
 use crate::config::GoParseContext;
 use crate::formatter::GoFormatter;
@@ -227,18 +226,9 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 mod tests {
     use super::*;
     use crate::types::{GoDependency, GoDirective};
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::parser::DependencySource;
     use deps_core::position::{Position as DomainPosition, Range as DomainRange};
     use deps_core::{Dependency, VersionData};
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::{EcosystemConfig, PackageVersions};
-
-    #[cfg(feature = "lsp-responses")]
-    deps_core::complete_versions_test_shim!(GoEcosystem);
     use std::collections::HashMap;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::{InlayHintLabel, Position};
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
@@ -266,27 +256,6 @@ mod tests {
     struct MockParseResult {
         dependencies: Vec<GoDependency>,
         uri: Url,
-    }
-
-    /// A dependency on `line`, with a `version_range` there so position-based lookup
-    /// (issue #593) can find it — mirrors `mock_dependency`, but with an explicit `source`.
-    #[cfg(feature = "lsp-responses")]
-    fn dep_with_source(name: &str, source: DependencySource, line: u32) -> GoDependency {
-        GoDependency {
-            module_path: pkg(name),
-            module_path_range: DomainRange::new(
-                DomainPosition::new(line, 0),
-                DomainPosition::new(line, 0),
-            ),
-            version: None,
-            version_range: Some(DomainRange::new(
-                DomainPosition::new(line, 0),
-                DomainPosition::new(line, 10),
-            )),
-            directive: GoDirective::Require,
-            indirect: false,
-            source,
-        }
     }
 
     impl deps_core::ParseResult for MockParseResult {
@@ -353,571 +322,6 @@ mod tests {
              require example.com/fake-msbuild-dep $(FAKE-MSBUILD-VERSION)\n";
     }
 
-    // #794: no `completion_guard_conformance!` for this crate — `complete_package_names`
-    // above unconditionally returns `vec![]` (Go has no centralized module-search API, so
-    // users type the full module path), never calling `registry.search` or
-    // `is_valid_completion_prefix_len` at all. The macro's fixture asserts a valid-length
-    // prefix against an always-has-a-result registry comes back non-empty, which cannot
-    // hold for a completion path that is unconditionally empty by design — mirrors
-    // `deps_github_actions`/`deps_gitlab_ci`'s identical N/A for the same reason (no
-    // package-name search endpoint).
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `Ecosystem::
-    // version_operator_chars`'s trait-default doc comment (`go.mod` has no operator
-    // syntax, so this crate never overrides it), so an edit to one without the other
-    // fails loudly instead of silently degrading completion. Calls through the real
-    // `version_operator_chars()` method (not a bare `&[]` literal) so a future override
-    // in this crate is caught by this test instead of silently diverging from it.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod go_operator_chars_conformance;
-        ecosystem: "go";
-        operator_chars: GoEcosystem::new(Arc::new(deps_core::HttpCache::new())).version_operator_chars();
-        required: &[];
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_up_to_date() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency(
-                "github.com/gin-gonic/gin",
-                Some("v1.9.1"),
-                5,
-            )],
-            uri,
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert(
-            "github.com/gin-gonic/gin".into(),
-            PackageVersions::latest_only("v1.9.1"),
-        );
-
-        let config = EcosystemConfig::default();
-
-        let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 1);
-        match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✅ v1.9.1"),
-            _ => panic!("Expected String label"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_needs_update() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency(
-                "github.com/gin-gonic/gin",
-                Some("v1.9.0"),
-                5,
-            )],
-            uri,
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert(
-            "github.com/gin-gonic/gin".into(),
-            PackageVersions::latest_only("v1.9.1"),
-        );
-
-        let config = EcosystemConfig::default();
-
-        let resolved_versions = HashMap::new();
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 1);
-        match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "❌ v1.9.1"),
-            _ => panic!("Expected String label"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_hide_up_to_date() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency(
-                "github.com/gin-gonic/gin",
-                Some("v1.9.1"),
-                5,
-            )],
-            uri,
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert(
-            "github.com/gin-gonic/gin".into(),
-            PackageVersions::latest_only("v1.9.1"),
-        );
-
-        let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
-
-        let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 0);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_no_version_range() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let mut dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9.1"), 5);
-        dep.version_range = None;
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-            uri,
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert(
-            "github.com/gin-gonic/gin".into(),
-            PackageVersions::latest_only("v1.9.1"),
-        );
-
-        let config = EcosystemConfig::default();
-
-        let resolved_versions = HashMap::new();
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 0);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_package_names_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let results = ecosystem.complete_package_names("github").await;
-        assert!(results.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_versions_real() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9"), 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "v1.9",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("v1.9")));
-    }
-
-    /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
-    /// the `is_empty()` assertion is driven by a deliberately-failing mocked 404 response,
-    /// not by whatever the live network happens to do — an offline run was previously
-    /// vacuously green here, masking a real regression in error handling. Only `/@v/list` is
-    /// mocked: `complete_versions` routes through `Registry::get_versions_with` → the
-    /// inherent `get_versions`, which never requests `/@latest` (that endpoint belongs to
-    /// `get_latest_matching`, a different call path).
-    ///
-    /// `assert_async` (impl-critic S1) proves the mock was actually hit, not just that some
-    /// error occurred — `completions` has no `Result` to match a specific error variant on
-    /// (it always degrades a fetch error to an empty `Vec`), so this is the strongest signal
-    /// available that the empty result came from the intended mocked 404 rather than an
-    /// unrelated failure (e.g. mockito's own `501` for an unmatched request, which would
-    /// satisfy a bare `is_empty()` just as well).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unknown_package() {
-        let mut server = mockito::Server::new_async().await;
-        let list_mock = server
-            .mock("GET", "/github.com/nonexistent/package12345/@v/list")
-            .with_status(404)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = Arc::new(GoRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            server.url(),
-        ));
-        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
-
-        let dep = mock_dependency("github.com/nonexistent/package12345", Some("v1.0"), 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "v1.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        list_mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_features_always_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_features(&pkg("github.com/gin-gonic/gin"), "")
-            .await;
-        assert!(results.is_empty());
-    }
-
-    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
-    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
-    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
-    /// matching versions and asserts the count is exactly the real cap.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_capped_at_max_completion_versions() {
-        let mut server = mockito::Server::new_async().await;
-        let versions_body = (0..8)
-            .map(|i| format!("v1.0.{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mock = server
-            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
-            .with_status(200)
-            .with_body(versions_body)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = Arc::new(GoRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            server.url(),
-        ));
-        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
-
-        // Test that we respect the display cap, not just some loose upper bound.
-        let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.0"), 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "v",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert_eq!(results.len(), 5);
-    }
-
-    /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
-    /// this is deterministic and fast — the sibling `test_generate_diagnostics_basic`
-    /// documents why the live-network shape is otherwise `#[ignore]`d.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_on_module_path() {
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
-            .with_status(200)
-            .with_body("v1.9.0\nv1.9.1\nv1.10.0\n")
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = Arc::new(GoRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            server.url(),
-        ));
-        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency(
-                "github.com/gin-gonic/gin",
-                Some("v1.9.1"),
-                5,
-            )],
-            uri,
-        };
-
-        let position = Position::new(5, 5);
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let hover = ecosystem
-            .generate_hover(
-                &parse_result,
-                position,
-                VersionData::new(&cached_versions, &resolved_versions),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        // Returns hover with package URL and the mock-derived latest version (impl-critic
-        // M1: without this, the assertions never depended on the mocked response at all).
-        assert!(hover.is_some());
-        let hover_content = hover.unwrap();
-        let markdown = hover_content.markdown();
-        assert!(markdown.contains("pkg.go.dev"));
-        assert!(
-            markdown.contains("**Latest**: `v1.10.0`"),
-            "expected the mocked /@v/list's highest version to render as Latest: {markdown}"
-        );
-    }
-
-    /// Regression for #1423 (live-verified Go symptom, tester/impl-critic follow-up): the
-    /// **real** `GoFormatter`, driven end-to-end through the public `Ecosystem::generate_hover`
-    /// entry point (not a synthetic non-identity formatter substituted in `deps-core`'s own
-    /// unit test), must render an OSV advisory's `fixed_versions` entry — OSV's wire spelling,
-    /// never carrying Go's mandatory `v` prefix — as `v0.55.0`, not the raw wire `0.55.0`.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_renders_fixed_version_in_go_native_namespace() {
-        use deps_core::osv::{
-            Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, VulnSeverity,
-            VulnerabilityMap,
-        };
-
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("GET", "/golang.org/x/net/@v/list")
-            .with_status(200)
-            .with_body("v0.17.0\n")
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = Arc::new(GoRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            server.url(),
-        ));
-        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency("golang.org/x/net", Some("v0.17.0"), 5)],
-            uri,
-        };
-
-        let mut vulnerabilities = VulnerabilityMap::new();
-        vulnerabilities.insert(
-            deps_core::test_util::vuln_key("golang.org/x/net"),
-            ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
-                vec![Arc::new(
-                    Advisory::new(
-                        "GO-2024-0001".to_string(),
-                        "2024-01-01T00:00:00Z".to_string(),
-                        VulnSeverity::High,
-                    )
-                    .expect("valid osv id")
-                    // OSV's wire spelling for Go never carries the `v` prefix `go.mod` requires.
-                    .with_fixed_versions(vec![OsvVersion::new("0.55.0")]),
-                )],
-                1,
-            ))),
-        );
-
-        let position = Position::new(5, 5);
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-        let versions = VersionData::new(&cached_versions, &resolved_versions)
-            .with_vulnerabilities(&vulnerabilities);
-
-        let hover = ecosystem
-            .generate_hover(
-                &parse_result,
-                position,
-                versions,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(hover.is_some());
-        let hover_content = hover.unwrap();
-        let markdown = hover_content.markdown();
-        assert!(
-            markdown.contains("v0.55.0"),
-            "Fixed in: must render the native-namespace version (v0.55.0), not the raw OSV \
-             wire spelling (0.55.0); got: {markdown}"
-        );
-        assert!(
-            !markdown.contains("Fixed in: `0.55.0`"),
-            "must not render the unconverted OSV wire spelling; got: {markdown}"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_outside_dependency() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency(
-                "github.com/gin-gonic/gin",
-                Some("v1.9.1"),
-                5,
-            )],
-            uri,
-        };
-
-        let position = Position::new(0, 0);
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let hover = ecosystem
-            .generate_hover(
-                &parse_result,
-                position,
-                VersionData::new(&cached_versions, &resolved_versions),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(hover.is_none());
-    }
-
-    /// #1014: backed by a mockito server (rather than a live `proxy.golang.org` request)
-    /// so this exercises the same `generate_code_actions` / REFACTOR-action-building code
-    /// path deterministically, without network flakiness (the sibling
-    /// `test_generate_diagnostics_basic` documents why that live-network shape is
-    /// otherwise `#[ignore]`d). `DependencySource::Registry` (the default from
-    /// `mock_dependency`) routes through `GoRegistry`'s `Public` tier, so
-    /// `with_public_base_for_test` — not the `WorkspaceDeclared`-tier `with_base` the
-    /// alternate-registry tests above use — is the matching mock entry point.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_code_actions_on_module() {
-        let mut server = mockito::Server::new_async().await;
-        server
-            .mock("GET", "/github.com/gin-gonic/gin/@v/list")
-            .with_status(200)
-            .with_body("v1.9.0\nv1.9.1\nv1.10.0\n")
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = Arc::new(GoRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            server.url(),
-        ));
-        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency(
-                "github.com/gin-gonic/gin",
-                Some("v1.9.0"),
-                5,
-            )],
-            uri: uri.clone(),
-        };
-
-        let position = Position::new(5, 5);
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        // `version_range` on line 5 spans columns 0..10; content must slice to
-        // exactly the declared requirement text there for the `literal_span_matches`
-        // guard in `generate_code_actions` to accept the edit.
-        let content = "\n\n\n\n\nv1.9.0    \n";
-
-        let actions = ecosystem
-            .generate_code_actions(
-                &parse_result,
-                position,
-                &uri,
-                VersionData::new(&cached_versions, &resolved_versions),
-                content,
-            )
-            .await;
-
-        let ls_uri: tower_lsp_server::ls_types::Uri = uri.as_str().parse().unwrap();
-
-        // Actions are registry-derived "update to version" REFACTOR edits, one per
-        // candidate version; exactly one is marked preferred (the highest matching).
-        assert!(
-            actions.iter().any(|action| {
-                action
-                    .edit
-                    .as_ref()
-                    .and_then(|edit| edit.changes.as_ref())
-                    .and_then(|changes| changes.get(&ls_uri))
-                    .is_some_and(|edits| edits.iter().any(|e| e.new_text.contains("v1.10.0")))
-            }),
-            "expected an action whose edit updates the dependency to v1.10.0, got: {actions:?}"
-        );
-        assert_eq!(
-            actions
-                .iter()
-                .filter(|action| action.is_preferred == Some(true))
-                .count(),
-            1,
-            "expected exactly one preferred action, got: {actions:?}"
-        );
-    }
-
     #[tokio::test]
     #[ignore = "Requires network access to proxy.golang.org"]
     async fn test_generate_diagnostics_basic() {
@@ -950,127 +354,6 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "Diagnostic generation timed out");
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let content = r"module example.com/myapp
-
-go 1.21
-
-require github.com/
-";
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![],
-            uri,
-        };
-
-        let position = Position::new(4, 19);
-
-        let completions = ecosystem
-            .generate_completions(
-                &parse_result,
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(completions.items.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_outside_context() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-
-        let content = r"module example.com/myapp
-
-go 1.21
-";
-
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = MockParseResult {
-            dependencies: vec![],
-            uri,
-        };
-
-        let position = Position::new(0, 0);
-
-        let completions = ecosystem
-            .generate_completions(
-                &parse_result,
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(completions.items.is_empty());
-    }
-
-    /// #1195 M4 regression: `VERSION_OPERATOR_CHARS` is empty for Go — `go.mod` requires a
-    /// bare exact semver with no comparator syntax at all, so nothing about the version
-    /// prefix's *shape* ever protected a `Version` position from `deps-lsp`'s raw-text
-    /// fallback before this PR; only `CompletionOrigin::Version` does now. Runs through the
-    /// real parser and the real `generate_completions` dispatch (not a synthetic
-    /// `ParseResult`), with a mocked 404 so the empty result is deterministic;
-    /// `list_mock.assert_async()` proves the `Version` context was actually reached rather
-    /// than resolving to `None`/`Unresolved`.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_empty_result_stamps_version_origin() {
-        let mut server = mockito::Server::new_async().await;
-        let list_mock = server
-            .mock("GET", "/github.com/nonexistent/package12345/@v/list")
-            .with_status(404)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = Arc::new(GoRegistry::with_public_base_for_test(
-            Arc::clone(&cache),
-            server.url(),
-        ));
-        let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
-
-        let content = "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/nonexistent/package12345 v1.2.3\n";
-        let uri = deps_core::test_util::test_uri("/test/go.mod");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        assert_eq!(
-            parse_result.dependencies().len(),
-            1,
-            "fixture must parse to exactly one dependency: {content}"
-        );
-
-        let version_range = parse_result.dependencies()[0].version_range().unwrap();
-        let position: Position = version_range.start.into();
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        list_mock.assert_async().await;
-        assert!(completions.items.is_empty());
-        assert_eq!(
-            completions.origin,
-            deps_core::completion::CompletionOrigin::Version,
-            "go.mod has no comparator syntax at all — CompletionOrigin::Version is the only \
-             thing that can stop deps-lsp's fallback from leaking the raw module-path+version \
-             text into a package-name search here"
-        );
     }
 
     #[tokio::test]
@@ -1139,154 +422,6 @@ require github.com/gin-gonic/gin v1.9.1
         assert_eq!(dep.name(), "github.com/example/pkg");
     }
 
-    // --- issue #593: completion routes by cursor position, not by resolved DependencySource name ---
-
-    /// Two dependencies sharing one `PackageName` but resolving to different sources no
-    /// longer collapse into the old name-based "offer nothing for either" result (spec 034
-    /// F1's `CompletionSource::Ambiguous`) — cursor position now identifies exactly one
-    /// dependency, so each occurrence routes independently through its own source.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        let registry_dep = dep_with_source("git.mycorp.example/pkg", DependencySource::Registry, 0);
-        let alternate_dep = dep_with_source(
-            "git.mycorp.example/pkg",
-            DependencySource::AlternateRegistry {
-                index: "go-private:never-registered".to_string(),
-                mirrors_crates_io: false,
-            },
-            1,
-        );
-        let alternate_position = alternate_dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![registry_dep, alternate_dep],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-
-        // The alternate occurrence resolves deterministically without network: its index was
-        // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
-        // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
-        // the routing.
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                alternate_position,
-                "v1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            results.is_empty(),
-            "unregistered alternate index must offer no completions"
-        );
-    }
-
-    /// An `AlternateRegistry` source whose index has no registered client offers no
-    /// completions — never a fall back to `proxy.golang.org` (the core of F1).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unregistered_alternate_offers_nothing() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        let dep = dep_with_source(
-            "git.mycorp.example/internal/auth",
-            DependencySource::AlternateRegistry {
-                index: "never-registered".to_string(),
-                mirrors_crates_io: false,
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "v1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(results.is_empty());
-    }
-
-    /// F1 end-to-end: a registered alternate client's version completion routes there,
-    /// proving completion actually consults the resolved `$GOENV` chain instead of always
-    /// querying the public root.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_routes_to_registered_alternate_client() {
-        use crate::config::{GoProxyChain, GoProxyHop, GoProxyUrl};
-        use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
-
-        let mut alt_server = mockito::Server::new_async().await;
-        alt_server
-            .mock("GET", "/git.mycorp.example/internal/auth/@v/list")
-            .with_status(200)
-            .with_body("v1.0.0\nv1.5.0\n")
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_registry_policy(WorkspaceRegistryAccess::All);
-        let registry = Arc::new(GoRegistry::new(Arc::clone(&cache)));
-        let ecosystem = GoEcosystem::with_context(Arc::clone(&registry), GoParseContext::default());
-
-        let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::All);
-        let chain = GoProxyChain {
-            key: "go-proxy:test".to_string(),
-            hops: vec![GoProxyHop::Url(
-                GoProxyUrl::new(&alt_server.url(), &policy).unwrap(),
-            )],
-            ..Default::default()
-        };
-        GoRegistry::register_alternate(&registry, &chain);
-
-        let dep = dep_with_source(
-            "git.mycorp.example/internal/auth",
-            DependencySource::AlternateRegistry {
-                index: "go-proxy:test".to_string(),
-                mirrors_crates_io: false,
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/go.mod"),
-        };
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "v1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-    }
-
-    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
-    /// `is_in_dependencies_section`'s `require (...)` block scan compose correctly
-    /// through the real trait method on realistic multi-line `go.mod` content.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = GoEcosystem::new(cache);
-        let content = "module example.com/myapp\n\nrequire (\n\tgithub.com/gin-gonic/g";
-        let line = content.lines().nth(3).unwrap();
-        let position = Position::new(3, line.chars().count() as u32);
-        assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position.into()),
-            Some("github.com/gin-gonic/g")
-        );
-    }
-
     #[test]
     fn test_is_in_dependencies_section_single_line() {
         let content = "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.9.1\n";
@@ -1339,5 +474,853 @@ require github.com/gin-gonic/gin v1.9.1
             ecosystem.completion_insert_text(&meta),
             Some("github.com/stretchr/testify v1.9.0".to_string())
         );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    mod lsp_tests {
+        use super::*;
+
+        use deps_core::parser::DependencySource;
+
+        use deps_core::{EcosystemConfig, PackageVersions};
+
+        deps_core::complete_versions_test_shim!(GoEcosystem);
+
+        use tower_lsp_server::ls_types::{InlayHintLabel, Position};
+
+        /// A dependency on `line`, with a `version_range` there so position-based lookup
+        /// (issue #593) can find it — mirrors `mock_dependency`, but with an explicit `source`.
+        fn dep_with_source(name: &str, source: DependencySource, line: u32) -> GoDependency {
+            GoDependency {
+                module_path: pkg(name),
+                module_path_range: DomainRange::new(
+                    DomainPosition::new(line, 0),
+                    DomainPosition::new(line, 0),
+                ),
+                version: None,
+                version_range: Some(DomainRange::new(
+                    DomainPosition::new(line, 0),
+                    DomainPosition::new(line, 10),
+                )),
+                directive: GoDirective::Require,
+                indirect: false,
+                source,
+            }
+        }
+
+        // #794: no `completion_guard_conformance!` for this crate — `complete_package_names`
+        // above unconditionally returns `vec![]` (Go has no centralized module-search API, so
+        // users type the full module path), never calling `registry.search` or
+        // `is_valid_completion_prefix_len` at all. The macro's fixture asserts a valid-length
+        // prefix against an always-has-a-result registry comes back non-empty, which cannot
+        // hold for a completion path that is unconditionally empty by design — mirrors
+        // `deps_github_actions`/`deps_gitlab_ci`'s identical N/A for the same reason (no
+        // package-name search endpoint).
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `Ecosystem::
+        // version_operator_chars`'s trait-default doc comment (`go.mod` has no operator
+        // syntax, so this crate never overrides it), so an edit to one without the other
+        // fails loudly instead of silently degrading completion. Calls through the real
+        // `version_operator_chars()` method (not a bare `&[]` literal) so a future override
+        // in this crate is caught by this test instead of silently diverging from it.
+        deps_core::operator_chars_conformance! {
+            mod go_operator_chars_conformance;
+            ecosystem: "go";
+            operator_chars: GoEcosystem::new(Arc::new(deps_core::HttpCache::new())).version_operator_chars();
+            required: &[];
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_up_to_date() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency(
+                    "github.com/gin-gonic/gin",
+                    Some("v1.9.1"),
+                    5,
+                )],
+                uri,
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "github.com/gin-gonic/gin".into(),
+                PackageVersions::latest_only("v1.9.1"),
+            );
+
+            let config = EcosystemConfig::default();
+
+            let mut resolved_versions = HashMap::new();
+            resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 1);
+            match &hints[0].label {
+                InlayHintLabel::String(s) => assert_eq!(s, "✅ v1.9.1"),
+                _ => panic!("Expected String label"),
+            }
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_needs_update() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency(
+                    "github.com/gin-gonic/gin",
+                    Some("v1.9.0"),
+                    5,
+                )],
+                uri,
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "github.com/gin-gonic/gin".into(),
+                PackageVersions::latest_only("v1.9.1"),
+            );
+
+            let config = EcosystemConfig::default();
+
+            let resolved_versions = HashMap::new();
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 1);
+            match &hints[0].label {
+                InlayHintLabel::String(s) => assert_eq!(s, "❌ v1.9.1"),
+                _ => panic!("Expected String label"),
+            }
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_hide_up_to_date() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency(
+                    "github.com/gin-gonic/gin",
+                    Some("v1.9.1"),
+                    5,
+                )],
+                uri,
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "github.com/gin-gonic/gin".into(),
+                PackageVersions::latest_only("v1.9.1"),
+            );
+
+            let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
+
+            let mut resolved_versions = HashMap::new();
+            resolved_versions.insert("github.com/gin-gonic/gin".into(), "v1.9.1".into());
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 0);
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_no_version_range() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let mut dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9.1"), 5);
+            dep.version_range = None;
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+                uri,
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                "github.com/gin-gonic/gin".into(),
+                PackageVersions::latest_only("v1.9.1"),
+            );
+
+            let config = EcosystemConfig::default();
+
+            let resolved_versions = HashMap::new();
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 0);
+        }
+
+        #[tokio::test]
+        async fn test_complete_package_names_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let results = ecosystem.complete_package_names("github").await;
+            assert!(results.is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_versions_real() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+            let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.9"), 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/go.mod"),
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "v1.9",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("v1.9")));
+        }
+
+        /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
+        /// the `is_empty()` assertion is driven by a deliberately-failing mocked 404 response,
+        /// not by whatever the live network happens to do — an offline run was previously
+        /// vacuously green here, masking a real regression in error handling. Only `/@v/list` is
+        /// mocked: `complete_versions` routes through `Registry::get_versions_with` → the
+        /// inherent `get_versions`, which never requests `/@latest` (that endpoint belongs to
+        /// `get_latest_matching`, a different call path).
+        ///
+        /// `assert_async` (impl-critic S1) proves the mock was actually hit, not just that some
+        /// error occurred — `completions` has no `Result` to match a specific error variant on
+        /// (it always degrades a fetch error to an empty `Vec`), so this is the strongest signal
+        /// available that the empty result came from the intended mocked 404 rather than an
+        /// unrelated failure (e.g. mockito's own `501` for an unmatched request, which would
+        /// satisfy a bare `is_empty()` just as well).
+        #[tokio::test]
+        async fn test_complete_versions_unknown_package() {
+            let mut server = mockito::Server::new_async().await;
+            let list_mock = server
+                .mock("GET", "/github.com/nonexistent/package12345/@v/list")
+                .with_status(404)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = Arc::new(GoRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                server.url(),
+            ));
+            let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+            let dep = mock_dependency("github.com/nonexistent/package12345", Some("v1.0"), 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/go.mod"),
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "v1.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            list_mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_complete_features_always_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let results = ecosystem
+                .complete_features(&pkg("github.com/gin-gonic/gin"), "")
+                .await;
+            assert!(results.is_empty());
+        }
+
+        /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+        /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+        /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+        /// matching versions and asserts the count is exactly the real cap.
+        #[tokio::test]
+        async fn test_complete_versions_capped_at_max_completion_versions() {
+            let mut server = mockito::Server::new_async().await;
+            let versions_body = (0..8)
+                .map(|i| format!("v1.0.{i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mock = server
+                .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+                .with_status(200)
+                .with_body(versions_body)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = Arc::new(GoRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                server.url(),
+            ));
+            let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+            // Test that we respect the display cap, not just some loose upper bound.
+            let dep = mock_dependency("github.com/gin-gonic/gin", Some("v1.0"), 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/go.mod"),
+            };
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "v",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert_eq!(results.len(), 5);
+        }
+
+        /// #1034: backed by a mockito server (rather than a live `proxy.golang.org` request) so
+        /// this is deterministic and fast — the sibling `test_generate_diagnostics_basic`
+        /// documents why the live-network shape is otherwise `#[ignore]`d.
+        #[tokio::test]
+        async fn test_generate_hover_on_module_path() {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+                .with_status(200)
+                .with_body("v1.9.0\nv1.9.1\nv1.10.0\n")
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = Arc::new(GoRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                server.url(),
+            ));
+            let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency(
+                    "github.com/gin-gonic/gin",
+                    Some("v1.9.1"),
+                    5,
+                )],
+                uri,
+            };
+
+            let position = Position::new(5, 5);
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+
+            let hover = ecosystem
+                .generate_hover(
+                    &parse_result,
+                    position,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            // Returns hover with package URL and the mock-derived latest version (impl-critic
+            // M1: without this, the assertions never depended on the mocked response at all).
+            assert!(hover.is_some());
+            let hover_content = hover.unwrap();
+            let markdown = hover_content.markdown();
+            assert!(markdown.contains("pkg.go.dev"));
+            assert!(
+                markdown.contains("**Latest**: `v1.10.0`"),
+                "expected the mocked /@v/list's highest version to render as Latest: {markdown}"
+            );
+        }
+
+        /// Regression for #1423 (live-verified Go symptom, tester/impl-critic follow-up): the
+        /// **real** `GoFormatter`, driven end-to-end through the public `Ecosystem::generate_hover`
+        /// entry point (not a synthetic non-identity formatter substituted in `deps-core`'s own
+        /// unit test), must render an OSV advisory's `fixed_versions` entry — OSV's wire spelling,
+        /// never carrying Go's mandatory `v` prefix — as `v0.55.0`, not the raw wire `0.55.0`.
+        #[tokio::test]
+        async fn test_generate_hover_renders_fixed_version_in_go_native_namespace() {
+            use deps_core::osv::{
+                Advisory, Capped, DependencyVulnerabilities, OsvVersion, ScanOutcome, VulnSeverity,
+                VulnerabilityMap,
+            };
+
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("GET", "/golang.org/x/net/@v/list")
+                .with_status(200)
+                .with_body("v0.17.0\n")
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = Arc::new(GoRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                server.url(),
+            ));
+            let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency("golang.org/x/net", Some("v0.17.0"), 5)],
+                uri,
+            };
+
+            let mut vulnerabilities = VulnerabilityMap::new();
+            vulnerabilities.insert(
+                deps_core::test_util::vuln_key("golang.org/x/net"),
+                ScanOutcome::Vulnerable(DependencyVulnerabilities::new(Capped::new(
+                    vec![Arc::new(
+                        Advisory::new(
+                            "GO-2024-0001".to_string(),
+                            "2024-01-01T00:00:00Z".to_string(),
+                            VulnSeverity::High,
+                        )
+                        .expect("valid osv id")
+                        // OSV's wire spelling for Go never carries the `v` prefix `go.mod` requires.
+                        .with_fixed_versions(vec![OsvVersion::new("0.55.0")]),
+                    )],
+                    1,
+                ))),
+            );
+
+            let position = Position::new(5, 5);
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+            let versions = VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulnerabilities);
+
+            let hover = ecosystem
+                .generate_hover(
+                    &parse_result,
+                    position,
+                    versions,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(hover.is_some());
+            let hover_content = hover.unwrap();
+            let markdown = hover_content.markdown();
+            assert!(
+                markdown.contains("v0.55.0"),
+                "Fixed in: must render the native-namespace version (v0.55.0), not the raw OSV \
+             wire spelling (0.55.0); got: {markdown}"
+            );
+            assert!(
+                !markdown.contains("Fixed in: `0.55.0`"),
+                "must not render the unconverted OSV wire spelling; got: {markdown}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_hover_outside_dependency() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency(
+                    "github.com/gin-gonic/gin",
+                    Some("v1.9.1"),
+                    5,
+                )],
+                uri,
+            };
+
+            let position = Position::new(0, 0);
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+
+            let hover = ecosystem
+                .generate_hover(
+                    &parse_result,
+                    position,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(hover.is_none());
+        }
+
+        /// #1014: backed by a mockito server (rather than a live `proxy.golang.org` request)
+        /// so this exercises the same `generate_code_actions` / REFACTOR-action-building code
+        /// path deterministically, without network flakiness (the sibling
+        /// `test_generate_diagnostics_basic` documents why that live-network shape is
+        /// otherwise `#[ignore]`d). `DependencySource::Registry` (the default from
+        /// `mock_dependency`) routes through `GoRegistry`'s `Public` tier, so
+        /// `with_public_base_for_test` — not the `WorkspaceDeclared`-tier `with_base` the
+        /// alternate-registry tests above use — is the matching mock entry point.
+        #[tokio::test]
+        async fn test_generate_code_actions_on_module() {
+            let mut server = mockito::Server::new_async().await;
+            server
+                .mock("GET", "/github.com/gin-gonic/gin/@v/list")
+                .with_status(200)
+                .with_body("v1.9.0\nv1.9.1\nv1.10.0\n")
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = Arc::new(GoRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                server.url(),
+            ));
+            let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency(
+                    "github.com/gin-gonic/gin",
+                    Some("v1.9.0"),
+                    5,
+                )],
+                uri: uri.clone(),
+            };
+
+            let position = Position::new(5, 5);
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+
+            // `version_range` on line 5 spans columns 0..10; content must slice to
+            // exactly the declared requirement text there for the `literal_span_matches`
+            // guard in `generate_code_actions` to accept the edit.
+            let content = "\n\n\n\n\nv1.9.0    \n";
+
+            let actions = ecosystem
+                .generate_code_actions(
+                    &parse_result,
+                    position,
+                    &uri,
+                    VersionData::new(&cached_versions, &resolved_versions),
+                    content,
+                )
+                .await;
+
+            let ls_uri: tower_lsp_server::ls_types::Uri = uri.as_str().parse().unwrap();
+
+            // Actions are registry-derived "update to version" REFACTOR edits, one per
+            // candidate version; exactly one is marked preferred (the highest matching).
+            assert!(
+                actions.iter().any(|action| {
+                    action
+                        .edit
+                        .as_ref()
+                        .and_then(|edit| edit.changes.as_ref())
+                        .and_then(|changes| changes.get(&ls_uri))
+                        .is_some_and(|edits| edits.iter().any(|e| e.new_text.contains("v1.10.0")))
+                }),
+                "expected an action whose edit updates the dependency to v1.10.0, got: {actions:?}"
+            );
+            assert_eq!(
+                actions
+                    .iter()
+                    .filter(|action| action.is_preferred == Some(true))
+                    .count(),
+                1,
+                "expected exactly one preferred action, got: {actions:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_package_name() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let content = r"module example.com/myapp
+
+go 1.21
+
+require github.com/
+";
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![],
+                uri,
+            };
+
+            let position = Position::new(4, 19);
+
+            let completions = ecosystem
+                .generate_completions(
+                    &parse_result,
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(completions.items.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_outside_context() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+
+            let content = r"module example.com/myapp
+
+go 1.21
+";
+
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = MockParseResult {
+                dependencies: vec![],
+                uri,
+            };
+
+            let position = Position::new(0, 0);
+
+            let completions = ecosystem
+                .generate_completions(
+                    &parse_result,
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(completions.items.is_empty());
+        }
+
+        /// #1195 M4 regression: `VERSION_OPERATOR_CHARS` is empty for Go — `go.mod` requires a
+        /// bare exact semver with no comparator syntax at all, so nothing about the version
+        /// prefix's *shape* ever protected a `Version` position from `deps-lsp`'s raw-text
+        /// fallback before this PR; only `CompletionOrigin::Version` does now. Runs through the
+        /// real parser and the real `generate_completions` dispatch (not a synthetic
+        /// `ParseResult`), with a mocked 404 so the empty result is deterministic;
+        /// `list_mock.assert_async()` proves the `Version` context was actually reached rather
+        /// than resolving to `None`/`Unresolved`.
+        #[tokio::test]
+        async fn test_generate_completions_version_context_empty_result_stamps_version_origin() {
+            let mut server = mockito::Server::new_async().await;
+            let list_mock = server
+                .mock("GET", "/github.com/nonexistent/package12345/@v/list")
+                .with_status(404)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = Arc::new(GoRegistry::with_public_base_for_test(
+                Arc::clone(&cache),
+                server.url(),
+            ));
+            let ecosystem = GoEcosystem::with_context(registry, GoParseContext::default());
+
+            let content = "module example.com/myapp\n\ngo 1.21\n\nrequire github.com/nonexistent/package12345 v1.2.3\n";
+            let uri = deps_core::test_util::test_uri("/test/go.mod");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            assert_eq!(
+                parse_result.dependencies().len(),
+                1,
+                "fixture must parse to exactly one dependency: {content}"
+            );
+
+            let version_range = parse_result.dependencies()[0].version_range().unwrap();
+            let position: Position = version_range.start.into();
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            list_mock.assert_async().await;
+            assert!(completions.items.is_empty());
+            assert_eq!(
+                completions.origin,
+                deps_core::completion::CompletionOrigin::Version,
+                "go.mod has no comparator syntax at all — CompletionOrigin::Version is the only \
+             thing that can stop deps-lsp's fallback from leaking the raw module-path+version \
+             text into a package-name search here"
+            );
+        }
+
+        // --- issue #593: completion routes by cursor position, not by resolved DependencySource name ---
+
+        /// Two dependencies sharing one `PackageName` but resolving to different sources no
+        /// longer collapse into the old name-based "offer nothing for either" result (spec 034
+        /// F1's `CompletionSource::Ambiguous`) — cursor position now identifies exactly one
+        /// dependency, so each occurrence routes independently through its own source.
+        #[tokio::test]
+        async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+            let registry_dep =
+                dep_with_source("git.mycorp.example/pkg", DependencySource::Registry, 0);
+            let alternate_dep = dep_with_source(
+                "git.mycorp.example/pkg",
+                DependencySource::AlternateRegistry {
+                    index: "go-private:never-registered".to_string(),
+                    mirrors_crates_io: false,
+                },
+                1,
+            );
+            let alternate_position = alternate_dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![registry_dep, alternate_dep],
+                uri: deps_core::test_util::test_uri("/test/go.mod"),
+            };
+
+            // The alternate occurrence resolves deterministically without network: its index was
+            // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
+            // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
+            // the routing.
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    alternate_position,
+                    "v1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                results.is_empty(),
+                "unregistered alternate index must offer no completions"
+            );
+        }
+
+        /// An `AlternateRegistry` source whose index has no registered client offers no
+        /// completions — never a fall back to `proxy.golang.org` (the core of F1).
+        #[tokio::test]
+        async fn test_complete_versions_unregistered_alternate_offers_nothing() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+            let dep = dep_with_source(
+                "git.mycorp.example/internal/auth",
+                DependencySource::AlternateRegistry {
+                    index: "never-registered".to_string(),
+                    mirrors_crates_io: false,
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/go.mod"),
+            };
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "v1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(results.is_empty());
+        }
+
+        /// F1 end-to-end: a registered alternate client's version completion routes there,
+        /// proving completion actually consults the resolved `$GOENV` chain instead of always
+        /// querying the public root.
+        #[tokio::test]
+        async fn test_complete_versions_routes_to_registered_alternate_client() {
+            use crate::config::{GoProxyChain, GoProxyHop, GoProxyUrl};
+            use deps_core::net_policy::{RegistryAccessPolicy, WorkspaceRegistryAccess};
+
+            let mut alt_server = mockito::Server::new_async().await;
+            alt_server
+                .mock("GET", "/git.mycorp.example/internal/auth/@v/list")
+                .with_status(200)
+                .with_body("v1.0.0\nv1.5.0\n")
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_registry_policy(WorkspaceRegistryAccess::All);
+            let registry = Arc::new(GoRegistry::new(Arc::clone(&cache)));
+            let ecosystem =
+                GoEcosystem::with_context(Arc::clone(&registry), GoParseContext::default());
+
+            let policy = RegistryAccessPolicy::new(WorkspaceRegistryAccess::All);
+            let chain = GoProxyChain {
+                key: "go-proxy:test".to_string(),
+                hops: vec![GoProxyHop::Url(
+                    GoProxyUrl::new(&alt_server.url(), &policy).unwrap(),
+                )],
+                ..Default::default()
+            };
+            GoRegistry::register_alternate(&registry, &chain);
+
+            let dep = dep_with_source(
+                "git.mycorp.example/internal/auth",
+                DependencySource::AlternateRegistry {
+                    index: "go-proxy:test".to_string(),
+                    mirrors_crates_io: false,
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/go.mod"),
+            };
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "v1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+        }
+
+        /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+        /// `is_in_dependencies_section`'s `require (...)` block scan compose correctly
+        /// through the real trait method on realistic multi-line `go.mod` content.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = GoEcosystem::new(cache);
+            let content = "module example.com/myapp\n\nrequire (\n\tgithub.com/gin-gonic/g";
+            let line = content.lines().nth(3).unwrap();
+            let position = Position::new(3, line.chars().count() as u32);
+            assert_eq!(
+                ecosystem.fallback_completion_prefix(content, position.into()),
+                Some("github.com/gin-gonic/g")
+            );
+        }
     }
 }

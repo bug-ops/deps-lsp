@@ -1,12 +1,6 @@
 //! GitHub Actions ecosystem implementation for deps-lsp.
 
 use dashmap::DashMap;
-use std::any::Any;
-use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
-use url::Url;
-
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
@@ -18,6 +12,11 @@ use deps_core::{
     diagnostic::{Diagnostic, Severity},
     lsp_helpers::EcosystemFormatter,
 };
+use std::any::Any;
+use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
+use url::Url;
 
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 
@@ -26,11 +25,13 @@ use crate::registry::GithubActionsRegistry;
 use crate::types::{GithubActionsDependency, PinStyle};
 use deps_core::lsp_helpers::TagIndex;
 
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions. Empty: a `uses:` ref is a bare tag/branch/SHA, with no
-/// comparison/caret/tilde operator syntax (#1137).
 #[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &[];
+mod lsp;
+#[cfg(feature = "lsp-responses")]
+use lsp::{
+    VERSION_OPERATOR_CHARS, build_sha_pin_action, collect_pin_all_to_sha_edits,
+    position_past_sha_pin_own_ref,
+};
 
 /// Whether `gha_dep`'s ref is diagnosable as a tag — either because
 /// [`crate::parser::classify_uses_value`] already classified it as [`PinStyle::Tag`] from
@@ -62,51 +63,6 @@ fn is_registry_confirmed_tag(
             }),
         Some(PinStyle::Sha { .. }) | None => false,
     }
-}
-
-/// Whether `position` sits strictly past a comment-annotated SHA pin's own ref text —
-/// see [`GithubActionsEcosystem::generate_completions`]'s doc for why this check exists
-/// (issue #1182) and why it cannot be a check on the extracted completion prefix.
-///
-/// Finds the dependency whose (deliberately widened) `version_range` contains
-/// `position` and, only when it is a [`PinStyle::Sha`] with a `comment_tag` (the one
-/// form where `version_range` extends past the ref's own text), compares `position`
-/// against the SHA's own end column — [`crate::types::sha_pin_raw_sha`]'s length, added
-/// to the range's start — rather than the range's own (widened) end. A position exactly
-/// at that column (cursor immediately after the last SHA character, still typing it) is
-/// deliberately *not* past it, so a commentless SHA pin's ordinary end-of-ref position is
-/// unaffected; a [`PinStyle::Sha`] with no `comment_tag` has no widened tail at all
-/// (`sha_pin_raw_sha` still resolves it, but its `version_range` already ends exactly at
-/// the SHA's own end, so this predicate can never fire for it).
-#[cfg(feature = "lsp-responses")]
-fn position_past_sha_pin_own_ref(parse_result: &dyn ParseResultTrait, position: Position) -> bool {
-    let position: deps_core::position::Position = position.into();
-    parse_result.dependencies().into_iter().any(|dep| {
-        let Some(range) = dep.version_range() else {
-            return false;
-        };
-        if !deps_core::position_in_range(position, range) {
-            return false;
-        }
-        let Some(gha_dep) = dep.as_any().downcast_ref::<GithubActionsDependency>() else {
-            return false;
-        };
-        if !matches!(
-            gha_dep.pin,
-            Some(PinStyle::Sha {
-                comment_tag: Some(_)
-            })
-        ) {
-            return false;
-        }
-        let Some(sha) = crate::types::sha_pin_raw_sha(gha_dep) else {
-            return false;
-        };
-        let Ok(sha_len) = u32::try_from(sha.len()) else {
-            return false;
-        };
-        position.character > range.start.character.saturating_add(sha_len)
-    })
 }
 
 /// GitHub Actions ecosystem implementation.
@@ -569,67 +525,9 @@ fn mutable_ref_pin_diagnostics(
         .collect()
 }
 
-/// Builds the "Pin `{name}` to commit SHA" quickfix (issue #473, US-002) for the
-/// `PinStyle::Tag` dependency at `position`, if [`GithubActionsFormatter::sha_pin_replacement_for`]
-/// resolves its current tag against the shared `TagIndex`.
-///
-/// Returns `None` (no destructive/no-op edit, FR-005) when the dependency at `position`
-/// is not `PinStyle::Tag`, has no `version_range`, or the `TagIndex` lookup misses (cache
-/// miss — e.g. the document was opened before the registry fetch completed).
-///
-/// Deliberately **not** widened to [`is_registry_confirmed_tag`]'s `PinStyle::Branch`
-/// case the way [`mutable_ref_pin_diagnostics`] is (#551 plan): FR-005/plan §11 (see
-/// `test_build_sha_pin_action_no_quickfix_for_branch_pin`) already forbids this
-/// quickfix for a `PinStyle::Branch` step even when a same-named `TagIndex` entry
-/// exists, since git permits a branch and a tag to share one name and GitHub's own
-/// `uses:` ref resolution for that collision is undocumented — an *automated edit*
-/// that silently pins to the tag's commit could pin to a different commit than the
-/// ref actually resolves to at run time. A diagnostic's advisory text carries no such
-/// risk (pinning to *some* SHA is safer than a moving ref either way), but this
-/// destructive edit keeps the stricter, pre-#551 guard.
-///
-/// Delegates entirely to [`deps_core::lsp_helpers::build_sha_pin_action`] (issue #1138) via
-/// [`GithubActionsFormatter`]'s [`deps_core::lsp_helpers::ShaPinning`] impl, which carries
-/// this guard.
-#[cfg(feature = "lsp-responses")]
-fn build_sha_pin_action(
-    parse_result: &dyn ParseResultTrait,
-    position: Position,
-    uri: &Url,
-    formatter: &GithubActionsFormatter,
-) -> Option<CodeAction> {
-    deps_core::lsp_helpers::build_sha_pin_action(
-        parse_result,
-        position,
-        uri,
-        formatter,
-        MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
-    )
-}
-
-/// Builds one [`TextEdit`] per `PinStyle::Tag` step in `parse_result` resolvable to a
-/// commit SHA via `formatter`'s `TagIndex` — the bulk counterpart to
-/// [`build_sha_pin_action`]'s single-step quickfix (issue #633). A step with no
-/// resolvable `TagIndex` entry (cache miss) is silently skipped, exactly like that
-/// quickfix's own withholding behavior — never blocking on, or triggering, a fetch.
-#[cfg(feature = "lsp-responses")]
-fn collect_pin_all_to_sha_edits(
-    parse_result: &dyn ParseResultTrait,
-    formatter: &GithubActionsFormatter,
-) -> Vec<TextEdit> {
-    let edits: Vec<TextEdit> = parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| deps_core::lsp_helpers::sha_pin_text_edit(formatter, dep))
-        .collect();
-    deps_core::lsp_helpers::dedup_overlapping_edits(edits, "collect_pin_all_to_sha_edits")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::lsp_helpers::splice_resolved_line;
     use std::collections::HashMap;
 
     // --- issue #473: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
@@ -1110,209 +1008,6 @@ mod tests {
         );
     }
 
-    /// Exercises `build_sha_pin_action` directly rather than through
-    /// `GithubActionsEcosystem::generate_code_actions`: the shared default that override
-    /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
-    /// which would overwrite a hand-seeded `TagIndex` fixture with real GitHub data before
-    /// this function ever runs.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_offers_quickfix_on_tag_index_hit() {
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
-
-        let formatter = GithubActionsFormatter {
-            tag_index: Arc::new(dashmap::DashMap::new()),
-        };
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-
-        let action = build_sha_pin_action(&parse_result, position, &uri, &formatter)
-            .expect("expected a Pin-to-commit-SHA quickfix");
-        assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
-        let edit = action.edit.as_ref().unwrap();
-        let text_edits = edit
-            .changes
-            .as_ref()
-            .unwrap()
-            .get(&deps_core::to_ls_uri(&uri))
-            .unwrap();
-        assert_eq!(text_edits.len(), 1);
-        assert_eq!(text_edits[0].new_text, format!("{} # v4", "a".repeat(40)));
-    }
-
-    /// Critic S2: the lookup now goes through the shared `is_position_on_dependency`
-    /// convention (`version_range` only, GHA does not override it) rather than a
-    /// hand-rolled check that also matched `name_range` — a cursor on the action *name*
-    /// must not offer this quickfix, matching every other deps-lsp code action's UX.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_cursor_on_name_range_offers_nothing() {
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
-
-        let formatter = GithubActionsFormatter {
-            tag_index: Arc::new(dashmap::DashMap::new()),
-        };
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .name_range()
-            .start
-            .into();
-
-        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
-    }
-
-    /// FR-005: a `TagIndex` cache miss must never offer a destructive/no-op edit.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_no_quickfix_on_tag_index_miss() {
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
-
-        let formatter = GithubActionsFormatter {
-            tag_index: Arc::new(dashmap::DashMap::new()),
-        };
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-
-        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
-    }
-
-    /// FR-005/plan §11: a `PinStyle::Branch` step must never get the SHA-pin quickfix,
-    /// even if a `TagIndex` entry happens to exist for its literal ref text.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_no_quickfix_for_branch_pin() {
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: some-org/some-action@main\n";
-        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
-
-        let formatter = GithubActionsFormatter {
-            tag_index: Arc::new(dashmap::DashMap::new()),
-        };
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "main".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        formatter.tag_index.insert(
-            deps_core::PackageName::new("some-org/some-action"),
-            Arc::new(index),
-        );
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-
-        assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
-    }
-
-    /// FR-010 (security audit finding): a quoted `uses:` scalar must never get the
-    /// SHA-pin quickfix, even on a `TagIndex` hit — writing `{sha} # {tag}` inside the
-    /// quotes would corrupt the value and make it re-parse as `PinStyle::Branch`.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_no_quickfix_for_quoted_scalar() {
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
-        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
-        assert!(!parse_result.dependencies[0].is_plain_scalar);
-
-        let formatter = GithubActionsFormatter {
-            tag_index: Arc::new(dashmap::DashMap::new()),
-        };
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-
-        assert!(
-            build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
-            "a quoted uses: scalar must withhold the quickfix even on a TagIndex hit"
-        );
-    }
-
-    /// Security audit finding (issue #633): a `uses:` step written in YAML flow-mapping
-    /// style has real content (`, with: {...}}`) after the ref on the same line — the
-    /// quickfix must withhold itself even on a `TagIndex` hit, since appending `# v4`
-    /// would comment out the rest of the flow mapping and produce invalid, unterminated
-    /// YAML (reproduced live by the security audit against a real `yaml_rust2` re-parse).
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_no_quickfix_for_flow_mapping_step() {
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
-        let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
-        assert!(!parse_result.dependencies[0].is_last_on_line);
-
-        let formatter = GithubActionsFormatter {
-            tag_index: Arc::new(dashmap::DashMap::new()),
-        };
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-
-        assert!(
-            build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
-            "a flow-mapping uses: step must withhold the quickfix even on a TagIndex hit"
-        );
-    }
-
     // #758: exact-value `Ecosystem` conformance, replacing two hand-written tests.
     // `lockfile_filenames()` omitted — GHA has no lock file concept (`no_lockfile_support`
     // below, #782 gap 2). No completion/json-depth conformance: GHA never performs
@@ -1344,18 +1039,6 @@ mod tests {
         reachable: true;
         fixture: ".github/workflows/unresolved.yml" =>
             "on: push\njobs:\n  build:\n    steps:\n      - uses: \"actions/checkout@${{ env.CHECKOUT_REF }}\"\n      - uses: \"actions/setup-node@v4-${{ env.NODE_REF }}\"\n      - uses: \"actions/cache@$(CACHE_REF)\"\n      - uses: \"actions/upload-artifact@$(UPLOAD-REF)\"\n";
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (a `uses:` ref has no operator syntax), so an edit to one without the
-    // other fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod github_actions_operator_chars_conformance;
-        ecosystem: "github-actions";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &[];
     }
 
     #[test]
@@ -1409,591 +1092,11 @@ mod tests {
         assert_eq!(result.dependencies().len(), 1);
     }
 
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_splice_resolved_line_after_requirement() {
-        let markdown = "# actions/checkout\n\n**Requirement**: `v4.2.0`\n\n**Latest**: `v4.3.0`\n";
-        let spliced = splice_resolved_line(markdown, "v4.2.0", &"a".repeat(40));
-        let req_pos = spliced.find("**Requirement**").unwrap();
-        let resolved_pos = spliced.find("**Resolved**").unwrap();
-        let latest_pos = spliced.find("**Latest**").unwrap();
-        assert!(req_pos < resolved_pos);
-        assert!(resolved_pos < latest_pos);
-        assert!(spliced.contains("aaaaaaa…"));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_splice_resolved_line_after_current_when_present() {
-        let markdown = "# actions/checkout\n\n**Current**: `v4.2.0`\n\n**Requirement**: `v4`\n";
-        let spliced = splice_resolved_line(markdown, "v4.2.0", &"b".repeat(40));
-        let current_pos = spliced.find("**Current**").unwrap();
-        let resolved_pos = spliced.find("**Resolved**").unwrap();
-        let requirement_pos = spliced.find("**Requirement**").unwrap();
-        assert!(current_pos < resolved_pos);
-        assert!(resolved_pos < requirement_pos);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_splice_resolved_line_falls_back_to_append_when_no_anchor() {
-        let markdown = "# actions/checkout\n\nno anchors here\n";
-        let spliced = splice_resolved_line(markdown, "v4.2.0", &"c".repeat(40));
-        assert!(spliced.starts_with(markdown));
-        assert!(spliced.contains("**Resolved**"));
-    }
-
-    /// #501 (tester finding): the shared `deps_core::generate_hover` gate only sees
-    /// `VersionData` and cannot know a `PinStyle::Tag` step still has a real "Pin to commit
-    /// SHA" quickfix available via the ecosystem-private `TagIndex`. Seeding the index
-    /// directly simulates a fetch that succeeded before the session went offline;
-    /// `cache.set_offline(NetworkMode::Offline)` then makes the live fetch this call attempts fail without
-    /// touching the network (mirroring `HttpCache`'s real offline-cold behavior), so
-    /// `VersionData` carries no signal of its own and only the post-hoc restore can produce
-    /// the footer.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(deps_core::NetworkMode::Offline);
-        let eco = GithubActionsEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        eco.formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let position = parse_result.dependencies()[0].name_range().start.into();
-        let cached = HashMap::new();
-        let resolved = HashMap::new();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await
-            .expect("hover should be generated for the dependency on this line");
-
-        let content = hover.markdown();
-        assert!(
-            content.contains("Press `Cmd+.` to update version"),
-            "a Tag-pinned step with a warm TagIndex entry still offers the SHA-pin quickfix \
-             while offline, so the footer must be restored even with no VersionData signal; \
-             got: {}",
-            content
-        );
-    }
-
-    /// A `PinStyle::Tag` step with no `TagIndex` entry (true cold start, nothing ever
-    /// resolved) must not have the footer restored — there is no quickfix to advertise.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_footer_stays_omitted_offline_for_tag_pin_without_tag_index() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(deps_core::NetworkMode::Offline);
-        let eco = GithubActionsEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-
-        let position = parse_result.dependencies()[0].name_range().start.into();
-        let cached = HashMap::new();
-        let resolved = HashMap::new();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await
-            .expect("hover should be generated for the dependency on this line");
-
-        let content = hover.markdown();
-        assert!(
-            !content.contains("Press `Cmd+.` to update version"),
-            "no TagIndex entry exists, so there is no quickfix to restore the footer for; \
-             got: {}",
-            content
-        );
-    }
-
-    /// Regression for critic finding C1 (#550): a bare-major tag pin (`@v4`, "the most
-    /// common real-world GitHub Actions pinning convention" per `populate_tag_index`'s own
-    /// docs) whose repository's tags are *all* bare-major fails `tags_to_versions`' full
-    /// `major.minor.patch` semver filter entirely, so the live hover fetch genuinely
-    /// succeeds with `available_versions == Some([])` — the #550 hover fix correctly
-    /// suppresses the shared footer for that case in general, but `populate_tag_index`
-    /// indexes bare-major tags independently of that filter, so the SHA-pin quickfix is
-    /// still genuinely available here. Unlike the offline-only sibling test above, this
-    /// drives a real (mocked) network fetch through the actual `GithubActionsRegistry` to
-    /// prove the restore now fires **online** too, not just offline.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list() {
-        let sha = "a".repeat(40);
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/repos/actions/checkout/tags")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"name": "v4", "commit": {{"sha": "{sha}"}}}}]"#
-            ))
-            .create_async()
-            .await;
-
-        let registry = crate::registry::GithubActionsRegistry::for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-            false,
-        );
-        let formatter = GithubActionsFormatter::new(registry.tag_index());
-        let eco = GithubActionsEcosystem {
-            registry: Arc::new(registry),
-            formatter,
-        };
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0].name_range().start.into();
-        let cached = HashMap::new();
-        let resolved = HashMap::new();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                deps_core::VersionData::new(&cached, &resolved),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await
-            .expect("hover should be generated for the dependency on this line");
-
-        let content = hover.markdown();
-        assert!(
-            !content.contains("**Recent versions**"),
-            "an all-bare-major tag list has zero full-semver entries, so the section \
-             must stay omitted; got: {}",
-            content
-        );
-        assert!(
-            content.contains("Press `Cmd+.` to update version"),
-            "a Tag-pinned step whose live fetch genuinely succeeded empty still has a \
-             real SHA-pin quickfix via TagIndex, so the footer must be restored online \
-             too, not just offline; got: {}",
-            content
-        );
-    }
-
-    /// FR-010 (security audit finding, mirrored from
-    /// `test_build_sha_pin_action_no_quickfix_for_quoted_scalar`): a quoted `uses:` scalar
-    /// never gets the SHA-pin quickfix even on a `TagIndex` hit, since `version_range` sits
-    /// inside the quotes and editing it there would corrupt the value. The footer
-    /// restoration must withhold itself the same way `build_sha_pin_action` does, not just
-    /// check `pin`/`TagIndex` resolvability.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_footer_not_restored_offline_for_quoted_tag_pin() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(deps_core::NetworkMode::Offline);
-        let eco = GithubActionsEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        eco.formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let position = parse_result.dependencies()[0].name_range().start.into();
-        let cached = HashMap::new();
-        let resolved = HashMap::new();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await
-            .expect("hover should be generated for the dependency on this line");
-
-        let content = hover.markdown();
-        assert!(
-            !content.contains("Press `Cmd+.` to update version"),
-            "a quoted uses: scalar offers no SHA-pin quickfix even on a TagIndex hit, so the \
-             footer must not be restored; got: {}",
-            content
-        );
-    }
-
-    /// Regression for #1178: a flow-style `uses:` step (issue #633's
-    /// `is_last_on_line == false` scenario — `, with: {...}}` follows the ref on the same
-    /// line) must not have the footer restored, even on a `TagIndex` hit. Before #1178 the
-    /// hand-rolled eligibility check omitted this `is_last_on_line` condition entirely, so
-    /// the footer was wrongly restored for a step whose quickfix `build_sha_pin_action`
-    /// itself withholds (see `test_build_sha_pin_action_no_quickfix_for_flow_mapping_step`).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_footer_not_restored_offline_for_flow_mapping_tag_pin() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(deps_core::NetworkMode::Offline);
-        let eco = GithubActionsEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let gha_dep = parse_result.dependencies()[0]
-            .as_any()
-            .downcast_ref::<GithubActionsDependency>()
-            .unwrap();
-        assert!(!gha_dep.is_last_on_line);
-
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "v4".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        eco.formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let position = parse_result.dependencies()[0].name_range().start.into();
-        let cached = HashMap::new();
-        let resolved = HashMap::new();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                deps_core::VersionData::new(&cached, &resolved).with_offline(true),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await
-            .expect("hover should be generated for the dependency on this line");
-
-        let content = hover.markdown();
-        assert!(
-            !content.contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
-            "a flow-style uses: step is not the last token on its line, so appending a SHA \
-             pin comment would produce invalid YAML; the footer must not be restored even \
-             on a TagIndex hit; got: {}",
-            content
-        );
-    }
-
-    // --- issue #633/#640: bulk "Pin all to SHA" collector + lens ---
-
-    #[cfg(feature = "lsp-responses")]
-    fn seed_tag(eco: &GithubActionsEcosystem, name: &str, tag: &str, sha: &str) {
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            tag.to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(sha).unwrap(),
-        );
-        eco.formatter
-            .tag_index
-            .insert(deps_core::PackageName::new(name), Arc::new(index));
-    }
-
     fn empty_versions() -> (
         HashMap<deps_core::PackageName, deps_core::PackageVersions>,
         HashMap<deps_core::PackageName, deps_core::ConcreteVersion>,
     ) {
         (HashMap::new(), HashMap::new())
-    }
-
-    /// (C′) test split, issue #640: the lens title/command-id assertion stays owned by
-    /// this crate — GHA's `pin_all_to_sha_noun()` wording must render byte-identically —
-    /// but now drives `deps_core::lsp_helpers::build_pin_all_to_sha_lens` directly from
-    /// `collect_pin_all_to_sha_edits`'s count, the same call `deps-lsp`'s
-    /// `handlers::code_lens` makes, rather than going through the (now-deleted)
-    /// `generate_code_lenses` override.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_build_pin_all_to_sha_lens_title_and_command_id() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
-        seed_tag(&eco, "actions/setup-node", "v3", &"b".repeat(40));
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n\
-             \x20 - uses: actions/checkout@v4\n\
-             \x20 - uses: actions/setup-node@v3\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let count = eco
-            .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
-            .len();
-        let lens = deps_core::lsp_helpers::build_pin_all_to_sha_lens(
-            count,
-            eco.pin_all_to_sha_noun(),
-            &uri,
-        )
-        .expect("expected a Pin-all-to-SHA lens");
-        let command = lens.command.unwrap();
-        assert_eq!(command.title, "Pin 2 actions to commit SHA");
-        assert_eq!(
-            command.command,
-            deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_singular_count_for_one_step() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert_eq!(edits.len(), 1);
-    }
-
-    /// #907 review follow-up (code review): the "Update N outdated dependencies" code
-    /// lens (`collect_update_all_edits`, shared `deps-core` logic) must agree with
-    /// inlay hints/diagnostics on a SHA pin's status. Here the SHA's registry-confirmed
-    /// tag (`TagIndex.sha_to_tag`) is `v4.0.0`, genuinely behind `latest` `v4.3.1`, even
-    /// though the human-written comment (`# v4`) matches at major-only precision — the
-    /// lens must count and edit it as outdated, not silently exclude it.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_update_all_edits_counts_sha_pin_outdated_via_tag_index_ground_truth() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        let sha = "a".repeat(40);
-        let mut index = TagIndex::default();
-        index.sha_to_tag.insert(
-            deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap(),
-            "v4.0.0".to_string(),
-        );
-        // Needed so `format_version_replacing_for` produces a real replacement for `latest`,
-        // or a `tag_to_sha` miss falls back to the unchanged literal and drops the edit.
-        index.tag_to_sha.insert(
-            "v4.3.1".to_string(),
-            deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
-        );
-        eco.formatter.tag_index.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            Arc::new(index),
-        );
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4\n");
-        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-
-        let mut cached = HashMap::new();
-        cached.insert(
-            deps_core::PackageName::new("actions/checkout"),
-            deps_core::PackageVersions::latest_only("v4.3.1"),
-        );
-        let resolved = HashMap::new();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = deps_core::lsp_helpers::collect_update_all_edits(
-            parse_result.as_ref(),
-            &content,
-            versions,
-            &eco.formatter,
-        );
-
-        assert_eq!(
-            edits.len(),
-            1,
-            "the SHA's real tag v4.0.0 is behind latest v4.3.1 and must be counted as \
-             outdated, even though its comment says v4 (which matches v4.3.1 at \
-             major-only precision)"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_empty_when_no_tag_pins() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = format!("steps:\n  - uses: actions/checkout@{}\n", "a".repeat(40));
-        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert!(
-            edits.is_empty(),
-            "an already-SHA-pinned workflow must produce no edits: {edits:?}"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_empty_when_tag_index_miss() {
-        // No `seed_tag` call: the one Tag-pinned step is a cache miss, skipped gracefully.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert!(
-            edits.is_empty(),
-            "a TagIndex cache miss must be skipped gracefully, not promise a no-op edit: \
-             {edits:?}"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_skips_unresolvable_step_but_counts_others() {
-        // A mix of one resolvable Tag pin and one cache-miss Tag pin: the collector must
-        // count only the resolvable one, silently skipping the other rather than refusing
-        // the whole batch or counting a step it cannot actually edit.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n\
-             \x20 - uses: actions/checkout@v4\n\
-             \x20 - uses: some-org/unresolved-action@v1\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert_eq!(
-            edits.len(),
-            1,
-            "only the resolvable step must be counted: {edits:?}"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_produces_correct_workspace_edit_for_multiple_steps()
-    {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        let sha1 = "a".repeat(40);
-        let sha2 = "b".repeat(40);
-        seed_tag(&eco, "actions/checkout", "v4", &sha1);
-        seed_tag(&eco, "actions/setup-node", "v3", &sha2);
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n\
-             \x20 - uses: actions/checkout@v4\n\
-             \x20 - uses: actions/setup-node@v3\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
-        let checkout_range = deps
-            .iter()
-            .find(|d| d.name().as_str() == "actions/checkout")
-            .and_then(|d| d.version_range())
-            .expect("actions/checkout must have a version_range");
-        let setup_node_range = deps
-            .iter()
-            .find(|d| d.name().as_str() == "actions/setup-node")
-            .and_then(|d| d.version_range())
-            .expect("actions/setup-node must have a version_range");
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert_eq!(edits.len(), 2);
-        // M1 (critic): the risk here is writing 40+ chars at the wrong span, so each edit's
-        // range must be pinned, not just its text — proving the mapping doesn't swap or shift.
-        let checkout_edit = edits
-            .iter()
-            .find(|e| e.new_text == format!("{sha1} # v4"))
-            .expect("expected an edit for actions/checkout");
-        assert_eq!(checkout_edit.range, checkout_range.into());
-        let setup_node_edit = edits
-            .iter()
-            .find(|e| e.new_text == format!("{sha2} # v3"))
-            .expect("expected an edit for actions/setup-node");
-        assert_eq!(setup_node_edit.range, setup_node_range.into());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_empty_for_branch_and_quoted_scalar() {
-        // Both must be withheld, matching `build_sha_pin_action`'s own guards (FR-005,
-        // FR-010) — the bulk aggregator must never be laxer than the per-step quickfix.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        seed_tag(&eco, "some-org/some-action", "main", &"a".repeat(40));
-        seed_tag(&eco, "actions/checkout", "v4", &"b".repeat(40));
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n\
-             \x20 - uses: some-org/some-action@main\n\
-             \x20 - uses: \"actions/checkout@v4\"\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert!(
-            edits.is_empty(),
-            "a branch pin and a quoted-scalar tag pin must both be withheld: {edits:?}"
-        );
-    }
-
-    /// Security audit finding (issue #633): the bulk aggregator must skip a flow-mapping
-    /// `uses:` step the same way the per-step quickfix does — a click on "Pin N actions
-    /// to commit SHA" must never turn a real click into workflow-wide YAML corruption.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_empty_for_flow_mapping_step() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert!(
-            edits.is_empty(),
-            "a flow-mapping tag pin must be withheld, not corrupted: {edits:?}"
-        );
     }
 
     // --- #706 review (S3): end-to-end coverage for an action.yml-routed document ---
@@ -2032,42 +1135,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_for_composite_action_yml_dependency() {
-        // Offline: the shared hover helper otherwise drives a live registry fetch, which is
-        // irrelevant here and would outlive the test as a leaked background task.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        cache.set_offline(deps_core::NetworkMode::Offline);
-        let eco = GithubActionsEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/repo/action.yml");
-        let content = "name: My Action\n\
-             runs:\n\
-             \x20 using: composite\n\
-             \x20 steps:\n\
-             \x20   - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let name_position = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
-            .name_range()
-            .start
-            .into();
-        let (cached, resolved) = empty_versions();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                name_position,
-                deps_core::VersionData::new(&cached, &resolved),
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(
-            hover.is_some(),
-            "hovering a uses: step inside a root-level action.yml must produce a hover"
-        );
-    }
-
     /// Security audit finding (LOW): end-to-end confirmation that a stray, unrelated
     /// `action.yml` (no top-level `runs:` key) degrades gracefully through the full
     /// `generate_diagnostics` path — zero diagnostics, not a panic or a spurious fetch.
@@ -2092,25 +1159,6 @@ mod tests {
             .await;
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-    }
-
-    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
-    /// the `uses:` step-key detection compose correctly through the real trait
-    /// method on realistic multi-line workflow content.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        let content = "jobs:\n  build:\n    steps:\n      - uses: actions/check";
-        let line = content.lines().nth(3).unwrap();
-        let position = Position::new(3, line.chars().count() as u32);
-        // Raw trim only, no manifest-syntax stripping — matches this ecosystem's
-        // "no override" prefix shape (see `extract_prefix`'s doc).
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            Some("- uses: actions/check")
-        );
     }
 
     #[test]
@@ -2176,230 +1224,1059 @@ mod tests {
         assert!(eco.completion_insert_text(&meta).is_none());
     }
 
-    // --- #793 characterization: `generate_completions` dispatch, pinned before the
-    // wildcard-match refactor. GitHub Actions serves only `Version` (no package-name
-    // search); `PackageName`/`Feature`/`None` must all return an untouched `Completions::default()`.
-
     #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GithubActionsEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0].name_range().start.into();
+    mod lsp_tests {
+        use super::*;
 
-        let result = eco
-            .generate_completions(
+        use deps_core::lsp_helpers::splice_resolved_line;
+
+        /// Exercises `build_sha_pin_action` directly rather than through
+        /// `GithubActionsEcosystem::generate_code_actions`: the shared default that override
+        /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
+        /// which would overwrite a hand-seeded `TagIndex` fixture with real GitHub data before
+        /// this function ever runs.
+        #[test]
+        fn test_build_sha_pin_action_offers_quickfix_on_tag_index_hit() {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+            let formatter = GithubActionsFormatter {
+                tag_index: Arc::new(dashmap::DashMap::new()),
+            };
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "v4".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+
+            let action = build_sha_pin_action(&parse_result, position, &uri, &formatter)
+                .expect("expected a Pin-to-commit-SHA quickfix");
+            assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
+            let edit = action.edit.as_ref().unwrap();
+            let text_edits = edit
+                .changes
+                .as_ref()
+                .unwrap()
+                .get(&deps_core::to_ls_uri(&uri))
+                .unwrap();
+            assert_eq!(text_edits.len(), 1);
+            assert_eq!(text_edits[0].new_text, format!("{} # v4", "a".repeat(40)));
+        }
+
+        /// Critic S2: the lookup now goes through the shared `is_position_on_dependency`
+        /// convention (`version_range` only, GHA does not override it) rather than a
+        /// hand-rolled check that also matched `name_range` — a cursor on the action *name*
+        /// must not offer this quickfix, matching every other deps-lsp code action's UX.
+        #[test]
+        fn test_build_sha_pin_action_cursor_on_name_range_offers_nothing() {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+            let formatter = GithubActionsFormatter {
+                tag_index: Arc::new(dashmap::DashMap::new()),
+            };
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "v4".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .name_range()
+                .start
+                .into();
+
+            assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+        }
+
+        /// FR-005: a `TagIndex` cache miss must never offer a destructive/no-op edit.
+        #[test]
+        fn test_build_sha_pin_action_no_quickfix_on_tag_index_miss() {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+            let formatter = GithubActionsFormatter {
+                tag_index: Arc::new(dashmap::DashMap::new()),
+            };
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+
+            assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+        }
+
+        /// FR-005/plan §11: a `PinStyle::Branch` step must never get the SHA-pin quickfix,
+        /// even if a `TagIndex` entry happens to exist for its literal ref text.
+        #[test]
+        fn test_build_sha_pin_action_no_quickfix_for_branch_pin() {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: some-org/some-action@main\n";
+            let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+
+            let formatter = GithubActionsFormatter {
+                tag_index: Arc::new(dashmap::DashMap::new()),
+            };
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "main".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            formatter.tag_index.insert(
+                deps_core::PackageName::new("some-org/some-action"),
+                Arc::new(index),
+            );
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+
+            assert!(build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none());
+        }
+
+        /// FR-010 (security audit finding): a quoted `uses:` scalar must never get the
+        /// SHA-pin quickfix, even on a `TagIndex` hit — writing `{sha} # {tag}` inside the
+        /// quotes would corrupt the value and make it re-parse as `PinStyle::Branch`.
+        #[test]
+        fn test_build_sha_pin_action_no_quickfix_for_quoted_scalar() {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
+            let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+            assert!(!parse_result.dependencies[0].is_plain_scalar);
+
+            let formatter = GithubActionsFormatter {
+                tag_index: Arc::new(dashmap::DashMap::new()),
+            };
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "v4".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+
+            assert!(
+                build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
+                "a quoted uses: scalar must withhold the quickfix even on a TagIndex hit"
+            );
+        }
+
+        /// Security audit finding (issue #633): a `uses:` step written in YAML flow-mapping
+        /// style has real content (`, with: {...}}`) after the ref on the same line — the
+        /// quickfix must withhold itself even on a `TagIndex` hit, since appending `# v4`
+        /// would comment out the rest of the flow mapping and produce invalid, unterminated
+        /// YAML (reproduced live by the security audit against a real `yaml_rust2` re-parse).
+        #[test]
+        fn test_build_sha_pin_action_no_quickfix_for_flow_mapping_step() {
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
+            let parse_result = crate::parser::parse_workflow_yaml(content, &uri).unwrap();
+            assert!(!parse_result.dependencies[0].is_last_on_line);
+
+            let formatter = GithubActionsFormatter {
+                tag_index: Arc::new(dashmap::DashMap::new()),
+            };
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "v4".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+
+            assert!(
+                build_sha_pin_action(&parse_result, position, &uri, &formatter).is_none(),
+                "a flow-mapping uses: step must withhold the quickfix even on a TagIndex hit"
+            );
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (a `uses:` ref has no operator syntax), so an edit to one without the
+        // other fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod github_actions_operator_chars_conformance;
+            ecosystem: "github-actions";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &[];
+        }
+
+        #[test]
+        fn test_splice_resolved_line_after_requirement() {
+            let markdown =
+                "# actions/checkout\n\n**Requirement**: `v4.2.0`\n\n**Latest**: `v4.3.0`\n";
+            let spliced = splice_resolved_line(markdown, "v4.2.0", &"a".repeat(40));
+            let req_pos = spliced.find("**Requirement**").unwrap();
+            let resolved_pos = spliced.find("**Resolved**").unwrap();
+            let latest_pos = spliced.find("**Latest**").unwrap();
+            assert!(req_pos < resolved_pos);
+            assert!(resolved_pos < latest_pos);
+            assert!(spliced.contains("aaaaaaa…"));
+        }
+
+        #[test]
+        fn test_splice_resolved_line_after_current_when_present() {
+            let markdown = "# actions/checkout\n\n**Current**: `v4.2.0`\n\n**Requirement**: `v4`\n";
+            let spliced = splice_resolved_line(markdown, "v4.2.0", &"b".repeat(40));
+            let current_pos = spliced.find("**Current**").unwrap();
+            let resolved_pos = spliced.find("**Resolved**").unwrap();
+            let requirement_pos = spliced.find("**Requirement**").unwrap();
+            assert!(current_pos < resolved_pos);
+            assert!(resolved_pos < requirement_pos);
+        }
+
+        #[test]
+        fn test_splice_resolved_line_falls_back_to_append_when_no_anchor() {
+            let markdown = "# actions/checkout\n\nno anchors here\n";
+            let spliced = splice_resolved_line(markdown, "v4.2.0", &"c".repeat(40));
+            assert!(spliced.starts_with(markdown));
+            assert!(spliced.contains("**Resolved**"));
+        }
+
+        /// #501 (tester finding): the shared `deps_core::generate_hover` gate only sees
+        /// `VersionData` and cannot know a `PinStyle::Tag` step still has a real "Pin to commit
+        /// SHA" quickfix available via the ecosystem-private `TagIndex`. Seeding the index
+        /// directly simulates a fetch that succeeded before the session went offline;
+        /// `cache.set_offline(NetworkMode::Offline)` then makes the live fetch this call attempts fail without
+        /// touching the network (mirroring `HttpCache`'s real offline-cold behavior), so
+        /// `VersionData` carries no signal of its own and only the post-hoc restore can produce
+        /// the footer.
+        #[tokio::test]
+        async fn test_generate_hover_restores_footer_offline_for_tag_pin_with_warm_tag_index() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_offline(deps_core::NetworkMode::Offline);
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "v4".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = parse_result.dependencies()[0].name_range().start.into();
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover should be generated for the dependency on this line");
+
+            let content = hover.markdown();
+            assert!(
+                content.contains("Press `Cmd+.` to update version"),
+                "a Tag-pinned step with a warm TagIndex entry still offers the SHA-pin quickfix \
+             while offline, so the footer must be restored even with no VersionData signal; \
+             got: {}",
+                content
+            );
+        }
+
+        /// A `PinStyle::Tag` step with no `TagIndex` entry (true cold start, nothing ever
+        /// resolved) must not have the footer restored — there is no quickfix to advertise.
+        #[tokio::test]
+        async fn test_generate_hover_footer_stays_omitted_offline_for_tag_pin_without_tag_index() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_offline(deps_core::NetworkMode::Offline);
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+            let position = parse_result.dependencies()[0].name_range().start.into();
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover should be generated for the dependency on this line");
+
+            let content = hover.markdown();
+            assert!(
+                !content.contains("Press `Cmd+.` to update version"),
+                "no TagIndex entry exists, so there is no quickfix to restore the footer for; \
+             got: {}",
+                content
+            );
+        }
+
+        /// Regression for critic finding C1 (#550): a bare-major tag pin (`@v4`, "the most
+        /// common real-world GitHub Actions pinning convention" per `populate_tag_index`'s own
+        /// docs) whose repository's tags are *all* bare-major fails `tags_to_versions`' full
+        /// `major.minor.patch` semver filter entirely, so the live hover fetch genuinely
+        /// succeeds with `available_versions == Some([])` — the #550 hover fix correctly
+        /// suppresses the shared footer for that case in general, but `populate_tag_index`
+        /// indexes bare-major tags independently of that filter, so the SHA-pin quickfix is
+        /// still genuinely available here. Unlike the offline-only sibling test above, this
+        /// drives a real (mocked) network fetch through the actual `GithubActionsRegistry` to
+        /// prove the restore now fires **online** too, not just offline.
+        #[tokio::test]
+        async fn test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list()
+         {
+            let sha = "a".repeat(40);
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("GET", "/repos/actions/checkout/tags")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"name": "v4", "commit": {{"sha": "{sha}"}}}}]"#
+                ))
+                .create_async()
+                .await;
+
+            let registry = crate::registry::GithubActionsRegistry::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+                false,
+            );
+            let formatter = GithubActionsFormatter::new(registry.tag_index());
+            let eco = GithubActionsEcosystem {
+                registry: Arc::new(registry),
+                formatter,
+            };
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position = parse_result.dependencies()[0].name_range().start.into();
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover should be generated for the dependency on this line");
+
+            let content = hover.markdown();
+            assert!(
+                !content.contains("**Recent versions**"),
+                "an all-bare-major tag list has zero full-semver entries, so the section \
+             must stay omitted; got: {}",
+                content
+            );
+            assert!(
+                content.contains("Press `Cmd+.` to update version"),
+                "a Tag-pinned step whose live fetch genuinely succeeded empty still has a \
+             real SHA-pin quickfix via TagIndex, so the footer must be restored online \
+             too, not just offline; got: {}",
+                content
+            );
+        }
+
+        /// FR-010 (security audit finding, mirrored from
+        /// `test_build_sha_pin_action_no_quickfix_for_quoted_scalar`): a quoted `uses:` scalar
+        /// never gets the SHA-pin quickfix even on a `TagIndex` hit, since `version_range` sits
+        /// inside the quotes and editing it there would corrupt the value. The footer
+        /// restoration must withhold itself the same way `build_sha_pin_action` does, not just
+        /// check `pin`/`TagIndex` resolvability.
+        #[tokio::test]
+        async fn test_generate_hover_footer_not_restored_offline_for_quoted_tag_pin() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_offline(deps_core::NetworkMode::Offline);
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: \"actions/checkout@v4\"\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "v4".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = parse_result.dependencies()[0].name_range().start.into();
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover should be generated for the dependency on this line");
+
+            let content = hover.markdown();
+            assert!(
+                !content.contains("Press `Cmd+.` to update version"),
+                "a quoted uses: scalar offers no SHA-pin quickfix even on a TagIndex hit, so the \
+             footer must not be restored; got: {}",
+                content
+            );
+        }
+
+        /// Regression for #1178: a flow-style `uses:` step (issue #633's
+        /// `is_last_on_line == false` scenario — `, with: {...}}` follows the ref on the same
+        /// line) must not have the footer restored, even on a `TagIndex` hit. Before #1178 the
+        /// hand-rolled eligibility check omitted this `is_last_on_line` condition entirely, so
+        /// the footer was wrongly restored for a step whose quickfix `build_sha_pin_action`
+        /// itself withholds (see `test_build_sha_pin_action_no_quickfix_for_flow_mapping_step`).
+        #[tokio::test]
+        async fn test_generate_hover_footer_not_restored_offline_for_flow_mapping_tag_pin() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_offline(deps_core::NetworkMode::Offline);
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let gha_dep = parse_result.dependencies()[0]
+                .as_any()
+                .downcast_ref::<GithubActionsDependency>()
+                .unwrap();
+            assert!(!gha_dep.is_last_on_line);
+
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "v4".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let position = parse_result.dependencies()[0].name_range().start.into();
+            let cached = HashMap::new();
+            let resolved = HashMap::new();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved).with_offline(true),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await
+                .expect("hover should be generated for the dependency on this line");
+
+            let content = hover.markdown();
+            assert!(
+                !content.contains(deps_core::lsp_helpers::CMD_DOT_FOOTER),
+                "a flow-style uses: step is not the last token on its line, so appending a SHA \
+             pin comment would produce invalid YAML; the footer must not be restored even \
+             on a TagIndex hit; got: {}",
+                content
+            );
+        }
+
+        // --- issue #633/#640: bulk "Pin all to SHA" collector + lens ---
+
+        fn seed_tag(eco: &GithubActionsEcosystem, name: &str, tag: &str, sha: &str) {
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                tag.to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(sha).unwrap(),
+            );
+            eco.formatter
+                .tag_index
+                .insert(deps_core::PackageName::new(name), Arc::new(index));
+        }
+
+        /// (C′) test split, issue #640: the lens title/command-id assertion stays owned by
+        /// this crate — GHA's `pin_all_to_sha_noun()` wording must render byte-identically —
+        /// but now drives `deps_core::lsp_helpers::build_pin_all_to_sha_lens` directly from
+        /// `collect_pin_all_to_sha_edits`'s count, the same call `deps-lsp`'s
+        /// `handlers::code_lens` makes, rather than going through the (now-deleted)
+        /// `generate_code_lenses` override.
+        #[tokio::test]
+        async fn test_build_pin_all_to_sha_lens_title_and_command_id() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+            seed_tag(&eco, "actions/setup-node", "v3", &"b".repeat(40));
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n\
+             \x20 - uses: actions/checkout@v4\n\
+             \x20 - uses: actions/setup-node@v3\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let count = eco
+                .collect_pin_all_to_sha_edits(parse_result.as_ref(), versions)
+                .len();
+            let lens = deps_core::lsp_helpers::build_pin_all_to_sha_lens(
+                count,
+                eco.pin_all_to_sha_noun(),
+                &uri,
+            )
+            .expect("expected a Pin-all-to-SHA lens");
+            let command = lens.command.unwrap();
+            assert_eq!(command.title, "Pin 2 actions to commit SHA");
+            assert_eq!(
+                command.command,
+                deps_core::lsp_helpers::PIN_ALL_TO_SHA_COMMAND_ID
+            );
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_singular_count_for_one_step() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert_eq!(edits.len(), 1);
+        }
+
+        /// #907 review follow-up (code review): the "Update N outdated dependencies" code
+        /// lens (`collect_update_all_edits`, shared `deps-core` logic) must agree with
+        /// inlay hints/diagnostics on a SHA pin's status. Here the SHA's registry-confirmed
+        /// tag (`TagIndex.sha_to_tag`) is `v4.0.0`, genuinely behind `latest` `v4.3.1`, even
+        /// though the human-written comment (`# v4`) matches at major-only precision — the
+        /// lens must count and edit it as outdated, not silently exclude it.
+        #[tokio::test]
+        async fn test_collect_update_all_edits_counts_sha_pin_outdated_via_tag_index_ground_truth()
+        {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let sha = "a".repeat(40);
+            let mut index = TagIndex::default();
+            index.sha_to_tag.insert(
+                deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap(),
+                "v4.0.0".to_string(),
+            );
+            // Needed so `format_version_replacing_for` produces a real replacement for `latest`,
+            // or a `tag_to_sha` miss falls back to the unchanged literal and drops the edit.
+            index.tag_to_sha.insert(
+                "v4.3.1".to_string(),
+                deps_core::lsp_helpers::CommitSha::parse(&"b".repeat(40)).unwrap(),
+            );
+            eco.formatter.tag_index.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                Arc::new(index),
+            );
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v4\n");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+
+            let mut cached = HashMap::new();
+            cached.insert(
+                deps_core::PackageName::new("actions/checkout"),
+                deps_core::PackageVersions::latest_only("v4.3.1"),
+            );
+            let resolved = HashMap::new();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = deps_core::lsp_helpers::collect_update_all_edits(
+                parse_result.as_ref(),
+                &content,
+                versions,
+                &eco.formatter,
+            );
+
+            assert_eq!(
+                edits.len(),
+                1,
+                "the SHA's real tag v4.0.0 is behind latest v4.3.1 and must be counted as \
+             outdated, even though its comment says v4 (which matches v4.3.1 at \
+             major-only precision)"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_empty_when_no_tag_pins() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{}\n", "a".repeat(40));
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert!(
+                edits.is_empty(),
+                "an already-SHA-pinned workflow must produce no edits: {edits:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_empty_when_tag_index_miss() {
+            // No `seed_tag` call: the one Tag-pinned step is a cache miss, skipped gracefully.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert!(
+                edits.is_empty(),
+                "a TagIndex cache miss must be skipped gracefully, not promise a no-op edit: \
+             {edits:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_skips_unresolvable_step_but_counts_others() {
+            // A mix of one resolvable Tag pin and one cache-miss Tag pin: the collector must
+            // count only the resolvable one, silently skipping the other rather than refusing
+            // the whole batch or counting a step it cannot actually edit.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n\
+             \x20 - uses: actions/checkout@v4\n\
+             \x20 - uses: some-org/unresolved-action@v1\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert_eq!(
+                edits.len(),
+                1,
+                "only the resolvable step must be counted: {edits:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_produces_correct_workspace_edit_for_multiple_steps()
+         {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let sha1 = "a".repeat(40);
+            let sha2 = "b".repeat(40);
+            seed_tag(&eco, "actions/checkout", "v4", &sha1);
+            seed_tag(&eco, "actions/setup-node", "v3", &sha2);
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n\
+             \x20 - uses: actions/checkout@v4\n\
+             \x20 - uses: actions/setup-node@v3\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            let checkout_range = deps
+                .iter()
+                .find(|d| d.name().as_str() == "actions/checkout")
+                .and_then(|d| d.version_range())
+                .expect("actions/checkout must have a version_range");
+            let setup_node_range = deps
+                .iter()
+                .find(|d| d.name().as_str() == "actions/setup-node")
+                .and_then(|d| d.version_range())
+                .expect("actions/setup-node must have a version_range");
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert_eq!(edits.len(), 2);
+            // M1 (critic): the risk here is writing 40+ chars at the wrong span, so each edit's
+            // range must be pinned, not just its text — proving the mapping doesn't swap or shift.
+            let checkout_edit = edits
+                .iter()
+                .find(|e| e.new_text == format!("{sha1} # v4"))
+                .expect("expected an edit for actions/checkout");
+            assert_eq!(checkout_edit.range, checkout_range.into());
+            let setup_node_edit = edits
+                .iter()
+                .find(|e| e.new_text == format!("{sha2} # v3"))
+                .expect("expected an edit for actions/setup-node");
+            assert_eq!(setup_node_edit.range, setup_node_range.into());
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_empty_for_branch_and_quoted_scalar() {
+            // Both must be withheld, matching `build_sha_pin_action`'s own guards (FR-005,
+            // FR-010) — the bulk aggregator must never be laxer than the per-step quickfix.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            seed_tag(&eco, "some-org/some-action", "main", &"a".repeat(40));
+            seed_tag(&eco, "actions/checkout", "v4", &"b".repeat(40));
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n\
+             \x20 - uses: some-org/some-action@main\n\
+             \x20 - uses: \"actions/checkout@v4\"\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert!(
+                edits.is_empty(),
+                "a branch pin and a quoted-scalar tag pin must both be withheld: {edits:?}"
+            );
+        }
+
+        /// Security audit finding (issue #633): the bulk aggregator must skip a flow-mapping
+        /// `uses:` step the same way the per-step quickfix does — a click on "Pin N actions
+        /// to commit SHA" must never turn a real click into workflow-wide YAML corruption.
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_empty_for_flow_mapping_step() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            seed_tag(&eco, "actions/checkout", "v4", &"a".repeat(40));
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - {uses: actions/checkout@v4, with: {node: 20}}\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert!(
+                edits.is_empty(),
+                "a flow-mapping tag pin must be withheld, not corrupted: {edits:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_hover_for_composite_action_yml_dependency() {
+            // Offline: the shared hover helper otherwise drives a live registry fetch, which is
+            // irrelevant here and would outlive the test as a leaked background task.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            cache.set_offline(deps_core::NetworkMode::Offline);
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/action.yml");
+            let content = "name: My Action\n\
+             runs:\n\
+             \x20 using: composite\n\
+             \x20 steps:\n\
+             \x20   - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let name_position = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+                .name_range()
+                .start
+                .into();
+            let (cached, resolved) = empty_versions();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    name_position,
+                    deps_core::VersionData::new(&cached, &resolved),
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(
+                hover.is_some(),
+                "hovering a uses: step inside a root-level action.yml must produce a hover"
+            );
+        }
+
+        /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+        /// the `uses:` step-key detection compose correctly through the real trait
+        /// method on realistic multi-line workflow content.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let content = "jobs:\n  build:\n    steps:\n      - uses: actions/check";
+            let line = content.lines().nth(3).unwrap();
+            let position = Position::new(3, line.chars().count() as u32);
+            // Raw trim only, no manifest-syntax stripping — matches this ecosystem's
+            // "no override" prefix shape (see `extract_prefix`'s doc).
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                Some("- uses: actions/check")
+            );
+        }
+
+        // --- #793 characterization: `generate_completions` dispatch, pinned before the
+        // wildcard-match refactor. GitHub Actions serves only `Version` (no package-name
+        // search); `PackageName`/`Feature`/`None` must all return an untouched `Completions::default()`.
+
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GithubActionsEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position = parse_result.dependencies()[0].name_range().start.into();
+
+            let result = eco
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert_eq!(
+                result,
+                Completions::default()
+                    .with_origin(deps_core::completion::CompletionOrigin::PackageName)
+            );
+        }
+
+        /// Drives a real (mocked) network fetch through `GithubActionsRegistry`, mirroring
+        /// `test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list`'s
+        /// `for_test` setup, so this proves `generate_completions`'s `Version` arm actually
+        /// threads the resolved position/`prefix` through to
+        /// `complete_versions_at_position` rather than just checking an empty degenerate case.
+        #[tokio::test]
+        async fn test_generate_completions_version_context_dispatches_to_registry() {
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("GET", "/repos/actions/checkout/tags")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"name": "v4.1.1", "commit": {{"sha": "{}"}}}}]"#,
+                    "a".repeat(40)
+                ))
+                .create_async()
+                .await;
+
+            let registry = crate::registry::GithubActionsRegistry::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+                false,
+            );
+            let formatter = GithubActionsFormatter::new(registry.tag_index());
+            let eco = GithubActionsEcosystem {
+                registry: Arc::new(registry),
+                formatter,
+            };
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = "steps:\n  - uses: actions/checkout@v4\n";
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position = parse_result.dependencies()[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context = deps_core::completion::detect_completion_context(
                 parse_result.as_ref(),
                 position,
                 content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert_eq!(
-            result,
-            Completions::default()
-                .with_origin(deps_core::completion::CompletionOrigin::PackageName)
-        );
-    }
-
-    /// Drives a real (mocked) network fetch through `GithubActionsRegistry`, mirroring
-    /// `test_generate_hover_restores_footer_online_for_bare_major_tag_with_empty_live_list`'s
-    /// `for_test` setup, so this proves `generate_completions`'s `Version` arm actually
-    /// threads the resolved position/`prefix` through to
-    /// `complete_versions_at_position` rather than just checking an empty degenerate case.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_dispatches_to_registry() {
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/repos/actions/checkout/tags")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"name": "v4.1.1", "commit": {{"sha": "{}"}}}}]"#,
-                "a".repeat(40)
-            ))
-            .create_async()
-            .await;
-
-        let registry = crate::registry::GithubActionsRegistry::for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-            false,
-        );
-        let formatter = GithubActionsFormatter::new(registry.tag_index());
-        let eco = GithubActionsEcosystem {
-            registry: Arc::new(registry),
-            formatter,
-        };
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = "steps:\n  - uses: actions/checkout@v4\n";
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = parse_result.dependencies()[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-        let freshness = deps_core::FreshnessSettings::default();
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
-            panic!("expected Version context, got {context:?}");
-        };
-        let direct = deps_core::completion::complete_versions_at_position(
-            eco.registry.as_ref(),
-            &eco.formatter,
-            parse_result.as_ref(),
-            position,
-            &prefix,
-            VERSION_OPERATOR_CHARS,
-            freshness,
-        )
-        .await;
-        let via_dispatch = eco
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert_eq!(
-            via_dispatch.origin,
-            deps_core::completion::CompletionOrigin::Version
-        );
-        assert!(!direct.is_empty());
-    }
-
-    /// Regression test for issue #1182. A comment-annotated SHA pin's `version_range`
-    /// intentionally spans through the trailing `# vX.Y.Z` comment — see
-    /// `crate::parser::tests::test_sha_with_comment_tag` — because
-    /// `GithubActionsFormatter::format_version_replacing_for`'s edit range and
-    /// `generate_hover`'s `**Resolved**` splice both depend on it covering the full
-    /// `<sha> # <tag>` text. That means `detect_completion_context` still reports a
-    /// `Version` context for a cursor anywhere in that span; `generate_completions`
-    /// must withhold a completion once the cursor is past the SHA's own end column —
-    /// including the whitespace padding before `#` and `#` itself, not just once the
-    /// cursor is past `#` (the gap an earlier, prefix-based guard missed, since
-    /// `extract_prefix` trims a padding-only or bare-`#` slice back to a bare SHA with
-    /// no whitespace left to detect) — while a cursor on or immediately after the SHA
-    /// itself still gets one.
-    ///
-    /// Two spaces separate the SHA from `#` so the padding-gap and immediately-before-`#`
-    /// positions below land on distinct columns.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_withholds_only_past_sha_pins_own_ref_end() {
-        let sha = "a".repeat(40);
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/repos/actions/checkout/tags")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"name": "v4.2.0", "commit": {{"sha": "{sha}"}}}}]"#
-            ))
-            .create_async()
-            .await;
-
-        let registry = crate::registry::GithubActionsRegistry::for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-            false,
-        );
-        let formatter = GithubActionsFormatter::new(registry.tag_index());
-        let eco = GithubActionsEcosystem {
-            registry: Arc::new(registry),
-            formatter,
-        };
-
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = format!("steps:\n  - uses: actions/checkout@{sha}  # v4.2.0\n");
-        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-        let version_range = parse_result.dependencies()[0].version_range().unwrap();
-        let sha_end = version_range.start.character + u32::try_from(sha.len()).unwrap();
-        let line = version_range.start.line;
-        let freshness = deps_core::FreshnessSettings::default();
-
-        // Right after the SHA's own last character: still typing the ref, must complete.
-        let allowed = eco
-            .generate_completions(
+            );
+            let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+                panic!("expected Version context, got {context:?}");
+            };
+            let direct = deps_core::completion::complete_versions_at_position(
+                eco.registry.as_ref(),
+                &eco.formatter,
                 parse_result.as_ref(),
-                deps_core::position::Position::new(line, sha_end).into(),
-                &content,
+                position,
+                &prefix,
+                VERSION_OPERATOR_CHARS,
                 freshness,
             )
             .await;
-        assert!(!allowed.items.is_empty());
+            let via_dispatch = eco
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert_eq!(
+                via_dispatch.origin,
+                deps_core::completion::CompletionOrigin::Version
+            );
+            assert!(!direct.is_empty());
+        }
 
-        // Past the SHA's own end: in the padding gap, immediately before `#`, and
-        // inside the comment past `#` — all three must withhold.
-        for character in [sha_end + 1, sha_end + 2, sha_end + 3] {
-            let withheld = eco
+        /// Regression test for issue #1182. A comment-annotated SHA pin's `version_range`
+        /// intentionally spans through the trailing `# vX.Y.Z` comment — see
+        /// `crate::parser::tests::test_sha_with_comment_tag` — because
+        /// `GithubActionsFormatter::format_version_replacing_for`'s edit range and
+        /// `generate_hover`'s `**Resolved**` splice both depend on it covering the full
+        /// `<sha> # <tag>` text. That means `detect_completion_context` still reports a
+        /// `Version` context for a cursor anywhere in that span; `generate_completions`
+        /// must withhold a completion once the cursor is past the SHA's own end column —
+        /// including the whitespace padding before `#` and `#` itself, not just once the
+        /// cursor is past `#` (the gap an earlier, prefix-based guard missed, since
+        /// `extract_prefix` trims a padding-only or bare-`#` slice back to a bare SHA with
+        /// no whitespace left to detect) — while a cursor on or immediately after the SHA
+        /// itself still gets one.
+        ///
+        /// Two spaces separate the SHA from `#` so the padding-gap and immediately-before-`#`
+        /// positions below land on distinct columns.
+        #[tokio::test]
+        async fn test_generate_completions_withholds_only_past_sha_pins_own_ref_end() {
+            let sha = "a".repeat(40);
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("GET", "/repos/actions/checkout/tags")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"name": "v4.2.0", "commit": {{"sha": "{sha}"}}}}]"#
+                ))
+                .create_async()
+                .await;
+
+            let registry = crate::registry::GithubActionsRegistry::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+                false,
+            );
+            let formatter = GithubActionsFormatter::new(registry.tag_index());
+            let eco = GithubActionsEcosystem {
+                registry: Arc::new(registry),
+                formatter,
+            };
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{sha}  # v4.2.0\n");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let version_range = parse_result.dependencies()[0].version_range().unwrap();
+            let sha_end = version_range.start.character + u32::try_from(sha.len()).unwrap();
+            let line = version_range.start.line;
+            let freshness = deps_core::FreshnessSettings::default();
+
+            // Right after the SHA's own last character: still typing the ref, must complete.
+            let allowed = eco
                 .generate_completions(
                     parse_result.as_ref(),
-                    deps_core::position::Position::new(line, character).into(),
+                    deps_core::position::Position::new(line, sha_end).into(),
                     &content,
                     freshness,
                 )
                 .await;
-            assert_eq!(
-                withheld,
-                Completions::default()
-                    .with_origin(deps_core::completion::CompletionOrigin::Version),
-                "expected no completion (and no fallback) at character {character} \
+            assert!(!allowed.items.is_empty());
+
+            // Past the SHA's own end: in the padding gap, immediately before `#`, and
+            // inside the comment past `#` — all three must withhold.
+            for character in [sha_end + 1, sha_end + 2, sha_end + 3] {
+                let withheld = eco
+                    .generate_completions(
+                        parse_result.as_ref(),
+                        deps_core::position::Position::new(line, character).into(),
+                        &content,
+                        freshness,
+                    )
+                    .await;
+                assert_eq!(
+                    withheld,
+                    Completions::default()
+                        .with_origin(deps_core::completion::CompletionOrigin::Version),
+                    "expected no completion (and no fallback) at character {character} \
                  (sha_end = {sha_end})"
-            );
+                );
+            }
         }
-    }
 
-    /// A commentless SHA pin's `version_range` already ends exactly at the SHA's own end
-    /// (never widened) — `position_past_sha_pin_own_ref`'s guard must never fire for it,
-    /// so completion at the ref's end column is unaffected by issue #1182's fix.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_unaffected_for_commentless_sha_pin() {
-        let sha = "a".repeat(40);
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/repos/actions/checkout/tags")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"name": "v4.2.0", "commit": {{"sha": "{sha}"}}}}]"#
-            ))
-            .create_async()
-            .await;
+        /// A commentless SHA pin's `version_range` already ends exactly at the SHA's own end
+        /// (never widened) — `position_past_sha_pin_own_ref`'s guard must never fire for it,
+        /// so completion at the ref's end column is unaffected by issue #1182's fix.
+        #[tokio::test]
+        async fn test_generate_completions_unaffected_for_commentless_sha_pin() {
+            let sha = "a".repeat(40);
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("GET", "/repos/actions/checkout/tags")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"name": "v4.2.0", "commit": {{"sha": "{sha}"}}}}]"#
+                ))
+                .create_async()
+                .await;
 
-        let registry = crate::registry::GithubActionsRegistry::for_test(
-            Arc::new(deps_core::HttpCache::new()),
-            server.url(),
-            false,
-        );
-        let formatter = GithubActionsFormatter::new(registry.tag_index());
-        let eco = GithubActionsEcosystem {
-            registry: Arc::new(registry),
-            formatter,
-        };
+            let registry = crate::registry::GithubActionsRegistry::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+                false,
+            );
+            let formatter = GithubActionsFormatter::new(registry.tag_index());
+            let eco = GithubActionsEcosystem {
+                registry: Arc::new(registry),
+                formatter,
+            };
 
-        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
-        let content = format!("steps:\n  - uses: actions/checkout@{sha}\n");
-        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-        let version_range = parse_result.dependencies()[0].version_range().unwrap();
-        let freshness = deps_core::FreshnessSettings::default();
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{sha}\n");
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+            let version_range = parse_result.dependencies()[0].version_range().unwrap();
+            let freshness = deps_core::FreshnessSettings::default();
 
-        let result = eco
-            .generate_completions(
-                parse_result.as_ref(),
-                version_range.end.into(),
-                &content,
-                freshness,
-            )
-            .await;
-        assert!(!result.items.is_empty());
+            let result = eco
+                .generate_completions(
+                    parse_result.as_ref(),
+                    version_range.end.into(),
+                    &content,
+                    freshness,
+                )
+                .await;
+            assert!(!result.items.is_empty());
+        }
     }
 }

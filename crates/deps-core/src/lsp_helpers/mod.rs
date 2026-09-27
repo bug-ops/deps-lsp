@@ -33,6 +33,9 @@ mod in_use_version;
 mod inlay_hints;
 #[cfg(test)]
 pub(crate) mod test_support;
+#[cfg(test)]
+#[cfg(feature = "lsp-responses")]
+pub(crate) mod test_support_lsp;
 
 /// Generic replacement for this module's former `TextEdit`-only `dedup_overlapping_edits`
 /// (#1329) — re-exported here so every existing `lsp_helpers::dedup_overlapping_edits(edits,

@@ -1033,56 +1033,6 @@ pub fn splice_resolved_line(markdown: &str, resolved_tag: &str, sha: &str) -> St
 mod tests {
     use super::*;
 
-    /// #1311: `resolved_tag` is tag-index/registry-controlled and unbounded — mirrors
-    /// diagnostics.rs's `MAX_VERSION_DIAGNOSTIC_CHARS` truncation test pattern.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn splice_resolved_line_truncates_overlong_resolved_tag() {
-        let long_tag = "9".repeat(5000);
-        let sha = "a".repeat(40);
-        let out = splice_resolved_line("", &long_tag, &sha);
-        assert!(out.len() < long_tag.len(), "got: {out}");
-        assert!(out.contains('…'));
-    }
-
-    /// #1310 critic M2: boundary case using `MAX_VERSION_DIAGNOSTIC_CHARS` specifically,
-    /// not just the 5000-char extreme.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn splice_resolved_line_boundary_at_and_over_cap() {
-        let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
-        let sha = "a".repeat(40);
-
-        // `short_sha` always renders with a trailing `…` of its own (it's a fixed
-        // 7-char prefix of a 40-char SHA), so a blanket "no ellipsis anywhere"
-        // assertion would be wrong here — check the tag's own code span exactly instead.
-        let at_cap = "9".repeat(cap);
-        let out = splice_resolved_line("", &at_cap, &sha);
-        assert!(out.contains(&format!("`{at_cap}`")), "got: {out}");
-
-        let over_cap = "9".repeat(cap + 1);
-        let out = splice_resolved_line("", &over_cap, &sha);
-        assert!(
-            out.contains(&format!("`{}…`", "9".repeat(cap))),
-            "got: {out}"
-        );
-    }
-
-    /// #1311/#1313: `resolved_tag` is a git tag (name/version-shaped), so it must strip
-    /// a `sanitize_invisible`-only codepoint (U+0600 ARABIC NUMBER SIGN) that
-    /// `is_markdown_unsafe` alone does not catch — deliberately exempt per #1248/#1323
-    /// — the same treatment `HoverMarkdown`'s `Name`/`Version` field kinds now apply.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn splice_resolved_line_strips_u0600_from_resolved_tag() {
-        let sha = "a".repeat(40);
-        let out = splice_resolved_line("", &format!("v1.0{}0", '\u{0600}'), &sha);
-        assert!(
-            !out.contains('\u{0600}'),
-            "U+0600 must be stripped from resolved_tag; got: {out}"
-        );
-    }
-
     #[test]
     fn test_is_full_sha_accepts_and_rejects() {
         assert!(is_full_sha(&"a".repeat(40)));
@@ -1591,165 +1541,208 @@ mod tests {
         assert_eq!(marker_byte_offset(content, &table, 5, 14), content.len());
     }
 
-    // --- #1138 review M5: direct coverage for `build_sha_pin_action`/`sha_pin_text_edit`,
-    // which previously had only indirect coverage via ecosystem-crate wrapper tests.
+    #[cfg(feature = "lsp-responses")]
+    mod lsp_tests {
+        use super::*;
 
-    #[cfg(feature = "lsp-responses")]
-    use crate::lsp_helpers::test_support::MOCK_FORMATTER;
-    #[cfg(feature = "lsp-responses")]
-    use crate::position::Position as CorePosition;
-    #[cfg(feature = "lsp-responses")]
-    use crate::test_util::StubFormatter;
-    #[cfg(feature = "lsp-responses")]
-    use crate::{PackageName, VersionReq};
+        /// #1311: `resolved_tag` is tag-index/registry-controlled and unbounded — mirrors
+        /// diagnostics.rs's `MAX_VERSION_DIAGNOSTIC_CHARS` truncation test pattern.
+        #[test]
+        fn splice_resolved_line_truncates_overlong_resolved_tag() {
+            let long_tag = "9".repeat(5000);
+            let sha = "a".repeat(40);
+            let out = splice_resolved_line("", &long_tag, &sha);
+            assert!(out.len() < long_tag.len(), "got: {out}");
+            assert!(out.contains('…'));
+        }
 
-    /// Resolves a dependency named `"resolvable"` to a fixed SHA; declines everything else
-    /// — the minimal [`ShaPinning`] fixture these tests need, layered onto the shared
-    /// [`MOCK_FORMATTER`] fixture (already implements every [`EcosystemFormatter`] sub-trait)
-    /// rather than hand-rolling a second formatter mock.
-    #[cfg(feature = "lsp-responses")]
-    impl ShaPinning for StubFormatter {
-        fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
-            if dep.name().as_str() != "resolvable" {
-                return None;
+        /// #1310 critic M2: boundary case using `MAX_VERSION_DIAGNOSTIC_CHARS` specifically,
+        /// not just the 5000-char extreme.
+        #[test]
+        fn splice_resolved_line_boundary_at_and_over_cap() {
+            let cap = MAX_VERSION_DIAGNOSTIC_CHARS;
+            let sha = "a".repeat(40);
+
+            // `short_sha` always renders with a trailing `…` of its own (it's a fixed
+            // 7-char prefix of a 40-char SHA), so a blanket "no ellipsis anywhere"
+            // assertion would be wrong here — check the tag's own code span exactly instead.
+            let at_cap = "9".repeat(cap);
+            let out = splice_resolved_line("", &at_cap, &sha);
+            assert!(out.contains(&format!("`{at_cap}`")), "got: {out}");
+
+            let over_cap = "9".repeat(cap + 1);
+            let out = splice_resolved_line("", &over_cap, &sha);
+            assert!(
+                out.contains(&format!("`{}…`", "9".repeat(cap))),
+                "got: {out}"
+            );
+        }
+
+        /// #1311/#1313: `resolved_tag` is a git tag (name/version-shaped), so it must strip
+        /// a `sanitize_invisible`-only codepoint (U+0600 ARABIC NUMBER SIGN) that
+        /// `is_markdown_unsafe` alone does not catch — deliberately exempt per #1248/#1323
+        /// — the same treatment `HoverMarkdown`'s `Name`/`Version` field kinds now apply.
+        #[test]
+        fn splice_resolved_line_strips_u0600_from_resolved_tag() {
+            let sha = "a".repeat(40);
+            let out = splice_resolved_line("", &format!("v1.0{}0", '\u{0600}'), &sha);
+            assert!(
+                !out.contains('\u{0600}'),
+                "U+0600 must be stripped from resolved_tag; got: {out}"
+            );
+        }
+
+        // --- #1138 review M5: direct coverage for `build_sha_pin_action`/`sha_pin_text_edit`,
+        // which previously had only indirect coverage via ecosystem-crate wrapper tests.
+
+        use crate::lsp_helpers::test_support::MOCK_FORMATTER;
+
+        use crate::position::Position as CorePosition;
+
+        use crate::test_util::StubFormatter;
+
+        use crate::{PackageName, VersionReq};
+
+        /// Resolves a dependency named `"resolvable"` to a fixed SHA; declines everything else
+        /// — the minimal [`ShaPinning`] fixture these tests need, layered onto the shared
+        /// [`MOCK_FORMATTER`] fixture (already implements every [`EcosystemFormatter`] sub-trait)
+        /// rather than hand-rolling a second formatter mock.
+        impl ShaPinning for StubFormatter {
+            fn resolve_static_sha_pin(&self, dep: &dyn Dependency) -> Option<ResolvedShaPin> {
+                if dep.name().as_str() != "resolvable" {
+                    return None;
+                }
+                Some(ResolvedShaPin {
+                    display_name: dep.name().as_str().to_string(),
+                    version_range: dep.version_range()?,
+                    replacement: "a".repeat(40),
+                })
             }
-            Some(ResolvedShaPin {
-                display_name: dep.name().as_str().to_string(),
-                version_range: dep.version_range()?,
+        }
+
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "fixed short ASCII test-fixture names never approach u32::MAX"
+        )]
+        fn sha_pin_test_dep(name: &str) -> crate::lsp_helpers::test_support::MockDep {
+            let range = Range::new(
+                CorePosition::new(0, 6),
+                CorePosition::new(0, 6 + name.len() as u32),
+            );
+            crate::lsp_helpers::test_support::MockDep {
+                name: PackageName::new(name),
+                version_req: VersionReq::new("v1"),
+                version_range: range,
+                name_range: range,
+            }
+        }
+
+        #[test]
+        fn test_build_sha_pin_action_resolves_at_position() {
+            let dep = sha_pin_test_dep("resolvable");
+            let uri = crate::test_util::test_uri("/repo/manifest.yml");
+            let parse_result = crate::lsp_helpers::test_support::MockParseResult {
+                deps: vec![dep],
+                uri: uri.clone(),
+            };
+            let position = Position {
+                line: 0,
+                character: 7,
+            };
+
+            let action = build_sha_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &MOCK_FORMATTER,
+                "TEST_DIAGNOSTIC_CODE",
+            )
+            .expect("resolvable dependency at position must produce a quickfix");
+
+            assert_eq!(action.title, "Pin resolvable to commit SHA");
+            let edits = action
+                .edit
+                .expect("quickfix must carry a WorkspaceEdit")
+                .changes
+                .expect("WorkspaceEdit must carry changes");
+            let text_edits = edits.values().next().expect("one file's edits");
+            assert_eq!(text_edits.len(), 1);
+            assert_eq!(text_edits[0].new_text, "a".repeat(40));
+        }
+
+        #[test]
+        fn test_build_sha_pin_action_none_when_pinning_declines() {
+            let dep = sha_pin_test_dep("not-resolvable");
+            let uri = crate::test_util::test_uri("/repo/manifest.yml");
+            let parse_result = crate::lsp_helpers::test_support::MockParseResult {
+                deps: vec![dep],
+                uri: uri.clone(),
+            };
+            let position = Position {
+                line: 0,
+                character: 7,
+            };
+
+            assert!(
+                build_sha_pin_action(
+                    &parse_result,
+                    position,
+                    &uri,
+                    &MOCK_FORMATTER,
+                    "TEST_DIAGNOSTIC_CODE",
+                )
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn test_build_sha_pin_action_none_when_position_off_dependency() {
+            let dep = sha_pin_test_dep("resolvable");
+            let uri = crate::test_util::test_uri("/repo/manifest.yml");
+            let parse_result = crate::lsp_helpers::test_support::MockParseResult {
+                deps: vec![dep],
+                uri: uri.clone(),
+            };
+            let position = Position {
+                line: 5,
+                character: 0,
+            };
+
+            assert!(
+                build_sha_pin_action(
+                    &parse_result,
+                    position,
+                    &uri,
+                    &MOCK_FORMATTER,
+                    "TEST_DIAGNOSTIC_CODE",
+                )
+                .is_none()
+            );
+        }
+
+        #[test]
+        fn test_sha_pin_text_edit_resolves() {
+            let dep = sha_pin_test_dep("resolvable");
+            let edit = sha_pin_text_edit(&MOCK_FORMATTER, &dep)
+                .expect("resolvable dependency must resolve");
+            assert_eq!(edit.new_text, "a".repeat(40));
+            assert_eq!(edit.range, dep.version_range.into());
+        }
+
+        #[test]
+        fn test_sha_pin_text_edit_none_when_pinning_declines() {
+            let dep = sha_pin_test_dep("not-resolvable");
+            assert!(sha_pin_text_edit(&MOCK_FORMATTER, &dep).is_none());
+        }
+
+        crate::debug_redaction_conformance!(
+            test_resolved_sha_pin_debug_redacts_credentials,
+            1,
+            ResolvedShaPin {
+                display_name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+                version_range: Range::default(),
                 replacement: "a".repeat(40),
-            })
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "fixed short ASCII test-fixture names never approach u32::MAX"
-    )]
-    fn sha_pin_test_dep(name: &str) -> crate::lsp_helpers::test_support::MockDep {
-        let range = Range::new(
-            CorePosition::new(0, 6),
-            CorePosition::new(0, 6 + name.len() as u32),
-        );
-        crate::lsp_helpers::test_support::MockDep {
-            name: PackageName::new(name),
-            version_req: VersionReq::new("v1"),
-            version_range: range,
-            name_range: range,
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_resolves_at_position() {
-        let dep = sha_pin_test_dep("resolvable");
-        let uri = crate::test_util::test_uri("/repo/manifest.yml");
-        let parse_result = crate::lsp_helpers::test_support::MockParseResult {
-            deps: vec![dep],
-            uri: uri.clone(),
-        };
-        let position = Position {
-            line: 0,
-            character: 7,
-        };
-
-        let action = build_sha_pin_action(
-            &parse_result,
-            position,
-            &uri,
-            &MOCK_FORMATTER,
-            "TEST_DIAGNOSTIC_CODE",
-        )
-        .expect("resolvable dependency at position must produce a quickfix");
-
-        assert_eq!(action.title, "Pin resolvable to commit SHA");
-        let edits = action
-            .edit
-            .expect("quickfix must carry a WorkspaceEdit")
-            .changes
-            .expect("WorkspaceEdit must carry changes");
-        let text_edits = edits.values().next().expect("one file's edits");
-        assert_eq!(text_edits.len(), 1);
-        assert_eq!(text_edits[0].new_text, "a".repeat(40));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_none_when_pinning_declines() {
-        let dep = sha_pin_test_dep("not-resolvable");
-        let uri = crate::test_util::test_uri("/repo/manifest.yml");
-        let parse_result = crate::lsp_helpers::test_support::MockParseResult {
-            deps: vec![dep],
-            uri: uri.clone(),
-        };
-        let position = Position {
-            line: 0,
-            character: 7,
-        };
-
-        assert!(
-            build_sha_pin_action(
-                &parse_result,
-                position,
-                &uri,
-                &MOCK_FORMATTER,
-                "TEST_DIAGNOSTIC_CODE",
-            )
-            .is_none()
+            },
         );
     }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_none_when_position_off_dependency() {
-        let dep = sha_pin_test_dep("resolvable");
-        let uri = crate::test_util::test_uri("/repo/manifest.yml");
-        let parse_result = crate::lsp_helpers::test_support::MockParseResult {
-            deps: vec![dep],
-            uri: uri.clone(),
-        };
-        let position = Position {
-            line: 5,
-            character: 0,
-        };
-
-        assert!(
-            build_sha_pin_action(
-                &parse_result,
-                position,
-                &uri,
-                &MOCK_FORMATTER,
-                "TEST_DIAGNOSTIC_CODE",
-            )
-            .is_none()
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_sha_pin_text_edit_resolves() {
-        let dep = sha_pin_test_dep("resolvable");
-        let edit =
-            sha_pin_text_edit(&MOCK_FORMATTER, &dep).expect("resolvable dependency must resolve");
-        assert_eq!(edit.new_text, "a".repeat(40));
-        assert_eq!(edit.range, dep.version_range.into());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_sha_pin_text_edit_none_when_pinning_declines() {
-        let dep = sha_pin_test_dep("not-resolvable");
-        assert!(sha_pin_text_edit(&MOCK_FORMATTER, &dep).is_none());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    crate::debug_redaction_conformance!(
-        test_resolved_sha_pin_debug_redacts_credentials,
-        1,
-        ResolvedShaPin {
-            display_name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
-            version_range: Range::default(),
-            replacement: "a".repeat(40),
-        },
-    );
 }

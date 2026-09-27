@@ -1,21 +1,12 @@
 //! GitLab CI ecosystem implementation for deps-lsp.
 
-use std::any::Any;
-use std::sync::{Arc, RwLock};
-#[cfg(feature = "lsp-responses")]
-use std::time::Duration;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CodeAction, CodeActionKind, Position, TextEdit, WorkspaceEdit};
-use url::Url;
-
+#[cfg(test)]
 #[cfg(feature = "lsp-responses")]
 use deps_core::PackageName;
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
 use deps_core::hover::Hover;
-#[cfg(feature = "lsp-responses")]
-use deps_core::lsp_helpers::truncate_for_diagnostic;
 #[cfg(feature = "lsp-responses")]
 use deps_core::lsp_helpers::{PackageNaming, PackageRendering};
 use deps_core::net_policy::RegistryAccessPolicy;
@@ -26,6 +17,11 @@ use deps_core::{
         EcosystemFormatter, MAX_DIAGNOSTIC_VALUE_CHARS, sanitize_and_truncate_for_diagnostic,
     },
 };
+use std::any::Any;
+use std::sync::{Arc, RwLock};
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CodeAction, Position, TextEdit};
+use url::Url;
 
 use crate::MUTABLE_REF_PIN_DIAGNOSTIC_CODE;
 use crate::UNRESOLVED_HOST_DIAGNOSTIC_CODE;
@@ -37,17 +33,19 @@ use crate::host::is_valid_gitlab_coordinate;
 use crate::registry::GitlabCiRegistry;
 use crate::types::{GitlabCiDependency, HostRef, IncludeKind, PinStyle};
 
+#[cfg(feature = "lsp-responses")]
+mod lsp;
+#[cfg(feature = "lsp-responses")]
+use lsp::{
+    COMPONENT_PIN_RESOLUTION_TIMEOUT, VERSION_OPERATOR_CHARS, build_dynamic_component_pin_action,
+    build_sha_pin_action, collect_pin_all_to_sha_edits, splice_project_line,
+};
+
 /// Maximum character count of an interpolated raw host expression before truncation —
 /// mirrors `deps_core::lsp_helpers::MAX_DIAGNOSTIC_VALUE_CHARS`'s numeric bound — a
 /// separate `= 128` literal, not derived from it, out of #1278's scope (that issue's
 /// nine-constant list did not include this one).
 const MAX_UNRESOLVED_HOST_MESSAGE_VALUE_CHARS: usize = 128;
-
-/// Leading version-constraint operators stripped from a completion prefix before matching
-/// it against registry versions. Empty: a component/include ref is a bare tag/branch/SHA,
-/// with no comparison/caret/tilde operator syntax (#1137).
-#[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &[];
 
 /// Whether `gl_dep`'s pin is diagnosable as a mutable tag ref — either because it was
 /// already classified [`PinStyle::Tag`] from its text shape, or because `tag_index`'s live
@@ -124,46 +122,6 @@ fn sha_pin_quickfix_kind(
         _ => None,
     }
 }
-
-/// Implements `deps-core`'s shared "pin to commit SHA" resolution (issue #1138) for the
-/// `ShaPinQuickfixKind::StaticTagIndex` path only: a `component:` include's
-/// `Latest`/`Partial` pin (`ShaPinQuickfixKind::DynamicComponentPin`) needs a live fetch
-/// and a [`GitlabCiRegistry`] handle this trait has no room for, so it stays local to
-/// `build_dynamic_component_pin_action` — the one genuinely GitLab-specific quickfix arm
-/// this ecosystem keeps outside the shared abstraction.
-#[cfg(feature = "lsp-responses")]
-impl deps_core::lsp_helpers::ShaPinning for GitlabCiFormatter {
-    fn resolve_static_sha_pin(
-        &self,
-        dep: &dyn deps_core::Dependency,
-    ) -> Option<deps_core::lsp_helpers::ResolvedShaPin> {
-        let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
-        if !matches!(
-            sha_pin_quickfix_kind(dep, gl_dep, self),
-            Some(ShaPinQuickfixKind::StaticTagIndex)
-        ) {
-            return None;
-        }
-        let version_range = gl_dep.version_range?;
-        let tag = gl_dep
-            .version_req
-            .as_ref()
-            .map(deps_core::VersionReq::as_str)?;
-        let new_text = self.sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, tag)?;
-        Some(deps_core::lsp_helpers::ResolvedShaPin {
-            display_name: gl_dep.name.as_str().to_string(),
-            version_range,
-            replacement: new_text,
-        })
-    }
-}
-
-/// Bound on [`GitlabCiRegistry::resolve_component_pin`]'s FR-007 hover-time resolution
-/// (H1, #466 review) — mirrors `deps_core::lsp_helpers::hover`'s `HOVER_FALLBACK_TIMEOUT`
-/// precedent for a live-fetch fallback invoked from hover generation: a failure or timeout
-/// here degrades gracefully to no `**Resolved**` line, never aborting the rest of the hover.
-#[cfg(feature = "lsp-responses")]
-const COMPONENT_PIN_RESOLUTION_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// GitLab CI ecosystem implementation.
 ///
@@ -754,286 +712,6 @@ fn mutable_ref_pin_diagnostics(
         .collect()
 }
 
-/// Builds the "Pin `{name}` to commit SHA" quickfix (issue #634) for the `PinStyle::Tag`
-/// dependency at `position`, if [`GitlabCiFormatter::sha_pin_replacement_for`] resolves its
-/// current tag/release name against the shared `TagIndex`.
-///
-/// Returns `None` (no destructive/no-op edit) when the dependency at `position` is not
-/// `PinStyle::Tag`, has no `version_range`, or the `TagIndex` lookup misses (cache miss —
-/// e.g. the document was opened before the registry fetch completed).
-///
-/// Deliberately **not** widened to [`is_registry_confirmed_tag`]'s `PinStyle::Branch` case
-/// the way [`mutable_ref_pin_diagnostics`] is, mirroring
-/// `deps_github_actions::ecosystem::build_sha_pin_action`'s identical pre-#551 guard: a
-/// `PinStyle::Branch` include can share its ref/pin text with an unrelated tag of the same
-/// name, and GitLab's own ref resolution for that collision is undocumented — an
-/// *automated edit* that silently pins to the tag's commit could pin to a different commit
-/// than the ref actually resolves to at run time. A diagnostic's advisory text carries no
-/// such risk, but this destructive edit keeps the stricter guard.
-///
-/// Delegates entirely to [`deps_core::lsp_helpers::build_sha_pin_action`] (issue #1138) via
-/// [`GitlabCiFormatter`]'s [`deps_core::lsp_helpers::ShaPinning`] impl, which carries this
-/// guard (restricted to [`ShaPinQuickfixKind::StaticTagIndex`]).
-#[cfg(feature = "lsp-responses")]
-fn build_sha_pin_action(
-    parse_result: &dyn ParseResultTrait,
-    position: Position,
-    uri: &Url,
-    formatter: &GitlabCiFormatter,
-) -> Option<CodeAction> {
-    deps_core::lsp_helpers::build_sha_pin_action(
-        parse_result,
-        position,
-        uri,
-        formatter,
-        MUTABLE_REF_PIN_DIAGNOSTIC_CODE,
-    )
-}
-
-/// Builds the "Pin `{name}` to commit SHA" quickfix (validation follow-up C2/S2) for a
-/// `component:` include pinned via `PinStyle::Latest`/`PinStyle::Partial` at `position`.
-///
-/// Unlike [`build_sha_pin_action`] (a synchronous `TagIndex` lookup only, since a
-/// `PinStyle::Tag` pin's own text already names the version), neither `Latest` nor
-/// `Partial` names a concrete version by itself — resolving one needs the FR-007 priority
-/// ladder run against the project's published releases, exactly the live fetch
-/// `generate_hover`'s `**Resolved**` splice already drives for the same pin forms. Bounded
-/// by [`COMPONENT_PIN_RESOLUTION_TIMEOUT`], mirroring that call site's identical
-/// degrade-to-nothing-on-timeout discipline: a failure or timeout here withholds the
-/// quickfix rather than blocking the rest of `generate_code_actions`.
-///
-/// Returns `None` when the dependency at `position` is not a `component:` include pinned
-/// via `Latest`/`Partial`, has no registered route, or the live resolution misses/fails/
-/// times out. The eligibility guard (kind/pin/route) is [`sha_pin_quickfix_kind`] (issue
-/// #643) — the single source of truth this and `mutable_ref_pin_diagnostics`'s message
-/// both consult, so they cannot independently drift about whether a quickfix exists.
-#[cfg(feature = "lsp-responses")]
-async fn build_dynamic_component_pin_action(
-    parse_result: &dyn ParseResultTrait,
-    position: Position,
-    uri: &Url,
-    formatter: &GitlabCiFormatter,
-    registry: &GitlabCiRegistry,
-) -> Option<CodeAction> {
-    // M2 (#640): the same `formatter.is_position_on_dependency` lookup
-    // `build_sha_pin_action` uses, rather than a bare `version_range` check — a
-    // consistency unification, not a behavior change for this pin shape.
-    let dep = parse_result
-        .dependencies()
-        .into_iter()
-        .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
-    if !matches!(
-        sha_pin_quickfix_kind(dep, gl_dep, formatter),
-        Some(ShaPinQuickfixKind::DynamicComponentPin)
-    ) {
-        return None;
-    }
-    let pin = gl_dep.pin.as_ref()?;
-    let version_range = gl_dep.version_range?;
-    let raw = gl_dep
-        .version_req
-        .as_ref()
-        .map(deps_core::VersionReq::as_str)?;
-    let deps_core::parser::DependencySource::AlternateRegistry { index, .. } = dep.source() else {
-        return None;
-    };
-    let route = registry.routes().get(&index).map(|r| r.clone())?;
-
-    let outcome = tokio::time::timeout(
-        COMPONENT_PIN_RESOLUTION_TIMEOUT,
-        registry.resolve_component_pin(dep.name(), &route, pin, raw),
-    )
-    .await;
-    let resolved = match outcome {
-        Ok(Ok(Some(resolved))) => resolved,
-        Ok(Ok(None)) => return None,
-        Ok(Err(error)) => {
-            tracing::warn!(package = %dep.name().for_tracing(), %error, "C2 component pin quickfix resolution failed");
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!(package = %dep.name().for_tracing(), "C2 component pin quickfix resolution timed out");
-            return None;
-        }
-    };
-
-    let changes = deps_core::single_file_edit(uri, version_range, resolved.sha?.to_string());
-
-    Some(CodeAction {
-        title: format!(
-            "Pin {} to commit SHA",
-            deps_core::lsp_helpers::redact_name_for_diagnostic(&gl_dep.name)
-        ),
-        kind: Some(CodeActionKind::QUICKFIX),
-        edit: Some(WorkspaceEdit {
-            changes: Some(changes),
-            ..Default::default()
-        }),
-        data: Some(serde_json::json!({
-            "diagnostic_codes": [MUTABLE_REF_PIN_DIAGNOSTIC_CODE],
-            "diagnostic_range": tower_lsp_server::ls_types::Range::from(version_range),
-        })),
-        ..Default::default()
-    })
-}
-
-/// Builds one [`TextEdit`] per mutable-ref dependency in `parse_result` resolvable to a
-/// commit SHA from already-in-hand data (issue #640) — the bulk counterpart of
-/// [`build_sha_pin_action`] and [`build_dynamic_component_pin_action`]'s per-position
-/// quickfixes, dispatched through the same [`sha_pin_quickfix_kind`] classification so all
-/// three can never disagree about which dependencies are eligible.
-///
-/// Deliberately performs **no network fetch**: a code lens is push-based and must never
-/// itself trigger one. A `DynamicComponentPin` dependency is instead resolved by
-/// reconstituting its release list from `versions.cached` (the caller's already-fetched
-/// version data) paired with `formatter`'s `TagIndex` for each release's SHA, then handed
-/// to the unmodified [`crate::component::resolve_component_pin`] ladder — see
-/// [`reconstitute_component_releases`] for why an unresolved-SHA entry is kept as a
-/// placeholder rather than dropped.
-#[cfg(feature = "lsp-responses")]
-fn collect_pin_all_to_sha_edits(
-    parse_result: &dyn ParseResultTrait,
-    formatter: &GitlabCiFormatter,
-    versions: deps_core::VersionData<'_>,
-) -> Vec<TextEdit> {
-    let edits: Vec<TextEdit> = parse_result
-        .dependencies()
-        .into_iter()
-        .filter_map(|dep| bulk_sha_pin_text_edit_for(dep, formatter, versions))
-        .collect();
-    deps_core::lsp_helpers::dedup_overlapping_edits(edits, "collect_pin_all_to_sha_edits")
-}
-
-/// Builds the bulk edit for one dependency, dispatching on [`sha_pin_quickfix_kind`]
-/// exactly like [`build_sha_pin_action`]/[`build_dynamic_component_pin_action`] do for a
-/// single position. `None` when the dependency is not diagnosable via either path, has no
-/// `version_range`, or (`DynamicComponentPin` only) the ladder can't resolve it from the
-/// caller's already-fetched `versions`.
-#[cfg(feature = "lsp-responses")]
-fn bulk_sha_pin_text_edit_for(
-    dep: &dyn deps_core::Dependency,
-    formatter: &GitlabCiFormatter,
-    versions: deps_core::VersionData<'_>,
-) -> Option<TextEdit> {
-    let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
-    let version_range = gl_dep.version_range?;
-
-    match sha_pin_quickfix_kind(dep, gl_dep, formatter)? {
-        ShaPinQuickfixKind::StaticTagIndex => {
-            deps_core::lsp_helpers::sha_pin_text_edit(formatter, dep)
-        }
-        ShaPinQuickfixKind::DynamicComponentPin => {
-            let pin = gl_dep.pin.as_ref()?;
-            let raw = gl_dep
-                .version_req
-                .as_ref()
-                .map(deps_core::VersionReq::as_str)?;
-            let releases =
-                reconstitute_component_releases(dep.name(), gl_dep, formatter, versions)?;
-            let resolved = crate::component::resolve_component_pin(pin, raw, &releases)?;
-            // The reconstituted list may carry `sha: None` placeholders (see
-            // `reconstitute_component_releases`); only a winner with a known SHA is safe
-            // to splice into a `TextEdit` — `CommitSha` already guarantees full-SHA shape,
-            // so no separate `is_full_sha` recheck is needed here.
-            let sha = resolved.sha?;
-            Some(TextEdit {
-                range: version_range.into(),
-                new_text: sha.to_string(),
-            })
-        }
-    }
-}
-
-/// Reconstitutes the release list [`crate::component::resolve_component_pin`]'s ladder
-/// needs for `name`, from `versions.cached` (already-fetched, never re-fetched here) and
-/// `formatter`'s `TagIndex` (for each release's SHA) — the cache-only alternative to
-/// [`crate::registry::GitlabCiRegistry::resolve_component_pin`]'s live fetch, since a bulk
-/// code lens must never itself trigger one.
-///
-/// **Never drops an entry whose SHA is unknown in the `TagIndex`** — keeps it with
-/// `sha: None` instead. This is not a per-release SHA gap guard (the registry's own
-/// `releases_to_versions` already drops any release with no valid SHA before it ever
-/// reaches `versions.cached`); it guards a *lifetime* mismatch between two caches populated
-/// at different times: `TagIndex` is capacity-bounded and evictable, while `versions.cached`
-/// is not, so a `tag_to_sha` miss for a release still present in `versions.cached` is a live
-/// possibility, not a hypothetical one. Dropping such an entry would silently shift what
-/// `Latest`/`Partial` resolves to onto a *different* release — and since
-/// `resolve_component_pin`'s `max_by` returns the **last** maximum on a tie (two releases
-/// normalizing to the same semver), preserving `versions.cached`'s exact order (itself the
-/// registry's own fetch/sort order) matters as much as preserving every entry. The
-/// `sha: None` placeholder is unreachable by the ladder's only SHA-matching arm
-/// (`PinStyle::Sha`, which [`sha_pin_quickfix_kind`] never routes to this path) — the
-/// caller still verifies the *winning* release actually has a SHA (`resolved.sha?`) before
-/// splicing it into a `TextEdit`.
-#[cfg(feature = "lsp-responses")]
-fn reconstitute_component_releases(
-    name: &PackageName,
-    gl_dep: &GitlabCiDependency,
-    formatter: &GitlabCiFormatter,
-    versions: deps_core::VersionData<'_>,
-) -> Option<Vec<crate::types::GitlabCiVersion>> {
-    let normalized_name = formatter.normalize_package_name(name);
-    let available = versions
-        .cached
-        .get(normalized_name.as_str())
-        .or_else(|| versions.cached.get(name))
-        .map(|v| &v.available)?;
-    let endpoint = gl_dep.kind.endpoint();
-    let tag_index = formatter.tag_index.get(&(endpoint, gl_dep.name.clone()));
-
-    Some(
-        available
-            .iter()
-            .map(|version| {
-                let sha = tag_index
-                    .as_ref()
-                    .and_then(|index| index.tag_to_sha.get(version.as_str()).cloned());
-                let prerelease =
-                    semver::Version::parse(deps_core::github::normalize_tag(version.as_str()))
-                        .is_ok_and(|parsed| !parsed.pre.is_empty());
-                crate::types::GitlabCiVersion {
-                    version: version.clone(),
-                    sha,
-                    prerelease,
-                    published_at: None,
-                }
-            })
-            .collect(),
-    )
-}
-
-/// Inserts a `**Project**: [name](url)` line immediately after the hover heading, for a
-/// `component:` include whose heading link is suppressed (spec §8.2).
-///
-/// The link *label* half is capped at [`MAX_DIAGNOSTIC_VALUE_CHARS`] — `url` is built
-/// from `gl_dep.project_path`, a manifest-controlled string `is_valid_gitlab_coordinate`
-/// bounds only by charset, not length or segment count (#1310 critic S3 — `deps-core`'s
-/// `git_ref.rs::splice_resolved_line` fixed the same class for `resolved_tag`). Only the
-/// *label* is capped, matching `HoverMarkdown::push_link`'s label-capped/
-/// destination-unbounded contract. The label is truncated only, not escaped — safe
-/// because `is_valid_gitlab_coordinate`'s charset gate (`is_valid_path_segment`,
-/// `[A-Za-z0-9._-]`-only per segment) already runs before this function's only caller
-/// builds `url`, so no Markdown-special character can reach it in the first place.
-// `pos`/`insert_at` come from `find("\n\n")`, an ASCII token, so both are always char
-// boundaries.
-#[allow(clippy::string_slice)]
-#[cfg(feature = "lsp-responses")]
-fn splice_project_line(markdown: &str, url: &str) -> String {
-    let label = truncate_for_diagnostic(url, MAX_DIAGNOSTIC_VALUE_CHARS);
-    let line = format!("**Project**: [{label}]({url})\n\n");
-    if let Some(pos) = markdown.find("\n\n") {
-        let insert_at = pos + 2;
-        let mut out = String::with_capacity(markdown.len() + line.len());
-        out.push_str(&markdown[..insert_at]);
-        out.push_str(&line);
-        out.push_str(&markdown[insert_at..]);
-        out
-    } else {
-        format!("{markdown}\n\n{line}")
-    }
-}
-
 #[cfg(test)]
 // Fixtures are single-line ASCII literals with hand-computed byte offsets.
 #[allow(clippy::string_slice)]
@@ -1041,10 +719,6 @@ mod tests {
     use super::*;
     use crate::types::EndpointKind;
     use dashmap::DashMap;
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::lsp_helpers::splice_resolved_line;
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::lsp_helpers::{CommitSha, TagIndex};
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id_and_display_name
     // and test_as_any. `lockfile_filenames()` is omitted — GitLab CI pipelines have no lock
@@ -1119,18 +793,6 @@ mod tests {
         non_placeholders: ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "main", "1.2", "v1.2.3"];
     }
 
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (a component/include ref has no operator syntax), so an edit to one
-    // without the other fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod gitlab_ci_operator_chars_conformance;
-        ecosystem: "gitlab-ci";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &[];
-    }
-
     #[test]
     fn test_manifest_routing() {
         let cache = Arc::new(HttpCache::new());
@@ -1151,76 +813,6 @@ mod tests {
         let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
         let result = eco.parse_manifest(content, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_splice_project_line() {
-        let markdown = "# gitlab.com/org/proj/comp\n\n**Requirement**: `1.0.0`\n";
-        let spliced = splice_project_line(markdown, "https://gitlab.com/org/proj");
-        assert!(spliced.contains("**Project**"));
-        assert!(spliced.find("**Project**").unwrap() < spliced.find("**Requirement**").unwrap());
-    }
-
-    /// #1310 critic S3: `project_path` is manifest-controlled and `is_valid_gitlab_coordinate`
-    /// bounds only its charset, not its length — the label half of the `**Project**` line
-    /// must be capped, matching `deps-core::git_ref.rs`'s `splice_resolved_line` fix for the
-    /// same class of gap.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn splice_project_line_caps_label_but_not_destination() {
-        let long_url = format!("https://gitlab.example.com/{}", "a".repeat(5000));
-        let spliced = splice_project_line("", &long_url);
-        assert!(
-            spliced.contains(&format!("]({long_url})")),
-            "the destination must not be truncated; got: {spliced}"
-        );
-        assert!(
-            spliced.contains('…'),
-            "the label must be truncated; got: {spliced}"
-        );
-        let label_start = spliced.find('[').unwrap() + 1;
-        let label_end = spliced.find(']').unwrap();
-        assert!(
-            spliced[label_start..label_end].chars().count() <= MAX_DIAGNOSTIC_VALUE_CHARS + 1,
-            "label must be bounded by the cap plus the ellipsis marker; got: {spliced}"
-        );
-    }
-
-    /// Boundary case (at cap / over cap), not just the 5000-char extreme.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn splice_project_line_label_boundary_at_and_over_cap() {
-        let prefix = "https://gitlab.example.com/";
-        let cap = MAX_DIAGNOSTIC_VALUE_CHARS;
-
-        let at_cap_url = format!("{prefix}{}", "a".repeat(cap - prefix.len()));
-        let spliced = splice_project_line("", &at_cap_url);
-        assert!(
-            spliced.contains(&format!("[{at_cap_url}]({at_cap_url})")),
-            "a url whose label is exactly at the cap must render whole; got: {spliced}"
-        );
-
-        let over_cap_url = format!("{prefix}{}", "a".repeat(cap - prefix.len() + 1));
-        let spliced = splice_project_line("", &over_cap_url);
-        let truncated_label = format!("{}…", &over_cap_url[..cap]);
-        assert!(
-            spliced.contains(&format!("[{truncated_label}]({over_cap_url})")),
-            "a url one char over the cap must truncate the label to exactly `cap` chars \
-             plus the ellipsis, while leaving the destination whole; got: {spliced}"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_splice_resolved_line_after_requirement() {
-        let markdown = "# org/proj\n\n**Requirement**: `v1.0.0`\n\n**Latest**: `v1.1.0`\n";
-        let spliced = splice_resolved_line(markdown, "v1.0.0", &"a".repeat(40));
-        let req_pos = spliced.find("**Requirement**").unwrap();
-        let resolved_pos = spliced.find("**Resolved**").unwrap();
-        let latest_pos = spliced.find("**Latest**").unwrap();
-        assert!(req_pos < resolved_pos);
-        assert!(resolved_pos < latest_pos);
     }
 
     /// M-a (#466 review): the two failure modes must produce visibly different messages —
@@ -1582,56 +1174,6 @@ mod tests {
         );
     }
 
-    /// S3 cold-cache negative test (architect's plan, tester re-review): documents the one
-    /// place where "message omits suffix" and "quickfix actually available" are
-    /// deliberately NOT the same fact. A `PinStyle::Tag` message never carries the suffix
-    /// — `sha_pin_quickfix_kind`'s `Tag` arm doesn't consult `TagIndex` at all, unlike the
-    /// `Latest`/`Partial` arm — yet `build_sha_pin_action` still withholds the quickfix on
-    /// a cold/unseeded cache (a genuine `TagIndex` miss, e.g. the document was opened
-    /// before the registry fetch completed). This divergence is pre-existing and accepted
-    /// (shared with `deps-github-actions`'s identical guard), not a regression #643
-    /// introduced — this test exists so it stays a documented, deliberate fact rather than
-    /// an implicit one.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_tag_pin_message_omits_suffix_on_cold_cache_while_quickfix_unavailable() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-
-        // `diagnostics_for` builds its own fresh `GitlabCiEcosystem`, so its `TagIndex` is
-        // guaranteed cold here — no `seed_tag`/`populate_tag_index_entries` call anywhere
-        // in this function.
-        let diagnostics = diagnostics_for(content, &uri).await;
-        let found = diagnostics
-            .iter()
-            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
-            .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag include");
-        assert!(
-            !found.message().contains("no automated fix available"),
-            "a PinStyle::Tag message never carries the suffix, cold cache or not: {}",
-            found.message()
-        );
-
-        // Independently-built parse result + formatter, likewise cold (no seeding).
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let instance_host = crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-        let parse_result =
-            crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host).unwrap();
-        let formatter = test_formatter();
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start;
-        assert!(
-            build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none(),
-            "a cold TagIndex must still withhold the quickfix even though the message \
-             omits the suffix — the one accepted message/quickfix divergence"
-        );
-    }
-
     #[tokio::test]
     async fn test_mutable_ref_pin_diagnostic_does_not_fire_for_sha_pin() {
         let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
@@ -1661,61 +1203,6 @@ mod tests {
                 .any(|d| d.code() == Some(mutable_ref_pin_code().as_str())),
             "a PinStyle::Branch include with no TagIndex confirmation is an honest \
              unknown, not diagnosable as a mutable tag ref"
-        );
-    }
-
-    /// Issue #551's lesson, mirrored from `deps_github_actions`: a `PinStyle::Branch`
-    /// include the `TagIndex` confirms is actually a published tag must still get the
-    /// diagnostic — with wording that says no automated fix is available (since
-    /// `build_sha_pin_action` deliberately stays restricted to `PinStyle::Tag`).
-    ///
-    /// Validation Fix 1: seeds `tag_index` through the crate's own
-    /// [`crate::registry::populate_tag_index_entries`] — the exact function
-    /// `GitlabCiRegistry::fetch_route` calls with the raw, unfiltered tags response — rather
-    /// than hand-building a `TagIndex` a real fetch could never produce. `cargo-deny` fails
-    /// `tags_to_versions`' full-semver filter, so this specifically proves the
-    /// registry-confirmed-Branch path is reachable via production data, not just the
-    /// diagnostic function's isolated logic (see also
-    /// `registry::tests::test_fetch_route_tags_indexes_non_semver_tag_for_registry_confirmation`
-    /// for the same guarantee at the live-fetch layer).
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_mutable_ref_pin_diagnostics_fires_for_registry_confirmed_branch() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj\n    ref: cargo-deny\n";
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let instance_host = crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-        let parse_result =
-            crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host).unwrap();
-        assert_eq!(parse_result.dependencies[0].pin, Some(PinStyle::Branch));
-
-        let tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>> =
-            Arc::new(DashMap::new());
-        let sha = "a".repeat(40);
-        crate::registry::populate_tag_index_entries(
-            &tag_index,
-            (
-                EndpointKind::Tags,
-                parse_result.dependencies[0].name.clone(),
-            ),
-            std::iter::once(("cargo-deny", sha.as_str())),
-        );
-        let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), tag_index);
-
-        let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
-
-        let found = diagnostics
-            .iter()
-            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
-            .expect("expected the mutable-ref-pin diagnostic for a registry-confirmed tag");
-        assert!(
-            found.message().contains("no automated fix available"),
-            "a registry-confirmed-but-Branch ref has no quickfix, so the message must say \
-             so; got: {}",
-            found.message()
         );
     }
 
@@ -1765,123 +1252,6 @@ mod tests {
             "org /proj project is pinned to the mutable ref `v1 .0`; pin to a full commit \
              SHA to guard against ref mutation"
         );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    fn test_formatter() -> GitlabCiFormatter {
-        GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
-    }
-
-    /// Exercises `build_sha_pin_action` directly rather than through
-    /// `GitlabCiEcosystem::generate_code_actions`: the shared default that override
-    /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
-    /// which would overwrite a hand-seeded `TagIndex` fixture with real GitLab data before
-    /// this function ever runs — mirrors `deps_github_actions`'s identical test rationale.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_offers_quickfix_on_tag_index_hit() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let instance_host = crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-        let parse_result =
-            crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host).unwrap();
-
-        let formatter = test_formatter();
-        let mut index = TagIndex::default();
-        let sha = "a".repeat(40);
-        index
-            .tag_to_sha
-            .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
-        formatter.tag_index.insert(
-            (
-                EndpointKind::Tags,
-                parse_result.dependencies[0].name.clone(),
-            ),
-            Arc::new(index),
-        );
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start;
-
-        let action = build_sha_pin_action(&parse_result, position.into(), &uri, &formatter)
-            .expect("expected a Pin-to-commit-SHA quickfix");
-        assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
-        let edit = action.edit.as_ref().unwrap();
-        let text_edits = edit
-            .changes
-            .as_ref()
-            .unwrap()
-            .get(&deps_core::to_ls_uri(&uri))
-            .unwrap();
-        assert_eq!(text_edits.len(), 1);
-        assert_eq!(text_edits[0].new_text, sha);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_no_quickfix_on_tag_index_miss() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let instance_host = crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-        let parse_result =
-            crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host).unwrap();
-
-        let formatter = test_formatter();
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start;
-
-        assert!(build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none());
-    }
-
-    /// Mirrors `deps_github_actions`'s identical guard: a `PinStyle::Branch` include must
-    /// never get the SHA-pin quickfix, even if a `TagIndex` entry happens to exist for its
-    /// literal ref text (a branch and a tag can share one name).
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_no_quickfix_for_branch_pin() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj\n    ref: main\n";
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let instance_host = crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-        let parse_result =
-            crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host).unwrap();
-
-        let formatter = test_formatter();
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "main".to_string(),
-            CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        formatter.tag_index.insert(
-            (
-                EndpointKind::Tags,
-                parse_result.dependencies[0].name.clone(),
-            ),
-            Arc::new(index),
-        );
-
-        let position = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start;
-
-        assert!(build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none());
     }
 
     // --- validation finding C3: always-mutable pin forms with no explicit ref/tag text ---
@@ -2048,500 +1418,6 @@ mod tests {
         assert!(!found[1].message().contains("v1.0.0"));
     }
 
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_multiple_includes_applies_matching_sha() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj1\n    ref: v1.0.0\n  - project: org/proj2\n    ref: v2.0.0\n";
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let instance_host = crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-        );
-        let parse_result =
-            crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host).unwrap();
-        assert_eq!(parse_result.dependencies.len(), 2);
-
-        let formatter = test_formatter();
-        let sha1 = "1".repeat(40);
-        let sha2 = "2".repeat(40);
-        let mut index1 = TagIndex::default();
-        index1
-            .tag_to_sha
-            .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
-        formatter.tag_index.insert(
-            (
-                EndpointKind::Tags,
-                parse_result.dependencies[0].name.clone(),
-            ),
-            Arc::new(index1),
-        );
-        let mut index2 = TagIndex::default();
-        index2
-            .tag_to_sha
-            .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
-        formatter.tag_index.insert(
-            (
-                EndpointKind::Tags,
-                parse_result.dependencies[1].name.clone(),
-            ),
-            Arc::new(index2),
-        );
-
-        let position0 = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start;
-        let position1 = deps_core::ParseResult::dependencies(&parse_result)[1]
-            .version_range()
-            .unwrap()
-            .start;
-
-        let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
-            .expect("expected a quickfix for the first include");
-        let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
-            .expect("expected a quickfix for the second include");
-
-        let edit0 = action0.edit.as_ref().unwrap();
-        let edit1 = action1.edit.as_ref().unwrap();
-        let ls_uri = deps_core::to_ls_uri(&uri);
-        assert_eq!(edit0.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha1);
-        assert_eq!(edit1.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha2);
-    }
-
-    /// Validation Fix 2 regression, exercised at the actual quickfix-production boundary
-    /// (not just the raw `TagIndex`, see `registry::tests::test_tag_index_keyed_by_endpoint_no_cross_kind_collision`):
-    /// a `project:` include for repo `org/proj/comp` and a `component:` include naming
-    /// component `comp` inside project `org/proj` share the identical host-qualified
-    /// `PackageName` text. Before keying `TagIndex` by `(EndpointKind, PackageName)`, the
-    /// second seeded entry would silently overwrite the first, and `build_sha_pin_action`
-    /// would apply the wrong repository's SHA to whichever include was queried second.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_build_sha_pin_action_no_cross_kind_collision() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj/comp\n    ref: v1.0.0\n  - component: gitlab.com/org/proj/comp@1.0.0\n";
-        let (policy, instance_host) = {
-            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-            let instance_host = crate::host::GitlabInstanceHost::new(
-                Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
-                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
-            );
-            (policy, instance_host)
-        };
-        let parse_result =
-            crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host).unwrap();
-        assert_eq!(parse_result.dependencies.len(), 2);
-        // Both includes resolve to the identical host-qualified name despite being
-        // unrelated resources — the exact collision this fix guards against.
-        assert_eq!(
-            parse_result.dependencies[0].name,
-            parse_result.dependencies[1].name
-        );
-
-        let formatter = test_formatter();
-        let project_sha = "1".repeat(40);
-        let component_sha = "2".repeat(40);
-        let mut project_index = TagIndex::default();
-        project_index.tag_to_sha.insert(
-            "v1.0.0".to_string(),
-            CommitSha::parse(&project_sha).unwrap(),
-        );
-        formatter.tag_index.insert(
-            (
-                EndpointKind::Tags,
-                parse_result.dependencies[0].name.clone(),
-            ),
-            Arc::new(project_index),
-        );
-        let mut component_index = TagIndex::default();
-        component_index.tag_to_sha.insert(
-            "1.0.0".to_string(),
-            CommitSha::parse(&component_sha).unwrap(),
-        );
-        formatter.tag_index.insert(
-            (
-                EndpointKind::Releases,
-                parse_result.dependencies[1].name.clone(),
-            ),
-            Arc::new(component_index),
-        );
-
-        let position0 = deps_core::ParseResult::dependencies(&parse_result)[0]
-            .version_range()
-            .unwrap()
-            .start;
-        let position1 = deps_core::ParseResult::dependencies(&parse_result)[1]
-            .version_range()
-            .unwrap()
-            .start;
-
-        let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
-            .expect("expected a quickfix for the project: include");
-        let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
-            .expect("expected a quickfix for the component: include");
-        let ls_uri = deps_core::to_ls_uri(&uri);
-
-        assert_eq!(
-            action0.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
-            project_sha,
-            "the project: include must resolve its own Tags-route SHA, not the component's"
-        );
-        assert_eq!(
-            action1.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
-            component_sha,
-            "the component: include must resolve its own Releases-route SHA, not the project's"
-        );
-    }
-
-    // --- validation follow-up C2/S2: quickfix for Latest/Partial component pins ---
-
-    #[cfg(feature = "lsp-responses")]
-    fn component_pin_test_setup(
-        server: &mockito::ServerGuard,
-        pin: PinStyle,
-        version_req: &str,
-    ) -> (
-        GitlabCiRegistry,
-        GitlabCiFormatter,
-        crate::types::GitlabCiParseResult,
-        Url,
-        Position,
-    ) {
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
-        let instance_host = Arc::new(crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::clone(&policy),
-        ));
-        let client = Arc::new(GitlabApiClient::new(
-            Arc::new(HttpCache::new()),
-            instance_host,
-        ));
-        let registry = GitlabCiRegistry::new(client);
-        let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
-
-        let host_bare = server.url();
-        let host = crate::host::GitlabHost::for_test(&host_bare);
-        let name = PackageName::new(format!("{}/org/proj/comp", host.host()));
-        let index = "gitlab:component-pin-test".to_string();
-        registry.register_alternate(&[(
-            index.clone(),
-            crate::types::GitlabRoute {
-                host,
-                endpoint: EndpointKind::Releases,
-            },
-        )]);
-
-        let range = tower_lsp_server::ls_types::Range::new(
-            tower_lsp_server::ls_types::Position::new(0, 0),
-            tower_lsp_server::ls_types::Position::new(0, version_req.len() as u32),
-        );
-        let dep = GitlabCiDependency {
-            name,
-            name_range: range.into(),
-            version_req: Some(version_req.into()),
-            version_range: Some(range.into()),
-            version_literal: None,
-            source: deps_core::parser::DependencySource::AlternateRegistry {
-                index,
-                mirrors_crates_io: false,
-            },
-            is_plain_scalar: true,
-            is_alias_occurrence: false,
-            kind: IncludeKind::Component,
-            host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
-            pin: Some(pin),
-            project_path: "org/proj".to_string(),
-        };
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![dep],
-            routes: vec![],
-            uri: uri.clone(),
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        (registry, formatter, parse_result, uri, range.start)
-    }
-
-    /// Tester re-review: end-to-end tie between the two halves of the #643 invariant on
-    /// the SAME fixture, in one assertion — the classification-table test only exercises
-    /// `sha_pin_quickfix_kind` directly, and the message/action assertions otherwise live
-    /// in disjoint tests, so nothing previously caught a future edit that special-cased one
-    /// call site without touching the shared predicate. A resolved host must both omit the
-    /// diagnostic's suffix AND actually offer the quickfix.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_message_omits_suffix_iff_quickfix_actually_offered_for_resolved_latest_pin() {
-        let mut server = mockito::Server::new_async().await;
-        let sha = "a".repeat(40);
-        let _releases_mock = server
-            .mock("GET", "/api/v4/projects/org%2Fproj/releases")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#
-            ))
-            .create_async()
-            .await;
-
-        let (registry, formatter, parse_result, uri, position) =
-            component_pin_test_setup(&server, PinStyle::Latest, "~latest");
-
-        let diagnostics = mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
-        let found = diagnostics
-            .iter()
-            .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
-            .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Latest component");
-        assert!(
-            !found.message().contains("no automated fix available"),
-            "a resolved host has a genuine quickfix, so the message must omit the suffix: {}",
-            found.message()
-        );
-
-        let action = build_dynamic_component_pin_action(
-            &parse_result,
-            position,
-            &uri,
-            &formatter,
-            &registry,
-        )
-        .await
-        .expect(
-            "the message just claimed a quickfix is available for this exact dependency — \
-             it must actually exist",
-        );
-        assert_eq!(
-            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&deps_core::to_ls_uri(&uri)][0]
-                .new_text,
-            sha
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_build_dynamic_component_pin_action_offers_quickfix_for_latest_pin() {
-        let mut server = mockito::Server::new_async().await;
-        let sha = "a".repeat(40);
-        let _releases_mock = server
-            .mock("GET", "/api/v4/projects/org%2Fproj/releases")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#
-            ))
-            .create_async()
-            .await;
-
-        let (registry, formatter, parse_result, uri, position) =
-            component_pin_test_setup(&server, PinStyle::Latest, "~latest");
-
-        let action = build_dynamic_component_pin_action(
-            &parse_result,
-            position,
-            &uri,
-            &formatter,
-            &registry,
-        )
-        .await
-        .expect("expected a quickfix resolving ~latest to a concrete SHA");
-        assert_eq!(
-            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&deps_core::to_ls_uri(&uri)][0]
-                .new_text,
-            sha
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_build_dynamic_component_pin_action_offers_quickfix_for_partial_pin() {
-        let mut server = mockito::Server::new_async().await;
-        let sha = "b".repeat(40);
-        let _releases_mock = server
-            .mock("GET", "/api/v4/projects/org%2Fproj/releases")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"tag_name":"1.2.5","commit":{{"id":"{sha}"}}}}]"#
-            ))
-            .create_async()
-            .await;
-
-        let (registry, formatter, parse_result, uri, position) =
-            component_pin_test_setup(&server, PinStyle::Partial, "1.2");
-
-        let action = build_dynamic_component_pin_action(
-            &parse_result,
-            position,
-            &uri,
-            &formatter,
-            &registry,
-        )
-        .await
-        .expect("expected a quickfix resolving the partial pin to a concrete SHA");
-        assert_eq!(
-            action.edit.as_ref().unwrap().changes.as_ref().unwrap()[&deps_core::to_ls_uri(&uri)][0]
-                .new_text,
-            sha
-        );
-    }
-
-    /// Security audit finding (#1252, critic follow-up C2): the one CodeAction title fixed
-    /// in this PR (`build_dynamic_component_pin_action`'s "Pin {name} to commit SHA") had no
-    /// regression test — a bidi override in the dependency name must not survive into the
-    /// title, and an oversized name must not grow it unbounded.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_build_dynamic_component_pin_action_title_sanitizes_and_caps_name() {
-        let mut server = mockito::Server::new_async().await;
-        let sha = "a".repeat(40);
-        let _releases_mock = server
-            .mock("GET", "/api/v4/projects/org%2Fproj/releases")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body(format!(
-                r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#
-            ))
-            .create_async()
-            .await;
-
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
-        let instance_host = Arc::new(crate::host::GitlabInstanceHost::new(
-            Arc::new(RwLock::new(None)),
-            Arc::clone(&policy),
-        ));
-        let client = Arc::new(GitlabApiClient::new(
-            Arc::new(HttpCache::new()),
-            instance_host,
-        ));
-        let registry = GitlabCiRegistry::new(client);
-        let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
-
-        let host_bare = server.url();
-        let long_suffix = "x".repeat(200);
-        // The bidi override and the length go into the trailing component-name segment
-        // only: `project_path_from_name`'s `Releases` branch derives the fetch path via
-        // `rsplit_once('/')`, keeping everything before the last `/` as the project path
-        // (must stay exactly "org/proj" to match the mock below) and treating the last
-        // segment as the (here, deliberately hostile) component name.
-        let host = crate::host::GitlabHost::for_test(&host_bare);
-        let name = PackageName::new(format!(
-            "{}/org/proj/co\u{202E}mp{long_suffix}",
-            host.host()
-        ));
-        let index = "gitlab:component-pin-title-test".to_string();
-        registry.register_alternate(&[(
-            index.clone(),
-            crate::types::GitlabRoute {
-                host,
-                endpoint: EndpointKind::Releases,
-            },
-        )]);
-
-        let version_req = "~latest";
-        let range = tower_lsp_server::ls_types::Range::new(
-            tower_lsp_server::ls_types::Position::new(0, 0),
-            tower_lsp_server::ls_types::Position::new(0, version_req.len() as u32),
-        );
-        let dep = GitlabCiDependency {
-            name,
-            name_range: range.into(),
-            version_req: Some(version_req.into()),
-            version_range: Some(range.into()),
-            version_literal: None,
-            source: deps_core::parser::DependencySource::AlternateRegistry {
-                index,
-                mirrors_crates_io: false,
-            },
-            is_plain_scalar: true,
-            is_alias_occurrence: false,
-            kind: IncludeKind::Component,
-            host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
-            pin: Some(PinStyle::Latest),
-            project_path: "org/proj".to_string(),
-        };
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![dep],
-            routes: vec![],
-            uri: uri.clone(),
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-
-        let action = build_dynamic_component_pin_action(
-            &parse_result,
-            range.start,
-            &uri,
-            &formatter,
-            &registry,
-        )
-        .await
-        .expect("expected a quickfix resolving ~latest to a concrete SHA");
-
-        assert!(
-            !action.title.contains('\u{202E}'),
-            "bidi override must not survive into the title: {:?}",
-            action.title
-        );
-        assert!(
-            action.title.len() < long_suffix.len(),
-            "an oversized name must not render in full inside the title: {:?}",
-            action.title
-        );
-        assert!(action.title.contains('…'));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_build_dynamic_component_pin_action_no_quickfix_when_nothing_matches() {
-        let mut server = mockito::Server::new_async().await;
-        let _releases_mock = server
-            .mock("GET", "/api/v4/projects/org%2Fproj/releases")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_body("[]")
-            .create_async()
-            .await;
-
-        let (registry, formatter, parse_result, uri, position) =
-            component_pin_test_setup(&server, PinStyle::Partial, "1.2");
-
-        assert!(
-            build_dynamic_component_pin_action(
-                &parse_result,
-                position,
-                &uri,
-                &formatter,
-                &registry
-            )
-            .await
-            .is_none()
-        );
-    }
-
-    /// Neither a `project:` include nor a `component:` `PinStyle::Tag`/`PinStyle::Branch`
-    /// pin is ever resolved by this function — it exists solely for `Latest`/`Partial`.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_build_dynamic_component_pin_action_ignores_non_latest_partial_pins() {
-        let server = mockito::Server::new_async().await;
-        let (registry, formatter, parse_result, uri, position) =
-            component_pin_test_setup(&server, PinStyle::Tag, "1.0.0");
-
-        assert!(
-            build_dynamic_component_pin_action(
-                &parse_result,
-                position,
-                &uri,
-                &formatter,
-                &registry
-            )
-            .await
-            .is_none()
-        );
-    }
-
     // --- issue #643 anti-drift: sha_pin_quickfix_kind classification table (S1/S3) ---
 
     /// Table-driven regression for the single classification `mutable_ref_pin_diagnostics`'s
@@ -2700,324 +1576,6 @@ mod tests {
         }
     }
 
-    // --- issue #640: bulk "Pin all to SHA" collector ---
-
-    #[cfg(feature = "lsp-responses")]
-    fn empty_versions() -> (
-        std::collections::HashMap<PackageName, deps_core::PackageVersions>,
-        std::collections::HashMap<PackageName, deps_core::ConcreteVersion>,
-    ) {
-        (
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_multiple_tag_includes_produce_sorted_edits() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj1\n    ref: v1.0.0\n  - project: org/proj2\n    ref: v2.0.0\n";
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
-        let sha1 = "1".repeat(40);
-        let sha2 = "2".repeat(40);
-        let mut index1 = TagIndex::default();
-        index1
-            .tag_to_sha
-            .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
-        eco.formatter.tag_index.insert(
-            (EndpointKind::Tags, deps[0].name().clone()),
-            Arc::new(index1),
-        );
-        let mut index2 = TagIndex::default();
-        index2
-            .tag_to_sha
-            .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
-        eco.formatter.tag_index.insert(
-            (EndpointKind::Tags, deps[1].name().clone()),
-            Arc::new(index2),
-        );
-
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-
-        assert_eq!(edits.len(), 2);
-        assert!(edits.iter().any(|e| e.new_text == sha1));
-        assert!(edits.iter().any(|e| e.new_text == sha2));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_skips_sha_branch_and_refless_includes() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let sha_lit = "a".repeat(40);
-        let content = format!(
-            "include:\n\
-             \x20 - project: org/sha\n    ref: {sha_lit}\n\
-             \x20 - project: org/branch\n    ref: main\n\
-             \x20 - project: org/norefs\n"
-        );
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
-
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-
-        assert!(
-            edits.is_empty(),
-            "a SHA pin, an unconfirmed branch pin, and a ref-less include must all be \
-             withheld: {edits:?}"
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_tag_index_miss_is_skipped() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        // No `tag_index` seed: a genuine cache miss must be skipped gracefully.
-
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-
-        assert!(edits.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_resolves_latest_component_pin_from_cached_versions()
-    {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
-            .name()
-            .clone();
-
-        let sha = "a".repeat(40);
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("2.0.0".to_string(), CommitSha::parse(&sha).unwrap());
-        eco.formatter
-            .tag_index
-            .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
-
-        let mut cached = std::collections::HashMap::new();
-        cached.insert(name, deps_core::PackageVersions::latest_only("2.0.0"));
-        let resolved = std::collections::HashMap::new();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].new_text, sha);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_resolves_partial_component_pin_picks_highest_matching()
-     {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - component: gitlab.com/org/proj/comp@1.2\n";
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
-            .name()
-            .clone();
-
-        let sha_low = "1".repeat(40);
-        let sha_high = "2".repeat(40);
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("1.2.0".to_string(), CommitSha::parse(&sha_low).unwrap());
-        index
-            .tag_to_sha
-            .insert("1.2.5".to_string(), CommitSha::parse(&sha_high).unwrap());
-        eco.formatter
-            .tag_index
-            .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
-
-        let mut cached = std::collections::HashMap::new();
-        let available: Vec<deps_core::ConcreteVersion> =
-            vec!["1.2.0".into(), "1.2.5".into(), "1.3.0".into()];
-        cached.insert(
-            name,
-            deps_core::PackageVersions::new("1.3.0".into(), std::sync::Arc::from(available)),
-        );
-        let resolved = std::collections::HashMap::new();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert_eq!(edits.len(), 1);
-        assert_eq!(
-            edits[0].new_text, sha_high,
-            "1.2 must pick the highest matching release (1.2.5), not 1.2.0 or the \
-             out-of-range 1.3.0"
-        );
-    }
-
-    /// S2 invariant-1 regression: the ladder's winning release (`2.0.0`, the highest) has
-    /// no `TagIndex` entry — the reconstitution must keep it as an empty-SHA placeholder
-    /// rather than dropping it, so `Latest` still resolves to `2.0.0` and then correctly
-    /// withholds the edit (since its SHA is unknown), instead of silently shifting the
-    /// result down to `1.0.0` just because that one happens to have a SHA on file.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_unknown_sha_winner_is_skipped_not_shifted() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
-            .name()
-            .clone();
-
-        // Only "1.0.0" has a TagIndex entry; "2.0.0" (the true winner) does not.
-        let mut index = TagIndex::default();
-        index.tag_to_sha.insert(
-            "1.0.0".to_string(),
-            CommitSha::parse(&"a".repeat(40)).unwrap(),
-        );
-        eco.formatter
-            .tag_index
-            .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
-
-        let mut cached = std::collections::HashMap::new();
-        let available: Vec<deps_core::ConcreteVersion> = vec!["1.0.0".into(), "2.0.0".into()];
-        cached.insert(
-            name,
-            deps_core::PackageVersions::new("2.0.0".into(), std::sync::Arc::from(available)),
-        );
-        let resolved = std::collections::HashMap::new();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert!(
-            edits.is_empty(),
-            "the unresolvable winner must be skipped outright, never silently replaced by \
-             a lower-ranked release that happens to have a known SHA: {edits:?}"
-        );
-    }
-
-    /// M2 (impl-critic minor): regression for `resolve_component_pin`'s documented
-    /// last-maximum tie-break (`component.rs:155`/`:167`) surviving through the bulk
-    /// collector's reconstitution — two releases that normalize to the same semver
-    /// (`1.2.0`/`v1.2.0`) must resolve by `available`'s own order, not be silently
-    /// reordered/deduped by a future "tidy up" of `reconstitute_component_releases`.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_latest_tie_break_picks_last_in_available_order() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
-            .name()
-            .clone();
-
-        let sha_first = "1".repeat(40);
-        let sha_last = "2".repeat(40);
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("1.2.0".to_string(), CommitSha::parse(&sha_first).unwrap());
-        index
-            .tag_to_sha
-            .insert("v1.2.0".to_string(), CommitSha::parse(&sha_last).unwrap());
-        eco.formatter
-            .tag_index
-            .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
-
-        let mut cached = std::collections::HashMap::new();
-        // "1.2.0" and "v1.2.0" normalize to the identical semver — order decides the tie.
-        let available: Vec<deps_core::ConcreteVersion> = vec!["1.2.0".into(), "v1.2.0".into()];
-        cached.insert(
-            name,
-            deps_core::PackageVersions::new("v1.2.0".into(), std::sync::Arc::from(available)),
-        );
-        let resolved = std::collections::HashMap::new();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-        assert_eq!(edits.len(), 1);
-        assert_eq!(
-            edits[0].new_text, sha_last,
-            "on a semver tie, the LAST entry in available's order must win, matching \
-             resolve_component_pin's documented max_by behavior"
-        );
-    }
-
-    /// M3: a quoted-scalar `ref:` must round-trip through the bulk collector exactly like
-    /// an unquoted one — `version_range` locates only the raw value text (`git_ref`), so
-    /// the surrounding quotes fall outside the edit and survive unmodified. Unlike
-    /// `deps-github-actions`, this ecosystem has no `is_plain_scalar`/flow-mapping guard
-    /// to withhold on, by design (see `build_sha_pin_action`'s doc comment).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_collect_pin_all_to_sha_edits_quoted_scalar_tag_pin_round_trips() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let content = "include:\n  - project: org/proj\n    ref: \"v1.0.0\"\n";
-        let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
-            .name()
-            .clone();
-        let sha = "a".repeat(40);
-        let mut index = TagIndex::default();
-        index
-            .tag_to_sha
-            .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
-        eco.formatter
-            .tag_index
-            .insert((EndpointKind::Tags, name), Arc::new(index));
-
-        let (cached, resolved) = empty_versions();
-        let versions = deps_core::VersionData::new(&cached, &resolved);
-        let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
-
-        assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].new_text, sha);
-
-        let table = deps_core::LineOffsetTable::new(content);
-        let start = table.position_to_byte_offset(content, edits[0].range.start.into());
-        let end = table.position_to_byte_offset(content, edits[0].range.end.into());
-        let new_content = format!(
-            "{}{}{}",
-            &content[..start],
-            edits[0].new_text,
-            &content[end..]
-        );
-        assert!(
-            new_content.contains(&format!("\"{sha}\"")),
-            "the surrounding quotes must survive the edit: {new_content}"
-        );
-        eco.parse_manifest(&new_content, &uri)
-            .await
-            .expect("resulting text must still parse");
-    }
-
-    /// `deps-gitlab-ci` never supports raw-text section detection at all (no cheap
-    /// section boundary shared by `project:`/`component:` include forms) — no override.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_default_none() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-        assert!(
-            eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0).into())
-                .is_none()
-        );
-    }
-
     #[test]
     fn test_completion_insert_text() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -3054,173 +1612,6 @@ mod tests {
             eco.completion_insert_text(&meta),
             Some("my-component@1.2.3".to_string())
         );
-    }
-
-    // --- #793: `generate_completions` dispatch, pinned before the wildcard-match refactor
-    // so it can't silently change behavior. GitLab CI serves only `Version` (no
-    // package-name search, NFR-002); the other two contexts must return `Completions::default()`.
-
-    /// A minimal, fully literal `GitlabCiDependency` for dispatch tests — bypasses the real
-    /// YAML parser so `name_range`/`version_range`/`source` are exactly what the test wants,
-    /// with no risk of a real parse resolving `source` to a live, network-reachable host.
-    #[cfg(feature = "lsp-responses")]
-    fn dispatch_test_dep(
-        name_range: deps_core::position::Range,
-        version_range: deps_core::position::Range,
-        source: deps_core::parser::DependencySource,
-    ) -> crate::types::GitlabCiDependency {
-        crate::types::GitlabCiDependency {
-            name: "org/proj".into(),
-            name_range,
-            version_req: Some("1.0.0".into()),
-            version_range: Some(version_range),
-            version_literal: None,
-            source,
-            is_plain_scalar: true,
-            is_alias_occurrence: false,
-            kind: IncludeKind::Project,
-            host: HostRef::Unresolved("$CI_SERVER_FQDN".to_string()),
-            pin: Some(PinStyle::Tag),
-            project_path: "org/proj".to_string(),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let name_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
-        let version_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
-        let dep = dispatch_test_dep(
-            name_range.into(),
-            version_range.into(),
-            deps_core::parser::DependencySource::CustomRegistry {
-                url: "https://gitlab.example".into(),
-            },
-        );
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![dep],
-            routes: vec![],
-            uri,
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-
-        let result = eco
-            .generate_completions(
-                &parse_result,
-                name_range.start,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert_eq!(
-            result,
-            Completions::default()
-                .with_origin(deps_core::completion::CompletionOrigin::PackageName)
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let name_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
-        let version_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
-        let dep = dispatch_test_dep(
-            name_range.into(),
-            version_range.into(),
-            deps_core::parser::DependencySource::CustomRegistry {
-                url: "https://gitlab.example".into(),
-            },
-        );
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![dep],
-            routes: vec![],
-            uri,
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-
-        // Line 0 falls outside every dependency's name/version range.
-        let result = eco
-            .generate_completions(
-                &parse_result,
-                Position::new(0, 0),
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert_eq!(result, Completions::default());
-    }
-
-    /// The dependency *is* found at `position`, but its source (`CustomRegistry`, an
-    /// unresolved host) fails closed inside `GitlabCiRegistry::get_versions_from` before any
-    /// network call — deterministic, and pins that `generate_completions` still threads the
-    /// found dependency's own `name`/`source` into `complete_versions_generic_from` rather
-    /// than, say, skipping the lookup or using a different dependency's source.
-    ///
-    /// tester finding #2 (post-#1136 review): the original version of this test only
-    /// asserted `via_dispatch.items == direct` — both sides independently call the *same*
-    /// gated function with the *same* args, so that equality would hold even if
-    /// `can_resolve_source` were deleted entirely (both sides would just as happily agree on
-    /// a non-empty result together). The explicit `is_empty()` assertion below is what
-    /// actually pins the observable outcome for a `CustomRegistry` source.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_dispatches_by_dependency_source() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let name_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
-        let version_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
-        let source = deps_core::parser::DependencySource::CustomRegistry {
-            url: "https://gitlab.example".into(),
-        };
-        let dep = dispatch_test_dep(name_range.into(), version_range.into(), source.clone());
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![dep],
-            routes: vec![],
-            uri,
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-        let freshness = deps_core::FreshnessSettings::default();
-
-        let via_dispatch = eco
-            .generate_completions(&parse_result, Position::new(2, 13), content, freshness)
-            .await;
-        let direct = deps_core::completion::complete_versions_generic_from(
-            eco.registry.as_ref(),
-            &eco.formatter,
-            &deps_core::PackageName::new("org/proj"),
-            &source,
-            "v1.0",
-            VERSION_OPERATOR_CHARS,
-            freshness,
-            &deps_core::SelectionContext::none(),
-        )
-        .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(
-            via_dispatch.items.is_empty(),
-            "a CustomRegistry source must yield zero completions, got: {:?}",
-            via_dispatch.items
-        );
-        assert!(!via_dispatch.is_incomplete);
     }
 
     // --- #912: alias-occurrence edit/completion withholding (spec FR-010/FR-011) ---
@@ -3264,150 +1655,6 @@ mod tests {
         assert!(sha_pin_quickfix_kind(&gl_dep, &gl_dep, &formatter).is_none());
     }
 
-    /// FR-010/US-002: the "Pin to commit SHA" code action must never be offered at an
-    /// alias site, even when a real `TagIndex` entry would otherwise resolve one.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_code_actions_withholds_sha_pin_for_alias_occurrence() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let version_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
-        let name_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
-        let gl_dep =
-            alias_dispatch_test_dep(name_range.into(), version_range.into(), Some(PinStyle::Tag));
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![gl_dep],
-            routes: vec![],
-            uri: uri.clone(),
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        let content = "include:\n  - project: org/proj\n    ref: *pin\n";
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-        let cached = std::collections::HashMap::new();
-        let resolved = std::collections::HashMap::new();
-
-        let actions = eco
-            .generate_code_actions(
-                &parse_result,
-                Position::new(2, 11),
-                &uri,
-                deps_core::VersionData::new(&cached, &resolved),
-                content,
-            )
-            .await;
-        assert!(
-            actions.is_empty(),
-            "expected no quickfix at an alias site: {actions:?}"
-        );
-    }
-
-    /// FR-011/EC-016/SC-006: version completion is withheld at an alias site using the
-    /// `project:`/`ref:` shape (`name_range != version_range`) — the shape where
-    /// `CompletionContext::Version` is actually reachable, so this is a meaningful test of
-    /// the gate rather than a vacuous one (see [`alias_dispatch_test_dep`]'s doc comment).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_withholds_version_completion_for_alias_occurrence() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let name_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
-        let version_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
-        let dep =
-            alias_dispatch_test_dep(name_range.into(), version_range.into(), Some(PinStyle::Tag));
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![dep],
-            routes: vec![],
-            uri,
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        let content = "include:\n  - project: org/proj\n    ref: *pin\n";
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-
-        // Cursor inside the alias token's `version_range`.
-        let result = eco
-            .generate_completions(
-                &parse_result,
-                Position::new(2, 11),
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert_eq!(result, Completions::default());
-    }
-
-    /// #912 critic S3: `#922`'s `dependency_version_range_is_literal` guard already blocks
-    /// `detect_completion_context` from ever returning `Version` for a `*`-leading
-    /// `version_range`, so the `generate_completions`-level test above no longer exercises
-    /// this ecosystem's own FR-011 gate — it now passes even without it. This test calls
-    /// `complete_version` directly, bypassing `detect_completion_context` entirely, to pin
-    /// that the local gate itself still withholds (defense-in-depth, not dead code).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_version_directly_withholds_for_alias_occurrence() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let name_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
-        let version_range =
-            tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
-        let dep =
-            alias_dispatch_test_dep(name_range.into(), version_range.into(), Some(PinStyle::Tag));
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![dep],
-            routes: vec![],
-            uri,
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-        let request = deps_core::completion::CompletionRequest::new(
-            &parse_result,
-            Position::new(2, 11),
-            deps_core::FreshnessSettings::default(),
-        );
-
-        let result = eco
-            .complete_version(request, PackageName::new("org/proj"), "v1.0".to_string())
-            .await;
-        assert_eq!(result, Completions::default());
-    }
-
-    /// FR-010/US-002: the bulk "pin all to SHA" lens must not produce an edit for an
-    /// alias-occurrence dependency, even when its pin would otherwise resolve one.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_collect_pin_all_to_sha_edits_withholds_for_alias_occurrence() {
-        let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
-        let range = deps_core::position::Range::new(
-            deps_core::position::Position::new(0, 0),
-            deps_core::position::Position::new(0, 4),
-        );
-        let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
-        let parse_result = crate::types::GitlabCiParseResult {
-            dependencies: vec![gl_dep],
-            routes: vec![],
-            uri,
-            dependency_truncation: None,
-            blocked_registries: Vec::new(),
-        };
-        let cache = Arc::new(HttpCache::new());
-        let eco = GitlabCiEcosystem::new(cache);
-        let cached = std::collections::HashMap::new();
-        let resolved = std::collections::HashMap::new();
-
-        let edits = eco.collect_pin_all_to_sha_edits(
-            &parse_result,
-            deps_core::VersionData::new(&cached, &resolved),
-        );
-        assert!(edits.is_empty());
-    }
-
     /// FR-010/#643: an alias-occurrence dependency's mutable-ref-pin diagnostic must carry
     /// the "manual edit" suffix — `sha_pin_quickfix_kind` (which this message's suffix
     /// decision reads) withholds regardless of `pin`, so the message stays honest about no
@@ -3426,5 +1673,1432 @@ mod tests {
             "alias-occurrence message must carry the manual-edit suffix: {}",
             found.message()
         );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    mod lsp_tests {
+        use super::*;
+
+        use deps_core::lsp_helpers::splice_resolved_line;
+
+        use deps_core::lsp_helpers::{CommitSha, TagIndex};
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (a component/include ref has no operator syntax), so an edit to one
+        // without the other fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod gitlab_ci_operator_chars_conformance;
+            ecosystem: "gitlab-ci";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &[];
+        }
+
+        #[test]
+        fn test_splice_project_line() {
+            let markdown = "# gitlab.com/org/proj/comp\n\n**Requirement**: `1.0.0`\n";
+            let spliced = splice_project_line(markdown, "https://gitlab.com/org/proj");
+            assert!(spliced.contains("**Project**"));
+            assert!(
+                spliced.find("**Project**").unwrap() < spliced.find("**Requirement**").unwrap()
+            );
+        }
+
+        /// #1310 critic S3: `project_path` is manifest-controlled and `is_valid_gitlab_coordinate`
+        /// bounds only its charset, not its length — the label half of the `**Project**` line
+        /// must be capped, matching `deps-core::git_ref.rs`'s `splice_resolved_line` fix for the
+        /// same class of gap.
+        #[test]
+        fn splice_project_line_caps_label_but_not_destination() {
+            let long_url = format!("https://gitlab.example.com/{}", "a".repeat(5000));
+            let spliced = splice_project_line("", &long_url);
+            assert!(
+                spliced.contains(&format!("]({long_url})")),
+                "the destination must not be truncated; got: {spliced}"
+            );
+            assert!(
+                spliced.contains('…'),
+                "the label must be truncated; got: {spliced}"
+            );
+            let label_start = spliced.find('[').unwrap() + 1;
+            let label_end = spliced.find(']').unwrap();
+            assert!(
+                spliced[label_start..label_end].chars().count() <= MAX_DIAGNOSTIC_VALUE_CHARS + 1,
+                "label must be bounded by the cap plus the ellipsis marker; got: {spliced}"
+            );
+        }
+
+        /// Boundary case (at cap / over cap), not just the 5000-char extreme.
+        #[test]
+        fn splice_project_line_label_boundary_at_and_over_cap() {
+            let prefix = "https://gitlab.example.com/";
+            let cap = MAX_DIAGNOSTIC_VALUE_CHARS;
+
+            let at_cap_url = format!("{prefix}{}", "a".repeat(cap - prefix.len()));
+            let spliced = splice_project_line("", &at_cap_url);
+            assert!(
+                spliced.contains(&format!("[{at_cap_url}]({at_cap_url})")),
+                "a url whose label is exactly at the cap must render whole; got: {spliced}"
+            );
+
+            let over_cap_url = format!("{prefix}{}", "a".repeat(cap - prefix.len() + 1));
+            let spliced = splice_project_line("", &over_cap_url);
+            let truncated_label = format!("{}…", &over_cap_url[..cap]);
+            assert!(
+                spliced.contains(&format!("[{truncated_label}]({over_cap_url})")),
+                "a url one char over the cap must truncate the label to exactly `cap` chars \
+             plus the ellipsis, while leaving the destination whole; got: {spliced}"
+            );
+        }
+
+        #[test]
+        fn test_splice_resolved_line_after_requirement() {
+            let markdown = "# org/proj\n\n**Requirement**: `v1.0.0`\n\n**Latest**: `v1.1.0`\n";
+            let spliced = splice_resolved_line(markdown, "v1.0.0", &"a".repeat(40));
+            let req_pos = spliced.find("**Requirement**").unwrap();
+            let resolved_pos = spliced.find("**Resolved**").unwrap();
+            let latest_pos = spliced.find("**Latest**").unwrap();
+            assert!(req_pos < resolved_pos);
+            assert!(resolved_pos < latest_pos);
+        }
+
+        /// S3 cold-cache negative test (architect's plan, tester re-review): documents the one
+        /// place where "message omits suffix" and "quickfix actually available" are
+        /// deliberately NOT the same fact. A `PinStyle::Tag` message never carries the suffix
+        /// — `sha_pin_quickfix_kind`'s `Tag` arm doesn't consult `TagIndex` at all, unlike the
+        /// `Latest`/`Partial` arm — yet `build_sha_pin_action` still withholds the quickfix on
+        /// a cold/unseeded cache (a genuine `TagIndex` miss, e.g. the document was opened
+        /// before the registry fetch completed). This divergence is pre-existing and accepted
+        /// (shared with `deps-github-actions`'s identical guard), not a regression #643
+        /// introduced — this test exists so it stays a documented, deliberate fact rather than
+        /// an implicit one.
+        #[tokio::test]
+        async fn test_tag_pin_message_omits_suffix_on_cold_cache_while_quickfix_unavailable() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+
+            // `diagnostics_for` builds its own fresh `GitlabCiEcosystem`, so its `TagIndex` is
+            // guaranteed cold here — no `seed_tag`/`populate_tag_index_entries` call anywhere
+            // in this function.
+            let diagnostics = diagnostics_for(content, &uri).await;
+            let found = diagnostics
+                .iter()
+                .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
+                .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Tag include");
+            assert!(
+                !found.message().contains("no automated fix available"),
+                "a PinStyle::Tag message never carries the suffix, cold cache or not: {}",
+                found.message()
+            );
+
+            // Independently-built parse result + formatter, likewise cold (no seeding).
+            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+            let instance_host = crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+            let parse_result =
+                crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+                    .unwrap();
+            let formatter = test_formatter();
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start;
+            assert!(
+                build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none(),
+                "a cold TagIndex must still withhold the quickfix even though the message \
+             omits the suffix — the one accepted message/quickfix divergence"
+            );
+        }
+
+        /// Issue #551's lesson, mirrored from `deps_github_actions`: a `PinStyle::Branch`
+        /// include the `TagIndex` confirms is actually a published tag must still get the
+        /// diagnostic — with wording that says no automated fix is available (since
+        /// `build_sha_pin_action` deliberately stays restricted to `PinStyle::Tag`).
+        ///
+        /// Validation Fix 1: seeds `tag_index` through the crate's own
+        /// [`crate::registry::populate_tag_index_entries`] — the exact function
+        /// `GitlabCiRegistry::fetch_route` calls with the raw, unfiltered tags response — rather
+        /// than hand-building a `TagIndex` a real fetch could never produce. `cargo-deny` fails
+        /// `tags_to_versions`' full-semver filter, so this specifically proves the
+        /// registry-confirmed-Branch path is reachable via production data, not just the
+        /// diagnostic function's isolated logic (see also
+        /// `registry::tests::test_fetch_route_tags_indexes_non_semver_tag_for_registry_confirmation`
+        /// for the same guarantee at the live-fetch layer).
+        #[test]
+        fn test_mutable_ref_pin_diagnostics_fires_for_registry_confirmed_branch() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj\n    ref: cargo-deny\n";
+            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+            let instance_host = crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+            let parse_result =
+                crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+                    .unwrap();
+            assert_eq!(parse_result.dependencies[0].pin, Some(PinStyle::Branch));
+
+            let tag_index: Arc<DashMap<(EndpointKind, PackageName), Arc<TagIndex>>> =
+                Arc::new(DashMap::new());
+            let sha = "a".repeat(40);
+            crate::registry::populate_tag_index_entries(
+                &tag_index,
+                (
+                    EndpointKind::Tags,
+                    parse_result.dependencies[0].name.clone(),
+                ),
+                std::iter::once(("cargo-deny", sha.as_str())),
+            );
+            let formatter = GitlabCiFormatter::new(Arc::new(DashMap::new()), tag_index);
+
+            let diagnostics =
+                mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
+
+            let found = diagnostics
+                .iter()
+                .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
+                .expect("expected the mutable-ref-pin diagnostic for a registry-confirmed tag");
+            assert!(
+                found.message().contains("no automated fix available"),
+                "a registry-confirmed-but-Branch ref has no quickfix, so the message must say \
+             so; got: {}",
+                found.message()
+            );
+        }
+
+        fn test_formatter() -> GitlabCiFormatter {
+            GitlabCiFormatter::new(Arc::new(DashMap::new()), Arc::new(DashMap::new()))
+        }
+
+        /// Exercises `build_sha_pin_action` directly rather than through
+        /// `GitlabCiEcosystem::generate_code_actions`: the shared default that override
+        /// delegates to first drives a *live* registry fetch (to list "Update to X" actions),
+        /// which would overwrite a hand-seeded `TagIndex` fixture with real GitLab data before
+        /// this function ever runs — mirrors `deps_github_actions`'s identical test rationale.
+        #[test]
+        fn test_build_sha_pin_action_offers_quickfix_on_tag_index_hit() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+            let instance_host = crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+            let parse_result =
+                crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+                    .unwrap();
+
+            let formatter = test_formatter();
+            let mut index = TagIndex::default();
+            let sha = "a".repeat(40);
+            index
+                .tag_to_sha
+                .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            formatter.tag_index.insert(
+                (
+                    EndpointKind::Tags,
+                    parse_result.dependencies[0].name.clone(),
+                ),
+                Arc::new(index),
+            );
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start;
+
+            let action = build_sha_pin_action(&parse_result, position.into(), &uri, &formatter)
+                .expect("expected a Pin-to-commit-SHA quickfix");
+            assert!(action.title.contains("Pin") && action.title.contains("commit SHA"));
+            let edit = action.edit.as_ref().unwrap();
+            let text_edits = edit
+                .changes
+                .as_ref()
+                .unwrap()
+                .get(&deps_core::to_ls_uri(&uri))
+                .unwrap();
+            assert_eq!(text_edits.len(), 1);
+            assert_eq!(text_edits[0].new_text, sha);
+        }
+
+        #[test]
+        fn test_build_sha_pin_action_no_quickfix_on_tag_index_miss() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+            let instance_host = crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+            let parse_result =
+                crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+                    .unwrap();
+
+            let formatter = test_formatter();
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start;
+
+            assert!(
+                build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none()
+            );
+        }
+
+        /// Mirrors `deps_github_actions`'s identical guard: a `PinStyle::Branch` include must
+        /// never get the SHA-pin quickfix, even if a `TagIndex` entry happens to exist for its
+        /// literal ref text (a branch and a tag can share one name).
+        #[test]
+        fn test_build_sha_pin_action_no_quickfix_for_branch_pin() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj\n    ref: main\n";
+            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+            let instance_host = crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+            let parse_result =
+                crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+                    .unwrap();
+
+            let formatter = test_formatter();
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "main".to_string(),
+                CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            formatter.tag_index.insert(
+                (
+                    EndpointKind::Tags,
+                    parse_result.dependencies[0].name.clone(),
+                ),
+                Arc::new(index),
+            );
+
+            let position = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start;
+
+            assert!(
+                build_sha_pin_action(&parse_result, position.into(), &uri, &formatter).is_none()
+            );
+        }
+
+        #[test]
+        fn test_build_sha_pin_action_multiple_includes_applies_matching_sha() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj1\n    ref: v1.0.0\n  - project: org/proj2\n    ref: v2.0.0\n";
+            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+            let instance_host = crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+            );
+            let parse_result =
+                crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+                    .unwrap();
+            assert_eq!(parse_result.dependencies.len(), 2);
+
+            let formatter = test_formatter();
+            let sha1 = "1".repeat(40);
+            let sha2 = "2".repeat(40);
+            let mut index1 = TagIndex::default();
+            index1
+                .tag_to_sha
+                .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
+            formatter.tag_index.insert(
+                (
+                    EndpointKind::Tags,
+                    parse_result.dependencies[0].name.clone(),
+                ),
+                Arc::new(index1),
+            );
+            let mut index2 = TagIndex::default();
+            index2
+                .tag_to_sha
+                .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
+            formatter.tag_index.insert(
+                (
+                    EndpointKind::Tags,
+                    parse_result.dependencies[1].name.clone(),
+                ),
+                Arc::new(index2),
+            );
+
+            let position0 = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start;
+            let position1 = deps_core::ParseResult::dependencies(&parse_result)[1]
+                .version_range()
+                .unwrap()
+                .start;
+
+            let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
+                .expect("expected a quickfix for the first include");
+            let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
+                .expect("expected a quickfix for the second include");
+
+            let edit0 = action0.edit.as_ref().unwrap();
+            let edit1 = action1.edit.as_ref().unwrap();
+            let ls_uri = deps_core::to_ls_uri(&uri);
+            assert_eq!(edit0.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha1);
+            assert_eq!(edit1.changes.as_ref().unwrap()[&ls_uri][0].new_text, sha2);
+        }
+
+        /// Validation Fix 2 regression, exercised at the actual quickfix-production boundary
+        /// (not just the raw `TagIndex`, see `registry::tests::test_tag_index_keyed_by_endpoint_no_cross_kind_collision`):
+        /// a `project:` include for repo `org/proj/comp` and a `component:` include naming
+        /// component `comp` inside project `org/proj` share the identical host-qualified
+        /// `PackageName` text. Before keying `TagIndex` by `(EndpointKind, PackageName)`, the
+        /// second seeded entry would silently overwrite the first, and `build_sha_pin_action`
+        /// would apply the wrong repository's SHA to whichever include was queried second.
+        #[test]
+        fn test_build_sha_pin_action_no_cross_kind_collision() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj/comp\n    ref: v1.0.0\n  - component: gitlab.com/org/proj/comp@1.0.0\n";
+            let (policy, instance_host) = {
+                let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+                let instance_host = crate::host::GitlabInstanceHost::new(
+                    Arc::new(RwLock::new(Some("gitlab.com".to_string()))),
+                    Arc::new(deps_core::net_policy::RegistryAccessPolicy::default()),
+                );
+                (policy, instance_host)
+            };
+            let parse_result =
+                crate::parser::parse_gitlab_ci_yaml(content, &uri, &policy, &instance_host)
+                    .unwrap();
+            assert_eq!(parse_result.dependencies.len(), 2);
+            // Both includes resolve to the identical host-qualified name despite being
+            // unrelated resources — the exact collision this fix guards against.
+            assert_eq!(
+                parse_result.dependencies[0].name,
+                parse_result.dependencies[1].name
+            );
+
+            let formatter = test_formatter();
+            let project_sha = "1".repeat(40);
+            let component_sha = "2".repeat(40);
+            let mut project_index = TagIndex::default();
+            project_index.tag_to_sha.insert(
+                "v1.0.0".to_string(),
+                CommitSha::parse(&project_sha).unwrap(),
+            );
+            formatter.tag_index.insert(
+                (
+                    EndpointKind::Tags,
+                    parse_result.dependencies[0].name.clone(),
+                ),
+                Arc::new(project_index),
+            );
+            let mut component_index = TagIndex::default();
+            component_index.tag_to_sha.insert(
+                "1.0.0".to_string(),
+                CommitSha::parse(&component_sha).unwrap(),
+            );
+            formatter.tag_index.insert(
+                (
+                    EndpointKind::Releases,
+                    parse_result.dependencies[1].name.clone(),
+                ),
+                Arc::new(component_index),
+            );
+
+            let position0 = deps_core::ParseResult::dependencies(&parse_result)[0]
+                .version_range()
+                .unwrap()
+                .start;
+            let position1 = deps_core::ParseResult::dependencies(&parse_result)[1]
+                .version_range()
+                .unwrap()
+                .start;
+
+            let action0 = build_sha_pin_action(&parse_result, position0.into(), &uri, &formatter)
+                .expect("expected a quickfix for the project: include");
+            let action1 = build_sha_pin_action(&parse_result, position1.into(), &uri, &formatter)
+                .expect("expected a quickfix for the component: include");
+            let ls_uri = deps_core::to_ls_uri(&uri);
+
+            assert_eq!(
+                action0.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
+                project_sha,
+                "the project: include must resolve its own Tags-route SHA, not the component's"
+            );
+            assert_eq!(
+                action1.edit.as_ref().unwrap().changes.as_ref().unwrap()[&ls_uri][0].new_text,
+                component_sha,
+                "the component: include must resolve its own Releases-route SHA, not the project's"
+            );
+        }
+
+        // --- validation follow-up C2/S2: quickfix for Latest/Partial component pins ---
+
+        fn component_pin_test_setup(
+            server: &mockito::ServerGuard,
+            pin: PinStyle,
+            version_req: &str,
+        ) -> (
+            GitlabCiRegistry,
+            GitlabCiFormatter,
+            crate::types::GitlabCiParseResult,
+            Url,
+            Position,
+        ) {
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
+            let instance_host = Arc::new(crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::clone(&policy),
+            ));
+            let client = Arc::new(GitlabApiClient::new(
+                Arc::new(HttpCache::new()),
+                instance_host,
+            ));
+            let registry = GitlabCiRegistry::new(client);
+            let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
+
+            let host_bare = server.url();
+            let host = crate::host::GitlabHost::for_test(&host_bare);
+            let name = PackageName::new(format!("{}/org/proj/comp", host.host()));
+            let index = "gitlab:component-pin-test".to_string();
+            registry.register_alternate(&[(
+                index.clone(),
+                crate::types::GitlabRoute {
+                    host,
+                    endpoint: EndpointKind::Releases,
+                },
+            )]);
+
+            let range = tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(0, version_req.len() as u32),
+            );
+            let dep = GitlabCiDependency {
+                name,
+                name_range: range.into(),
+                version_req: Some(version_req.into()),
+                version_range: Some(range.into()),
+                version_literal: None,
+                source: deps_core::parser::DependencySource::AlternateRegistry {
+                    index,
+                    mirrors_crates_io: false,
+                },
+                is_plain_scalar: true,
+                is_alias_occurrence: false,
+                kind: IncludeKind::Component,
+                host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
+                pin: Some(pin),
+                project_path: "org/proj".to_string(),
+            };
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![dep],
+                routes: vec![],
+                uri: uri.clone(),
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            (registry, formatter, parse_result, uri, range.start)
+        }
+
+        /// Tester re-review: end-to-end tie between the two halves of the #643 invariant on
+        /// the SAME fixture, in one assertion — the classification-table test only exercises
+        /// `sha_pin_quickfix_kind` directly, and the message/action assertions otherwise live
+        /// in disjoint tests, so nothing previously caught a future edit that special-cased one
+        /// call site without touching the shared predicate. A resolved host must both omit the
+        /// diagnostic's suffix AND actually offer the quickfix.
+        #[tokio::test]
+        async fn test_message_omits_suffix_iff_quickfix_actually_offered_for_resolved_latest_pin() {
+            let mut server = mockito::Server::new_async().await;
+            let sha = "a".repeat(40);
+            let _releases_mock = server
+                .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#
+                ))
+                .create_async()
+                .await;
+
+            let (registry, formatter, parse_result, uri, position) =
+                component_pin_test_setup(&server, PinStyle::Latest, "~latest");
+
+            let diagnostics =
+                mutable_ref_pin_diagnostics(&parse_result, Severity::Hint, &formatter);
+            let found = diagnostics
+                .iter()
+                .find(|d| d.code() == Some(mutable_ref_pin_code().as_str()))
+                .expect("expected the mutable-ref-pin diagnostic for a PinStyle::Latest component");
+            assert!(
+                !found.message().contains("no automated fix available"),
+                "a resolved host has a genuine quickfix, so the message must omit the suffix: {}",
+                found.message()
+            );
+
+            let action = build_dynamic_component_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &formatter,
+                &registry,
+            )
+            .await
+            .expect(
+                "the message just claimed a quickfix is available for this exact dependency — \
+             it must actually exist",
+            );
+            assert_eq!(
+                action.edit.as_ref().unwrap().changes.as_ref().unwrap()
+                    [&deps_core::to_ls_uri(&uri)][0]
+                    .new_text,
+                sha
+            );
+        }
+
+        #[tokio::test]
+        async fn test_build_dynamic_component_pin_action_offers_quickfix_for_latest_pin() {
+            let mut server = mockito::Server::new_async().await;
+            let sha = "a".repeat(40);
+            let _releases_mock = server
+                .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#
+                ))
+                .create_async()
+                .await;
+
+            let (registry, formatter, parse_result, uri, position) =
+                component_pin_test_setup(&server, PinStyle::Latest, "~latest");
+
+            let action = build_dynamic_component_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &formatter,
+                &registry,
+            )
+            .await
+            .expect("expected a quickfix resolving ~latest to a concrete SHA");
+            assert_eq!(
+                action.edit.as_ref().unwrap().changes.as_ref().unwrap()
+                    [&deps_core::to_ls_uri(&uri)][0]
+                    .new_text,
+                sha
+            );
+        }
+
+        #[tokio::test]
+        async fn test_build_dynamic_component_pin_action_offers_quickfix_for_partial_pin() {
+            let mut server = mockito::Server::new_async().await;
+            let sha = "b".repeat(40);
+            let _releases_mock = server
+                .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"tag_name":"1.2.5","commit":{{"id":"{sha}"}}}}]"#
+                ))
+                .create_async()
+                .await;
+
+            let (registry, formatter, parse_result, uri, position) =
+                component_pin_test_setup(&server, PinStyle::Partial, "1.2");
+
+            let action = build_dynamic_component_pin_action(
+                &parse_result,
+                position,
+                &uri,
+                &formatter,
+                &registry,
+            )
+            .await
+            .expect("expected a quickfix resolving the partial pin to a concrete SHA");
+            assert_eq!(
+                action.edit.as_ref().unwrap().changes.as_ref().unwrap()
+                    [&deps_core::to_ls_uri(&uri)][0]
+                    .new_text,
+                sha
+            );
+        }
+
+        /// Security audit finding (#1252, critic follow-up C2): the one CodeAction title fixed
+        /// in this PR (`build_dynamic_component_pin_action`'s "Pin {name} to commit SHA") had no
+        /// regression test — a bidi override in the dependency name must not survive into the
+        /// title, and an oversized name must not grow it unbounded.
+        #[tokio::test]
+        async fn test_build_dynamic_component_pin_action_title_sanitizes_and_caps_name() {
+            let mut server = mockito::Server::new_async().await;
+            let sha = "a".repeat(40);
+            let _releases_mock = server
+                .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body(format!(
+                    r#"[{{"tag_name":"2.0.0","commit":{{"id":"{sha}"}}}}]"#
+                ))
+                .create_async()
+                .await;
+
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::default());
+            let instance_host = Arc::new(crate::host::GitlabInstanceHost::new(
+                Arc::new(RwLock::new(None)),
+                Arc::clone(&policy),
+            ));
+            let client = Arc::new(GitlabApiClient::new(
+                Arc::new(HttpCache::new()),
+                instance_host,
+            ));
+            let registry = GitlabCiRegistry::new(client);
+            let formatter = GitlabCiFormatter::new(registry.routes(), registry.tag_index());
+
+            let host_bare = server.url();
+            let long_suffix = "x".repeat(200);
+            // The bidi override and the length go into the trailing component-name segment
+            // only: `project_path_from_name`'s `Releases` branch derives the fetch path via
+            // `rsplit_once('/')`, keeping everything before the last `/` as the project path
+            // (must stay exactly "org/proj" to match the mock below) and treating the last
+            // segment as the (here, deliberately hostile) component name.
+            let host = crate::host::GitlabHost::for_test(&host_bare);
+            let name = PackageName::new(format!(
+                "{}/org/proj/co\u{202E}mp{long_suffix}",
+                host.host()
+            ));
+            let index = "gitlab:component-pin-title-test".to_string();
+            registry.register_alternate(&[(
+                index.clone(),
+                crate::types::GitlabRoute {
+                    host,
+                    endpoint: EndpointKind::Releases,
+                },
+            )]);
+
+            let version_req = "~latest";
+            let range = tower_lsp_server::ls_types::Range::new(
+                tower_lsp_server::ls_types::Position::new(0, 0),
+                tower_lsp_server::ls_types::Position::new(0, version_req.len() as u32),
+            );
+            let dep = GitlabCiDependency {
+                name,
+                name_range: range.into(),
+                version_req: Some(version_req.into()),
+                version_range: Some(range.into()),
+                version_literal: None,
+                source: deps_core::parser::DependencySource::AlternateRegistry {
+                    index,
+                    mirrors_crates_io: false,
+                },
+                is_plain_scalar: true,
+                is_alias_occurrence: false,
+                kind: IncludeKind::Component,
+                host: HostRef::Literal(crate::host::GitlabHost::for_test(&host_bare)),
+                pin: Some(PinStyle::Latest),
+                project_path: "org/proj".to_string(),
+            };
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![dep],
+                routes: vec![],
+                uri: uri.clone(),
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+
+            let action = build_dynamic_component_pin_action(
+                &parse_result,
+                range.start,
+                &uri,
+                &formatter,
+                &registry,
+            )
+            .await
+            .expect("expected a quickfix resolving ~latest to a concrete SHA");
+
+            assert!(
+                !action.title.contains('\u{202E}'),
+                "bidi override must not survive into the title: {:?}",
+                action.title
+            );
+            assert!(
+                action.title.len() < long_suffix.len(),
+                "an oversized name must not render in full inside the title: {:?}",
+                action.title
+            );
+            assert!(action.title.contains('…'));
+        }
+
+        #[tokio::test]
+        async fn test_build_dynamic_component_pin_action_no_quickfix_when_nothing_matches() {
+            let mut server = mockito::Server::new_async().await;
+            let _releases_mock = server
+                .mock("GET", "/api/v4/projects/org%2Fproj/releases")
+                .match_query(mockito::Matcher::Any)
+                .with_status(200)
+                .with_body("[]")
+                .create_async()
+                .await;
+
+            let (registry, formatter, parse_result, uri, position) =
+                component_pin_test_setup(&server, PinStyle::Partial, "1.2");
+
+            assert!(
+                build_dynamic_component_pin_action(
+                    &parse_result,
+                    position,
+                    &uri,
+                    &formatter,
+                    &registry
+                )
+                .await
+                .is_none()
+            );
+        }
+
+        /// Neither a `project:` include nor a `component:` `PinStyle::Tag`/`PinStyle::Branch`
+        /// pin is ever resolved by this function — it exists solely for `Latest`/`Partial`.
+        #[tokio::test]
+        async fn test_build_dynamic_component_pin_action_ignores_non_latest_partial_pins() {
+            let server = mockito::Server::new_async().await;
+            let (registry, formatter, parse_result, uri, position) =
+                component_pin_test_setup(&server, PinStyle::Tag, "1.0.0");
+
+            assert!(
+                build_dynamic_component_pin_action(
+                    &parse_result,
+                    position,
+                    &uri,
+                    &formatter,
+                    &registry
+                )
+                .await
+                .is_none()
+            );
+        }
+
+        // --- issue #640: bulk "Pin all to SHA" collector ---
+
+        fn empty_versions() -> (
+            std::collections::HashMap<PackageName, deps_core::PackageVersions>,
+            std::collections::HashMap<PackageName, deps_core::ConcreteVersion>,
+        ) {
+            (
+                std::collections::HashMap::new(),
+                std::collections::HashMap::new(),
+            )
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_multiple_tag_includes_produce_sorted_edits() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj1\n    ref: v1.0.0\n  - project: org/proj2\n    ref: v2.0.0\n";
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let deps = deps_core::ParseResult::dependencies(parse_result.as_ref());
+            let sha1 = "1".repeat(40);
+            let sha2 = "2".repeat(40);
+            let mut index1 = TagIndex::default();
+            index1
+                .tag_to_sha
+                .insert("v1.0.0".to_string(), CommitSha::parse(&sha1).unwrap());
+            eco.formatter.tag_index.insert(
+                (EndpointKind::Tags, deps[0].name().clone()),
+                Arc::new(index1),
+            );
+            let mut index2 = TagIndex::default();
+            index2
+                .tag_to_sha
+                .insert("v2.0.0".to_string(), CommitSha::parse(&sha2).unwrap());
+            eco.formatter.tag_index.insert(
+                (EndpointKind::Tags, deps[1].name().clone()),
+                Arc::new(index2),
+            );
+
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+
+            assert_eq!(edits.len(), 2);
+            assert!(edits.iter().any(|e| e.new_text == sha1));
+            assert!(edits.iter().any(|e| e.new_text == sha2));
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_skips_sha_branch_and_refless_includes() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let sha_lit = "a".repeat(40);
+            let content = format!(
+                "include:\n\
+             \x20 - project: org/sha\n    ref: {sha_lit}\n\
+             \x20 - project: org/branch\n    ref: main\n\
+             \x20 - project: org/norefs\n"
+            );
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(&content, &uri).await.unwrap();
+
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+
+            assert!(
+                edits.is_empty(),
+                "a SHA pin, an unconfirmed branch pin, and a ref-less include must all be \
+             withheld: {edits:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_tag_index_miss_is_skipped() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            // No `tag_index` seed: a genuine cache miss must be skipped gracefully.
+
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+
+            assert!(edits.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_resolves_latest_component_pin_from_cached_versions()
+         {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+                .name()
+                .clone();
+
+            let sha = "a".repeat(40);
+            let mut index = TagIndex::default();
+            index
+                .tag_to_sha
+                .insert("2.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            eco.formatter
+                .tag_index
+                .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
+
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(name, deps_core::PackageVersions::latest_only("2.0.0"));
+            let resolved = std::collections::HashMap::new();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert_eq!(edits.len(), 1);
+            assert_eq!(edits[0].new_text, sha);
+        }
+
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_resolves_partial_component_pin_picks_highest_matching()
+         {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - component: gitlab.com/org/proj/comp@1.2\n";
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+                .name()
+                .clone();
+
+            let sha_low = "1".repeat(40);
+            let sha_high = "2".repeat(40);
+            let mut index = TagIndex::default();
+            index
+                .tag_to_sha
+                .insert("1.2.0".to_string(), CommitSha::parse(&sha_low).unwrap());
+            index
+                .tag_to_sha
+                .insert("1.2.5".to_string(), CommitSha::parse(&sha_high).unwrap());
+            eco.formatter
+                .tag_index
+                .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
+
+            let mut cached = std::collections::HashMap::new();
+            let available: Vec<deps_core::ConcreteVersion> =
+                vec!["1.2.0".into(), "1.2.5".into(), "1.3.0".into()];
+            cached.insert(
+                name,
+                deps_core::PackageVersions::new("1.3.0".into(), std::sync::Arc::from(available)),
+            );
+            let resolved = std::collections::HashMap::new();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert_eq!(edits.len(), 1);
+            assert_eq!(
+                edits[0].new_text, sha_high,
+                "1.2 must pick the highest matching release (1.2.5), not 1.2.0 or the \
+             out-of-range 1.3.0"
+            );
+        }
+
+        /// S2 invariant-1 regression: the ladder's winning release (`2.0.0`, the highest) has
+        /// no `TagIndex` entry — the reconstitution must keep it as an empty-SHA placeholder
+        /// rather than dropping it, so `Latest` still resolves to `2.0.0` and then correctly
+        /// withholds the edit (since its SHA is unknown), instead of silently shifting the
+        /// result down to `1.0.0` just because that one happens to have a SHA on file.
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_unknown_sha_winner_is_skipped_not_shifted() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+                .name()
+                .clone();
+
+            // Only "1.0.0" has a TagIndex entry; "2.0.0" (the true winner) does not.
+            let mut index = TagIndex::default();
+            index.tag_to_sha.insert(
+                "1.0.0".to_string(),
+                CommitSha::parse(&"a".repeat(40)).unwrap(),
+            );
+            eco.formatter
+                .tag_index
+                .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
+
+            let mut cached = std::collections::HashMap::new();
+            let available: Vec<deps_core::ConcreteVersion> = vec!["1.0.0".into(), "2.0.0".into()];
+            cached.insert(
+                name,
+                deps_core::PackageVersions::new("2.0.0".into(), std::sync::Arc::from(available)),
+            );
+            let resolved = std::collections::HashMap::new();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert!(
+                edits.is_empty(),
+                "the unresolvable winner must be skipped outright, never silently replaced by \
+             a lower-ranked release that happens to have a known SHA: {edits:?}"
+            );
+        }
+
+        /// M2 (impl-critic minor): regression for `resolve_component_pin`'s documented
+        /// last-maximum tie-break (`component.rs:155`/`:167`) surviving through the bulk
+        /// collector's reconstitution — two releases that normalize to the same semver
+        /// (`1.2.0`/`v1.2.0`) must resolve by `available`'s own order, not be silently
+        /// reordered/deduped by a future "tidy up" of `reconstitute_component_releases`.
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_latest_tie_break_picks_last_in_available_order()
+        {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - component: gitlab.com/org/proj/comp@~latest\n";
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+                .name()
+                .clone();
+
+            let sha_first = "1".repeat(40);
+            let sha_last = "2".repeat(40);
+            let mut index = TagIndex::default();
+            index
+                .tag_to_sha
+                .insert("1.2.0".to_string(), CommitSha::parse(&sha_first).unwrap());
+            index
+                .tag_to_sha
+                .insert("v1.2.0".to_string(), CommitSha::parse(&sha_last).unwrap());
+            eco.formatter
+                .tag_index
+                .insert((EndpointKind::Releases, name.clone()), Arc::new(index));
+
+            let mut cached = std::collections::HashMap::new();
+            // "1.2.0" and "v1.2.0" normalize to the identical semver — order decides the tie.
+            let available: Vec<deps_core::ConcreteVersion> = vec!["1.2.0".into(), "v1.2.0".into()];
+            cached.insert(
+                name,
+                deps_core::PackageVersions::new("v1.2.0".into(), std::sync::Arc::from(available)),
+            );
+            let resolved = std::collections::HashMap::new();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+            assert_eq!(edits.len(), 1);
+            assert_eq!(
+                edits[0].new_text, sha_last,
+                "on a semver tie, the LAST entry in available's order must win, matching \
+             resolve_component_pin's documented max_by behavior"
+            );
+        }
+
+        /// M3: a quoted-scalar `ref:` must round-trip through the bulk collector exactly like
+        /// an unquoted one — `version_range` locates only the raw value text (`git_ref`), so
+        /// the surrounding quotes fall outside the edit and survive unmodified. Unlike
+        /// `deps-github-actions`, this ecosystem has no `is_plain_scalar`/flow-mapping guard
+        /// to withhold on, by design (see `build_sha_pin_action`'s doc comment).
+        #[tokio::test]
+        async fn test_collect_pin_all_to_sha_edits_quoted_scalar_tag_pin_round_trips() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let content = "include:\n  - project: org/proj\n    ref: \"v1.0.0\"\n";
+            let eco = GitlabCiEcosystem::new(Arc::new(HttpCache::new()));
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let name = deps_core::ParseResult::dependencies(parse_result.as_ref())[0]
+                .name()
+                .clone();
+            let sha = "a".repeat(40);
+            let mut index = TagIndex::default();
+            index
+                .tag_to_sha
+                .insert("v1.0.0".to_string(), CommitSha::parse(&sha).unwrap());
+            eco.formatter
+                .tag_index
+                .insert((EndpointKind::Tags, name), Arc::new(index));
+
+            let (cached, resolved) = empty_versions();
+            let versions = deps_core::VersionData::new(&cached, &resolved);
+            let edits = eco.collect_pin_all_to_sha_edits(parse_result.as_ref(), versions);
+
+            assert_eq!(edits.len(), 1);
+            assert_eq!(edits[0].new_text, sha);
+
+            let table = deps_core::LineOffsetTable::new(content);
+            let start = table.position_to_byte_offset(content, edits[0].range.start.into());
+            let end = table.position_to_byte_offset(content, edits[0].range.end.into());
+            let new_content = format!(
+                "{}{}{}",
+                &content[..start],
+                edits[0].new_text,
+                &content[end..]
+            );
+            assert!(
+                new_content.contains(&format!("\"{sha}\"")),
+                "the surrounding quotes must survive the edit: {new_content}"
+            );
+            eco.parse_manifest(&new_content, &uri)
+                .await
+                .expect("resulting text must still parse");
+        }
+
+        /// `deps-gitlab-ci` never supports raw-text section detection at all (no cheap
+        /// section boundary shared by `project:`/`component:` include forms) — no override.
+        #[test]
+        fn test_fallback_completion_prefix_default_none() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+            assert!(
+                eco.fallback_completion_prefix("anything at all\n", Position::new(0, 0).into())
+                    .is_none()
+            );
+        }
+
+        // --- #793: `generate_completions` dispatch, pinned before the wildcard-match refactor
+        // so it can't silently change behavior. GitLab CI serves only `Version` (no
+        // package-name search, NFR-002); the other two contexts must return `Completions::default()`.
+
+        /// A minimal, fully literal `GitlabCiDependency` for dispatch tests — bypasses the real
+        /// YAML parser so `name_range`/`version_range`/`source` are exactly what the test wants,
+        /// with no risk of a real parse resolving `source` to a live, network-reachable host.
+        fn dispatch_test_dep(
+            name_range: deps_core::position::Range,
+            version_range: deps_core::position::Range,
+            source: deps_core::parser::DependencySource,
+        ) -> crate::types::GitlabCiDependency {
+            crate::types::GitlabCiDependency {
+                name: "org/proj".into(),
+                name_range,
+                version_req: Some("1.0.0".into()),
+                version_range: Some(version_range),
+                version_literal: None,
+                source,
+                is_plain_scalar: true,
+                is_alias_occurrence: false,
+                kind: IncludeKind::Project,
+                host: HostRef::Unresolved("$CI_SERVER_FQDN".to_string()),
+                pin: Some(PinStyle::Tag),
+                project_path: "org/proj".to_string(),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_returns_empty_non_incomplete() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let name_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+            let version_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
+            let dep = dispatch_test_dep(
+                name_range.into(),
+                version_range.into(),
+                deps_core::parser::DependencySource::CustomRegistry {
+                    url: "https://gitlab.example".into(),
+                },
+            );
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![dep],
+                routes: vec![],
+                uri,
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+            let cache = Arc::new(HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+
+            let result = eco
+                .generate_completions(
+                    &parse_result,
+                    name_range.start,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert_eq!(
+                result,
+                Completions::default()
+                    .with_origin(deps_core::completion::CompletionOrigin::PackageName)
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_version_context_no_dependency_at_position_returns_empty()
+        {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let name_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+            let version_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
+            let dep = dispatch_test_dep(
+                name_range.into(),
+                version_range.into(),
+                deps_core::parser::DependencySource::CustomRegistry {
+                    url: "https://gitlab.example".into(),
+                },
+            );
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![dep],
+                routes: vec![],
+                uri,
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+            let cache = Arc::new(HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+
+            // Line 0 falls outside every dependency's name/version range.
+            let result = eco
+                .generate_completions(
+                    &parse_result,
+                    Position::new(0, 0),
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert_eq!(result, Completions::default());
+        }
+
+        /// The dependency *is* found at `position`, but its source (`CustomRegistry`, an
+        /// unresolved host) fails closed inside `GitlabCiRegistry::get_versions_from` before any
+        /// network call — deterministic, and pins that `generate_completions` still threads the
+        /// found dependency's own `name`/`source` into `complete_versions_generic_from` rather
+        /// than, say, skipping the lookup or using a different dependency's source.
+        ///
+        /// tester finding #2 (post-#1136 review): the original version of this test only
+        /// asserted `via_dispatch.items == direct` — both sides independently call the *same*
+        /// gated function with the *same* args, so that equality would hold even if
+        /// `can_resolve_source` were deleted entirely (both sides would just as happily agree on
+        /// a non-empty result together). The explicit `is_empty()` assertion below is what
+        /// actually pins the observable outcome for a `CustomRegistry` source.
+        #[tokio::test]
+        async fn test_generate_completions_version_context_dispatches_by_dependency_source() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let name_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+            let version_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 15));
+            let source = deps_core::parser::DependencySource::CustomRegistry {
+                url: "https://gitlab.example".into(),
+            };
+            let dep = dispatch_test_dep(name_range.into(), version_range.into(), source.clone());
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![dep],
+                routes: vec![],
+                uri,
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            let content = "include:\n  - project: org/proj\n    ref: v1.0.0\n";
+            let cache = Arc::new(HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let via_dispatch = eco
+                .generate_completions(&parse_result, Position::new(2, 13), content, freshness)
+                .await;
+            let direct = deps_core::completion::complete_versions_generic_from(
+                eco.registry.as_ref(),
+                &eco.formatter,
+                &deps_core::PackageName::new("org/proj"),
+                &source,
+                "v1.0",
+                VERSION_OPERATOR_CHARS,
+                freshness,
+                &deps_core::SelectionContext::none(),
+            )
+            .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(
+                via_dispatch.items.is_empty(),
+                "a CustomRegistry source must yield zero completions, got: {:?}",
+                via_dispatch.items
+            );
+            assert!(!via_dispatch.is_incomplete);
+        }
+
+        /// FR-010/US-002: the "Pin to commit SHA" code action must never be offered at an
+        /// alias site, even when a real `TagIndex` entry would otherwise resolve one.
+        #[tokio::test]
+        async fn test_generate_code_actions_withholds_sha_pin_for_alias_occurrence() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let version_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
+            let name_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+            let gl_dep = alias_dispatch_test_dep(
+                name_range.into(),
+                version_range.into(),
+                Some(PinStyle::Tag),
+            );
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![gl_dep],
+                routes: vec![],
+                uri: uri.clone(),
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            let content = "include:\n  - project: org/proj\n    ref: *pin\n";
+            let cache = Arc::new(HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+
+            let actions = eco
+                .generate_code_actions(
+                    &parse_result,
+                    Position::new(2, 11),
+                    &uri,
+                    deps_core::VersionData::new(&cached, &resolved),
+                    content,
+                )
+                .await;
+            assert!(
+                actions.is_empty(),
+                "expected no quickfix at an alias site: {actions:?}"
+            );
+        }
+
+        /// FR-011/EC-016/SC-006: version completion is withheld at an alias site using the
+        /// `project:`/`ref:` shape (`name_range != version_range`) — the shape where
+        /// `CompletionContext::Version` is actually reachable, so this is a meaningful test of
+        /// the gate rather than a vacuous one (see [`alias_dispatch_test_dep`]'s doc comment).
+        #[tokio::test]
+        async fn test_generate_completions_withholds_version_completion_for_alias_occurrence() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let name_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+            let version_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
+            let dep = alias_dispatch_test_dep(
+                name_range.into(),
+                version_range.into(),
+                Some(PinStyle::Tag),
+            );
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![dep],
+                routes: vec![],
+                uri,
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            let content = "include:\n  - project: org/proj\n    ref: *pin\n";
+            let cache = Arc::new(HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+
+            // Cursor inside the alias token's `version_range`.
+            let result = eco
+                .generate_completions(
+                    &parse_result,
+                    Position::new(2, 11),
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert_eq!(result, Completions::default());
+        }
+
+        /// #912 critic S3: `#922`'s `dependency_version_range_is_literal` guard already blocks
+        /// `detect_completion_context` from ever returning `Version` for a `*`-leading
+        /// `version_range`, so the `generate_completions`-level test above no longer exercises
+        /// this ecosystem's own FR-011 gate — it now passes even without it. This test calls
+        /// `complete_version` directly, bypassing `detect_completion_context` entirely, to pin
+        /// that the local gate itself still withholds (defense-in-depth, not dead code).
+        #[tokio::test]
+        async fn test_complete_version_directly_withholds_for_alias_occurrence() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let name_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(1, 4), Position::new(1, 12));
+            let version_range =
+                tower_lsp_server::ls_types::Range::new(Position::new(2, 9), Position::new(2, 13));
+            let dep = alias_dispatch_test_dep(
+                name_range.into(),
+                version_range.into(),
+                Some(PinStyle::Tag),
+            );
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![dep],
+                routes: vec![],
+                uri,
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            let cache = Arc::new(HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+            let request = deps_core::completion::CompletionRequest::new(
+                &parse_result,
+                Position::new(2, 11),
+                deps_core::FreshnessSettings::default(),
+            );
+
+            let result = eco
+                .complete_version(request, PackageName::new("org/proj"), "v1.0".to_string())
+                .await;
+            assert_eq!(result, Completions::default());
+        }
+
+        /// FR-010/US-002: the bulk "pin all to SHA" lens must not produce an edit for an
+        /// alias-occurrence dependency, even when its pin would otherwise resolve one.
+        #[test]
+        fn test_collect_pin_all_to_sha_edits_withholds_for_alias_occurrence() {
+            let uri = deps_core::test_util::test_uri("/repo/.gitlab-ci.yml");
+            let range = deps_core::position::Range::new(
+                deps_core::position::Position::new(0, 0),
+                deps_core::position::Position::new(0, 4),
+            );
+            let gl_dep = alias_dispatch_test_dep(range, range, Some(PinStyle::Tag));
+            let parse_result = crate::types::GitlabCiParseResult {
+                dependencies: vec![gl_dep],
+                routes: vec![],
+                uri,
+                dependency_truncation: None,
+                blocked_registries: Vec::new(),
+            };
+            let cache = Arc::new(HttpCache::new());
+            let eco = GitlabCiEcosystem::new(cache);
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+
+            let edits = eco.collect_pin_all_to_sha_edits(
+                &parse_result,
+                deps_core::VersionData::new(&cached, &resolved),
+            );
+            assert!(edits.is_empty());
+        }
     }
 }

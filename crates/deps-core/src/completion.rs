@@ -5621,7 +5621,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_complete_versions_generic_from_routes_source_to_get_versions_from() {
-        use crate::lsp_helpers::test_support::MOCK_WIDENED_RESOLVE_FORMATTER;
+        use crate::lsp_helpers::test_support_lsp::MOCK_WIDENED_RESOLVE_FORMATTER;
 
         let registry = RoutingMockRegistry;
         let alternate = crate::parser::DependencySource::AlternateRegistry {
@@ -5959,7 +5959,7 @@ mod tests {
     async fn test_complete_versions_generic_from_prefers_non_deprecated_over_newer_deprecated() {
         // Critic S1: same #952 defect class with "deprecated" substituted for "pre-release"
         // (npm's #338 NFR-002 shape) — must prefer the older, non-flagged release.
-        use crate::lsp_helpers::test_support::{
+        use crate::lsp_helpers::test_support_lsp::{
             MockRegistryPreferringUnflagged, MockVersionWithStatus,
         };
 

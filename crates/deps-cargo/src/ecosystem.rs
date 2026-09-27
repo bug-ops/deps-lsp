@@ -6,15 +6,11 @@
 use std::any::Any;
 use std::sync::Arc;
 #[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
+use tower_lsp_server::ls_types::Range;
 use url::Url;
 
 #[cfg(feature = "lsp-responses")]
-use deps_core::Version;
-#[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
-#[cfg(feature = "lsp-responses")]
-use deps_core::parser::DependencySource;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
@@ -23,13 +19,10 @@ use crate::formatter::CargoFormatter;
 use crate::parser::CargoParseContext;
 use crate::registry::CargoRegistry;
 
-/// Leading version-constraint operators `semver::VersionReq` (Cargo's own requirement
-/// grammar) accepts, stripped from a completion prefix before matching it against
-/// registry versions. Includes the bare wildcard `*` (`VersionReq::new("*")` is a valid,
-/// tested requirement — see `registry.rs`'s tests) alongside the comparison and
-/// caret/tilde operators (#1137).
 #[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
+mod lsp;
+#[cfg(feature = "lsp-responses")]
+use lsp::VERSION_OPERATOR_CHARS;
 
 /// Cargo ecosystem implementation.
 ///
@@ -49,49 +42,6 @@ pub struct CargoEcosystem {
     /// explicitly by [`Self::with_context`] so `deps_engine::setup::register_ecosystems` can share
     /// one process-wide policy handle with `ServerState`.
     context: CargoParseContext,
-}
-
-/// The source(s) a `CompletionContext::Version`/`Feature`'s bare `package_name` joins back
-/// to within a manifest's already-parsed dependencies (spec FR-012).
-#[cfg(feature = "lsp-responses")]
-enum CompletionSource {
-    /// No dependency in the manifest has this exact name yet — most commonly because the
-    /// user is still typing a brand-new dependency line, with `registry`/`registry-index`
-    /// not yet present for the parser to classify. Callers fall back to the pre-existing
-    /// crates.io-only behavior, unchanged.
-    NotInManifest,
-    /// Every occurrence of this name in the manifest agrees on one resolved source.
-    Resolved(DependencySource),
-    /// Two or more occurrences of this name resolve to different sources (the same
-    /// ambiguity FR-011 covers for the background fetch) — callers must offer no
-    /// completions at all rather than picking one arbitrarily.
-    Ambiguous,
-}
-
-/// Joins `package_name` back to `parse_result.dependencies()` by name (spec FR-012).
-#[cfg(feature = "lsp-responses")]
-fn resolve_completion_source(
-    parse_result: &dyn ParseResultTrait,
-    package_name: &deps_core::PackageName,
-) -> CompletionSource {
-    let mut sources = parse_result
-        .dependencies()
-        .into_iter()
-        .filter(|d| d.name() == package_name)
-        .map(deps_core::Dependency::source);
-
-    let Some(first) = sources.next() else {
-        return CompletionSource::NotInManifest;
-    };
-    if sources.all(|s| s == first) {
-        CompletionSource::Resolved(first)
-    } else {
-        tracing::warn!(
-            package = %package_name.for_tracing(),
-            "ambiguous dependency source for version/feature completion; offering none"
-        );
-        CompletionSource::Ambiguous
-    }
 }
 
 impl CargoEcosystem {
@@ -129,113 +79,7 @@ impl CargoEcosystem {
             context: CargoParseContext::default(),
         }
     }
-
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_package_names(&self, prefix: &str, range: Range) -> Vec<CompletionItem> {
-        // Package-name search is crates.io-only unconditionally (the sparse index protocol
-        // has no search endpoint), so `self.registry`'s source-blind `search` already means
-        // crates.io by construction.
-        deps_core::completion::complete_package_names_generic(
-            self.registry.as_ref(),
-            prefix,
-            20,
-            range,
-        )
-        .await
-    }
-
-    /// Completes feature flags for a specific package.
-    ///
-    /// Fetches features from the latest stable version, routed by the source `package_name`
-    /// resolves to in `parse_result` by name (spec FR-012) — unlike version completion
-    /// (issue #593, position-based; see [`Ecosystem::complete_version`]'s default
-    /// implementation), this still joins by name via
-    /// [`resolve_completion_source`]/[`CompletionSource`], so it keeps the same residual
-    /// same-name-different-source `Ambiguous` gap #593 fixed for versions (not itself in
-    /// #593's scope: `features_range`-based position routing for this method is a follow-up,
-    /// not done here).
-    #[cfg(feature = "lsp-responses")]
-    async fn complete_features(
-        &self,
-        parse_result: &dyn ParseResultTrait,
-        package_name: &deps_core::PackageName,
-        prefix: &str,
-    ) -> Completions {
-        use deps_core::completion::build_feature_completion;
-
-        let versions_result: Result<Vec<Box<dyn Version>>> =
-            match resolve_completion_source(parse_result, package_name) {
-                CompletionSource::Ambiguous => return Completions::default(),
-                CompletionSource::NotInManifest
-                | CompletionSource::Resolved(DependencySource::Registry) => {
-                    Registry::get_versions(self.registry.as_ref(), package_name).await
-                }
-                CompletionSource::Resolved(DependencySource::AlternateRegistry {
-                    index, ..
-                }) => match self.registry.alternate_client(&index) {
-                    Some(client) => Registry::get_versions(client.as_ref(), package_name).await,
-                    None => return Completions::default(),
-                },
-                CompletionSource::Resolved(_) => return Completions::default(),
-            };
-
-        let versions = match versions_result {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to fetch versions for '{}': {}",
-                    package_name.for_tracing(),
-                    e
-                );
-                return Completions::default();
-            }
-        };
-
-        let latest = match versions.iter().find(|v| v.is_stable()) {
-            Some(v) => v,
-            None => {
-                tracing::warn!(
-                    "No stable version found for '{}'",
-                    package_name.for_tracing()
-                );
-                return Completions::default();
-            }
-        };
-
-        // `features()` comes back in HashMap iteration order (non-deterministic); sort so
-        // truncation below keeps the same names across calls instead of an arbitrary subset.
-        let mut features: Vec<String> = latest
-            .features()
-            .into_iter()
-            .filter(|f| f.starts_with(prefix))
-            .collect();
-        features.sort_unstable();
-
-        // Build safe items first, then cap: an unsafe name (rejected by
-        // `build_feature_completion`'s `is_safe_feature_name` gate) must not count against the
-        // cap, or a single malicious feature name could push a legitimate one out of the
-        // response.
-        let items: Vec<CompletionItem> = features
-            .iter()
-            .filter_map(|feature| build_feature_completion(feature, package_name, None))
-            .collect();
-
-        let is_incomplete = items.len() > MAX_COMPLETION_FEATURES;
-        let items = items.into_iter().take(MAX_COMPLETION_FEATURES).collect();
-
-        Completions::new(items).with_incomplete(is_incomplete)
-    }
 }
-
-/// Maximum number of feature completions to show.
-///
-/// Unlike `MAX_COMPLETION_VERSIONS`, there is no rank-preserving bump logic here — the
-/// filtered feature list is sorted alphabetically and simply truncated, with `is_incomplete`
-/// set on the response when that truncates anything. A registry index entry is capped at
-/// 32 MiB, but an unusual or hostile registry could still return an oversized `features` map
-/// for a single crate; this bounds the LSP-visible blast radius.
-#[cfg(feature = "lsp-responses")]
-const MAX_COMPLETION_FEATURES: usize = 5;
 
 impl deps_core::ecosystem::private::Sealed for CargoEcosystem {}
 
@@ -354,19 +198,6 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use crate::registry::CratesIoRegistry;
-    #[cfg(feature = "lsp-responses")]
-    use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::{EcosystemConfig, PackageVersions, VersionData};
-    #[cfg(feature = "lsp-responses")]
-    use std::collections::HashMap;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
-
-    #[cfg(feature = "lsp-responses")]
-    deps_core::complete_versions_test_shim!(CargoEcosystem);
 
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests. Does
     // not replace registry.rs's `test_registry_creation`, which constructs `CratesIoRegistry`
@@ -406,906 +237,8 @@ mod tests {
              thiserror = \"$(THISERROR-VERSION)\"\n";
     }
 
-    // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
-    // The mock registry stands in for `self.registry`, calling the same shared guard with
-    // the same `limit: 20` — without it, an always-offline real registry couldn't
-    // distinguish "the guard rejected this prefix" from "the network call failed" (M1).
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod cargo_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            // Boxed: `complete_package_names_generic`'s `impl Future` borrows `registry`
-            // across the `.await`, which a plain `Fn(..) -> Fut` can't express per-call.
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`semver::VersionReq`'s operator set), so an edit to one without the
-    // other fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod cargo_operator_chars_conformance;
-        ecosystem: "cargo";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['^', '~', '=', '<', '>', '*'];
-    }
-
-    // #1136: a dependency whose source is an unregistered custom registry must yield zero
-    // version completions and never reach `CratesIoRegistry` — the mock's `.expect(0)`
-    // fails the test if the gate is ever bypassed, not just if the result happens to come
-    // back empty.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_source_gate_conformance! {
-        mod cargo_completion_source_gate_conformance;
-        build: async {
-            let mut server = mockito::Server::new_async().await;
-            let mock = server
-                .mock("GET", mockito::Matcher::Any)
-                .expect(0)
-                .create_async()
-                .await;
-            let cache = Arc::new(deps_core::HttpCache::new());
-            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-            let eco = CargoEcosystem::with_registry_for_test(registry);
-            (eco, mock, server)
-        };
-        manifest: "Cargo.toml" => "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"my-corp\" }\n";
-    }
-
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
-    }
-
-    /// Mock dependency for testing
-    #[cfg(feature = "lsp-responses")]
-    fn mock_dependency(
-        name: &str,
-        version: Option<&str>,
-        name_line: u32,
-        version_line: u32,
-    ) -> CargoDependency {
-        CargoDependency {
-            name: name.into(),
-            name_range: Range::new(
-                Position::new(name_line, 0),
-                Position::new(name_line, name.len() as u32),
-            )
-            .into(),
-            version_req: version.map(Into::into),
-            version_range: version.map(|_| {
-                Range::new(
-                    Position::new(version_line, 0),
-                    Position::new(version_line, 10),
-                )
-                .into()
-            }),
-            features: vec![],
-            features_range: None,
-            source: DependencySource::Registry,
-            section: CargoDependencySection::Dependencies,
-            package: None,
-            custom_registry_origin: None,
-        }
-    }
-
-    /// Mock parse result for testing
-    #[cfg(feature = "lsp-responses")]
-    struct MockParseResult {
-        dependencies: Vec<CargoDependency>,
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    impl deps_core::ParseResult for MockParseResult {
-        fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
-            self.dependencies
-                .iter()
-                .map(|d| d as &dyn deps_core::Dependency)
-                .collect()
-        }
-
-        fn workspace_root(&self) -> Option<&std::path::Path> {
-            None
-        }
-
-        fn uri(&self) -> &Url {
-            static URI: std::sync::LazyLock<Url> =
-                std::sync::LazyLock::new(|| deps_core::test_util::test_uri("/test/Cargo.toml"));
-            &URI
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    /// A `MockParseResult` with no dependencies — `resolve_completion_source` reports
-    /// `NotInManifest` for any name against it, so `complete_features` falls back to its
-    /// pre-existing crates.io-only behavior. Used by tests below that only exercise
-    /// `complete_features` (`complete_versions` is now position-based; see `mock_dependency`).
-    #[cfg(feature = "lsp-responses")]
-    fn empty_parse_result() -> MockParseResult {
-        MockParseResult {
-            dependencies: vec![],
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_up_to_date_exact_match() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency("serde", Some("1.0.214"), 5, 5)],
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
-
-        let config = EcosystemConfig::default();
-
-        let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.0.214".into());
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 1);
-        match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✅ 1.0.214"),
-            _ => panic!("Expected String label"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_up_to_date_caret_version() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency("serde", Some("^1.0"), 5, 5)],
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
-
-        let config = EcosystemConfig::default();
-
-        let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.0.214".into());
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 1);
-        match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "✅ 1.0.214"),
-            _ => panic!("Expected String label"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_needs_update() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency("serde", Some("1.0.100"), 5, 5)],
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
-
-        let config = EcosystemConfig::default();
-
-        let resolved_versions = HashMap::new();
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 1);
-        match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "❌ 1.0.214"),
-            _ => panic!("Expected String label"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_hide_up_to_date() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency("serde", Some("1.0.214"), 5, 5)],
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
-
-        let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
-
-        // Up to date, but show_up_to_date_hints is false — hint must still be suppressed.
-        let mut resolved_versions = HashMap::new();
-        resolved_versions.insert("serde".into(), "1.0.214".into());
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 0);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_no_version_range() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let mut dep = mock_dependency("serde", Some("1.0.214"), 5, 5);
-        dep.version_range = None;
-
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
-
-        let config = EcosystemConfig::default();
-
-        let resolved_versions = HashMap::new();
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 0);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_caret_edge_case() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        // "^" alone, with no version number, must not panic and must still yield a hint.
-        let dep = mock_dependency("serde", Some("^"), 5, 5);
-
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let mut cached_versions = HashMap::new();
-        cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
-
-        let config = EcosystemConfig::default();
-
-        let resolved_versions = HashMap::new();
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loaded,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 1);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_has_real_range() {
-        // Regression test for #232: the textEdit range for a package-name completion
-        // must be the real name token span, not the (0,0)-(0,0) placeholder.
-        //
-        // `parse_manifest` transitively touches fs_probe (via `discover_workspace`); see
-        // `fs_probe::snapshot_guard`'s doc.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        let content = "[dependencies]\nserd = \"1.0\"\n";
-        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(1, 3); // cursor after "ser" in "serd"
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        match context {
-            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                assert_eq!(prefix, "ser");
-                assert_ne!(range, Range::default());
-                assert_eq!(range, Range::new(Position::new(1, 0), Position::new(1, 4)));
-            }
-            other => panic!("Expected PackageName context, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_package_names_real_search() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_package_names("serd", Range::default())
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.label == "serde"));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_versions_real() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        let dep = mock_dependency("serde", Some("1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("1.0")));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_versions_with_operator() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        let dep = mock_dependency("serde", Some("^1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "^1.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("1.0")));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_features_real() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_features(&empty_parse_result(), &pkg("serde"), "")
-            .await
-            .items;
-        assert!(!results.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_features_with_prefix() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_features(&empty_parse_result(), &pkg("serde"), "der")
-            .await
-            .items;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("der")));
-    }
-
-    /// Issue #593: two dependencies sharing one `PackageName` but resolving to different
-    /// sources no longer collapse into the old name-based `CompletionSource::Ambiguous`
-    /// "offer nothing for either" result (review finding #6) — cursor position now
-    /// identifies exactly one dependency, so each occurrence routes independently.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let mut registry_dep = mock_dependency("shared-name", Some("1.0"), 0, 0);
-        registry_dep.source = DependencySource::Registry;
-        let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
-        alternate_dep.source = DependencySource::AlternateRegistry {
-            index: "https://index.mycorp.dev/never-registered".into(),
-            mirrors_crates_io: false,
-        };
-        let alternate_position = alternate_dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![registry_dep, alternate_dep],
-        };
-
-        // Resolves deterministically without network: the unregistered index fails closed
-        // with `PackageNotFound` before any HTTP call, proving its own source drove routing.
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                alternate_position,
-                "1",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            results.is_empty(),
-            "unregistered alternate index must offer no completions"
-        );
-    }
-
-    /// Issue #593 critic finding M5: the test above only proves the *empty* case, which a
-    /// totally broken position lookup would also satisfy. This proves position-based routing
-    /// actually selects the right source's data — a *registered* alternate index's own client
-    /// is hit and its versions come back — mirroring `deps-go`'s/`deps-nuget`'s equivalent
-    /// `..._routes_to_registered_alternate_client` tests.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_routes_to_registered_alternate_client() {
-        let mut server = mockito::Server::new_async().await;
-        let _mock = server
-            .mock("GET", "/se/rd/serde")
-            .with_status(200)
-            .with_body(
-                "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{},\"deps\":[]}\n\
-                 {\"name\":\"serde\",\"vers\":\"1.5.0\",\"yanked\":false,\"features\":{},\"deps\":[]}\n",
-            )
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let policy = deps_core::net_policy::RegistryAccessPolicy::default();
-        let registry_index = crate::config::RegistryIndex::new(
-            &server.url(),
-            crate::config::IndexTrust::Trusted,
-            &policy,
-        )
-        .unwrap();
-        let index_key = registry_index.as_str().to_string();
-        ecosystem.registry.register_alternate(registry_index, None);
-
-        let mut dep = mock_dependency("serde", Some("1.0"), 0, 0);
-        dep.source = DependencySource::AlternateRegistry {
-            index: index_key,
-            mirrors_crates_io: false,
-        };
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            !results.is_empty(),
-            "a registered alternate index must route completions through its own client"
-        );
-    }
-
-    /// Same ambiguity, exercised through `complete_features` — mirrors
-    /// `test_complete_versions_ambiguous_source_offers_nothing`'s routing policy.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_features_ambiguous_source_offers_nothing() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let mut registry_dep = mock_dependency("shared-name", Some("1.0"), 0, 0);
-        registry_dep.source = DependencySource::Registry;
-        let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
-        alternate_dep.source = DependencySource::AlternateRegistry {
-            index: "https://index.mycorp.dev".into(),
-            mirrors_crates_io: false,
-        };
-        let parse_result = MockParseResult {
-            dependencies: vec![registry_dep, alternate_dep],
-        };
-
-        let results = ecosystem
-            .complete_features(&parse_result, &pkg("shared-name"), "")
-            .await
-            .items;
-        assert!(
-            results.is_empty(),
-            "an ambiguous source must offer no feature completions"
-        );
-    }
-
-    /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
-    /// that makes zero requests (and so also produces an empty result) can no longer pass
-    /// vacuously — `mock.assert_async()` requires the request to actually have been made.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unknown_package() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/th/is/this-package-does-not-exist-12345")
-            .with_status(404)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
-        let dep = mock_dependency("this-package-does-not-exist-12345", Some("1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1.0",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
-    /// that makes zero requests (and so also produces an empty result) can no longer pass
-    /// vacuously — `mock.assert_async()` requires the request to actually have been made.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_features_unknown_package() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/th/is/this-package-does-not-exist-12345")
-            .with_status(404)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
-
-        let results = ecosystem
-            .complete_features(
-                &empty_parse_result(),
-                &pkg("this-package-does-not-exist-12345"),
-                "",
-            )
-            .await
-            .items;
-        mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// #1302: `latest.features()` is capped at `MAX_COMPLETION_FEATURES` (5) before being
-    /// turned into completion items — an oversized `features` map from an unusual or
-    /// hostile registry must not reach the LSP client uncapped.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_features_capped_at_max() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/ma/ny/many-features")
-            .with_status(200)
-            .with_body(
-                "{\"name\":\"many-features\",\"vers\":\"1.0.0\",\"yanked\":false,\
-                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[],\"f4\":[],\"f5\":[],\"f6\":[],\
-                 \"f7\":[],\"f8\":[]},\"deps\":[]}\n",
-            )
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
-
-        let results = ecosystem
-            .complete_features(&empty_parse_result(), &pkg("many-features"), "")
-            .await;
-        mock.assert_async().await;
-        let labels: Vec<&str> = results
-            .items
-            .iter()
-            .map(|item| item.label.as_str())
-            .collect();
-        assert_eq!(
-            labels,
-            ["f1", "f2", "f3", "f4", "f5"],
-            "truncation must keep the alphabetically first 5 features, not an arbitrary subset"
-        );
-        assert!(
-            results.is_incomplete,
-            "truncated feature completions must report is_incomplete"
-        );
-    }
-
-    /// #1302 boundary case: fewer than `MAX_COMPLETION_FEATURES` matching features must all
-    /// be returned uncapped — guards against an off-by-one in the `.take()` bound.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_features_below_cap_uncapped() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/fe/w-/few-features")
-            .with_status(200)
-            .with_body(
-                "{\"name\":\"few-features\",\"vers\":\"1.0.0\",\"yanked\":false,\
-                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[]},\"deps\":[]}\n",
-            )
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
-
-        let results = ecosystem
-            .complete_features(&empty_parse_result(), &pkg("few-features"), "")
-            .await;
-        mock.assert_async().await;
-        assert_eq!(
-            results.items.len(),
-            3,
-            "fewer than MAX_COMPLETION_FEATURES matches must not be truncated"
-        );
-        assert!(
-            !results.is_incomplete,
-            "an uncapped result must not report is_incomplete"
-        );
-    }
-
-    /// #1302 exact-boundary case: `features.len() == MAX_COMPLETION_FEATURES` must return
-    /// all of them uncapped — nothing was actually dropped, so `is_incomplete` must be
-    /// `false`. Catches a `>` vs `>=` mistake in the `is_incomplete` computation that the
-    /// 8-vs-3 cases above wouldn't.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_features_at_exact_cap_uncapped() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/ex/ac/exactly-five")
-            .with_status(200)
-            .with_body(
-                "{\"name\":\"exactly-five\",\"vers\":\"1.0.0\",\"yanked\":false,\
-                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[],\"f4\":[],\"f5\":[]},\"deps\":[]}\n",
-            )
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
-
-        let results = ecosystem
-            .complete_features(&empty_parse_result(), &pkg("exactly-five"), "")
-            .await;
-        mock.assert_async().await;
-        assert_eq!(
-            results.items.len(),
-            5,
-            "exactly MAX_COMPLETION_FEATURES matches must not be truncated"
-        );
-        assert!(
-            !results.is_incomplete,
-            "a result at exactly the cap, with nothing dropped, must not report is_incomplete"
-        );
-    }
-
-    /// #1052: uses a mockito search endpoint instead of the live crates.io search API, so a
-    /// regression that makes zero requests (and so also produces an empty result) can no
-    /// longer pass vacuously — `mock.assert_async()` requires the request to actually have
-    /// been made, and the assertion checks a real, specific completion item instead of the
-    /// old `results.is_empty() || !results.is_empty()` tautology.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_package_names_special_characters() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/crates?q=tokio-ut&per_page=20&sort=downloads")
-            .with_status(200)
-            .with_body(
-                r#"{"crates":[{"name":"tokio-util","description":null,"repository":null,"documentation":null,"max_version":"0.7.10"}]}"#,
-            )
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
-
-        let results = ecosystem
-            .complete_package_names("tokio-ut", Range::default())
-            .await;
-
-        mock.assert_async().await;
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].label, "tokio-util");
-        assert_eq!(results[0].detail.as_deref(), Some("v0.7.10"));
-    }
-
-    /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
-    /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
-    /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
-    /// matching versions and asserts the count is exactly the real cap.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_capped_at_max_completion_versions() {
-        let mut server = mockito::Server::new_async().await;
-        let versions_body = (0..8)
-            .map(|i| format!(r#"{{"name":"serde","vers":"1.0.{i}","yanked":false,"features":{{}},"deps":[]}}"#))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mock = server
-            .mock("GET", "/se/rd/serde")
-            .with_status(200)
-            .with_body(versions_body)
-            .create_async()
-            .await;
-
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
-        let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
-        let ecosystem = CargoEcosystem::with_registry_for_test(registry);
-
-        let dep = mock_dependency("serde", Some("1.0"), 0, 0);
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-        let results = ecosystem
-            .complete_versions(
-                &parse_result,
-                position,
-                "1",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        mock.assert_async().await;
-        assert_eq!(results.len(), 5);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_features_empty_list() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        // "nonexistent" prefix: anyhow has no feature starting with it.
-        let results = ecosystem
-            .complete_features(&empty_parse_result(), &pkg("anyhow"), "nonexistent")
-            .await
-            .items;
-        assert!(results.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_complete_package_names_special_chars_real() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let results = ecosystem
-            .complete_package_names("tokio-ut", Range::default())
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().any(|r| r.label.contains('-')));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_generate_inlay_hints_loading_state() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency("tokio", Some("1.0"), 5, 5)],
-        };
-
-        // Empty caches - simulating loading state
-        let cached_versions = HashMap::new();
-        let resolved_versions = HashMap::new();
-
-        let config = EcosystemConfig::default();
-
-        let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
-            &parse_result,
-            VersionData::new(&cached_versions, &resolved_versions),
-            deps_core::LoadingState::Loading,
-            &config,
-        ));
-
-        assert_eq!(hints.len(), 1);
-        match &hints[0].label {
-            InlayHintLabel::String(s) => assert_eq!(s, "⏳", "Expected loading indicator"),
-            _ => panic!("Expected String label"),
-        }
-
-        if let Some(tower_lsp_server::ls_types::InlayHintTooltip::String(tooltip)) =
-            &hints[0].tooltip
-        {
-            assert_eq!(tooltip, "Fetching latest version...");
-        } else {
-            panic!("Expected tooltip for loading state");
-        }
-    }
-
-    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
-    /// `is_in_toml_dependencies` + `raw_prefix` compose correctly through the real
-    /// trait method on realistic multi-line content, not just each primitive in
-    /// isolation.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        let content = "[package]\nname = \"test\"\n\n[dependencies]\nser";
-        let line = content.lines().nth(4).unwrap();
-        let position = Position::new(4, line.chars().count() as u32);
-        assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position.into()),
-            Some("ser")
-        );
     }
 
     #[test]
@@ -1394,124 +327,1003 @@ mod tests {
         );
     }
 
-    // --- #793 characterization: `generate_completions` dispatch, pinned before the
-    // wildcard-match refactor moves the match into `deps-core`. Each test drives the real
-    // `detect_completion_context`, checking route-equivalence against the crate's own
-    // inherent `complete_*` method rather than a re-implementation of the match.
-
     #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
-        // A 1-char prefix ("s") is below `is_valid_completion_prefix_len`'s 2-char minimum —
-        // deterministic without touching crates.io.
-        let content = "s";
-        let parse_result = MockParseResult {
-            dependencies: vec![mock_dependency("s", None, 0, 0)],
-        };
-        let position = Position::new(0, 1);
-        let freshness = deps_core::FreshnessSettings::default();
+    mod lsp_tests {
+        use super::*;
 
-        let context =
-            deps_core::completion::detect_completion_context(&parse_result, position, content);
-        let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
-        else {
-            panic!("expected PackageName context, got {context:?}");
-        };
-        let direct = ecosystem.complete_package_names(&prefix, range).await;
-        let via_dispatch = ecosystem
-            .generate_completions(&parse_result, position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-    }
+        use crate::registry::CratesIoRegistry;
 
-    /// Mirrors `test_complete_versions_same_name_different_sources_routes_by_position`: an
-    /// unregistered `AlternateRegistry` index fails closed (`CargoRegistry::alternate_client`
-    /// returns `None`) before any network call, so this is deterministic.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_dispatches_by_position() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
+        use crate::types::{CargoDependency, CargoDependencySection, DependencySource};
 
-        // Distinct name/version lines: `detect_completion_context` checks `name_range`
-        // before `version_range`, and `mock_dependency` on a single shared line would put
-        // both ranges on line 0, letting the name range shadow the version one.
-        let mut dep = mock_dependency("shared-name", Some("1.0"), 0, 1);
-        dep.source = DependencySource::AlternateRegistry {
-            index: "https://index.mycorp.dev/never-registered".into(),
-            mirrors_crates_io: false,
-        };
-        let position = dep.version_range.unwrap().start.into();
-        let parse_result = MockParseResult {
-            dependencies: vec![dep],
-        };
-        // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
-        // slice of `content` to actually match the declared `version_req` ("1.0") — padded
-        // to `mock_dependency`'s fixed 10-char-wide range, whitespace-insensitively equal.
-        let content = "shared-name\n1.0       ";
-        let freshness = deps_core::FreshnessSettings::default();
+        use deps_core::{EcosystemConfig, PackageVersions, VersionData};
 
-        let context =
-            deps_core::completion::detect_completion_context(&parse_result, position, content);
-        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
-            panic!("expected Version context, got {context:?}");
-        };
-        let direct = ecosystem
-            .complete_versions(&parse_result, position, &prefix, freshness)
-            .await;
-        let via_dispatch = ecosystem
-            .generate_completions(&parse_result, position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-    }
+        use std::collections::HashMap;
 
-    /// Mirrors `test_complete_features_ambiguous_source_offers_nothing`: two same-named
-    /// dependencies resolving to different sources deterministically offer no feature
-    /// completions, with no network call.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_feature_context_dispatches_by_name() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = CargoEcosystem::new(cache);
+        use tower_lsp_server::ls_types::{InlayHintLabel, Position, Range};
 
-        let mut registry_dep = mock_dependency("shared-name", Some("1.0"), 0, 0);
-        registry_dep.source = DependencySource::Registry;
-        let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
-        alternate_dep.source = DependencySource::AlternateRegistry {
-            index: "https://index.mycorp.dev".into(),
-            mirrors_crates_io: false,
-        };
-        // A distinct line so this doesn't fall inside `alternate_dep`'s own name/version
-        // range (both on line 1) and get misdetected as `PackageName`/`Version`.
-        alternate_dep.features_range =
-            Some(Range::new(Position::new(2, 0), Position::new(2, 5)).into());
-        let position = Position::new(2, 2);
-        let parse_result = MockParseResult {
-            dependencies: vec![registry_dep, alternate_dep],
-        };
-        let content = "";
-        let freshness = deps_core::FreshnessSettings::default();
+        deps_core::complete_versions_test_shim!(CargoEcosystem);
 
-        let context =
-            deps_core::completion::detect_completion_context(&parse_result, position, content);
-        let deps_core::completion::CompletionContext::Feature {
-            package_name,
-            prefix,
-        } = context
-        else {
-            panic!("expected Feature context, got {context:?}");
-        };
-        let direct = ecosystem
-            .complete_features(&parse_result, &package_name, &prefix)
-            .await;
-        let via_dispatch = ecosystem
-            .generate_completions(&parse_result, position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct.items);
-        assert!(direct.items.is_empty());
+        // #758: the shared completion-prefix-length guard, replacing two hand-written tests.
+        // The mock registry stands in for `self.registry`, calling the same shared guard with
+        // the same `limit: 20` — without it, an always-offline real registry couldn't
+        // distinguish "the guard rejected this prefix" from "the network call failed" (M1).
+        deps_core::completion_guard_conformance! {
+            mod cargo_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                // Boxed: `complete_package_names_generic`'s `impl Future` borrows `registry`
+                // across the `.await`, which a plain `Fn(..) -> Fut` can't express per-call.
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (`semver::VersionReq`'s operator set), so an edit to one without the
+        // other fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod cargo_operator_chars_conformance;
+            ecosystem: "cargo";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['^', '~', '=', '<', '>', '*'];
+        }
+
+        // #1136: a dependency whose source is an unregistered custom registry must yield zero
+        // version completions and never reach `CratesIoRegistry` — the mock's `.expect(0)`
+        // fails the test if the gate is ever bypassed, not just if the result happens to come
+        // back empty.
+        deps_core::completion_source_gate_conformance! {
+            mod cargo_completion_source_gate_conformance;
+            build: async {
+                let mut server = mockito::Server::new_async().await;
+                let mock = server
+                    .mock("GET", mockito::Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let cache = Arc::new(deps_core::HttpCache::new());
+                let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+                let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+                let eco = CargoEcosystem::with_registry_for_test(registry);
+                (eco, mock, server)
+            };
+            manifest: "Cargo.toml" => "[dependencies]\ninternal-crate = { version = \"1.0\", registry = \"my-corp\" }\n";
+        }
+
+        /// Mock dependency for testing
+        fn mock_dependency(
+            name: &str,
+            version: Option<&str>,
+            name_line: u32,
+            version_line: u32,
+        ) -> CargoDependency {
+            CargoDependency {
+                name: name.into(),
+                name_range: Range::new(
+                    Position::new(name_line, 0),
+                    Position::new(name_line, name.len() as u32),
+                )
+                .into(),
+                version_req: version.map(Into::into),
+                version_range: version.map(|_| {
+                    Range::new(
+                        Position::new(version_line, 0),
+                        Position::new(version_line, 10),
+                    )
+                    .into()
+                }),
+                features: vec![],
+                features_range: None,
+                source: DependencySource::Registry,
+                section: CargoDependencySection::Dependencies,
+                package: None,
+                custom_registry_origin: None,
+            }
+        }
+
+        /// Mock parse result for testing
+        struct MockParseResult {
+            dependencies: Vec<CargoDependency>,
+        }
+
+        impl deps_core::ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn deps_core::Dependency> {
+                self.dependencies
+                    .iter()
+                    .map(|d| d as &dyn deps_core::Dependency)
+                    .collect()
+            }
+
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+
+            fn uri(&self) -> &Url {
+                static URI: std::sync::LazyLock<Url> =
+                    std::sync::LazyLock::new(|| deps_core::test_util::test_uri("/test/Cargo.toml"));
+                &URI
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// A `MockParseResult` with no dependencies — `resolve_completion_source` reports
+        /// `NotInManifest` for any name against it, so `complete_features` falls back to its
+        /// pre-existing crates.io-only behavior. Used by tests below that only exercise
+        /// `complete_features` (`complete_versions` is now position-based; see `mock_dependency`).
+        fn empty_parse_result() -> MockParseResult {
+            MockParseResult {
+                dependencies: vec![],
+            }
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_up_to_date_exact_match() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency("serde", Some("1.0.214"), 5, 5)],
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+
+            let config = EcosystemConfig::default();
+
+            let mut resolved_versions = HashMap::new();
+            resolved_versions.insert("serde".into(), "1.0.214".into());
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 1);
+            match &hints[0].label {
+                InlayHintLabel::String(s) => assert_eq!(s, "✅ 1.0.214"),
+                _ => panic!("Expected String label"),
+            }
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_up_to_date_caret_version() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency("serde", Some("^1.0"), 5, 5)],
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+
+            let config = EcosystemConfig::default();
+
+            let mut resolved_versions = HashMap::new();
+            resolved_versions.insert("serde".into(), "1.0.214".into());
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 1);
+            match &hints[0].label {
+                InlayHintLabel::String(s) => assert_eq!(s, "✅ 1.0.214"),
+                _ => panic!("Expected String label"),
+            }
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_needs_update() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency("serde", Some("1.0.100"), 5, 5)],
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+
+            let config = EcosystemConfig::default();
+
+            let resolved_versions = HashMap::new();
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 1);
+            match &hints[0].label {
+                InlayHintLabel::String(s) => assert_eq!(s, "❌ 1.0.214"),
+                _ => panic!("Expected String label"),
+            }
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_hide_up_to_date() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency("serde", Some("1.0.214"), 5, 5)],
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+
+            let config = EcosystemConfig::default().with_show_up_to_date_hints(false);
+
+            // Up to date, but show_up_to_date_hints is false — hint must still be suppressed.
+            let mut resolved_versions = HashMap::new();
+            resolved_versions.insert("serde".into(), "1.0.214".into());
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 0);
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_no_version_range() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let mut dep = mock_dependency("serde", Some("1.0.214"), 5, 5);
+            dep.version_range = None;
+
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+
+            let config = EcosystemConfig::default();
+
+            let resolved_versions = HashMap::new();
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 0);
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_caret_edge_case() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            // "^" alone, with no version number, must not panic and must still yield a hint.
+            let dep = mock_dependency("serde", Some("^"), 5, 5);
+
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert("serde".into(), PackageVersions::latest_only("1.0.214"));
+
+            let config = EcosystemConfig::default();
+
+            let resolved_versions = HashMap::new();
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loaded,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn test_package_name_completion_context_has_real_range() {
+            // Regression test for #232: the textEdit range for a package-name completion
+            // must be the real name token span, not the (0,0)-(0,0) placeholder.
+            //
+            // `parse_manifest` transitively touches fs_probe (via `discover_workspace`); see
+            // `fs_probe::snapshot_guard`'s doc.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+            let content = "[dependencies]\nserd = \"1.0\"\n";
+            let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(1, 3); // cursor after "ser" in "serd"
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+
+            match context {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    assert_eq!(prefix, "ser");
+                    assert_ne!(range, Range::default());
+                    assert_eq!(range, Range::new(Position::new(1, 0), Position::new(1, 4)));
+                }
+                other => panic!("Expected PackageName context, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_package_names_real_search() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let results = ecosystem
+                .complete_package_names("serd", Range::default())
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().any(|r| r.label == "serde"));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_versions_real() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+            let dep = mock_dependency("serde", Some("1.0"), 0, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("1.0")));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_versions_with_operator() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+            let dep = mock_dependency("serde", Some("^1.0"), 0, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "^1.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("1.0")));
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_features_real() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let results = ecosystem
+                .complete_features(&empty_parse_result(), &pkg("serde"), "")
+                .await
+                .items;
+            assert!(!results.is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_features_with_prefix() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let results = ecosystem
+                .complete_features(&empty_parse_result(), &pkg("serde"), "der")
+                .await
+                .items;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("der")));
+        }
+
+        /// Issue #593: two dependencies sharing one `PackageName` but resolving to different
+        /// sources no longer collapse into the old name-based `CompletionSource::Ambiguous`
+        /// "offer nothing for either" result (review finding #6) — cursor position now
+        /// identifies exactly one dependency, so each occurrence routes independently.
+        #[tokio::test]
+        async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let mut registry_dep = mock_dependency("shared-name", Some("1.0"), 0, 0);
+            registry_dep.source = DependencySource::Registry;
+            let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
+            alternate_dep.source = DependencySource::AlternateRegistry {
+                index: "https://index.mycorp.dev/never-registered".into(),
+                mirrors_crates_io: false,
+            };
+            let alternate_position = alternate_dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![registry_dep, alternate_dep],
+            };
+
+            // Resolves deterministically without network: the unregistered index fails closed
+            // with `PackageNotFound` before any HTTP call, proving its own source drove routing.
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    alternate_position,
+                    "1",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                results.is_empty(),
+                "unregistered alternate index must offer no completions"
+            );
+        }
+
+        /// Issue #593 critic finding M5: the test above only proves the *empty* case, which a
+        /// totally broken position lookup would also satisfy. This proves position-based routing
+        /// actually selects the right source's data — a *registered* alternate index's own client
+        /// is hit and its versions come back — mirroring `deps-go`'s/`deps-nuget`'s equivalent
+        /// `..._routes_to_registered_alternate_client` tests.
+        #[tokio::test]
+        async fn test_complete_versions_routes_to_registered_alternate_client() {
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                    .mock("GET", "/se/rd/serde")
+                    .with_status(200)
+                    .with_body(
+                        "{\"name\":\"serde\",\"vers\":\"1.0.0\",\"yanked\":false,\"features\":{},\"deps\":[]}\n\
+                 {\"name\":\"serde\",\"vers\":\"1.5.0\",\"yanked\":false,\"features\":{},\"deps\":[]}\n",
+                    )
+                    .create_async()
+                    .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let policy = deps_core::net_policy::RegistryAccessPolicy::default();
+            let registry_index = crate::config::RegistryIndex::new(
+                &server.url(),
+                crate::config::IndexTrust::Trusted,
+                &policy,
+            )
+            .unwrap();
+            let index_key = registry_index.as_str().to_string();
+            ecosystem.registry.register_alternate(registry_index, None);
+
+            let mut dep = mock_dependency("serde", Some("1.0"), 0, 0);
+            dep.source = DependencySource::AlternateRegistry {
+                index: index_key,
+                mirrors_crates_io: false,
+            };
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                !results.is_empty(),
+                "a registered alternate index must route completions through its own client"
+            );
+        }
+
+        /// Same ambiguity, exercised through `complete_features` — mirrors
+        /// `test_complete_versions_ambiguous_source_offers_nothing`'s routing policy.
+        #[tokio::test]
+        async fn test_complete_features_ambiguous_source_offers_nothing() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let mut registry_dep = mock_dependency("shared-name", Some("1.0"), 0, 0);
+            registry_dep.source = DependencySource::Registry;
+            let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
+            alternate_dep.source = DependencySource::AlternateRegistry {
+                index: "https://index.mycorp.dev".into(),
+                mirrors_crates_io: false,
+            };
+            let parse_result = MockParseResult {
+                dependencies: vec![registry_dep, alternate_dep],
+            };
+
+            let results = ecosystem
+                .complete_features(&parse_result, &pkg("shared-name"), "")
+                .await
+                .items;
+            assert!(
+                results.is_empty(),
+                "an ambiguous source must offer no feature completions"
+            );
+        }
+
+        /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
+        /// that makes zero requests (and so also produces an empty result) can no longer pass
+        /// vacuously — `mock.assert_async()` requires the request to actually have been made.
+        #[tokio::test]
+        async fn test_complete_versions_unknown_package() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/th/is/this-package-does-not-exist-12345")
+                .with_status(404)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+            let dep = mock_dependency("this-package-does-not-exist-12345", Some("1.0"), 0, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1.0",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// #1045: uses a mockito 404 instead of the live crates.io sparse index, so a regression
+        /// that makes zero requests (and so also produces an empty result) can no longer pass
+        /// vacuously — `mock.assert_async()` requires the request to actually have been made.
+        #[tokio::test]
+        async fn test_complete_features_unknown_package() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/th/is/this-package-does-not-exist-12345")
+                .with_status(404)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+            let results = ecosystem
+                .complete_features(
+                    &empty_parse_result(),
+                    &pkg("this-package-does-not-exist-12345"),
+                    "",
+                )
+                .await
+                .items;
+            mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// #1302: `latest.features()` is capped at `MAX_COMPLETION_FEATURES` (5) before being
+        /// turned into completion items — an oversized `features` map from an unusual or
+        /// hostile registry must not reach the LSP client uncapped.
+        #[tokio::test]
+        async fn test_complete_features_capped_at_max() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/ma/ny/many-features")
+                .with_status(200)
+                .with_body(
+                    "{\"name\":\"many-features\",\"vers\":\"1.0.0\",\"yanked\":false,\
+                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[],\"f4\":[],\"f5\":[],\"f6\":[],\
+                 \"f7\":[],\"f8\":[]},\"deps\":[]}\n",
+                )
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+            let results = ecosystem
+                .complete_features(&empty_parse_result(), &pkg("many-features"), "")
+                .await;
+            mock.assert_async().await;
+            let labels: Vec<&str> = results
+                .items
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect();
+            assert_eq!(
+                labels,
+                ["f1", "f2", "f3", "f4", "f5"],
+                "truncation must keep the alphabetically first 5 features, not an arbitrary subset"
+            );
+            assert!(
+                results.is_incomplete,
+                "truncated feature completions must report is_incomplete"
+            );
+        }
+
+        /// #1302 boundary case: fewer than `MAX_COMPLETION_FEATURES` matching features must all
+        /// be returned uncapped — guards against an off-by-one in the `.take()` bound.
+        #[tokio::test]
+        async fn test_complete_features_below_cap_uncapped() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/fe/w-/few-features")
+                .with_status(200)
+                .with_body(
+                    "{\"name\":\"few-features\",\"vers\":\"1.0.0\",\"yanked\":false,\
+                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[]},\"deps\":[]}\n",
+                )
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+            let results = ecosystem
+                .complete_features(&empty_parse_result(), &pkg("few-features"), "")
+                .await;
+            mock.assert_async().await;
+            assert_eq!(
+                results.items.len(),
+                3,
+                "fewer than MAX_COMPLETION_FEATURES matches must not be truncated"
+            );
+            assert!(
+                !results.is_incomplete,
+                "an uncapped result must not report is_incomplete"
+            );
+        }
+
+        /// #1302 exact-boundary case: `features.len() == MAX_COMPLETION_FEATURES` must return
+        /// all of them uncapped — nothing was actually dropped, so `is_incomplete` must be
+        /// `false`. Catches a `>` vs `>=` mistake in the `is_incomplete` computation that the
+        /// 8-vs-3 cases above wouldn't.
+        #[tokio::test]
+        async fn test_complete_features_at_exact_cap_uncapped() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/ex/ac/exactly-five")
+                .with_status(200)
+                .with_body(
+                    "{\"name\":\"exactly-five\",\"vers\":\"1.0.0\",\"yanked\":false,\
+                 \"features\":{\"f1\":[],\"f2\":[],\"f3\":[],\"f4\":[],\"f5\":[]},\"deps\":[]}\n",
+                )
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+            let results = ecosystem
+                .complete_features(&empty_parse_result(), &pkg("exactly-five"), "")
+                .await;
+            mock.assert_async().await;
+            assert_eq!(
+                results.items.len(),
+                5,
+                "exactly MAX_COMPLETION_FEATURES matches must not be truncated"
+            );
+            assert!(
+                !results.is_incomplete,
+                "a result at exactly the cap, with nothing dropped, must not report is_incomplete"
+            );
+        }
+
+        /// #1052: uses a mockito search endpoint instead of the live crates.io search API, so a
+        /// regression that makes zero requests (and so also produces an empty result) can no
+        /// longer pass vacuously — `mock.assert_async()` requires the request to actually have
+        /// been made, and the assertion checks a real, specific completion item instead of the
+        /// old `results.is_empty() || !results.is_empty()` tautology.
+        #[tokio::test]
+        async fn test_complete_package_names_special_characters() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                    .mock("GET", "/crates?q=tokio-ut&per_page=20&sort=downloads")
+                    .with_status(200)
+                    .with_body(
+                        r#"{"crates":[{"name":"tokio-util","description":null,"repository":null,"documentation":null,"max_version":"0.7.10"}]}"#,
+                    )
+                    .create_async()
+                    .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+            let results = ecosystem
+                .complete_package_names("tokio-ut", Range::default())
+                .await;
+
+            mock.assert_async().await;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].label, "tokio-util");
+            assert_eq!(results[0].detail.as_deref(), Some("v0.7.10"));
+        }
+
+        /// #1066: was `assert!(results.len() <= 20)` against a live registry — a tautology given
+        /// the actual display cap (`MAX_COMPLETION_VERSIONS`, `deps-core`) is 5, not 20, so it
+        /// passed vacuously (even for 0 results) and could never catch a cap regression. Mocks 8
+        /// matching versions and asserts the count is exactly the real cap.
+        #[tokio::test]
+        async fn test_complete_versions_capped_at_max_completion_versions() {
+            let mut server = mockito::Server::new_async().await;
+            let versions_body = (0..8)
+                    .map(|i| format!(r#"{{"name":"serde","vers":"1.0.{i}","yanked":false,"features":{{}},"deps":[]}}"#))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            let mock = server
+                .mock("GET", "/se/rd/serde")
+                .with_status(200)
+                .with_body(versions_body)
+                .create_async()
+                .await;
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let crates_io = CratesIoRegistry::with_base_for_test(Arc::clone(&cache), &server.url());
+            let registry = CargoRegistry::with_crates_io_for_test(Arc::clone(&cache), crates_io);
+            let ecosystem = CargoEcosystem::with_registry_for_test(registry);
+
+            let dep = mock_dependency("serde", Some("1.0"), 0, 0);
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+            let results = ecosystem
+                .complete_versions(
+                    &parse_result,
+                    position,
+                    "1",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            mock.assert_async().await;
+            assert_eq!(results.len(), 5);
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_features_empty_list() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            // "nonexistent" prefix: anyhow has no feature starting with it.
+            let results = ecosystem
+                .complete_features(&empty_parse_result(), &pkg("anyhow"), "nonexistent")
+                .await
+                .items;
+            assert!(results.is_empty());
+        }
+
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_complete_package_names_special_chars_real() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let results = ecosystem
+                .complete_package_names("tokio-ut", Range::default())
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().any(|r| r.label.contains('-')));
+        }
+
+        #[test]
+        fn test_generate_inlay_hints_loading_state() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency("tokio", Some("1.0"), 5, 5)],
+            };
+
+            // Empty caches - simulating loading state
+            let cached_versions = HashMap::new();
+            let resolved_versions = HashMap::new();
+
+            let config = EcosystemConfig::default();
+
+            let hints = tokio_test::block_on(ecosystem.generate_inlay_hints(
+                &parse_result,
+                VersionData::new(&cached_versions, &resolved_versions),
+                deps_core::LoadingState::Loading,
+                &config,
+            ));
+
+            assert_eq!(hints.len(), 1);
+            match &hints[0].label {
+                InlayHintLabel::String(s) => assert_eq!(s, "⏳", "Expected loading indicator"),
+                _ => panic!("Expected String label"),
+            }
+
+            if let Some(tower_lsp_server::ls_types::InlayHintTooltip::String(tooltip)) =
+                &hints[0].tooltip
+            {
+                assert_eq!(tooltip, "Fetching latest version...");
+            } else {
+                panic!("Expected tooltip for loading state");
+            }
+        }
+
+        /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+        /// `is_in_toml_dependencies` + `raw_prefix` compose correctly through the real
+        /// trait method on realistic multi-line content, not just each primitive in
+        /// isolation.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+            let content = "[package]\nname = \"test\"\n\n[dependencies]\nser";
+            let line = content.lines().nth(4).unwrap();
+            let position = Position::new(4, line.chars().count() as u32);
+            assert_eq!(
+                ecosystem.fallback_completion_prefix(content, position.into()),
+                Some("ser")
+            );
+        }
+
+        // --- #793 characterization: `generate_completions` dispatch, pinned before the
+        // wildcard-match refactor moves the match into `deps-core`. Each test drives the real
+        // `detect_completion_context`, checking route-equivalence against the crate's own
+        // inherent `complete_*` method rather than a re-implementation of the match.
+
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+            // A 1-char prefix ("s") is below `is_valid_completion_prefix_len`'s 2-char minimum —
+            // deterministic without touching crates.io.
+            let content = "s";
+            let parse_result = MockParseResult {
+                dependencies: vec![mock_dependency("s", None, 0, 0)],
+            };
+            let position = Position::new(0, 1);
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
+            let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
+            else {
+                panic!("expected PackageName context, got {context:?}");
+            };
+            let direct = ecosystem.complete_package_names(&prefix, range).await;
+            let via_dispatch = ecosystem
+                .generate_completions(&parse_result, position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+        }
+
+        /// Mirrors `test_complete_versions_same_name_different_sources_routes_by_position`: an
+        /// unregistered `AlternateRegistry` index fails closed (`CargoRegistry::alternate_client`
+        /// returns `None`) before any network call, so this is deterministic.
+        #[tokio::test]
+        async fn test_generate_completions_version_context_dispatches_by_position() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            // Distinct name/version lines: `detect_completion_context` checks `name_range`
+            // before `version_range`, and `mock_dependency` on a single shared line would put
+            // both ranges on line 0, letting the name range shadow the version one.
+            let mut dep = mock_dependency("shared-name", Some("1.0"), 0, 1);
+            dep.source = DependencySource::AlternateRegistry {
+                index: "https://index.mycorp.dev/never-registered".into(),
+                mirrors_crates_io: false,
+            };
+            let position = dep.version_range.unwrap().start.into();
+            let parse_result = MockParseResult {
+                dependencies: vec![dep],
+            };
+            // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
+            // slice of `content` to actually match the declared `version_req` ("1.0") — padded
+            // to `mock_dependency`'s fixed 10-char-wide range, whitespace-insensitively equal.
+            let content = "shared-name\n1.0       ";
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
+            let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+                panic!("expected Version context, got {context:?}");
+            };
+            let direct = ecosystem
+                .complete_versions(&parse_result, position, &prefix, freshness)
+                .await;
+            let via_dispatch = ecosystem
+                .generate_completions(&parse_result, position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+        }
+
+        /// Mirrors `test_complete_features_ambiguous_source_offers_nothing`: two same-named
+        /// dependencies resolving to different sources deterministically offer no feature
+        /// completions, with no network call.
+        #[tokio::test]
+        async fn test_generate_completions_feature_context_dispatches_by_name() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = CargoEcosystem::new(cache);
+
+            let mut registry_dep = mock_dependency("shared-name", Some("1.0"), 0, 0);
+            registry_dep.source = DependencySource::Registry;
+            let mut alternate_dep = mock_dependency("shared-name", Some("1.0"), 1, 1);
+            alternate_dep.source = DependencySource::AlternateRegistry {
+                index: "https://index.mycorp.dev".into(),
+                mirrors_crates_io: false,
+            };
+            // A distinct line so this doesn't fall inside `alternate_dep`'s own name/version
+            // range (both on line 1) and get misdetected as `PackageName`/`Version`.
+            alternate_dep.features_range =
+                Some(Range::new(Position::new(2, 0), Position::new(2, 5)).into());
+            let position = Position::new(2, 2);
+            let parse_result = MockParseResult {
+                dependencies: vec![registry_dep, alternate_dep],
+            };
+            let content = "";
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
+            let deps_core::completion::CompletionContext::Feature {
+                package_name,
+                prefix,
+            } = context
+            else {
+                panic!("expected Feature context, got {context:?}");
+            };
+            let direct = ecosystem
+                .complete_features(&parse_result, &package_name, &prefix)
+                .await;
+            let via_dispatch = ecosystem
+                .generate_completions(&parse_result, position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct.items);
+            assert!(direct.items.is_empty());
+        }
     }
 }

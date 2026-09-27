@@ -17,14 +17,6 @@
 //! `Registry::get_latest_matching` (a fetch error or `Ok(None)` both simply omit the
 //! package from `cached_versions`), so no special-casing is needed here.
 
-use std::any::Any;
-#[cfg(feature = "lsp-responses")]
-use std::collections::HashSet;
-use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
-use url::Url;
-
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 #[cfg(feature = "lsp-responses")]
@@ -34,6 +26,11 @@ use deps_core::parser::DependencySource;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
+use std::any::Any;
+use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Position, Range};
+use url::Url;
 
 use crate::config::NuGetParseContext;
 use crate::formatter::NuGetFormatter;
@@ -41,23 +38,13 @@ use crate::lockfile::NuGetLockParser;
 use crate::parser::NuGetParseResult;
 use crate::registry::NuGetRegistry;
 
-/// Leading version-constraint operators stripped from a completion prefix before
-/// matching it against registry versions: the two range delimiters
-/// `version::parse_range` accepts (`[1.0,2.0)`) —
-/// `deps_core::interval::BracketStyle::Standard`, no reversed-bracket form (NuGet spec
-/// §2). A bare version (no leading bracket, including `1.0.*` floating versions) is a
-/// floor, not a range, and has no operator to strip. Originally left empty, which meant
-/// a completion prefix like `"[2.2"` was never stripped down to `"2.2"` and so never
-/// prefix-matched any real version (#1137 critic S1).
 #[cfg(feature = "lsp-responses")]
-const VERSION_OPERATOR_CHARS: &[char] = &['[', '('];
-
-/// Bounds `NuGetEcosystem::generate_hover`'s `unlisted_versions` fetch (S4, #451
-/// follow-up) — mirrors `deps_core::lsp_helpers::hover`'s own private `HOVER_FALLBACK_TIMEOUT`
-/// for its analogous fallback fetch: hover responses must return quickly, and without this
-/// bound a pathological feed's registration-hive walk could run unbounded.
+mod lsp;
 #[cfg(feature = "lsp-responses")]
-const HOVER_UNLISTED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+use lsp::{HOVER_UNLISTED_TIMEOUT, VERSION_OPERATOR_CHARS, annotate_unlisted_versions};
+#[cfg(test)]
+#[cfg(feature = "lsp-responses")]
+use std::collections::HashSet;
 
 /// NuGet/.NET ecosystem implementation.
 ///
@@ -458,48 +445,9 @@ fn extract_prefix(line: &str, character: u32) -> &str {
     )
 }
 
-/// Injects a `*(unlisted)*` marker into each `"- \`VERSION\` ..."` "Recent versions" bullet
-/// line whose version is in `unlisted`, right after the version literal and before any
-/// existing tag (`*(latest)*`, an age suffix, ...) — matching the position/spacing
-/// `formatter.yanked_label()` occupies for other ecosystems' `*(yanked)*` markers. Lines
-/// that don't match the bullet format (the `**Latest**`/`**Requirement**` lines, the footer)
-/// pass through unchanged.
-// `tick` comes from `find('`')`, an ASCII byte, so both slice bounds are always char
-// boundaries.
-#[cfg(feature = "lsp-responses")]
-#[allow(clippy::string_slice)]
-fn annotate_unlisted_versions(markdown: &str, unlisted: &HashSet<String>) -> String {
-    let mut out = String::with_capacity(markdown.len() + unlisted.len() * 14);
-    for line in markdown.split_inclusive('\n') {
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let matched = body.strip_prefix("- `").and_then(|rest| {
-            let tick = rest.find('`')?;
-            Some((&rest[..tick], &rest[tick + 1..]))
-        });
-        match matched {
-            Some((version, rest)) if unlisted.contains(version) => {
-                out.push_str("- `");
-                out.push_str(version);
-                out.push_str("` *(unlisted)*");
-                out.push_str(rest);
-            }
-            _ => out.push_str(body),
-        }
-        if line.ends_with('\n') {
-            out.push('\n');
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use crate::types::NuGetDependency;
-
-    #[cfg(feature = "lsp-responses")]
-    deps_core::complete_versions_test_shim!(NuGetEcosystem);
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_lockfile_filenames/test_as_any
@@ -530,38 +478,6 @@ mod tests {
             "<Project><ItemGroup><PackageReference Include=\"AutoMapper\" Version=\"$(AutoMapperVersion)\" /><PackageReference Include=\"known-good-control\" Version=\"1.0.0\" /></ItemGroup></Project>";
     }
 
-    // #758: the shared completion-prefix-length guard, replacing
-    // test_complete_package_names_min_prefix (which only checked the empty-prefix case).
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod nuget_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`version::parse_range`'s range-delimiter set), so an edit to one
-    // without the other fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod nuget_operator_chars_conformance;
-        ecosystem: "nuget";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['[', '('];
-    }
-
     #[test]
     fn test_manifest_extensions() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -577,43 +493,6 @@ mod tests {
         let cache = Arc::new(deps_core::HttpCache::new());
         let eco = NuGetEcosystem::new(cache);
         assert!(eco.lockfile_provider().is_some());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_has_real_range() {
-        // Regression test for #232: the textEdit range for a package-name completion
-        // must be the real name token span, not the (0,0)-(0,0) placeholder.
-        //
-        // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` calls
-        // `config::resolve_with_context` directly, and every such test in this file must
-        // hold it.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>";
-        let uri = deps_core::test_util::test_uri("/test/App.csproj");
-
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(2, 33); // cursor after "Fo" in "Foo"
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        match context {
-            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                assert_eq!(prefix, "Fo");
-                assert_ne!(range, Range::default());
-                assert_eq!(
-                    range,
-                    Range::new(Position::new(2, 31), Position::new(2, 34))
-                );
-            }
-            other => panic!("Expected PackageName context, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -686,514 +565,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    // --- complete_versions: position-based dependency lookup + can_resolve_source gate (issue #593) ---
-
-    /// A dependency on `line`, with a `version_range` there so position-based lookup (issue
-    /// #593) can find it — mirrors `deps_go::ecosystem::tests::dep_with_source`.
-    #[cfg(feature = "lsp-responses")]
-    fn dep_with_source(name: &str, source: DependencySource, line: u32) -> NuGetDependency {
-        NuGetDependency {
-            name: name.into(),
-            name_range: deps_core::Range::new(
-                deps_core::Position::new(line, 0),
-                deps_core::Position::new(line, 0),
-            ),
-            version_requirement: Some("1.0.0".into()),
-            version_range: Some(deps_core::Range::new(
-                deps_core::Position::new(line, 0),
-                deps_core::Position::new(line, 10),
-            )),
-            source,
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_position_based_lookup_finds_correct_dependency() {
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-        let _index_mock = server
-            .mock("GET", "/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&base))
-            .create_async()
-            .await;
-        let _flat_mock = server
-            .mock("GET", "/flatcontainer/targetpkg/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["1.0.0", "1.2.0"]}"#)
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        // "otherpkg" has no mock registered — if position-based lookup picked it instead of
-        // the dependency actually under the cursor, this would fail closed to empty instead
-        // of returning `targetpkg`'s versions.
-        let other = dep_with_source("otherpkg", DependencySource::Registry, 0);
-        let target = dep_with_source("targetpkg", DependencySource::Registry, 1);
-        let target_position = target.version_range.unwrap().start;
-        let parse_result = NuGetParseResult {
-            dependencies: vec![other, target],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        let results = eco
-            .complete_versions(
-                &parse_result,
-                target_position.into(),
-                "1",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            !results.is_empty(),
-            "position-based lookup must resolve the dependency at the cursor position"
-        );
-    }
-
-    /// #1223 M2: proves `NuGetEcosystem`'s `version_operator_chars()` override (`['[', '(']`)
-    /// is actually wired into the shared `Ecosystem::complete_version` default, not just
-    /// declared — a bracket-interval-shaped prefix (`"[1."`, as typed mid-`[1.0,2.0)`) must
-    /// prefix-match real version data with the leading `[` stripped, not fall through to an
-    /// unfiltered top-N list. `2.0.0`'s presence in the mocked feed alongside `1.0.0`/`1.2.0`
-    /// is what makes the assertion below reflect filtering rather than an unfiltered list —
-    /// mirrors `deps_composer::ecosystem::tests::
-    /// test_generate_completions_strips_not_equal_operator_against_real_registry`'s same
-    /// non-vacuous-filtering shape for Composer's `!=` operator.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_strips_bracket_operator_against_real_registry() {
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-        let _index_mock = server
-            .mock("GET", "/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&base))
-            .create_async()
-            .await;
-        let _flat_mock = server
-            .mock("GET", "/flatcontainer/targetpkg/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["1.0.0", "1.2.0", "2.0.0"]}"#)
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        let dep = dep_with_source("targetpkg", DependencySource::Registry, 0);
-        let position = dep.version_range.unwrap().start;
-        let parse_result = NuGetParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        let results = eco
-            .complete_versions(
-                &parse_result,
-                position.into(),
-                "[1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(!results.is_empty());
-        assert!(results.iter().all(|r| r.label.starts_with("1.")));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_no_dependency_at_position_offers_nothing() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-
-        let dep = dep_with_source("somepkg", DependencySource::Registry, 0);
-        let parse_result = NuGetParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        let results = eco
-            .complete_versions(
-                &parse_result,
-                Position::new(99, 0),
-                "1",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(results.is_empty());
-    }
-
-    /// `can_resolve_source`'s gate (matching hover/diagnostics/code-actions' identical check,
-    /// #248 leak class) must keep an unresolvable `CustomRegistry` source from ever reaching
-    /// api.nuget.org. The `.expect(0)` mock fails the test if that endpoint is hit at all.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_gate_blocks_unresolvable_source() {
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-        let _index_mock = server
-            .mock("GET", "/index.json")
-            .expect(0)
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        let dep = dep_with_source(
-            "privatepkg",
-            DependencySource::CustomRegistry {
-                url: "https://feed.mycorp.example/v3/index.json".to_string(),
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start;
-        let parse_result = NuGetParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        let results = eco
-            .complete_versions(
-                &parse_result,
-                position.into(),
-                "1",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            results.is_empty(),
-            "an unresolvable CustomRegistry source must offer no completions"
-        );
-        _index_mock.assert_async().await;
-    }
-
-    /// An `AlternateRegistry` source whose index has no registered client offers no
-    /// completions rather than falling back to the public registry.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unregistered_alternate_offers_nothing() {
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-        let _index_mock = server
-            .mock("GET", "/index.json")
-            .expect(0)
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        let dep = dep_with_source(
-            "internal.auth",
-            DependencySource::AlternateRegistry {
-                index: "nuget-chain:never-registered".to_string(),
-                mirrors_crates_io: false,
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start;
-        let parse_result = NuGetParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        let results = eco
-            .complete_versions(
-                &parse_result,
-                position.into(),
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            results.is_empty(),
-            "unregistered alternate index must offer no completions"
-        );
-        _index_mock.assert_async().await;
-    }
-
-    /// A registered `AlternateRegistry` chain routes `complete_versions` through its own
-    /// client, never the public root registry.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_routes_to_registered_alternate_client() {
-        let mut alt_server = mockito::Server::new_async().await;
-        let alt_base = alt_server.url();
-        let _alt_index_mock = alt_server
-            .mock("GET", "/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&alt_base))
-            .create_async()
-            .await;
-        let _alt_flat_mock = alt_server
-            .mock("GET", "/flatcontainer/internal.auth/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["1.2.3", "1.3.0"]}"#)
-            .create_async()
-            .await;
-
-        let mut public_server = mockito::Server::new_async().await;
-        let public_base = public_server.url();
-        let _public_index_mock = public_server
-            .mock("GET", "/index.json")
-            .expect(0)
-            .create_async()
-            .await;
-
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::All,
-        ));
-        let root = Arc::new(NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{public_base}/index.json"),
-        ));
-
-        let feed_url =
-            crate::config::NuGetFeedUrl::new(&format!("{alt_base}/index.json"), &policy).unwrap();
-        let chain = crate::config::NuGetSourceChain {
-            key: "nuget-chain:test-alt".to_string(),
-            hops: vec![crate::config::ResolvedHop {
-                url: feed_url,
-                slot: None,
-                auth: None,
-            }],
-            implicit_public_fallback: false,
-        };
-        NuGetRegistry::register_alternate(&root, &chain, &policy);
-
-        let context = crate::config::NuGetParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
-            user_profile_config: None,
-            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let eco = NuGetEcosystem::with_context(root, context);
-
-        let dep = dep_with_source(
-            "internal.auth",
-            DependencySource::AlternateRegistry {
-                index: "nuget-chain:test-alt".to_string(),
-                mirrors_crates_io: false,
-            },
-            0,
-        );
-        let position = dep.version_range.unwrap().start;
-        let parse_result = NuGetParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        let results = eco
-            .complete_versions(
-                &parse_result,
-                position.into(),
-                "1.",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            !results.is_empty(),
-            "a registered alternate index must route completions through its own client"
-        );
-        _public_index_mock.assert_async().await;
-    }
-
-    /// Two dependencies sharing one `PackageName` but resolving to different sources must
-    /// route independently by cursor position, not collapse into an ambiguous "offer nothing
-    /// for either" result.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_same_name_different_sources_routes_by_position() {
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-        let _index_mock = server
-            .mock("GET", "/index.json")
-            .expect(0)
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        let registry_dep = dep_with_source("shared.pkg", DependencySource::Registry, 0);
-        let alternate_dep = dep_with_source(
-            "shared.pkg",
-            DependencySource::AlternateRegistry {
-                index: "nuget-chain:never-registered".to_string(),
-                mirrors_crates_io: false,
-            },
-            1,
-        );
-        let alternate_position = alternate_dep.version_range.unwrap().start;
-        let parse_result = NuGetParseResult {
-            dependencies: vec![registry_dep, alternate_dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-
-        // The alternate occurrence resolves deterministically without network: its index was
-        // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
-        // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
-        // the routing. The `.expect(0)` mock proves no fallback to the public registry either.
-        let results = eco
-            .complete_versions(
-                &parse_result,
-                alternate_position.into(),
-                "1",
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(
-            results.is_empty(),
-            "unregistered alternate index must offer no completions, not fall back to the \
-             co-occurring Registry-sourced entry"
-        );
-        _index_mock.assert_async().await;
-    }
-
-    /// End-to-end regression for issue #163: a `.csproj`/`Directory.Packages.props`
-    /// bare-floor `Version` pinned behind the latest registry release must render `❌
-    /// {latest}`, not `✅` — see `NuGetFormatter::is_requirement_up_to_date`.
-    #[cfg(feature = "lsp-responses")]
-    async fn inlay_hint_labels(
-        eco: &NuGetEcosystem,
-        content: &str,
-        uri: &Url,
-        latest: &str,
-    ) -> Vec<String> {
-        use deps_core::lsp_helpers::VersionData;
-        use deps_core::{EcosystemConfig, LoadingState, PackageVersions};
-        use tower_lsp_server::ls_types::InlayHintLabel;
-
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here — held for this shared helper's `parse_manifest` call so
-        // every one of its five callers is covered without repeating the guard per-caller.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let parse_result = eco.parse_manifest(content, uri).await.unwrap();
-        let mut cached = std::collections::HashMap::new();
-        cached.insert(
-            "newtonsoft.json".into(),
-            PackageVersions::latest_only(latest),
-        );
-        let resolved = std::collections::HashMap::new();
-
-        let hints = eco
-            .generate_inlay_hints(
-                parse_result.as_ref(),
-                VersionData::new(&cached, &resolved),
-                LoadingState::Idle,
-                &EcosystemConfig::default(),
-            )
-            .await;
-
-        hints
-            .into_iter()
-            .map(|h| match h.label {
-                InlayHintLabel::String(s) => s,
-                InlayHintLabel::LabelParts(_) => unreachable!("NuGet never emits label parts"),
-            })
-            .collect()
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_inlay_hint_flags_outdated_csproj_package_reference() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-
-        let labels = inlay_hint_labels(&eco, content, &uri, "13.0.4").await;
-        assert_eq!(labels, vec!["❌ 13.0.4"]);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_inlay_hint_marks_up_to_date_csproj_package_reference() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-
-        let labels = inlay_hint_labels(&eco, content, &uri, "13.0.3").await;
-        assert_eq!(labels, vec!["✅"]);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_inlay_hint_flags_outdated_directory_packages_props() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/Directory.Packages.props");
-        let content = r#"<Project><ItemGroup><PackageVersion Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-
-        let labels = inlay_hint_labels(&eco, content, &uri, "13.0.4").await;
-        assert_eq!(labels, vec!["❌ 13.0.4"]);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_inlay_hint_packages_config_exact_pin_unaffected() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/packages.config");
-        let content = r#"<packages><package id="Newtonsoft.Json" version="13.0.3" targetFramework="net48" /></packages>"#;
-
-        assert_eq!(
-            inlay_hint_labels(&eco, content, &uri, "13.0.4").await,
-            vec!["❌ 13.0.4"]
-        );
-        assert_eq!(
-            inlay_hint_labels(&eco, content, &uri, "13.0.3").await,
-            vec!["✅"]
-        );
-    }
-
     /// Diagnostics counterpart of the inlay-hint regressions above: `generate_diagnostics`
     /// (default impl, delegates to `lsp_helpers::generate_diagnostics_from_cache`) shares
     /// the same `EcosystemFormatter::is_requirement_up_to_date` call site, so it was
@@ -1256,839 +627,6 @@ mod tests {
                 .await
                 .is_empty()
         );
-    }
-
-    // --- annotate_unlisted_versions (D1, #451) ---
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_annotate_unlisted_versions_tags_matching_bullet() {
-        let markdown = "**Recent versions**:\n- `2.0.0` *(latest)*\n- `1.0.0`\n";
-        let unlisted: HashSet<String> = HashSet::from(["1.0.0".to_string()]);
-        let out = annotate_unlisted_versions(markdown, &unlisted);
-        assert!(out.contains("- `1.0.0` *(unlisted)*\n"));
-        assert!(out.contains("- `2.0.0` *(latest)*\n"));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_annotate_unlisted_versions_preserves_existing_tags_and_age_suffix() {
-        let markdown = "- `1.2.1` *(yanked)* — 5 months ago\n";
-        let unlisted: HashSet<String> = HashSet::from(["1.2.1".to_string()]);
-        let out = annotate_unlisted_versions(markdown, &unlisted);
-        assert_eq!(out, "- `1.2.1` *(unlisted)* *(yanked)* — 5 months ago\n");
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_annotate_unlisted_versions_untagged_line_when_no_match() {
-        let markdown = "- `1.0.0`\n";
-        let unlisted: HashSet<String> = HashSet::from(["2.0.0".to_string()]);
-        assert_eq!(annotate_unlisted_versions(markdown, &unlisted), markdown);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_annotate_unlisted_versions_leaves_non_bullet_lines_untouched() {
-        let markdown = "**Latest**: `1.0.0`\n\n---\n⌨️ **Press `Cmd+.` to update version**";
-        let unlisted: HashSet<String> = HashSet::from(["1.0.0".to_string()]);
-        assert_eq!(annotate_unlisted_versions(markdown, &unlisted), markdown);
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_annotate_unlisted_versions_no_trailing_newline_preserved() {
-        let markdown = "- `1.0.0`";
-        let unlisted: HashSet<String> = HashSet::from(["1.0.0".to_string()]);
-        assert_eq!(
-            annotate_unlisted_versions(markdown, &unlisted),
-            "- `1.0.0` *(unlisted)*"
-        );
-    }
-
-    // --- generate_hover: hover-only unlisted enrichment (D1, #451) ---
-
-    #[cfg(feature = "lsp-responses")]
-    fn nuget_service_index_body(base: &str) -> String {
-        format!(
-            r#"{{"version": "3.0.0", "resources": [
-                {{"@id": "{base}/flatcontainer", "@type": "PackageBaseAddress/3.0.0"}},
-                {{"@id": "{base}/query", "@type": "SearchQueryService/3.5.0"}},
-                {{"@id": "{base}/registrations", "@type": "RegistrationsBaseUrl/3.6.0"}}
-            ]}}"#
-        )
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_marks_unlisted_recent_version() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-
-        let _service_index_mock = server
-            .mock("GET", "/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&base))
-            .create_async()
-            .await;
-        let _flat_mock = server
-            .mock("GET", "/flatcontainer/newtonsoft.json/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["12.0.1", "13.0.3"]}"#)
-            .create_async()
-            .await;
-        let _reg_mock = server
-            .mock("GET", "/registrations/newtonsoft.json/index.json")
-            .with_status(200)
-            .with_body(
-                r#"{"count": 1, "items": [{"@id": "x", "count": 2, "items": [
-                    {"catalogEntry": {"version": "12.0.1", "listed": true}},
-                    {"catalogEntry": {"version": "13.0.3", "listed": false}}
-                ]}]}"#,
-            )
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        let uri = deps_core::test_util::test_uri("/test/App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-
-        let cached = std::collections::HashMap::new();
-        let resolved = std::collections::HashMap::new();
-        // Freshness disabled: proves the unlisted marker doesn't depend on the freshness
-        // toggle at all (unlike `published_at`, which is gated by it) — see
-        // `unlisted_versions`'s doc comment.
-        let freshness = deps_core::FreshnessSettings {
-            enabled: false,
-            cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-        };
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                Position::new(0, 49), // inside "Newtonsoft.Json"
-                deps_core::VersionData::new(&cached, &resolved),
-                freshness,
-            )
-            .await
-            .expect("hover for a resolvable in-range dependency must not be None");
-
-        let content = hover.markdown();
-        assert!(
-            content.contains("- `13.0.3` *(unlisted)*"),
-            "unlisted version must be tagged, got: {}",
-            content
-        );
-        assert!(
-            !content.contains("`12.0.1` *(unlisted)*"),
-            "listed version must not be tagged, got: {}",
-            content
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_degrades_gracefully_when_registration_fetch_fails() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-
-        let _service_index_mock = server
-            .mock("GET", "/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&base))
-            .create_async()
-            .await;
-        let _flat_mock = server
-            .mock("GET", "/flatcontainer/newtonsoft.json/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["13.0.3"]}"#)
-            .create_async()
-            .await;
-        let _reg_mock = server
-            .mock("GET", "/registrations/newtonsoft.json/index.json")
-            .with_status(500)
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        let uri = deps_core::test_util::test_uri("/test/App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-
-        let cached = std::collections::HashMap::new();
-        let resolved = std::collections::HashMap::new();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                Position::new(0, 49),
-                deps_core::VersionData::new(&cached, &resolved),
-                deps_core::FreshnessSettings {
-                    enabled: false,
-                    cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                },
-            )
-            .await
-            .expect("a registration-hive failure must still degrade to the base hover");
-
-        let content = hover.markdown();
-        assert!(content.contains("`13.0.3`"));
-        assert!(!content.contains("*(unlisted)*"));
-    }
-
-    /// S4 regression (#451 follow-up): with no dependency at `position`, the base render
-    /// resolves to `None` — the unlisted-versions fetch must be skipped entirely rather than
-    /// issued (and awaited) for a hover response that will end up empty anyway. The `.expect(0)`
-    /// mocks fail the test if either endpoint is hit.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_skips_unlisted_fetch_when_no_dependency_at_position() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-
-        let _service_index_mock = server
-            .mock("GET", "/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&base))
-            .expect(0)
-            .create_async()
-            .await;
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
-
-        let uri = deps_core::test_util::test_uri("/test/App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-
-        let cached = std::collections::HashMap::new();
-        let resolved = std::collections::HashMap::new();
-
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                Position::new(0, 0), // outside any dependency's name/version range
-                deps_core::VersionData::new(&cached, &resolved),
-                deps_core::FreshnessSettings {
-                    enabled: false,
-                    cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                },
-            )
-            .await;
-
-        assert!(hover.is_none());
-        // `.expect(0)` above already asserts this, but check() surfaces a clear message.
-        _service_index_mock.assert_async().await;
-    }
-
-    // --- private feed end-to-end (issue #523) ---
-
-    /// C1 end-to-end: a root `NuGet.Config` `<clear/>` + CorpFeed must resolve a private
-    /// package's versions from CorpFeed alone — the root registry's own service index (the
-    /// production api.nuget.org stand-in here) must receive **zero** requests, proving the
-    /// resurrection bug (#248 class) is closed at the real `parse_manifest`/`Registry`
-    /// call path, not just at `NuGetConfig`'s own unit-test level.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_private_feed_clear_resolves_zero_requests_to_public_registry() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-
-        let _public_index_mock = server
-            .mock("GET", "/public/index.json")
-            .with_status(200)
-            .expect(0)
-            .create_async()
-            .await;
-        let _corp_index_mock = server
-            .mock("GET", "/corp/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&format!("{base}/corp")))
-            .create_async()
-            .await;
-        let _corp_flat_mock = server
-            .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["1.2.3"]}"#)
-            .create_async()
-            .await;
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("NuGet.Config"),
-            format!(
-                r#"<configuration><packageSources>
-                    <clear />
-                    <add key="CorpFeed" value="{base}/corp/index.json" />
-                </packageSources></configuration>"#
-            ),
-        )
-        .unwrap();
-        let manifest_path = dir.path().join("App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
-        std::fs::write(&manifest_path, content).unwrap();
-        let uri = Url::from_file_path(&manifest_path).unwrap();
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/public/index.json"),
-        );
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::All,
-        ));
-        let context = crate::config::NuGetParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
-            user_profile_config: None,
-            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
-
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let dep = parse_result
-            .dependencies()
-            .into_iter()
-            .find(|d| d.name().as_str() == "MyCompany.Internal")
-            .expect("dependency must be present");
-        let source = dep.source();
-        assert!(
-            matches!(source, DependencySource::AlternateRegistry { .. }),
-            "expected AlternateRegistry, got {source:?}"
-        );
-        let name = dep.name().clone();
-
-        let versions = eco
-            .registry
-            .as_ref()
-            .get_versions_from(&name, &source, deps_core::FreshnessSettings::default())
-            .await
-            .unwrap();
-        assert_eq!(versions.len(), 1);
-
-        _public_index_mock.assert_async().await;
-        _corp_index_mock.assert_async().await;
-        _corp_flat_mock.assert_async().await;
-    }
-
-    /// #925 (mirrors `deps-cargo`'s
-    /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`): a
-    /// `NuGet.Config` source blocked by the current `registries.workspace_registries` policy
-    /// must populate `ParseResult::blocked_registries` at the real `parse_manifest` call path,
-    /// not just leave the dependency unresolved with no trace.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_parse_manifest_blocked_source_populates_blocked_registries() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("NuGet.Config"),
-            r#"<configuration><packageSources>
-                <clear />
-                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
-            </packageSources></configuration>"#,
-        )
-        .unwrap();
-        let manifest_path = dir.path().join("App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
-        std::fs::write(&manifest_path, content).unwrap();
-        let uri = Url::from_file_path(&manifest_path).unwrap();
-
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
-        ));
-        let context = crate::config::NuGetParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
-            user_profile_config: None,
-            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let eco = NuGetEcosystem::with_context(
-            Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
-            context,
-        );
-
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let dep = parse_result
-            .dependencies()
-            .into_iter()
-            .find(|d| d.name().as_str() == "MyCompany.Internal")
-            .expect("dependency must be present");
-        assert_eq!(
-            dep.source(),
-            DependencySource::CustomRegistry {
-                url: "https://169.254.169.254/v3/index.json".to_string(),
-            },
-            "a blocked source must stay unresolved, not silently become Registry"
-        );
-
-        let blocked = parse_result.blocked_registries();
-        assert_eq!(blocked.len(), 1);
-        let occurrence = &blocked[0];
-        assert_eq!(occurrence.range, dep.name_range());
-        assert_eq!(
-            occurrence.class,
-            deps_core::net_policy::HostClass::CloudMetadata
-        );
-        assert_eq!(
-            occurrence.raw_value,
-            "https://169.254.169.254/v3/index.json"
-        );
-        assert_eq!(occurrence.declaration_key, "source:Blocked");
-    }
-
-    /// #1442 (mirrors [`test_parse_manifest_blocked_source_populates_blocked_registries`] for
-    /// every rejection reason other than a policy-blocked host): a `NuGet.Config` source
-    /// rejected for carrying embedded userinfo must populate `ParseResult::rejected_registries`
-    /// at the real `parse_manifest` call path — previously such a source vanished with only a
-    /// `tracing::warn!`, indistinguishable in the editor from a dependency simply not yet
-    /// checked.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_parse_manifest_rejected_source_populates_rejected_registries() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("NuGet.Config"),
-            r#"<configuration><packageSources>
-                <add key="Insecure" value="http://corp.example/v3/index.json" />
-            </packageSources></configuration>"#,
-        )
-        .unwrap();
-        let manifest_path = dir.path().join("App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
-        std::fs::write(&manifest_path, content).unwrap();
-        let uri = Url::from_file_path(&manifest_path).unwrap();
-
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::All,
-        ));
-        let context = crate::config::NuGetParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
-            user_profile_config: None,
-            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let eco = NuGetEcosystem::with_context(
-            Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
-            context,
-        );
-
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let dep = parse_result
-            .dependencies()
-            .into_iter()
-            .find(|d| d.name().as_str() == "MyCompany.Internal")
-            .expect("dependency must be present");
-
-        let rejected = parse_result.rejected_registries();
-        assert_eq!(rejected.len(), 1);
-        let occurrence = &rejected[0];
-        assert_eq!(occurrence.range, dep.name_range());
-        assert_eq!(
-            occurrence.reason,
-            deps_core::net_policy::RegistryRejectionReason::NotHttps
-        );
-        assert_eq!(occurrence.raw_value, "http://corp.example/v3/index.json");
-        assert_eq!(occurrence.declaration_key, "source:Insecure");
-        assert!(
-            parse_result.blocked_registries().is_empty(),
-            "a non-blocked-host rejection must never also report via blocked_registries"
-        );
-    }
-
-    /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve to
-    /// a real ancestor directory for `NuGet.Config` discovery — same guard gap class as
-    /// #1084/#1089's lock file fix, applied here to `parse_manifest`'s config lookup. Builds
-    /// a real `NuGet.Config` that would have blocked the dependency's source if discovery
-    /// ran, then proves a malicious-scheme/host URI pointing at the same real path falls back
-    /// to the default (empty) config instead of walking the real directory.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_parse_manifest_skips_nuget_config_discovery_for_malicious_uri() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("NuGet.Config"),
-            r#"<configuration><packageSources>
-                <clear />
-                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
-            </packageSources></configuration>"#,
-        )
-        .unwrap();
-        let manifest_path = dir.path().join("App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
-        std::fs::write(&manifest_path, content).unwrap();
-
-        let file_uri = url::Url::from_file_path(&manifest_path).unwrap();
-        let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
-
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
-        ));
-
-        // `("file://", true)` is a positive control: a plain, unmodified `file:` URI for the
-        // same real path *must* find the real `NuGet.Config` and populate `blocked_registries`
-        // — pinning in-tree that the fixture itself is live, not just externally verified.
-        //
-        // `("file://attacker.example", false)` used to be a third case here. It was removed
-        // (#1090 guard-gap follow-up): when this test's real temp-dir path is
-        // Windows-drive-letter-shaped (`C:\...`, as `tempfile::tempdir()` produces on a real
-        // Windows machine), a `file:` URI with a non-empty host and that path cannot be
-        // represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
-        // parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host
-        // before `parse_manifest`'s config discovery (or any code holding only a `&Url`) can
-        // see it, so that case asserted an unreachable invariant and failed on
-        // `windows-latest` CI. On Unix the path is never drive-letter-shaped, so the host
-        // survives parsing and the per-layer host guard stays live and testable there — this
-        // comment only concerns the Windows-shaped case, not a claim that the guard is dead
-        // on every platform. This exact bypass is guarded and tested platform-independently
-        // at the point where untrusted URIs are first parsed:
-        // `deps_lsp::lsp_types_interop::from_lsp_uri`, see
-        // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
-        for (prefix, expect_blocked) in [("file://", true), ("https://attacker.example", false)] {
-            let uri: url::Url = format!("{prefix}{path_part}").parse().unwrap();
-            let context = crate::config::NuGetParseContext {
-                policy: Arc::clone(&policy),
-                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
-                user_profile_config: None,
-                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            };
-            let eco = NuGetEcosystem::with_context(
-                Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
-                context,
-            );
-
-            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-            let dep = parse_result
-                .dependencies()
-                .into_iter()
-                .find(|d| d.name().as_str() == "MyCompany.Internal")
-                .expect("dependency must be present");
-            if expect_blocked {
-                assert_eq!(
-                    dep.source(),
-                    DependencySource::CustomRegistry {
-                        url: "https://169.254.169.254/v3/index.json".to_string(),
-                    },
-                    "test premise: a real file: URI must resolve the real NuGet.Config"
-                );
-                assert_eq!(parse_result.blocked_registries().len(), 1);
-            } else {
-                assert_eq!(
-                    dep.source(),
-                    DependencySource::Registry,
-                    "a malicious-scheme/host URI ({prefix}) must never resolve NuGet.Config \
-                     discovery against a real ancestor directory"
-                );
-                assert!(parse_result.blocked_registries().is_empty());
-            }
-        }
-    }
-
-    /// C1 regression (impl-critic): `generate_hover`'s unlisted-versions decoration must
-    /// never fire against the public root registry for a dependency that resolved to a
-    /// private feed — before the fix, `unlisted_versions` was called unconditionally
-    /// on `self.registry` (always `Public`-tier), sending the private package's real name to
-    /// the mocked-as-public-registry endpoint regardless of which feed it actually resolved
-    /// to. The `.expect(0)` mock fails the test if that endpoint is ever hit.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_skips_unlisted_fetch_for_private_feed_dependency() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-
-        let _public_index_mock = server
-            .mock("GET", "/public/index.json")
-            .with_status(200)
-            .expect(0)
-            .create_async()
-            .await;
-        let _corp_index_mock = server
-            .mock("GET", "/corp/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&format!("{base}/corp")))
-            .create_async()
-            .await;
-        let _corp_flat_mock = server
-            .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["1.2.3"]}"#)
-            .create_async()
-            .await;
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("NuGet.Config"),
-            format!(
-                r#"<configuration><packageSources>
-                    <clear />
-                    <add key="CorpFeed" value="{base}/corp/index.json" />
-                </packageSources></configuration>"#
-            ),
-        )
-        .unwrap();
-        let manifest_path = dir.path().join("App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
-        std::fs::write(&manifest_path, content).unwrap();
-        let uri = Url::from_file_path(&manifest_path).unwrap();
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/public/index.json"),
-        );
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::All,
-        ));
-        let context = crate::config::NuGetParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
-            user_profile_config: None,
-            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
-
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        // Position inside "MyCompany.Internal" in the Include attribute.
-        let position = Position::new(0, 49);
-
-        let cached = std::collections::HashMap::new();
-        let resolved = std::collections::HashMap::new();
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                deps_core::VersionData::new(&cached, &resolved),
-                deps_core::FreshnessSettings {
-                    enabled: false,
-                    cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                },
-            )
-            .await;
-
-        assert!(
-            hover.is_some(),
-            "expected a hover render for a resolvable in-range dependency"
-        );
-        _public_index_mock.assert_async().await;
-    }
-
-    /// SC-004/US-004 (issue #562, FR-012): a package resolved via a workspace-declared
-    /// (`AlternateRegistry`) feed now gets the same hover-only `*(unlisted)*` marker a
-    /// public-registry dependency gets — registration-hive enrichment is no longer skipped for
-    /// alternate feeds.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_hover_marks_unlisted_for_alternate_registry_dependency() {
-        // See the comment in `test_package_name_completion_context_has_real_range` on why
-        // this guard is needed here.
-        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-
-        let _corp_index_mock = server
-            .mock("GET", "/corp/index.json")
-            .with_status(200)
-            .with_body(nuget_service_index_body(&format!("{base}/corp")))
-            .create_async()
-            .await;
-        let _corp_flat_mock = server
-            .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
-            .with_status(200)
-            .with_body(r#"{"versions": ["1.2.3"]}"#)
-            .create_async()
-            .await;
-        let _corp_reg_mock = server
-            .mock("GET", "/corp/registrations/mycompany.internal/index.json")
-            .with_status(200)
-            .with_body(
-                r#"{"count": 1, "items": [{"@id": "x", "count": 1, "items": [
-                    {"catalogEntry": {"version": "1.2.3", "listed": false}}
-                ]}]}"#,
-            )
-            .create_async()
-            .await;
-
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("NuGet.Config"),
-            format!(
-                r#"<configuration><packageSources>
-                    <clear />
-                    <add key="CorpFeed" value="{base}/corp/index.json" />
-                </packageSources></configuration>"#
-            ),
-        )
-        .unwrap();
-        let manifest_path = dir.path().join("App.csproj");
-        let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.2.3" /></ItemGroup></Project>"#;
-        std::fs::write(&manifest_path, content).unwrap();
-        let uri = Url::from_file_path(&manifest_path).unwrap();
-
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/public/index.json"),
-        );
-        let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
-            deps_core::net_policy::WorkspaceRegistryAccess::All,
-        ));
-        let context = crate::config::NuGetParseContext {
-            policy: Arc::clone(&policy),
-            config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
-            user_profile_config: None,
-            user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        };
-        let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
-
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(0, 49); // inside "MyCompany.Internal"
-
-        let cached = std::collections::HashMap::new();
-        let resolved = std::collections::HashMap::new();
-        let hover = eco
-            .generate_hover(
-                parse_result.as_ref(),
-                position,
-                deps_core::VersionData::new(&cached, &resolved),
-                deps_core::FreshnessSettings {
-                    enabled: false,
-                    cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                },
-            )
-            .await
-            .expect("hover for a resolvable alternate-feed dependency must not be None");
-
-        let content = hover.markdown();
-        assert!(
-            content.contains("- `1.2.3` *(unlisted)*"),
-            "expected the alternate-feed dependency's unlisted marker, got: {}",
-            content
-        );
-        _corp_index_mock.assert_async().await;
-        _corp_flat_mock.assert_async().await;
-        _corp_reg_mock.assert_async().await;
-    }
-
-    /// Composition regression guard (#390/#282/#699 bug class, mirrors the deleted
-    /// `deps-lsp` end-to-end test `test_fallback_completion_nuget_query_matches_attribute_value`):
-    /// proves `line_at` + `is_in_xml_tag_section` + `strip_open_xml_attribute_value`
-    /// compose correctly through the real trait method on realistic multi-line
-    /// `.csproj` content.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition_include_attribute() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            Some("Newt")
-        );
-    }
-
-    /// Same composition, `packages.config`'s `id="..."` attribute instead of
-    /// `PackageReference`'s `Include="..."`.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition_id_attribute() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let content = "<packages>\n  <package id=\"Newt";
-        let line = content.lines().nth(1).unwrap();
-        let position = Position::new(1, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            Some("Newt")
-        );
-    }
-
-    /// Typing inside a non-target attribute's value (`Version="1.0`, after `Include`
-    /// already closed) must not compose into a search prefix — an *empty* one, not
-    /// `None`. This is the load-bearing case for `fallback_completion_is_bare`'s
-    /// hardcoded `true`: since `fallback_completion`'s caller rejects an empty prefix
-    /// before ever calling `fallback_completion_is_bare`, the only way this method is
-    /// reached at all is with a non-empty prefix, which `strip_open_xml_attribute_value`
-    /// only ever produces from inside an open target attribute value (#724/#728).
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition_non_target_attribute() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let content = "<ItemGroup>\n  <PackageReference Include=\"Foo\" Version=\"1.0";
-        let line = content.lines().nth(1).unwrap();
-        let position = Position::new(1, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            Some("")
-        );
-    }
-
-    /// A `<PropertyGroup>` is outside `<ItemGroup>`/`<packages>` entirely — the
-    /// section gate itself must reject it, composed through the real trait method.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition_outside_section() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let content = "<Project>\n  <PropertyGroup>\n    <TargetFramework>net8.0";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            None
-        );
-    }
-
-    /// #724/#728: whenever the raw-text fallback path reaches a completable prefix at
-    /// all, the cursor is already inside an open `Include="`/`id="` attribute value —
-    /// `fallback_completion_is_bare` must always report that so the caller inserts the
-    /// bare package name instead of a full `<PackageReference .../>` tag that would
-    /// nest inside the attribute value it was typed into.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_always_true() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #724: the default `fallback_bare_insert_text` (bare `metadata.name()`) is the
@@ -2281,111 +819,1494 @@ mod tests {
         );
     }
 
-    // --- #793 characterization: `generate_completions` dispatch, pinned before the
-    // wildcard-match refactor moves the match into `deps-core`.
-
     #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = NuGetEcosystem::new(cache);
-        // "F" is below `is_valid_completion_prefix_len`'s 2-char minimum — deterministic
-        // without touching api.nuget.org.
-        let content = "F";
-        let dep = NuGetDependency {
-            name: "F".into(),
-            name_range: deps_core::Range::new(
-                deps_core::Position::new(0, 0),
-                deps_core::Position::new(0, 1),
-            ),
-            version_requirement: None,
-            version_range: None,
-            source: DependencySource::Registry,
-        };
-        let parse_result = NuGetParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-        let position = Position::new(0, 1);
-        let freshness = deps_core::FreshnessSettings::default();
+    mod lsp_tests {
+        use super::*;
 
-        let context =
-            deps_core::completion::detect_completion_context(&parse_result, position, content);
-        let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
-        else {
-            panic!("expected PackageName context, got {context:?}");
-        };
-        let direct = eco.complete_package_names(&prefix, range).await;
-        let via_dispatch = eco
-            .generate_completions(&parse_result, position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-    }
+        use crate::types::NuGetDependency;
 
-    /// Mirrors `test_complete_versions_gate_blocks_unresolvable_source`: an unresolvable
-    /// `CustomRegistry` source must never reach api.nuget.org — the `.expect(0)` mock fails
-    /// the test if that endpoint is hit at all.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_gate_blocks_unresolvable_source() {
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-        let _index_mock = server
-            .mock("GET", "/index.json")
-            .expect(0)
-            .create_async()
-            .await;
+        deps_core::complete_versions_test_shim!(NuGetEcosystem);
 
-        let registry = NuGetRegistry::with_service_index_url(
-            Arc::new(deps_core::HttpCache::new()),
-            format!("{base}/index.json"),
-        );
-        let eco = NuGetEcosystem::with_registry(registry);
+        // #758: the shared completion-prefix-length guard, replacing
+        // test_complete_package_names_min_prefix (which only checked the empty-prefix case).
+        deps_core::completion_guard_conformance! {
+            mod nuget_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
 
-        let dep = dep_with_source(
-            "privatepkg",
-            DependencySource::CustomRegistry {
-                url: "https://feed.mycorp.example/v3/index.json".to_string(),
-            },
-            0,
-        );
-        let parse_result = NuGetParseResult {
-            dependencies: vec![dep],
-            uri: deps_core::test_util::test_uri("/test/App.csproj"),
-            resolved_chains: Vec::new(),
-            blocked_registries: Vec::new(),
-            rejected_registries: Vec::new(),
-            dependency_truncation: None,
-        };
-        // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
-        // slice of `content` to actually match `dep_with_source`'s declared
-        // `version_requirement` ("1.0.0") — padded to its fixed 10-char-wide range,
-        // whitespace-insensitively equal.
-        let content = "1.0.0     ";
-        // Character 1, not 0: `dep_with_source`'s `name_range` is the zero-width
-        // `(line,0)-(line,0)`, which `detect_completion_context` would otherwise match
-        // exactly at character 0 before ever reaching `version_range`.
-        let position = Position::new(0, 1);
-        let freshness = deps_core::FreshnessSettings::default();
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (`version::parse_range`'s range-delimiter set), so an edit to one
+        // without the other fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod nuget_operator_chars_conformance;
+            ecosystem: "nuget";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['[', '('];
+        }
 
-        let context =
-            deps_core::completion::detect_completion_context(&parse_result, position, content);
-        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
-            panic!("expected Version context, got {context:?}");
-        };
-        let direct = eco
-            .complete_versions(&parse_result, position, &prefix, freshness)
-            .await;
-        let via_dispatch = eco
-            .generate_completions(&parse_result, position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-        _index_mock.assert_async().await;
+        #[tokio::test]
+        async fn test_package_name_completion_context_has_real_range() {
+            // Regression test for #232: the textEdit range for a package-name completion
+            // must be the real name token span, not the (0,0)-(0,0) placeholder.
+            //
+            // Held per `fs_probe::snapshot_guard`'s doc: `parse_manifest` calls
+            // `config::resolve_with_context` directly, and every such test in this file must
+            // hold it.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Foo\" Version=\"1.0.0\" />\n  </ItemGroup>\n</Project>";
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(2, 33); // cursor after "Fo" in "Foo"
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+
+            match context {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    assert_eq!(prefix, "Fo");
+                    assert_ne!(range, Range::default());
+                    assert_eq!(
+                        range,
+                        Range::new(Position::new(2, 31), Position::new(2, 34))
+                    );
+                }
+                other => panic!("Expected PackageName context, got {other:?}"),
+            }
+        }
+
+        // --- complete_versions: position-based dependency lookup + can_resolve_source gate (issue #593) ---
+
+        /// A dependency on `line`, with a `version_range` there so position-based lookup (issue
+        /// #593) can find it — mirrors `deps_go::ecosystem::tests::dep_with_source`.
+        fn dep_with_source(name: &str, source: DependencySource, line: u32) -> NuGetDependency {
+            NuGetDependency {
+                name: name.into(),
+                name_range: deps_core::Range::new(
+                    deps_core::Position::new(line, 0),
+                    deps_core::Position::new(line, 0),
+                ),
+                version_requirement: Some("1.0.0".into()),
+                version_range: Some(deps_core::Range::new(
+                    deps_core::Position::new(line, 0),
+                    deps_core::Position::new(line, 10),
+                )),
+                source,
+            }
+        }
+
+        #[tokio::test]
+        async fn test_complete_versions_position_based_lookup_finds_correct_dependency() {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _index_mock = server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&base))
+                .create_async()
+                .await;
+            let _flat_mock = server
+                .mock("GET", "/flatcontainer/targetpkg/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["1.0.0", "1.2.0"]}"#)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            // "otherpkg" has no mock registered — if position-based lookup picked it instead of
+            // the dependency actually under the cursor, this would fail closed to empty instead
+            // of returning `targetpkg`'s versions.
+            let other = dep_with_source("otherpkg", DependencySource::Registry, 0);
+            let target = dep_with_source("targetpkg", DependencySource::Registry, 1);
+            let target_position = target.version_range.unwrap().start;
+            let parse_result = NuGetParseResult {
+                dependencies: vec![other, target],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            let results = eco
+                .complete_versions(
+                    &parse_result,
+                    target_position.into(),
+                    "1",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                !results.is_empty(),
+                "position-based lookup must resolve the dependency at the cursor position"
+            );
+        }
+
+        /// #1223 M2: proves `NuGetEcosystem`'s `version_operator_chars()` override (`['[', '(']`)
+        /// is actually wired into the shared `Ecosystem::complete_version` default, not just
+        /// declared — a bracket-interval-shaped prefix (`"[1."`, as typed mid-`[1.0,2.0)`) must
+        /// prefix-match real version data with the leading `[` stripped, not fall through to an
+        /// unfiltered top-N list. `2.0.0`'s presence in the mocked feed alongside `1.0.0`/`1.2.0`
+        /// is what makes the assertion below reflect filtering rather than an unfiltered list —
+        /// mirrors `deps_composer::ecosystem::tests::
+        /// test_generate_completions_strips_not_equal_operator_against_real_registry`'s same
+        /// non-vacuous-filtering shape for Composer's `!=` operator.
+        #[tokio::test]
+        async fn test_complete_versions_strips_bracket_operator_against_real_registry() {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _index_mock = server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&base))
+                .create_async()
+                .await;
+            let _flat_mock = server
+                .mock("GET", "/flatcontainer/targetpkg/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["1.0.0", "1.2.0", "2.0.0"]}"#)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let dep = dep_with_source("targetpkg", DependencySource::Registry, 0);
+            let position = dep.version_range.unwrap().start;
+            let parse_result = NuGetParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            let results = eco
+                .complete_versions(
+                    &parse_result,
+                    position.into(),
+                    "[1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(!results.is_empty());
+            assert!(results.iter().all(|r| r.label.starts_with("1.")));
+        }
+
+        #[tokio::test]
+        async fn test_complete_versions_no_dependency_at_position_offers_nothing() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+
+            let dep = dep_with_source("somepkg", DependencySource::Registry, 0);
+            let parse_result = NuGetParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            let results = eco
+                .complete_versions(
+                    &parse_result,
+                    Position::new(99, 0),
+                    "1",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(results.is_empty());
+        }
+
+        /// `can_resolve_source`'s gate (matching hover/diagnostics/code-actions' identical check,
+        /// #248 leak class) must keep an unresolvable `CustomRegistry` source from ever reaching
+        /// api.nuget.org. The `.expect(0)` mock fails the test if that endpoint is hit at all.
+        #[tokio::test]
+        async fn test_complete_versions_gate_blocks_unresolvable_source() {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _index_mock = server
+                .mock("GET", "/index.json")
+                .expect(0)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let dep = dep_with_source(
+                "privatepkg",
+                DependencySource::CustomRegistry {
+                    url: "https://feed.mycorp.example/v3/index.json".to_string(),
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start;
+            let parse_result = NuGetParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            let results = eco
+                .complete_versions(
+                    &parse_result,
+                    position.into(),
+                    "1",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                results.is_empty(),
+                "an unresolvable CustomRegistry source must offer no completions"
+            );
+            _index_mock.assert_async().await;
+        }
+
+        /// An `AlternateRegistry` source whose index has no registered client offers no
+        /// completions rather than falling back to the public registry.
+        #[tokio::test]
+        async fn test_complete_versions_unregistered_alternate_offers_nothing() {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _index_mock = server
+                .mock("GET", "/index.json")
+                .expect(0)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let dep = dep_with_source(
+                "internal.auth",
+                DependencySource::AlternateRegistry {
+                    index: "nuget-chain:never-registered".to_string(),
+                    mirrors_crates_io: false,
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start;
+            let parse_result = NuGetParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            let results = eco
+                .complete_versions(
+                    &parse_result,
+                    position.into(),
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                results.is_empty(),
+                "unregistered alternate index must offer no completions"
+            );
+            _index_mock.assert_async().await;
+        }
+
+        /// A registered `AlternateRegistry` chain routes `complete_versions` through its own
+        /// client, never the public root registry.
+        #[tokio::test]
+        async fn test_complete_versions_routes_to_registered_alternate_client() {
+            let mut alt_server = mockito::Server::new_async().await;
+            let alt_base = alt_server.url();
+            let _alt_index_mock = alt_server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&alt_base))
+                .create_async()
+                .await;
+            let _alt_flat_mock = alt_server
+                .mock("GET", "/flatcontainer/internal.auth/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["1.2.3", "1.3.0"]}"#)
+                .create_async()
+                .await;
+
+            let mut public_server = mockito::Server::new_async().await;
+            let public_base = public_server.url();
+            let _public_index_mock = public_server
+                .mock("GET", "/index.json")
+                .expect(0)
+                .create_async()
+                .await;
+
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            ));
+            let root = Arc::new(NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{public_base}/index.json"),
+            ));
+
+            let feed_url =
+                crate::config::NuGetFeedUrl::new(&format!("{alt_base}/index.json"), &policy)
+                    .unwrap();
+            let chain = crate::config::NuGetSourceChain {
+                key: "nuget-chain:test-alt".to_string(),
+                hops: vec![crate::config::ResolvedHop {
+                    url: feed_url,
+                    slot: None,
+                    auth: None,
+                }],
+                implicit_public_fallback: false,
+            };
+            NuGetRegistry::register_alternate(&root, &chain, &policy);
+
+            let context = crate::config::NuGetParseContext {
+                policy: Arc::clone(&policy),
+                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                user_profile_config: None,
+                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let eco = NuGetEcosystem::with_context(root, context);
+
+            let dep = dep_with_source(
+                "internal.auth",
+                DependencySource::AlternateRegistry {
+                    index: "nuget-chain:test-alt".to_string(),
+                    mirrors_crates_io: false,
+                },
+                0,
+            );
+            let position = dep.version_range.unwrap().start;
+            let parse_result = NuGetParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            let results = eco
+                .complete_versions(
+                    &parse_result,
+                    position.into(),
+                    "1.",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                !results.is_empty(),
+                "a registered alternate index must route completions through its own client"
+            );
+            _public_index_mock.assert_async().await;
+        }
+
+        /// Two dependencies sharing one `PackageName` but resolving to different sources must
+        /// route independently by cursor position, not collapse into an ambiguous "offer nothing
+        /// for either" result.
+        #[tokio::test]
+        async fn test_complete_versions_same_name_different_sources_routes_by_position() {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _index_mock = server
+                .mock("GET", "/index.json")
+                .expect(0)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let registry_dep = dep_with_source("shared.pkg", DependencySource::Registry, 0);
+            let alternate_dep = dep_with_source(
+                "shared.pkg",
+                DependencySource::AlternateRegistry {
+                    index: "nuget-chain:never-registered".to_string(),
+                    mirrors_crates_io: false,
+                },
+                1,
+            );
+            let alternate_position = alternate_dep.version_range.unwrap().start;
+            let parse_result = NuGetParseResult {
+                dependencies: vec![registry_dep, alternate_dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+
+            // The alternate occurrence resolves deterministically without network: its index was
+            // never registered, so the fetch fails closed with `PackageNotFound` before any HTTP
+            // call — proving its own source, not the co-occurring `Registry`-sourced entry, drove
+            // the routing. The `.expect(0)` mock proves no fallback to the public registry either.
+            let results = eco
+                .complete_versions(
+                    &parse_result,
+                    alternate_position.into(),
+                    "1",
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(
+                results.is_empty(),
+                "unregistered alternate index must offer no completions, not fall back to the \
+             co-occurring Registry-sourced entry"
+            );
+            _index_mock.assert_async().await;
+        }
+
+        /// End-to-end regression for issue #163: a `.csproj`/`Directory.Packages.props`
+        /// bare-floor `Version` pinned behind the latest registry release must render `❌
+        /// {latest}`, not `✅` — see `NuGetFormatter::is_requirement_up_to_date`.
+        async fn inlay_hint_labels(
+            eco: &NuGetEcosystem,
+            content: &str,
+            uri: &Url,
+            latest: &str,
+        ) -> Vec<String> {
+            use deps_core::lsp_helpers::VersionData;
+            use deps_core::{EcosystemConfig, LoadingState, PackageVersions};
+            use tower_lsp_server::ls_types::InlayHintLabel;
+
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here — held for this shared helper's `parse_manifest` call so
+            // every one of its five callers is covered without repeating the guard per-caller.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let parse_result = eco.parse_manifest(content, uri).await.unwrap();
+            let mut cached = std::collections::HashMap::new();
+            cached.insert(
+                "newtonsoft.json".into(),
+                PackageVersions::latest_only(latest),
+            );
+            let resolved = std::collections::HashMap::new();
+
+            let hints = eco
+                .generate_inlay_hints(
+                    parse_result.as_ref(),
+                    VersionData::new(&cached, &resolved),
+                    LoadingState::Idle,
+                    &EcosystemConfig::default(),
+                )
+                .await;
+
+            hints
+                .into_iter()
+                .map(|h| match h.label {
+                    InlayHintLabel::String(s) => s,
+                    InlayHintLabel::LabelParts(_) => unreachable!("NuGet never emits label parts"),
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn test_inlay_hint_flags_outdated_csproj_package_reference() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+            let labels = inlay_hint_labels(&eco, content, &uri, "13.0.4").await;
+            assert_eq!(labels, vec!["❌ 13.0.4"]);
+        }
+
+        #[tokio::test]
+        async fn test_inlay_hint_marks_up_to_date_csproj_package_reference() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+            let labels = inlay_hint_labels(&eco, content, &uri, "13.0.3").await;
+            assert_eq!(labels, vec!["✅"]);
+        }
+
+        #[tokio::test]
+        async fn test_inlay_hint_flags_outdated_directory_packages_props() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/Directory.Packages.props");
+            let content = r#"<Project><ItemGroup><PackageVersion Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+
+            let labels = inlay_hint_labels(&eco, content, &uri, "13.0.4").await;
+            assert_eq!(labels, vec!["❌ 13.0.4"]);
+        }
+
+        #[tokio::test]
+        async fn test_inlay_hint_packages_config_exact_pin_unaffected() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/packages.config");
+            let content = r#"<packages><package id="Newtonsoft.Json" version="13.0.3" targetFramework="net48" /></packages>"#;
+
+            assert_eq!(
+                inlay_hint_labels(&eco, content, &uri, "13.0.4").await,
+                vec!["❌ 13.0.4"]
+            );
+            assert_eq!(
+                inlay_hint_labels(&eco, content, &uri, "13.0.3").await,
+                vec!["✅"]
+            );
+        }
+
+        // --- annotate_unlisted_versions (D1, #451) ---
+
+        #[test]
+        fn test_annotate_unlisted_versions_tags_matching_bullet() {
+            let markdown = "**Recent versions**:\n- `2.0.0` *(latest)*\n- `1.0.0`\n";
+            let unlisted: HashSet<String> = HashSet::from(["1.0.0".to_string()]);
+            let out = annotate_unlisted_versions(markdown, &unlisted);
+            assert!(out.contains("- `1.0.0` *(unlisted)*\n"));
+            assert!(out.contains("- `2.0.0` *(latest)*\n"));
+        }
+
+        #[test]
+        fn test_annotate_unlisted_versions_preserves_existing_tags_and_age_suffix() {
+            let markdown = "- `1.2.1` *(yanked)* — 5 months ago\n";
+            let unlisted: HashSet<String> = HashSet::from(["1.2.1".to_string()]);
+            let out = annotate_unlisted_versions(markdown, &unlisted);
+            assert_eq!(out, "- `1.2.1` *(unlisted)* *(yanked)* — 5 months ago\n");
+        }
+
+        #[test]
+        fn test_annotate_unlisted_versions_untagged_line_when_no_match() {
+            let markdown = "- `1.0.0`\n";
+            let unlisted: HashSet<String> = HashSet::from(["2.0.0".to_string()]);
+            assert_eq!(annotate_unlisted_versions(markdown, &unlisted), markdown);
+        }
+
+        #[test]
+        fn test_annotate_unlisted_versions_leaves_non_bullet_lines_untouched() {
+            let markdown = "**Latest**: `1.0.0`\n\n---\n⌨️ **Press `Cmd+.` to update version**";
+            let unlisted: HashSet<String> = HashSet::from(["1.0.0".to_string()]);
+            assert_eq!(annotate_unlisted_versions(markdown, &unlisted), markdown);
+        }
+
+        #[test]
+        fn test_annotate_unlisted_versions_no_trailing_newline_preserved() {
+            let markdown = "- `1.0.0`";
+            let unlisted: HashSet<String> = HashSet::from(["1.0.0".to_string()]);
+            assert_eq!(
+                annotate_unlisted_versions(markdown, &unlisted),
+                "- `1.0.0` *(unlisted)*"
+            );
+        }
+
+        // --- generate_hover: hover-only unlisted enrichment (D1, #451) ---
+
+        fn nuget_service_index_body(base: &str) -> String {
+            format!(
+                r#"{{"version": "3.0.0", "resources": [
+                {{"@id": "{base}/flatcontainer", "@type": "PackageBaseAddress/3.0.0"}},
+                {{"@id": "{base}/query", "@type": "SearchQueryService/3.5.0"}},
+                {{"@id": "{base}/registrations", "@type": "RegistrationsBaseUrl/3.6.0"}}
+            ]}}"#
+            )
+        }
+
+        #[tokio::test]
+        async fn test_generate_hover_marks_unlisted_recent_version() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+
+            let _service_index_mock = server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&base))
+                .create_async()
+                .await;
+            let _flat_mock = server
+                .mock("GET", "/flatcontainer/newtonsoft.json/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["12.0.1", "13.0.3"]}"#)
+                .create_async()
+                .await;
+            let _reg_mock = server
+                .mock("GET", "/registrations/newtonsoft.json/index.json")
+                .with_status(200)
+                .with_body(
+                    r#"{"count": 1, "items": [{"@id": "x", "count": 2, "items": [
+                    {"catalogEntry": {"version": "12.0.1", "listed": true}},
+                    {"catalogEntry": {"version": "13.0.3", "listed": false}}
+                ]}]}"#,
+                )
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+            // Freshness disabled: proves the unlisted marker doesn't depend on the freshness
+            // toggle at all (unlike `published_at`, which is gated by it) — see
+            // `unlisted_versions`'s doc comment.
+            let freshness = deps_core::FreshnessSettings {
+                enabled: false,
+                cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+            };
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    Position::new(0, 49), // inside "Newtonsoft.Json"
+                    deps_core::VersionData::new(&cached, &resolved),
+                    freshness,
+                )
+                .await
+                .expect("hover for a resolvable in-range dependency must not be None");
+
+            let content = hover.markdown();
+            assert!(
+                content.contains("- `13.0.3` *(unlisted)*"),
+                "unlisted version must be tagged, got: {}",
+                content
+            );
+            assert!(
+                !content.contains("`12.0.1` *(unlisted)*"),
+                "listed version must not be tagged, got: {}",
+                content
+            );
+        }
+
+        #[tokio::test]
+        async fn test_generate_hover_degrades_gracefully_when_registration_fetch_fails() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+
+            let _service_index_mock = server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&base))
+                .create_async()
+                .await;
+            let _flat_mock = server
+                .mock("GET", "/flatcontainer/newtonsoft.json/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["13.0.3"]}"#)
+                .create_async()
+                .await;
+            let _reg_mock = server
+                .mock("GET", "/registrations/newtonsoft.json/index.json")
+                .with_status(500)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    Position::new(0, 49),
+                    deps_core::VersionData::new(&cached, &resolved),
+                    deps_core::FreshnessSettings {
+                        enabled: false,
+                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+                    },
+                )
+                .await
+                .expect("a registration-hive failure must still degrade to the base hover");
+
+            let content = hover.markdown();
+            assert!(content.contains("`13.0.3`"));
+            assert!(!content.contains("*(unlisted)*"));
+        }
+
+        /// S4 regression (#451 follow-up): with no dependency at `position`, the base render
+        /// resolves to `None` — the unlisted-versions fetch must be skipped entirely rather than
+        /// issued (and awaited) for a hover response that will end up empty anyway. The `.expect(0)`
+        /// mocks fail the test if either endpoint is hit.
+        #[tokio::test]
+        async fn test_generate_hover_skips_unlisted_fetch_when_no_dependency_at_position() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+
+            let _service_index_mock = server
+                .mock("GET", "/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&base))
+                .expect(0)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let uri = deps_core::test_util::test_uri("/test/App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="Newtonsoft.Json" Version="13.0.3" /></ItemGroup></Project>"#;
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    Position::new(0, 0), // outside any dependency's name/version range
+                    deps_core::VersionData::new(&cached, &resolved),
+                    deps_core::FreshnessSettings {
+                        enabled: false,
+                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+                    },
+                )
+                .await;
+
+            assert!(hover.is_none());
+            // `.expect(0)` above already asserts this, but check() surfaces a clear message.
+            _service_index_mock.assert_async().await;
+        }
+
+        // --- private feed end-to-end (issue #523) ---
+
+        /// C1 end-to-end: a root `NuGet.Config` `<clear/>` + CorpFeed must resolve a private
+        /// package's versions from CorpFeed alone — the root registry's own service index (the
+        /// production api.nuget.org stand-in here) must receive **zero** requests, proving the
+        /// resurrection bug (#248 class) is closed at the real `parse_manifest`/`Registry`
+        /// call path, not just at `NuGetConfig`'s own unit-test level.
+        #[tokio::test]
+        async fn test_private_feed_clear_resolves_zero_requests_to_public_registry() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+
+            let _public_index_mock = server
+                .mock("GET", "/public/index.json")
+                .with_status(200)
+                .expect(0)
+                .create_async()
+                .await;
+            let _corp_index_mock = server
+                .mock("GET", "/corp/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&format!("{base}/corp")))
+                .create_async()
+                .await;
+            let _corp_flat_mock = server
+                .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["1.2.3"]}"#)
+                .create_async()
+                .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("NuGet.Config"),
+                format!(
+                    r#"<configuration><packageSources>
+                    <clear />
+                    <add key="CorpFeed" value="{base}/corp/index.json" />
+                </packageSources></configuration>"#
+                ),
+            )
+            .unwrap();
+            let manifest_path = dir.path().join("App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+            std::fs::write(&manifest_path, content).unwrap();
+            let uri = Url::from_file_path(&manifest_path).unwrap();
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/public/index.json"),
+            );
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            ));
+            let context = crate::config::NuGetParseContext {
+                policy: Arc::clone(&policy),
+                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                user_profile_config: None,
+                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let dep = parse_result
+                .dependencies()
+                .into_iter()
+                .find(|d| d.name().as_str() == "MyCompany.Internal")
+                .expect("dependency must be present");
+            let source = dep.source();
+            assert!(
+                matches!(source, DependencySource::AlternateRegistry { .. }),
+                "expected AlternateRegistry, got {source:?}"
+            );
+            let name = dep.name().clone();
+
+            let versions = eco
+                .registry
+                .as_ref()
+                .get_versions_from(&name, &source, deps_core::FreshnessSettings::default())
+                .await
+                .unwrap();
+            assert_eq!(versions.len(), 1);
+
+            _public_index_mock.assert_async().await;
+            _corp_index_mock.assert_async().await;
+            _corp_flat_mock.assert_async().await;
+        }
+
+        /// #925 (mirrors `deps-cargo`'s
+        /// `test_parse_registry_index_literal_blocked_by_policy_populates_blocked_registries`): a
+        /// `NuGet.Config` source blocked by the current `registries.workspace_registries` policy
+        /// must populate `ParseResult::blocked_registries` at the real `parse_manifest` call path,
+        /// not just leave the dependency unresolved with no trace.
+        #[tokio::test]
+        async fn test_parse_manifest_blocked_source_populates_blocked_registries() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("NuGet.Config"),
+                r#"<configuration><packageSources>
+                <clear />
+                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
+            </packageSources></configuration>"#,
+            )
+            .unwrap();
+            let manifest_path = dir.path().join("App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+            std::fs::write(&manifest_path, content).unwrap();
+            let uri = Url::from_file_path(&manifest_path).unwrap();
+
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+            ));
+            let context = crate::config::NuGetParseContext {
+                policy: Arc::clone(&policy),
+                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                user_profile_config: None,
+                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let eco = NuGetEcosystem::with_context(
+                Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
+                context,
+            );
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let dep = parse_result
+                .dependencies()
+                .into_iter()
+                .find(|d| d.name().as_str() == "MyCompany.Internal")
+                .expect("dependency must be present");
+            assert_eq!(
+                dep.source(),
+                DependencySource::CustomRegistry {
+                    url: "https://169.254.169.254/v3/index.json".to_string(),
+                },
+                "a blocked source must stay unresolved, not silently become Registry"
+            );
+
+            let blocked = parse_result.blocked_registries();
+            assert_eq!(blocked.len(), 1);
+            let occurrence = &blocked[0];
+            assert_eq!(occurrence.range, dep.name_range());
+            assert_eq!(
+                occurrence.class,
+                deps_core::net_policy::HostClass::CloudMetadata
+            );
+            assert_eq!(
+                occurrence.raw_value,
+                "https://169.254.169.254/v3/index.json"
+            );
+            assert_eq!(occurrence.declaration_key, "source:Blocked");
+        }
+
+        /// #1442 (mirrors [`test_parse_manifest_blocked_source_populates_blocked_registries`] for
+        /// every rejection reason other than a policy-blocked host): a `NuGet.Config` source
+        /// rejected for carrying embedded userinfo must populate `ParseResult::rejected_registries`
+        /// at the real `parse_manifest` call path — previously such a source vanished with only a
+        /// `tracing::warn!`, indistinguishable in the editor from a dependency simply not yet
+        /// checked.
+        #[tokio::test]
+        async fn test_parse_manifest_rejected_source_populates_rejected_registries() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("NuGet.Config"),
+                r#"<configuration><packageSources>
+                <add key="Insecure" value="http://corp.example/v3/index.json" />
+            </packageSources></configuration>"#,
+            )
+            .unwrap();
+            let manifest_path = dir.path().join("App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+            std::fs::write(&manifest_path, content).unwrap();
+            let uri = Url::from_file_path(&manifest_path).unwrap();
+
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            ));
+            let context = crate::config::NuGetParseContext {
+                policy: Arc::clone(&policy),
+                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                user_profile_config: None,
+                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let eco = NuGetEcosystem::with_context(
+                Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
+                context,
+            );
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let dep = parse_result
+                .dependencies()
+                .into_iter()
+                .find(|d| d.name().as_str() == "MyCompany.Internal")
+                .expect("dependency must be present");
+
+            let rejected = parse_result.rejected_registries();
+            assert_eq!(rejected.len(), 1);
+            let occurrence = &rejected[0];
+            assert_eq!(occurrence.range, dep.name_range());
+            assert_eq!(
+                occurrence.reason,
+                deps_core::net_policy::RegistryRejectionReason::NotHttps
+            );
+            assert_eq!(occurrence.raw_value, "http://corp.example/v3/index.json");
+            assert_eq!(occurrence.declaration_key, "source:Insecure");
+            assert!(
+                parse_result.blocked_registries().is_empty(),
+                "a non-blocked-host rejection must never also report via blocked_registries"
+            );
+        }
+
+        /// #1090: a non-`file:`-scheme (or remote-host `file:`) manifest URI must not resolve to
+        /// a real ancestor directory for `NuGet.Config` discovery — same guard gap class as
+        /// #1084/#1089's lock file fix, applied here to `parse_manifest`'s config lookup. Builds
+        /// a real `NuGet.Config` that would have blocked the dependency's source if discovery
+        /// ran, then proves a malicious-scheme/host URI pointing at the same real path falls back
+        /// to the default (empty) config instead of walking the real directory.
+        #[tokio::test]
+        async fn test_parse_manifest_skips_nuget_config_discovery_for_malicious_uri() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("NuGet.Config"),
+                r#"<configuration><packageSources>
+                <clear />
+                <add key="Blocked" value="https://169.254.169.254/v3/index.json" />
+            </packageSources></configuration>"#,
+            )
+            .unwrap();
+            let manifest_path = dir.path().join("App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+            std::fs::write(&manifest_path, content).unwrap();
+
+            let file_uri = url::Url::from_file_path(&manifest_path).unwrap();
+            let path_part = file_uri.as_str().strip_prefix("file://").unwrap();
+
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::PublicOnly,
+            ));
+
+            // `("file://", true)` is a positive control: a plain, unmodified `file:` URI for the
+            // same real path *must* find the real `NuGet.Config` and populate `blocked_registries`
+            // — pinning in-tree that the fixture itself is live, not just externally verified.
+            //
+            // `("file://attacker.example", false)` used to be a third case here. It was removed
+            // (#1090 guard-gap follow-up): when this test's real temp-dir path is
+            // Windows-drive-letter-shaped (`C:\...`, as `tempfile::tempdir()` produces on a real
+            // Windows machine), a `file:` URI with a non-empty host and that path cannot be
+            // represented by a parsed `url::Url` at all — the WHATWG URL Standard's file-host
+            // parsing rule (`SyntaxViolation::FileWithHostAndWindowsDrive`) strips the host
+            // before `parse_manifest`'s config discovery (or any code holding only a `&Url`) can
+            // see it, so that case asserted an unreachable invariant and failed on
+            // `windows-latest` CI. On Unix the path is never drive-letter-shaped, so the host
+            // survives parsing and the per-layer host guard stays live and testable there — this
+            // comment only concerns the Windows-shaped case, not a claim that the guard is dead
+            // on every platform. This exact bypass is guarded and tested platform-independently
+            // at the point where untrusted URIs are first parsed:
+            // `deps_lsp::lsp_types_interop::from_lsp_uri`, see
+            // its test `test_from_lsp_uri_rejects_windows_drive_host_bypass`.
+            for (prefix, expect_blocked) in [("file://", true), ("https://attacker.example", false)]
+            {
+                let uri: url::Url = format!("{prefix}{path_part}").parse().unwrap();
+                let context = crate::config::NuGetParseContext {
+                    policy: Arc::clone(&policy),
+                    config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                    user_profile_config: None,
+                    user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                };
+                let eco = NuGetEcosystem::with_context(
+                    Arc::new(NuGetRegistry::new(Arc::new(deps_core::HttpCache::new()))),
+                    context,
+                );
+
+                let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+                let dep = parse_result
+                    .dependencies()
+                    .into_iter()
+                    .find(|d| d.name().as_str() == "MyCompany.Internal")
+                    .expect("dependency must be present");
+                if expect_blocked {
+                    assert_eq!(
+                        dep.source(),
+                        DependencySource::CustomRegistry {
+                            url: "https://169.254.169.254/v3/index.json".to_string(),
+                        },
+                        "test premise: a real file: URI must resolve the real NuGet.Config"
+                    );
+                    assert_eq!(parse_result.blocked_registries().len(), 1);
+                } else {
+                    assert_eq!(
+                        dep.source(),
+                        DependencySource::Registry,
+                        "a malicious-scheme/host URI ({prefix}) must never resolve NuGet.Config \
+                     discovery against a real ancestor directory"
+                    );
+                    assert!(parse_result.blocked_registries().is_empty());
+                }
+            }
+        }
+
+        /// C1 regression (impl-critic): `generate_hover`'s unlisted-versions decoration must
+        /// never fire against the public root registry for a dependency that resolved to a
+        /// private feed — before the fix, `unlisted_versions` was called unconditionally
+        /// on `self.registry` (always `Public`-tier), sending the private package's real name to
+        /// the mocked-as-public-registry endpoint regardless of which feed it actually resolved
+        /// to. The `.expect(0)` mock fails the test if that endpoint is ever hit.
+        #[tokio::test]
+        async fn test_generate_hover_skips_unlisted_fetch_for_private_feed_dependency() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+
+            let _public_index_mock = server
+                .mock("GET", "/public/index.json")
+                .with_status(200)
+                .expect(0)
+                .create_async()
+                .await;
+            let _corp_index_mock = server
+                .mock("GET", "/corp/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&format!("{base}/corp")))
+                .create_async()
+                .await;
+            let _corp_flat_mock = server
+                .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["1.2.3"]}"#)
+                .create_async()
+                .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("NuGet.Config"),
+                format!(
+                    r#"<configuration><packageSources>
+                    <clear />
+                    <add key="CorpFeed" value="{base}/corp/index.json" />
+                </packageSources></configuration>"#
+                ),
+            )
+            .unwrap();
+            let manifest_path = dir.path().join("App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.0.0" /></ItemGroup></Project>"#;
+            std::fs::write(&manifest_path, content).unwrap();
+            let uri = Url::from_file_path(&manifest_path).unwrap();
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/public/index.json"),
+            );
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            ));
+            let context = crate::config::NuGetParseContext {
+                policy: Arc::clone(&policy),
+                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                user_profile_config: None,
+                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            // Position inside "MyCompany.Internal" in the Include attribute.
+            let position = Position::new(0, 49);
+
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved),
+                    deps_core::FreshnessSettings {
+                        enabled: false,
+                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+                    },
+                )
+                .await;
+
+            assert!(
+                hover.is_some(),
+                "expected a hover render for a resolvable in-range dependency"
+            );
+            _public_index_mock.assert_async().await;
+        }
+
+        /// SC-004/US-004 (issue #562, FR-012): a package resolved via a workspace-declared
+        /// (`AlternateRegistry`) feed now gets the same hover-only `*(unlisted)*` marker a
+        /// public-registry dependency gets — registration-hive enrichment is no longer skipped for
+        /// alternate feeds.
+        #[tokio::test]
+        async fn test_generate_hover_marks_unlisted_for_alternate_registry_dependency() {
+            // See the comment in `test_package_name_completion_context_has_real_range` on why
+            // this guard is needed here.
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+
+            let _corp_index_mock = server
+                .mock("GET", "/corp/index.json")
+                .with_status(200)
+                .with_body(nuget_service_index_body(&format!("{base}/corp")))
+                .create_async()
+                .await;
+            let _corp_flat_mock = server
+                .mock("GET", "/corp/flatcontainer/mycompany.internal/index.json")
+                .with_status(200)
+                .with_body(r#"{"versions": ["1.2.3"]}"#)
+                .create_async()
+                .await;
+            let _corp_reg_mock = server
+                .mock("GET", "/corp/registrations/mycompany.internal/index.json")
+                .with_status(200)
+                .with_body(
+                    r#"{"count": 1, "items": [{"@id": "x", "count": 1, "items": [
+                    {"catalogEntry": {"version": "1.2.3", "listed": false}}
+                ]}]}"#,
+                )
+                .create_async()
+                .await;
+
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("NuGet.Config"),
+                format!(
+                    r#"<configuration><packageSources>
+                    <clear />
+                    <add key="CorpFeed" value="{base}/corp/index.json" />
+                </packageSources></configuration>"#
+                ),
+            )
+            .unwrap();
+            let manifest_path = dir.path().join("App.csproj");
+            let content = r#"<Project><ItemGroup><PackageReference Include="MyCompany.Internal" Version="1.2.3" /></ItemGroup></Project>"#;
+            std::fs::write(&manifest_path, content).unwrap();
+            let uri = Url::from_file_path(&manifest_path).unwrap();
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/public/index.json"),
+            );
+            let policy = Arc::new(deps_core::net_policy::RegistryAccessPolicy::new(
+                deps_core::net_policy::WorkspaceRegistryAccess::All,
+            ));
+            let context = crate::config::NuGetParseContext {
+                policy: Arc::clone(&policy),
+                config_cache: Arc::new(crate::config::NuGetConfigCache::new()),
+                user_profile_config: None,
+                user_profile_sources: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let eco = NuGetEcosystem::with_context(Arc::new(registry), context);
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(0, 49); // inside "MyCompany.Internal"
+
+            let cached = std::collections::HashMap::new();
+            let resolved = std::collections::HashMap::new();
+            let hover = eco
+                .generate_hover(
+                    parse_result.as_ref(),
+                    position,
+                    deps_core::VersionData::new(&cached, &resolved),
+                    deps_core::FreshnessSettings {
+                        enabled: false,
+                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
+                    },
+                )
+                .await
+                .expect("hover for a resolvable alternate-feed dependency must not be None");
+
+            let content = hover.markdown();
+            assert!(
+                content.contains("- `1.2.3` *(unlisted)*"),
+                "expected the alternate-feed dependency's unlisted marker, got: {}",
+                content
+            );
+            _corp_index_mock.assert_async().await;
+            _corp_flat_mock.assert_async().await;
+            _corp_reg_mock.assert_async().await;
+        }
+
+        /// Composition regression guard (#390/#282/#699 bug class, mirrors the deleted
+        /// `deps-lsp` end-to-end test `test_fallback_completion_nuget_query_matches_attribute_value`):
+        /// proves `line_at` + `is_in_xml_tag_section` + `strip_open_xml_attribute_value`
+        /// compose correctly through the real trait method on realistic multi-line
+        /// `.csproj` content.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition_include_attribute() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                Some("Newt")
+            );
+        }
+
+        /// Same composition, `packages.config`'s `id="..."` attribute instead of
+        /// `PackageReference`'s `Include="..."`.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition_id_attribute() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let content = "<packages>\n  <package id=\"Newt";
+            let line = content.lines().nth(1).unwrap();
+            let position = Position::new(1, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                Some("Newt")
+            );
+        }
+
+        /// Typing inside a non-target attribute's value (`Version="1.0`, after `Include`
+        /// already closed) must not compose into a search prefix — an *empty* one, not
+        /// `None`. This is the load-bearing case for `fallback_completion_is_bare`'s
+        /// hardcoded `true`: since `fallback_completion`'s caller rejects an empty prefix
+        /// before ever calling `fallback_completion_is_bare`, the only way this method is
+        /// reached at all is with a non-empty prefix, which `strip_open_xml_attribute_value`
+        /// only ever produces from inside an open target attribute value (#724/#728).
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition_non_target_attribute() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let content = "<ItemGroup>\n  <PackageReference Include=\"Foo\" Version=\"1.0";
+            let line = content.lines().nth(1).unwrap();
+            let position = Position::new(1, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                Some("")
+            );
+        }
+
+        /// A `<PropertyGroup>` is outside `<ItemGroup>`/`<packages>` entirely — the
+        /// section gate itself must reject it, composed through the real trait method.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition_outside_section() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let content = "<Project>\n  <PropertyGroup>\n    <TargetFramework>net8.0";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                None
+            );
+        }
+
+        /// #724/#728: whenever the raw-text fallback path reaches a completable prefix at
+        /// all, the cursor is already inside an open `Include="`/`id="` attribute value —
+        /// `fallback_completion_is_bare` must always report that so the caller inserts the
+        /// bare package name instead of a full `<PackageReference .../>` tag that would
+        /// nest inside the attribute value it was typed into.
+        #[test]
+        fn test_fallback_completion_is_bare_always_true() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            let content = "<Project>\n  <ItemGroup>\n    <PackageReference Include=\"Newt";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        // --- #793 characterization: `generate_completions` dispatch, pinned before the
+        // wildcard-match refactor moves the match into `deps-core`.
+
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = NuGetEcosystem::new(cache);
+            // "F" is below `is_valid_completion_prefix_len`'s 2-char minimum — deterministic
+            // without touching api.nuget.org.
+            let content = "F";
+            let dep = NuGetDependency {
+                name: "F".into(),
+                name_range: deps_core::Range::new(
+                    deps_core::Position::new(0, 0),
+                    deps_core::Position::new(0, 1),
+                ),
+                version_requirement: None,
+                version_range: None,
+                source: DependencySource::Registry,
+            };
+            let parse_result = NuGetParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+            let position = Position::new(0, 1);
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
+            let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
+            else {
+                panic!("expected PackageName context, got {context:?}");
+            };
+            let direct = eco.complete_package_names(&prefix, range).await;
+            let via_dispatch = eco
+                .generate_completions(&parse_result, position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+        }
+
+        /// Mirrors `test_complete_versions_gate_blocks_unresolvable_source`: an unresolvable
+        /// `CustomRegistry` source must never reach api.nuget.org — the `.expect(0)` mock fails
+        /// the test if that endpoint is hit at all.
+        #[tokio::test]
+        async fn test_generate_completions_version_context_gate_blocks_unresolvable_source() {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            let _index_mock = server
+                .mock("GET", "/index.json")
+                .expect(0)
+                .create_async()
+                .await;
+
+            let registry = NuGetRegistry::with_service_index_url(
+                Arc::new(deps_core::HttpCache::new()),
+                format!("{base}/index.json"),
+            );
+            let eco = NuGetEcosystem::with_registry(registry);
+
+            let dep = dep_with_source(
+                "privatepkg",
+                DependencySource::CustomRegistry {
+                    url: "https://feed.mycorp.example/v3/index.json".to_string(),
+                },
+                0,
+            );
+            let parse_result = NuGetParseResult {
+                dependencies: vec![dep],
+                uri: deps_core::test_util::test_uri("/test/App.csproj"),
+                resolved_chains: Vec::new(),
+                blocked_registries: Vec::new(),
+                rejected_registries: Vec::new(),
+                dependency_truncation: None,
+            };
+            // #919: `detect_completion_context`'s literal-span guard requires `version_range`'s
+            // slice of `content` to actually match `dep_with_source`'s declared
+            // `version_requirement` ("1.0.0") — padded to its fixed 10-char-wide range,
+            // whitespace-insensitively equal.
+            let content = "1.0.0     ";
+            // Character 1, not 0: `dep_with_source`'s `name_range` is the zero-width
+            // `(line,0)-(line,0)`, which `detect_completion_context` would otherwise match
+            // exactly at character 0 before ever reaching `version_range`.
+            let position = Position::new(0, 1);
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context =
+                deps_core::completion::detect_completion_context(&parse_result, position, content);
+            let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+                panic!("expected Version context, got {context:?}");
+            };
+            let direct = eco
+                .complete_versions(&parse_result, position, &prefix, freshness)
+                .await;
+            let via_dispatch = eco
+                .generate_completions(&parse_result, position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+            _index_mock.assert_async().await;
+        }
     }
 }

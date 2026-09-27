@@ -5,24 +5,28 @@
 //! inlay hints, hover, code actions, and diagnostics — all via `deps-core`'s generic
 //! handlers, with no Deno-specific handler code (FR-010).
 
-use std::any::Any;
-use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
-
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
+use std::any::Any;
+use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 
 use crate::formatter::DenoFormatter;
 use crate::registry::DenoRegistry;
+
 use deps_npm::NpmRegistry;
 
 /// Leading version-constraint operators stripped from a completion prefix before matching
 /// it against registry versions: `node-semver`'s caret, tilde, comparison, and wildcard
 /// operators — both JSR and npm specifiers resolve through this grammar (#1137).
+///
+/// Not extracted into a submodule (unlike this crate's peers with a multi-item completion
+/// surface): a single gated const isn't worth a `mod` declaration of its own, since that
+/// declaration would itself need a gate — net more gates, not fewer.
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*'];
 
@@ -303,8 +307,6 @@ mod tests {
     use super::*;
     use deps_core::VersionData;
     use std::collections::HashMap;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
 
     fn pkg(s: &str) -> deps_core::PackageName {
         deps_core::PackageName::new(s)
@@ -355,38 +357,6 @@ mod tests {
                 "makefile": "npm:lodash@$(LODASH_VERSION)",
                 "msbuild": "npm:chalk@$(CHALK-VERSION)"
             }}"#;
-    }
-
-    // #758: the shared completion-prefix-length guard, replacing
-    // test_complete_package_names_minimum_prefix (which only checked a 1-character prefix).
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod deno_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`node-semver`'s operator set), so an edit to one without the other
-    // fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod deno_operator_chars_conformance;
-        ecosystem: "deno";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['^', '~', '=', '<', '>', '*'];
     }
 
     #[tokio::test]
@@ -558,95 +528,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_no_context() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/deno.json");
-
-        let content = r#"{"name": "test"}"#;
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(0, 0);
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert!(completions.items.is_empty());
-    }
-
-    /// #1038: uses a mockito 404 instead of the live `jsr.io`, so a regression that makes
-    /// zero requests (and so also produces an empty result) can no longer pass vacuously —
-    /// `mock.assert_async()` requires the request to actually have been made.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_complete_versions_unknown_package() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/@this-scope/does-not-exist-12345/meta.json")
-            .with_status(404)
-            .create_async()
-            .await;
-        // A `jsr:`-scheme package must never fall through to the `npm:` half (#1038 M3):
-        // a separate mock server with `.expect(0)` pins that, rather than the previous
-        // unexplained `http://127.0.0.1:1` sentinel, which would have silently turned a
-        // jsr->npm-fallback regression into a connect-refused error instead of a test failure.
-        let mut npm_server = mockito::Server::new_async().await;
-        let npm_mock = npm_server
-            .mock("GET", mockito::Matcher::Any)
-            .expect(0)
-            .create_async()
-            .await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let npm = NpmRegistry::with_public_base_for_test(Arc::clone(&cache), npm_server.url());
-        let registry =
-            DenoRegistry::with_bases_for_test(Arc::clone(&cache), npm, server.url(), server.url());
-        let ecosystem = DenoEcosystem::with_registry_for_test(registry);
-
-        // Exercises `DenoRegistry`'s own jsr/npm scheme routing directly through the public
-        // `complete_versions_generic_from` entry point, rather than through
-        // `DenoEcosystem::complete_versions` (position-based since #1136, needing a real
-        // manifest fixture this test has no other reason to build).
-        let results = deps_core::completion::complete_versions_generic_from(
-            ecosystem.registry.as_ref(),
-            &DenoFormatter,
-            &deps_core::PackageName::new("jsr:@this-scope/does-not-exist-12345"),
-            &deps_core::parser::DependencySource::Registry,
-            "1.0",
-            VERSION_OPERATOR_CHARS,
-            deps_core::FreshnessSettings::default(),
-            &deps_core::SelectionContext::none(),
-        )
-        .await;
-        mock.assert_async().await;
-        npm_mock.assert_async().await;
-        assert!(results.is_empty());
-    }
-
-    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
-    /// `is_in_json_dependencies` compose correctly through the real trait method on
-    /// realistic multi-line content — no quote strip, unlike npm/Composer (see
-    /// `DenoEcosystem::fallback_completion_prefix`'s doc for why).
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = DenoEcosystem::new(cache);
-        let content = "{\n  \"name\": \"test\",\n  \"imports\": {\n    \"@std/fs\": \"jsr:@std/f";
-        let line = content.lines().nth(3).unwrap();
-        let position = Position::new(3, line.chars().count() as u32);
-        assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position.into()),
-            Some("\"@std/fs\": \"jsr:@std/f")
-        );
-    }
-
     #[test]
     fn test_is_in_dependencies_section_imports() {
         let content = "{\n  \"name\": \"test\",\n  \"imports\": {\n    \"@std/fs\": \"jsr:@std/fs@^1.0\"\n  }\n}";
@@ -720,5 +601,133 @@ mod tests {
             ecosystem.completion_insert_text(&meta),
             Some("\"@std/fs\": \"jsr:@std/fs\"".to_string())
         );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    mod lsp_tests {
+        use super::*;
+
+        use tower_lsp_server::ls_types::Position;
+
+        // #758: the shared completion-prefix-length guard, replacing
+        // test_complete_package_names_minimum_prefix (which only checked a 1-character prefix).
+        deps_core::completion_guard_conformance! {
+            mod deno_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (`node-semver`'s operator set), so an edit to one without the other
+        // fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod deno_operator_chars_conformance;
+            ecosystem: "deno";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['^', '~', '=', '<', '>', '*'];
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_no_context() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = DenoEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/deno.json");
+
+            let content = r#"{"name": "test"}"#;
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(0, 0);
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert!(completions.items.is_empty());
+        }
+
+        /// #1038: uses a mockito 404 instead of the live `jsr.io`, so a regression that makes
+        /// zero requests (and so also produces an empty result) can no longer pass vacuously —
+        /// `mock.assert_async()` requires the request to actually have been made.
+        #[tokio::test]
+        async fn test_complete_versions_unknown_package() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/@this-scope/does-not-exist-12345/meta.json")
+                .with_status(404)
+                .create_async()
+                .await;
+            // A `jsr:`-scheme package must never fall through to the `npm:` half (#1038 M3):
+            // a separate mock server with `.expect(0)` pins that, rather than the previous
+            // unexplained `http://127.0.0.1:1` sentinel, which would have silently turned a
+            // jsr->npm-fallback regression into a connect-refused error instead of a test failure.
+            let mut npm_server = mockito::Server::new_async().await;
+            let npm_mock = npm_server
+                .mock("GET", mockito::Matcher::Any)
+                .expect(0)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let npm = NpmRegistry::with_public_base_for_test(Arc::clone(&cache), npm_server.url());
+            let registry = DenoRegistry::with_bases_for_test(
+                Arc::clone(&cache),
+                npm,
+                server.url(),
+                server.url(),
+            );
+            let ecosystem = DenoEcosystem::with_registry_for_test(registry);
+
+            // Exercises `DenoRegistry`'s own jsr/npm scheme routing directly through the public
+            // `complete_versions_generic_from` entry point, rather than through
+            // `DenoEcosystem::complete_versions` (position-based since #1136, needing a real
+            // manifest fixture this test has no other reason to build).
+            let results = deps_core::completion::complete_versions_generic_from(
+                ecosystem.registry.as_ref(),
+                &DenoFormatter,
+                &deps_core::PackageName::new("jsr:@this-scope/does-not-exist-12345"),
+                &deps_core::parser::DependencySource::Registry,
+                "1.0",
+                VERSION_OPERATOR_CHARS,
+                deps_core::FreshnessSettings::default(),
+                &deps_core::SelectionContext::none(),
+            )
+            .await;
+            mock.assert_async().await;
+            npm_mock.assert_async().await;
+            assert!(results.is_empty());
+        }
+
+        /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+        /// `is_in_json_dependencies` compose correctly through the real trait method on
+        /// realistic multi-line content — no quote strip, unlike npm/Composer (see
+        /// `DenoEcosystem::fallback_completion_prefix`'s doc for why).
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = DenoEcosystem::new(cache);
+            let content =
+                "{\n  \"name\": \"test\",\n  \"imports\": {\n    \"@std/fs\": \"jsr:@std/f";
+            let line = content.lines().nth(3).unwrap();
+            let position = Position::new(3, line.chars().count() as u32);
+            assert_eq!(
+                ecosystem.fallback_completion_prefix(content, position.into()),
+                Some("\"@std/fs\": \"jsr:@std/f")
+            );
+        }
     }
 }
