@@ -53,6 +53,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 /// let analysis = ManifestAnalysis {
 ///     parse_result: deps_core::test_util::stub_parse_result_with_dependencies(0),
 ///     uri: deps_core::test_util::test_uri("/test/pubspec.yaml"),
+///     now: deps_core::PublishTime::now(),
 ///     ecosystem_id: EcosystemId::Dart,
 ///     cached_versions: HashMap::new(),
 ///     resolved_versions: HashMap::new(),
@@ -60,6 +61,8 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 ///     outcomes: deps_core::lsp_helpers::DependencyOutcomes::new(),
 ///     vulnerabilities: None,
 ///     latest_status: None,
+///     fallback_status: None,
+///     gossip_findings: HashMap::new(),
 ///     licenses: HashMap::new(),
 ///     license_policy: deps_core::licenses::LicensePolicy::default(),
 ///     license_source: deps_core::LicenseSource::default(),
@@ -363,6 +366,7 @@ fn classify_vulnerable_dependency(
             // FR-014: `--security-only`'s fix target comes from the advisory, never a
             // GOSSIP-filtered registry `latest` (issue #1521 item 1).
             gossip_excluded_version: None,
+            cooldown_fallback: None,
         },
         // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
         // forward to the fix target — see `requirement_already_resolves_to`'s and
@@ -435,6 +439,7 @@ fn skipped_not_requested(
         advisory_ids: Vec::new(),
         ignore_rule_overridden: false,
         gossip_excluded_version: None,
+        cooldown_fallback: None,
     }
 }
 
@@ -452,6 +457,7 @@ fn unfixable_item(
         advisory_ids: Vec::new(),
         ignore_rule_overridden,
         gossip_excluded_version: None,
+        cooldown_fallback: None,
     }
 }
 
@@ -470,6 +476,7 @@ fn requires_lockfile_update_item(
         advisory_ids: advisory_ids.to_vec(),
         ignore_rule_overridden,
         gossip_excluded_version: None,
+        cooldown_fallback: None,
     }
 }
 
@@ -621,6 +628,7 @@ mod tests {
         ManifestAnalysis {
             parse_result: deps_core::test_util::stub_parse_result_with_dependencies(0),
             uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+            now: deps_core::PublishTime::now(),
             ecosystem_id: EcosystemId::Cargo,
             cached_versions,
             resolved_versions: HashMap::new(),
@@ -628,6 +636,8 @@ mod tests {
             outcomes: deps_core::lsp_helpers::DependencyOutcomes::new(),
             vulnerabilities: None,
             latest_status: None,
+            fallback_status: None,
+            gossip_findings: HashMap::new(),
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
             license_source: deps_core::LicenseSource::default(),

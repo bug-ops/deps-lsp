@@ -3393,6 +3393,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             m

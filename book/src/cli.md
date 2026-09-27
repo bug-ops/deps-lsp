@@ -247,17 +247,21 @@ explicit choice.
 - **Default mode** targets every dependency `check` would report `outdated`, rewriting its
   declared requirement to the latest matching version — **unless that version was published
   within `freshness.cooldown_secs` of now** (default: 3 days, Dependabot's own default), in
-  which case the dependency is left alone for this run and reported as a `skipped` outcome
-  whose reason names the freshness cooldown window (issue #1525). This is on by default and
-  applies even with no
-  `--cooldown`/`--config` given at all: a version that just came out is not yet a real
-  recommendation. It is a full skip, not a fallback to an older, already-cooled-down version —
-  a release cadence faster than the cooldown window (e.g. a package that ships every day or
-  two) can leave a dependency skipped indefinitely until a release survives long enough to age
-  past the window on its own. Disable this filter entirely with a `--config` file setting
-  `[freshness] enabled = false`, or narrow the window with `--cooldown` (see below). This
-  filter is `deps-cli update`-specific — `check`'s own `Outdated` diagnostic and `deps-lsp`'s
-  "update to latest" code action still only *annotate* a fresh version's age, never exclude it.
+  which case `update` targets the newest already-cooled-down, independently OSV-verified,
+  floor-protected fallback candidate instead, when one exists (issue #1528). This is on by
+  default and applies even with no `--cooldown`/`--config` given at all: a version that just
+  came out is not yet a real recommendation. A fallback candidate is only computed when a
+  lock-file-resolved in-use version exists to floor the search — a range requirement with no
+  lock file (the majority case for a fresh install) still falls back to a full skip, reported
+  as a `skipped` outcome whose reason names the freshness cooldown window (extending the
+  fallback to that case is a documented, tracked limitation, not yet implemented). When the
+  fallback candidate is itself OSV-flagged or unverified,
+  `update` refuses to write it and exits non-zero naming that version, the same way an unsafe
+  `latest` is refused — it never silently falls back to the plain cooldown skip. Disable this
+  filter entirely with a `--config` file setting `[freshness] enabled = false`, or narrow the
+  window with `--cooldown` (see below). This filter is `deps-cli update`-specific — `check`'s
+  own `Outdated` diagnostic and `deps-lsp`'s "update to latest" code action still only
+  *annotate* a fresh version's age, never exclude it or substitute a fallback.
 - **`--security-only`** targets only dependencies OSV reports vulnerable, rewriting to the
   advisory's own recommended fix (never a plain "latest" pick), and independently
   re-verifies that fix against OSV before writing it. Every vulnerable dependency is
@@ -322,7 +326,7 @@ writing.
 | Exit code | Meaning |
 |---|---|
 | `0` | Every selected update was applied, or nothing was eligible, or every non-applied item was a deliberate exclusion — an `[update].ignore` match, a `--package` exclusion, or a version held back by the default-mode freshness cooldown (reported as a `skipped` outcome, see above) |
-| `1` | At least one item the run *wanted* to fix but could not — an unsafe/unrecognized span, `requires-lockfile-update`, or `unfixable` |
+| `1` | At least one item the run *wanted* to fix but could not — an unsafe/unrecognized span, `requires-lockfile-update`, `unfixable`, or a cooldown-fallback candidate that was itself OSV-flagged/unverified |
 | `2` | Execution error — not a single recognized manifest, a registry required to classify the manifest was unreachable, a write/read failure, a symlinked manifest path (refused before any read, not just before the write), stale content detected before write, or `--security-only` combined with `network.offline`/vulnerability scanning disabled |
 
 An ignore rule, a `--package` exclusion, or a freshness-cooldown pause is something the run
@@ -330,7 +334,8 @@ deliberately chose to leave alone, not a failure — none of the three ever turn
 run non-zero on their own. The cooldown pause is automatic (policy-driven), not
 operator-requested the way the other two are, but the exit-code treatment is identical: a CI
 pipeline must not start failing merely because a dependency's latest release is a few hours
-old.
+old. An OSV-blocked cooldown-fallback candidate is different: it is a safety refusal, not a
+deliberate pause, so it exits `1` the same way a flagged/unverified `latest` does.
 
 **A single unreachable dependency aborts the whole run.** Unlike `check`, which still reports
 its other findings alongside exit `2`, `update` treats any one dependency's registry fetch

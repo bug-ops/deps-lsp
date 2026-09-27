@@ -84,12 +84,18 @@ pub fn exit_code(
 /// `0` if every item is [`Outcome::Applied`], the plan was empty (nothing eligible), or every
 /// non-`Applied` item is a deliberate exclusion
 /// (<code>[Outcome::Skipped]([SkipReason::NotRequested])</code> — a `--package` narrowing —
-/// <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code> — a `[update].ignore` match — or
+/// <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code> — a `[update].ignore` match —
 /// <code>[Outcome::Skipped]([SkipReason::WithinFreshnessCooldown])</code>, issue #1525's
 /// automatic, policy-driven pause rather than a failed fix attempt — **not guaranteed to
 /// self-resolve**: it clears only once a release survives long enough to age past the cooldown
 /// window without a newer release replacing it, so a package publishing at least once per
-/// window can stay skipped indefinitely (see [`SkipReason::WithinFreshnessCooldown`]'s own doc)).
+/// window can stay skipped indefinitely (see [`SkipReason::WithinFreshnessCooldown`]'s own doc)
+/// — or <code>[Outcome::Skipped]([SkipReason::OverlapsAnotherEdit])</code>: a genuinely
+/// overlapping edit dropped by [`crate::update::dedup_applied_items`], not a failed fix attempt
+/// — the surviving edit at the same span already achieves the write (spec 075 fix-cycle
+/// finding: [`crate::update::plan_updates`] now calls `dedup_applied_items` on itself, per
+/// FR-015, making this variant reachable from default-mode `update` for the first time; leaving
+/// it out of this exemption list regressed a scenario that exited clean before that change).
 /// `1` if at least one item is
 /// <code>[Outcome::Skipped]([SkipReason::NotSafelyEditable])</code>,
 /// [`Outcome::RequiresLockfileUpdate`], or [`Outcome::Unfixable`] — these represent something
@@ -124,6 +130,7 @@ pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
                     SkipReason::NotRequested
                         | SkipReason::IgnoreRule
                         | SkipReason::WithinFreshnessCooldown
+                        | SkipReason::OverlapsAnotherEdit
                 )
         )
     });
@@ -243,6 +250,7 @@ mod tests {
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
+            cooldown_fallback: None,
         }
     }
 
@@ -326,6 +334,23 @@ mod tests {
             items: vec![
                 update_item(applied()),
                 update_item(Outcome::Skipped(SkipReason::WithinFreshnessCooldown)),
+            ],
+        };
+        assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
+    }
+
+    /// Spec 075 fix-cycle (code review): a genuinely overlapping edit dropped by
+    /// `dedup_applied_items` is not a failed fix attempt — the surviving edit at the same span
+    /// already achieves the write. Regression guard: `plan_updates` now calls
+    /// `dedup_applied_items` on itself (FR-015), making this variant reachable from
+    /// default-mode `update` for the first time; before that change the dropped item never
+    /// became a `PlannedUpdateItem` at all, so this scenario always exited clean.
+    #[test]
+    fn test_update_exit_code_overlaps_another_edit_skip_alone_is_clean() {
+        let plan = UpdatePlan {
+            items: vec![
+                update_item(applied()),
+                update_item(Outcome::Skipped(SkipReason::OverlapsAnotherEdit)),
             ],
         };
         assert_eq!(update_exit_code(&plan), EXIT_CLEAN);

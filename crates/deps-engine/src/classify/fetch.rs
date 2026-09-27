@@ -849,18 +849,37 @@ async fn fetch_and_classify_package(
                 .and_then(|idx| versions.get(idx))
                 .map(|v| v.version_string().clone());
 
-            let gossip_finding = gossip.and_then(|g| g.get(&name));
             // `now` read once per fetch call.
             let now = deps_core::freshness::PublishTime::now();
+            // Shared gate (spec 075 FR-005/T000, DRY) — already required `Some` + active, so
+            // behavior here is unchanged; only the ad-hoc closure is replaced.
             let is_gossip_cooldown = |version: &ConcreteVersion| {
-                gossip_finding.is_some_and(|finding| {
-                    finding.version.as_str() == version.as_str()
-                        && finding.cooldown.as_ref().is_some_and(|c| c.is_active(now))
-                })
+                deps_core::lsp_helpers::gossip_cooldown_for(gossip, &name, version.as_str(), now)
+                    == deps_core::lsp_helpers::GossipCooldownLookup::Active
             };
             let unfiltered_pick_flagged = unfiltered_pick_version
                 .as_ref()
                 .is_some_and(&is_gossip_cooldown);
+
+            // Spec 075 FR-001/FR-002 (T001): computed unconditionally whenever freshness is
+            // enabled, before `versions` is consumed below — read-time disposition
+            // (`deps_core::lsp_helpers::cooldown_disposition`) decides later whether `latest`
+            // is actually blocked and this candidate is needed.
+            let latest_is_prerelease = unfiltered_pick_idx
+                .and_then(|idx| versions.get(idx))
+                .is_some_and(|v| v.is_prerelease());
+            let cooldown_fallback = compute_cooldown_fallback(
+                registry,
+                &versions,
+                &name,
+                &in_use_versions,
+                wildcard_req,
+                *selection_context,
+                freshness,
+                gossip,
+                now,
+                latest_is_prerelease,
+            );
 
             // The resolved pick (or `None`, meaning the `get_latest_matching_from` fallback
             // below runs) and the FR-005 attribution field.
@@ -1089,6 +1108,9 @@ async fn fetch_and_classify_package(
                     if let Some(excluded) = gossip_excluded_version {
                         versions = versions.with_gossip_excluded_version(excluded);
                     }
+                    if let Some(fallback) = cooldown_fallback {
+                        versions = versions.with_cooldown_fallback(fallback);
+                    }
                     PackageStatus::Resolved {
                         versions,
                         deprecation,
@@ -1145,6 +1167,138 @@ async fn fetch_and_classify_package(
         status,
         yanked,
     }
+}
+
+/// A cheap, cloneable [`Version`] carrying just the fields [`compute_cooldown_fallback`]'s
+/// re-ranking pass needs — lets it build an owned candidate list for
+/// [`Registry::select_latest_matching`] from borrowed data, since `Version` trait objects have
+/// no `clone_box` (fetch.rs's own `IndexedVersion` comment explains why: `versions` is moved
+/// further down this same function and no ecosystem needs to duplicate a real `Version` impl).
+#[derive(Debug, Clone)]
+struct CooldownCandidate {
+    version: ConcreteVersion,
+    published_at: deps_core::freshness::PublishTime,
+    removal_status: RemovalStatus,
+    prerelease: bool,
+}
+
+impl Version for CooldownCandidate {
+    fn version_string(&self) -> &ConcreteVersion {
+        &self.version
+    }
+    fn published_at(&self) -> Option<deps_core::freshness::PublishTime> {
+        Some(self.published_at)
+    }
+    fn removal_status(&self) -> RemovalStatus {
+        self.removal_status
+    }
+    fn is_prerelease(&self) -> bool {
+        self.prerelease
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}
+
+/// Spec 075 FR-001/FR-002: computes the cooldown-fallback candidate for one dependency.
+///
+/// (Fix-cycle item 5/S5): the cooled subset is ranked through `registry`'s own
+/// `select_latest_matching` — the exact same selection algorithm that picks `latest` itself —
+/// rather than by raw newest-first list position. A naive "first cooldown-cleared entry by
+/// date" pick can land on a prerelease/canary release a frequent publisher ships between
+/// stable releases; FR-001's ecosystem-safety guard would then reject it with no retry,
+/// reopening the starvation this feature exists to close. Delegating the ranking itself to
+/// `select_latest_matching` means the pick is already ecosystem-preferred by construction; the
+/// explicit `ecosystem_safe` check below is defense in depth against `select_latest_matching`'s
+/// own wildcard-existence fallback (which may prefer a yanked version to answer "does this
+/// package exist" rather than ever returning `None` — never appropriate for a fallback write
+/// target).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors fetch_and_classify_package's own identical rationale — every parameter \
+              is either registry/selection-rule plumbing already threaded through that \
+              function or a planning knob this helper alone needs"
+)]
+fn compute_cooldown_fallback(
+    registry: &dyn Registry,
+    versions: &[Box<dyn Version>],
+    name: &PackageName,
+    in_use_versions: &[String],
+    wildcard_req: &VersionReq,
+    selection_context: deps_core::SelectionContext,
+    freshness: deps_core::freshness::FreshnessSettings,
+    gossip: Option<&HashMap<PackageName, deps_core::GossipFindings>>,
+    now: deps_core::freshness::PublishTime,
+    latest_is_prerelease: bool,
+) -> Option<deps_core::lsp_helpers::CooldownFallback> {
+    if !freshness.enabled {
+        return None;
+    }
+
+    // D2 floor: position of the newest `in_use_versions` entry in `versions` (newest-first,
+    // so the smallest index is newest) — no in-use version resolved means no floor, and no
+    // fallback is computed at all (spec 075 OQ1).
+    let floor = in_use_versions
+        .iter()
+        .filter_map(|iv| {
+            versions
+                .iter()
+                .position(|v| v.version_string().as_str() == iv.as_str())
+        })
+        .min()?;
+
+    // Every candidate that clears cooldown by the shared GOSSIP gate (an authoritative answer
+    // wins) or, absent one, the local heuristic — fail-closed when `published_at` is unknown
+    // (OQ2) — paired with its original index into `versions`.
+    let (cleared_indices, cleared_versions): (Vec<usize>, Vec<Box<dyn Version>>) = versions
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, v)| {
+            let published_at = v.published_at()?;
+            let cleared = match deps_core::lsp_helpers::gossip_cooldown_for(
+                gossip,
+                name,
+                v.version_string().as_str(),
+                now,
+            ) {
+                deps_core::lsp_helpers::GossipCooldownLookup::Active => false,
+                deps_core::lsp_helpers::GossipCooldownLookup::NotActive => true,
+                deps_core::lsp_helpers::GossipCooldownLookup::Unavailable => {
+                    !deps_core::is_within_cooldown(
+                        published_at.age_secs_from(now),
+                        freshness.cooldown_secs,
+                    )
+                }
+            };
+            cleared.then(|| {
+                let candidate: Box<dyn Version> = Box::new(CooldownCandidate {
+                    version: v.version_string().clone(),
+                    published_at,
+                    removal_status: v.removal_status(),
+                    prerelease: v.is_prerelease(),
+                });
+                (idx, candidate)
+            })
+        })
+        .unzip();
+
+    // FR-001: the ecosystem's own selection-rule pick over the cooled subset — checked only
+    // against this single pick, no retry further down the list on failure.
+    let pick =
+        registry.select_latest_matching(&cleared_versions, wildcard_req, &selection_context)?;
+    let idx = *cleared_indices.get(pick)?;
+    let candidate = versions.get(idx)?;
+    let published_at = candidate.published_at()?;
+    let ecosystem_safe = !candidate.removal_status().blocks_resolution()
+        && (!candidate.is_prerelease() || latest_is_prerelease);
+    let above_floor = idx < floor;
+
+    (ecosystem_safe && above_floor).then(|| {
+        deps_core::lsp_helpers::CooldownFallback::new(
+            candidate.version_string().clone(),
+            published_at,
+        )
+    })
 }
 
 /// Re-keys a completed fetch's yanked/fetch-failure findings from raw to normalized package
@@ -4995,6 +5149,262 @@ mod tests {
                 registry.fallback_call_count(),
                 0,
                 "the network fallback must never be invoked as a consequence of GOSSIP's own filtering"
+            );
+        }
+    }
+
+    /// Spec 075 (`deps-cli update` cooldown fallback): `PackageVersions::cooldown_fallback`
+    /// computation (FR-001/FR-002), tested through the same `fetch_latest_versions_parallel`
+    /// entry point `gossip_cooldown_filter_tests` uses for its sibling spec 074 feature.
+    mod cooldown_fallback_tests {
+        use super::*;
+        use deps_core::{PublishTime, Registry, RemovalStatus, Version};
+        use std::any::Any;
+
+        #[derive(Debug, Clone)]
+        struct MockVersion {
+            version: ConcreteVersion,
+            published_at: Option<PublishTime>,
+            removal_status: RemovalStatus,
+            prerelease: bool,
+        }
+
+        impl MockVersion {
+            fn new(version: &str, published_at: PublishTime) -> Self {
+                Self {
+                    version: version.into(),
+                    published_at: Some(published_at),
+                    removal_status: RemovalStatus::Available,
+                    prerelease: false,
+                }
+            }
+
+            fn yanked(mut self) -> Self {
+                self.removal_status = RemovalStatus::Yanked;
+                self
+            }
+
+            fn prerelease(mut self) -> Self {
+                self.prerelease = true;
+                self
+            }
+        }
+
+        impl Version for MockVersion {
+            fn version_string(&self) -> &ConcreteVersion {
+                &self.version
+            }
+            fn published_at(&self) -> Option<PublishTime> {
+                self.published_at
+            }
+            fn removal_status(&self) -> RemovalStatus {
+                self.removal_status
+            }
+            fn is_prerelease(&self) -> bool {
+                self.prerelease
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// A fixed, newest-first version list — `select_latest_matching` mirrors a real
+        /// ecosystem's own selection rules (skip yanked/prerelease), same contract
+        /// `gossip_cooldown_filter_tests::FixedListRegistry` documents for its own mock.
+        struct FixedRegistry(Vec<MockVersion>);
+
+        impl Registry for FixedRegistry {
+            fn get_versions<'a>(
+                &'a self,
+                _name: &'a PackageName,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
+            {
+                let versions: Vec<Box<dyn Version>> = self
+                    .0
+                    .iter()
+                    .cloned()
+                    .map(|v| Box::new(v) as Box<dyn Version>)
+                    .collect();
+                Box::pin(async move { Ok(versions) })
+            }
+
+            fn get_latest_matching<'a>(
+                &'a self,
+                _name: &'a PackageName,
+                _req: &'a VersionReq,
+                _selection_context: &'a SelectionContext,
+            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
+            {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn search_raw<'a>(
+                &'a self,
+                _query: &'a str,
+                _limit: usize,
+            ) -> deps_core::ecosystem::BoxFuture<
+                'a,
+                deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>,
+            > {
+                Box::pin(async move { Ok(vec![]) })
+            }
+
+            fn select_latest_matching(
+                &self,
+                versions: &[Box<dyn Version>],
+                _req: &VersionReq,
+                _selection_context: &SelectionContext,
+            ) -> Option<usize> {
+                versions
+                    .iter()
+                    .position(|v| !v.removal_status().blocks_resolution() && !v.is_prerelease())
+            }
+
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        async fn fetch_pkg(
+            versions: Vec<MockVersion>,
+            in_use: Vec<&'static str>,
+            cooldown_secs: u64,
+        ) -> Option<PackageVersions> {
+            let registry: Arc<dyn Registry> = Arc::new(FixedRegistry(versions));
+            let mut in_use_map = HashMap::new();
+            if !in_use.is_empty() {
+                in_use_map.insert(
+                    PackageName::new("pkg"),
+                    in_use.into_iter().map(String::from).collect(),
+                );
+            }
+            let result = fetch_latest_versions_parallel(
+                registry,
+                with_registry_source(vec![PackageName::new("pkg")]),
+                &in_use_map,
+                None,
+                deps_core::freshness::FreshnessSettings {
+                    enabled: true,
+                    cooldown_secs,
+                },
+                5,
+                10,
+                &SelectionContext::none(),
+                None,
+            )
+            .await;
+            result.versions.get(&PackageName::new("pkg")).cloned()
+        }
+
+        /// Spec 075 SC-003/FR-001 (S1 repro): the newest cooldown-cleared candidate (1.1.0) is
+        /// yanked — the ecosystem-safety guard rejects it with no retry down to a further,
+        /// also-cooldown-cleared candidate (1.0.0, itself yanked and the in-use floor).
+        #[tokio::test]
+        async fn yanked_top_ranked_cleared_candidate_yields_no_fallback() {
+            let now = PublishTime::now();
+            let cooldown_secs = 3 * 24 * 60 * 60;
+            let recent = PublishTime::from_unix_secs(now.as_unix_secs() - 60); // within cooldown
+            let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60); // cleared
+
+            let versions = vec![
+                MockVersion::new("1.2.0", recent),
+                MockVersion::new("1.1.0", old).yanked(),
+                MockVersion::new("1.0.0", old).yanked(),
+            ];
+
+            let package_versions = fetch_pkg(versions, vec!["1.0.0"], cooldown_secs)
+                .await
+                .expect("pkg must resolve");
+
+            assert!(
+                package_versions.cooldown_fallback.is_none(),
+                "a yanked top-ranked cooldown-cleared candidate must not be recovered by \
+                 retrying further down the list: {:?}",
+                package_versions.cooldown_fallback
+            );
+        }
+
+        /// The positive case sanity check: with the same shape but the newest cleared
+        /// candidate NOT yanked, a fallback is computed.
+        #[tokio::test]
+        async fn cleared_safe_candidate_above_the_floor_is_the_fallback() {
+            let now = PublishTime::now();
+            let cooldown_secs = 3 * 24 * 60 * 60;
+            let recent = PublishTime::from_unix_secs(now.as_unix_secs() - 60);
+            let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
+
+            let versions = vec![
+                MockVersion::new("1.2.0", recent),
+                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.0.0", old),
+            ];
+
+            let package_versions = fetch_pkg(versions, vec!["1.0.0"], cooldown_secs)
+                .await
+                .expect("pkg must resolve");
+
+            let fallback = package_versions
+                .cooldown_fallback
+                .expect("a safe, cooldown-cleared, above-floor candidate must be recovered");
+            assert_eq!(fallback.version.as_str(), "1.1.0");
+        }
+
+        /// Fix-cycle item 5/S5: the newest cooldown-cleared candidate by publish date is a
+        /// prerelease (a canary/nightly a frequent publisher ships between stable releases).
+        /// Ranking through `registry.select_latest_matching` over the cooled subset — instead
+        /// of the old "first cleared entry by raw list position, no retry" — naturally skips
+        /// it and lands on the next cooled, stable release, closing the exact starvation
+        /// scenario FR-001 exists to prevent (a naive by-date pick would have rejected the
+        /// prerelease with no retry and returned `None`).
+        #[tokio::test]
+        async fn prerelease_top_ranked_by_date_is_skipped_for_the_next_cooled_stable_release() {
+            let now = PublishTime::now();
+            let cooldown_secs = 3 * 24 * 60 * 60;
+            let recent = PublishTime::from_unix_secs(now.as_unix_secs() - 60);
+            let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
+            let older = PublishTime::from_unix_secs(now.as_unix_secs() - 31 * 24 * 60 * 60);
+
+            let versions = vec![
+                MockVersion::new("2.0.0", recent), // fresh, not cooled
+                MockVersion::new("2.0.0-rc.1", old).prerelease(), // cooled, but a prerelease
+                MockVersion::new("1.9.0", older),  // cooled, stable
+                MockVersion::new("1.8.0", older),  // in-use floor
+            ];
+
+            let package_versions = fetch_pkg(versions, vec!["1.8.0"], cooldown_secs)
+                .await
+                .expect("pkg must resolve");
+
+            let fallback = package_versions.cooldown_fallback.expect(
+                "the prerelease must be skipped in favor of the next cooled stable release",
+            );
+            assert_eq!(fallback.version.as_str(), "1.9.0");
+        }
+
+        /// Spec 075 FR-002/OQ1 (tester Gap D): no lockfile-resolved in-use version means no
+        /// floor can be constructed, so `cooldown_fallback` stays `None` even though a
+        /// perfectly safe, cooldown-cleared candidate exists — the documented no-floor
+        /// limitation (NFR-005b), not a defect.
+        #[tokio::test]
+        async fn no_in_use_version_yields_no_fallback_even_with_a_safe_cleared_candidate() {
+            let now = PublishTime::now();
+            let cooldown_secs = 3 * 24 * 60 * 60;
+            let recent = PublishTime::from_unix_secs(now.as_unix_secs() - 60);
+            let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
+
+            let versions = vec![
+                MockVersion::new("1.2.0", recent),
+                MockVersion::new("1.1.0", old),
+            ];
+
+            let package_versions = fetch_pkg(versions, Vec::new(), cooldown_secs)
+                .await
+                .expect("pkg must resolve");
+
+            assert!(
+                package_versions.cooldown_fallback.is_none(),
+                "no in-use version to floor the search must yield no fallback: {:?}",
+                package_versions.cooldown_fallback
             );
         }
     }

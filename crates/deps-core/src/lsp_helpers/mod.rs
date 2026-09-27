@@ -99,6 +99,175 @@ pub use inlay_hints::generate_inlay_hints;
 /// only the versions actually rendered, rather than the entire version history.
 pub const HOVER_RECENT_VERSIONS: usize = 8;
 
+/// A cooldown-cleared, ecosystem-safe, floor-protected fallback candidate (spec 075
+/// `deps-cli update` fallback, FR-001/FR-002).
+///
+/// Computed once, at fetch time, by `deps-engine::classify::fetch::fetch_and_classify_package`
+/// — never at read time (see [`cooldown_disposition`] for the read-time side). [`Self::published_at`]
+/// is never `None`: a candidate without a known publish time is never stored (OQ2's fail-closed
+/// rule for a non-`latest` candidate).
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CooldownFallback {
+    /// The fallback candidate's version.
+    pub version: ConcreteVersion,
+    /// When the fallback candidate was published. Never `None` — see the type's own doc.
+    pub published_at: PublishTime,
+}
+
+impl CooldownFallback {
+    /// Constructs a `CooldownFallback`.
+    ///
+    /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
+    /// this crate, so every other crate must go through this constructor instead.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::PublishTime;
+    /// use deps_core::lsp_helpers::CooldownFallback;
+    ///
+    /// let fallback = CooldownFallback::new("1.1.0".into(), PublishTime::from_unix_secs(1_000));
+    /// assert_eq!(fallback.version, "1.1.0");
+    /// ```
+    #[must_use]
+    pub const fn new(version: ConcreteVersion, published_at: PublishTime) -> Self {
+        Self {
+            version,
+            published_at,
+        }
+    }
+}
+
+/// What blocked [`PackageVersions::latest`] from being usable as-is — drives
+/// check/hover/diagnostics wording. Carried by [`CooldownDisposition::Blocked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CooldownBlocker {
+    /// GOSSIP reported an active cooldown for this exact version (spec 072 FR-005).
+    Gossip,
+    /// The local `freshness.cooldown_secs` heuristic reports this version as recently
+    /// published, with no authoritative GOSSIP answer available for it.
+    Local {
+        /// When `latest` was published, per the registry.
+        published_at: PublishTime,
+    },
+}
+
+/// Read-time-only outcome of [`cooldown_disposition`] — never stored on [`PackageVersions`].
+///
+/// Spec 075 NFR-002: a stored disposition would be a fetch-time snapshot, violating spec 072
+/// FR-011's read-time evaluation requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CooldownDisposition<'a> {
+    /// The freshness feature is disabled — cooldown has no effect at all.
+    NotEvaluated,
+    /// `latest` is not blocked by cooldown (no GOSSIP verdict, or a past one; no active local
+    /// heuristic result).
+    Cleared,
+    /// `latest` is currently blocked. `fallback`, when present, is the newest
+    /// cooldown-cleared, ecosystem-safe, floor-protected alternative a caller may offer
+    /// instead (spec 075) — `None` when no such candidate was found at fetch time.
+    Blocked {
+        /// What blocked `latest`.
+        by: CooldownBlocker,
+        /// The fallback candidate, if one was computed and stored for this dependency.
+        fallback: Option<&'a CooldownFallback>,
+    },
+}
+
+/// Evaluates, at read time, whether [`PackageVersions::latest`] is blocked by the freshness
+/// cooldown and whether a stored [`PackageVersions::cooldown_fallback`] candidate is available.
+///
+/// Spec 075 FR-004's single precedence function, shared by `apply_outdated_rule`
+/// (check/diagnostics wording) and `deps-cli update`'s planner so the two commands can no
+/// longer disagree (spec 075 NFR-001 steps 0-4; OSV verification is deliberately NOT this
+/// function's job — see spec 075 FR-010/FR-011).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{CooldownDisposition, PackageVersions, cooldown_disposition};
+/// use deps_core::{FreshnessSettings, PackageName, PublishTime};
+/// use std::sync::Arc;
+///
+/// let versions = PackageVersions::new(
+///     "2.0.0".into(),
+///     Arc::from(vec!["2.0.0".into(), "1.0.0".into()]),
+/// )
+/// .with_published_at(PublishTime::from_unix_secs(1_000));
+///
+/// let disposition = cooldown_disposition(
+///     &versions,
+///     &PackageName::new("left-pad"),
+///     FreshnessSettings {
+///         enabled: true,
+///         cooldown_secs: 500,
+///     },
+///     None,
+///     PublishTime::from_unix_secs(2_000),
+/// );
+/// assert_eq!(disposition, CooldownDisposition::Cleared);
+///
+/// let blocked = cooldown_disposition(
+///     &versions,
+///     &PackageName::new("left-pad"),
+///     FreshnessSettings {
+///         enabled: true,
+///         cooldown_secs: 5_000,
+///     },
+///     None,
+///     PublishTime::from_unix_secs(2_000),
+/// );
+/// assert!(matches!(blocked, CooldownDisposition::Blocked { .. }));
+/// ```
+#[must_use]
+pub fn cooldown_disposition<'a>(
+    versions: &'a PackageVersions,
+    name: &PackageName,
+    freshness: crate::freshness::FreshnessSettings,
+    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
+    now: PublishTime,
+) -> CooldownDisposition<'a> {
+    if !freshness.enabled {
+        return CooldownDisposition::NotEvaluated;
+    }
+
+    // NFR-002 (M3): the stored fallback candidate is itself re-evaluated at read time — a
+    // `cooldown_secs` narrowed between fetch and read (or, for a long-lived LSP cache, simply
+    // enough wall-clock time passing that the fetch-time computation has gone stale in the
+    // *other* direction the caller didn't ask about) must never let a candidate that no
+    // longer clears the window keep reading as usable. This can only make the outcome
+    // stricter, never less safe — a `None` fallback stays `None`.
+    let fallback = versions.cooldown_fallback.as_ref().filter(|fallback| {
+        !crate::freshness::is_within_cooldown(
+            fallback.published_at.age_secs_from(now),
+            freshness.cooldown_secs,
+        )
+    });
+
+    match gossip_cooldown_for(gossip_prefetch, name, versions.latest.as_str(), now) {
+        GossipCooldownLookup::Active => CooldownDisposition::Blocked {
+            by: CooldownBlocker::Gossip,
+            fallback,
+        },
+        GossipCooldownLookup::NotActive => CooldownDisposition::Cleared,
+        GossipCooldownLookup::Unavailable => match versions.published_at {
+            Some(published_at)
+                if crate::freshness::is_within_cooldown(
+                    published_at.age_secs_from(now),
+                    freshness.cooldown_secs,
+                ) =>
+            {
+                CooldownDisposition::Blocked {
+                    by: CooldownBlocker::Local { published_at },
+                    fallback,
+                }
+            }
+            _ => CooldownDisposition::Cleared,
+        },
+    }
+}
+
 /// Registry version data for one package, fetched together in a single round trip.
 ///
 /// `latest` and `available` are deliberately asymmetric — this is load-bearing, not an
@@ -169,6 +338,14 @@ pub struct PackageVersions {
     /// unfiltered pick is reused instead. Purely an in-process outcome-reporting field: no
     /// wire/schema format carries it.
     pub gossip_excluded_version: Option<ConcreteVersion>,
+    /// The newest cooldown-cleared, ecosystem-safe, floor-protected candidate found for this
+    /// dependency when `latest` may be cooldown-blocked (`deps-cli update`'s fallback, spec
+    /// 075 FR-001/FR-002). Computed unconditionally whenever freshness is enabled, regardless
+    /// of whether `latest` itself is currently blocked — see [`cooldown_disposition`] for the
+    /// read-time decision of whether it is actually needed (spec 075 NFR-002). `None` when
+    /// freshness is disabled, no lockfile-resolved in-use version exists to floor the search
+    /// (spec 075 OQ1), or no candidate passed every guard.
+    pub cooldown_fallback: Option<CooldownFallback>,
 }
 
 impl PackageVersions {
@@ -202,6 +379,7 @@ impl PackageVersions {
             yanked: Arc::from(Vec::new()),
             published_at: None,
             gossip_excluded_version: None,
+            cooldown_fallback: None,
         }
     }
 
@@ -224,6 +402,13 @@ impl PackageVersions {
     #[must_use]
     pub fn with_gossip_excluded_version(mut self, excluded: ConcreteVersion) -> Self {
         self.gossip_excluded_version = Some(excluded);
+        self
+    }
+
+    /// Attaches the computed cooldown-fallback candidate. See [`Self::cooldown_fallback`].
+    #[must_use]
+    pub fn with_cooldown_fallback(mut self, fallback: CooldownFallback) -> Self {
+        self.cooldown_fallback = Some(fallback);
         self
     }
 
@@ -259,6 +444,7 @@ impl PackageVersions {
             yanked: Arc::from(Vec::new()),
             published_at: None,
             gossip_excluded_version: None,
+            cooldown_fallback: None,
         }
     }
 
@@ -284,6 +470,7 @@ impl PackageVersions {
             yanked: Arc::from(Vec::new()),
             published_at: None,
             gossip_excluded_version: None,
+            cooldown_fallback: None,
         }
     }
 }
@@ -1083,16 +1270,24 @@ impl<'a> VersionData<'a> {
 }
 
 /// The three states [`gossip_cooldown_for`] can resolve to — deliberately distinct from a
-/// plain `Option<&GossipCooldown>` (issue #1456 security/impl-critic review, S2): a bare
-/// `Option` conflates "no GOSSIP data available for this version at all" with "GOSSIP has
-/// data and it authoritatively says this version is not in cooldown", and both used to fall
-/// through to the unattributed local heuristic — which can then show a cooldown callout
-/// that directly contradicts what GOSSIP already knows, violating FR-002's "authoritative
-/// when available" requirement.
+/// plain `Option<&GossipCooldown>` (issue #1456 security/impl-critic review, S2).
+///
+/// A bare `Option` conflates "no GOSSIP data available for this version at all" with "GOSSIP
+/// has data and it authoritatively says this version is not in cooldown", and both used to
+/// fall through to the unattributed local heuristic — which can then show a cooldown callout
+/// that directly contradicts what GOSSIP already knows, violating FR-002's "authoritative when
+/// available" requirement.
+///
+/// Spec 075 FR-005 (R-S3) redefined [`Self::NotActive`] to require a parsed, past `end` —
+/// a missing COOLDOWN finding is [`Self::Unavailable`], not [`Self::NotActive`]. The earlier
+/// definition conflated "no data" with "confirmed clear", which was fail-open for a write
+/// path (`deps-cli update`'s cooldown-fallback candidate, spec 075).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum GossipCooldownLookup {
-    /// No GOSSIP data for this exact version (absent entry, or an FR-008 version mismatch)
-    /// — the caller falls back to the local `is_within_cooldown` heuristic, unattributed.
+pub enum GossipCooldownLookup {
+    /// No GOSSIP data for this exact version — an absent entry, an FR-008 version mismatch,
+    /// or a COOLDOWN finding with no cooldown at all (`findings.cooldown == None`, including
+    /// a missing/unparseable `end`, spec 075 FR-005) — the caller falls back to the local
+    /// `is_within_cooldown` heuristic, unattributed.
     Unavailable,
     /// GOSSIP data is present for this exact version and confirms an active cooldown as of
     /// `now` (spec 072 FR-011's read-time `end > now` check) — the caller renders a
@@ -1101,22 +1296,62 @@ pub(crate) enum GossipCooldownLookup {
     /// where that data is still available (`GossipFindings.cooldown`) if a future caller
     /// needs it.
     Active,
-    /// GOSSIP data is present for this exact version and authoritatively reports it is
-    /// **not** in cooldown (no active `end` date, or a past one) — the caller must render
-    /// nothing here, never falling back to the local heuristic, which could contradict this
-    /// answer.
+    /// GOSSIP data is present for this exact version and authoritatively reports a cooldown
+    /// that has already ended (a parsed, past `end`) — the caller must render nothing here,
+    /// never falling back to the local heuristic, which could contradict this answer.
     NotActive,
 }
 
 /// Looks up the GOSSIP cooldown state for `name` in `gossip_prefetch`, applying spec 072
-/// FR-008's version-equality gate against `comparand` (the version actually being displayed
-/// at this call site — hover's `latest_line`, diagnostics' `package_versions.latest`) and
-/// FR-011's read-time `end > now` check — shared by `hover::push_latest_hover_section` and
-/// `diagnostics::apply_outdated_rule` so the two call sites can never diverge on this gate.
+/// FR-008's version-equality gate against `comparand` and FR-011's read-time `end > now` check.
+///
+/// `comparand` is the version actually being displayed at this call site — hover's
+/// `latest_line`, diagnostics' `package_versions.latest` — shared by
+/// `hover::push_latest_hover_section`, `diagnostics::apply_outdated_rule`,
+/// [`crate::lsp_helpers::cooldown_disposition`], and `deps-engine`'s fallback-candidate
+/// computation (spec 075) so no call site can diverge on this gate.
 ///
 /// See [`GossipCooldownLookup`]'s doc for why this returns a three-state enum rather than
 /// `Option<&GossipCooldown>`.
-pub(crate) fn gossip_cooldown_for(
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::PackageName;
+/// use deps_core::deps_dev::{GossipCooldown, GossipRiskLevel};
+/// use deps_core::lsp_helpers::{GossipCooldownLookup, gossip_cooldown_for};
+/// use deps_core::test_util::stub_gossip_findings;
+/// use deps_core::PublishTime;
+/// use std::collections::HashMap;
+///
+/// let name = PackageName::new("left-pad");
+/// let mut prefetch = HashMap::new();
+/// prefetch.insert(
+///     name.clone(),
+///     stub_gossip_findings(
+///         "1.3.0",
+///         Some(GossipCooldown::new(
+///             PublishTime::from_unix_secs(2_000),
+///             GossipRiskLevel::High,
+///         )),
+///     ),
+/// );
+///
+/// assert_eq!(
+///     gossip_cooldown_for(Some(&prefetch), &name, "1.3.0", PublishTime::from_unix_secs(1_000)),
+///     GossipCooldownLookup::Active
+/// );
+/// assert_eq!(
+///     gossip_cooldown_for(Some(&prefetch), &name, "1.3.0", PublishTime::from_unix_secs(3_000)),
+///     GossipCooldownLookup::NotActive
+/// );
+/// assert_eq!(
+///     gossip_cooldown_for(None, &name, "1.3.0", PublishTime::now()),
+///     GossipCooldownLookup::Unavailable
+/// );
+/// ```
+#[must_use]
+pub fn gossip_cooldown_for(
     gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
     name: &PackageName,
     comparand: &str,
@@ -1130,7 +1365,8 @@ pub(crate) fn gossip_cooldown_for(
     }
     match findings.cooldown.as_ref() {
         Some(cooldown) if cooldown.is_active(now) => GossipCooldownLookup::Active,
-        _ => GossipCooldownLookup::NotActive,
+        Some(_) => GossipCooldownLookup::NotActive,
+        None => GossipCooldownLookup::Unavailable,
     }
 }
 
@@ -3496,12 +3732,14 @@ mod tests {
         assert!(matches!(lookup, GossipCooldownLookup::NotActive));
     }
 
-    /// Issue #1456 security/impl-critic review S2: GOSSIP data present, version-matched,
-    /// and explicitly reporting no cooldown at all (`cooldown: None` — no `COOLDOWN`
-    /// finding and no `cooldownEnd` fallback) must be `NotActive`, distinguishable from
-    /// `Unavailable` — the whole point of the tri-state fix.
+    /// Spec 075 FR-005 (R-S3), inverting the earlier `..._is_not_active` expectation: GOSSIP
+    /// data present, version-matched, but explicitly reporting no cooldown at all
+    /// (`cooldown: None` — no `COOLDOWN` finding and no `cooldownEnd` fallback) must be
+    /// `Unavailable`, not `NotActive` — `NotActive` now means only "a parsed, past `end` was
+    /// found", so the caller falls back to the local heuristic instead of reading this as an
+    /// authoritative "not in cooldown" answer (the old mapping was fail-open for a write path).
     #[test]
-    fn gossip_cooldown_for_present_but_no_cooldown_data_is_not_active() {
+    fn gossip_cooldown_for_present_but_no_cooldown_data_is_unavailable() {
         let name = PackageName::new("vite");
         let mut prefetch = HashMap::new();
         prefetch.insert(
@@ -3510,7 +3748,7 @@ mod tests {
         );
 
         let lookup = gossip_cooldown_for(Some(&prefetch), &name, "8.3.1", PublishTime::now());
-        assert!(matches!(lookup, GossipCooldownLookup::NotActive));
+        assert!(matches!(lookup, GossipCooldownLookup::Unavailable));
     }
 
     #[test]
@@ -3524,6 +3762,68 @@ mod tests {
             gossip_cooldown_for(Some(&prefetch), &name, "8.3.1", PublishTime::now()),
             GossipCooldownLookup::Unavailable
         ));
+    }
+
+    // --- cooldown_disposition (spec 075 FR-004/NFR-002) ---
+
+    /// Fix-cycle item 8 (M3/NFR-002): a stored fallback candidate is re-evaluated against
+    /// read-time `now`/`freshness.cooldown_secs`, not trusted as a fetch-time snapshot. A
+    /// fallback whose own `published_at` no longer clears a (narrower, read-time)
+    /// `cooldown_secs` must read as absent, not as a stale "still usable" answer.
+    #[test]
+    fn cooldown_disposition_read_time_reevaluates_the_stored_fallback() {
+        let now = PublishTime::from_unix_secs(10_000);
+        let versions = PackageVersions::new("2.0.0".into(), Arc::from(vec!["2.0.0".into()]))
+            .with_published_at(PublishTime::from_unix_secs(9_900)) // 100s old
+            .with_cooldown_fallback(CooldownFallback::new(
+                "1.9.0".into(),
+                PublishTime::from_unix_secs(9_800), // 200s old at read time
+            ));
+        let name = PackageName::new("pkg");
+
+        // At fetch time, a 150s cooldown window: latest (100s old) is blocked, the fallback
+        // (200s old) already clears it.
+        let disposition = cooldown_disposition(
+            &versions,
+            &name,
+            crate::freshness::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 150,
+            },
+            None,
+            now,
+        );
+        assert!(
+            matches!(
+                disposition,
+                CooldownDisposition::Blocked {
+                    fallback: Some(_),
+                    ..
+                }
+            ),
+            "got: {disposition:?}"
+        );
+
+        // Read time later widens the configured cooldown to 10_000s (e.g. a stricter
+        // `--cooldown` override) — the SAME stored fallback (still only 200s old) no longer
+        // clears it and must read as absent, never as the earlier fetch-time answer.
+        let disposition = cooldown_disposition(
+            &versions,
+            &name,
+            crate::freshness::FreshnessSettings {
+                enabled: true,
+                cooldown_secs: 10_000,
+            },
+            None,
+            now,
+        );
+        assert!(
+            matches!(
+                disposition,
+                CooldownDisposition::Blocked { fallback: None, .. }
+            ),
+            "a fallback that no longer clears cooldown at read time must not be surfaced: {disposition:?}"
+        );
     }
 
     /// #919: a plain literal version — `version_range`'s slice equals the declared

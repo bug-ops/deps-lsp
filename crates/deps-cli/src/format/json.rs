@@ -155,6 +155,28 @@ pub struct UpdateItemDocument {
     pub reason: String,
     /// OSV advisory ids this item resolves — non-empty only in `--security-only` mode.
     pub advisory_ids: Vec<String>,
+    /// Spec 075 FR-013: this item's cooldown-fallback attribution, when one was consulted.
+    /// Additive (NFR-005) — omitted entirely, not `null`, when the item has none.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cooldown_fallback: Option<CooldownFallbackDocument>,
+}
+
+/// [`crate::update::CooldownFallbackNote`]'s JSON shape (spec 075 FR-013).
+#[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CooldownFallbackDocument {
+    /// The fallback candidate was written; `latest` names the excluded, cooldown-blocked
+    /// version this item targeted instead.
+    AppliedInsteadOf {
+        /// The excluded, cooldown-blocked `latest` version.
+        latest: String,
+    },
+    /// A fallback candidate existed but was itself OSV-`Flagged`/`Unverified` and was never
+    /// written; `version` names it.
+    Blocked {
+        /// The blocked fallback candidate's version.
+        version: String,
+    },
 }
 
 /// Builds the versioned [`UpdateReportDocument`] for `plan`.
@@ -188,6 +210,18 @@ pub fn update_to_document(
             outcome: item.outcome.wire_token().to_string(),
             reason: item.reason(),
             advisory_ids: item.advisory_ids.clone(),
+            cooldown_fallback: item.cooldown_fallback.as_ref().map(|note| match note {
+                crate::update::CooldownFallbackNote::AppliedInsteadOf(latest) => {
+                    CooldownFallbackDocument::AppliedInsteadOf {
+                        latest: latest.to_string(),
+                    }
+                }
+                crate::update::CooldownFallbackNote::Blocked { version } => {
+                    CooldownFallbackDocument::Blocked {
+                        version: version.to_string(),
+                    }
+                }
+            }),
         })
         .collect();
 
@@ -305,6 +339,7 @@ mod tests {
             advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
+            cooldown_fallback: None,
         }
     }
 
