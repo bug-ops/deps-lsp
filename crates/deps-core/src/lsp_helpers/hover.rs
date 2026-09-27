@@ -307,6 +307,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             vuln_keys.as_ref(),
             &normalized_name,
             latest_ver,
+            formatter,
         ),
         None => LatestVerdict::NotApplicable,
     };

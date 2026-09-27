@@ -200,6 +200,7 @@ pub fn generate_inlay_hints(
                     vuln_keys.as_ref(),
                     normalized_name.as_str(),
                     latest.as_str(),
+                    formatter,
                 );
                 if let LatestVerdict::Flagged {
                     advisory_ids,
@@ -239,6 +240,7 @@ pub fn generate_inlay_hints(
                     vuln_keys.as_ref(),
                     normalized_name.as_str(),
                     latest.as_str(),
+                    formatter,
                 );
                 if let LatestVerdict::Flagged {
                     advisory_ids,

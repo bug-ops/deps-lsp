@@ -2480,6 +2480,7 @@ fn push_flagged_latest_admitted_by_requirement(
         vuln_keys,
         ctx.normalized_name,
         latest,
+        ctx.formatter,
     );
     let LatestVerdict::Flagged {
         advisory_ids,
@@ -2552,6 +2553,7 @@ fn apply_outdated_rule(
         vuln_keys,
         ctx.normalized_name,
         latest.as_str(),
+        ctx.formatter,
     );
 
     let published_at = ctx
