@@ -172,6 +172,32 @@ struct RecordCacheEntry {
     fetched_at: Instant,
 }
 
+/// A single-flight fetch slot for one advisory id, tracking how many concurrent callers are
+/// currently waiting on it (issue #1539 review finding: solo-caller timeout leak).
+///
+/// [`OsvClient::fetch_record_single_flight`] evicts a completed entry from `record_in_flight`
+/// unconditionally, but a caller that times out via its own per-caller deadline must only evict
+/// when it was the *last* caller still waiting on this id — otherwise a caller whose timeout
+/// fires while a different caller is still driving `cell` to completion would rip the shared
+/// slot out from under it (the bug finding #1 fixed). `waiters` makes that "was I last"
+/// determination race-free: incremented once per caller under the `DashMap` entry's own lock
+/// before that caller starts waiting, decremented via `fetch_sub` (whose return value is the
+/// pre-decrement count) when that caller stops waiting for any reason. Exactly one concurrent
+/// decrementer ever observes the count reaching zero, even if multiple solo timeouts race.
+struct InFlightRecord {
+    cell: tokio::sync::OnceCell<Option<Arc<OsvVulnRecord>>>,
+    waiters: std::sync::atomic::AtomicUsize,
+}
+
+impl InFlightRecord {
+    fn new() -> Self {
+        Self {
+            cell: tokio::sync::OnceCell::new(),
+            waiters: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
 /// Batches dependency versions against OSV.dev and resolves matching
 /// advisories, with its own semantic cache layered on top of
 /// [`HttpCache`]'s transport (`post_json`/`get_cached`).
@@ -193,8 +219,9 @@ pub struct OsvClient {
     /// only the raw [`OsvVulnRecord`] fetch is shared; each caller still derives its own
     /// [`Advisory`] via `into_advisory` for the package it actually queried, since one record
     /// can describe several unrelated packages (see the `scan_filters_affected_entries_to_the_queried_package`
-    /// test).
-    record_in_flight: DashMap<String, Arc<tokio::sync::OnceCell<Option<Arc<OsvVulnRecord>>>>>,
+    /// test). See [`InFlightRecord`] for how eviction avoids both stranding a live waiter and
+    /// leaking an entry no caller is left to clean up (issue #1539).
+    record_in_flight: DashMap<String, Arc<InFlightRecord>>,
     /// Overridable in test builds only, so `mockito` can stand in for
     /// `https://api.osv.dev` — mirrors [`crate::cache::ensure_https`]'s existing
     /// `#[cfg(test)]` relaxation for the same reason, and [`crate::deps_dev::DepsDevClient`]'s
@@ -415,7 +442,8 @@ impl OsvClient {
             if let Some(vuln_ids) = cached_ids {
                 outcomes.insert(
                     t.key.clone(),
-                    self.build_outcome(osv_eco, &t.osv_name, &vuln_ids).await,
+                    self.build_outcome(osv_eco, &t.osv_name, &vuln_ids, deadline)
+                        .await,
                 );
             } else {
                 to_query.push(t.clone());
@@ -441,7 +469,7 @@ impl OsvClient {
                 }
                 return outcomes;
             }
-            self.resolve_chunk(osv_eco, chunk, &mut outcomes, &mut truncated)
+            self.resolve_chunk(osv_eco, chunk, &mut outcomes, &mut truncated, deadline)
                 .await;
         }
 
@@ -459,7 +487,7 @@ impl OsvClient {
             return outcomes;
         }
 
-        self.recover_truncated(osv_eco, &truncated, &mut outcomes)
+        self.recover_truncated(osv_eco, &truncated, &mut outcomes, deadline)
             .await;
 
         outcomes
@@ -482,6 +510,7 @@ impl OsvClient {
         chunk: &[ScanTarget],
         outcomes: &mut VulnerabilityMap,
         truncated: &mut Vec<ScanTarget>,
+        deadline: Instant,
     ) {
         let url = self.batch_url();
         tracing::Span::current().record(
@@ -546,7 +575,7 @@ impl OsvClient {
             self.store_query_cache(osv_eco, target, &vuln_ids);
             outcomes.insert(
                 target.key.clone(),
-                self.build_outcome(osv_eco, &target.osv_name, &vuln_ids)
+                self.build_outcome(osv_eco, &target.osv_name, &vuln_ids, deadline)
                     .await,
             );
         }
@@ -562,6 +591,7 @@ impl OsvClient {
         osv_eco: OsvEcosystem,
         truncated: &[ScanTarget],
         outcomes: &mut VulnerabilityMap,
+        deadline: Instant,
     ) {
         use futures::stream::{self, StreamExt};
 
@@ -575,13 +605,27 @@ impl OsvClient {
             .map(|target| async move {
                 // Same client-wide OSV request budget as `fetch_record_single_flight` (issue
                 // #1535) — a `/v1/query` requery is as expensive as a `/v1/vulns/{id}` fetch,
-                // so it draws from the same semaphore rather than its own separate window.
-                // TODO(critic): bound this acquire by the scan deadline — see #1539.
-                let Ok(_permit) = Arc::clone(&self.record_fetch_semaphore)
-                    .acquire_owned()
-                    .await
-                else {
-                    return (target.key.clone(), ScanOutcome::Skipped(SkipReason::QueryFailed));
+                // so it draws from the same semaphore rather than its own separate window. The
+                // wait itself is bounded by `deadline` (issue #1539): a scan must not overrun its
+                // timeout window sitting in the semaphore queue, so an expired wait fails this
+                // item closed exactly like an `Err` from `acquire_owned` already did.
+                let _permit = match tokio::time::timeout_at(
+                    tokio::time::Instant::from_std(deadline),
+                    Arc::clone(&self.record_fetch_semaphore).acquire_owned(),
+                )
+                .await
+                {
+                    Ok(Ok(permit)) => permit,
+                    Ok(Err(_)) => {
+                        return (target.key.clone(), ScanOutcome::Skipped(SkipReason::QueryFailed));
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            dep = %target.key,
+                            "OSV truncation-requery permit wait exceeded scan deadline"
+                        );
+                        return (target.key.clone(), ScanOutcome::Skipped(SkipReason::QueryFailed));
+                    }
                 };
                 let outcome = match self.query_single(osv_eco, &target).await {
                     // `/v1/query` can itself paginate — never trust its
@@ -662,6 +706,7 @@ impl OsvClient {
         osv_eco: OsvEcosystem,
         osv_name: &str,
         vuln_ids: &[(String, String)],
+        deadline: Instant,
     ) -> ScanOutcome {
         if vuln_ids.is_empty() {
             return ScanOutcome::Clean;
@@ -673,7 +718,9 @@ impl OsvClient {
                       always <= vuln_ids.len()"
         )]
         let to_fetch = &vuln_ids[..vuln_ids.len().min(MAX_ADVISORY_RECORDS)];
-        let advisories = self.fetch_records(osv_eco, osv_name, to_fetch).await;
+        let advisories = self
+            .fetch_records(osv_eco, osv_name, to_fetch, deadline)
+            .await;
 
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
             advisories: Capped::new(advisories, vuln_ids.len()),
@@ -691,6 +738,7 @@ impl OsvClient {
         osv_eco: OsvEcosystem,
         osv_name: &str,
         ids: &[(String, String)],
+        deadline: Instant,
     ) -> Vec<Arc<Advisory>> {
         use futures::stream::{self, StreamExt};
 
@@ -703,7 +751,7 @@ impl OsvClient {
                     return Some(advisory);
                 }
 
-                let record = self.fetch_record_single_flight(&id).await?;
+                let record = self.fetch_record_single_flight(&id, deadline).await?;
                 let advisory = Arc::new((*record).clone().into_advisory(osv_name, osv_eco)?);
                 self.store_record_cache(&advisory);
                 Some(advisory)
@@ -721,17 +769,37 @@ impl OsvClient {
     /// /v1/vulns/{id}`, and gates the underlying HTTP fetch through `record_fetch_semaphore` so
     /// [`RECORD_FETCH_CONCURRENCY`] bounds fetch concurrency client-wide (issue #1535) rather
     /// than resetting to a fresh window on every call.
-    async fn fetch_record_single_flight(&self, id: &str) -> Option<Arc<OsvVulnRecord>> {
-        let cell = Arc::clone(
+    ///
+    /// The wait (permit acquire + HTTP fetch) is bounded by each *caller's own* `deadline`
+    /// (issue #1539): wrapping the whole [`tokio::sync::OnceCell::get_or_init`] call in an outer
+    /// `timeout_at`, rather than only the permit acquire inside the initializer closure, matters
+    /// because `record_in_flight` is shared client-wide — a caller that joins a cell some other
+    /// caller is already initializing must not be bound by *that* caller's deadline instead of
+    /// its own (issue #1539 critique S1). Two failure modes that would otherwise follow:
+    /// overrunning a short-lived caller's own deadline while piggybacking on a longer-lived
+    /// initializer, or a near-expired initializer poisoning the cell with `None` for a
+    /// long-lived caller that still had budget left. `OnceCell::get_or_init` is documented
+    /// cancel-safe: dropping the initializing future on this caller's own timeout releases the
+    /// cell's internal lock so a still-waiting caller starts its own initialization attempt with
+    /// its own deadline, rather than inheriting a poisoned result.
+    async fn fetch_record_single_flight(
+        &self,
+        id: &str,
+        deadline: Instant,
+    ) -> Option<Arc<OsvVulnRecord>> {
+        let entry = Arc::clone(
             self.record_in_flight
                 .entry(id.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .or_insert_with(|| Arc::new(InFlightRecord::new()))
                 .value(),
         );
+        entry
+            .waiters
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
-        let result = cell
-            .get_or_init(|| async {
-                // TODO(critic): bound this acquire by the scan deadline — see #1539.
+        match tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            entry.cell.get_or_init(|| async {
                 let permit = Arc::clone(&self.record_fetch_semaphore)
                     .acquire_owned()
                     .await
@@ -739,18 +807,51 @@ impl OsvClient {
                 let record = self.fetch_single_record(id).await.map(Arc::new);
                 drop(permit);
                 record
-            })
-            .await
-            .clone();
+            }),
+        )
+        .await
+        {
+            Ok(value) => {
+                let result = value.clone();
 
-        // Only a dedup window for concurrently-overlapping requests, not a persistent cache
-        // (`record_cache` already serves that role) — drop the entry once resolved so a later,
-        // non-overlapping fetch of the same id re-queries rather than growing this map forever
-        // over a server-lifetime client.
-        self.record_in_flight
-            .remove_if(id, |_, v| Arc::ptr_eq(v, &cell));
+                // Only a dedup window for concurrently-overlapping requests, not a persistent
+                // cache (`record_cache` already serves that role) — drop the entry once resolved
+                // so a later, non-overlapping fetch of the same id re-queries rather than growing
+                // this map forever over a server-lifetime client. Eviction is unconditional here:
+                // this caller's own `get_or_init` actually completed, so `entry.cell` is
+                // guaranteed fully initialized regardless of how many other callers are still
+                // waiting on it (they'll each observe the same completed value via their own
+                // `get_or_init` call, independent of the map entry).
+                self.record_in_flight
+                    .remove_if(id, |_, v| Arc::ptr_eq(v, &entry));
 
-        result
+                result
+            }
+            Err(_) => {
+                tracing::warn!(id, "OSV record fetch wait exceeded scan deadline");
+
+                // Evicting unconditionally on this caller's own timeout would remove the entry
+                // out from under a *different* caller still legitimately driving the same cell to
+                // completion (issue #1539 critique finding #1): a third caller joining in that
+                // window would then create a brand-new cell and issue a redundant `GET
+                // /v1/vulns/{id}`, defeating single-flight coalescing (#1535). But never evicting
+                // on timeout leaks the entry forever when this caller was the *only* one waiting
+                // — nobody else is left to ever drive `entry.cell` to completion and evict it
+                // (issue #1539 review finding). `waiters.fetch_sub` returns the pre-decrement
+                // count, so exactly one concurrent caller — whichever one's decrement observes
+                // `1` — is guaranteed to be the last, even if multiple solo timeouts race.
+                if entry
+                    .waiters
+                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+                    == 1
+                {
+                    self.record_in_flight
+                        .remove_if(id, |_, v| Arc::ptr_eq(v, &entry));
+                }
+
+                None
+            }
+        }
     }
 
     /// Fetches a single advisory record. Uses [`HttpCache::get_transport_only`]
@@ -1340,6 +1441,47 @@ mod tests {
         assert_matches!(
             outcomes.get(&crate::test_util::vuln_key("linux")),
             Some(ScanOutcome::Skipped(SkipReason::Truncated))
+        );
+    }
+
+    /// Issue #1539: `recover_truncated`'s permit wait must also fail closed at the scan
+    /// deadline — the same bound as `fetch_record_single_flight`, exercised end-to-end through
+    /// `scan` with the client-wide semaphore held externally so the requery can never acquire a
+    /// permit before the deadline elapses. Budget widened to 1s (critique M3) to comfortably
+    /// cover the mock-server round trip on a slow CI runner without risking the pre-recovery
+    /// deadline check (mod.rs `resolve`) firing first and yielding `Truncated` instead of the
+    /// `QueryFailed` this test targets; the whole call is wrapped in an outer test timeout
+    /// (critique M2) so a regression fails this test rather than hanging CI.
+    #[tokio::test]
+    async fn recover_truncated_permit_wait_bounded_by_deadline_fails_query_failed() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{"next_page_token":"abc"}]}"#)
+            .create_async()
+            .await;
+
+        let _permits: Vec<_> = futures::future::join_all(
+            (0..RECORD_FETCH_CONCURRENCY)
+                .map(|_| Arc::clone(&client.record_fetch_semaphore).acquire_owned()),
+        )
+        .await
+        .into_iter()
+        .map(|permit| permit.expect("semaphore is not closed"))
+        .collect();
+
+        let targets = vec![target("linux", "5.10.1")];
+        let outcomes = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.scan(EcosystemId::Go, &targets, Duration::from_secs(1)),
+        )
+        .await
+        .expect("the requery must fail at the deadline, not hang until a permit frees up");
+
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("linux")),
+            Some(ScanOutcome::Skipped(SkipReason::QueryFailed))
         );
     }
 
@@ -2012,12 +2154,13 @@ mod tests {
             format!("http://{addr}"),
         ));
 
+        let deadline = Instant::now() + Duration::from_secs(30);
         let handles: Vec<_> = (0..20)
             .map(|i| {
                 let client = Arc::clone(&client);
                 tokio::spawn(async move {
                     client
-                        .fetch_record_single_flight(&format!("ADVISORY-{i}"))
+                        .fetch_record_single_flight(&format!("ADVISORY-{i}"), deadline)
                         .await
                 })
             })
@@ -2052,10 +2195,13 @@ mod tests {
             format!("http://{addr}"),
         ));
 
+        let deadline = Instant::now() + Duration::from_secs(30);
         let handles: Vec<_> = (0..20)
             .map(|_| {
                 let client = Arc::clone(&client);
-                tokio::spawn(async move { client.fetch_record_single_flight("SAME-ID").await })
+                tokio::spawn(
+                    async move { client.fetch_record_single_flight("SAME-ID", deadline).await },
+                )
             })
             .collect();
 
@@ -2072,6 +2218,245 @@ mod tests {
             total.load(Ordering::SeqCst),
             1,
             "20 concurrent fetches of the same id must land exactly one HTTP request"
+        );
+    }
+
+    /// Issue #1539: the permit wait itself must be bounded by the scan deadline, not only the
+    /// per-chunk/per-requery checks around it — otherwise a scan can overrun its timeout window
+    /// sitting in the semaphore queue under heavy client-wide load. No mock server is needed:
+    /// the semaphore is saturated so the deadline must expire before any HTTP fetch is even
+    /// attempted. The whole call is wrapped in an outer test timeout (critique M2) so a
+    /// regression that reintroduces an unbounded wait fails this test rather than hanging CI.
+    #[tokio::test]
+    async fn fetch_record_single_flight_fails_fast_when_permit_wait_exceeds_deadline() {
+        let client = client();
+
+        let _permits: Vec<_> = futures::future::join_all(
+            (0..RECORD_FETCH_CONCURRENCY)
+                .map(|_| Arc::clone(&client.record_fetch_semaphore).acquire_owned()),
+        )
+        .await
+        .into_iter()
+        .map(|permit| permit.expect("semaphore is not closed"))
+        .collect();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.fetch_record_single_flight("UNREACHABLE-ID", deadline),
+        )
+        .await
+        .expect("the wait must fail at the deadline, not hang until a permit frees up");
+
+        assert!(
+            result.is_none(),
+            "a permit wait that outlives the deadline must fail closed, not eventually succeed"
+        );
+    }
+
+    /// Issue #1539 code-review finding: a *solo* caller (no other caller ever waits on the same
+    /// advisory id) that times out must still evict its own `record_in_flight` entry — the
+    /// finding-#1 fix (only evicting on `Ok`) otherwise leaves nobody to ever clean it up, leaking
+    /// one entry per unique id that times out with no follower for the client's lifetime.
+    #[tokio::test]
+    async fn fetch_record_single_flight_solo_caller_timeout_does_not_leak_in_flight_entry() {
+        let client = client();
+
+        let _permits: Vec<_> = futures::future::join_all(
+            (0..RECORD_FETCH_CONCURRENCY)
+                .map(|_| Arc::clone(&client.record_fetch_semaphore).acquire_owned()),
+        )
+        .await
+        .into_iter()
+        .map(|permit| permit.expect("semaphore is not closed"))
+        .collect();
+
+        let deadline = Instant::now() + Duration::from_millis(50);
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.fetch_record_single_flight("SOLO-ID", deadline),
+        )
+        .await
+        .expect("a solo caller must fail at its own deadline, not hang");
+
+        assert!(
+            result.is_none(),
+            "a solo caller's own timeout must fail closed"
+        );
+        assert!(
+            !client.record_in_flight.contains_key("SOLO-ID"),
+            "a solo caller's timeout must evict its own record_in_flight entry, not leak it \
+             for the rest of the client's lifetime"
+        );
+    }
+
+    /// Issue #1539 critique S1: `record_in_flight` is shared client-wide, so a caller joining a
+    /// cell some other caller is already initializing must be bounded by *its own* deadline, not
+    /// the initializer's. Caller A (near-expired deadline) starts initializing on a saturated
+    /// semaphore; caller B (ample deadline) joins the same cell a moment later. Once A's timeout
+    /// fires, `OnceCell::get_or_init`'s cancel-safety must let B take over its own initialization
+    /// attempt with B's own deadline — proven here by releasing the permits only after A's
+    /// deadline has elapsed but well before B's, so B can only succeed if it is not bound by A's
+    /// (already-expired) deadline.
+    #[tokio::test]
+    async fn fetch_record_single_flight_bounds_each_caller_by_its_own_deadline() {
+        let (addr, _in_flight, _watermark, _total) =
+            spawn_mock_vuln_server(Duration::from_millis(10)).await;
+        let client = Arc::new(OsvClient::with_base_url(
+            Arc::new(HttpCache::new()),
+            format!("http://{addr}"),
+        ));
+
+        let permits: Vec<_> = futures::future::join_all(
+            (0..RECORD_FETCH_CONCURRENCY)
+                .map(|_| Arc::clone(&client.record_fetch_semaphore).acquire_owned()),
+        )
+        .await
+        .into_iter()
+        .map(|permit| permit.expect("semaphore is not closed"))
+        .collect();
+
+        let short_deadline = Instant::now() + Duration::from_millis(50);
+        let long_deadline = Instant::now() + Duration::from_secs(10);
+
+        let a = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .fetch_record_single_flight("SHARED-ID", short_deadline)
+                    .await
+            }
+        });
+        // Give A time to become the cell's initializer (queued on the saturated semaphore)
+        // before B joins the same in-flight cell.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let b = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .fetch_record_single_flight("SHARED-ID", long_deadline)
+                    .await
+            }
+        });
+
+        // Release the permits only once A's own deadline has certainly elapsed — B must not
+        // inherit A's timeout, so B can only observe `Some` if it re-initializes on its own.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        drop(permits);
+
+        let a_result = tokio::time::timeout(Duration::from_secs(5), a)
+            .await
+            .expect("A must fail at its own deadline, not hang")
+            .expect("task did not panic");
+        let b_result = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .expect("B must not be bounded by A's already-expired deadline")
+            .expect("task did not panic");
+
+        assert!(
+            a_result.is_none(),
+            "A's own short deadline must fail its wait closed"
+        );
+        assert!(
+            b_result.is_some(),
+            "B must not be poisoned by A's timeout — it has to run its own initialization \
+             attempt with its own, still-live deadline"
+        );
+    }
+
+    /// Issue #1539 critique finding #1: evicting `record_in_flight`'s entry unconditionally
+    /// (including on a caller's own timeout) would remove the cell out from under a *different*
+    /// caller still legitimately driving it to completion, breaking single-flight coalescing
+    /// (#1535). Caller A (short deadline) starts initializing on a saturated semaphore; caller B
+    /// (long deadline) joins the same cell and becomes the new leader once A's timeout fires and
+    /// cancels A's attempt; caller C (long deadline) joins afterward, while B is still the active
+    /// initializer. If A's own timeout wrongly evicted the shared cell, C would find no map entry
+    /// and start a second, redundant `GET /v1/vulns/{id}` — asserted here via the mock server's
+    /// request counter staying at exactly 1.
+    #[tokio::test]
+    async fn fetch_record_single_flight_third_caller_reuses_cell_after_first_callers_timeout() {
+        let (addr, _in_flight, _watermark, total) =
+            spawn_mock_vuln_server(Duration::from_millis(10)).await;
+        let client = Arc::new(OsvClient::with_base_url(
+            Arc::new(HttpCache::new()),
+            format!("http://{addr}"),
+        ));
+
+        let permits: Vec<_> = futures::future::join_all(
+            (0..RECORD_FETCH_CONCURRENCY)
+                .map(|_| Arc::clone(&client.record_fetch_semaphore).acquire_owned()),
+        )
+        .await
+        .into_iter()
+        .map(|permit| permit.expect("semaphore is not closed"))
+        .collect();
+
+        let short_deadline = Instant::now() + Duration::from_millis(50);
+        let long_deadline = Instant::now() + Duration::from_secs(10);
+
+        let a = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .fetch_record_single_flight("SHARED-ID", short_deadline)
+                    .await
+            }
+        });
+        // Give A time to become the cell's initializer before B joins.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let b = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .fetch_record_single_flight("SHARED-ID", long_deadline)
+                    .await
+            }
+        });
+
+        // Wait past A's deadline (so A has timed out and, pre-fix, would have evicted the cell)
+        // before C joins — B must still be the one driving the cell to completion at this point,
+        // since the semaphore stays saturated until well after this.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let c = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                client
+                    .fetch_record_single_flight("SHARED-ID", long_deadline)
+                    .await
+            }
+        });
+
+        // Give C a moment to join the in-flight cell before releasing the permits B is waiting
+        // on, then let B (and, transitively, C) complete.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(permits);
+
+        let a_result = tokio::time::timeout(Duration::from_secs(5), a)
+            .await
+            .expect("A must fail at its own deadline, not hang")
+            .expect("task did not panic");
+        let b_result = tokio::time::timeout(Duration::from_secs(5), b)
+            .await
+            .expect("B must not hang")
+            .expect("task did not panic");
+        let c_result = tokio::time::timeout(Duration::from_secs(5), c)
+            .await
+            .expect("C must not hang")
+            .expect("task did not panic");
+
+        assert!(a_result.is_none(), "A's own short deadline must fail");
+        assert!(
+            b_result.is_some(),
+            "B must complete the fetch it is driving"
+        );
+        assert!(
+            c_result.is_some(),
+            "C must observe B's result by joining the same cell, not fail or hang"
+        );
+        assert_eq!(
+            total.load(Ordering::SeqCst),
+            1,
+            "C must reuse B's in-flight cell rather than issuing a second, redundant fetch"
         );
     }
 }
