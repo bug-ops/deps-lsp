@@ -260,18 +260,20 @@ pub fn is_requested(
 ///   unconditionally, independent of any GOSSIP verdict. Reconciling the two would need a
 ///   GOSSIP-verdict signal threaded into `ManifestAnalysis` beyond the `gossip_excluded_version`
 ///   attribution already carried — out of scope for this fix; a `check` vs. `update` cooldown
-///   message can therefore legitimately differ for the same dependency.
+///   message can therefore legitimately differ for the same dependency. Tracked as issue #1529.
 /// - `deps-lsp`'s "update to latest" code action (`deps_core::edit::collect_update_edits`, the
 ///   `collect_update_candidates` sibling that drops the `Unplannable` arm) does **not** gain
 ///   this filter — it stays scoped to `deps-cli update`'s planner only, so an editor quick-fix
-///   can still offer a version this command would skip as too fresh.
+///   can still offer a version this command would skip as too fresh. Whether this should
+///   eventually converge, and whether `update`'s long-term default should pick the newest
+///   already-cooled-down version instead of a full skip, is tracked in issue #1528.
 //
 // TODO(critic): this is a full skip, not a fallback to the newest already-cooled-down
 // candidate the way GOSSIP's floor-protected filter (`deps-engine/src/classify/fetch.rs`)
 // does for its own signal — starves a package that publishes at least once per cooldown
 // window (it never becomes an update target). A real fallback needs a per-version
 // publish-time list threaded from the fetch layer, which `PackageVersions` does not carry
-// today (only `latest`'s own `published_at`) — tracked as a follow-up issue (critique D1).
+// today (only `latest`'s own `published_at`) — tracked as issue #1528.
 fn within_freshness_cooldown(
     analysis: &ManifestAnalysis,
     normalized_name: &str,
