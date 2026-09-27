@@ -108,6 +108,17 @@ impl RequirementMatcher for MavenMatcher {
     fn strict_prerelease_exclusion(&self) -> bool {
         false
     }
+
+    /// #1590: Maven has no literal `!=` operator, but `Self::Ranges` can express the same kind
+    /// of exclusion through a disjoint union (e.g. `[1.0,1.5),(1.5,2.0)` bans exactly `1.5.0`)
+    /// — see [`crate::range::explicitly_excludes`] for the gap-detection logic.
+    /// `AlwaysSatisfied`/`Exact` have no such shape to punch a hole in.
+    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
+        match self {
+            Self::Ranges(ranges) => crate::range::explicitly_excludes(version.as_str(), ranges),
+            Self::AlwaysSatisfied | Self::Exact(_) => false,
+        }
+    }
 }
 
 impl PackageNaming for MavenFormatter {
