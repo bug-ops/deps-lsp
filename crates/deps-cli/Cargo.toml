@@ -89,8 +89,12 @@ deps-core = { workspace = true, features = ["test-util"] }
 # `deps_engine::test_util::TestTier3Ecosystem` — a network-free tier-3 `Ecosystem` test
 # double used by `check_integration.rs`'s `tier3_wiring_regression` test (issue #1133 critic
 # S2) to prove `check_manifest` actually reaches `prefetch_tier3_licenses`, so deleting that
-# call site fails this test instead of leaving the suite silently green.
-deps-engine = { workspace = true, features = ["test-util"] }
+# call site fails this test instead of leaving the suite silently green. The `cargo` feature
+# also re-exports `deps_engine::setup::CargoFormatter` — the real semver-backed formatter used by
+# `update::security`'s regression test proving Cargo's actual matcher (not a mock) returns
+# `Some(false)` for a compound requirement/fix pair (issue #1578) — deps-cli must reach it
+# through deps-engine's ecosystem registry, never link deps-cargo directly.
+deps-engine = { workspace = true, features = ["test-util", "cargo"] }
 insta = { workspace = true, features = ["json", "redactions"] }
 jsonschema = { workspace = true }
 # `check_integration.rs`'s `gossip_prefetch_wiring_regression` module (issue #1521 item 2) —

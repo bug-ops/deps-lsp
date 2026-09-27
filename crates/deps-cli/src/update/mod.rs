@@ -192,6 +192,17 @@ pub enum UnfixableReason {
     /// two would tell the operator to regenerate the lock file for a dependency that is still
     /// vulnerable (#1566 S1).
     UnsupportedRequirementShape,
+    /// The declared requirement's raw text exceeds `deps_core::lsp_helpers::MAX_REQUIREMENT_LEN`
+    /// (`deps_core::lsp_helpers::requirement_is_oversized`, #1472's CWE-400 defense-in-depth
+    /// bound) — a size-based fail-closed guard applied *before* a requirement matcher is ever
+    /// compiled, never itself a confirmed exclusion. Distinct from
+    /// [`Self::UnsupportedRequirementShape`] (#1578 S1): that variant means a matcher actually
+    /// ran and confirmed the declared requirement excludes the fix target, while this one means
+    /// the matcher never ran at all, so an oversized requirement that would in fact have
+    /// admitted the fix is still reported here rather than as
+    /// [`Outcome::RequiresLockfileUpdate`] — conflating the two would let a false "confirmed
+    /// excluded" claim reach the operator for a case that was never actually checked.
+    OversizedRequirement,
 }
 
 impl Outcome {
@@ -314,6 +325,9 @@ impl PlannedUpdateItem {
             Outcome::Unfixable(UnfixableReason::Yanked) => "the fix target is yanked",
             Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape) => {
                 "the declared requirement's syntax has no safe single-value rewrite and does not already admit the fix version — manual edit required"
+            }
+            Outcome::Unfixable(UnfixableReason::OversizedRequirement) => {
+                "the declared requirement is too large to safely evaluate; treating as unfixable — manual edit required"
             }
         };
         let mut reason = base.to_string();

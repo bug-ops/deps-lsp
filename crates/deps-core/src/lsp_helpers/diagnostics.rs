@@ -602,7 +602,28 @@ pub fn requirement_len_exceeds_cap(requirement: &str) -> bool {
 
 /// [`VersionReq`]-typed sibling of [`requirement_len_exceeds_cap`], for call sites that
 /// already hold a resolved requirement rather than a raw string.
-pub(crate) fn requirement_is_oversized(requirement: &VersionReq) -> bool {
+///
+/// A length check only — it says nothing about whether `requirement`'s text is otherwise
+/// well-formed or parses successfully; a short requirement can still be malformed, and this
+/// returning `false` is not itself a validity guarantee.
+///
+/// `pub` (#1578): reused by callers outside `deps-core` that need this same size gate before
+/// compiling a requirement, the same way [`requirement_len_exceeds_cap`] already is, rather
+/// than duplicating the length check inline.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, requirement_is_oversized};
+/// use deps_core::VersionReq;
+///
+/// assert!(!requirement_is_oversized(&VersionReq::new("^1.0.0")));
+/// assert!(requirement_is_oversized(&VersionReq::new(
+///     &"1".repeat(MAX_REQUIREMENT_LEN + 1)
+/// )));
+/// ```
+#[must_use]
+pub fn requirement_is_oversized(requirement: &VersionReq) -> bool {
     requirement_len_exceeds_cap(requirement.as_str())
 }
 
