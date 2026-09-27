@@ -737,6 +737,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
+            None,
             &SwiftFormatter,
         );
 
@@ -798,6 +799,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
+            None,
             &SwiftFormatter,
         );
 

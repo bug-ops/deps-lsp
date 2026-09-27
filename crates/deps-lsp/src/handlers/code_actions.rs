@@ -29,7 +29,13 @@ pub async fn handle_code_actions(
         return vec![];
     }
 
-    let offline = { config.read().await.policy.network.offline };
+    let (offline, vulnerabilities_enabled) = {
+        let config = config.read().await;
+        (
+            config.policy.network.offline,
+            config.policy.diagnostics.vulnerabilities_enabled,
+        )
+    };
 
     // Release the DashMap shard `Ref` before awaiting `generate_code_actions`'s registry
     // fetch — holding it across the await would block a concurrent `documents.get_mut` on
@@ -43,6 +49,7 @@ pub async fn handle_code_actions(
                 .snapshot()
                 .with_resolved_version_candidates()
                 .with_vulnerabilities()
+                .with_latest_status(vulnerabilities_enabled && !offline)
                 .with_outcomes()
                 .finish();
             Some((

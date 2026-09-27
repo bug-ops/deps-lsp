@@ -535,7 +535,7 @@ async fn run_update(
     let scope = if args.security_only {
         deps_cli::analyze::AnalysisScope::vulnerabilities_only()
     } else {
-        deps_cli::analyze::AnalysisScope::none()
+        deps_cli::analyze::AnalysisScope::update_default()
     };
     let analysis = analyze_manifest(
         &manifest.ecosystem,
@@ -566,6 +566,23 @@ async fn run_update(
         Some(rules) => IgnoreRules::new(rules, formatter),
         None => IgnoreRules::empty(),
     };
+    // Issue #1517: an unverified (never checked, timed out, or failed) OSV latest-check for
+    // an outdated dependency must abort the whole run the same way a registry outage does —
+    // silently omitting just that dependency from the plan could look like "nothing to do"
+    // when the truth is "this could not be confirmed safe to write." Critique S4: scoped to
+    // default mode only, and to dependencies actually in scope for this run's plan
+    // (`--package`/`[update].ignore`) — `--security-only` never reads the default-mode plan
+    // this check exists to protect, and an unrelated, unrequested dependency's transient OSV
+    // timeout must not block it from applying fixes it already independently verified.
+    if !args.security_only
+        && analysis.has_unverified_latest_check(formatter, &args.package, &ignore_rules)
+    {
+        return Err(format!(
+            "the OSV.dev latest-version check for one or more dependencies in {} could not be \
+             completed (timeout or query failure); the plan would be based on unverified data",
+            manifest.display_path.display()
+        ));
+    }
 
     let mut plan = if args.security_only {
         update::security::plan_security_updates(
@@ -585,6 +602,33 @@ async fn run_update(
     // `apply_plan`'s own dedup pass to `Skipped(OverlapsAnotherEdit)` first, so a reported
     // `applied` outcome always matches what actually gets written.
     update::dedup_applied_items(&mut plan.items);
+
+    // Issue #1517 critique S3: `analysis.latest_status.is_none()` means the OSV latest-check
+    // did not run at all for this manifest — a *deliberate* offline/disabled skip (see
+    // `analyze_manifest`'s `run_latest_check` gate), not a transient per-dependency failure
+    // (those still fail closed via `has_unverified_latest_check`/`collect_update_candidates`'s
+    // own gate above and below). `latest_verdict` degrades that to `NotApplicable`, so default
+    // mode still writes the cached `latest` — silently, unless warned here. `--security-only`
+    // never reads a cached `latest` at all (its fix targets come from advisories), so this
+    // warning is default-mode only.
+    if !args.security_only
+        && analysis.latest_status.is_none()
+        && plan
+            .items
+            .iter()
+            .any(|item| matches!(item.outcome, update::Outcome::Applied(_)))
+    {
+        let reason = if ctx.policy.network.offline {
+            "network.offline is set"
+        } else {
+            "diagnostics.vulnerabilities_enabled is disabled"
+        };
+        eprintln!(
+            "deps-cli: warning: the latest version(s) applied to {} were not checked against \
+             OSV.dev ({reason}); this update proceeded on unverified data",
+            manifest.display_path.display()
+        );
+    }
 
     update::apply_plan(
         &plan,

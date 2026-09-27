@@ -506,6 +506,15 @@ impl DocumentState {
         self.signals.vulnerabilities = vulnerabilities;
     }
 
+    /// Updates phase B's per-key "latest" check result (issue #1517) — full-replace, the same
+    /// "one background task (phase B) owns the whole map, recomputed fresh each run" contract
+    /// [`Self::update_vulnerabilities`] has, since phase B always rebuilds
+    /// [`deps_core::osv::LatestStatusMap`] from the document's *current* `cached_versions` on
+    /// every run rather than incrementally patching a prior result.
+    pub fn update_latest_status(&mut self, latest_status: deps_core::osv::LatestStatusMap) {
+        self.signals.latest_status = latest_status;
+    }
+
     /// Full-replace update of [`PackageSignals::licenses`] — every existing entry is discarded and
     /// replaced with exactly `licenses`, the same "one background task owns the whole
     /// map" contract [`Self::update_vulnerabilities`] has for `vulnerabilities`.
@@ -1033,6 +1042,24 @@ pub struct ServerState {
     /// until `Backend::initialize`/`did_change_configuration` first parses
     /// `initializationOptions.gossip`.
     pub gossip_enabled: AtomicBool,
+    /// Whether the OSV latest-check (issue #1517) is currently *effectively* enabled —
+    /// `policy.diagnostics.vulnerabilities_enabled && !policy.network.offline`, mirroring
+    /// `typosquat_enabled`'s rationale but tracking a derived, two-flag condition rather than
+    /// a single config field. Used only to detect the disabled/offline -> enabled transition
+    /// (critique S5): `Backend::did_change_configuration` compares this against the freshly
+    /// resolved value and, on a `false` -> `true` edge, triggers an immediate rescan for every
+    /// open document (`document::lifecycle::trigger_osv_rescan_for_open_documents`) — without
+    /// it, `PackageSignals::latest_status` would stay permanently empty (`Unverified` for
+    /// every outdated dependency) until each document's next edit or reopen, since toggling
+    /// either flag is not a parse-affecting config change (`config::reparse_scope`) and
+    /// schedules no reparse/refetch of its own. Defaults to `true`
+    /// (`DepsConfig::default()`'s own `vulnerabilities_enabled: true`, `offline: false`) —
+    /// unlike `typosquat_enabled`/`gossip_enabled`, which are opt-in features defaulting
+    /// `false`, the OSV latest-check is opt-out, so starting this at `false` would spuriously
+    /// read as a disabled->enabled transition on the very first `did_change_configuration` a
+    /// client sends without ever having called `Backend::initialize` with
+    /// `initializationOptions` first.
+    pub osv_latest_check_enabled: AtomicBool,
     /// Ecosystem ids `crate::register_ecosystems` actually threaded the live
     /// `registry_policy` handle into (issue #592 security M1) — the single source of truth
     /// `config::reparse_scope`'s caller uses to scope a `registries.workspace_registries`
@@ -1178,6 +1205,7 @@ impl ServerState {
             license_policy: RwLock::new(Arc::new(LicensePolicy::default())),
             typosquat_enabled: AtomicBool::new(false),
             gossip_enabled: AtomicBool::new(false),
+            osv_latest_check_enabled: AtomicBool::new(true),
             workspace_registry_ecosystems,
             cold_start_limiter,
             tasks: tokio::sync::RwLock::new(HashMap::new()),
@@ -1306,6 +1334,22 @@ impl ServerState {
     /// Mirrors [`Self::set_typosquat_enabled`]'s exact rationale.
     pub fn set_gossip_enabled(&self, enabled: bool) {
         self.gossip_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Returns whether the OSV latest-check is currently effectively enabled (issue #1517
+    /// critique S5). See [`Self::osv_latest_check_enabled`]'s field doc.
+    pub fn is_osv_latest_check_enabled(&self) -> bool {
+        self.osv_latest_check_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Replaces the tracked effective OSV latest-check state (issue #1517 critique S5).
+    ///
+    /// Mirrors [`Self::set_typosquat_enabled`]'s exact rationale; called from
+    /// `Backend::apply_resolved_config` with `vulnerabilities_enabled && !offline` already
+    /// combined by the caller.
+    pub fn set_osv_latest_check_enabled(&self, enabled: bool) {
+        self.osv_latest_check_enabled
+            .store(enabled, Ordering::Relaxed);
     }
 
     /// Unions `scope` into the pending coalesced reparse and bumps the generation counter

@@ -8,8 +8,8 @@
 //! `generate_diagnostics`/`to_finding` — no behavior change to `check` itself.
 
 use deps_core::licenses::LicensePolicy;
-use deps_core::lsp_helpers::DependencyOutcomes;
-use deps_core::osv::VulnerabilityMap;
+use deps_core::lsp_helpers::{DependencyOutcomes, LatestVerdict, latest_verdict};
+use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
 use deps_core::{ConcreteVersion, Ecosystem, EcosystemId, LicenseSource, PackageName, VersionData};
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
@@ -18,7 +18,7 @@ use deps_engine::classify::fetch::{
     apply_fetch_outcomes, fetch_latest_versions_parallel, prepare_fetch,
 };
 use deps_engine::classify::license::prefetch_tier3_licenses;
-use deps_engine::classify::osv::build_scan_targets;
+use deps_engine::classify::osv::{build_latest_check_targets, build_scan_targets};
 use deps_engine::classify::resolved::load_resolved_versions;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -48,7 +48,7 @@ const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 /// ```
 /// use deps_cli::analyze::AnalysisScope;
 ///
-/// let update_default_mode = AnalysisScope::none();
+/// let update_default_mode = AnalysisScope::update_default();
 /// assert!(!update_default_mode.licenses);
 /// assert!(!update_default_mode.vulnerabilities);
 ///
@@ -88,9 +88,14 @@ impl AnalysisScope {
         }
     }
 
-    /// Neither phase runs — `deps-cli update`'s default-mode scope.
+    /// Neither the license nor the vulnerability-classification phase runs —
+    /// `deps-cli update`'s default-mode scope. Named for that one caller (not `none()`,
+    /// its pre-#1517 name) since [`analyze_manifest`] still unconditionally runs the OSV
+    /// **latest-check** (issue #1517) regardless of this scope: `update`'s default mode
+    /// must never write a flagged/unverified `latest` into the manifest, so that check is
+    /// not one of the two phases this scope can opt out of.
     #[must_use]
-    pub const fn none() -> Self {
+    pub const fn update_default() -> Self {
         Self {
             licenses: false,
             vulnerabilities: false,
@@ -126,6 +131,11 @@ pub struct ManifestAnalysis {
     pub outcomes: DependencyOutcomes,
     /// OSV scan results, when the scan ran (enabled and not offline).
     pub vulnerabilities: Option<VulnerabilityMap>,
+    /// Phase B's per-key "latest" check result (issue #1517), when the check ran (enabled and
+    /// not offline) — populated regardless of `AnalysisScope`, since `update`'s default mode
+    /// needs this even though it opts out of both `licenses` and `vulnerabilities`. See
+    /// [`deps_core::osv::LatestStatusMap`] for the map's fail-closed-on-absence contract.
+    pub latest_status: Option<LatestStatusMap>,
     /// License data backfilled from the registry fetch (tier 1) and the tier-3 prefetch,
     /// keyed by raw package name.
     pub licenses: HashMap<PackageName, Vec<String>>,
@@ -162,7 +172,82 @@ impl ManifestAnalysis {
         if let Some(vulnerabilities) = self.vulnerabilities.as_ref() {
             version_data = version_data.with_vulnerabilities(vulnerabilities);
         }
+        if let Some(latest_status) = self.latest_status.as_ref() {
+            version_data = version_data.with_latest_status(latest_status);
+        }
         version_data
+    }
+
+    /// Whether any [`deps_core::lsp_helpers::RequirementStatus::Outdated`] dependency actually
+    /// in scope for this run's plan (per `package_filter`/`ignore_rules`, issue #1517 critique
+    /// S4) came back [`LatestVerdict::Unverified`] (issue #1517) — a transient OSV
+    /// failure/timeout, or the check never having run at all despite being enabled. Callers
+    /// (`deps-cli update`'s default mode) treat this the same as
+    /// [`Self::registry_unreachable`]: abort the whole run rather than silently omitting just
+    /// the affected dependency from the plan, since an unverifiable check must never be
+    /// mistaken for a clean one.
+    ///
+    /// `package_filter` is matched via `crate::update::is_requested`, and `ignore_rules` via
+    /// [`crate::update::ignore::IgnoreRules::matches_name`] (a name-only match, deliberately not
+    /// [`crate::update::ignore::IgnoreRules::skip_reason`]'s kind-scoped one: this abort-check
+    /// runs before any concrete `current`/target pair exists to classify an [`UpdateKind`] from).
+    /// A dependency this widens past scope (a kind-scoped ignore rule that would not actually
+    /// have matched this update) is not a regression: `deps_core::edit::collect_update_candidates`
+    /// applies the exact same [`latest_verdict`] gate per-candidate independently, so an
+    /// unverified `latest` for it still surfaces as `Skipped(NotSafelyEditable(LatestUnverified))`
+    /// in the final plan (a nonzero exit) rather than silently vanishing — this check only
+    /// controls whether the *whole run* aborts early with a clearer message, not whether the
+    /// unverified dependency itself is ever caught.
+    ///
+    /// [`UpdateKind`]: deps_core::edit::UpdateKind
+    #[must_use]
+    pub fn has_unverified_latest_check(
+        &self,
+        formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+        package_filter: &[String],
+        ignore_rules: &crate::update::ignore::IgnoreRules,
+    ) -> bool {
+        let vuln_keys = deps_core::osv::vulnerability_keys(
+            self.parse_result.as_ref(),
+            &self.resolved_versions,
+            Some(&self.resolved_version_candidates),
+            formatter,
+            self.ecosystem_id,
+        );
+        self.parse_result.dependencies().into_iter().any(|dep| {
+            let normalized_name = formatter.normalize_package_name(dep.name());
+            if !crate::update::is_requested(package_filter, &normalized_name, formatter)
+                || ignore_rules.matches_name(&normalized_name)
+            {
+                return false;
+            }
+            let Some(latest) = self
+                .cached_versions
+                .get(normalized_name.as_str())
+                .or_else(|| self.cached_versions.get(dep.name()))
+                .map(|v| &v.latest)
+            else {
+                return false;
+            };
+            let Some(version_req) = dep.version_requirement() else {
+                return false;
+            };
+            if formatter.requirement_status_for(dep, version_req, latest)
+                != deps_core::lsp_helpers::RequirementStatus::Outdated
+            {
+                return false;
+            }
+            matches!(
+                latest_verdict(
+                    self.latest_status.as_ref(),
+                    dep,
+                    Some(&vuln_keys),
+                    &normalized_name,
+                    latest.as_str(),
+                ),
+                LatestVerdict::Unverified
+            )
+        })
     }
 }
 
@@ -352,8 +437,48 @@ pub async fn analyze_manifest(
         }
     };
 
-    let (tier3_result, vulnerabilities): (_, Option<VulnerabilityMap>) =
-        tokio::join!(tier3_license_fetch, osv_scan);
+    // Issue #1517: unconditional on `scope` (unlike the OSV vulnerability scan above) —
+    // `update`'s default mode never reads `ManifestAnalysis::vulnerabilities`, but it always
+    // needs to know whether the `latest` it's about to write is itself safe. Still gated on
+    // the same `vulnerabilities_enabled`/`!offline` policy every other OSV call respects.
+    let run_latest_check =
+        ctx.policy.diagnostics.vulnerabilities_enabled && !ctx.policy.network.offline;
+    let latest_check = async {
+        if run_latest_check {
+            let vuln_keys = deps_core::osv::vulnerability_keys(
+                parse_result.as_ref(),
+                &resolved_versions,
+                Some(&resolved_version_candidates),
+                formatter,
+                ecosystem_id,
+            );
+            let (targets, mut latest_status) = build_latest_check_targets(
+                parse_result.as_ref(),
+                &cached_versions,
+                &vuln_keys,
+                formatter,
+            );
+            if !targets.is_empty() {
+                let timeout = Duration::from_secs(
+                    ctx.policy
+                        .cache
+                        .fetch_timeout_secs
+                        .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
+                );
+                let checked = ctx
+                    .osv
+                    .check_candidates(ecosystem_id, &targets, timeout)
+                    .await;
+                latest_status.extend(checked);
+            }
+            Some(latest_status)
+        } else {
+            None
+        }
+    };
+
+    let (tier3_result, vulnerabilities, latest_status): (_, Option<VulnerabilityMap>, _) =
+        tokio::join!(tier3_license_fetch, osv_scan, latest_check);
 
     // Merged (not replaced) alongside the tier-1 backfill above via `entry().or_insert()`,
     // not `extend` (critic nit): the two sources are disjoint today (only Composer
@@ -381,6 +506,7 @@ pub async fn analyze_manifest(
         resolved_version_candidates,
         outcomes,
         vulnerabilities,
+        latest_status,
         licenses,
         license_policy,
         license_source: ecosystem.license_source(),
@@ -389,4 +515,155 @@ pub async fn analyze_manifest(
         registry_unreachable,
         license_fetch_incomplete,
     })
+}
+
+#[cfg(test)]
+mod has_unverified_latest_check_tests {
+    use super::ManifestAnalysis;
+    use crate::update::ignore::IgnoreRules;
+    use deps_core::licenses::LicensePolicy;
+    use deps_core::lsp_helpers::{DependencyOutcomes, PackageVersions};
+    use deps_core::osv::LatestStatusMap;
+    use deps_core::parser::DependencySource;
+    use deps_core::position::{Position, Range};
+    use deps_core::test_util::StubFormatter;
+    use deps_core::{Dependency, EcosystemId, PackageName, ParseResult, VersionReq};
+    use std::any::Any;
+    use std::collections::{HashMap, HashSet};
+
+    struct MockDep {
+        name: PackageName,
+        version_req: VersionReq,
+        version_range: Range,
+    }
+    impl Dependency for MockDep {
+        fn name(&self) -> &PackageName {
+            &self.name
+        }
+        fn name_range(&self) -> Range {
+            Range::default()
+        }
+        fn version_requirement(&self) -> Option<&VersionReq> {
+            Some(&self.version_req)
+        }
+        fn version_range(&self) -> Option<Range> {
+            Some(self.version_range)
+        }
+        fn source(&self) -> DependencySource {
+            DependencySource::Registry
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    struct MockParseResult {
+        deps: Vec<MockDep>,
+        uri: url::Url,
+    }
+    impl ParseResult for MockParseResult {
+        fn dependencies(&self) -> Vec<&dyn Dependency> {
+            self.deps.iter().map(|d| d as &dyn Dependency).collect()
+        }
+        fn workspace_root(&self) -> Option<&std::path::Path> {
+            None
+        }
+        fn uri(&self) -> &url::Url {
+            &self.uri
+        }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    /// One outdated `serde` dependency ("1.0.0" -> cached latest "1.2.0"), with `latest_status`
+    /// set to `Some(&empty map)` — the exact pre-phase-B/never-checked state `latest_verdict`
+    /// treats as `Unverified` (fail closed).
+    fn analysis_with_one_outdated_unverified_dep() -> ManifestAnalysis {
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            PackageName::new("serde"),
+            PackageVersions::latest_only("1.2.0"),
+        );
+
+        ManifestAnalysis {
+            parse_result: Box::new(MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("serde"),
+                    version_req: VersionReq::new("1.0.0"),
+                    version_range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+                }],
+                uri: uri.clone(),
+            }),
+            uri,
+            ecosystem_id: EcosystemId::Cargo,
+            cached_versions,
+            resolved_versions: HashMap::new(),
+            resolved_version_candidates: HashMap::new(),
+            outcomes: DependencyOutcomes::new(),
+            vulnerabilities: None,
+            latest_status: Some(LatestStatusMap::new()),
+            licenses: HashMap::new(),
+            license_policy: LicensePolicy::default(),
+            license_source: deps_core::LicenseSource::default(),
+            offline: false,
+            fetch_failed: HashSet::new(),
+            registry_unreachable: false,
+            license_fetch_incomplete: false,
+        }
+    }
+
+    /// Baseline: an unfiltered, unignored outdated dependency with no OSV verdict for its
+    /// cached latest is reported as unverified.
+    #[test]
+    fn true_for_outdated_unverified_dependency_in_scope() {
+        let analysis = analysis_with_one_outdated_unverified_dep();
+        assert!(analysis.has_unverified_latest_check(
+            &StubFormatter::DEFAULT,
+            &[],
+            &IgnoreRules::empty(),
+        ));
+    }
+
+    /// Issue #1517 critique S4: a `--package` filter that does not name the unverified
+    /// dependency must exclude it from this abort-check, the same scoping
+    /// `deps_cli::update::is_requested` applies to the actual plan.
+    #[test]
+    fn false_when_package_filter_excludes_the_dependency() {
+        let analysis = analysis_with_one_outdated_unverified_dep();
+        assert!(!analysis.has_unverified_latest_check(
+            &StubFormatter::DEFAULT,
+            &["some-other-package".to_string()],
+            &IgnoreRules::empty(),
+        ));
+    }
+
+    /// A `--package` filter that does name the dependency still reports it.
+    #[test]
+    fn true_when_package_filter_names_the_dependency() {
+        let analysis = analysis_with_one_outdated_unverified_dep();
+        assert!(analysis.has_unverified_latest_check(
+            &StubFormatter::DEFAULT,
+            &["serde".to_string()],
+            &IgnoreRules::empty(),
+        ));
+    }
+
+    /// Issue #1517 critique S4: an `[update].ignore` rule naming the dependency must exclude
+    /// it from this abort-check too, regardless of the rule's `update_types` scope (a name-only
+    /// match — see `has_unverified_latest_check`'s own doc for why it does not attempt
+    /// `IgnoreRules::skip_reason`'s kind-scoped match here).
+    #[test]
+    fn false_when_an_ignore_rule_names_the_dependency() {
+        let analysis = analysis_with_one_outdated_unverified_dep();
+        let rules = IgnoreRules::new(
+            vec![crate::config::IgnoreRule {
+                name: "serde".to_string(),
+                update_types: None,
+            }],
+            &StubFormatter::DEFAULT,
+        );
+        assert!(!analysis.has_unverified_latest_check(&StubFormatter::DEFAULT, &[], &rules));
+    }
 }

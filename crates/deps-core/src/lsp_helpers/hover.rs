@@ -22,9 +22,9 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
-    EcosystemFormatter, GossipCooldownLookup, HOVER_RECENT_VERSIONS, VersionData,
-    await_versions_fetch, escape_markdown, gossip_cooldown_for, in_use_version, markdown_code_span,
-    position_in_range, resolve_in_use_version, resolve_scan_outcome,
+    EcosystemFormatter, GossipCooldownLookup, HOVER_RECENT_VERSIONS, LatestVerdict, VersionData,
+    await_versions_fetch, escape_markdown, gossip_cooldown_for, in_use_version, latest_verdict,
+    markdown_code_span, position_in_range, resolve_in_use_version, resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -286,10 +286,9 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         }
         None => GossipCooldownLookup::Unavailable,
     };
-    push_latest_hover_section(&mut markdown, latest_line, freshness, now, gossip_cooldown);
-
     // #394 S2: version-qualified key so a hover on one occurrence of a duplicated name never
-    // shows another occurrence's OSV result.
+    // shows another occurrence's OSV result. Computed before `push_latest_hover_section` (issue
+    // #1517) so that section's own OSV latest-verdict lookup can use it too.
     let vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
             parse_result,
@@ -299,6 +298,27 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             ecosystem,
         )
     });
+    // Issue #1517: computed once here (not inside `push_latest_hover_section`) since the
+    // `Cmd+.` footer below also needs it to decide whether to advertise the update action.
+    let latest_verdict_result = match latest_line {
+        Some((latest_ver, _)) => latest_verdict(
+            versions.latest_status,
+            dep,
+            vuln_keys.as_ref(),
+            &normalized_name,
+            latest_ver,
+        ),
+        None => LatestVerdict::NotApplicable,
+    };
+    push_latest_hover_section(
+        &mut markdown,
+        latest_line,
+        freshness,
+        now,
+        gossip_cooldown,
+        &latest_verdict_result,
+    );
+
     let vuln_outcome = versions
         .vulnerabilities
         .and_then(|m| resolve_scan_outcome(m, dep, vuln_keys.as_ref(), &normalized_name));
@@ -308,7 +328,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // Package-level context (#205) renders before per-version security advisories:
     // deprecation is a property of the package, advisories of the version.
     push_deprecation_hover_section(&mut markdown, formatter, deprecation);
-    push_vulnerability_hover_section(&mut markdown, formatter, vuln_outcome);
+    let latest_status_for_dep = versions
+        .latest_status
+        .and_then(|m| super::resolve_latest_status(m, dep, vuln_keys.as_ref(), &normalized_name));
+    push_vulnerability_hover_section(
+        &mut markdown,
+        formatter,
+        vuln_outcome,
+        latest_status_for_dep,
+    );
 
     // Awaited last so the wait overlaps as much of this function's own work as possible.
     // Bounds only the wait: over budget, the spawned task keeps running and warms
@@ -463,6 +491,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             deprecation,
             offline: versions.offline,
             requirement_is_placeholder,
+            latest_verdict: latest_verdict_result.clone(),
         },
     );
 
@@ -660,6 +689,7 @@ fn push_latest_hover_section(
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
     gossip_cooldown: GossipCooldownLookup,
+    latest_verdict: &LatestVerdict,
 ) {
     let Some((latest_ver, raw_published_at)) = latest_line else {
         return;
@@ -676,6 +706,34 @@ fn push_latest_hover_section(
         markdown.push_static(")*");
     }
     markdown.push_static("\n\n");
+
+    // Issue #1517: a latest OSV confirmed flagged/malicious must never be described as a
+    // benign "recently published" cooldown notice (AC7) — this callout replaces the GOSSIP/
+    // local cooldown callout entirely rather than appending alongside it.
+    if let LatestVerdict::Flagged {
+        advisory_ids,
+        malicious,
+    } = latest_verdict
+    {
+        if *malicious {
+            markdown.push_static(
+                "> 🚫 **Latest version is confirmed malicious by OSV.dev** — do not upgrade to \
+                 this version.\n",
+            );
+        } else {
+            markdown.push_static(
+                "> ⚠️ **Latest version is flagged by OSV.dev** — do not upgrade to this \
+                 version.\n",
+            );
+        }
+        if !advisory_ids.is_empty() {
+            markdown.push_static("> ");
+            markdown.push_text(&advisory_ids.join(", "), FieldKind::Prose);
+            markdown.push_static("\n");
+        }
+        markdown.push_static("\n");
+        return;
+    }
 
     // Issue #1456, spec 072 FR-002/NFR-004, S2: a GOSSIP-sourced cooldown answer is
     // authoritative whenever available — both `Active` (render the attributed callout) and
@@ -863,14 +921,22 @@ fn push_recent_versions_hover_section(
 /// ([`crate::edit::requirement_is_placeholder_for`], default-on across ecosystems since
 /// #1393), so `Cmd+.` would return zero actions regardless of how much version,
 /// vulnerability, or deprecation data was rendered above.
+/// Issue #1517: whether `latest` is safe enough to justify advertising an "update to latest"
+/// action at all — `Verified` (checked, clean) or `NotApplicable` (OSV disabled/offline, or a
+/// structural skip); `Flagged`/`Unverified` must never be implied safe by this footer.
 fn push_cmd_dot_footer_hover_section(markdown: &mut HoverMarkdown, state: CmdDotFooterState<'_>) {
-    let has_offline_actionable_data = state.available_versions.is_some_and(|v| !v.is_empty())
-        || state.cached_latest.is_some()
+    let latest_is_safe = matches!(
+        state.latest_verdict,
+        LatestVerdict::Verified | LatestVerdict::NotApplicable
+    );
+    let has_offline_actionable_data = (state.cached_latest.is_some()
+        || state.available_versions.is_some_and(|v| !v.is_empty()))
+        && latest_is_safe
         || matches!(state.vuln_outcome, Some(ScanOutcome::Vulnerable(_)))
         || state.deprecation.is_some();
     let live_fetch_definitively_empty = state.available_versions.is_some_and(<[_]>::is_empty);
-    let footer_actionable =
-        has_offline_actionable_data || (!live_fetch_definitively_empty && !state.offline);
+    let footer_actionable = has_offline_actionable_data
+        || (!live_fetch_definitively_empty && !state.offline && latest_is_safe);
     if state.resolvable && footer_actionable && !state.requirement_is_placeholder {
         markdown.push_static(CMD_DOT_FOOTER);
     }
@@ -886,6 +952,8 @@ struct CmdDotFooterState<'a> {
     deprecation: Option<&'a Deprecation>,
     offline: bool,
     requirement_is_placeholder: bool,
+    /// See [`push_cmd_dot_footer_hover_section`]'s doc.
+    latest_verdict: LatestVerdict,
 }
 
 /// Appends the "Offline: version and vulnerability data not checked" footer (issue
@@ -1084,6 +1152,7 @@ fn push_vulnerability_hover_section(
     markdown: &mut HoverMarkdown,
     formatter: &dyn EcosystemFormatter,
     outcome: Option<&ScanOutcome>,
+    latest_status: Option<&crate::osv::UpgradeStatus>,
 ) {
     match outcome {
         Some(ScanOutcome::Vulnerable(dv)) => {
@@ -1138,10 +1207,11 @@ fn push_vulnerability_hover_section(
                 markdown.push_static(" more advisories)*\n");
             }
 
-            if let crate::osv::UpgradeStatus::CandidateVulnerable {
+            if let Some(crate::osv::UpgradeStatus::CandidateVulnerable {
                 version,
                 advisory_ids,
-            } = &dv.upgrade_status
+                ..
+            }) = latest_status
                 // Deliberately the full (fix-computation) `dv.advisories`, not
                 // `display_advisories`: a larger known-severity index only ever makes this
                 // informational-suppression check more accurate, never less (#1422).
@@ -1624,6 +1694,7 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             GossipCooldownLookup::Unavailable,
+            &LatestVerdict::NotApplicable,
         );
         assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
         assert!(markdown.as_str().contains('…'));
@@ -1642,6 +1713,7 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             GossipCooldownLookup::Unavailable,
+            &LatestVerdict::NotApplicable,
         );
         assert_eq!(markdown.as_str(), format!("**Latest**: `{at_cap}`\n\n"));
 
@@ -1653,6 +1725,7 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             GossipCooldownLookup::Unavailable,
+            &LatestVerdict::NotApplicable,
         );
         assert_eq!(
             markdown.as_str(),
@@ -1673,6 +1746,7 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
             GossipCooldownLookup::Unavailable,
+            &LatestVerdict::NotApplicable,
         );
         assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
     }
@@ -1688,6 +1762,7 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::from_unix_secs(1_000),
             GossipCooldownLookup::Active,
+            &LatestVerdict::NotApplicable,
         );
         assert!(
             markdown.as_str().contains("deps.dev/GOSSIP"),
@@ -1706,6 +1781,7 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::from_unix_secs(1_000_000),
             GossipCooldownLookup::Unavailable,
+            &LatestVerdict::NotApplicable,
         );
         assert!(
             !markdown.as_str().contains("deps.dev/GOSSIP"),
@@ -1730,10 +1806,70 @@ mod tests {
             crate::freshness::FreshnessSettings::default(),
             PublishTime::from_unix_secs(1_000_000),
             GossipCooldownLookup::NotActive,
+            &LatestVerdict::NotApplicable,
         );
         assert!(
             !markdown.as_str().contains("Recently published"),
             "GOSSIP's authoritative negative must suppress the local heuristic too: {markdown}"
+        );
+    }
+
+    /// Issue #1517 AC7: a `LatestVerdict::Flagged` version must never render the benign
+    /// "Recently published" cooldown callout, even when GOSSIP independently reports an
+    /// active cooldown for the same version (the live-verified confusion this issue reports).
+    #[test]
+    fn push_latest_hover_section_flagged_suppresses_cooldown_callout() {
+        let mut markdown = HoverMarkdown::new();
+        let verdict = LatestVerdict::Flagged {
+            advisory_ids: vec!["MAL-2026-16332".to_string()],
+            malicious: true,
+        };
+        push_latest_hover_section(
+            &mut markdown,
+            Some(("1.0.8", Some(PublishTime::from_unix_secs(999_999)))),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::from_unix_secs(1_000_000),
+            GossipCooldownLookup::Active,
+            &verdict,
+        );
+        assert!(
+            !markdown.as_str().contains("Recently published"),
+            "a flagged/malicious latest must never render as a benign cooldown notice: {markdown}"
+        );
+        assert!(
+            markdown.as_str().contains("confirmed malicious"),
+            "got: {markdown}"
+        );
+        assert!(
+            markdown.as_str().contains("MAL") && markdown.as_str().contains("16332"),
+            "got: {markdown}"
+        );
+    }
+
+    /// Non-malicious `Flagged` (e.g. a non-critical vulnerability) uses the softer "flagged"
+    /// wording, not "confirmed malicious".
+    #[test]
+    fn push_latest_hover_section_flagged_non_malicious_uses_flagged_wording() {
+        let mut markdown = HoverMarkdown::new();
+        let verdict = LatestVerdict::Flagged {
+            advisory_ids: vec!["GHSA-xxxx".to_string()],
+            malicious: false,
+        };
+        push_latest_hover_section(
+            &mut markdown,
+            Some(("2.0.0", None)),
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+            GossipCooldownLookup::Unavailable,
+            &verdict,
+        );
+        assert!(
+            markdown.as_str().contains("flagged by OSV.dev"),
+            "got: {markdown}"
+        );
+        assert!(
+            !markdown.as_str().contains("confirmed malicious"),
+            "got: {markdown}"
         );
     }
 
@@ -4910,8 +5046,8 @@ mod tests {
     #[tokio::test]
     async fn test_generate_hover_vulnerable_outcome_shows_advisories_and_more_count() {
         use crate::osv::{
-            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-            VulnerabilityMap,
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
         };
 
         let parse_result = MockParseResult {
@@ -4930,17 +5066,24 @@ mod tests {
                     3,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::CandidateVulnerable {
-                    version: "2.0.0".into(),
-                    advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
-                },
             }),
+        );
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("bad-pkg"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "2.0.0".into(),
+                advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Critical),
+            },
         );
 
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2).into(),
-            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulns)
+                .with_latest_status(&latest_status),
             &MockRegistry,
             &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
@@ -4985,15 +5128,21 @@ mod tests {
         aliases.extend((7..11).map(|i| format!("CVE-2020-{i:04}")));
         advisory.aliases = aliases;
 
-        let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1))
-            .with_upgrade_status(UpgradeStatus::CandidateVulnerable {
-                version: "V".repeat(500),
-                advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
-            });
+        let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
+        let latest = UpgradeStatus::CandidateVulnerable {
+            version: "V".repeat(500),
+            advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
+            worst_severity: Some(VulnSeverity::High),
+        };
 
         let outcome = ScanOutcome::Vulnerable(dv);
         let mut markdown = HoverMarkdown::new();
-        push_vulnerability_hover_section(&mut markdown, &MOCK_FORMATTER, Some(&outcome));
+        push_vulnerability_hover_section(
+            &mut markdown,
+            &MOCK_FORMATTER,
+            Some(&outcome),
+            Some(&latest),
+        );
 
         // `S`/`F`/`V` are not ASCII punctuation, so `escape_markdown`/`markdown_code_span`
         // leave them untouched — the rendered run is pinned to exactly
@@ -5067,7 +5216,7 @@ mod tests {
         let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
         let outcome = ScanOutcome::Vulnerable(dv);
         let mut markdown = HoverMarkdown::new();
-        push_vulnerability_hover_section(&mut markdown, &GO_STYLE_FORMATTER, Some(&outcome));
+        push_vulnerability_hover_section(&mut markdown, &GO_STYLE_FORMATTER, Some(&outcome), None);
 
         assert!(
             markdown.as_str().contains("v0.55.0"),
@@ -5105,7 +5254,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -5161,7 +5309,6 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -5197,8 +5344,8 @@ mod tests {
         // dependency's already-classified list. Every id here maps to `Informational`, so the
         // line must not render.
         use crate::osv::{
-            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-            VulnerabilityMap,
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
         };
 
         let parse_result = MockParseResult {
@@ -5216,17 +5363,24 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![advisory], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::CandidateVulnerable {
-                    version: "0.5.0".to_string(),
-                    advisory_ids: Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
-                },
             }),
+        );
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("yaml-rust"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "0.5.0".to_string(),
+                advisory_ids: Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Informational),
+            },
         );
 
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2).into(),
-            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulns)
+                .with_latest_status(&latest_status),
             &MockRegistry,
             &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
@@ -5251,8 +5405,8 @@ mod tests {
         // (non-Informational) one, the line must still render — a real
         // vulnerability signal must never be silently dropped.
         use crate::osv::{
-            Capped, DependencyVulnerabilities, ScanOutcome, UpgradeStatus, VulnSeverity,
-            VulnerabilityMap,
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
         };
 
         let parse_result = MockParseResult {
@@ -5272,23 +5426,30 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![informational_advisory, graded_advisory], 2),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::CandidateVulnerable {
-                    version: "2.0.0".to_string(),
-                    advisory_ids: Capped::new(
-                        vec![
-                            "RUSTSEC-2024-0320".to_string(),
-                            "RUSTSEC-2020-0071".to_string(),
-                        ],
-                        2,
-                    ),
-                },
             }),
+        );
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("mixed-pkg"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "2.0.0".to_string(),
+                advisory_ids: Capped::new(
+                    vec![
+                        "RUSTSEC-2024-0320".to_string(),
+                        "RUSTSEC-2020-0071".to_string(),
+                    ],
+                    2,
+                ),
+                worst_severity: Some(VulnSeverity::High),
+            },
         );
 
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2).into(),
-            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_vulnerabilities(&vulns)
+                .with_latest_status(&latest_status),
             &MockRegistry,
             &MOCK_FORMATTER,
             crate::FreshnessSettings::default(),
@@ -5356,7 +5517,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
         vulns.insert(patched_key, ScanOutcome::Clean);
@@ -5463,7 +5623,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
         vulns.insert(renamed_key, ScanOutcome::Clean);

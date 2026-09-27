@@ -472,7 +472,8 @@ mod tests {
                 version: "2.0.0".to_string(),
             });
 
-        let planned = plan_vulnerability_fix(&gl_dep, version_range, "1.0.0", &dv, &formatter());
+        let planned =
+            plan_vulnerability_fix(&gl_dep, version_range, "1.0.0", &dv, None, &formatter());
 
         assert_eq!(
             planned
@@ -975,6 +976,7 @@ mod tests {
             dep.version_range().expect("ref has a version range"),
             current,
             &dv,
+            None,
             &formatter(),
         );
 

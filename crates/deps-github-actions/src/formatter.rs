@@ -438,7 +438,7 @@ mod tests {
                 version: "v4".to_string(),
             });
 
-        let planned = plan_vulnerability_fix(*dep, version_range, "v3", &dv, &formatter());
+        let planned = plan_vulnerability_fix(*dep, version_range, "v3", &dv, None, &formatter());
 
         assert_eq!(
             planned
@@ -1204,6 +1204,7 @@ mod tests {
             d.version_range.expect("test dep has a version range"),
             "v4.2.0",
             &dv,
+            None,
             &fmt,
         );
 
@@ -1494,7 +1495,7 @@ mod tests {
                 version: "v5".to_string(),
             });
 
-        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, &formatter());
+        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, None, &formatter());
 
         assert_eq!(
             planned,

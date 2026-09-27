@@ -944,6 +944,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
+            None,
             &BundlerFormatter,
         );
 
@@ -1000,8 +1001,9 @@ mod tests {
                 version: "6.1.0".to_string(),
             });
 
-        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, &BundlerFormatter)
-            .expect("a non-interpolated multi-constraint requirement must be rewritable");
+        let planned =
+            plan_vulnerability_fix(*dep, version_range, current, &dv, None, &BundlerFormatter)
+                .expect("a non-interpolated multi-constraint requirement must be rewritable");
 
         assert_eq!(planned.edit.new_text, "6.1.0");
 
@@ -1055,6 +1057,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
+            None,
             &BundlerFormatter,
         );
 
@@ -1125,6 +1128,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
+            None,
             &BundlerFormatter,
         );
 

@@ -1447,7 +1447,14 @@ mod tests {
 
         let dv = vuln_fix_dv("3.12.0");
         assert_eq!(
-            plan_vulnerability_fix(&dep, version_range, "self.version", &dv, &ComposerFormatter),
+            plan_vulnerability_fix(
+                &dep,
+                version_range,
+                "self.version",
+                &dv,
+                None,
+                &ComposerFormatter
+            ),
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
             "self.version must never be overwritten with a literal fix version"
         );
@@ -1477,6 +1484,7 @@ mod tests {
                 version_range,
                 "dev-main as 1.0.0",
                 &dv,
+                None,
                 &ComposerFormatter
             ),
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
@@ -1505,7 +1513,14 @@ mod tests {
 
         let dv = vuln_fix_dv("3.0.2");
         assert_eq!(
-            plan_vulnerability_fix(&dep, version_range, "${PSR_LOG}", &dv, &ComposerFormatter),
+            plan_vulnerability_fix(
+                &dep,
+                version_range,
+                "${PSR_LOG}",
+                &dv,
+                None,
+                &ComposerFormatter
+            ),
             Err(deps_core::edit::VulnFixSkip::UnresolvedPlaceholder),
             "an unexpanded ${{VAR}} placeholder must never be overwritten with a literal fix \
              version"
@@ -1532,8 +1547,9 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("6.5.0");
-        let planned = plan_vulnerability_fix(&dep, version_range, "6.0.0", &dv, &ComposerFormatter)
-            .expect("a resolved requirement must still be rewritten to the fix version");
+        let planned =
+            plan_vulnerability_fix(&dep, version_range, "6.0.0", &dv, None, &ComposerFormatter)
+                .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "6.5.0");
     }
 

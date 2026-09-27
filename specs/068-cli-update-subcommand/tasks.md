@@ -330,7 +330,7 @@ security-sensitive decision from the architect/critic review rounds.
 **Spec reference**: [[spec#FR-008]] through [[spec#FR-015]]
 
 **Acceptance criteria**:
-- [ ] `crates/deps-cli/src/update/security.rs`: builds `osv_name_by_key(build_scan_targets(..))`, calls `collect_fix_target_resolutions` with an **empty** `latest_native_by_key`, runs `OsvClient::check_candidates`, then `apply_live_fix_target_statuses` — a code comment states explicitly *why* the map is empty (the CLI runs no phase B.1 shortcut; a populated map would resolve every fix target to `NotChecked` and suppress every fix) so a future reader does not "fix" it by populating the map
+- [ ] `crates/deps-cli/src/update/security.rs`: builds `osv_name_by_key(build_scan_targets(..))`, calls `collect_fix_target_resolutions` with the CLI's own real `latest_status: &osv::LatestStatusMap` (superseded by issue #1517: `analyze_manifest` now runs its own phase-B.1-equivalent latest-check, so this map is no longer deliberately left empty — see spec.md's amended FR-009), runs `OsvClient::check_candidates`, then `apply_live_fix_target_statuses`
 - [ ] For every dependency OSV classifies `Vulnerable`: call `plan_vulnerability_fix` with `recommended_fix()` as the target (never `latest`)
 - [ ] Yank filter: compare `formatter.osv_version_to_native(&fix.version)` against each entry's `ConcreteVersion::as_str()` in the cached `PackageVersions::yanked` list (using the normalized-then-raw name fallback for the lookup), gated on `RemovalStatus::blocks_resolution()` — matching `code_actions.rs:595-601`'s comparison form exactly (FR-012)
 - [ ] Two-signal `Unfixable` rule (FR-011): a dependency is `Unfixable` when it appears in `FetchResult::fetch_failed` **or** has no `PackageVersions` entry — both signals checked explicitly, with a code comment citing `fetch_and_classify_package` (`crates/deps-engine/src/classify/fetch.rs:605-825`) as the reason both are checked (load-bearing, not redundant). The same code comment (or an adjacent one) must note the resulting divergence from `deps-lsp` (critic finding N2): `deps-lsp` fails closed only on a *timed-out* fetch and leaves a plain fetch *failure* unfiltered (`code_actions.rs:590-604`, explicit that the two cases differ), whereas this two-signal rule fails closed on both. This is intentional (the CLI is strictly stricter, the safe direction) and must not be "aligned" with `deps-lsp`'s narrower behavior by a future refactor
@@ -443,9 +443,9 @@ last.
   per the original architecture handoff's "Implementation gotcha") — a
   `cargo build --workspace` after adding the `Update` variant is the fastest
   way to find every occurrence via compile errors.
-- T010: do not populate `latest_native_by_key` "to be safe" — an empty map
-  is the correct, deliberate choice (see acceptance criteria); populating
-  it silently suppresses every fix.
+- T010 (superseded by issue #1517): the map is no longer deliberately left
+  empty — `analyze_manifest` now runs its own real latest-check and passes
+  that populated `latest_status` map through (see spec.md's amended FR-009).
 - T011: `--dry-run` must still perform the TOCTOU re-read/compare (do not
   skip it "because nothing will be written anyway") — otherwise a
   `--dry-run` report can describe a plan that a following real run would

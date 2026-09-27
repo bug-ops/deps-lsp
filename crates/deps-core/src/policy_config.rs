@@ -410,6 +410,7 @@ impl DiagnosticsConfig {
             .with_deprecated(self.deprecated_severity)
             .with_mutable_ref_pin(self.mutable_ref_pin_severity)
             .with_mutable_ref_pin_enabled(self.mutable_ref_pin_enabled)
+            .with_vulnerabilities_enabled(self.vulnerabilities_enabled)
     }
 }
 

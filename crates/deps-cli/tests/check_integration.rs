@@ -926,7 +926,7 @@ mod tier3_wiring_regression {
     }
 
     /// Code review finding 6: `deps-cli update`'s default mode declares
-    /// `AnalysisScope::none()`, which must skip the tier-3 license prefetch even when a
+    /// `AnalysisScope::update_default()`, which must skip the tier-3 license prefetch even when a
     /// non-empty `license_policy` is configured — proving this is a genuinely separate gate
     /// from the pre-existing empty-policy short-circuit the test above covers, not the same
     /// mechanism under a different name. A `TestTier3Ecosystem::pending()` would hang this
@@ -956,12 +956,12 @@ mod tier3_wiring_regression {
                 &manifest_path,
                 "unused",
                 &ctx,
-                deps_cli::analyze::AnalysisScope::none(),
+                deps_cli::analyze::AnalysisScope::update_default(),
             ),
         )
         .await
         .expect(
-            "must not hang: AnalysisScope::none() must skip the tier-3 fetch regardless of \
+            "must not hang: AnalysisScope::update_default() must skip the tier-3 fetch regardless of \
              license_policy",
         )
         .expect("analyze_manifest must not fail for this fixture");

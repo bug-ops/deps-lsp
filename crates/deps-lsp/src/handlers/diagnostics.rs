@@ -284,6 +284,7 @@ pub(crate) async fn generate_diagnostics_internal(
             .snapshot()
             .with_resolved_version_candidates()
             .with_vulnerabilities()
+            .with_latest_status(severities.vulnerabilities_enabled && !offline)
             .with_outcomes()
             .with_license_prefetch()
             .with_typosquat_prefetch(typosquat_visibility)

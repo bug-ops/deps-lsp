@@ -134,13 +134,15 @@ pub async fn handle_document_open(
 
     state.update_document(uri.clone(), doc_state);
 
-    // Read before any OSV request is built, so disabling the feature suppresses the
-    // network call itself (FR-011).
+    // Read before any OSV request is built, so disabling the feature (or being offline)
+    // suppresses the network call itself (FR-011; issue #1517 critique S3 — an explicit
+    // offline condition must degrade phase A/B the same way disabling the feature already
+    // does, not attempt the network call and fail transiently instead).
     let (diagnostics_snapshot, vulnerabilities_enabled) = {
         let cfg = config.read().await;
         (
             diagnostics::DiagnosticsSnapshot::from_config(&cfg),
-            cfg.policy.diagnostics.vulnerabilities_enabled,
+            cfg.policy.diagnostics.vulnerabilities_enabled && !cfg.policy.network.offline,
         )
     };
 
@@ -504,24 +506,15 @@ async fn run_document_open_background_task(
     // above) and, only now that `cached_versions` holds the registry's
     // actual latest (not the lockfile-seeded placeholder — critique S1),
     // run phase B and commit before generating diagnostics.
-    if let Some(osv_task) = osv_task {
-        match osv_task.await {
-            Ok(Some(phase_a_result)) => {
-                let ecosystem_id = ecosystem.ecosystem_id();
-                run_osv_phase_b_and_commit(
-                    &uri,
-                    &state,
-                    ecosystem_id,
-                    ecosystem.formatter(),
-                    diagnostics_snapshot.fetch_timeout_secs,
-                    phase_a_result,
-                )
-                .await;
-            }
-            Ok(None) => {}
-            Err(e) => tracing::warn!("OSV scan task failed: {e}"),
-        }
-    }
+    await_and_commit_osv_phase_b(
+        osv_task,
+        &uri,
+        &state,
+        &client,
+        ecosystem.as_ref(),
+        diagnostics_snapshot.fetch_timeout_secs,
+    )
+    .await;
 
     // Join the tier-3 license pre-fetch too (round 3 finding #3), for the same reason:
     // its commit must land before this publish, not after. The typosquat pre-fetch,
@@ -884,12 +877,13 @@ pub(crate) async fn handle_document_change_guarded(
         return Ok(None);
     }
 
-    // Read before any OSV request is built (FR-011).
+    // Read before any OSV request is built (FR-011; issue #1517 critique S3 — see the
+    // open-path's identical read for why offline is folded in here too).
     let (diagnostics_snapshot, vulnerabilities_enabled) = {
         let cfg = config.read().await;
         (
             diagnostics::DiagnosticsSnapshot::from_config(&cfg),
-            cfg.policy.diagnostics.vulnerabilities_enabled,
+            cfg.policy.diagnostics.vulnerabilities_enabled && !cfg.policy.network.offline,
         )
     };
 
@@ -1013,6 +1007,24 @@ pub(crate) fn change_task_triggers(
     (needs_osv_rescan, needs_license_refresh)
 }
 
+/// Whether OSV phase A should run for this debounced edit (issue #1517 critique S5): either
+/// [`change_task_triggers`]'s own `needs_osv_rescan` fires, or a registry refetch is about to
+/// happen for at least one dependency for a reason `needs_osv_rescan`'s manifest-diff/lock-file
+/// signals never see at all — `RefetchPolicy::AllDependencies` (composer `minimum-stability`
+/// #1433, routing-only config changes #592) refetches every dependency's registry-cached
+/// "latest" without touching the manifest text or the lock file, so `needs_osv_rescan` alone
+/// would leave phase B never re-verifying a "latest" that may have just changed. Pulled out as
+/// a pure function for the same truth-table-testability reason [`change_task_triggers`] itself
+/// gives (issue #1407 R1).
+#[must_use]
+pub(crate) const fn osv_phase_a_should_run(
+    needs_osv_rescan: bool,
+    vulnerabilities_enabled: bool,
+    deps_to_fetch_is_empty: bool,
+) -> bool {
+    needs_osv_rescan || (vulnerabilities_enabled && !deps_to_fetch_is_empty)
+}
+
 /// Background task spawned by [`handle_document_change`] once the new document state has
 /// been committed: reloads lock-file-resolved versions, then runs the OSV rescan
 /// concurrently with any registry fetch the diff calls for, and finally publishes the
@@ -1131,10 +1143,14 @@ async fn run_document_change_task(
         doc.bump_resolved_generation(state.next_resolved_versions_generation());
     }
 
-    // Phase A OSV scan (only when a dependency was added or an existing one's version
-    // changed, or the lock file moved a resolved version underneath this edit — critique
-    // S1, issue #1399), spawned so it runs concurrently with the registry fetch below.
-    let osv_task = needs_osv_rescan.then(|| {
+    // Phase A OSV scan, spawned so it runs concurrently with the registry fetch below. See
+    // `osv_phase_a_should_run`'s own doc for the two independent triggers.
+    let should_run_osv_phase_a = osv_phase_a_should_run(
+        needs_osv_rescan,
+        config.vulnerabilities_enabled,
+        deps_to_fetch.is_empty(),
+    );
+    let osv_task = should_run_osv_phase_a.then(|| {
         tokio::spawn(
             run_osv_scan_phase_a(
                 uri.clone(),
@@ -1236,6 +1252,7 @@ async fn run_document_change_task(
             osv_task,
             &uri,
             &state,
+            &client,
             ecosystem.as_ref(),
             config.diagnostics.fetch_timeout_secs,
         )
@@ -1326,6 +1343,7 @@ async fn run_document_change_task(
         osv_task,
         &uri,
         &state,
+        &client,
         ecosystem.as_ref(),
         config.diagnostics.fetch_timeout_secs,
     )
@@ -1347,10 +1365,19 @@ async fn run_document_change_task(
 /// the outcome. Shared by both branches of [`run_document_change_task`] (nothing to fetch
 /// vs. a full registry fetch), which otherwise diverge before OSV handling but must treat
 /// it identically.
+///
+/// Issue #1517 (design point 5): the caller's own inlay-hint/code-lens refresh notification
+/// fires *before* this function's phase-B commit lands (it must, to show hints as early as
+/// possible for everything else phase B doesn't touch) — a client that re-requests hints in
+/// response to that notification would otherwise render the pre-phase-B (possibly
+/// still-"safe"-looking) state until some unrelated later event happens to refresh again. This
+/// function fires a second refresh itself, after phase B actually commits, so a flagged/
+/// malicious "latest" phase B just found is reflected without waiting on that.
 async fn await_and_commit_osv_phase_b(
     osv_task: Option<JoinHandle<Option<OsvScanResult>>>,
     uri: &Uri,
     state: &Arc<ServerState>,
+    client: &Client,
     ecosystem: &dyn Ecosystem,
     fetch_timeout_secs: u64,
 ) {
@@ -1369,6 +1396,7 @@ async fn await_and_commit_osv_phase_b(
                 phase_a_result,
             )
             .await;
+            state.spawn_refresh_requests(client);
         }
         Ok(None) => {}
         Err(e) => tracing::warn!("OSV scan task failed: {e}"),
@@ -1597,6 +1625,80 @@ pub(crate) async fn trigger_typosquat_prefetch_for_open_documents(
     }
 }
 
+/// Triggers an OSV phase A + phase B rescan for every currently open document (issue #1517
+/// critique S5) — intended to be called once, from `Backend::did_change_configuration`,
+/// exactly when the OSV latest-check becomes effectively enabled
+/// (`policy.diagnostics.vulnerabilities_enabled && !policy.network.offline` transitions from
+/// `false` to `true`), mirroring [`trigger_typosquat_prefetch_for_open_documents`]'s rationale:
+/// toggling either flag is not a parse-affecting config change (`config::reparse_scope`), so it
+/// schedules no reparse/refetch of its own, and without this trigger an already-open document's
+/// `latest_status` stays permanently empty (`Unverified` for every outdated dependency, per
+/// [`deps_core::lsp_helpers::latest_verdict`]'s fail-closed contract) until its next edit or
+/// reopen.
+///
+/// Unlike the typosquat/gossip triggers, this fires-and-forgets a single [`spawn_supervised`]
+/// task per document that runs phase A, then (if it produced a result) phase B, then republishes
+/// both the inlay-hint/code-lens refresh and diagnostics for that document — the full commit
+/// shape [`await_and_commit_osv_phase_b`] gives the ordinary edit paths, since a phase-B commit
+/// changes more than just the diagnostics set. Not registered with a generation-ordered task
+/// registry (unlike typosquat/gossip): this is a one-off catch-up per enable transition, not a
+/// per-edit debounced signal that a later edit could supersede, and every commit site it feeds
+/// is already staleness-guarded by `resolved_versions_generation`/content matching, so a document
+/// closed mid-rescan simply finds nothing left to commit against.
+pub(crate) async fn trigger_osv_rescan_for_open_documents(
+    state: &Arc<ServerState>,
+    client: &Client,
+    config: Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    for (uri, ecosystem) in open_documents_with_ecosystem(state) {
+        let state = Arc::clone(state);
+        let client = client.clone();
+        let config = Arc::clone(&config);
+        spawn_supervised(
+            async move {
+                let ecosystem_id = ecosystem.ecosystem_id();
+                let Some(phase_a_result) = run_osv_scan_phase_a(
+                    uri.clone(),
+                    Arc::clone(&state),
+                    Arc::clone(&ecosystem),
+                    fetch_timeout_secs,
+                )
+                .await
+                else {
+                    return;
+                };
+                run_osv_phase_b_and_commit(
+                    &uri,
+                    &state,
+                    ecosystem_id,
+                    ecosystem.formatter(),
+                    fetch_timeout_secs,
+                    phase_a_result,
+                )
+                .await;
+                state.spawn_refresh_requests(&client);
+                let dep_count = diagnostics::document_dependency_count(&state, &uri);
+                let snapshot = {
+                    let cfg = config.read().await;
+                    diagnostics::DiagnosticsSnapshot::from_config(&cfg)
+                };
+                diagnostics::publish_document_diagnostics(
+                    &state, &client, &uri, &snapshot, dep_count,
+                )
+                .await;
+            }
+            .instrument(tracing::Span::current()),
+            |e| {
+                tracing::error!(
+                    "OSV rescan-on-enable panicked ({e}); a document's latest-check status may \
+                     be stale until its next edit or reopen"
+                );
+            },
+        );
+    }
+}
+
 /// Ensures a document is loaded in state.
 ///
 /// If the document is not already in state, loads it from disk,
@@ -1775,6 +1877,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Issue #1517 critique S5: exhaustive truth table over `osv_phase_a_should_run`'s three
+    /// boolean inputs — phase A must run whenever either `needs_osv_rescan` fires, or
+    /// vulnerabilities checking is enabled and a registry refetch is actually about to happen
+    /// (`deps_to_fetch` non-empty), independent of `needs_osv_rescan`'s own manifest-diff/
+    /// lock-file-derived value.
+    #[test]
+    fn osv_phase_a_should_run_truth_table() {
+        for needs_osv_rescan in [false, true] {
+            for vulnerabilities_enabled in [false, true] {
+                for deps_to_fetch_is_empty in [false, true] {
+                    let actual = osv_phase_a_should_run(
+                        needs_osv_rescan,
+                        vulnerabilities_enabled,
+                        deps_to_fetch_is_empty,
+                    );
+                    let expected =
+                        needs_osv_rescan || (vulnerabilities_enabled && !deps_to_fetch_is_empty);
+                    assert_eq!(
+                        actual, expected,
+                        "mismatch for needs_osv_rescan={needs_osv_rescan} \
+                         vulnerabilities_enabled={vulnerabilities_enabled} \
+                         deps_to_fetch_is_empty={deps_to_fetch_is_empty}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Issue #1517 critique S5 (negative control): `RefetchPolicy::AllDependencies` refetches
+    /// every dependency's cached "latest" (composer `minimum-stability` #1433, routing-only
+    /// config changes #592) without touching the manifest text — `needs_osv_rescan` alone stays
+    /// `false` here, but phase A must still run because a non-empty `deps_to_fetch` means a
+    /// fresh "latest" is coming.
+    #[test]
+    fn osv_phase_a_should_run_true_for_all_dependencies_refetch_with_no_manifest_diff() {
+        assert!(osv_phase_a_should_run(
+            false, // needs_osv_rescan: no dependency add/version-change/lock-file move
+            true,  // vulnerabilities checking is enabled
+            false, // deps_to_fetch is non-empty (AllDependencies refetch)
+        ));
     }
 
     /// impl-critic S1 (#1433): a `minimum-stability`-only edit changes no dependency

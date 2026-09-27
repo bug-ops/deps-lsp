@@ -738,8 +738,9 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("1.2.0");
-        let planned = plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, &MavenFormatter)
-            .expect("a resolved requirement must still be rewritten to the fix version");
+        let planned =
+            plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, None, &MavenFormatter)
+                .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "1.2.0");
     }
 }

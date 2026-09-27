@@ -287,7 +287,9 @@ default mode:
 
 --security-only mode:
   osv_name_by_key(build_scan_targets(..))
-    -> collect_fix_target_resolutions (empty latest_native_by_key)
+    -> collect_fix_target_resolutions (analysis.latest_status: issue #1517 — the CLI's own
+       real LatestStatusMap from analyze_manifest's phase-B.1-equivalent latest-check, not a
+       deliberately-empty map)
     -> OsvClient::check_candidates
     -> apply_live_fix_target_statuses
     -> plan_vulnerability_fix per Vulnerable dependency

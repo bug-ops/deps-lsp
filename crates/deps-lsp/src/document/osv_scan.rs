@@ -3,7 +3,6 @@
 //! verification.
 
 use super::state::{ResolvedGeneration, ServerState};
-use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
@@ -54,11 +53,6 @@ pub(crate) struct OsvScanResult {
     vulnerabilities: deps_core::osv::VulnerabilityMap,
     /// `key -> osv_name`, needed to build phase B candidates.
     osv_name_by_key: HashMap<deps_core::osv::VulnKey, String>,
-    /// `key -> dep.name()` (raw, pre-normalization), the fallback
-    /// `cached_versions` lookup needs since that map is keyed by the raw
-    /// name while `key` is normalized (critique S2) — they differ for
-    /// Composer/Swift/NuGet-style ecosystems.
-    raw_name_by_key: HashMap<deps_core::osv::VulnKey, String>,
 }
 
 /// Phase A: builds scan targets, runs [`deps_core::osv::OsvClient::scan`], and
@@ -80,7 +74,7 @@ pub(crate) async fn run_osv_scan_phase_a(
 ) -> Option<OsvScanResult> {
     let ecosystem_id = ecosystem.ecosystem_id();
 
-    let (content_snapshot, resolved_generation, targets, mut vulnerabilities, raw_name_by_key) = {
+    let (content_snapshot, resolved_generation, targets, mut vulnerabilities) = {
         let doc = state.get_document(&uri)?;
         let parse_result = doc.parse_result()?;
         let (targets, skipped) = deps_engine::classify::osv::build_scan_targets(
@@ -90,31 +84,11 @@ pub(crate) async fn run_osv_scan_phase_a(
             ecosystem.formatter(),
             ecosystem_id,
         );
-        // Keyed the same way `targets`/`skipped` are (#394 S2: possibly
-        // version-qualified, not just the plain normalized name) so phase B's
-        // `raw_name_by_key.get(key)` fallback below still finds this
-        // occurrence's raw name when its key was disambiguated.
-        let vuln_keys = deps_core::osv::vulnerability_keys(
-            parse_result,
-            &doc.signals.resolved_versions,
-            Some(&doc.signals.resolved_version_candidates),
-            ecosystem.formatter(),
-            ecosystem_id,
-        );
-        let raw_name_by_key: HashMap<deps_core::osv::VulnKey, String> = parse_result
-            .dependencies()
-            .into_iter()
-            .map(|d| {
-                let key = deps_core::osv::vuln_key_for(d, Some(&vuln_keys), ecosystem.formatter());
-                (key, d.name().as_str().to_string())
-            })
-            .collect();
         (
             doc.content.clone(),
             doc.signals.resolved_versions_generation,
             targets,
             skipped,
-            raw_name_by_key,
         )
     };
 
@@ -142,7 +116,6 @@ pub(crate) async fn run_osv_scan_phase_a(
         resolved_generation,
         vulnerabilities,
         osv_name_by_key,
-        raw_name_by_key,
     })
 }
 
@@ -325,12 +298,14 @@ pub(crate) async fn run_license_prefetch(
 /// `deps-lsp`'s own tuning choice, not a shared default.
 const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
 
-/// Phase B: for every dependency phase A flagged [`deps_core::osv::ScanOutcome::Vulnerable`],
-/// checks whether the version currently recommended (the registry's latest,
-/// now that the registry fetch has resolved — critique S1) is itself
-/// affected (B.1), then independently verifies each dependency's recommended
-/// *fix target* F (B.2, #462 — see [`run_osv_fix_target_verification`]),
-/// before committing the result into `DocumentState.signals.vulnerabilities`.
+/// Phase B: checks whether the version currently recommended as "latest" is itself affected
+/// for **every** dependency with a registry-cached latest (B.1, issue #1517 — previously
+/// restricted to dependencies phase A already flagged
+/// [`deps_core::osv::ScanOutcome::Vulnerable`] at their *pinned* version, which let a
+/// cleanly-pinned dependency's malicious/vulnerable latest go completely unchecked), then
+/// independently verifies each vulnerable dependency's recommended *fix target* F (B.2, #462 —
+/// see [`run_osv_fix_target_verification`]), before committing both results into
+/// `DocumentState.signals.vulnerabilities`/`latest_status`.
 ///
 /// Must be called only *after* the registry fetch has updated
 /// `doc.signals.cached_versions`: calling it concurrently with that fetch (as the
@@ -349,8 +324,13 @@ const LICENSE_PREFETCH_CONCURRENCY: usize = 8;
 /// guard, so giving it its own full budget would both double phase B's
 /// worst-case wall-clock time (contradicting NFR-002's singular "existing...
 /// budget" framing) and widen the window in which a mid-scan edit discards
-/// this whole result, `upgrade_status` included. Sharing one deadline caps
-/// the total at the original ceiling, same as before this fix existed.
+/// this whole result. Sharing one deadline caps the total at the original
+/// ceiling, same as before this fix existed. A timeout partway through B.1 gives the
+/// unresolved targets a [`deps_core::osv::UpgradeStatus::CandidateUnverified`] entry in
+/// `latest_status` (never an absent one — see [`deps_core::osv::OsvClient::check_candidates`]'s
+/// own contract), which every renderer's [`deps_core::lsp_helpers::latest_verdict`] already
+/// treats as [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail-closed) — never
+/// silently "verified safe".
 pub(crate) async fn run_osv_phase_b_and_commit(
     uri: &Uri,
     state: &Arc<ServerState>,
@@ -366,70 +346,51 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         .map(|(key, _)| key.clone())
         .collect();
 
-    if !vulnerable_keys.is_empty() {
-        let phase_b_deadline = Instant::now()
-            + Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
+    let phase_b_deadline =
+        Instant::now() + Duration::from_secs(fetch_timeout_secs.min(OSV_SCAN_TIMEOUT_CEILING_SECS));
 
-        // B.1 (US-002, unchanged by #462): checks the registry's "latest" candidate.
-        // `latest_native_by_key` is kept for B.2 below, which needs the same native
-        // "latest" string to detect a fix target F that coincides with latest (FR-002)
-        // without re-deriving it from `doc.signals.cached_versions` a second time.
-        let latest_native_by_key: HashMap<deps_core::osv::VulnKey, String> = {
-            let Some(doc) = state.get_document(uri) else {
-                return;
-            };
-            vulnerable_keys
-                .iter()
-                .filter_map(|key| {
-                    let latest = doc
-                        .signals
-                        .cached_versions
-                        .get(key.as_str())
-                        .or_else(|| {
-                            let raw = result.raw_name_by_key.get(key)?;
-                            doc.signals.cached_versions.get(raw.as_str())
-                        })?
-                        .latest
-                        .clone();
-                    Some((key.clone(), latest.to_string()))
-                })
-                .collect()
+    // B.1 (issue #1517): latest-check targets for every registry dependency with a
+    // registry-cached latest, plus explicit structural skips — never only phase A's
+    // vulnerable subset. `vuln_keys` is recomputed fresh here (cheap, pure) rather than
+    // carried from phase A, since it must reflect the document as of *this* snapshot, not
+    // phase A's possibly-earlier one.
+    let (targets, mut latest_status) = {
+        let Some(doc) = state.get_document(uri) else {
+            return;
         };
+        let Some(parse_result) = doc.parse_result() else {
+            return;
+        };
+        let vuln_keys = deps_core::osv::vulnerability_keys(
+            parse_result,
+            &doc.signals.resolved_versions,
+            Some(&doc.signals.resolved_version_candidates),
+            formatter,
+            ecosystem_id,
+        );
+        deps_engine::classify::osv::build_latest_check_targets(
+            parse_result,
+            &doc.signals.cached_versions,
+            &vuln_keys,
+            formatter,
+        )
+    };
 
-        let candidates: Vec<deps_core::osv::ScanTarget> = vulnerable_keys
-            .iter()
-            .filter_map(|key| {
-                let osv_name = result.osv_name_by_key.get(key)?.clone();
-                let latest_native = ConcreteVersion::new(latest_native_by_key.get(key)?.clone());
-                Some(deps_core::osv::ScanTarget::from_native(
-                    key.clone(),
-                    osv_name,
-                    latest_native,
-                    formatter,
-                ))
-            })
-            .collect();
+    if !targets.is_empty() {
+        let timeout_duration = phase_b_deadline.saturating_duration_since(Instant::now());
+        let checked = state
+            .osv
+            .check_candidates(ecosystem_id, &targets, timeout_duration)
+            .await;
+        latest_status.extend(checked);
+    }
 
-        if !candidates.is_empty() {
-            let timeout_duration = phase_b_deadline.saturating_duration_since(Instant::now());
-            let statuses = state
-                .osv
-                .check_candidates(ecosystem_id, &candidates, timeout_duration)
-                .await;
-            for (key, status) in statuses {
-                if let Some(deps_core::osv::ScanOutcome::Vulnerable(dv)) =
-                    result.vulnerabilities.get_mut(&key)
-                {
-                    dv.upgrade_status = status;
-                }
-            }
-        }
-
+    if !vulnerable_keys.is_empty() {
         run_osv_fix_target_verification(
             &mut result.vulnerabilities,
             &vulnerable_keys,
             &result.osv_name_by_key,
-            &latest_native_by_key,
+            &latest_status,
             ecosystem_id,
             formatter,
             &state.osv,
@@ -449,6 +410,7 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             tracing::debug!("dropping stale OSV scan result: resolved versions changed mid-scan");
         } else {
             doc.update_vulnerabilities(result.vulnerabilities);
+            doc.update_latest_status(latest_status);
         }
     }
 }
@@ -464,8 +426,8 @@ pub(crate) async fn run_osv_phase_b_and_commit(
 /// only by a `// TODO(critic): ... see #216 critique D1` comment; now #462).
 ///
 /// Resolution order per dependency, cheapest first:
-/// 1. F equals the already-checked "latest" candidate (FR-002) — reuse `upgrade_status`,
-///    no extra call.
+/// 1. F equals the already-checked "latest" candidate (FR-002) — reuse that entry from the
+///    shared [`deps_core::osv::LatestStatusMap`] (issue #1517), no extra call.
 /// 2. Otherwise, queue a live [`deps_core::osv::OsvClient::check_candidates`] check for F,
 ///    batched into a single call across every dependency that reaches this branch (NFR-001)
 ///    — never one call per dependency. There is no data-derived shortcut here: a proof
@@ -488,7 +450,7 @@ async fn run_osv_fix_target_verification(
     vulnerabilities: &mut deps_core::osv::VulnerabilityMap,
     vulnerable_keys: &[deps_core::osv::VulnKey],
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
-    latest_native_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    latest_status: &deps_core::osv::LatestStatusMap,
     ecosystem_id: EcosystemId,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     osv: &deps_core::osv::OsvClient,
@@ -501,7 +463,7 @@ async fn run_osv_fix_target_verification(
             vulnerabilities,
             vulnerable_keys,
             osv_name_by_key,
-            latest_native_by_key,
+            latest_status,
             formatter,
         );
 
@@ -1136,6 +1098,104 @@ mod tests {
                 Some(&vec!["MIT".to_string()]),
                 "no intervening bump occurred, so the fetch's result must commit: {:?}",
                 doc.signals.licenses
+            );
+        }
+    }
+
+    /// Issue #1517 critique S6: no test covered the actual root-cause wiring — phase B
+    /// populating `latest_status` for a dependency phase A found *clean* (the #1517 bug
+    /// scenario: a pre-fix build only ever latest-checked dependencies phase A had already
+    /// flagged `Vulnerable`, so a cleanly-pinned dependency's malicious/vulnerable "latest"
+    /// went completely unchecked).
+    #[cfg(feature = "cargo")]
+    mod phase_b_latest_status_tests {
+        use super::super::super::state::DocumentState;
+        use super::*;
+        use deps_core::osv::{OsvClient, UpgradeStatus};
+        use std::assert_matches;
+
+        /// End to end: a registry-sourced Cargo dependency pinned at a clean version, with a
+        /// registry-cached "latest" that differs from it, against a mocked OSV.dev that
+        /// reports both the pinned version and the latest as clean. Phase A must find the
+        /// pinned version clean (not vulnerable), and phase B must still populate
+        /// `latest_status` with a `CandidateClean` entry for the *latest* version — the map
+        /// entry every renderer's `latest_verdict` gate depends on to ever render the update
+        /// as `Verified` rather than fail closed.
+        #[tokio::test]
+        async fn phase_b_populates_latest_status_for_a_phase_a_clean_dependency() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            // Both phase A's (pinned "1.0.0") and phase B's (latest "1.2.0") batch queries
+            // hit this same endpoint; mocked to report every queried version clean, so this
+            // one mock covers both calls (`.expect(2)`).
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect(2)
+                .create_async()
+                .await;
+
+            let mut state = ServerState::new();
+            state.osv = Arc::new(OsvClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            ));
+            let state = Arc::new(state);
+
+            let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+            let ecosystem = state
+                .ecosystem_registry
+                .for_uri(&url)
+                .expect("Cargo ecosystem not found");
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            let mut doc_state =
+                DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+            doc_state.update_resolved_versions(
+                HashMap::from([(PackageName::new("serde"), "1.0.0".into())]),
+                HashMap::new(),
+                state.next_resolved_versions_generation(),
+            );
+            doc_state.update_cached_versions(HashMap::from([(
+                PackageName::new("serde"),
+                deps_core::lsp_helpers::PackageVersions::latest_only("1.2.0"),
+            )]));
+            state.update_document(uri.clone(), doc_state);
+
+            let phase_a_result =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect("a registry dependency must produce a phase-A result");
+
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                phase_a_result,
+            )
+            .await;
+
+            let doc = state.get_document(&uri).unwrap();
+            assert_matches!(
+                doc.signals
+                    .vulnerabilities
+                    .get(&deps_core::test_util::vuln_key("serde")),
+                Some(deps_core::osv::ScanOutcome::Clean),
+                "phase A must find the pinned version clean: {:?}",
+                doc.signals.vulnerabilities
+            );
+            assert_matches!(
+                doc.signals
+                    .latest_status
+                    .get(&deps_core::test_util::vuln_key("serde")),
+                Some(UpgradeStatus::CandidateClean { version }) if version == "1.2.0",
+                "phase B must populate latest_status for a phase-A-clean dependency too \
+                 (issue #1517) — got: {:?}",
+                doc.signals.latest_status
             );
         }
     }

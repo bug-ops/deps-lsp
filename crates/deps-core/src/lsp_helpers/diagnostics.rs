@@ -19,7 +19,7 @@ use crate::{
 };
 
 use super::{
-    EcosystemFormatter, GossipCooldownLookup, PackageVersions, RequirementMatcher,
+    EcosystemFormatter, GossipCooldownLookup, LatestVerdict, PackageVersions, RequirementMatcher,
     RequirementStatus, VersionData, gossip_cooldown_for, resolve_scan_outcome,
     version_range_is_synthetic_empty,
 };
@@ -374,6 +374,17 @@ pub struct DiagnosticSeverities {
     /// additionally needs a real presence toggle, mirroring
     /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s shape.
     pub mutable_ref_pin_enabled: bool,
+    /// Whether OSV vulnerability checking is enabled at all (issue #1517), mirroring
+    /// `deps_lsp::config::DiagnosticsConfig::vulnerabilities_enabled`'s exact shape and
+    /// default (`true`, opt-out). Consulted by the `deps-lsp` diagnostics handler to decide
+    /// whether to attach [`crate::VersionData::latest_status`] at all: an *absent*
+    /// [`crate::osv::LatestStatusMap`] means "not applicable" (this flag is `false`, so phase
+    /// B never runs and there is nothing to verify), while a *present but empty* one means
+    /// "unverified — fail closed" (checking is on, phase B just hasn't committed yet). Bundled
+    /// here rather than threaded as a new parameter through `generate_diagnostics_internal`'s
+    /// many call sites, the same reasoning [`Self::mutable_ref_pin_enabled`] already
+    /// documents for its own on/off toggle.
+    pub vulnerabilities_enabled: bool,
 }
 
 impl Default for DiagnosticSeverities {
@@ -410,6 +421,7 @@ impl DiagnosticSeverities {
             deprecated: Severity::Warning,
             mutable_ref_pin: Severity::Hint,
             mutable_ref_pin_enabled: true,
+            vulnerabilities_enabled: true,
         }
     }
 
@@ -460,6 +472,13 @@ impl DiagnosticSeverities {
     #[must_use]
     pub const fn with_mutable_ref_pin_enabled(mut self, mutable_ref_pin_enabled: bool) -> Self {
         self.mutable_ref_pin_enabled = mutable_ref_pin_enabled;
+        self
+    }
+
+    /// Overrides [`Self::vulnerabilities_enabled`]. See [`Self::with_outdated`].
+    #[must_use]
+    pub const fn with_vulnerabilities_enabled(mut self, vulnerabilities_enabled: bool) -> Self {
+        self.vulnerabilities_enabled = vulnerabilities_enabled;
         self
     }
 }
@@ -1031,7 +1050,7 @@ pub fn generate_diagnostics_from_cache(
         {
             continue;
         }
-        apply_outdated_rule(&mut diagnostics, &ctx, &resolved);
+        apply_outdated_rule(&mut diagnostics, &ctx, &resolved, vuln_keys.as_ref());
     }
 
     push_collapsed_fetch_failures(&mut diagnostics, fetch_failed, uri);
@@ -2429,10 +2448,15 @@ fn apply_yanked_only_rule(
 /// gated on `ctx.freshness.enabled` + `package_versions.published_at` +
 /// `is_within_cooldown(age, cooldown_secs)`; **severity is identical in both cases**
 /// (already the floor — see the module docs).
+// TODO(critic): a semver range that already admits a flagged/unverified latest (e.g. `^1.0.4`
+// with no lockfile, registry latest 1.0.8 flagged) renders `UpToDate`/no diagnostic here, since
+// this rule only fires on `RequirementStatus::Outdated` — surface `LatestVerdict::Flagged`
+// for a requirement that admits a flagged latest too (#1517 D1).
 fn apply_outdated_rule(
     diagnostics: &mut Vec<Diagnostic>,
     ctx: &RuleContext<'_>,
     resolved: &ResolvedData<'_>,
+    vuln_keys: Option<&crate::osv::VulnKeys>,
 ) {
     let dep = ctx.dep;
     let package_versions = resolved.package_versions;
@@ -2449,6 +2473,18 @@ fn apply_outdated_rule(
         return;
     }
 
+    // Issue #1517: the single gate every "Outdated" surface must consult before treating
+    // `latest` as a safe upgrade recommendation — `Flagged`/`Unverified` never render the
+    // benign cooldown wording (AC7) and escalate severity instead of the configured
+    // `outdated` floor.
+    let verdict = crate::lsp_helpers::latest_verdict(
+        ctx.versions.latest_status,
+        dep,
+        vuln_keys,
+        ctx.normalized_name,
+        latest.as_str(),
+    );
+
     let published_at = ctx
         .freshness
         .enabled
@@ -2459,43 +2495,72 @@ fn apply_outdated_rule(
     // `Active` and `NotActive` skip the local heuristic entirely; only `Unavailable` (no
     // GOSSIP data for this version) falls back to it. Gated on `ctx.freshness.enabled` too
     // — disabling the freshness feature entirely disables this differentiation regardless
-    // of source, matching hover's identical gate.
-    let gossip_cooldown = ctx.freshness.enabled.then(|| {
-        gossip_cooldown_for(
-            ctx.versions.gossip_prefetch,
-            dep.name(),
-            latest.as_str(),
-            ctx.now,
-        )
-    });
+    // of source, matching hover's identical gate. Suppressed entirely when OSV already
+    // flagged this exact version (issue #1517 AC7) — a confirmed-unsafe version must never
+    // also read as a benign "recently published" notice.
+    let gossip_cooldown =
+        (ctx.freshness.enabled && !matches!(verdict, LatestVerdict::Flagged { .. })).then(|| {
+            gossip_cooldown_for(
+                ctx.versions.gossip_prefetch,
+                dep.name(),
+                latest.as_str(),
+                ctx.now,
+            )
+        });
     let latest =
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
-    let message = match gossip_cooldown {
-        Some(GossipCooldownLookup::Active) => format!(
-            "Newer version available: {latest} (deps.dev/GOSSIP reports this release is \
-             still within its cooldown window)"
-        ),
-        Some(GossipCooldownLookup::NotActive) => {
-            format!("Newer version available: {latest}")
+    let (message, severity) = match &verdict {
+        LatestVerdict::Flagged {
+            advisory_ids,
+            malicious,
+        } => {
+            let ids = if advisory_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", advisory_ids.join(", "))
+            };
+            let severity = if *malicious {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+            (
+                format!("Latest version {latest} is flagged by OSV{ids} — do not upgrade"),
+                severity,
+            )
         }
-        Some(GossipCooldownLookup::Unavailable) | None => match published_at {
-            Some(published_at)
-                if is_within_cooldown(
-                    published_at.age_secs_from(ctx.now),
-                    ctx.freshness.cooldown_secs,
-                ) =>
-            {
-                format!(
-                    "Newer version available: {latest} (published {} — still within the release cooldown window)",
-                    format_relative_age(published_at.age_secs_from(ctx.now))
-                )
-            }
-            _ => format!("Newer version available: {latest}"),
-        },
+        LatestVerdict::Unverified => (
+            format!("Newer version available: {latest} (not yet verified against OSV)"),
+            ctx.severities.outdated,
+        ),
+        LatestVerdict::Verified | LatestVerdict::NotApplicable => {
+            let message = match gossip_cooldown {
+                Some(GossipCooldownLookup::Active) => format!(
+                    "Newer version available: {latest} (deps.dev/GOSSIP reports this release is \
+                     still within its cooldown window)"
+                ),
+                Some(GossipCooldownLookup::NotActive) => {
+                    format!("Newer version available: {latest}")
+                }
+                Some(GossipCooldownLookup::Unavailable) | None => match published_at {
+                    Some(published_at)
+                        if is_within_cooldown(
+                            published_at.age_secs_from(ctx.now),
+                            ctx.freshness.cooldown_secs,
+                        ) =>
+                    {
+                        format!(
+                            "Newer version available: {latest} (published {} — still within the release cooldown window)",
+                            format_relative_age(published_at.age_secs_from(ctx.now))
+                        )
+                    }
+                    _ => format!("Newer version available: {latest}"),
+                },
+            };
+            (message, ctx.severities.outdated)
+        }
     };
-    diagnostics.push(
-        Diagnostic::new(resolved.version_range, message).with_severity(ctx.severities.outdated),
-    );
+    diagnostics.push(Diagnostic::new(resolved.version_range, message).with_severity(severity));
 }
 
 /// R8 — fetch-failure collapse (#479, #480 S2, #478/#485).
@@ -6017,6 +6082,208 @@ mod tests {
         );
     }
 
+    /// Issue #1517 (the P0 this fix addresses): a cleanly-pinned dependency whose `latest` OSV
+    /// found malicious must render an Error-severity "flagged" diagnostic — not the benign
+    /// "Newer version available" wording, and never a cooldown callout even when GOSSIP
+    /// independently reports one for the same version (AC7).
+    #[test]
+    fn test_generate_diagnostics_outdated_latest_flagged_malicious_renders_error() {
+        use crate::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "feed-widget-helper".into(),
+            PackageVersions {
+                latest: "1.0.8".into(),
+                available: Arc::from(vec!["1.0.8".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+
+        let mut gossip = HashMap::new();
+        gossip.insert(
+            PackageName::new("feed-widget-helper"),
+            crate::GossipFindings {
+                version: "1.0.8".to_string(),
+                cooldown: Some(crate::GossipCooldown {
+                    end: PublishTime::from_unix_secs(PublishTime::now().as_unix_secs() + 1_000),
+                    risk: crate::GossipRiskLevel::High,
+                }),
+                low_usage: None,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status)
+                .with_gossip_prefetch(&gossip),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Some(Severity::Error));
+        assert!(
+            diagnostics[0].message().contains("flagged by OSV"),
+            "got: {}",
+            diagnostics[0].message()
+        );
+        assert!(diagnostics[0].message().contains("MAL-2026-16332"));
+        assert!(
+            !diagnostics[0].message().contains("cooldown"),
+            "a confirmed-malicious latest must never read as a benign cooldown notice: {}",
+            diagnostics[0].message()
+        );
+    }
+
+    /// Non-malicious `Flagged` (e.g. a graded but non-critical vulnerability) renders at
+    /// Warning severity, not Error.
+    #[test]
+    fn test_generate_diagnostics_outdated_latest_flagged_non_malicious_renders_warning() {
+        use crate::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "pkg".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "2.0.0".to_string(),
+                advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
+                worst_severity: Some(VulnSeverity::High),
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
+        assert!(diagnostics[0].message().contains("flagged by OSV"));
+    }
+
+    /// Issue #1517 AC4: a `latest_status` map with no entry for this dependency (the
+    /// pre-phase-B window, or a transient skip) must fail closed — never render the plain
+    /// "Newer version available" wording that implies the upgrade was checked and is safe.
+    #[test]
+    fn test_generate_diagnostics_outdated_unverified_latest_appends_hint() {
+        use crate::osv::LatestStatusMap;
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "pkg".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+        // Empty map, not `None`: the pre-phase-B window attaches `Some(&empty_map)`.
+        let latest_status = LatestStatusMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(DiagnosticSeverities::default().outdated)
+        );
+        assert!(
+            diagnostics[0]
+                .message()
+                .contains("not yet verified against OSV"),
+            "got: {}",
+            diagnostics[0].message()
+        );
+    }
+
     /// Issue #1456 security/impl-critic review S2: GOSSIP data is present and version-
     /// matched but explicitly reports no cooldown at all (`cooldown: None`) — the message
     /// must NOT fall back to the local heuristic, even though the local `published_at`
@@ -7628,7 +7895,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -7679,7 +7945,6 @@ mod tests {
                     2,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -7751,7 +8016,6 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![std::sync::Arc::new(advisory)], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -7810,7 +8074,6 @@ mod tests {
                     2,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -7877,7 +8140,6 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(vec![advisory], 1),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -7933,7 +8195,6 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(advisories, 40),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -8015,7 +8276,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
         vulns.insert(patched_key, ScanOutcome::Clean);
@@ -8119,7 +8379,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
         vulns.insert(renamed_key, ScanOutcome::Clean);
