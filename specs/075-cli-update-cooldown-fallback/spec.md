@@ -13,6 +13,7 @@ created: 2026-09-27
 status: ready
 related:
   - "[[constitution]]"
+  - "[[076-cli-update-cooldown-fallback-no-lockfile/spec]]"
   - "[[074-deps-cli-gossip-parity/spec]]"
   - "[[072-deps-dev-gossip-signals/spec]]"
   - "[[068-cli-update-subcommand/spec]]"
@@ -172,6 +173,22 @@ encoded here).
 | FR-014 | THE SYSTEM SHALL update `SkipReason::WithinFreshnessCooldown`'s doc comment (`crates/deps-cli/src/update/mod.rs:129-139`) to reflect the new meaning: "nothing available clears cooldown (no fallback candidate, or the fallback itself does not clear the declared-requirement/in-use floor)" — its current "not guaranteed to self-resolve... starves a package" framing becomes stale once the fallback path exists | must |
 | FR-015 | `dedup_overlapping_edits` (or equivalent overlap-collapsing step) SHALL run AFTER the per-occurrence view selection (FR-007), over the chosen `PlannedUpdate`s only — never over both views' candidates | must |
 
+> [!info] Amended by [[076-cli-update-cooldown-fallback-no-lockfile/spec]]
+> **FR-002**: "no in-use version resolved... SHALL NOT compute a fallback" is no longer
+> categorical. Spec 076 extends the fallback to this case too (issue #1544), gated on the same
+> per-occurrence requirement-floor guard FR-003 originally introduced — now generalized as spec
+> 076 FR-023's `fallback_edit_excludes_newer`.
+>
+> **FR-003**: the `formatter.manifest_requirement_is_resolved_version(dep)` exception (the Go
+> `require`-directive bypass) is REMOVED by spec 076 FR-022 — Go's `ExactMatcher` alone (no bypass)
+> is sufficient once spec 076's guard ships; the exception guarded an unreachable branch. The
+> compiled-matcher check this FR introduced is itself superseded by spec 076 FR-023/FR-024's
+> re-parse-based `fallback_edit_excludes_newer`, which validates the manifest's EFFECTIVE post-edit
+> requirement (after applying the candidate edit and re-parsing) rather than compiling the
+> declared requirement's text directly — spec 076's own round-2 review found that compiling text
+> directly is wrong for some grammars (Swift's `from:`/`.exact`/`.upToNextMinor` labels, Bundler's
+> multi-constraint literals).
+
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
@@ -182,6 +199,23 @@ encoded here).
 | NFR-004 | Performance | The FR-010 OSV round costs zero extra network calls on a typical run: it is gated on `AnalysisScope::cooldown_fallback` (only set for `update`'s default mode) and only fires for occurrences where `cooldown_disposition` already found `Blocked { fallback: Some(_) }` in a first pass |
 | NFR-005 | Compatibility | FR-013's `cooldown_fallback` JSON field is additive (omitted when `None`) — NOT a breaking change (OQ6). It is documented in `CHANGELOG.md` under `### Changed`, not `### Breaking`, alongside: (a) the FR-005 GOSSIP-wording change (a version with no parsed cooldown `end` no longer reads as an authoritative "not in cooldown" in `check`/hover/diagnostics text), and (b) spec 074 FR-003b's behavior for a no-lockfile dependency whose `latest` is GOSSIP-`Active`: `update` now skips it (`WithinFreshnessCooldown`) instead of applying it, per NFR-001 step 2 combined with FR-002's "no floor, no fallback" rule |
 | NFR-006 | Testability | Every row of §6's decision table SHALL be reachable by an existing or new test named in §7's traceability table — no row may be asserted only by code inspection |
+
+> [!info] Amended by [[076-cli-update-cooldown-fallback-no-lockfile/spec]]
+> **NFR-001 step 4**: the fallback selection criteria "FR-002 (in-use floor)... FR-003 (per-occurrence
+> requirement floor)" is superseded — the in-use floor now has a third state (no in-use version
+> resolved is no longer an unconditional exclusion, spec 076 FR-016/FR-017), and the requirement
+> floor is spec 076 FR-023/FR-024's re-parse-based `fallback_edit_excludes_newer`, applied
+> identically to this spec's lockfile-resolved path and spec 076's no-lockfile path.
+>
+> **NFR-005(b)**: the no-lockfile GOSSIP-`Active`-dependency behavior described here ("`update` now
+> skips it... instead of applying it, per NFR-001 step 2 combined with FR-002's 'no floor, no
+> fallback' rule") is superseded a second time. Spec 076 potentially restores "applied" for this
+> case — but ONLY when spec 076 FR-023's guard passes for that dependency's ecosystem/requirement
+> shape (the common case for npm/Composer/Bundler/Go/Maven/Gradle/NuGet; conditional for
+> Cargo/Dart/PyPI/Swift depending on whether a known newer version falls inside or outside the
+> written range, spec 076 FR-025). It remains "skipped" whenever that guard fails. This is a further
+> `### Fixed`/`### Changed` `CHANGELOG.md` entry once spec 076 ships, not a reversion of this
+> line's original `### Changed` entry.
 
 ## 5. Data Model
 
