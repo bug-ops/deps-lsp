@@ -246,80 +246,56 @@ async fn run_document_open_background_task(
         doc.update_cached_versions(cached_versions_from_lockfile(&instant_resolved));
     }
 
-    // Phase A OSV scan, spawned so it runs concurrently with the
-    // registry fetch below rather than gating the inlay-hint refresh
-    // that must happen immediately after it (critique S2).
-    let osv_task = vulnerabilities_enabled.then(|| {
-        tokio::spawn(
-            run_osv_scan_phase_a(
-                uri.clone(),
-                Arc::clone(&state),
-                Arc::clone(&ecosystem),
-                diagnostics_snapshot.fetch_timeout_secs,
-            )
-            .instrument(tracing::Span::current()),
-        )
-    });
-
-    // Tier-3 license pre-fetch (issue #660), spawned concurrently with the registry
-    // fetch below, same shape as OSV phase A — joined (round 3 finding #3) just before
-    // this function's diagnostics publish so a tier-3 license-policy violation can
-    // appear in the *first* publish after this open, not only whenever some later,
-    // unrelated event happens to regenerate diagnostics. No-op for every ecosystem but
-    // Dart/Swift/Gradle/Deno.
-    let license_task = tokio::spawn(
-        run_license_prefetch(
-            uri.clone(),
-            Arc::clone(&state),
-            Arc::clone(&ecosystem),
-            diagnostics_snapshot.fetch_timeout_secs,
-        )
-        .instrument(tracing::Span::current()),
+    // Phase A OSV scan and tier-3 license pre-fetch (issue #660), both spawned so they run
+    // concurrently with the registry fetch below rather than gating the inlay-hint refresh
+    // that must happen immediately after (critique S2). The license pre-fetch is joined
+    // (round 3 finding #3) just before this function's diagnostics publish so a tier-3
+    // license-policy violation can appear in the *first* publish after this open, not only
+    // whenever some later, unrelated event happens to regenerate diagnostics; a no-op for
+    // every ecosystem but Dart/Swift/Gradle/Deno. The open path always runs both (no prior
+    // state to gate against) — see `spawn_osv_and_license_prefetch`'s own doc for the
+    // change-task counterpart, which gates each independently.
+    let (osv_task, license_task) = spawn_osv_and_license_prefetch(
+        &uri,
+        &state,
+        &ecosystem,
+        diagnostics_snapshot.fetch_timeout_secs,
+        PrefetchGates {
+            run_osv: vulnerabilities_enabled,
+            run_license: true,
+        },
     );
 
     // Typosquat pre-fetch (issue #1437) — unlike `license_task` above, deliberately *not*
     // joined before this function's diagnostics publish (impl-critic N2). See
-    // `spawn_typosquat_prefetch_and_republish`'s own doc for why. Always spawns (the open
-    // path has no previous state to gate against), but still seeds
+    // `spawn_typosquat_prefetch_and_republish`'s own doc for why. Forced (the open path has
+    // no previous state to gate against), but still seeds
     // `PackageSignals::typosquat_checked_names` from the just-opened content (issue #1455
     // critic S1) so the *first* debounced edit afterward compares against a real baseline
     // instead of an empty one, which would otherwise make that first edit's gate fire even
     // for a version-only change.
-    if let Some(mut doc) = state.documents.get_mut(&uri) {
-        let current_names = current_declared_names(&doc, ecosystem.formatter());
-        doc.signals
-            .typosquat_checked_names
-            .refresh_from(current_names);
-    }
-    // Drawn synchronously, immediately before spawning (issue #1455 critic M2) — see
-    // `ServerState::next_typosquat_task_generation`'s own doc for why the ordering matters.
-    let typosquat_generation = state.next_typosquat_task_generation();
-    let typosquat_task = spawn_typosquat_prefetch_and_republish(
-        uri.clone(),
-        Arc::clone(&state),
-        client.clone(),
-        Arc::clone(&ecosystem),
-        Arc::clone(&config),
+    refresh_and_maybe_spawn_typosquat(
+        &uri,
+        &state,
+        &client,
+        &ecosystem,
+        &config,
         diagnostics_snapshot.fetch_timeout_secs,
-    );
-    state
-        .track_typosquat_task(uri.clone(), typosquat_generation, typosquat_task)
-        .await;
+        true,
+    )
+    .await;
 
     // GOSSIP pre-fetch (issue #1456, spec 072) — same detached, self-guarded shape as the
     // typosquat pre-fetch above, including task tracking (finding #4).
-    let gossip_generation = state.next_gossip_task_generation();
-    let gossip_task = spawn_gossip_prefetch_and_republish(
-        uri.clone(),
-        Arc::clone(&state),
-        client.clone(),
-        Arc::clone(&ecosystem),
-        Arc::clone(&config),
+    spawn_and_track_gossip(
+        &uri,
+        &state,
+        &client,
+        &ecosystem,
+        &config,
         diagnostics_snapshot.fetch_timeout_secs,
-    );
-    state
-        .track_gossip_task(uri.clone(), gossip_generation, gossip_task)
-        .await;
+    )
+    .await;
 
     // Collect dependency names+sources, the in-use-version map (§4.6), and the manifest's own
     // `SelectionContext` (#1433) in one pass while holding the reference (can't hold across
@@ -534,7 +510,7 @@ async fn run_document_open_background_task(
     // its commit must land before this publish, not after. The typosquat pre-fetch,
     // spawned above via `spawn_typosquat_prefetch_and_republish`, is deliberately *not*
     // joined here (impl-critic N2) — it republishes on its own once it resolves.
-    await_license_prefetch(Some(license_task)).await;
+    await_license_prefetch(license_task).await;
 
     // Publish diagnostics (may be slower, runs after hints are already visible)
     diagnostics::publish_document_diagnostics(
@@ -1039,6 +1015,123 @@ pub(crate) const fn osv_phase_a_should_run(
     needs_osv_rescan || (vulnerabilities_enabled && !deps_to_fetch_is_empty)
 }
 
+/// Which of [`spawn_osv_and_license_prefetch`]'s two independent spawns should run — named
+/// fields instead of two adjacent same-typed `bool` parameters, which would otherwise invite
+/// the transposition risk this PR fixes elsewhere via `ResolvedPick` (fetch.rs).
+struct PrefetchGates {
+    run_osv: bool,
+    run_license: bool,
+}
+
+/// Spawns the OSV phase-A scan and the tier-3 license pre-fetch per `gates`, extracted from
+/// [`run_document_open_background_task`] and [`run_document_change_task`] (issue #1560): the
+/// two spawn blocks were near-identical, differing only in which boolean gates each spawn —
+/// the open task always runs the license pre-fetch (`run_license: true`) and gates OSV on
+/// `vulnerabilities_enabled` alone, while the change task gates both independently
+/// ([`osv_phase_a_should_run`] and `needs_license_refresh`).
+fn spawn_osv_and_license_prefetch(
+    uri: &Uri,
+    state: &Arc<ServerState>,
+    ecosystem: &Arc<dyn Ecosystem>,
+    fetch_timeout_secs: u64,
+    gates: PrefetchGates,
+) -> (
+    Option<JoinHandle<Option<OsvScanResult>>>,
+    Option<JoinHandle<()>>,
+) {
+    let osv_task = gates.run_osv.then(|| {
+        tokio::spawn(
+            run_osv_scan_phase_a(
+                uri.clone(),
+                Arc::clone(state),
+                Arc::clone(ecosystem),
+                fetch_timeout_secs,
+            )
+            .instrument(tracing::Span::current()),
+        )
+    });
+
+    let license_task = gates.run_license.then(|| {
+        tokio::spawn(
+            run_license_prefetch(
+                uri.clone(),
+                Arc::clone(state),
+                Arc::clone(ecosystem),
+                fetch_timeout_secs,
+            )
+            .instrument(tracing::Span::current()),
+        )
+    });
+
+    (osv_task, license_task)
+}
+
+/// Refreshes `PackageSignals::typosquat_checked_names` from the document's current declared
+/// names, then spawns and tracks the typosquat pre-fetch (issue #1437) when `force` is true
+/// or the refresh itself detected a change — extracted from
+/// [`run_document_open_background_task`] and [`run_document_change_task`] (issue #1560): the
+/// open path forces a spawn (no prior state to diff against, `force: true`), the change path
+/// only spawns on an actual name-set drift (issue #1455 batch item 1, `force: false`).
+async fn refresh_and_maybe_spawn_typosquat(
+    uri: &Uri,
+    state: &Arc<ServerState>,
+    client: &Client,
+    ecosystem: &Arc<dyn Ecosystem>,
+    config: &Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+    force: bool,
+) {
+    let names_changed = state.documents.get_mut(uri).is_some_and(|mut doc| {
+        let current_names = current_declared_names(&doc, ecosystem.formatter());
+        doc.signals
+            .typosquat_checked_names
+            .refresh_from(current_names)
+    });
+
+    if force || names_changed {
+        // Drawn synchronously, immediately before spawning (issue #1455 critic M2) — see
+        // `ServerState::next_typosquat_task_generation`'s own doc for why the ordering
+        // matters.
+        let typosquat_generation = state.next_typosquat_task_generation();
+        let typosquat_task = spawn_typosquat_prefetch_and_republish(
+            uri.clone(),
+            Arc::clone(state),
+            client.clone(),
+            Arc::clone(ecosystem),
+            Arc::clone(config),
+            fetch_timeout_secs,
+        );
+        state
+            .track_typosquat_task(uri.clone(), typosquat_generation, typosquat_task)
+            .await;
+    }
+}
+
+/// Spawns and tracks the GOSSIP pre-fetch (issue #1456, spec 072) — extracted from
+/// [`run_document_open_background_task`] and [`run_document_change_task`] (issue #1560):
+/// identical, unconditional shape in both.
+async fn spawn_and_track_gossip(
+    uri: &Uri,
+    state: &Arc<ServerState>,
+    client: &Client,
+    ecosystem: &Arc<dyn Ecosystem>,
+    config: &Arc<RwLock<DepsConfig>>,
+    fetch_timeout_secs: u64,
+) {
+    let gossip_generation = state.next_gossip_task_generation();
+    let gossip_task = spawn_gossip_prefetch_and_republish(
+        uri.clone(),
+        Arc::clone(state),
+        client.clone(),
+        Arc::clone(ecosystem),
+        Arc::clone(config),
+        fetch_timeout_secs,
+    );
+    state
+        .track_gossip_task(uri.clone(), gossip_generation, gossip_task)
+        .await;
+}
+
 /// Background task spawned by [`handle_document_change`] once the new document state has
 /// been committed: reloads lock-file-resolved versions, then runs the OSV rescan
 /// concurrently with any registry fetch the diff calls for, and finally publishes the
@@ -1158,42 +1251,29 @@ async fn run_document_change_task(
     }
 
     // Phase A OSV scan, spawned so it runs concurrently with the registry fetch below. See
-    // `osv_phase_a_should_run`'s own doc for the two independent triggers.
+    // `osv_phase_a_should_run`'s own doc for the two independent triggers. Tier-3 license
+    // pre-fetch (issue #660/#1407) gated on `needs_license_refresh` — fires from either a
+    // manifest-diff-level dependency add/version-change or a lock-only drift
+    // (`change_task_triggers`'s `any_resolved_move`), independently of the OSV gate. Joined
+    // (round 3 finding #3) via `await_license_prefetch` below, same shape as `osv_task`, so
+    // its commit lands before either of this function's diagnostics publishes, not after.
+    // See `spawn_osv_and_license_prefetch`'s own doc for the open-task counterpart, which
+    // always runs both.
     let should_run_osv_phase_a = osv_phase_a_should_run(
         needs_osv_rescan,
         config.vulnerabilities_enabled,
         deps_to_fetch.is_empty(),
     );
-    let osv_task = should_run_osv_phase_a.then(|| {
-        tokio::spawn(
-            run_osv_scan_phase_a(
-                uri.clone(),
-                Arc::clone(&state),
-                Arc::clone(&ecosystem),
-                config.diagnostics.fetch_timeout_secs,
-            )
-            .instrument(tracing::Span::current()),
-        )
-    });
-
-    // Tier-3 license pre-fetch (issue #660/#1407), gated on `needs_license_refresh` —
-    // fires from either a manifest-diff-level dependency add/version-change or a
-    // lock-only drift (`change_task_triggers`'s `any_resolved_move`), same trigger shape
-    // as `osv_task` above but independently gated on ecosystem/policy instead of
-    // `vulnerabilities_enabled`. Joined (round 3 finding #3) via `await_license_prefetch`
-    // below, same shape as `osv_task`, so its commit lands before either of this
-    // function's diagnostics publishes below, not after.
-    let license_task = needs_license_refresh.then(|| {
-        tokio::spawn(
-            run_license_prefetch(
-                uri.clone(),
-                Arc::clone(&state),
-                Arc::clone(&ecosystem),
-                config.diagnostics.fetch_timeout_secs,
-            )
-            .instrument(tracing::Span::current()),
-        )
-    });
+    let (osv_task, license_task) = spawn_osv_and_license_prefetch(
+        &uri,
+        &state,
+        &ecosystem,
+        config.diagnostics.fetch_timeout_secs,
+        PrefetchGates {
+            run_osv: should_run_osv_phase_a,
+            run_license: needs_license_refresh,
+        },
+    );
 
     // Typosquat pre-fetch (issue #1437), gated on the declared name set actually having
     // drifted from `PackageSignals::typosquat_checked_names` (issue #1455 batch item 1,
@@ -1207,42 +1287,29 @@ async fn run_document_change_task(
     // this remains a no-op spawn for the common (disabled) case, same as the open-path spawn.
     // Deliberately *not* joined before either of this function's diagnostics publishes below
     // (impl-critic N2) — see `spawn_typosquat_prefetch_and_republish`'s own doc for why.
-    let typosquat_names_changed = state.documents.get_mut(&uri).is_some_and(|mut doc| {
-        let current_names = current_declared_names(&doc, ecosystem.formatter());
-        doc.signals
-            .typosquat_checked_names
-            .refresh_from(current_names)
-    });
-    if typosquat_names_changed {
-        let typosquat_generation = state.next_typosquat_task_generation();
-        let typosquat_task = spawn_typosquat_prefetch_and_republish(
-            uri.clone(),
-            Arc::clone(&state),
-            client.clone(),
-            Arc::clone(&ecosystem),
-            Arc::clone(&live_config),
-            config.diagnostics.fetch_timeout_secs,
-        );
-        state
-            .track_typosquat_task(uri.clone(), typosquat_generation, typosquat_task)
-            .await;
-    }
+    refresh_and_maybe_spawn_typosquat(
+        &uri,
+        &state,
+        &client,
+        &ecosystem,
+        &live_config,
+        config.diagnostics.fetch_timeout_secs,
+        false,
+    )
+    .await;
 
     // GOSSIP pre-fetch (issue #1456, spec 072) — same unconditional, self-guarded,
     // not-joined-before-publish shape as the typosquat pre-fetch above, including task
     // tracking (finding #4).
-    let gossip_generation = state.next_gossip_task_generation();
-    let gossip_task = spawn_gossip_prefetch_and_republish(
-        uri.clone(),
-        Arc::clone(&state),
-        client.clone(),
-        Arc::clone(&ecosystem),
-        Arc::clone(&live_config),
+    spawn_and_track_gossip(
+        &uri,
+        &state,
+        &client,
+        &ecosystem,
+        &live_config,
         config.diagnostics.fetch_timeout_secs,
-    );
-    state
-        .track_gossip_task(uri.clone(), gossip_generation, gossip_task)
-        .await;
+    )
+    .await;
 
     // Known limitation (#424 N2): editing composer.json's `minimum-stability` field alone
     // adds no dependency and changes no requirement string, so `deps_to_fetch` stays empty

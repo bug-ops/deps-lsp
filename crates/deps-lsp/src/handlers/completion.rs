@@ -786,39 +786,8 @@ mod tests {
     async fn test_completion_missing_document_reports_incomplete_for_flagged_ecosystem() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version};
+        use deps_core::{Ecosystem, EcosystemFormatter, ParseResult, Registry};
         use std::any::Any;
-
-        struct NoopRegistry;
-        impl Registry for NoopRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         /// Stands in for `PypiEcosystem`: overrides `package_search_is_incomplete`
         /// the same way, and `generate_completions` is deliberately `unimplemented!()`
@@ -844,7 +813,7 @@ mod tests {
                 Box::pin(async move { unimplemented!() })
             }
             fn registry(&self) -> Arc<dyn Registry> {
-                Arc::new(NoopRegistry)
+                Arc::new(deps_core::test_util::MockRegistry::new())
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
                 &deps_core::test_util::StubFormatter::DEFAULT
@@ -1972,43 +1941,10 @@ mod tests {
     #[tokio::test]
     async fn test_completion_freshness_enabled_live_reload_changes_label_details_on_next_request() {
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{
-            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
-        };
+        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
         use std::any::Any;
         use std::path::Path;
         use tower_lsp_server::ls_types::CompletionItemLabelDetails;
-
-        struct NoopRegistry;
-        impl Registry for NoopRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         /// Stands in for a real ecosystem's `generate_completions`, echoing whatever
         /// `freshness.is_enabled()` it was called with into `label_details` — exactly the
@@ -2035,7 +1971,7 @@ mod tests {
                 Box::pin(async move { unimplemented!() })
             }
             fn registry(&self) -> Arc<dyn Registry> {
-                Arc::new(NoopRegistry)
+                Arc::new(deps_core::test_util::MockRegistry::new())
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
                 &deps_core::test_util::StubFormatter::DEFAULT
@@ -2196,41 +2132,14 @@ ser"
     /// either way.
     #[tokio::test]
     async fn test_fallback_completion_rejects_single_cjk_char_prefix() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("guard must short-circuit before reaching registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), Some("日"));
+        let state = mock_cargo_state(
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Panic(
+                    "guard must short-circuit before reaching registry search",
+                ),
+            )),
+            Some("日"),
+        );
         let items =
             fallback_completion(&state, EcosystemId::Cargo, Position::new(1, 1), "unused").await;
         assert!(items.is_empty());
@@ -2244,42 +2153,15 @@ ser"
     /// the upper bound regresses.
     #[tokio::test]
     async fn test_fallback_completion_rejects_prefix_over_200_chars() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("guard must short-circuit before reaching registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
         let long_prefix: &'static str = Box::leak("a".repeat(201).into_boxed_str());
-        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), Some(long_prefix));
+        let state = mock_cargo_state(
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Panic(
+                    "guard must short-circuit before reaching registry search",
+                ),
+            )),
+            Some(long_prefix),
+        );
         let items =
             fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
         assert!(items.is_empty());
@@ -2291,72 +2173,15 @@ ser"
     /// of exactly 200 chars is still accepted and reaches the registry.
     #[tokio::test]
     async fn test_fallback_completion_accepts_prefix_at_200_char_boundary() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct MockMetadata {
-            name: deps_core::PackageName,
-            latest_version: deps_core::ConcreteVersion,
-        }
-        impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct StubRegistry;
-        impl Registry for StubRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("serde"),
-                        latest_version: "1.0.0".into(),
-                    }) as Box<dyn Metadata>])
-                })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
         let boundary_prefix: &'static str = Box::leak("a".repeat(200).into_boxed_str());
-        let state = mock_cargo_state(Arc::new(StubRegistry), Some(boundary_prefix));
+        let state = mock_cargo_state(
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Results(vec![
+                    deps_core::test_util::MockMetadata::new("serde", "1.0.0"),
+                ]),
+            )),
+            Some(boundary_prefix),
+        );
         let items =
             fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
         assert_eq!(items.len(), 1);
@@ -2364,49 +2189,18 @@ ser"
 
     #[tokio::test]
     async fn test_fallback_completion_passes_two_char_prefixes_to_search() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct StubRegistry;
-        impl Registry for StubRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("serde"),
-                        latest_version: "1.0.0".into(),
-                    }) as Box<dyn Metadata>])
-                })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
+        fn stub_registry() -> Arc<dyn deps_core::Registry> {
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Results(vec![
+                    deps_core::test_util::MockMetadata::new("serde", "1.0.0"),
+                ]),
+            ))
         }
 
         // Two CJK characters: byte count (6) and char count (2) agree, so this was
         // never affected by the byte-length bug, but it must keep passing through to
         // search.
-        let cjk_state = mock_cargo_state(Arc::new(StubRegistry), Some("日本"));
+        let cjk_state = mock_cargo_state(stub_registry(), Some("日本"));
         let cjk_items = fallback_completion(
             &cjk_state,
             EcosystemId::Cargo,
@@ -2419,7 +2213,7 @@ ser"
 
         // Two ASCII chars: regression check that the char-count guard didn't change
         // behavior for the common case.
-        let ascii_state = mock_cargo_state(Arc::new(StubRegistry), Some("se"));
+        let ascii_state = mock_cargo_state(stub_registry(), Some("se"));
         let ascii_items = fallback_completion(
             &ascii_state,
             EcosystemId::Cargo,
@@ -2433,41 +2227,14 @@ ser"
 
     #[tokio::test]
     async fn test_fallback_completion_rejects_prefix_with_equals() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("guard must short-circuit before reaching registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), Some("se = \"1.0"));
+        let state = mock_cargo_state(
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Panic(
+                    "guard must short-circuit before reaching registry search",
+                ),
+            )),
+            Some("se = \"1.0"),
+        );
         let items =
             fallback_completion(&state, EcosystemId::Cargo, Position::new(1, 9), "unused").await;
         assert!(items.is_empty());
@@ -2481,42 +2248,12 @@ ser"
     /// reaches the registry after all.
     #[tokio::test]
     async fn test_fallback_completion_rejects_credential_bearing_prefix() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("guard must short-circuit before reaching registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
         let state = mock_cargo_state(
-            Arc::new(PanicsIfSearchedRegistry),
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Panic(
+                    "guard must short-circuit before reaching registry search",
+                ),
+            )),
             Some("deploy:AUDITSENTINEL0000@git.internal.corp/team/x"),
         );
         let items =
@@ -2535,49 +2272,14 @@ ser"
     /// `bare = true` at all, since `mock_cargo_state` always builds `is_bare: false`).
     #[tokio::test]
     async fn test_fallback_completion_bare_routes_through_to_fallback_bare_insert_text() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct StubRegistry;
-        impl Registry for StubRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("guava"),
-                        latest_version: "33.0.0".into(),
-                    }) as Box<dyn Metadata>])
-                })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
         let state = ServerState::new();
         state.ecosystem_registry.register(Arc::new(MockEcosystem {
             ecosystem_id: deps_core::EcosystemId::Cargo,
-            registry: Arc::new(StubRegistry),
+            registry: Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Results(vec![
+                    deps_core::test_util::MockMetadata::new("guava", "33.0.0"),
+                ]),
+            )),
             fallback_prefix: Some("gua"),
             insert_text: |_| panic!("bare=true must not call completion_insert_text"),
             is_bare: true,
@@ -2599,41 +2301,14 @@ ser"
     /// `test_fallback_completion_maven_in_open_group_id_tag_suppresses_item`).
     #[tokio::test]
     async fn test_fallback_completion_none_prefix_never_reaches_registry() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("None prefix must short-circuit before reaching registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let state = mock_cargo_state(Arc::new(PanicsIfSearchedRegistry), None);
+        let state = mock_cargo_state(
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Panic(
+                    "None prefix must short-circuit before reaching registry search",
+                ),
+            )),
+            None,
+        );
         let items =
             fallback_completion(&state, EcosystemId::Cargo, Position::new(0, 0), "unused").await;
         assert!(items.is_empty());
@@ -2646,38 +2321,11 @@ ser"
     /// after (or not at all).
     #[test]
     fn test_create_package_completion_item_rejects_unsafe_latest_version() {
-        struct MockMetadata {
-            name: deps_core::PackageName,
-            latest_version: deps_core::ConcreteVersion,
-        }
-        impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                &self.latest_version
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("serde"),
-            latest_version: "1.0.0\", git = \"https://evil".into(),
-        };
+        let meta =
+            deps_core::test_util::MockMetadata::new("serde", "1.0.0\", git = \"https://evil");
         let ecosystem = MockEcosystem {
             ecosystem_id: deps_core::EcosystemId::Cargo,
-            registry: Arc::new(NoopRegistry),
+            registry: Arc::new(deps_core::test_util::MockRegistry::new()),
             fallback_prefix: None,
             insert_text: |_| panic!("gate must reject before completion_insert_text runs"),
             is_bare: false,
@@ -2693,38 +2341,10 @@ ser"
     /// here with a `MockEcosystem` whose `insert_text` panics if invoked.
     #[test]
     fn test_create_package_completion_item_rejects_malicious_name() {
-        struct MockMetadata {
-            name: deps_core::PackageName,
-            latest_version: deps_core::ConcreteVersion,
-        }
-        impl deps_core::Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                &self.latest_version
-            }
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
-        }
-
-        let meta = MockMetadata {
-            name: deps_core::PackageName::new("evil\"\nbackdoor = \"9.9.9"),
-            latest_version: "9.9.9".into(),
-        };
+        let meta = deps_core::test_util::MockMetadata::new("evil\"\nbackdoor = \"9.9.9", "9.9.9");
         let ecosystem = MockEcosystem {
             ecosystem_id: deps_core::EcosystemId::Cargo,
-            registry: Arc::new(NoopRegistry),
+            registry: Arc::new(deps_core::test_util::MockRegistry::new()),
             fallback_prefix: None,
             insert_text: |_| panic!("gate must reject before completion_insert_text runs"),
             is_bare: false,
@@ -2732,39 +2352,6 @@ ser"
         };
 
         assert!(create_package_completion_item(&meta, &ecosystem, false, 0, "").is_none());
-    }
-
-    struct NoopRegistry;
-    impl deps_core::Registry for NoopRegistry {
-        fn get_versions<'a>(
-            &'a self,
-            _name: &'a deps_core::PackageName,
-        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Version>>>>
-        {
-            Box::pin(async move { Ok(vec![]) })
-        }
-        fn get_latest_matching<'a>(
-            &'a self,
-            _name: &'a deps_core::PackageName,
-            _req: &'a deps_core::VersionReq,
-            _selection_context: &'a deps_core::SelectionContext,
-        ) -> deps_core::ecosystem::BoxFuture<
-            'a,
-            deps_core::Result<Option<Box<dyn deps_core::Version>>>,
-        > {
-            Box::pin(async move { Ok(None) })
-        }
-        fn search_raw<'a>(
-            &'a self,
-            _query: &'a str,
-            _limit: usize,
-        ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn deps_core::Metadata>>>>
-        {
-            Box::pin(async move { Ok(vec![]) })
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
     }
 
     struct MockMetadata {
@@ -2794,49 +2381,14 @@ ser"
 
     #[tokio::test]
     async fn test_search_packages_returns_results_within_timeout() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct FastRegistry;
-        impl Registry for FastRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("express"),
-                        latest_version: "4.18.2".into(),
-                    }) as Box<dyn Metadata>])
-                })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Npm, Arc::new(FastRegistry));
+        let ecosystem = mock_ecosystem(
+            deps_core::EcosystemId::Npm,
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Results(vec![
+                    deps_core::test_util::MockMetadata::new("express", "4.18.2"),
+                ]),
+            )),
+        );
         let items = search_packages(ecosystem.as_ref(), "express", false).await;
 
         assert_eq!(items.len(), 1);
@@ -2908,49 +2460,14 @@ ser"
     /// `filter_text` alone through the whole fallback path, not just in isolation.
     #[tokio::test]
     async fn test_search_packages_leaves_filter_text_alone_for_non_normalizing_registry() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PlainRegistry;
-        impl Registry for PlainRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("express"),
-                        latest_version: "4.18.2".into(),
-                    }) as Box<dyn Metadata>])
-                })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Npm, Arc::new(PlainRegistry));
+        let ecosystem = mock_ecosystem(
+            deps_core::EcosystemId::Npm,
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Results(vec![
+                    deps_core::test_util::MockMetadata::new("express", "4.18.2"),
+                ]),
+            )),
+        );
         let items = search_packages(ecosystem.as_ref(), "exp", false).await;
 
         assert_eq!(items.len(), 1);
@@ -2965,43 +2482,13 @@ ser"
     /// regresses.
     #[tokio::test]
     async fn test_search_packages_rejects_credential_bearing_query() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct PanicsIfSearchedRegistry;
-        impl Registry for PanicsIfSearchedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                panic!("guard must short-circuit before reaching registry search");
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
         let ecosystem = mock_ecosystem(
             deps_core::EcosystemId::Npm,
-            Arc::new(PanicsIfSearchedRegistry),
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Panic(
+                    "guard must short-circuit before reaching registry search",
+                ),
+            )),
         );
         let items = search_packages(
             ecosystem.as_ref(),
@@ -3021,57 +2508,14 @@ ser"
     /// tests (issue #722); this is the generic `filter_map` plumbing only.
     #[tokio::test]
     async fn test_search_packages_filters_rejected_completion_items_keeps_safe_ones() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct TwoResultRegistry;
-        impl Registry for TwoResultRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![
-                        Box::new(MockMetadata {
-                            name: deps_core::PackageName::new("safe-package"),
-                            latest_version: "1.0.0".into(),
-                        }) as Box<dyn Metadata>,
-                        Box::new(MockMetadata {
-                            name: deps_core::PackageName::new("rejected-package"),
-                            latest_version: "1.0.0".into(),
-                        }) as Box<dyn Metadata>,
-                    ])
-                })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
         let ecosystem = Arc::new(MockEcosystem {
             ecosystem_id: deps_core::EcosystemId::Cargo,
-            registry: Arc::new(TwoResultRegistry),
+            registry: Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Results(vec![
+                    deps_core::test_util::MockMetadata::new("safe-package", "1.0.0"),
+                    deps_core::test_util::MockMetadata::new("rejected-package", "1.0.0"),
+                ]),
+            )),
             fallback_prefix: None,
             insert_text: |metadata| {
                 if metadata.name().as_str() == "rejected-package" {
@@ -3096,55 +2540,15 @@ ser"
     /// instead of every item hardcoding the same value.
     #[tokio::test]
     async fn test_search_packages_preserves_registry_relevance_sort_text() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct TwoResultRegistry;
-        impl Registry for TwoResultRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![
-                        Box::new(MockMetadata {
-                            name: deps_core::PackageName::new("serde"),
-                            latest_version: "1.0.0".into(),
-                        }) as Box<dyn Metadata>,
-                        Box::new(MockMetadata {
-                            name: deps_core::PackageName::new("serde_json"),
-                            latest_version: "1.0.0".into(),
-                        }) as Box<dyn Metadata>,
-                    ])
-                })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let ecosystem = mock_ecosystem(deps_core::EcosystemId::Cargo, Arc::new(TwoResultRegistry));
+        let ecosystem = mock_ecosystem(
+            deps_core::EcosystemId::Cargo,
+            Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                deps_core::test_util::SearchBehavior::Results(vec![
+                    deps_core::test_util::MockMetadata::new("serde", "1.0.0"),
+                    deps_core::test_util::MockMetadata::new("serde_json", "1.0.0"),
+                ]),
+            )),
+        );
         let items = search_packages(ecosystem.as_ref(), "serde", false).await;
 
         assert_eq!(items.len(), 2);
@@ -3168,7 +2572,7 @@ ser"
         };
         let ecosystem = MockEcosystem {
             ecosystem_id: deps_core::EcosystemId::Maven,
-            registry: Arc::new(NoopRegistry),
+            registry: Arc::new(deps_core::test_util::MockRegistry::new()),
             fallback_prefix: None,
             insert_text: |_| panic!("bare=true must not call completion_insert_text"),
             is_bare: true,
@@ -3191,7 +2595,7 @@ ser"
         };
         let ecosystem = MockEcosystem {
             ecosystem_id: deps_core::EcosystemId::Cargo,
-            registry: Arc::new(NoopRegistry),
+            registry: Arc::new(deps_core::test_util::MockRegistry::new()),
             fallback_prefix: None,
             insert_text: default_insert_text,
             is_bare: false,
@@ -3233,7 +2637,7 @@ ser"
         };
         let ecosystem = MockEcosystem {
             ecosystem_id: deps_core::EcosystemId::Cargo,
-            registry: Arc::new(NoopRegistry),
+            registry: Arc::new(deps_core::test_util::MockRegistry::new()),
             fallback_prefix: None,
             insert_text: default_insert_text,
             is_bare: false,
@@ -3433,41 +2837,8 @@ ser"
     async fn test_generate_completions_is_incomplete_flows_into_response_both_branches() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{
-            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
-        };
+        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
         use std::any::Any;
-
-        struct NoopRegistry;
-        impl Registry for NoopRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         /// Stands in for `PypiEcosystem`: always reports incomplete results, and
         /// returns either zero or one completion item depending on `has_item`.
@@ -3494,7 +2865,7 @@ ser"
                 Box::pin(async move { unimplemented!() })
             }
             fn registry(&self) -> Arc<dyn Registry> {
-                Arc::new(NoopRegistry)
+                Arc::new(deps_core::test_util::MockRegistry::new())
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
                 &deps_core::test_util::StubFormatter::DEFAULT
@@ -3745,72 +3116,9 @@ ser"
     async fn test_handle_completion_falls_back_when_origin_unresolved() {
         use deps_core::completion::Completions;
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{
-            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
-        };
+        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
         use std::any::Any;
         use std::path::Path;
-
-        struct OneResultRegistry;
-        impl Registry for OneResultRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("requests"),
-                        latest_version: deps_core::ConcreteVersion::new("2.31.0"),
-                    }) as Box<dyn Metadata>])
-                })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockMetadata {
-            name: deps_core::PackageName,
-            latest_version: deps_core::ConcreteVersion,
-        }
-        impl Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct NotSuppressingEcosystem;
         impl Sealed for NotSuppressingEcosystem {}
@@ -3833,7 +3141,11 @@ ser"
                 Box::pin(async move { unimplemented!() })
             }
             fn registry(&self) -> Arc<dyn Registry> {
-                Arc::new(OneResultRegistry)
+                Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                    deps_core::test_util::SearchBehavior::Results(vec![
+                        deps_core::test_util::MockMetadata::new("requests", "2.31.0"),
+                    ]),
+                ))
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
                 &deps_core::test_util::StubFormatter::DEFAULT
@@ -3934,72 +3246,9 @@ ser"
     async fn test_fallback_gate_across_all_origins() {
         use deps_core::completion::{CompletionOrigin, Completions};
         use deps_core::ecosystem::private::Sealed;
-        use deps_core::{
-            Dependency, Ecosystem, EcosystemFormatter, Metadata, ParseResult, Registry, Version,
-        };
+        use deps_core::{Dependency, Ecosystem, EcosystemFormatter, ParseResult, Registry};
         use std::any::Any;
         use std::path::Path;
-
-        struct OneResultRegistry;
-        impl Registry for OneResultRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockMetadata {
-                        name: deps_core::PackageName::new("requests"),
-                        latest_version: deps_core::ConcreteVersion::new("2.31.0"),
-                    }) as Box<dyn Metadata>])
-                })
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct MockMetadata {
-            name: deps_core::PackageName,
-            latest_version: deps_core::ConcreteVersion,
-        }
-        impl Metadata for MockMetadata {
-            fn name(&self) -> &deps_core::PackageName {
-                &self.name
-            }
-            fn description(&self) -> Option<&str> {
-                None
-            }
-            fn repository(&self) -> Option<&str> {
-                None
-            }
-            fn documentation(&self) -> Option<&str> {
-                None
-            }
-            fn latest_version(&self) -> &deps_core::ConcreteVersion {
-                &self.latest_version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct OriginProbeEcosystem {
             origin: CompletionOrigin,
@@ -4024,7 +3273,11 @@ ser"
                 Box::pin(async move { unimplemented!() })
             }
             fn registry(&self) -> Arc<dyn Registry> {
-                Arc::new(OneResultRegistry)
+                Arc::new(deps_core::test_util::MockRegistry::new().with_search(
+                    deps_core::test_util::SearchBehavior::Results(vec![
+                        deps_core::test_util::MockMetadata::new("requests", "2.31.0"),
+                    ]),
+                ))
             }
             fn formatter(&self) -> &dyn EcosystemFormatter {
                 &deps_core::test_util::StubFormatter::DEFAULT
