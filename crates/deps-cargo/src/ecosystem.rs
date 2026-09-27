@@ -241,6 +241,72 @@ mod tests {
         deps_core::PackageName::new(s)
     }
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against Cargo's REAL
+    /// formatter and a real `EcosystemReparse`, pinning the exact probe values architect/critic
+    /// review verified empirically (spec 076 tasks.md T003's "Test location" note). Cargo's
+    /// bare requirement renders as an implicit caret, so FR-025's rule is conditional on the
+    /// fresh version's position — both sub-cases (in-range fails closed, out-of-range writes)
+    /// are pinned here, round-4 critic M5.
+    async fn fallback_edit_outcome(
+        req: &str,
+        fallback: &str,
+        available: &[&str],
+    ) -> deps_core::lsp_helpers::FallbackEditVerdict {
+        let ecosystem = CargoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = format!("[dependencies]\npkg = \"{req}\"\n");
+        let uri = deps_core::test_util::test_uri("/test/Cargo.toml");
+        deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &CargoFormatter,
+            &uri,
+            &content,
+            "pkg",
+            fallback,
+            available,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_d0_in_range_downgrade() {
+        // R0 "1.5" (implicit ^1.5)'s own floor among the listed versions is 1.5.0 (newer,
+        // higher-index-lower position than the 1.0.0 fallback) — writing 1.0.0 would be a
+        // genuine downgrade from what R0 already resolves to unedited, so d0 rejects before
+        // any re-parse. Corrected for #1564/#1561's floor-comparison fix: unlike the pre-fix
+        // "any newer entry also matches" reading, this no longer fires just because R0 also
+        // admits something newer than the fallback within its own range.
+        assert_eq!(
+            fallback_edit_outcome("1.5", "1.0.0", &["1.6.0", "1.5.0", "1.0.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalResolvesPastFallback
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_d1_in_range_auto_follow() {
+        // R0 "1.0" (implicit ^1.0) does not itself admit the 2.0.0 fallback (c0 does not
+        // short-circuit) and its own floor among the listed versions, 1.5.0, sits at an older
+        // position than the fallback, so d0 passes too. The written edit ("2.0.0", implicit
+        // ^2.0.0) then auto-follows into the fresh 2.1.0 — spec 076's own S1 protection (d1),
+        // which #1565's single-phase guard never had.
+        assert_eq!(
+            fallback_edit_outcome("1.0", "2.0.0", &["2.1.0", "2.0.0", "1.5.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_out_of_range() {
+        // The written edit ("1.1.0", implicit ^1.1.0) excludes the fresh 3.0.0 — writable.
+        assert_eq!(
+            fallback_edit_outcome("1.0", "1.1.0", &["3.0.0", "1.1.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     #[test]
     fn test_is_in_dependencies_section_basic() {
         let content = "\n[dependencies]\nserde\n";

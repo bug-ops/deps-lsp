@@ -21,17 +21,33 @@ related:
 > **Plan**: [[plan]]
 > **Total tasks**: 9 (T000-T008)
 
+> [!warning] Implementation-design overrides (2026-09-27; see spec §3 amendment callout)
+> - **T001**: no `CooldownVerdict`/`cooldown_verdict_for`. #1553's `cooldown_precedence` and gate
+>   already ship FR-019/FR-020. Scope shrinks to SC-013's invariant tests only, with no production change.
+> - **T002**: `parse_manifest_now` doc must state that re-parse is not pure. Cargo/Go/Deno/npm register
+>   alternates (idempotent: `register_capped` is keyed by URL/chain key), and Cargo/NuGet/Gradle do sync
+>   disk reads. Fix `parse_manifest_blocking`'s false "never actually yields" doc claim (Composer awaits).
+>   Composer `Pending` → `None` (fail closed), no `block_in_place`. Add a blanket
+>   `impl<F: Fn(&str) -> Option<Box<dyn ParseResult>>> ManifestReparse for F` plus one shared deps-cli test
+>   helper that rebuilds the occurrence from the edited text at the same `version_range.start`.
+> - **T003**: two-phase guard returning `FallbackEditVerdict` (spec FR-023 as amended), not `bool`.
+>   SC-014 tests assert the exact `FallbackEditRejection` variant.
+> - **T004**: callers branch on `FallbackEditVerdict::Writable`; `Rejected(r)` → `tracing::debug!` + the
+>   existing `WithinFreshnessCooldown`/never-demoted handling.
+> - **T000**: also invert `fetch.rs::no_in_use_version_yields_no_fallback_even_with_a_safe_cleared_candidate`.
+> - **T007**: obsolete (#1551 closed by #1553). T008's §11 item 2 is now the Composer re-parse follow-up.
+
 ## Progress
 
-- [ ] T000: Shared `InUseFloor` classifier (FR-016, FR-017, FR-018)
-- [ ] T001: `cooldown_verdict_for` extraction and the M4 fetch-time gate (FR-019, FR-020, FR-021)
-- [ ] T002: Sync-capped re-parse mechanism (FR-024)
-- [ ] T003: Uniform requirement-floor guard `fallback_edit_excludes_newer` (FR-022, FR-023, FR-025)
-- [ ] T004: Wire the guard into `deps-cli update`'s planner (replaces `fallback_satisfies_requirement`)
-- [ ] T005: Per-ecosystem real-parser outcome tests (FR-026)
-- [ ] T006: Spec 075 lockfile-path regression verification (FR-027)
-- [ ] T007: `#1551` closure verification (FR-028)
-- [ ] T008: CHANGELOG, follow-up issues, MOC-specs status (§10, §11)
+- [x] T000: Shared `InUseFloor` classifier (FR-016, FR-017, FR-018)
+- [x] T001: Verify #1553's shipped precedence/gate coverage; FR-021 invariant tests (FR-019, FR-020, FR-021)
+- [x] T002: Sync-capped re-parse mechanism (FR-024)
+- [x] T003: Uniform requirement-floor guard `fallback_edit_excludes_newer` (FR-022, FR-023, FR-025)
+- [x] T004: Wire the guard into `deps-cli update`'s planner (replaces `fallback_satisfies_requirement`)
+- [x] T005: Per-ecosystem real-parser outcome tests (FR-026)
+- [x] T006: Spec 075 lockfile-path regression verification (FR-027)
+- [x] T007: ~~`#1551` closure verification~~ — obsolete, #1551 closed by #1553 (FR-028)
+- [x] T008: CHANGELOG, follow-up issues, MOC-specs status (§10, §11)
 
 ---
 
@@ -39,16 +55,15 @@ related:
 
 ```mermaid
 graph TD
-    T000[T000: InUseFloor FR-016/017/018] --> T001[T001: cooldown_verdict_for + gate FR-019/020/021]
+    T000[T000: InUseFloor FR-016/017/018] --> T001[T001: verify shipped gate + FR-021 tests]
     T002[T002: re-parse mechanism FR-024] --> T003[T003: guard FR-022/023/025]
     T001 --> T004[T004: wire into planner]
     T003 --> T004
     T004 --> T005[T005: per-ecosystem outcome tests FR-026]
     T004 --> T006[T006: spec 075 regression verification FR-027]
-    T001 --> T007[T007: #1551 closure verification FR-028]
     T005 --> T008[T008: CHANGELOG, follow-up issues, MOC-specs status]
     T006 --> T008
-    T007 --> T008
+    T001 --> T008
 ```
 
 Parallelizable: T000 and T002 have no shared files and can be implemented in either order (or by
@@ -89,42 +104,24 @@ at the locatable one and ignores that another in-use version could not be placed
 
 ---
 
-### T001: `cooldown_verdict_for` extraction and the M4 fetch-time gate
+### T001: Verify #1553's shipped precedence/gate coverage; FR-021 invariant tests
 
-**Context**: FR-019/FR-020/FR-021, #1551 items 1 and 4 — `cooldown_disposition`'s inline
-GOSSIP-vs-local-heuristic branching (`crates/deps-core/src/lsp_helpers/mod.rs:248-268`) must become
-a standalone function so the fallback-candidate computation in `deps-engine` can share it, gated so
-the full version-history scan only runs when the unfiltered pick is actually blocked.
+**Context**: FR-019/FR-020 were shipped by #1553 before this spec's implementation:
+`deps_core::lsp_helpers::cooldown_precedence` (`Cleared` | `Blocked(CooldownBlocker)`) is already the
+single GOSSIP-vs-local primitive at `cooldown_disposition` and both `compute_cooldown_fallback` call
+sites, and `compute_cooldown_fallback` already skips the scan when the known unfiltered pick is
+`Cleared` (an unknown pick still scans). No production change here.
 **Spec reference**: [[spec#FR-019]], [[spec#FR-020]], [[spec#FR-021]]
 **Acceptance criteria**:
-- [ ] `pub enum CooldownVerdict { Blocked(CooldownBlocker), Cleared, NoPublishTime }` added to
-      `deps_core::lsp_helpers`, with a `# Examples` doctest
-- [ ] `pub fn cooldown_verdict_for(gossip, name, version, published_at, freshness, now) ->
-      CooldownVerdict` extracted from `cooldown_disposition`'s existing GOSSIP/local branching —
-      `cooldown_disposition` itself is rewritten to call it and map `NoPublishTime` to `Cleared`
-      for `latest` (preserving today's exact behavior, NFR-007)
-- [ ] `fetch_and_classify_package` calls `cooldown_verdict_for` on `unfiltered_pick_version` and
-      runs `compute_cooldown_fallback` (the full scan) ONLY when the result is `Blocked(_)` —
-      `Cleared`/`NoPublishTime` short-circuits to `cooldown_fallback: None` with zero extra
-      GOSSIP/`select_latest_matching` calls
-- [ ] The fallback-candidate's own cooled-subset filter (inside `compute_cooldown_fallback`) also
-      calls `cooldown_verdict_for` per candidate, mapping `NoPublishTime` to NOT cleared (fail
-      closed, spec 075 OQ2 — unchanged from today's existing per-candidate fail-closed behavior,
-      just routed through the shared function)
-- [ ] Spec 074's `is_gossip_cooldown` closure (`fetch.rs:856-859`) is explicitly left AS ITS OWN
-      separate GOSSIP-only-Active check, not routed through `cooldown_verdict_for` — do not merge
-      it in (FR-019's explicit carve-out)
-- [ ] New test: zero fallback-candidate computation when `latest` is `Cleared`/`NoPublishTime`
-      (SC-012)
-- [ ] New tests: FR-021's gate-superset invariant, all 3 proof cases plus the
-      cooldown-window-narrowed-between-fetch-and-read case asserting a skip (SC-013)
-- [ ] NFR-007: every existing `cooldown_disposition`, `apply_outdated_rule`, `gossip_cooldown_for`,
-      LSP hover, LSP diagnostics, and `deps-cli check`/`update` report test passes with UNCHANGED
-      expectations (SC-021)
-**Dependencies**: none
-**Files**: `crates/deps-core/src/lsp_helpers/mod.rs`, `crates/deps-engine/src/classify/fetch.rs`
-**Complexity**: medium
-
+- [ ] NO `CooldownVerdict`/`cooldown_verdict_for` is added (spec §3 amendment callout)
+- [ ] SC-012: confirm existing #1553 tests cover "known Cleared pick → no scan" and "unknown pick →
+      full scan" (`unknown_list_based_pick_still_runs_the_full_fallback_search`); add a test only for a gap
+- [ ] SC-013: FR-021 gate-superset tests in `deps-engine` (3 proof cases + window-narrowed case asserting a
+      skip, never an unsafe write)
+- [ ] NFR-007/SC-021: existing precedence/disposition/hover/diagnostics/report tests unchanged
+**Dependencies**: T000 (shares `fetch.rs`)
+**Files**: `crates/deps-engine/src/classify/fetch.rs` (tests only)
+**Complexity**: low
 ---
 
 ### T002: Sync-capped re-parse mechanism
@@ -160,45 +157,58 @@ call site, without bypassing the existing `#796` dependency-count cap.
 
 ---
 
-### T003: Uniform requirement-floor guard `fallback_edit_excludes_newer`
+### T003: Two-phase requirement guard `fallback_edit_excludes_newer` -> `FallbackEditVerdict`
 
-**Context**: FR-022/FR-023/FR-025 — replaces spec 075's span-text `fallback_satisfies_requirement`
-(`crates/deps-cli/src/update/mod.rs:729`) with one re-parse-based guard in `deps-core`, applied
-identically to spec 075's `Located` path and this spec's new `Absent` path, with no per-ecosystem
-override and no retry. Also removes spec 075 FR-003's Go-bypass exception, which round-1 critic
-proved guards an unreachable branch.
+**Context**: FR-022/FR-023 (as amended)/FR-025 — replaces spec 075's `fallback_satisfies_requirement`
+(`crates/deps-cli/src/update/mod.rs`) with one guard in `deps-core`, applied identically to the
+`Located` and `Absent` paths, no per-ecosystem override, no retry. Removes spec 075's Go bypass.
 **Spec reference**: [[spec#FR-022]], [[spec#FR-023]], [[spec#FR-025]]
 **Acceptance criteria**:
+- [ ] `pub enum FallbackEditVerdict { Writable, Rejected(FallbackEditRejection) }` and exhaustive
+      `pub enum FallbackEditRejection { OriginalUncompilable, OriginalAlreadyUpToDate,
+      OriginalResolvesPastFallback, ReparseFailed, OccurrenceNotUnique, EditedUncompilable,
+      EditedExcludesFallback, EditedAdmitsNewer }` in `deps_core::lsp_helpers` (derive `Debug, Clone,
+      Copy, PartialEq, Eq`; `///` docs + doctest)
 - [ ] `pub fn fallback_edit_excludes_newer(formatter, reparse: &dyn ManifestReparse, content, dep,
-      candidate: &ManifestEdit, fallback, available) -> bool` added to `deps_core::lsp_helpers`
-- [ ] Implementation: apply `candidate` to a scratch copy of `content` via
-      `deps_core::edit::apply_edits`; re-parse via `reparse.reparse(..)` (T002); locate the
-      occurrence by `(normalized name, version_range.start)` (T002); on its
-      `version_requirement()`, return `true` iff (a) `compile_requirement` is `Some`, (b) the
-      matcher admits at least one `available` entry, (c) `is_requirement_up_to_date(requirement,
-      fallback)` is `false`, (d) no entry in `available` AT OR NEWER than `fallback` satisfies
-      `requirement_already_resolves_to` — note check (d) includes the fallback's OWN position,
-      unlike spec 075's original strictly-newer-only check
-- [ ] `manifest_requirement_is_resolved_version`'s exception clause (spec 075 FR-003, Go bypass)
-      is REMOVED — no special case for Go anywhere in this function
-- [ ] `deps-cli`'s `fallback_satisfies_requirement` (`update/mod.rs:729`) is DELETED, not kept
-      alongside the new function
-- [ ] New test: NuGet `[2.0.0,)` bare-floor repro — a below-floor fallback is rejected via check
-      (c), proving the guard is self-contained without relying on the NuGet formatter's own
-      floor-carve-out as the only barrier (SC-014)
-- [ ] New test: an unsatisfiable requirement (e.g. `^5` with only 1.x/2.x published) fails closed
-      via check (b) (SC-014)
-- [ ] New test: `>=2.0,<2.3` admits fresh `2.3.0` — check (d), including the fallback's own
-      position — correctly rejects it (SC-014)
-- [ ] New tests: Swift `.exact(...)` and `.upToNextMinor` are evaluated on their REAL re-parsed
-      semantics, not the replacement span's literal text (SC-015)
-- [ ] Existing Go fallback tests (`test_fallback_satisfies_requirement_go_exception_bypasses_compile_requirement`
-      and its `plan_updates`-level equivalents) are INVERTED to prove Go's `ExactMatcher` alone —
-      no bypass — still resolves the same outcome (SC-020)
-**Dependencies**: T002
-**Files**: `crates/deps-core/src/lsp_helpers/mod.rs`
-**Complexity**: high
+      candidate: &ManifestEdit, fallback, available) -> FallbackEditVerdict`, checks in this order,
+      first failure wins:
+      - Phase 1 on R0 = `dep.version_requirement()` (no parse): a0 `compile_requirement(R0)` is `Some`;
+        c0 `!is_requirement_up_to_date(R0, fallback)`; d0 no `available` entry STRICTLY newer than
+        `fallback` (newest-first list, `take_while(|v| v != fallback)`) has
+        `requirement_already_resolves_to(R0, v)`
+      - Re-parse: `apply_edits(content, &[candidate])` → `reparse.reparse(..)` (`None` → `ReparseFailed`)
+        → exactly one dep with `normalize_package_name(name)` equal AND
+        `version_range().start == dep.version_range().start` (else `OccurrenceNotUnique`)
+      - Phase 2 on R1 = that dep's `version_requirement()`: a1 `compile_requirement(R1)` is `Some`;
+        b1 matcher `matches(fallback) == Some(true)`; d1 no entry STRICTLY newer than `fallback` has
+        `requirement_already_resolves_to(R1, v)`
+      - Yanked entries are NOT filtered out of the d0/d1 scans (conservative)
+- [ ] No Go special case anywhere; `fallback_satisfies_requirement` is DELETED (the
+      `manifest_requirement_is_resolved_version` trait method itself stays — other callers use it)
+- [ ] SC-014 unit tests in `deps-core`, one per `FallbackEditRejection` variant plus `Writable`, each
+      asserting the EXACT variant, using stub formatters + closure `ManifestReparse` (see "Test
+      location" below): d0 (R0 `^2.0`, fallback 1.9.0, 2.x available); c0 (NuGet-shaped floor stub, R0
+      `2.0.0`, fallback 1.9.0); d1 (semver stub, R0 `1.0`, fallback 2.0.0, edit `2.0.0`, fresh 2.1.0);
+      b1 (reparse closure yields R1 `^5`, only 1.x/2.x available); a0/a1 (stub with no
+      `compile_requirement`); `ReparseFailed` (closure → `None`); `OccurrenceNotUnique` (closure yields
+      two matching deps); `Writable` (semver stub, fallback 2.5.0, fresh 3.0.0)
+- [ ] SC-015: Swift `.exact(...)`/`.upToNextMinor` and Bundler multi-constraint evaluated on real
+      re-parsed semantics — lives in `deps-swift`/`deps-bundler` tests (real formatter + `EcosystemReparse`)
+- [ ] SC-020: spec 075's Go-bypass tests inverted to prove Go's `ExactMatcher` alone yields the same
+      outcome (lives in `deps-go` or `deps-cli` with the real `GoFormatter`)
 
+**Test location (decided)**: `deps-core` cannot depend on ecosystem crates, so SC-014's variant
+coverage lives in `deps-core` with stubs: a semver-backed stub (`compile_semver_requirement` +
+default `resolves_to`/`up_to_date`, i.e. real semver semantics, Cargo-like) and a NuGet-floor stub
+overriding `is_requirement_up_to_date`/`requirement_already_resolves_to` with the floor rule
+(floor ≥ target → up to date; a floor never resolves forward). The REAL-formatter confirmations of
+the same probe values live in the ecosystem crates as part of T005/SC-018: `deps-cargo` pins d0
+(`1.0`/1.1.0/fresh 1.2.0), d1 (`1.0`/2.0.0/fresh 2.1.0), and `Writable` (fallback 1.1.0/fresh 3.0.0);
+`deps-nuget` pins c0 (floor `2.0.0`/fallback 1.9.0) and the M2 loosening (floor `1.0.0`/fallback
+1.1.0/fresh 1.2.0 → `Writable`).
+**Dependencies**: T002
+**Files**: `crates/deps-core/src/lsp_helpers/mod.rs` (or a new `lsp_helpers/fallback_edit.rs` submodule)
+**Complexity**: high
 ---
 
 ### T004: Wire the guard into `deps-cli update`'s planner
@@ -248,7 +258,9 @@ re-parse lookup.
       requirement (Cargo, Dart, PyPI's `~=`/default form, Swift `.upToNextMinor`), the test pins
       BOTH sub-cases (fresh version inside the range → fails closed; outside → writes) — not a
       single assertion (round-4 critic M5)
-- [ ] GitHub Actions/GitLab CI tests assert rejection via check (a) (`compile_requirement` is
+- [ ] `deps-cargo` and `deps-nuget` tests additionally pin the real-formatter confirmations of T003's
+      SC-014 probe values (see T003 "Test location"), asserting the exact `FallbackEditVerdict`
+- [ ] GitHub Actions/GitLab CI tests assert `Rejected(OriginalUncompilable)` (a0; `compile_requirement` is
       `None`) — documented as unchanged, pre-existing behavior, not a new fail-closed case (SC-018)
 **Dependencies**: T004
 **Files**: `crates/deps-cargo`, `crates/deps-npm`, `crates/deps-deno`, `crates/deps-pypi`,
@@ -281,26 +293,10 @@ caret/range-shaped fallback for Cargo, Dart, PyPI's default form, or Swift `from
 
 ---
 
-### T007: `#1551` closure verification
+### T007: ~~`#1551` closure verification~~ (obsolete)
 
-**Context**: FR-028 — `#1551` items 1, 2, and 4 are closed by T000/T001's shared helpers, but
-closure requires a TEST proving both `cooldown_verdict_for` call sites (the fallback-candidate
-filter and `cooldown_disposition`) actually route through the same function, not just that both
-happen to produce the same answer today.
-**Spec reference**: [[spec#FR-028]]
-**Acceptance criteria**:
-- [ ] A test (or code-level assertion the PR description points to) demonstrates both call sites
-      invoke `cooldown_verdict_for` — e.g. a shared-fixture test that changes one input and
-      observes both call sites' verdicts move together
-- [ ] The PR description states `Closes #1551` is scoped to items 1, 2, and 4 only
-- [ ] Items 3 and 5 are filed as their own follow-up issue (T008) — `Closes #1551` is NOT used if
-      that would auto-close the issue with items 3/5 still open; state explicitly which items this
-      PR closes
-**Dependencies**: T001
-**Files**: none (verification task; may add a test to `crates/deps-engine/src/classify/fetch.rs` or
-`crates/deps-core/src/lsp_helpers/mod.rs`)
-**Complexity**: low
-
+#1551 was closed by #1553 (`a85946540`, all five items). Nothing to do; do not reference
+`Closes #1551` in this spec's PR.
 ---
 
 ### T008: CHANGELOG, follow-up issues, MOC-specs status
@@ -325,7 +321,7 @@ spec's initial, overly narrow scope restriction).
       addresses, per §9's Rollout Plan wording
 - [ ] `specs/MOC-specs.md`'s row for 076 is updated to `tasks` phase, `shipped` status, with the PR
       and issue numbers once merged
-**Dependencies**: T005, T006, T007
+**Dependencies**: T001, T005, T006
 **Files**: `CHANGELOG.md`, `specs/MOC-specs.md`
 **Complexity**: low
 
@@ -338,16 +334,15 @@ spec's initial, overly narrow scope restriction).
 T000 and T002 can run in parallel (no shared files). T001 needs T000's `InUseFloor` type in scope
 at the fallback call site but not vice versa; T003 needs T002's re-parse mechanism. T004 needs both
 T000 (for the `Absent` path to exist at all) and T003 (for the guard to check it). T005 and T006
-both need T004; T007 needs only T001. T008 is strictly last.
+both need T004; T007 is obsolete. T008 is strictly last.
 
 ### Common patterns
 
 - Follow `deps-core`'s existing exhaustive-enum-over-bool convention for `InUseFloor` and
-  `CooldownVerdict` — do not add a `bool`/`Option<bool>` where an enum is warranted.
+  `FallbackEditVerdict`/`FallbackEditRejection` — do not add a `bool`/`Option<bool>` where an enum is warranted.
 - Reuse `deps_core::edit::apply_edits` (already exists, spec 068) for T002/T003's scratch-copy
   application — do not write a second edit-application helper.
-- Mirror spec 075's own `cooldown_disposition` doctest style for `cooldown_verdict_for`'s new
-  `# Examples` section.
+- Mirror `cooldown_precedence`'s doctest style for `fallback_edit_excludes_newer`'s new `# Examples`.
 
 ### Gotchas
 

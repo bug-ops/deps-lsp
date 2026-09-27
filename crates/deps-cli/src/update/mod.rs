@@ -8,12 +8,12 @@ pub mod security;
 
 use deps_core::PackageName;
 use deps_core::edit::{
-    EditSpan, ManifestEdit, UnplannableReason, UpdateCandidate, UpdateKind, apply_edits,
-    classify_update, collect_update_candidates, dedup_overlapping_edits,
+    EditSpan, ManifestEdit, ManifestReparse, UnplannableReason, UpdateCandidate, UpdateKind,
+    apply_edits, classify_update, collect_update_candidates, dedup_overlapping_edits,
 };
 use deps_core::lsp_helpers::{
-    CooldownDisposition, EcosystemFormatter, LatestVerdict, PackageVersions, cooldown_disposition,
-    latest_verdict,
+    CooldownDisposition, EcosystemFormatter, FallbackEditVerdict, LatestVerdict, PackageVersions,
+    cooldown_disposition, fallback_edit_excludes_newer, latest_verdict,
 };
 use std::collections::HashMap;
 
@@ -542,10 +542,15 @@ fn resolve_cooldown_fallback_view(
 ///     license_fetch_incomplete: false,
 /// };
 ///
+/// // Freshness is disabled by default, so this fixture never reaches the fallback-edit guard
+/// // — the closure is never actually called.
+/// let reparse = |_content: &str| -> Option<Box<dyn ParseResult>> { None };
+///
 /// let plan = plan_updates(
 ///     &analysis,
 ///     content,
 ///     &MockFormatter,
+///     &reparse,
 ///     &[],
 ///     &IgnoreRules::empty(),
 ///     deps_core::FreshnessSettings::default(),
@@ -557,10 +562,17 @@ fn resolve_cooldown_fallback_view(
 /// assert_eq!(plan.items[0].target, "1.2.0");
 /// ```
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "spec 076 T004 adds `reparse` (FR-024) to the existing FR-007 planner surface; \
+              grouping into a struct would only move, not reduce, churn (mirrors \
+              resolve_occurrence's own identical rationale)"
+)]
 pub fn plan_updates(
     analysis: &ManifestAnalysis,
     content: &str,
     formatter: &dyn EcosystemFormatter,
+    reparse: &dyn ManifestReparse,
     package_filter: &[String],
     ignore_rules: &IgnoreRules,
     freshness: deps_core::FreshnessSettings,
@@ -695,7 +707,9 @@ pub fn plan_updates(
                 &mut fallback_by_key,
                 &dep_by_key,
                 analysis,
+                content,
                 formatter,
+                reparse,
                 package_filter,
                 ignore_rules,
                 freshness,
@@ -832,52 +846,6 @@ fn osv_advisory_ids(
     }
 }
 
-/// Spec 075 FR-003 (A1), corrected for issues #1564/#1561: whether `fallback` may serve as this
-/// occurrence's fallback write target, given its declared `version_req`.
-///
-/// Not "does the requirement admit some entry newer than `fallback`" (#1564: for a permissive,
-/// auto-following requirement — Cargo's implicit caret, the common case — a cooldown-blocked
-/// `latest` almost always also matches, rejecting the fallback in essentially every real-world
-/// scenario) and not "does `fallback` itself satisfy the requirement" (self-contradictory — the
-/// fallback view FR-008/009 only ever marks a candidate `Planned` when it does NOT, under the
-/// loose default heuristic). The correct question is whether `fallback` is a **downgrade below
-/// the requirement's own floor** — the OLDEST `available` entry the compiled requirement still
-/// matches (`available` is newest-first, so the floor sits at the LARGEST matching index).
-/// `fallback` is safe iff it is at or after that index. Deliberately ignores the requirement's
-/// upper bound (a caret ceiling, ...): a fallback beyond it is a legitimate forward update (e.g.
-/// a major-version fallback the engine's own wildcard-ranked search selected), never a downgrade.
-///
-/// Fails closed (#1561, CWE-1284) whenever no listed entry evidences the floor at or below
-/// `fallback` — `compile_requirement` unavailable, `fallback` itself unlisted, or nothing
-/// matches the requirement at all (the declared pin is unlisted, e.g. yanked — the prior "no
-/// newer match found" reading treated this as vacuously safe and let the write downgrade below
-/// the declared pin). Never infer "not a downgrade" from absence of evidence.
-///
-/// Exception: when `formatter.manifest_requirement_is_resolved_version(dep)` (Go's `require`
-/// directive) the declared requirement IS the in-use version, so the engine's D2 floor (spec
-/// 075 FR-002) already serves this floor and no further check is needed.
-fn fallback_satisfies_requirement(
-    formatter: &dyn EcosystemFormatter,
-    dep: &dyn deps_core::Dependency,
-    version_req: &deps_core::VersionReq,
-    fallback: &deps_core::ConcreteVersion,
-    available: &[deps_core::ConcreteVersion],
-) -> bool {
-    if formatter.manifest_requirement_is_resolved_version(dep) {
-        return true;
-    }
-    let Some(matcher) = formatter.compile_requirement(version_req) else {
-        return false;
-    };
-    let Some(fallback_pos) = available.iter().position(|v| v == fallback) else {
-        return false;
-    };
-    let floor_pos = available
-        .iter()
-        .rposition(|v| matcher.matches(v) == Some(true));
-    floor_pos.is_some_and(|floor_pos| floor_pos >= fallback_pos)
-}
-
 /// Spec 075 FR-007: the unified per-occurrence planner pipeline. Builds `latest_candidate`'s
 /// identity once, resolves this occurrence's [`CooldownDisposition`], and — only when it is
 /// `Blocked` — consults `fallback_by_key` (removed so each fallback occurrence is used at most
@@ -895,7 +863,9 @@ fn resolve_occurrence(
     fallback_by_key: &mut HashMap<OccurrenceKey, UpdateCandidate>,
     dep_by_key: &HashMap<OccurrenceKey, &dyn deps_core::Dependency>,
     analysis: &ManifestAnalysis,
+    content: &str,
     formatter: &dyn EcosystemFormatter,
+    reparse: &dyn ManifestReparse,
     package_filter: &[String],
     ignore_rules: &IgnoreRules,
     freshness: deps_core::FreshnessSettings,
@@ -1043,15 +1013,25 @@ fn resolve_occurrence(
                             )
                         };
                     }
-                    let requirement_ok = dep_by_key
-                        .get(&key)
-                        .copied()
-                        .and_then(|dep| dep.version_requirement().map(|req| (dep, req)))
-                        .is_some_and(|(dep, req)| {
-                            fallback_satisfies_requirement(
-                                formatter, dep, req, &fb.target, available,
-                            )
-                        });
+                    // Spec 076 FR-022/FR-023/FR-025: one uniform, re-parse-based guard applied
+                    // identically to the `Located` (this occurrence has a lockfile-resolved
+                    // in-use version) and `Absent` (spec 076's no-lockfile) paths — no per-
+                    // ecosystem override, no Go exception (removed, FR-022: `ExactMatcher`
+                    // alone is sufficient once this guard ships).
+                    let requirement_ok = dep_by_key.get(&key).copied().is_some_and(|dep| {
+                        let verdict = fallback_edit_excludes_newer(
+                            formatter, reparse, content, dep, &fb.edit, &fb.target, available,
+                        );
+                        if let FallbackEditVerdict::Rejected(reason) = verdict {
+                            tracing::debug!(
+                                package = %normalized_name,
+                                fallback = %fb.target,
+                                ?reason,
+                                "fallback edit rejected by fallback_edit_excludes_newer"
+                            );
+                        }
+                        matches!(verdict, FallbackEditVerdict::Writable)
+                    });
                     if requirement_ok {
                         // Rows 7 & 9 (fix-cycle item 3/S3): `ignore_rules` now runs against
                         // the SELECTED (fallback) target unconditionally, regardless of
@@ -1115,6 +1095,8 @@ fn resolve_occurrence(
                         }
                     }
                 }
+                // FR-011: an OSV-flagged/unverified fallback must surface here even when
+                // `fallback_edit_excludes_newer` (never consulted in this arm) would also reject it.
                 Some(UpdateCandidate::Unplannable {
                     reason: fb_reason, ..
                 }) => {
@@ -1375,6 +1357,49 @@ mod tests {
         }
     }
 
+    /// Spec 076 T004/M6: a [`ManifestReparse`] stub that must never actually be called — for
+    /// fixtures whose disposition never reaches [`fallback_edit_excludes_newer`]'s re-parse
+    /// phase (freshness disabled, no fallback candidate, or the fallback view's own OSV/
+    /// structural rejection resolves the occurrence before the guard ever runs).
+    fn never_reparse(_content: &str) -> Option<Box<dyn ParseResult>> {
+        unreachable!("this fixture's disposition must never reach the fallback-edit re-parse phase")
+    }
+
+    /// Spec 076 M6: shared `ManifestReparse` test stub for this module's quoted-version,
+    /// one-dependency-per-line fixtures (`name = "X"`). Rebuilds each `deps` entry's occurrence
+    /// by reading back whatever version text now sits between ITS OWN quotes in the edited
+    /// content, at the SAME position its original `version_range.start` had — genuinely
+    /// reflects the edit `plan_updates` applied, rather than hard-coding the expected target
+    /// (mirrors production `EcosystemReparse`'s re-parse-the-actual-edit contract).
+    fn reparse_quoted_deps(deps: Vec<(&'static str, Position)>) -> impl ManifestReparse {
+        move |edited_content: &str| -> Option<Box<dyn ParseResult>> {
+            let rebuilt: Vec<TestDep> = deps
+                .iter()
+                .map(|&(name, start)| {
+                    let line = edited_content.lines().nth(start.line as usize)?;
+                    let rest = line.get(start.character as usize..)?;
+                    let version_len = rest.find('"')?;
+                    let version = rest.get(..version_len)?;
+                    Some(TestDep {
+                        name: PackageName::new(name),
+                        version_req: deps_core::VersionReq::new(version),
+                        version_range: Range::new(
+                            start,
+                            Position::new(
+                                start.line,
+                                start.character + u32::try_from(version_len).ok()?,
+                            ),
+                        ),
+                    })
+                })
+                .collect::<Option<_>>()?;
+            Some(Box::new(TestParseResult {
+                deps: rebuilt,
+                uri: deps_core::test_util::test_uri("/test/Cargo.toml"),
+            }) as Box<dyn ParseResult>)
+        }
+    }
+
     /// [`plan_updates`] with freshness cooldown filtering disabled — the pre-#1525 behavior
     /// every test not specifically about that filter wants.
     ///
@@ -1394,6 +1419,7 @@ mod tests {
             analysis,
             content,
             formatter,
+            &never_reparse,
             package_filter,
             ignore_rules,
             deps_core::FreshnessSettings::Disabled,
@@ -1464,6 +1490,7 @@ mod tests {
             &analysis,
             content,
             &STUB_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -1509,6 +1536,7 @@ mod tests {
             &analysis,
             content,
             &STUB_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Disabled,
@@ -1591,6 +1619,7 @@ mod tests {
             &analysis,
             content,
             &STUB_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -1771,6 +1800,7 @@ mod tests {
             &analysis,
             content,
             &STUB_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -1829,6 +1859,7 @@ mod tests {
             &analysis,
             content,
             &STUB_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -1883,6 +1914,7 @@ mod tests {
             &analysis,
             content,
             &STUB_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -2377,133 +2409,177 @@ mod tests {
     impl deps_core::lsp_helpers::SourcePolicy for RealSemverFormatter {}
     impl deps_core::lsp_helpers::OsvNaming for RealSemverFormatter {}
 
-    /// Spec 075 SC-004/FR-003 (A1 repro), corrected for #1564/#1561: the guard rejects a
-    /// fallback iff the requirement's own floor (the oldest `available` entry it still
-    /// matches) is newer than the fallback — not "does the fallback itself satisfy the
-    /// requirement" (the inverted reading that made `Applied(fallback)` unreachable outside the
-    /// Go exception, impl-critic S1).
+    /// Spec 076 FR-022/FR-023 (A1 repro, phase-1 d0), corrected for #1564/#1561: rejects a
+    /// fallback whose UNEDITED requirement's own floor (the oldest `available` entry it still
+    /// matches) is newer than the fallback — replaces spec 075's isolated
+    /// `fallback_satisfies_requirement` unit test (that function is deleted, and with it the Go
+    /// `manifest_requirement_is_resolved_version` bypass, FR-022: Go's `ExactMatcher` alone is
+    /// sufficient — the bypass's own inversion test lives in `deps-go` as part of T005/SC-020,
+    /// since `deps-cli` does not depend on `deps-go`).
     #[test]
-    fn test_fallback_satisfies_requirement_rejects_a1_repro_downgrade() {
+    fn test_fallback_edit_excludes_newer_rejects_a1_repro_downgrade() {
         let dep = test_dep(
             "pkg",
             ">=3.0.0",
             Range::new(Position::new(0, 0), Position::new(0, 5)),
         );
-        let req = deps_core::VersionReq::new(">=3.0.0");
+        let edit = ManifestEdit {
+            range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            new_text: "2.9.0".to_string(),
+        };
 
         // A1 repro: `latest` (3.2.0) already satisfies `>=3.0.0`, so falling back to the older
-        // 2.9.0 would be a downgrade relative to what re-resolution already gives — reject.
+        // 2.9.0 would be a downgrade relative to what re-resolution already gives — reject at
+        // d0, before any re-parse (`never_reparse` must never be consulted).
         let available_with_newer_match: Vec<deps_core::ConcreteVersion> =
             vec!["3.2.0".into(), "2.9.0".into()];
-        assert!(
-            !fallback_satisfies_requirement(
+        assert_eq!(
+            deps_core::lsp_helpers::fallback_edit_excludes_newer(
                 &RealSemverFormatter,
+                &never_reparse,
+                "pkg = \">=3.0.0\"\n",
                 &dep,
-                &req,
+                &edit,
                 &deps_core::ConcreteVersion::new("2.9.0"),
                 &available_with_newer_match,
+            ),
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalResolvesPastFallback
             ),
             "2.9.0 is a downgrade relative to what >=3.0.0 already resolves to (3.2.0) and must \
              never be treated as a usable fallback"
         );
-
-        // No available entry newer than the fallback also satisfies the requirement — not a
-        // downgrade, accept.
-        let available_no_newer_match: Vec<deps_core::ConcreteVersion> = vec!["3.5.0".into()];
-        assert!(
-            fallback_satisfies_requirement(
-                &RealSemverFormatter,
-                &dep,
-                &req,
-                &deps_core::ConcreteVersion::new("3.5.0"),
-                &available_no_newer_match,
-            ),
-            "3.5.0 satisfies >=3.0.0 and nothing newer in `available` also does"
-        );
     }
 
-    /// Issue #1564 repro: a permissive, auto-following requirement (Cargo's implicit caret)
-    /// already admits the cooldown-blocked `latest` (0.22.8) just as much as the fallback
-    /// (0.22.7) — the OLD "reject if anything newer also matches" reading rejected this in
-    /// essentially every real-world caret-range scenario, including the exact one spec 075's
-    /// own playbook documents as the primary use case. The requirement's own floor (0.22.6,
-    /// the oldest listed match) is older than the fallback, so this must be accepted.
+    /// Issue #1564, adapted to spec 076's two-phase guard — and DELIBERATELY corrected, not
+    /// carried over verbatim, from #1565's own single-phase `Applied`/`Writable` expectation.
+    /// R0 (unedited, "0.22.6", implicit caret) already resolves past the fallback (0.22.7) just
+    /// as freely as it resolves past the cooldown-blocked `latest` (0.22.8) — #1565's
+    /// floor-comparison fix (d0 here) correctly does NOT reject this alone, since the
+    /// requirement's own floor (0.22.6) is not newer than the fallback. But spec 076 adds a
+    /// SECOND phase (d1) #1565 never had: the WRITTEN edit ("0.22.7", also an implicit caret)
+    /// auto-follows forward into the fresh 0.22.8, which is exactly spec 076's S1 anti-
+    /// auto-follow protection this guard exists to add. So unlike #1565's own repro, this must
+    /// resolve `Rejected(EditedAdmitsNewer)`, not `Writable` — d0 passing does not mean the edit
+    /// is safe to write once the two-phase guard also checks what the WRITTEN text re-admits.
     #[test]
-    fn test_fallback_satisfies_requirement_accepts_permissive_range_repro_1564() {
+    fn test_fallback_edit_excludes_newer_rejects_auto_follow_after_d0_passes_1564() {
         let dep = test_dep(
-            "bevy_brp_mcp",
+            "pkg",
             "0.22.6",
-            Range::new(Position::new(0, 0), Position::new(0, 5)),
+            Range::new(Position::new(0, 7), Position::new(0, 13)),
         );
-        let req = deps_core::VersionReq::new("0.22.6");
+        let edit = ManifestEdit {
+            range: Range::new(Position::new(0, 7), Position::new(0, 13)),
+            new_text: "0.22.7".to_string(),
+        };
         let available: Vec<deps_core::ConcreteVersion> =
             vec!["0.22.8".into(), "0.22.7".into(), "0.22.6".into()];
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
 
-        assert!(
-            fallback_satisfies_requirement(
-                &RealSemverFormatter,
-                &dep,
-                &req,
-                &deps_core::ConcreteVersion::new("0.22.7"),
-                &available,
+        let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
+            &RealSemverFormatter,
+            &reparse,
+            "pkg = \"0.22.6\"\n",
+            &dep,
+            &edit,
+            &deps_core::ConcreteVersion::new("0.22.7"),
+            &available,
+        );
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer
             ),
-            "0.22.7 is still >= the requirement's own floor (0.22.6) — a cooldown-cleared \
-             fallback within the same already-permitted range is never a downgrade"
+            "d0 passes (0.22.6's own floor is not newer than 0.22.7), but the written 0.22.7 \
+             caret still auto-follows into the fresh 0.22.8 — d1 must reject: {verdict:?}"
         );
     }
 
-    /// Issue #1561 repro (CWE-1284): the declared exact pin (`=1.5.0`) is absent from
-    /// `available` (unpublished/yanked/filtered) — the OLD "no newer match found" reading
-    /// treated this as vacuously safe and let the fallback (1.4.0, strictly older than the
-    /// declared pin) be written, a silent downgrade below what the manifest declares. Fail
-    /// closed: no listed entry evidences the floor at or below the fallback, so reject.
+    /// Issue #1561 repro (CWE-1284), adapted: the declared exact pin (`=1.5.0`) is absent from
+    /// `available` (unpublished/yanked/filtered) — the requirement's own floor (d0) cannot be
+    /// evidenced by any listed entry, so this must fail closed rather than vacuously accept the
+    /// fallback (1.4.0, strictly older than the declared pin).
     #[test]
-    fn test_fallback_satisfies_requirement_fails_closed_on_unlisted_pin_1561() {
+    fn test_fallback_edit_excludes_newer_fails_closed_on_unlisted_pin_1561() {
         let dep = test_dep(
-            "foo",
+            "pkg",
             "=1.5.0",
-            Range::new(Position::new(0, 0), Position::new(0, 5)),
+            Range::new(Position::new(0, 7), Position::new(0, 14)),
         );
-        let req = deps_core::VersionReq::new("=1.5.0");
+        let edit = ManifestEdit {
+            range: Range::new(Position::new(0, 7), Position::new(0, 14)),
+            new_text: "1.4.0".to_string(),
+        };
         // 1.5.0 (the declared pin) is not listed — unpublished/yanked/filtered.
         let available: Vec<deps_core::ConcreteVersion> =
             vec!["2.0.0".into(), "1.4.0".into(), "1.0.0".into()];
 
-        assert!(
-            !fallback_satisfies_requirement(
-                &RealSemverFormatter,
-                &dep,
-                &req,
-                &deps_core::ConcreteVersion::new("1.4.0"),
-                &available,
+        let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
+            &RealSemverFormatter,
+            &never_reparse,
+            "pkg = \"=1.5.0\"\n",
+            &dep,
+            &edit,
+            &deps_core::ConcreteVersion::new("1.4.0"),
+            &available,
+        );
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalResolvesPastFallback
             ),
             "the declared pin 1.5.0 is unlisted; nothing evidences that 1.4.0 is not a \
-             downgrade below it, so this must fail closed"
+             downgrade below it, so this must fail closed: {verdict:?}"
         );
     }
 
-    /// FR-003's exception: `manifest_requirement_is_resolved_version` (Go's `require`
-    /// directive) short-circuits the compiled-matcher check entirely.
+    /// Issue #1561, second cause: the FALLBACK itself is absent from `available` (a stale
+    /// `CooldownFallback` computed against a version list that has since changed) — distinct
+    /// from the declared-pin-unlisted case above, which is why `fallback_edit_excludes_newer`
+    /// reports it as its own `FallbackUnlisted` variant.
     #[test]
-    fn test_fallback_satisfies_requirement_go_exception_bypasses_compile_requirement() {
+    fn test_fallback_edit_excludes_newer_fails_closed_on_unlisted_fallback() {
         let dep = test_dep(
-            "golang.org/x/text",
-            "v1.0.0",
-            Range::new(Position::new(0, 0), Position::new(0, 5)),
+            "pkg",
+            "0.22.6",
+            Range::new(Position::new(0, 7), Position::new(0, 13)),
         );
-        let req = deps_core::VersionReq::new("v1.0.0");
+        let edit = ManifestEdit {
+            range: Range::new(Position::new(0, 7), Position::new(0, 13)),
+            new_text: "0.22.7".to_string(),
+        };
+        // 0.22.7 (the fallback) is not listed at all.
+        let available: Vec<deps_core::ConcreteVersion> = vec!["0.22.8".into(), "0.22.6".into()];
 
-        assert!(fallback_satisfies_requirement(
-            &FALLBACK_FORMATTER,
+        let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
+            &RealSemverFormatter,
+            &never_reparse,
+            "pkg = \"0.22.6\"\n",
             &dep,
-            &req,
-            &deps_core::ConcreteVersion::new("v0.5.0"),
-            &[],
-        ));
+            &edit,
+            &deps_core::ConcreteVersion::new("0.22.7"),
+            &available,
+        );
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::FallbackUnlisted
+            ),
+            "got: {verdict:?}"
+        );
     }
 
     /// One dependency, cooldown-blocked by the local heuristic, with a stored fallback
     /// candidate — shared setup for the SC-005/SC-006 fallback-selection tests below.
+    ///
+    /// Spec 076: the declared requirement is an exact pin (`=1.0.0`) and `latest` is a MAJOR
+    /// version bump (`2.0.0`) — outside the caret range a bare-rendered fallback edit (e.g.
+    /// `"1.1.0"` compiling to `^1.1.0`) would admit, so the two-phase guard's phase 1/2 checks
+    /// pass for any test using this fixture that actually reaches `fallback_edit_excludes_newer`
+    /// (most of the tests below do not: their fallback view's own OSV/structural rejection, or
+    /// the ignore-rule short-circuit inside `never_demoted`, resolves the occurrence before the
+    /// guard is ever consulted — see each test's own doc for which case it is).
     fn fallback_scenario_analysis(
         fallback_version: &str,
     ) -> (
@@ -2513,21 +2589,37 @@ mod tests {
     ) {
         let now = deps_core::PublishTime::from_unix_secs(10_000);
         let published_at = deps_core::PublishTime::from_unix_secs(9_900); // 100s old, within cooldown
-        let mut versions = cached("pkg", "1.2.0");
+        let mut versions = cached("pkg", "2.0.0");
         versions.insert(
             PackageName::new("pkg"),
-            PackageVersions::latest_only("1.2.0")
-                .with_published_at(published_at)
-                .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
-                    fallback_version.into(),
-                    deps_core::PublishTime::from_unix_secs(1_000),
-                )),
+            // `available` must list both the exact-pin R0's own floor ("1.0.0") and the
+            // fallback candidate itself, or `fallback_edit_excludes_newer`'s fail-closed
+            // `FallbackUnlisted`/floor checks reject before ever reaching a test's own
+            // scenario under test — `latest_only`'s single-element `[latest]` list isn't
+            // enough once that guard's two-phase, position-based checks are in play.
+            PackageVersions::new(
+                deps_core::ConcreteVersion::new("2.0.0"),
+                std::sync::Arc::from(vec![
+                    deps_core::ConcreteVersion::new("2.0.0"),
+                    deps_core::ConcreteVersion::new("1.1.0"),
+                    deps_core::ConcreteVersion::new("1.0.0"),
+                ]),
+            )
+            .with_published_at(published_at)
+            .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
+                fallback_version.into(),
+                deps_core::PublishTime::from_unix_secs(1_000),
+            )),
         );
         let analysis = test_analysis(
             vec![test_dep(
                 "pkg",
-                "1.0.0",
-                Range::new(Position::new(0, 7), Position::new(0, 12)),
+                "=1.0.0",
+                // 6-char span ("=1.0.0"), matching the exact-pin requirement text — a test using
+                // this fixture's fallback view as `Planned` (not short-circuited by its own OSV
+                // status) needs `content`'s literal span to match, or `collect_update_candidates`
+                // marks it `Unplannable(NonLiteralSpan)` before the guard is ever reached.
+                Range::new(Position::new(0, 7), Position::new(0, 13)),
             )],
             versions,
         );
@@ -2580,22 +2672,28 @@ mod tests {
         (analysis, freshness, now)
     }
 
-    /// Spec 075 SC-005 (fix-cycle item 1/S1, real-formatter variant): the fallback path must
-    /// actually fire with a real semver comparator, not only through the Go-exception stub —
-    /// an exact Cargo-style pin (`=1.0.0`) is outdated relative to both `latest` and the
-    /// fallback under the default heuristic, and the fallback (1.1.0) is not a downgrade
-    /// relative to what `=1.0.0` itself resolves to (only `1.0.0` itself, listed here and
-    /// strictly older than the fallback).
+    /// Spec 076 T006/FR-027 (verification candidate named by spec §10/tasks.md): under spec
+    /// 075's guard this asserted `Applied`, because that guard only ever compiled the declared
+    /// `=1.0.0` text itself, never the WRITTEN edit. Spec 076's two-phase guard re-parses the
+    /// actual edit: `RealSemverFormatter`'s default rendering writes the fallback BARE
+    /// (`"1.1.0"`), which Cargo-like semver compiles as a caret range `^1.1.0` — and that range
+    /// still admits the fresh `1.2.0` it exists to exclude. d1 (`EditedAdmitsNewer`) now
+    /// correctly rejects it — the documented, out-of-scope common-case fail-closed outcome for
+    /// an auto-following ecosystem (spec 076 §1), not a regression. `1.0.0` (the exact pin's
+    /// own value) must be listed for d0's fix-cycle floor-comparison scan to find it and let
+    /// phase 1 pass, so this test actually reaches d1.
     #[test]
-    fn test_plan_updates_real_semver_formatter_applies_fallback() {
+    fn test_plan_updates_real_semver_formatter_rejects_in_range_caret_admission() {
         let content = "pkg = \"=1.0.0\"\n";
         let (analysis, freshness, now) =
             real_semver_scenario("=1.0.0", &["1.2.0", "1.1.0", "1.0.0"], "1.1.0");
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
 
         let plan = plan_updates(
             &analysis,
             content,
             &RealSemverFormatter,
+            &reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2603,11 +2701,43 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(plan.items[0].target, "1.1.0");
-        assert!(
-            matches!(plan.items[0].outcome, Outcome::Applied(_)),
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
             "got: {:?}",
             plan.items[0].outcome
+        );
+
+        // Fix-cycle M3 (impl-critic): `Skipped(WithinFreshnessCooldown)` alone doesn't
+        // distinguish `EditedAdmitsNewer` from `ReparseFailed`/`OccurrenceNotUnique` — pin the
+        // exact rejection variant directly.
+        let dep = test_dep(
+            "pkg",
+            "=1.0.0",
+            Range::new(Position::new(0, 7), Position::new(0, 13)),
+        );
+        let candidate = ManifestEdit {
+            range: Range::new(Position::new(0, 7), Position::new(0, 13)),
+            new_text: "1.1.0".to_string(),
+        };
+        let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
+            &RealSemverFormatter,
+            &reparse,
+            content,
+            &dep,
+            &candidate,
+            &deps_core::ConcreteVersion::new("1.1.0"),
+            &[
+                deps_core::ConcreteVersion::new("1.2.0"),
+                deps_core::ConcreteVersion::new("1.1.0"),
+                deps_core::ConcreteVersion::new("1.0.0"),
+            ],
+        );
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer
+            )
         );
     }
 
@@ -2625,6 +2755,7 @@ mod tests {
             &analysis,
             content,
             &RealSemverFormatter,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2641,23 +2772,31 @@ mod tests {
         assert!(plan.items[0].cooldown_fallback.is_none());
     }
 
-    /// Issue #1564, end to end (crates.io `bevy_brp_mcp`-shaped repro): a three-version,
-    /// live-registry-shaped fixture — `0.22.8` (newest, cooldown-blocked, would be `latest`),
-    /// `0.22.7` (cleared, the stored fallback), `0.22.6` (declared/locked) — under a bare
-    /// (implicit-caret) Cargo-style requirement. Before the fix, `fallback_satisfies_requirement`
-    /// rejected this because `0.22.8` also matches the same permissive requirement as the
-    /// fallback; the requirement's actual floor (`0.22.6`) is older than the fallback, so this
-    /// must resolve to `Applied(0.22.7)`, not a silent `WithinFreshnessCooldown` skip.
+    /// Issue #1564, end to end (crates.io `bevy_brp_mcp`-shaped repro), corrected per T006/S1
+    /// for spec 076: a three-version, live-registry-shaped fixture — `0.22.8` (newest,
+    /// cooldown-blocked, would be `latest`), `0.22.7` (cleared, the stored fallback), `0.22.6`
+    /// (declared/locked) — under a bare (implicit-caret) Cargo-style requirement.
+    ///
+    /// #1565 (shipped, spec-075-only scope) fixed d0 (the check against the UNEDITED
+    /// requirement) to stop over-rejecting this shape and expected `Applied(0.22.7)`. Spec
+    /// 076's independent, ADDITIONAL d1 check (against the WRITTEN edit, which #1565 never had
+    /// since spec 075 had no re-parse mechanism at all) still correctly rejects it: writing the
+    /// fallback bare renders `^0.22.7`, which — exactly like `^0.22.6` — still admits the
+    /// fresh, cooldown-blocked `0.22.8`. This is spec 076 §1's documented, user-decided
+    /// (OQ-C) common-case fail-closed outcome for an auto-following ecosystem, not a
+    /// regression of #1565 — see this fix cycle's handoff for the full architectural note.
     #[test]
-    fn test_plan_updates_real_semver_formatter_applies_fallback_over_permissive_range_1564() {
+    fn test_plan_updates_real_semver_formatter_rejects_permissive_range_1564() {
         let content = "pkg = \"0.22.6\"\n";
         let (analysis, freshness, now) =
             real_semver_scenario("0.22.6", &["0.22.8", "0.22.7", "0.22.6"], "0.22.7");
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
 
         let plan = plan_updates(
             &analysis,
             content,
             &RealSemverFormatter,
+            &reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2665,22 +2804,20 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(plan.items[0].target, "0.22.7");
-        assert!(
-            matches!(plan.items[0].outcome, Outcome::Applied(_)),
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
             "got: {:?}",
             plan.items[0].outcome
         );
-        assert_eq!(
-            plan.items[0].cooldown_fallback,
-            Some(CooldownFallbackNote::AppliedInsteadOf("0.22.8".into()))
-        );
+        assert!(plan.items[0].cooldown_fallback.is_none());
     }
 
     /// Issue #1561, end to end (CWE-1284): the declared exact pin (`=1.5.0`) is absent from the
     /// registry's version list (unpublished/yanked/filtered) and the fallback (`1.4.0`) is
     /// strictly older than it — must never be applied, regardless of how the fallback view
-    /// itself classifies the occurrence.
+    /// itself classifies the occurrence. Rejected at d0 (`OriginalResolvesPastFallback`),
+    /// before re-parse is ever consulted.
     #[test]
     fn test_plan_updates_fails_closed_on_unlisted_pin_downgrade_1561() {
         let content = "pkg = \"=1.5.0\"\n";
@@ -2691,6 +2828,7 @@ mod tests {
             &analysis,
             content,
             &RealSemverFormatter,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2725,18 +2863,20 @@ mod tests {
     fn test_plan_updates_flagged_latest_with_verified_fallback_applies_fallback() {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
 
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.2.0".to_string(),
+                version: "2.0.0".to_string(),
                 advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
         );
         analysis.latest_status = Some(latest_status);
+        // Issue #1561 item 1: `latest_status` is populated, so `fallback_status` must be too —
+        // a bare `None` now fails the fallback closed to `Unverified` (defense-in-depth).
         let mut fallback_status = LatestStatusMap::new();
         fallback_status.insert(
             deps_core::test_util::vuln_key("pkg"),
@@ -2745,11 +2885,16 @@ mod tests {
             },
         );
         analysis.fallback_status = Some(fallback_status);
+        // Spec 076: reaching `Applied` needs a real `compile_requirement` (the Go-bypass
+        // `FALLBACK_FORMATTER` no longer short-circuits the guard, FR-022) and a working
+        // re-parse (FR-024).
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
 
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
+            &RealSemverFormatter,
+            &reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2770,7 +2915,7 @@ mod tests {
         );
         assert_eq!(
             plan.items[0].cooldown_fallback,
-            Some(CooldownFallbackNote::AppliedInsteadOf("1.2.0".into()))
+            Some(CooldownFallbackNote::AppliedInsteadOf("2.0.0".into()))
         );
     }
 
@@ -2799,6 +2944,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2825,7 +2971,7 @@ mod tests {
     /// never silently writing either version.
     #[test]
     fn test_plan_updates_fb_target_fallback_version_divergence_fails_closed() {
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
 
         let mut divergent_view = HashMap::new();
@@ -2839,6 +2985,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2855,7 +3002,7 @@ mod tests {
             plan.items[0]
         );
         assert_eq!(
-            plan.items[0].target, "1.2.0",
+            plan.items[0].target, "2.0.0",
             "must fall back to the real (unmodified) latest, never either divergent fallback \
              value"
         );
@@ -2868,7 +3015,7 @@ mod tests {
     fn test_plan_updates_flagged_fallback_blocks_and_exits_nonzero() {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
 
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
         let mut fallback_status = LatestStatusMap::new();
         fallback_status.insert(
@@ -2885,6 +3032,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2923,7 +3071,7 @@ mod tests {
     fn test_plan_updates_unverified_fallback_blocks_and_exits_nonzero() {
         use deps_core::osv::LatestStatusMap;
 
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
         // Present but empty: OSV checking is on, but this fallback was never verified.
         analysis.fallback_status = Some(LatestStatusMap::new());
@@ -2932,6 +3080,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -2961,7 +3110,7 @@ mod tests {
     fn test_plan_updates_both_latest_and_fallback_osv_blocked_defers_to_latest() {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
 
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
         let flagged = |version: &str| {
             let mut status = LatestStatusMap::new();
@@ -2975,13 +3124,14 @@ mod tests {
             );
             status
         };
-        analysis.latest_status = Some(flagged("1.2.0"));
+        analysis.latest_status = Some(flagged("2.0.0"));
         analysis.fallback_status = Some(flagged("1.1.0"));
 
         let plan = plan_updates(
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -3012,7 +3162,7 @@ mod tests {
     /// `NotSafelyEditable`.
     #[test]
     fn test_plan_updates_fallback_blocked_by_non_osv_reason_is_cooldown_skip() {
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         // A space is outside `is_safe_version_string`'s allowlist, so the fallback view
         // resolves this occurrence to `Unplannable(UnsafeLatestVersion)`.
         let (analysis, freshness, now) = fallback_scenario_analysis("1.1.0 unsafe");
@@ -3021,6 +3171,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             freshness,
@@ -3044,17 +3195,26 @@ mod tests {
     /// Fix-cycle item 3/S3 (impl-critic repro E): row 7 (a flagged latest with a clean
     /// fallback) must still honor `[update].ignore` — previously it wrote `Applied(fb.edit)`
     /// unconditionally, bypassing the rule the identical row-9 case already respected.
-    #[test]
-    fn test_plan_updates_row7_honors_ignore_rule_instead_of_applying() {
+    ///
+    /// Fix-cycle S1 (impl-critic, significant): this MUST reach `requirement_ok = true` (the
+    /// guard's `Writable` verdict) so the ignore-rule check inside that branch is the thing
+    /// actually under test — `RealSemverFormatter` + a working `reparse_quoted_deps` and a
+    /// `content` literal matching the exact-pin requirement text are required for that; using
+    /// `FALLBACK_FORMATTER`/`never_reparse` (a0-uncompilable) made this test pass through
+    /// `never_demoted`'s OWN, unrelated ignore-rule check instead, leaving the actual row-7
+    /// branch with zero coverage (proven by mutation: removing the ignore-rule check inside
+    /// `requirement_ok` still passed 318/318 deps-cli tests before this fix).
+    #[tokio::test]
+    async fn test_plan_updates_row7_honors_ignore_rule_instead_of_applying() {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
 
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
         let mut latest_status = LatestStatusMap::new();
         latest_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.2.0".to_string(),
+                version: "2.0.0".to_string(),
                 advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -3065,13 +3225,15 @@ mod tests {
                 name: "pkg".to_string(),
                 update_types: None,
             }],
-            &FALLBACK_FORMATTER,
+            &RealSemverFormatter,
         );
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
 
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
+            &RealSemverFormatter,
+            &reparse,
             &[],
             &ignore_pkg,
             freshness,
@@ -3091,6 +3253,47 @@ mod tests {
         );
     }
 
+    /// Fix-cycle S1 follow-up (row-9 counterpart, impl-critic recommendation): the identical
+    /// ignore-rule check inside `requirement_ok`, but for an UNFLAGGED latest (row 9's ordinary
+    /// cooldown-fallback substitution, not row 7's flagged-latest variant) — proves the
+    /// ignore-rule branch is covered regardless of which row reaches it.
+    #[tokio::test]
+    async fn test_plan_updates_row9_honors_ignore_rule_instead_of_applying() {
+        let content = "pkg = \"=1.0.0\"\n";
+        let (analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
+        let ignore_pkg = IgnoreRules::new(
+            vec![crate::config::IgnoreRule {
+                name: "pkg".to_string(),
+                update_types: None,
+            }],
+            &RealSemverFormatter,
+        );
+        let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &RealSemverFormatter,
+            &reparse,
+            &[],
+            &ignore_pkg,
+            freshness,
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::IgnoreRule),
+            "an ignored package's row-9 fallback must not be applied: {:?}",
+            plan.items[0].outcome
+        );
+        assert_eq!(
+            crate::exit::update_exit_code(&plan),
+            crate::exit::EXIT_CLEAN
+        );
+    }
+
     /// Fix-cycle item 4/S4 (impl-critic repro F): row 10 (an OSV-blocked fallback) must still
     /// honor `[update].ignore` — previously an ignored package's blocked fallback exited 1
     /// regardless of the rule, unlike row 8's identical `resolve_from_latest` handling.
@@ -3098,7 +3301,7 @@ mod tests {
     fn test_plan_updates_row10_honors_ignore_rule_instead_of_exiting_nonzero() {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
 
-        let content = "pkg = \"1.0.0\"\n";
+        let content = "pkg = \"=1.0.0\"\n";
         let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
         let mut fallback_status = LatestStatusMap::new();
         fallback_status.insert(
@@ -3122,6 +3325,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &ignore_pkg,
             freshness,
@@ -3185,6 +3389,7 @@ mod tests {
             &analysis,
             content,
             &lowercase_formatter,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -3209,50 +3414,77 @@ mod tests {
     /// checks — each occurrence's distinct `version_range` disambiguates them.
     #[test]
     fn test_plan_updates_name_range_collision_does_not_swap_occurrences() {
-        let content = "alpha = \"1.0.0\"\nbeta = \"9.0.0\"\n";
+        let content = "alpha = \"=1.0.0\"\nbeta = \"=9.0.0\"\n";
         let now = deps_core::PublishTime::from_unix_secs(10_000);
         let published_at = deps_core::PublishTime::from_unix_secs(9_900); // within cooldown
 
+        // Spec 076: exact pins, with `latest` a major-version bump OUTSIDE the caret range a
+        // bare-rendered fallback edit compiles to (`^1.1.0` excludes `2.0.0`; `^9.1.0` excludes
+        // `10.0.0`) — otherwise the two-phase guard's d1 check would correctly fail closed
+        // (spec 076 §1's documented auto-following-ecosystem case), which is not what this
+        // test's own point (no cross-occurrence swap) is about.
         let mut versions = HashMap::new();
         versions.insert(
             PackageName::new("alpha"),
-            PackageVersions::latest_only("1.2.0")
-                .with_published_at(published_at)
-                .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
-                    "1.1.0".into(),
-                    deps_core::PublishTime::from_unix_secs(1_000),
-                )),
+            // `available` must list both the exact-pin R0's own floor ("1.0.0") and the
+            // fallback itself ("1.1.0"), or the guard's fail-closed `FallbackUnlisted`/floor
+            // checks reject before this test's own cross-occurrence scenario is exercised.
+            PackageVersions::new(
+                deps_core::ConcreteVersion::new("2.0.0"),
+                std::sync::Arc::from(vec![
+                    deps_core::ConcreteVersion::new("2.0.0"),
+                    deps_core::ConcreteVersion::new("1.1.0"),
+                    deps_core::ConcreteVersion::new("1.0.0"),
+                ]),
+            )
+            .with_published_at(published_at)
+            .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
+                "1.1.0".into(),
+                deps_core::PublishTime::from_unix_secs(1_000),
+            )),
         );
         versions.insert(
             PackageName::new("beta"),
-            PackageVersions::latest_only("9.2.0")
-                .with_published_at(published_at)
-                .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
-                    "9.1.0".into(),
-                    deps_core::PublishTime::from_unix_secs(1_000),
-                )),
+            PackageVersions::new(
+                deps_core::ConcreteVersion::new("10.0.0"),
+                std::sync::Arc::from(vec![
+                    deps_core::ConcreteVersion::new("10.0.0"),
+                    deps_core::ConcreteVersion::new("9.1.0"),
+                    deps_core::ConcreteVersion::new("9.0.0"),
+                ]),
+            )
+            .with_published_at(published_at)
+            .with_cooldown_fallback(deps_core::lsp_helpers::CooldownFallback::new(
+                "9.1.0".into(),
+                deps_core::PublishTime::from_unix_secs(1_000),
+            )),
         );
 
         let analysis = test_analysis(
             vec![
                 test_dep(
                     "alpha",
-                    "1.0.0",
-                    Range::new(Position::new(0, 9), Position::new(0, 14)),
+                    "=1.0.0",
+                    Range::new(Position::new(0, 9), Position::new(0, 15)),
                 ),
                 test_dep(
                     "beta",
-                    "9.0.0",
-                    Range::new(Position::new(1, 8), Position::new(1, 13)),
+                    "=9.0.0",
+                    Range::new(Position::new(1, 8), Position::new(1, 14)),
                 ),
             ],
             versions,
         );
+        let reparse = reparse_quoted_deps(vec![
+            ("alpha", Position::new(0, 9)),
+            ("beta", Position::new(1, 8)),
+        ]);
 
         let plan = plan_updates(
             &analysis,
             content,
-            &FALLBACK_FORMATTER,
+            &RealSemverFormatter,
+            &reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -3329,6 +3561,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {
@@ -3407,6 +3640,7 @@ mod tests {
             &analysis,
             content,
             &FALLBACK_FORMATTER,
+            &never_reparse,
             &[],
             &IgnoreRules::empty(),
             deps_core::FreshnessSettings::Enabled {

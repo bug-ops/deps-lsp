@@ -578,6 +578,50 @@ mod tests {
         deps_core::PackageName::new(s)
     }
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against PyPI's REAL
+    /// formatter and a real `EcosystemReparse`. PyPI's `~=` form renders to `~={truncated}`
+    /// (e.g. `~=1.1`, PEP 440 shorthand for `>=1.1,==1.*`), an auto-following range like
+    /// Cargo's caret — FR-025's rule is conditional on the fresh version's position, both
+    /// sub-cases pinned (round-4 critic M5).
+    async fn fallback_edit_outcome(
+        fallback: &str,
+        available: &[&str],
+    ) -> deps_core::lsp_helpers::FallbackEditVerdict {
+        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "pkg~=0.9\n".to_string();
+        let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+        deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &PypiFormatter,
+            &uri,
+            &content,
+            "pkg",
+            fallback,
+            available,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_d1_in_range_tilde_admission() {
+        // The written edit ("~=1.1") auto-follows into the fresh in-range 1.5.0.
+        assert_eq!(
+            fallback_edit_outcome("1.1.0", &["1.5.0", "1.1.0", "0.9.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_out_of_range() {
+        // The written edit ("~=1.1") excludes the fresh out-of-range (major-bump) 2.5.0.
+        assert_eq!(
+            fallback_edit_outcome("1.1.0", &["2.5.0", "1.1.0", "0.9.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
     // test_ecosystem_lockfile_filenames/test_as_any/test_registry_returns_arc family.

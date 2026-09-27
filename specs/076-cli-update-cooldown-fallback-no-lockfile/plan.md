@@ -23,6 +23,15 @@ related:
 > verdict: minor, approved to proceed) design chain, 2026-09-27, against shipped HEAD `73c9d52b9`
 > (spec 075's PR #1550).
 
+> [!warning] Superseded in part (implementation design, 2026-09-27)
+> This plan predates #1553 (`a85946540`) and the implementation-design review. Where it conflicts with
+> spec.md's §3 amendment callout or tasks.md's overrides callout, those win. Concretely:
+> (1) no `CooldownVerdict`/`cooldown_verdict_for` — #1553's `cooldown_precedence` and its gate are
+> FR-019/FR-020; (2) `fallback_edit_excludes_newer` returns `FallbackEditVerdict` via a two-phase guard
+> (R0: a0/c0/d0, then R1: a1/b1/d1), not a single-phase `bool` over the re-parsed requirement;
+> (3) Composer's genuinely-awaiting `parse_manifest` fails closed (`ReparseFailed`); (4) SC-014 lives in
+> `deps-core` with stubs, and real-formatter confirmations live in `deps-cargo`/`deps-nuget` (tasks.md T003).
+
 ## 1. Architecture
 
 ### Approach (final, round-4 design only)
@@ -83,7 +92,7 @@ No new pipeline, no new `UpdateKind`/`ManifestEdit` variant, no new per-ecosyste
 graph TD
     A[deps-engine: fetch_and_classify_package] -->|FR-016/017/018| B[InUseFloor: Absent/Located/Unlocatable]
     B -->|Absent: no floor, Located: D2 floor, Unlocatable: None| C[compute_cooldown_fallback]
-    G[deps-core: cooldown_verdict_for, FR-019] -->|FR-020 gate: scan only if Blocked| C
+    G[deps-core: cooldown_precedence, FR-019, shipped by #1553] -->|FR-020 gate: skip scan if known pick Cleared| C
     G --> D[deps-core: cooldown_disposition, unchanged call site]
     C --> E[PackageVersions.cooldown_fallback]
     E --> D
@@ -112,10 +121,8 @@ No new crates. Changes land in existing files:
 ```
 crates/deps-engine/src/classify/fetch.rs      # InUseFloor (FR-016/017/018) replacing protect_floor
                                                # (:894) and the fallback `floor` lookup (:1241);
-                                               # cooldown_verdict_for call at the M4 gate (FR-020)
-crates/deps-core/src/lsp_helpers/mod.rs       # CooldownVerdict + cooldown_verdict_for (FR-019),
-                                               # extracted from cooldown_disposition's inline
-                                               # branching; cooldown_disposition itself calls it
+                                               # (gate already shipped by #1553)
+crates/deps-core/src/lsp_helpers/mod.rs       # FallbackEditVerdict/FallbackEditRejection (FR-023)
 crates/deps-core/src/lsp_helpers/formatter.rs # no signature change — fallback_edit_excludes_newer
                                                # (FR-023) is a free fn consuming the existing
                                                # EcosystemFormatter/RequirementResolution methods
@@ -162,26 +169,25 @@ fn in_use_floor(versions: &[Box<dyn Version>], in_use_versions: &[String]) -> In
 ```rust
 // crates/deps-core/src/lsp_helpers/mod.rs
 
-/// FR-019: the shared GOSSIP-vs-local-heuristic precedence result. Covers only
-/// spec 075 NFR-001 steps 2-3 — freshness-enabled (step 0) and OSV (step 1) remain
-/// each caller's concern.
+/// FR-023 (amended): typed result of `fallback_edit_excludes_newer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CooldownVerdict {
-    Blocked(CooldownBlocker),
-    Cleared,
-    /// No GOSSIP verdict AND no local `published_at` — each caller decides its own
-    /// missing-publish-time policy (spec 075 NFR-001 step 3 / OQ2).
-    NoPublishTime,
+pub enum FallbackEditVerdict {
+    Writable,
+    Rejected(FallbackEditRejection),
 }
 
-pub fn cooldown_verdict_for(
-    gossip: Option<&HashMap<PackageName, GossipFindings>>,
-    name: &PackageName,
-    version: &str,
-    published_at: Option<PublishTime>,
-    freshness: crate::freshness::FreshnessSettings,
-    now: PublishTime,
-) -> CooldownVerdict { /* NFR-001 steps 2-3, extracted from cooldown_disposition */ }
+/// Which FR-023 check rejected the fallback edit, in evaluation order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackEditRejection {
+    OriginalUncompilable,         // a0
+    OriginalAlreadyUpToDate,      // c0
+    OriginalResolvesPastFallback, // d0
+    ReparseFailed,
+    OccurrenceNotUnique,
+    EditedUncompilable,           // a1
+    EditedExcludesFallback,       // b1
+    EditedAdmitsNewer,            // d1
+}
 ```
 
 ```rust
@@ -243,7 +249,7 @@ pub fn fallback_edit_excludes_newer(
     candidate: &crate::edit::ManifestEdit,
     fallback: &crate::ConcreteVersion,
     available: &[crate::ConcreteVersion],
-) -> bool { /* apply_edits -> reparse -> locate by (name, version_range.start) -> checks (a)-(d) */ }
+) -> FallbackEditVerdict { /* R0: a0/c0/d0 -> apply_edits -> reparse -> locate by (name, version_range.start) -> R1: a1/b1/d1 */ }
 ```
 
 ### Migrations
@@ -252,12 +258,11 @@ None — no persisted schema, no lockfile format change.
 
 ## 4. API Design
 
-New public API surface: `deps_core::lsp_helpers::{CooldownVerdict, cooldown_verdict_for,
+New public API surface: `deps_core::lsp_helpers::{FallbackEditVerdict, FallbackEditRejection,
 fallback_edit_excludes_newer}`, `deps_core::edit::{ManifestReparse, EcosystemReparse}`,
 `deps_core::ecosystem::parse_manifest_now`. Every one requires a `///` doc comment with a runnable
-`# Examples` doctest per this project's Rust API doc rule (none of these existed before as
-private/`pub(crate)` items exempt from that rule — `cooldown_verdict_for` is a new extraction, not
-a promotion of an existing `pub(crate)` item the way spec 075's `gossip_cooldown_for` was).
+`# Examples` doctest per this project's Rust API doc rule (all are new items, not promotions of
+existing `pub(crate)` ones).
 
 ## 5. Integration Points
 
@@ -280,9 +285,9 @@ parse code path. `OsvClient`/`DepsDevClient` integration is unchanged from spec 
 
 | Level | Framework | What to Test | Coverage Target |
 |-------|-----------|---------------|------------------|
-| Unit | `cargo nextest` | `InUseFloor` classification (all 3 variants, both call sites), `cooldown_verdict_for` extraction (NFR-007 pure-refactor check), `fallback_edit_excludes_newer` checks (a)-(d) in isolation with a stub `ManifestReparse`, `parse_manifest_now`'s cap enforcement | Every §6 row (spec.md) reachable (NFR-006-equivalent testability bar, inherited from spec 075's own NFR-006) |
+| Unit | `cargo nextest` | `InUseFloor` classification (all 3 variants, both call sites), `fallback_edit_excludes_newer` one test per `FallbackEditRejection` variant with stub formatters + closure `ManifestReparse`, `parse_manifest_now`'s cap enforcement | Every §6 row (spec.md) reachable (NFR-006-equivalent testability bar, inherited from spec 075's own NFR-006) |
 | Integration | `cargo nextest`, existing `deps-cli` fixture harness | `deps-cli update`'s planner end to end for the `Absent` path (US-003), spec 075's `Located` path re-verified under the new guard (FR-027/SC-019), the 14 per-ecosystem real-parser outcome tests (FR-026/SC-018) | All spec.md §7 SC rows pass |
-| Doctest | `cargo test --doc` | New `# Examples` on `cooldown_verdict_for`, `fallback_edit_excludes_newer`, `ManifestReparse`, `parse_manifest_now` | Required, not optional |
+| Doctest | `cargo test --doc` | New `# Examples` on `FallbackEditVerdict`, `fallback_edit_excludes_newer`, `ManifestReparse`, `parse_manifest_now` | Required, not optional |
 
 ## 8. Performance Considerations
 
@@ -317,8 +322,7 @@ requirement — splitting into two sequential PRs instead of one:
   amendment notes are already written (this spec's §10, applied during spec-writing, not a
   T008 task) and need no further action here. This is the highest-risk piece — it changes the
   guard spec 075's ALREADY-SHIPPED lockfile path relies on.
-- **PR-B**: T000/T001 (`InUseFloor`'s `Absent` state and the `cooldown_verdict_for`/M4-gate
-  primitives), T004 (wiring), T005 (per-ecosystem tests), and T007 (`#1551` closure) — the new
+- **PR-B**: T000/T001 (`InUseFloor`'s `Absent` state and the FR-021 gate tests), T004 (wiring), T005 (per-ecosystem tests), and T007 (`#1551` closure) — the new
   no-lockfile feature itself, built on PR-A's corrected guard.
 
 A single PR covering all of T000-T008 is equally defensible (critic's own words: "one PR is also
@@ -329,11 +333,11 @@ by default in either direction.
 
 | Principle | Status | Notes |
 |-----------|--------|-------|
-| Type safety (exhaustive enums, no stringly-typed data) | Compliant | `InUseFloor`, `CooldownVerdict` are exhaustive enums; no `bool`/`Option<bool>` introduced anywhere in this design |
+| Type safety (exhaustive enums, no stringly-typed data) | Compliant | `InUseFloor`, `FallbackEditVerdict`, `FallbackEditRejection` are exhaustive enums; no `bool`/`Option<bool>` introduced anywhere in this design |
 | `unsafe_code = "forbid"` | Compliant | No `unsafe` needed |
 | `thiserror` typed errors | N/A | `parse_manifest_now` reuses `Ecosystem::parse_manifest`'s existing `crate::error::Result`, collapsed to `Option` only at the `now_or_never()`/cap boundary, consistent with `ManifestReparse`'s `Option`-returning contract |
 | Rust API docs (`///`, `# Examples`) | Required, tracked | All of §4's new public items need doctests |
-| DRY / cross-ecosystem consistency | Compliant | `InUseFloor` (FR-016) and `cooldown_verdict_for` (FR-019) each replace exactly the duplication #1551 flagged; `fallback_edit_excludes_newer` is the one guard for all 14 ecosystems, no per-ecosystem override (FR-025) |
+| DRY / cross-ecosystem consistency | Compliant | `InUseFloor` (FR-016) extends #1553's shared `in_use_floor`; `cooldown_precedence` (FR-019, #1553) is reused unchanged; `fallback_edit_excludes_newer` is the one guard for all 14 ecosystems, no per-ecosystem override (FR-025) |
 
 ## 11. Risks and Mitigations
 

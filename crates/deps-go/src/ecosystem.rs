@@ -234,6 +234,33 @@ mod tests {
         deps_core::PackageName::new(s)
     }
 
+    /// Spec 076 FR-022/SC-020 (T005): `fallback_edit_excludes_newer` against Go's REAL
+    /// formatter and a real `EcosystemReparse` — Go's `require` directive is always an exact
+    /// version, so `ExactMatcher` alone (no `manifest_requirement_is_resolved_version` bypass,
+    /// removed by FR-022) is sufficient: this inverts spec 075's Go-bypass-specific test, and
+    /// pins the unconditional `Writable` outcome the bypass used to short-circuit to.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_exact_matcher_no_bypass() {
+        let ecosystem = GoEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content =
+            "module example.com/myapp\n\nrequire github.com/gin-gonic/gin v1.0.0\n".to_string();
+        let uri = deps_core::test_util::test_uri("/test/go.mod");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &GoFormatter,
+            &uri,
+            &content,
+            "github.com/gin-gonic/gin",
+            "v1.1.0",
+            &["v1.2.0", "v1.1.0", "v1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     /// Mock dependency for testing
     fn mock_dependency(name: &str, version: Option<&str>, line: u32) -> GoDependency {
         GoDependency {

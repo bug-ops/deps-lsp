@@ -367,6 +367,33 @@ mod tests {
         deps_core::PackageName::new(s)
     }
 
+    /// Spec 076 FR-026/SC-018 (T005): `fallback_edit_excludes_newer` against npm's REAL
+    /// formatter and a real `EcosystemReparse`. npm's default rendering writes a bare EXACT
+    /// version (not an auto-following range), so FR-025's rule is unconditional — one
+    /// assertion suffices (round-4 critic M5's "both sub-cases" requirement only applies to
+    /// the auto-following ecosystems). US-003's own `Absent`-path acceptance-criterion
+    /// fixture: `^1.0.0` with 2.0.0 cooled/fallback, 2.1.0 fresh.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_bare_exact_rendering() {
+        let ecosystem = NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"dependencies": {"pkg": "^1.0.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &NpmFormatter,
+            &uri,
+            &content,
+            "pkg",
+            "2.0.0",
+            &["2.1.0", "2.0.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests.
     deps_core::ecosystem_conformance! {
         mod npm_ecosystem_conformance;

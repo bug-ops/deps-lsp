@@ -530,6 +530,53 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Spec 076 FR-025/SC-018 (T005): GitHub Actions has no compiled requirement model at
+    /// all — `fallback_edit_excludes_newer`'s check a0 (`OriginalUncompilable`) rejects it
+    /// before this spec's rule is ever reached, unchanged, existing behavior from spec 075,
+    /// not a new fail-closed case this spec introduces.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_a0_uncompilable() {
+        let cache = Arc::new(deps_core::HttpCache::new());
+        let ecosystem = GithubActionsEcosystem::new(cache);
+        let content = "steps:\n  - uses: actions/checkout@v4\n".to_string();
+        let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+        let parsed = ecosystem
+            .parse_manifest(&content, &uri)
+            .await
+            .expect("manifest must parse");
+        let dep = parsed
+            .dependencies()
+            .into_iter()
+            .find(|d| d.name().as_str() == "actions/checkout")
+            .expect("dependency present");
+        let candidate = deps_core::edit::ManifestEdit {
+            range: dep.version_range().expect("version range"),
+            new_text: "v5".to_string(),
+        };
+        let reparse = deps_core::edit::EcosystemReparse {
+            ecosystem: &ecosystem,
+            uri: &uri,
+        };
+        let fallback = deps_core::ConcreteVersion::new("v5");
+        let available = [deps_core::ConcreteVersion::new("v6"), fallback.clone()];
+
+        let verdict = deps_core::lsp_helpers::fallback_edit_excludes_newer(
+            ecosystem.formatter(),
+            &reparse,
+            &content,
+            dep,
+            &candidate,
+            &fallback,
+            &available,
+        );
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalUncompilable
+            )
+        );
+    }
+
     // --- issue #473: mutable-ref-pin diagnostic + "Pin to commit SHA" code action ---
 
     fn mutable_ref_pin_code() -> String {

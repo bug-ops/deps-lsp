@@ -201,6 +201,92 @@ impl Ecosystem for SwiftEcosystem {
 mod tests {
     use super::*;
 
+    /// Spec 076 FR-026/SC-018/SC-015 (T005): `fallback_edit_excludes_newer` against Swift's
+    /// REAL formatter and a real `EcosystemReparse`. The edited SPAN is only the quoted
+    /// version literal — the surrounding `.upToNextMajor(from:)`/`.upToNextMinor(from:)`/
+    /// `.exact(...)` label survives the edit unchanged, so re-parsing recovers the correct
+    /// EFFECTIVE requirement shape (round-2 critic S2, the exact grammar FR-024's re-parse
+    /// mechanism exists for — compiling the replacement span's own text in isolation would be
+    /// wrong here).
+    async fn fallback_edit_outcome(
+        content: &str,
+        fallback: &str,
+        available: &[&str],
+    ) -> deps_core::lsp_helpers::FallbackEditVerdict {
+        let ecosystem = SwiftEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let uri = deps_core::test_util::test_uri("/test/Package.swift");
+        deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &SwiftFormatter,
+            &uri,
+            content,
+            "acme/pkg",
+            fallback,
+            available,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_writable_exact() {
+        // `.exact(...)` is an exact pin (unconditional, FR-025) — outcome doesn't depend on
+        // the fresh version's position.
+        let content = r#".package(url: "https://github.com/acme/pkg", .exact("1.0.0"))"#;
+        assert_eq!(
+            fallback_edit_outcome(content, "1.1.0", &["1.2.0", "1.1.0", "1.0.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_from_d1_in_range() {
+        // Bare `from:` is implicit `.upToNextMajor` — the written `from: "2.1.0"` auto-follows
+        // into the fresh, same-major 2.5.0.
+        let content = r#".package(url: "https://github.com/acme/pkg", from: "1.0.0")"#;
+        assert_eq!(
+            fallback_edit_outcome(content, "2.1.0", &["2.5.0", "2.1.0", "1.0.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_from_writable_out_of_range() {
+        // The written `from: "2.1.0"` excludes the fresh, next-major 3.5.0.
+        let content = r#".package(url: "https://github.com/acme/pkg", from: "1.0.0")"#;
+        assert_eq!(
+            fallback_edit_outcome(content, "2.1.0", &["3.5.0", "2.1.0", "1.0.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_up_to_next_minor_d1_in_range() {
+        // `.upToNextMinor(from: "2.1.0")` admits only same-minor [2.1.0,2.2.0) — the fresh
+        // 2.1.5 is still inside it.
+        let content =
+            r#".package(url: "https://github.com/acme/pkg", .upToNextMinor(from: "1.0.0"))"#;
+        assert_eq!(
+            fallback_edit_outcome(content, "2.1.0", &["2.1.5", "2.1.0", "1.0.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::EditedAdmitsNewer
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_pins_up_to_next_minor_writable_out_of_range() {
+        // `.upToNextMinor(from: "2.1.0")` excludes the fresh, next-minor 2.2.0 — FR-025's "no
+        // newer same-minor version exists" case.
+        let content =
+            r#".package(url: "https://github.com/acme/pkg", .upToNextMinor(from: "1.0.0"))"#;
+        assert_eq!(
+            fallback_edit_outcome(content, "2.1.0", &["2.2.0", "2.1.0", "1.0.0"]).await,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
     // test_ecosystem_display_name, test_manifest_filenames, and test_as_any.
     deps_core::ecosystem_conformance! {

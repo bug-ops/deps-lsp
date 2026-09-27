@@ -75,6 +75,80 @@ pub fn test_uri(unix_path: &str) -> url::Url {
     url::Url::from_file_path(path).expect("test_uri: fixture path must be a valid file URL")
 }
 
+/// Runs [`crate::lsp_helpers::fallback_edit_excludes_newer`] end to end against a real ecosystem.
+///
+/// Parses `content`, locates the dependency named `dep_name`, renders the edit for `fallback`
+/// via `formatter`, and re-parses through `ecosystem` (spec 076 T005).
+///
+/// Extracted from ~14 near-identical per-ecosystem-crate test helpers (spec 076 fix-cycle
+/// finding #8/DRY) into one shared implementation — every ecosystem crate's own
+/// `fallback_edit_outcome` test helper should build its `content`/`uri` fixture, then delegate
+/// here instead of duplicating the parse/render/reparse/verdict plumbing.
+///
+/// # Panics
+///
+/// Panics if `content` fails to parse, `dep_name` is not found among its dependencies, or the
+/// fallback edit cannot be rendered — this is a test helper, not production code, so a
+/// malformed fixture should fail loudly rather than degrade to a misleading verdict.
+///
+/// # Examples
+///
+/// `Ecosystem` is sealed (only implementable inside this crate), and every concrete
+/// implementation lives in a downstream `deps-<ecosystem>` crate, so this cannot be exercised
+/// from a `deps-core` doc-test without a circular dev-dependency — see any of the ~14
+/// ecosystem crates' own `ecosystem.rs` test modules (e.g. `deps-cargo`) for a real call site.
+///
+/// ```ignore
+/// let verdict = deps_core::test_util::fallback_edit_outcome(
+///     &ecosystem, &formatter, &uri, &content, "pkg", "1.1.0", &["1.2.0", "1.1.0"],
+/// )
+/// .await;
+/// assert_eq!(verdict, deps_core::lsp_helpers::FallbackEditVerdict::Writable);
+/// ```
+#[cfg(feature = "test-util")]
+pub async fn fallback_edit_outcome(
+    ecosystem: &dyn crate::Ecosystem,
+    formatter: &dyn crate::lsp_helpers::EcosystemFormatter,
+    uri: &url::Url,
+    content: &str,
+    dep_name: &str,
+    fallback: &str,
+    available: &[&str],
+) -> crate::lsp_helpers::FallbackEditVerdict {
+    let parsed = ecosystem
+        .parse_manifest(content, uri)
+        .await
+        .expect("manifest must parse");
+    let dep = parsed
+        .dependencies()
+        .into_iter()
+        .find(|d| d.name().as_str() == dep_name)
+        .expect("dependency present");
+    let fallback = crate::ConcreteVersion::new(fallback);
+    let new_text = crate::edit::replacement_text(
+        formatter,
+        dep,
+        &fallback,
+        dep.version_requirement()
+            .expect("declared requirement")
+            .as_str(),
+    )
+    .expect("replacement text");
+    let candidate = crate::edit::ManifestEdit {
+        range: dep.version_range().expect("version range"),
+        new_text,
+    };
+    let reparse = crate::edit::EcosystemReparse { ecosystem, uri };
+    let available: Vec<crate::ConcreteVersion> = available
+        .iter()
+        .map(|v| crate::ConcreteVersion::new(*v))
+        .collect();
+
+    crate::lsp_helpers::fallback_edit_excludes_newer(
+        formatter, &reparse, content, dep, &candidate, &fallback, &available,
+    )
+}
+
 /// Builds a [`crate::osv::VulnKey`] from a plain name, for [`crate::osv::VulnerabilityMap`]
 /// test fixtures.
 ///

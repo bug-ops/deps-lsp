@@ -243,14 +243,14 @@ pub use deps_dev::{
 pub use ecosystem::{
     BlockedRegistryOccurrence, BlockedSourceClass, Dependency, Ecosystem, EcosystemConfig,
     EcosystemId, LicenseSource, ParseResult, RegistryOccurrence, RejectedRegistryOccurrence,
-    RejectedSourceClass, parse_manifest_blocking,
+    RejectedSourceClass, parse_manifest_blocking, parse_manifest_now,
 };
 pub use ecosystem_registry::EcosystemRegistry;
 pub use edit::{
-    EditSpan, ManifestEdit, PlannedUpdate, UnplannableReason, UpdateCandidate, UpdateKind,
-    VulnFixSkip, apply_edits, classify_update, collect_update_candidates, collect_update_edits,
-    dedup_overlapping_edits, plan_verified_fix, plan_vulnerability_fix, resolve_recommended_fix,
-    resolve_verified_fix,
+    EcosystemReparse, EditSpan, ManifestEdit, ManifestReparse, PlannedUpdate, UnplannableReason,
+    UpdateCandidate, UpdateKind, VulnFixSkip, apply_edits, classify_update,
+    collect_update_candidates, collect_update_edits, dedup_overlapping_edits, plan_verified_fix,
+    plan_vulnerability_fix, resolve_recommended_fix, resolve_verified_fix,
 };
 pub use error::{DepsError, FetchFailure, RateLimitEvidence, Result};
 pub use freshness::{
