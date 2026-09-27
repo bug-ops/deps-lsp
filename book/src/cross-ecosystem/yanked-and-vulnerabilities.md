@@ -129,6 +129,92 @@ lacking a real signal (see restriction above), and that also covers Deno's `npm:
 the remaining 7 have no real yanked signal to source it from (four are architecturally
 impossible — no such registry concept exists — and Go's is a fixable but separate gap).
 
+## Latest-Version Safety Check (issue #1517)
+
+`deps-lsp` and `deps-cli update` never recommend or apply a dependency's `latest` version
+without an independent OSV.dev check on that exact version — not just on the version
+currently pinned in the manifest. Before this fix, OSV's second-phase ("phase B") check on an
+upgrade candidate only ran for a dependency **already** flagged vulnerable at its pinned
+version, so a cleanly-pinned dependency's `latest` was never itself checked: every renderer
+that recommends `latest` as an upgrade, and `deps-cli update`'s default mode, could recommend
+or silently apply a version OSV.dev flags as malicious or critical. Phase B now runs for
+**every** dependency whose registry-reported `latest` differs from its pinned/in-use version,
+regardless of whether the pinned version itself has any advisories.
+
+This is entirely ecosystem-agnostic: the check lives in `deps-core` (`osv::LatestStatusMap`,
+`lsp_helpers::latest_verdict`), not in any one ecosystem crate, so it applies uniformly to
+every ecosystem OSV.dev has an advisory feed for — there is no npm-specific or Cargo-specific
+variant of this logic.
+
+### The four verdicts
+
+Every renderer computes one of four verdicts for the version it is about to show as `latest`,
+via the shared `latest_verdict` gate:
+
+- **Verified** — OSV.dev checked this exact version and found it clean (or affected only by an
+  [informational](#informational-advisories-issue-1043) advisory). Shown normally as an
+  ordinary upgrade recommendation.
+- **Flagged** — OSV.dev checked this exact version and found a real advisory against it.
+  Hover shows `🚫 Latest version is confirmed malicious by OSV.dev — do not upgrade to this
+  version` (a confirmed-malicious-package record) or `⚠️ Latest version is flagged by OSV.dev
+  — do not upgrade to this version` (any other non-informational advisory), and the advisory
+  ids are listed. Diagnostics report `Latest version <v> is flagged by OSV (<ids>) — do not
+  upgrade`, at `Error` severity for a malicious record or `Warning` otherwise (escalated above
+  the configured `outdated` severity). Inlay hints show `🚫`/`⚠️ <v> flagged` instead of the
+  plain outdated icon.
+- **Unverified** — the version was never definitively checked: OSV hasn't completed phase B
+  yet, a transient failure or timeout occurred, or the checked version has since diverged from
+  what's now cached as `latest`. Diagnostics report `Newer version available: <v> (not yet
+  verified against OSV)` at the ordinary `outdated` severity — visually distinct from both
+  `Verified` (no such caveat) and `Flagged` (no escalated severity), but treated identically to
+  `Flagged` for *whether the upgrade is recommended*.
+- **NotApplicable** — OSV checking does not apply here at all: OSV is disabled or offline for
+  this scan, or the dependency's source is structurally never checked against OSV (e.g. a git
+  dependency, or an ecosystem OSV.dev does not cover). Renders exactly like `Verified` — no
+  caveat, since there was never a check to distrust.
+
+**The safety principle is fail-closed**: only `Verified` and `NotApplicable` are ever treated
+as "safe to recommend or apply." Anything not affirmatively verified clean — including a
+timeout, incomplete advisory data, or a deliberate offline/disabled skip — is treated the same
+as an actively flagged version. This applies before the very first phase B run completes, too:
+an empty status map (nothing checked yet) yields `Unverified`, never a silent pass-through.
+
+### Where this applies
+
+Every renderer that can surface `latest` as an upgrade consults this gate: hover, diagnostics,
+code actions, code lens, inlay hints, and completion.
+
+- The **"Fix Vulnerability" / "update to version X" code actions** (see below) never offer the
+  `latest` item unless its verdict is `Verified` or `NotApplicable`; a `Flagged` or `Unverified`
+  `latest` is simply omitted from the list rather than offered with a warning, so it can never
+  be applied with one click.
+- **`deps-cli update`'s default mode** refuses to write a `Flagged` or `Unverified` `latest`
+  into the manifest at all — the dependency is reported as `Unplannable` with reason
+  `LatestFlaggedByOsv` or `LatestUnverified` rather than silently dropped or silently applied.
+  There is currently no override flag: a dependency in this state cannot be updated to `latest`
+  via `deps-cli update` until OSV affirmatively clears it. If any in-scope dependency's `latest`
+  comes back `Unverified` (rather than `Flagged`), the whole run aborts early with a clear
+  message instead of silently omitting just that dependency, the same way a registry-unreachable
+  condition does.
+- As a side effect, a `Flagged` latest also suppresses the release-freshness/cooldown callout
+  (hover's "recently published" notice and the equivalent GOSSIP-sourced diagnostic wording) for
+  that version — a confirmed-unsafe version must never also read as a benign "just released,
+  wait it out" notice.
+
+### Known limitations
+
+- **Only the `latest` item is gated today.** Code actions and completion can still offer a
+  non-latest intermediate version (e.g. picking from the full version list rather than jumping
+  straight to `latest`) without an independent OSV check on that specific version — tracked
+  separately as issue #1524.
+- **A permissive semver range can still mask a flagged `latest`.** If a dependency's declared
+  requirement is broad enough to already admit the registry's `latest` (e.g. `^1.0.4` with no
+  lock file, where `1.0.4` is itself the flagged version), the dependency reads as
+  `RequirementStatus::UpToDate` rather than `Outdated`, and this check — which only runs on the
+  `Outdated` path — never fires. The dependency shows no OSV caveat, and no diagnostic is
+  raised, even though the version already in scope is the one OSV flagged. Tracked separately
+  as issue #1526.
+
 ## Code Action: Fix Vulnerability
 
 A dependency flagged by the OSV vulnerability scan (see the security-advisories hover
