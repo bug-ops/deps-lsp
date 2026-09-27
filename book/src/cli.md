@@ -250,11 +250,13 @@ explicit choice.
   which case `update` targets the newest already-cooled-down, independently OSV-verified,
   floor-protected fallback candidate instead, when one exists (issue #1528). This is on by
   default and applies even with no `--cooldown`/`--config` given at all: a version that just
-  came out is not yet a real recommendation. A fallback candidate is only computed when a
-  lock-file-resolved in-use version exists to floor the search — a range requirement with no
-  lock file (the majority case for a fresh install) still falls back to a full skip, reported
-  as a `skipped` outcome whose reason names the freshness cooldown window (extending the
-  fallback to that case is a documented, tracked limitation, not yet implemented). When the
+  came out is not yet a real recommendation. A fallback candidate is computed whether or not a
+  lock-file-resolved in-use version exists: with a lock file, the search floors at the in-use
+  version; with no lock file and a range requirement (the majority case for a fresh install),
+  it floors at the declared requirement itself, and is only written when doing so provably
+  doesn't leave the requirement still admitting a newer, still-cooling version on the next
+  unlocked resolve — otherwise `update` falls back to a full skip, reported as a `skipped`
+  outcome whose reason names the freshness cooldown window (issue #1544). When the
   fallback candidate is itself OSV-flagged or unverified,
   `update` refuses to write it and exits non-zero naming that version, the same way an unsafe
   `latest` is refused — it never silently falls back to the plain cooldown skip. Disable this
