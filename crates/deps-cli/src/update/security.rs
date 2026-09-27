@@ -2,7 +2,6 @@
 //! native-form yank filter, and the three-outcome classification (#1120, spec 068 FR-008
 //! through FR-015).
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use deps_core::Ecosystem;
@@ -60,6 +59,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 ///     resolved_version_candidates: HashMap::new(),
 ///     outcomes: deps_core::lsp_helpers::DependencyOutcomes::new(),
 ///     vulnerabilities: None,
+///     latest_status: None,
 ///     licenses: HashMap::new(),
 ///     license_policy: deps_core::licenses::LicensePolicy::default(),
 ///     license_source: deps_core::LicenseSource::default(),
@@ -115,18 +115,25 @@ pub async fn plan_security_updates(
     );
     let osv_name_by_key = deps_engine::classify::osv::osv_name_by_key(&targets);
 
-    // FR-009: deliberately empty. The CLI runs no phase B.1 "latest" shortcut (unlike
-    // `deps-lsp`'s `run_osv_phase_b_and_commit`), so populating this map would make every
-    // fix target resolve to `NotChecked` and silently suppress every fix — see
-    // `collect_fix_target_resolutions`'s doc for the two-case resolution order this
-    // depends on. Do not "fix" this by populating it.
-    let latest_native_by_key: HashMap<deps_core::osv::VulnKey, String> = HashMap::new();
+    // Issue #1517 (former FR-009 hazard, now dissolved): `deps-cli` runs its own phase-B.1
+    // "latest" check (`analyze_manifest`'s `latest_check`), so — unlike before, when this map
+    // was deliberately left empty — the CLI now has a real `LatestStatusMap` to pass here,
+    // the same shared source of truth `deps-lsp` commits to `DocumentState.signals`. `None`
+    // (vulnerabilities checking disabled, or offline) degrades to an empty map, which
+    // `collect_fix_target_resolutions` already treats as "nothing to reuse, always live-check"
+    // — never a silently-suppressed fix.
+    static EMPTY_LATEST_STATUS: std::sync::LazyLock<deps_core::osv::LatestStatusMap> =
+        std::sync::LazyLock::new(deps_core::osv::LatestStatusMap::new);
+    let latest_status = analysis
+        .latest_status
+        .as_ref()
+        .unwrap_or(&EMPTY_LATEST_STATUS);
     let (resolved, live_check_candidates) =
         deps_engine::classify::osv::collect_fix_target_resolutions(
             vulnerabilities,
             &vulnerable_keys,
             &osv_name_by_key,
-            &latest_native_by_key,
+            latest_status,
             formatter,
         );
 
@@ -175,9 +182,19 @@ pub async fn plan_security_updates(
             continue;
         }
 
+        let latest = analysis.latest_status.as_ref().and_then(|map| {
+            deps_core::lsp_helpers::resolve_latest_status(
+                map,
+                dep,
+                Some(&vuln_key_by_range),
+                &normalized_name,
+            )
+        });
+
         items.push(classify_vulnerable_dependency(
             dep,
             dv,
+            latest,
             &normalized_name,
             analysis,
             formatter,
@@ -195,9 +212,16 @@ pub async fn plan_security_updates(
 /// been resolved (live-checked or not). Split out specifically so this decision logic is
 /// unit-testable without an `OsvClient`/network dependency (spec 068 S5) — `dv` is taken
 /// pre-resolved rather than re-deriving its `fix_target_status` here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "issue #1517 added `latest` alongside seven pre-existing parameters; mirrors \
+              `deps-lsp::document::osv_scan::run_osv_fix_target_verification`'s identical \
+              precedent for the same OSV-plumbing reason"
+)]
 fn classify_vulnerable_dependency(
     dep: &dyn deps_core::Dependency,
     dv: &deps_core::osv::DependencyVulnerabilities,
+    latest: Option<&deps_core::osv::UpgradeStatus>,
     normalized_name: &str,
     analysis: &ManifestAnalysis,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
@@ -261,7 +285,7 @@ fn classify_vulnerable_dependency(
     // *before* the version_requirement/version_range/yanked checks below, exactly like the
     // pre-#1350 code did, so an unverified fix target is never misreported as
     // `RequiresLockfileUpdate`/`Unfixable(Yanked)` instead of `Unfixable(NoVerifiedFix)`.
-    let (fix, version_native) = match resolve_verified_fix(dv, formatter) {
+    let (fix, version_native) = match resolve_verified_fix(dv, latest, formatter) {
         Ok(pair) => pair,
         Err(_) => {
             return unfixable_item(
@@ -597,6 +621,7 @@ mod tests {
             resolved_version_candidates: HashMap::new(),
             outcomes: deps_core::lsp_helpers::DependencyOutcomes::new(),
             vulnerabilities: None,
+            latest_status: None,
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
             license_source: deps_core::LicenseSource::default(),
@@ -625,6 +650,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -653,6 +679,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -678,6 +705,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -701,6 +729,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -722,6 +751,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &NO_COMPILE_REQUIREMENT_FORMATTER,
@@ -752,6 +782,7 @@ mod tests {
         let rewrite_item = classify_vulnerable_dependency(
             &rewrite_dep,
             &rewrite_dv,
+            None,
             "serde",
             &rewrite_analysis,
             &rewrite_formatter,
@@ -769,6 +800,7 @@ mod tests {
         let lockfile_item = classify_vulnerable_dependency(
             &lockfile_dep,
             &lockfile_dv,
+            None,
             "tokio",
             &lockfile_analysis,
             &lockfile_formatter,
@@ -804,6 +836,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -830,6 +863,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -864,6 +898,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -892,6 +927,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -929,6 +965,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -972,6 +1009,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -1009,6 +1047,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -1048,6 +1087,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -1091,6 +1131,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -1119,6 +1160,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -1148,6 +1190,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,
@@ -1175,6 +1218,7 @@ mod tests {
         let item = classify_vulnerable_dependency(
             &dep,
             &dv,
+            None,
             "serde",
             &analysis,
             &formatter,

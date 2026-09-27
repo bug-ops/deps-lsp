@@ -888,6 +888,7 @@ pub async fn assert_unresolved_requirements_never_rewritten(
                 dep.version_range().expect("checked above"),
                 current,
                 &dv,
+                None,
                 formatter,
             );
             // #1391: tightened to `UnresolvedPlaceholder` alone — the assertion above already

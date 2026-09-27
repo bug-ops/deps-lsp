@@ -9,7 +9,7 @@
 //! items are visible to descendant modules, and `signals` is a descendant of `state`.
 
 use deps_core::lsp_helpers::EcosystemFormatter;
-use deps_core::osv::VulnerabilityMap;
+use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, GossipFindings, PackageName, PackageVersions,
     TyposquatSignal, VersionData,
@@ -56,6 +56,16 @@ pub struct PackageSignals {
     /// the first background scan completes; carried across document edits
     /// by `preserve_cache` so it is not wiped on every keystroke.
     pub vulnerabilities: VulnerabilityMap,
+    /// Phase B's per-key "latest" check result (issue #1517), keyed the same way as
+    /// [`Self::vulnerabilities`] — see [`deps_core::osv::LatestStatusMap`]. Populated for
+    /// every dependency with a registry-cached latest, not only ones already flagged
+    /// [`deps_core::osv::ScanOutcome::Vulnerable`] at their pinned version — the gap this issue
+    /// closes. Empty until the first phase B commits; carried across document edits by
+    /// `preserve_cache`. Every handler attaches this unconditionally (mirroring
+    /// [`Self::vulnerabilities`]'s own unconditional attach) so the pre-phase-B window renders
+    /// `Some(&empty map)`, not `None` — [`deps_core::lsp_helpers::latest_verdict`] treats an
+    /// empty map's absent entry as `Unverified` (fail closed), never `NotApplicable`.
+    pub latest_status: LatestStatusMap,
     /// Yanked, deprecation, and fetch-failure findings from the lifecycle's registry
     /// fetch, keyed by **normalized** package name. This is deliberately a different
     /// type from `FetchResult`'s raw-keyed triple: the split makes a forgotten
@@ -169,6 +179,7 @@ impl std::fmt::Debug for PackageSignals {
             resolved_version_candidates,
             resolved_versions_generation,
             vulnerabilities,
+            latest_status,
             outcomes,
             licenses,
             typosquats,
@@ -184,6 +195,7 @@ impl std::fmt::Debug for PackageSignals {
             )
             .field("resolved_versions_generation", resolved_versions_generation)
             .field("vulnerabilities_count", &vulnerabilities.len())
+            .field("latest_status_count", &latest_status.len())
             .field("licenses_count", &licenses.len())
             .field("typosquats_count", &typosquats.len())
             .field(
@@ -213,6 +225,7 @@ impl Default for PackageSignals {
             resolved_version_candidates: HashMap::new(),
             resolved_versions_generation: ResolvedGeneration::INITIAL,
             vulnerabilities: VulnerabilityMap::new(),
+            latest_status: LatestStatusMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
@@ -250,6 +263,7 @@ impl PackageSignals {
             resolved_version_candidates,
             resolved_versions_generation: _,
             vulnerabilities,
+            latest_status,
             outcomes,
             licenses,
             typosquats,
@@ -265,6 +279,7 @@ impl PackageSignals {
             gossip_findings.remove(removed_dep);
             let normalized = formatter.normalize_package_name(removed_dep);
             vulnerabilities.retain(|key, _| key.as_str() != normalized);
+            latest_status.retain(|key, _| key.as_str() != normalized);
             outcomes.remove(&normalized);
         }
     }
@@ -282,6 +297,7 @@ impl PackageSignals {
             resolved: self.resolved_versions.clone(),
             candidates: None,
             vulnerabilities: None,
+            latest_status: None,
             outcomes: None,
             licenses: None,
             typosquats: None,
@@ -319,6 +335,7 @@ pub(crate) struct SignalsSnapshotBuilder<'a> {
     resolved: HashMap<PackageName, ConcreteVersion>,
     candidates: Option<HashMap<PackageName, Vec<ConcreteVersion>>>,
     vulnerabilities: Option<VulnerabilityMap>,
+    latest_status: Option<LatestStatusMap>,
     outcomes: Option<DependencyOutcomes>,
     licenses: Option<HashMap<PackageName, Vec<String>>>,
     typosquats: Option<HashMap<PackageName, TyposquatSignal>>,
@@ -337,6 +354,30 @@ impl SignalsSnapshotBuilder<'_> {
     #[must_use]
     pub(crate) fn with_vulnerabilities(mut self) -> Self {
         self.vulnerabilities = Some(self.signals.vulnerabilities.clone());
+        self
+    }
+
+    /// Attaches [`PackageSignals::latest_status`] (issue #1517) when `enabled` is `true`,
+    /// leaving it `None` otherwise. Callers pass `policy.diagnostics.vulnerabilities_enabled
+    /// && !policy.network.offline` (critique S3) — checking never actually runs while
+    /// offline either (`document::lifecycle`'s phase-A spawn gate matches), so both
+    /// conditions must degrade the same way here.
+    ///
+    /// Unlike [`Self::with_vulnerabilities`]'s unconditional attach, this **must** be gated:
+    /// an absent [`deps_core::osv::LatestStatusMap`] means [`deps_core::lsp_helpers::LatestVerdict::NotApplicable`]
+    /// (OSV checking doesn't apply at all — the pre-#1517 permissive behavior, correct when the
+    /// operator disabled vulnerability checking entirely, or is working offline), while a
+    /// *present but empty* map means [`deps_core::lsp_helpers::LatestVerdict::Unverified`]
+    /// (checking is on, phase B just hasn't run yet — fail closed). `PackageSignals::latest_status`
+    /// stays permanently empty whenever vulnerabilities checking is disabled or offline (phase B
+    /// never runs), so attaching it unconditionally like `vulnerabilities` would wrongly turn
+    /// "feature disabled"/"offline" into "permanently unverified," blocking every update
+    /// recommendation forever instead of falling back to not-applicable.
+    #[must_use]
+    pub(crate) fn with_latest_status(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.latest_status = Some(self.signals.latest_status.clone());
+        }
         self
     }
 
@@ -387,6 +428,7 @@ impl SignalsSnapshotBuilder<'_> {
             resolved: self.resolved,
             candidates: self.candidates,
             vulnerabilities: self.vulnerabilities,
+            latest_status: self.latest_status,
             outcomes: self.outcomes,
             licenses: self.licenses,
             typosquats: self.typosquats,
@@ -407,6 +449,7 @@ pub(crate) struct SignalsSnapshot {
     resolved: HashMap<PackageName, ConcreteVersion>,
     candidates: Option<HashMap<PackageName, Vec<ConcreteVersion>>>,
     vulnerabilities: Option<VulnerabilityMap>,
+    latest_status: Option<LatestStatusMap>,
     outcomes: Option<DependencyOutcomes>,
     licenses: Option<HashMap<PackageName, Vec<String>>>,
     typosquats: Option<HashMap<PackageName, TyposquatSignal>>,
@@ -426,6 +469,9 @@ impl SignalsSnapshot {
         }
         if let Some(vulnerabilities) = &self.vulnerabilities {
             data = data.with_vulnerabilities(vulnerabilities);
+        }
+        if let Some(latest_status) = &self.latest_status {
+            data = data.with_latest_status(latest_status);
         }
         if let Some(outcomes) = &self.outcomes {
             data = data.with_outcomes(outcomes);

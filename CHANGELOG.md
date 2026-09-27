@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli, deps-engine**: `check`/`update` now honor `[gossip].enabled`, floor-protected against ever excluding an already-in-use version, plus an `ignored_sections`/`[typosquat]` warning-parity fix for explicit `--config` files (resolves #1474) (#1520)
 
 ### Security
+- **deps-lsp, deps-cli, deps-core**: closes several residual fail-open gaps in the OSV latest-check across completion, diagnostics, and `deps-cli update` (part of #1517)
+- **deps-lsp, deps-cli, deps-core, deps-engine**: OSV phase B now checks every dependency's registry `latest`, not only ones already flagged vulnerable at their pinned version, closing a gap where a malicious/vulnerable `latest` could be recommended or auto-written as a safe upgrade (resolves #1517)
+- **deps-lsp**: a GOSSIP cooldown sentinel no longer masks an OSV-flagged malicious/critical latest version as a benign "recently published" notice (part of #1517)
 - **deps-lsp, deps-cli, deps-core, deps-cargo, deps-npm, deps-pypi, deps-swift, deps-github-actions**: sink-level and per-site sanitization closes the residual CWE-117 log-forging sinks left open after #1500 (resolves #1505) (#1512)
 - **deps-core**: `PackageName::for_tracing()`/`redact::url_for_tracing()` now sweep control/format characters (`\n`, `\r`, ESC) from a manifest-controlled name or URL, closing a log-forging/terminal-escape-injection gap (CWE-117/CWE-150) in `deps-lsp`'s stderr tracing output (resolves #1469) (#1500)
 - **deps-core, deps-nuget**: `VulnKey`'s `Display`, NuGet `nuget.config` source-key `WARN`/`DEBUG` logging, and POM license-name `DEBUG` logging now sanitize `\n`/`\r` before rendering, closing residual CWE-117 log-forging sinks left over from #1469's narrower fix (resolves #1501)
@@ -141,6 +144,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: the dependency-count-ceiling wrapper now forwards `selection_context`/`invalid_minimum_stability`, fixing lost `minimum-stability` enforcement on a capped `composer.json` (resolves #1444) (#1450)
 
 ### Breaking
+- **deps-core**: `osv::DependencyVulnerabilities` no longer has an `upgrade_status` field — `recommended_fix` now takes `latest: Option<&UpgradeStatus>`, looked up by the caller from the new `osv::LatestStatusMap` (the single per-key "latest" verdict every renderer and `deps-cli` now share); `UpgradeStatus::CandidateVulnerable` gains a `worst_severity: Option<VulnSeverity>` field and a new `CandidateUnverified { version, reason }` variant; `OsvClient::check_candidates` now returns `LatestStatusMap` and produces an entry for every candidate instead of silently dropping a `Skipped` one (part of #1517)
+- **deps-core**: `edit::resolve_recommended_fix`/`resolve_verified_fix`/`plan_vulnerability_fix` gain a `latest: Option<&osv::UpgradeStatus>` parameter; new `edit::UnplannableReason::LatestFlaggedByOsv`/`LatestUnverified` variants (part of #1517)
+- **deps-engine**: `classify::osv::collect_fix_target_resolutions`/`resolve_fix_target`'s `latest_native_by_key: HashMap<VulnKey, String>` parameter is now `latest_status: &osv::LatestStatusMap`; new `classify::osv::build_latest_check_targets` (part of #1517)
+- **deps-cli**: `analyze::AnalysisScope::none()` is renamed `update_default()`; `analyze::ManifestAnalysis` gains a `latest_status` field (part of #1517)
+- **deps-cli**: `ManifestAnalysis::has_unverified_latest_check` gains `package_filter`/`ignore_rules` parameters, scoping the check to dependencies actually in scope for the run's plan (part of #1517)
+- **deps-core**: `osv::OsvClient::for_test`/its `base_url` override are now available behind `#[cfg(feature = "test-util")]`, not only `#[cfg(test)]`, so downstream crates can mock OSV responses in their own tests (part of #1517)
 - **deps-core**: `GithubActionsVersion.sha`/`GitlabCiVersion.sha` are now the new `lsp_helpers::CommitSha` newtype (`Option<CommitSha>` for GitLab) instead of `String`; `GitlabCiVersion::new`'s signature changed accordingly (part of #1480) (#1510)
 - **deps-core**: `TagIndex` moved from `deps-github-actions`/`deps-gitlab-ci`'s own `registry` modules to `deps_core::lsp_helpers::TagIndex`, now keyed by `CommitSha` instead of `String` (part of #1480) (#1510)
 - **deps-gitlab-ci**: `GitlabRoute`'s public `origin: String` field is replaced by a `pub(crate)` `host: GitlabHost` field plus a `host()` getter; `GitlabHost::trusted` is removed; `routes()`/`register_alternate` are now `pub(crate)` (part of #1480) (#1510)

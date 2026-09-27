@@ -57,7 +57,7 @@ pub async fn handle_code_lens(
 
     // Release the DashMap shard `Ref` before awaiting (#333): `with_document` only hands
     // `extract` a borrowed `&DocumentState` synchronously, so it can't leak across the await below.
-    let Some((ecosystem, parse_result, content, snapshot)) = state
+    let Some((ecosystem, ecosystem_id, parse_result, content, snapshot)) = state
         .with_document(uri, |doc| {
             let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
 
@@ -69,8 +69,19 @@ pub async fn handle_code_lens(
             }
 
             let parse_result = doc.parse_result_arc()?;
-            let snapshot = doc.signals.snapshot().finish();
-            Some((ecosystem, parse_result, doc.content.clone(), snapshot))
+            let snapshot = doc
+                .signals
+                .snapshot()
+                .with_vulnerabilities()
+                .with_latest_status(severities.vulnerabilities_enabled && !offline)
+                .finish();
+            Some((
+                ecosystem,
+                doc.ecosystem,
+                parse_result,
+                doc.content.clone(),
+                snapshot,
+            ))
         })
         .flatten()
     else {
@@ -85,7 +96,12 @@ pub async fn handle_code_lens(
         tracing::warn!("URI is not representable as a url::Url: {:?}", uri);
         return vec![];
     };
-    let versions = snapshot.version_data().with_offline(offline);
+    // Issue #1517: `with_ecosystem` lets `collect_update_candidates`'s own OSV latest-verdict
+    // gate disambiguate duplicate dependency names, mirroring every other renderer.
+    let versions = snapshot
+        .version_data()
+        .with_offline(offline)
+        .with_ecosystem(ecosystem_id);
     let mut lenses = ecosystem
         .generate_code_lenses(
             parse_result.as_ref(),
@@ -273,7 +289,25 @@ mod tests {
                 content.to_string(),
                 parse_result,
             );
+            // Issue #1517: these fixtures are about the outdated/pin-to-sha lens logic, not
+            // OSV verification — mark every cached package's latest as already
+            // OSV-verified-clean so the new `latest_verdict` gate in
+            // `collect_update_candidates` doesn't turn every one of them into an
+            // `Unplannable{LatestUnverified}` (the correct fail-closed default when phase B
+            // never actually ran, which is exactly what this synthetic fixture never does).
+            let latest_status: deps_core::osv::LatestStatusMap = cached
+                .iter()
+                .map(|(name, versions)| {
+                    (
+                        deps_core::test_util::vuln_key(name.as_str()),
+                        deps_core::osv::UpgradeStatus::CandidateClean {
+                            version: versions.latest.to_string(),
+                        },
+                    )
+                })
+                .collect();
             doc_state.update_cached_versions(cached);
+            doc_state.update_latest_status(latest_status);
             doc_state.set_loaded();
             doc_state.set_version(Some(1));
             state.update_document(uri.clone(), doc_state);
@@ -1185,6 +1219,18 @@ let package = Package(
                 deps_core::PackageVersions::latest_only("v4"),
             );
             doc_state.update_cached_versions(cached);
+            // Issue #1517: this test is about the mutable-ref-pin gate, not OSV
+            // verification — mark the outdated dependency's latest as already
+            // OSV-verified-clean so the sibling `updateAllOutdated` lens assertion below
+            // isn't affected by the new fail-closed-when-unverified gate.
+            let mut latest_status = deps_core::osv::LatestStatusMap::new();
+            latest_status.insert(
+                deps_core::test_util::vuln_key("actions/checkout"),
+                deps_core::osv::UpgradeStatus::CandidateClean {
+                    version: "v4".to_string(),
+                },
+            );
+            doc_state.update_latest_status(latest_status);
             doc_state.set_loaded();
             doc_state.set_version(Some(1));
             state.update_document(uri.clone(), doc_state);

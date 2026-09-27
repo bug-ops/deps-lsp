@@ -691,6 +691,7 @@ mod tests {
             deps_core::position::Range::default(),
             "$(AutoMapperVersion)",
             &dv,
+            None,
             &NuGetFormatter,
         );
 
@@ -852,6 +853,7 @@ mod tests {
             version_range,
             dep.version_requirement().unwrap().as_str(),
             &dv,
+            None,
             &NuGetFormatter,
         )
         .expect(
@@ -905,6 +907,7 @@ mod tests {
             deps_core::position::Range::default(),
             current,
             &dv,
+            None,
             &NuGetFormatter,
         );
 

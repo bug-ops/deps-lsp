@@ -666,11 +666,12 @@ mod capped_tests {
 
 /// Result of checking whether a recommended upgrade target is itself affected.
 ///
-/// Populated by [`crate::osv::OsvClient::check_candidates`] (phase B), which only runs for
-/// dependencies phase A already flagged as [`ScanOutcome::Vulnerable`]. Used for both the
-/// registry's "latest" candidate ([`DependencyVulnerabilities::upgrade_status`]) and the
-/// independently-verified fix target F ([`DependencyVulnerabilities::fix_target_status`]) —
-/// see the latter's doc for why F needs its own verification result distinct from latest's.
+/// Populated by [`crate::osv::OsvClient::check_candidates`] (phase B, issue #1517: now run for
+/// every dependency with a registry-cached latest, not only ones phase A already flagged
+/// [`ScanOutcome::Vulnerable`]). Used for both the registry's "latest" candidate (the per-key
+/// entry in [`crate::osv::LatestStatusMap`]) and the independently-verified fix target F
+/// ([`DependencyVulnerabilities::fix_target_status`]) — see the latter's doc for why F needs its
+/// own verification result distinct from latest's.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpgradeStatus {
@@ -694,6 +695,27 @@ pub enum UpgradeStatus {
         /// candidate; an incomplete list means some are missing, not that none
         /// exist.
         advisory_ids: Capped<String>,
+        /// The most severe [`VulnSeverity`] among `advisory_ids`'s full records, or `None` when
+        /// no record could be fetched for any of them (issue #1517) — a caller must treat `None`
+        /// as blocking (never render this candidate as safe), never as "no advisories". Exists
+        /// so an [`VulnSeverity::Informational`]-only advisory that affects every version of a
+        /// dependency (common for RUSTSEC-style maintenance notices) does not wrongly suppress
+        /// "outdated" status for that dependency's latest — a caller checks this field before
+        /// treating [`Self::CandidateVulnerable`] as a hard block.
+        worst_severity: Option<VulnSeverity>,
+    },
+    /// The candidate upgrade version's OSV status could not be determined — either the check
+    /// was never run (transient: query failure, timeout, truncation) or structurally does not
+    /// apply (this dependency's source/ecosystem is never checked against OSV at all). See
+    /// [`SkipReason::is_structural`] for the distinction a caller (e.g.
+    /// `crate::lsp_helpers::latest_verdict`) uses to tell the two apart — a transient reason
+    /// must fail closed (never rendered as "verified safe"), while a structural one degrades to
+    /// "not applicable" instead (issue #1517).
+    CandidateUnverified {
+        /// The version that was attempted (or would have been attempted, for a structural skip).
+        version: String,
+        /// Why the check did not produce a definite clean/vulnerable verdict.
+        reason: SkipReason,
     },
 }
 
@@ -714,13 +736,13 @@ pub struct DependencyVulnerabilities {
     /// `ADVISORY_DISPLAY_CAP` and is the source of the render layer's "+N more advisories"
     /// count (`architecture.md` §7).
     pub advisories: Capped<Arc<Advisory>>,
-    /// Result of phase B's "latest" check, if it has run for this dependency.
-    pub upgrade_status: UpgradeStatus,
     /// Independent verification of [`Self::recommended_fix`]'s target version F, if F
-    /// differs from the "latest" candidate `upgrade_status` already covers. Left at
+    /// differs from the "latest" candidate (looked up by the caller from
+    /// [`crate::osv::LatestStatusMap`], the single source of truth for phase B's "latest" check —
+    /// issue #1517 removed this struct's own parallel `upgrade_status` field). Left at
     /// [`UpgradeStatus::NotChecked`] until [`Self::recommended_fix`] has been computed and F's
-    /// status resolved — either reused from `upgrade_status` when F equals latest, or checked
-    /// live via [`crate::osv::OsvClient::check_candidates`] otherwise (always live-checked when
+    /// status resolved — either reused from the latest-status map entry when F equals latest, or
+    /// checked live via [`crate::osv::OsvClient::check_candidates`] otherwise (always live-checked when
     /// F differs from latest: a data-derived shortcut was tried and rejected — see git history
     /// on this field and #462's critique — because it degenerates into checking F against
     /// exactly the advisories it was computed from, proving nothing about an advisory phase
@@ -738,9 +760,8 @@ pub struct DependencyVulnerabilities {
 
 impl DependencyVulnerabilities {
     /// Constructs a `DependencyVulnerabilities` from its fetched advisories, with
-    /// [`Self::upgrade_status`] and [`Self::fix_target_status`] both left at
-    /// [`UpgradeStatus::NotChecked`] — chain [`Self::with_upgrade_status`] and/or
-    /// [`Self::with_fix_target_status`] to attach phase B results.
+    /// [`Self::fix_target_status`] left at [`UpgradeStatus::NotChecked`] — chain
+    /// [`Self::with_fix_target_status`] to attach phase B's result.
     ///
     /// Needed because [`Self`] is `#[non_exhaustive]`: a struct literal only works inside
     /// this crate, so every other crate (including test code) must go through this
@@ -758,16 +779,8 @@ impl DependencyVulnerabilities {
     pub const fn new(advisories: Capped<Arc<Advisory>>) -> Self {
         Self {
             advisories,
-            upgrade_status: UpgradeStatus::NotChecked,
             fix_target_status: UpgradeStatus::NotChecked,
         }
-    }
-
-    /// Attaches phase B's "latest" check result. See [`Self::upgrade_status`].
-    #[must_use]
-    pub fn with_upgrade_status(mut self, upgrade_status: UpgradeStatus) -> Self {
-        self.upgrade_status = upgrade_status;
-        self
     }
 
     /// Attaches the independent verification of the recommended fix target. See
@@ -875,6 +888,20 @@ const fn severity_rank(severity: VulnSeverity) -> u8 {
     }
 }
 
+/// The most severe [`VulnSeverity`] among `advisories`, by [`severity_rank`] — `None` when
+/// `advisories` is empty.
+///
+/// Used by [`crate::osv::OsvClient::check_candidates`] (issue #1517) to populate
+/// [`UpgradeStatus::CandidateVulnerable::worst_severity`] so a caller can tell an
+/// [`VulnSeverity::Informational`]-only candidate (e.g. a RUSTSEC "unmaintained" notice
+/// affecting every version) apart from a genuinely blocking one.
+pub(crate) fn worst_severity(advisories: &[Arc<Advisory>]) -> Option<VulnSeverity> {
+    advisories
+        .iter()
+        .map(|a| a.severity)
+        .max_by_key(|&s| severity_rank(s))
+}
+
 impl DependencyVulnerabilities {
     /// Recommends a single upgrade target that resolves as many of this
     /// dependency's known advisories as possible.
@@ -932,15 +959,27 @@ impl DependencyVulnerabilities {
     ///
     /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory("RUSTSEC-1", "1.2.0")], 1));
     ///
-    /// let fix = dv.recommended_fix().unwrap();
+    /// let fix = dv.recommended_fix(None).unwrap();
     /// assert_eq!(fix.version, "1.2.0");
     /// assert_eq!(fix.advisory_ids, vec!["RUSTSEC-1".to_string()]);
     /// ```
+    ///
+    /// # Arguments
+    ///
+    /// * `latest` - This dependency's entry (looked up by the caller via its [`VulnKey`]) in the
+    ///   shared [`crate::osv::LatestStatusMap`] phase B's "latest" check populates (issue #1517)
+    ///   — `None` when OSV's latest-check never ran for this dependency (matches the previous
+    ///   `upgrade_status` field's [`UpgradeStatus::NotChecked`] default).
     #[must_use]
-    pub fn recommended_fix(&self) -> Option<FixRecommendation> {
-        let still_applying: &[String] = match &self.upgrade_status {
-            UpgradeStatus::CandidateVulnerable { advisory_ids, .. } => advisory_ids.items(),
-            UpgradeStatus::NotChecked | UpgradeStatus::CandidateClean { .. } => &[],
+    pub fn recommended_fix(&self, latest: Option<&UpgradeStatus>) -> Option<FixRecommendation> {
+        let still_applying: &[String] = match latest {
+            Some(UpgradeStatus::CandidateVulnerable { advisory_ids, .. }) => advisory_ids.items(),
+            Some(
+                UpgradeStatus::NotChecked
+                | UpgradeStatus::CandidateClean { .. }
+                | UpgradeStatus::CandidateUnverified { .. },
+            )
+            | None => &[],
         };
 
         let mut claimed: Vec<&Advisory> = self
@@ -1065,6 +1104,32 @@ impl SkipReason {
             Self::Truncated => Some("the OSV.dev result set was truncated"),
         }
     }
+
+    /// Whether this reason is structural — permanent for as long as a dependency is declared
+    /// the way it is (a mapping/ecosystem-support gap) — as opposed to transient (a timeout or
+    /// a temporary OSV outage, which a retry could resolve).
+    ///
+    /// Used by callers deciding whether a dependency whose "latest" was never checked (issue
+    /// #1517) should be treated as not-applicable (structural) or unverified/fail-closed
+    /// (transient) — a [`Self::QueryFailed`]/[`Self::Truncated`]/[`Self::NoConcreteVersion`]
+    /// skip must never be silently treated as "this dependency has no latest to verify", since a
+    /// retry or a resolved lockfile could turn it into a real, checkable result later.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::SkipReason;
+    ///
+    /// assert!(SkipReason::UnmappableName.is_structural());
+    /// assert!(!SkipReason::QueryFailed.is_structural());
+    /// ```
+    #[must_use]
+    pub const fn is_structural(self) -> bool {
+        matches!(
+            self,
+            Self::NonRegistrySource | Self::UnmappableName | Self::UnmappableEcosystem
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1150,6 +1215,22 @@ pub enum ScanOutcome {
 /// See [`vulnerability_keys`] for how a key is derived — normally the normalized dependency
 /// name, but version-qualified for a duplicated dependency name's ambiguous occurrences.
 pub type VulnerabilityMap = HashMap<VulnKey, ScanOutcome>;
+
+/// Per-key "latest"-check result map (issue #1517).
+///
+/// The single source of truth for every renderer (hover, diagnostics, code actions, code lens,
+/// inlay hints, completion) and `deps-cli update`/`check` deciding whether a dependency's
+/// recommended upgrade target is itself safe to adopt.
+///
+/// Unlike [`VulnerabilityMap`] (populated for every dependency phase A considered, vulnerable or
+/// not), this map is populated only for dependencies that have a registry-cached "latest" to
+/// check — see `deps_engine::classify::osv::build_latest_check_targets` for how entries are
+/// built, including the structural [`UpgradeStatus::CandidateUnverified`] entries for a
+/// dependency whose source/ecosystem is never checked against OSV at all. A key absent from this
+/// map (as opposed to present with [`UpgradeStatus::NotChecked`]/
+/// [`UpgradeStatus::CandidateUnverified`]) means OSV checking is disabled or offline for this
+/// scan entirely — `crate::lsp_helpers::latest_verdict` treats the two differently.
+pub type LatestStatusMap = HashMap<VulnKey, UpgradeStatus>;
 
 /// A single occurrence's [`VulnerabilityMap`] lookup key, as computed by [`vulnerability_keys`]
 /// or [`vuln_key_for`].
@@ -1879,40 +1960,30 @@ mod recommended_fix_tests {
         })
     }
 
-    fn dv(
-        advisories: Vec<Arc<Advisory>>,
-        upgrade_status: UpgradeStatus,
-    ) -> DependencyVulnerabilities {
+    fn dv(advisories: Vec<Arc<Advisory>>) -> DependencyVulnerabilities {
         let total = advisories.len();
         DependencyVulnerabilities {
             advisories: Capped::new(advisories, total),
-            upgrade_status,
             fix_target_status: UpgradeStatus::NotChecked,
         }
     }
 
     #[test]
     fn no_advisory_has_a_fix_returns_none() {
-        let vulns = dv(
-            vec![advisory("A1", VulnSeverity::High, &[])],
-            UpgradeStatus::NotChecked,
-        );
-        assert!(vulns.recommended_fix().is_none());
+        let vulns = dv(vec![advisory("A1", VulnSeverity::High, &[])]);
+        assert!(vulns.recommended_fix(None).is_none());
     }
 
     #[test]
     fn multiple_advisories_combine_into_one_fix_at_the_highest_version() {
         // A1 fixed at 1.1.0, A2 fixed at 1.3.0: the recommendation targets
         // the highest of the two and claims both ids.
-        let vulns = dv(
-            vec![
-                advisory("A1", VulnSeverity::High, &["1.1.0"]),
-                advisory("A2", VulnSeverity::Critical, &["1.3.0"]),
-            ],
-            UpgradeStatus::NotChecked,
-        );
+        let vulns = dv(vec![
+            advisory("A1", VulnSeverity::High, &["1.1.0"]),
+            advisory("A2", VulnSeverity::Critical, &["1.3.0"]),
+        ]);
 
-        let fix = vulns.recommended_fix().unwrap();
+        let fix = vulns.recommended_fix(None).unwrap();
         assert_eq!(fix.version, "1.3.0");
         // Sorted by severity descending: Critical (A2) before High (A1).
         assert_eq!(fix.advisory_ids, vec!["A2".to_string(), "A1".to_string()]);
@@ -1923,57 +1994,63 @@ mod recommended_fix_tests {
         // Critic's counterexample: A1 fixed 1.1.0, A2 fixed 1.2.0. Phase B
         // reports the candidate is still affected by A1 only, so A1 must be
         // dropped from the claim while A2 survives.
-        let vulns = dv(
-            vec![
-                advisory("A1", VulnSeverity::High, &["1.1.0"]),
-                advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
-            ],
-            UpgradeStatus::CandidateVulnerable {
-                version: "1.2.0".to_string(),
-                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
-            },
-        );
+        let vulns = dv(vec![
+            advisory("A1", VulnSeverity::High, &["1.1.0"]),
+            advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
+        ]);
+        let latest = UpgradeStatus::CandidateVulnerable {
+            version: "1.2.0".to_string(),
+            advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+            worst_severity: Some(VulnSeverity::High),
+        };
 
-        let fix = vulns.recommended_fix().unwrap();
+        let fix = vulns.recommended_fix(Some(&latest)).unwrap();
         assert_eq!(fix.version, "1.2.0");
         assert_eq!(fix.advisory_ids, vec!["A2".to_string()]);
     }
 
     #[test]
     fn candidate_vulnerable_subtracting_every_claimed_id_returns_none() {
-        let vulns = dv(
-            vec![advisory("A1", VulnSeverity::High, &["1.1.0"])],
-            UpgradeStatus::CandidateVulnerable {
-                version: "1.1.0".to_string(),
-                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
-            },
-        );
-        assert!(vulns.recommended_fix().is_none());
+        let vulns = dv(vec![advisory("A1", VulnSeverity::High, &["1.1.0"])]);
+        let latest = UpgradeStatus::CandidateVulnerable {
+            version: "1.1.0".to_string(),
+            advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+            worst_severity: Some(VulnSeverity::High),
+        };
+        assert!(vulns.recommended_fix(Some(&latest)).is_none());
     }
 
     #[test]
     fn candidate_clean_subtracts_nothing() {
-        let vulns = dv(
-            vec![advisory("A1", VulnSeverity::High, &["1.1.0"])],
-            UpgradeStatus::CandidateClean {
-                version: "2.0.0".to_string(),
-            },
-        );
-        let fix = vulns.recommended_fix().unwrap();
+        let vulns = dv(vec![advisory("A1", VulnSeverity::High, &["1.1.0"])]);
+        let latest = UpgradeStatus::CandidateClean {
+            version: "2.0.0".to_string(),
+        };
+        let fix = vulns.recommended_fix(Some(&latest)).unwrap();
+        assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
+    }
+
+    #[test]
+    fn candidate_unverified_subtracts_nothing() {
+        // Issue #1517: an unresolved latest-check (timeout/structural skip) must not be
+        // mistaken for a confirmed-vulnerable candidate — `still_applying` stays empty.
+        let vulns = dv(vec![advisory("A1", VulnSeverity::High, &["1.1.0"])]);
+        let latest = UpgradeStatus::CandidateUnverified {
+            version: "2.0.0".to_string(),
+            reason: SkipReason::QueryFailed,
+        };
+        let fix = vulns.recommended_fix(Some(&latest)).unwrap();
         assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
     }
 
     #[test]
     fn advisory_without_a_fix_is_excluded_from_the_claim() {
-        let vulns = dv(
-            vec![
-                advisory("A1", VulnSeverity::High, &["1.1.0"]),
-                advisory("A2", VulnSeverity::Critical, &[]),
-            ],
-            UpgradeStatus::NotChecked,
-        );
+        let vulns = dv(vec![
+            advisory("A1", VulnSeverity::High, &["1.1.0"]),
+            advisory("A2", VulnSeverity::Critical, &[]),
+        ]);
 
-        let fix = vulns.recommended_fix().unwrap();
+        let fix = vulns.recommended_fix(None).unwrap();
         assert_eq!(fix.version, "1.1.0");
         assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
     }
@@ -1983,33 +2060,29 @@ mod recommended_fix_tests {
         // Critic S1 counterexample: A1 (fixed 3.0.0) still applies at the candidate and is
         // excluded; A2 (fixed 1.2.0) is claimed. Recommended version must be 1.2.0, computed
         // over what's actually claimed — not 3.0.0, which doesn't even resolve A1.
-        let vulns = dv(
-            vec![
-                advisory("A1", VulnSeverity::High, &["3.0.0"]),
-                advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
-            ],
-            UpgradeStatus::CandidateVulnerable {
-                version: "3.0.0".to_string(),
-                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
-            },
-        );
+        let vulns = dv(vec![
+            advisory("A1", VulnSeverity::High, &["3.0.0"]),
+            advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
+        ]);
+        let latest = UpgradeStatus::CandidateVulnerable {
+            version: "3.0.0".to_string(),
+            advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+            worst_severity: Some(VulnSeverity::High),
+        };
 
-        let fix = vulns.recommended_fix().unwrap();
+        let fix = vulns.recommended_fix(Some(&latest)).unwrap();
         assert_eq!(fix.version, "1.2.0");
         assert_eq!(fix.advisory_ids, vec!["A2".to_string()]);
     }
 
     #[test]
     fn equal_severity_ties_break_lexicographically_by_id() {
-        let vulns = dv(
-            vec![
-                advisory("B1", VulnSeverity::High, &["1.0.0"]),
-                advisory("A1", VulnSeverity::High, &["1.0.0"]),
-            ],
-            UpgradeStatus::NotChecked,
-        );
+        let vulns = dv(vec![
+            advisory("B1", VulnSeverity::High, &["1.0.0"]),
+            advisory("A1", VulnSeverity::High, &["1.0.0"]),
+        ]);
 
-        let fix = vulns.recommended_fix().unwrap();
+        let fix = vulns.recommended_fix(None).unwrap();
         assert_eq!(fix.advisory_ids, vec!["A1".to_string(), "B1".to_string()]);
     }
 }
@@ -2034,7 +2107,6 @@ mod advisories_for_display_tests {
     fn dv(advisories: Vec<Arc<Advisory>>, total: usize) -> DependencyVulnerabilities {
         DependencyVulnerabilities {
             advisories: Capped::new(advisories, total),
-            upgrade_status: UpgradeStatus::NotChecked,
             fix_target_status: UpgradeStatus::NotChecked,
         }
     }
@@ -2393,7 +2465,7 @@ mod osv_version_validation_tests {
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
 
-        let fix = dv.recommended_fix().expect("a fix must be recommended");
+        let fix = dv.recommended_fix(None).expect("a fix must be recommended");
         assert_eq!(fix.version, "2.31.0");
     }
 
@@ -2432,7 +2504,7 @@ mod osv_version_validation_tests {
 
         let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
         assert!(
-            dv.recommended_fix().is_none(),
+            dv.recommended_fix(None).is_none(),
             "recommended_fix must return None when no advisory has a claimable fix"
         );
     }

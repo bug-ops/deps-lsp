@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crate::error::DepsError;
 use crate::licenses::LicensePolicy;
-use crate::osv::{ScanOutcome, VulnerabilityMap};
+use crate::osv::{
+    LatestStatusMap, ScanOutcome, UpgradeStatus, VulnKey, VulnSeverity, VulnerabilityMap,
+};
 use crate::position::{Position, Range};
 use crate::{
     ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
@@ -708,6 +710,15 @@ pub struct VersionData<'a> {
     /// not `&'a DepsDevClient`, for the same "clone into a detached background task"
     /// reason [`Self::trust`]'s doc gives.
     pub gossip_client: Option<&'a Arc<DepsDevClient>>,
+    /// Phase B's per-key "latest" check result (issue #1517), keyed the same way as
+    /// [`Self::vulnerabilities`] — see [`crate::osv::LatestStatusMap`]. `None` means OSV
+    /// checking is disabled or offline for this scan entirely, distinct from `Some(map)` with a
+    /// missing/`Unverified` entry for one dependency (which [`latest_verdict`] treats as
+    /// fail-closed, not "not applicable"). Every renderer that surfaces a dependency's `latest`
+    /// as an upgrade recommendation (hover, diagnostics, code actions, code lens, inlay hints,
+    /// completion) must consult [`latest_verdict`] with this field before treating that `latest`
+    /// as safe.
+    pub latest_status: Option<&'a LatestStatusMap>,
 }
 
 impl<'a> VersionData<'a> {
@@ -747,6 +758,7 @@ impl<'a> VersionData<'a> {
             typosquat_prefetch: None,
             gossip_prefetch: None,
             gossip_client: None,
+            latest_status: None,
         }
     }
 
@@ -793,6 +805,28 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub fn with_vulnerabilities(mut self, vulnerabilities: &'a VulnerabilityMap) -> Self {
         self.vulnerabilities = Some(vulnerabilities);
+        self
+    }
+
+    /// Attaches phase B's per-key "latest" check result to this `VersionData`. See
+    /// [`Self::latest_status`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use deps_core::osv::LatestStatusMap;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let latest_status = LatestStatusMap::new();
+    /// let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
+    /// assert!(versions.latest_status.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_latest_status(mut self, latest_status: &'a LatestStatusMap) -> Self {
+        self.latest_status = Some(latest_status);
         self
     }
 
@@ -1327,16 +1361,233 @@ pub fn resolve_scan_outcome<'a>(
     keys: Option<&crate::osv::VulnKeys>,
     normalized_name: &str,
 ) -> Option<&'a ScanOutcome> {
+    resolve_by_vuln_key(vulnerabilities, dep, keys, normalized_name)
+}
+
+/// Shared per-occurrence [`VulnKey`] lookup chain (version-qualified key, then normalized name,
+/// then declared name) underlying both [`resolve_scan_outcome`] and [`resolve_latest_status`] —
+/// the two maps [`VulnerabilityMap`] and [`crate::osv::LatestStatusMap`] share this exact key
+/// space (#1517), so the fallback chain only needs writing once.
+fn resolve_by_vuln_key<'a, V>(
+    map: &'a HashMap<VulnKey, V>,
+    dep: &dyn Dependency,
+    keys: Option<&crate::osv::VulnKeys>,
+    normalized_name: &str,
+) -> Option<&'a V> {
     keys.and_then(|k| k.get(&dep.name_range()))
-        .and_then(|key| vulnerabilities.get(key))
-        .or_else(|| {
-            vulnerabilities.get(&crate::osv::VulnKey::from_name(normalized_name.to_string()))
-        })
-        .or_else(|| {
-            vulnerabilities.get(&crate::osv::VulnKey::from_name(
-                dep.name().as_str().to_string(),
-            ))
-        })
+        .and_then(|key| map.get(key))
+        .or_else(|| map.get(&VulnKey::from_name(normalized_name.to_string())))
+        .or_else(|| map.get(&VulnKey::from_name(dep.name().as_str().to_string())))
+}
+
+/// Looks up `dep`'s entry in phase B's per-key "latest" status map, using the same
+/// version-qualified-key-then-normalized-name-then-declared-name fallback chain as
+/// [`resolve_scan_outcome`] (#1517).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::resolve_latest_status;
+/// use deps_core::osv::{LatestStatusMap, UpgradeStatus};
+/// use deps_core::position::{Position, Range};
+/// use deps_core::{Dependency, PackageName, VersionReq};
+/// use std::any::Any;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     name_range: Range,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         self.name_range
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("time"),
+///     name_range: Range::new(Position::new(0, 0), Position::new(0, 4)).into(),
+/// };
+///
+/// let mut latest_status = LatestStatusMap::new();
+/// latest_status.insert(
+///     deps_core::test_util::vuln_key("time"),
+///     UpgradeStatus::CandidateClean {
+///         version: "1.0.0".to_string(),
+///     },
+/// );
+///
+/// let status = resolve_latest_status(&latest_status, &dep, None, "time");
+/// assert!(matches!(status, Some(UpgradeStatus::CandidateClean { .. })));
+/// ```
+pub fn resolve_latest_status<'a>(
+    latest_status: &'a LatestStatusMap,
+    dep: &dyn Dependency,
+    keys: Option<&crate::osv::VulnKeys>,
+    normalized_name: &str,
+) -> Option<&'a UpgradeStatus> {
+    resolve_by_vuln_key(latest_status, dep, keys, normalized_name)
+}
+
+/// Whether a dependency's currently-displayed "latest" upgrade recommendation is safe to
+/// surface as such (issue #1517).
+///
+/// The single gate every renderer (hover, diagnostics, code actions, code lens, inlay hints,
+/// completion) and `deps-cli update`/`check` must consult before treating `latest` as an
+/// endorsed upgrade target.
+// Exhaustive: a new "verdict" is a deliberate design decision about how a fifth case should
+// render everywhere at once, never a silent default — mirrors `EcosystemId`'s exhaustive-match
+// convention (project rule, see #118).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LatestVerdict {
+    /// OSV's latest-check does not apply here: OSV is disabled/offline for this scan entirely
+    /// (no [`crate::osv::LatestStatusMap`] was ever attached), or this dependency's skip reason
+    /// is structural ([`crate::osv::SkipReason::is_structural`] — its source/ecosystem is never
+    /// checked against OSV, e.g. a git dependency or an OSV-unsupported ecosystem).
+    NotApplicable,
+    /// The exact version currently displayed as "latest" was checked and found clean (or
+    /// affected only by [`VulnSeverity::Informational`]-only advisories, e.g. an "unmaintained"
+    /// notice with no genuine security content).
+    Verified,
+    /// The exact version currently displayed as "latest" was checked and found affected by at
+    /// least one non-informational advisory (or a record whose severity could not be
+    /// determined, which is treated as blocking rather than silently passed through).
+    Flagged {
+        /// Advisory ids affecting the checked version, for display.
+        advisory_ids: Vec<String>,
+        /// Whether the worst affecting advisory is a confirmed-malicious-package record
+        /// ([`VulnSeverity::Malicious`]) — renderers use this to escalate wording/severity.
+        malicious: bool,
+    },
+    /// The version was never definitively checked against OSV: no entry for this dependency
+    /// (including the pre-phase-B window, where an empty map is attached deliberately so this
+    /// case fires instead of [`Self::NotApplicable`]), a transient skip (timeout, query
+    /// failure, truncation), or the checked version has since diverged from what's now
+    /// displayed as `latest`. Renderers must treat this the same as [`Self::Flagged`] for the
+    /// purpose of *not* recommending the upgrade — the two are kept distinct only so wording can
+    /// differ ("not yet verified" vs. "flagged unsafe").
+    Unverified,
+}
+
+/// Computes `dep`'s [`LatestVerdict`] against `displayed_latest` (the exact version string a
+/// renderer is about to show as "latest") from `latest_status` (typically
+/// [`VersionData::latest_status`]).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{LatestVerdict, latest_verdict};
+/// use deps_core::osv::{LatestStatusMap, UpgradeStatus};
+/// use deps_core::position::{Position, Range};
+/// use deps_core::{Dependency, PackageName, VersionReq};
+/// use std::any::Any;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     name_range: Range,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         self.name_range
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("left-pad"),
+///     name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
+/// };
+///
+/// // No map attached at all (OSV disabled/offline) — not applicable, today's behavior.
+/// assert_eq!(
+///     latest_verdict(None, &dep, None, "left-pad", "1.0.8"),
+///     LatestVerdict::NotApplicable
+/// );
+///
+/// // A map with no entry for this dependency (e.g. before phase B first completes) must fail
+/// // closed, never pass through as safe.
+/// let empty = LatestStatusMap::new();
+/// assert_eq!(
+///     latest_verdict(Some(&empty), &dep, None, "left-pad", "1.0.8"),
+///     LatestVerdict::Unverified
+/// );
+/// ```
+#[must_use]
+pub fn latest_verdict(
+    latest_status: Option<&LatestStatusMap>,
+    dep: &dyn Dependency,
+    keys: Option<&crate::osv::VulnKeys>,
+    normalized_name: &str,
+    displayed_latest: &str,
+) -> LatestVerdict {
+    let Some(map) = latest_status else {
+        return LatestVerdict::NotApplicable;
+    };
+
+    match resolve_latest_status(map, dep, keys, normalized_name) {
+        None | Some(UpgradeStatus::NotChecked) => LatestVerdict::Unverified,
+        Some(UpgradeStatus::CandidateUnverified { reason, .. }) => {
+            if reason.is_structural() {
+                LatestVerdict::NotApplicable
+            } else {
+                LatestVerdict::Unverified
+            }
+        }
+        Some(UpgradeStatus::CandidateClean { version }) => {
+            if version == displayed_latest {
+                LatestVerdict::Verified
+            } else {
+                LatestVerdict::Unverified
+            }
+        }
+        Some(UpgradeStatus::CandidateVulnerable {
+            version,
+            advisory_ids,
+            worst_severity,
+        }) => {
+            if version != displayed_latest {
+                return LatestVerdict::Unverified;
+            }
+            if *worst_severity == Some(VulnSeverity::Informational) {
+                LatestVerdict::Verified
+            } else {
+                LatestVerdict::Flagged {
+                    advisory_ids: advisory_ids.items().to_vec(),
+                    malicious: *worst_severity == Some(VulnSeverity::Malicious),
+                }
+            }
+        }
+    }
 }
 
 /// Converts byte offsets in source text to LSP `Position` values.

@@ -615,6 +615,20 @@ pub enum UnplannableReason {
     /// The formatter's rewrite would be a no-op (no single unambiguous rewrite exists, e.g.
     /// `deps-gradle`'s `{strictly}!!{preferred}` shorthand).
     NoOpRewrite,
+    /// Issue #1517: OSV checked this exact `latest` version and found it affected by a
+    /// non-informational advisory (or a confirmed-malicious record) —
+    /// [`crate::lsp_helpers::LatestVerdict::Flagged`]. Writing this version into the manifest
+    /// would be the exact supply-chain exposure this variant exists to prevent; the shared
+    /// planner this variant lives in ([`collect_update_candidates`]) is used by both the LSP
+    /// code lens and `deps-cli update`'s default mode, so both refuse it identically.
+    LatestFlaggedByOsv,
+    /// Issue #1517: `latest`'s OSV status could not be verified —
+    /// [`crate::lsp_helpers::LatestVerdict::Unverified`] (never checked, a transient
+    /// failure/timeout, or the checked version has since diverged from what's now cached as
+    /// `latest`). Fails closed the same way [`Self::LatestFlaggedByOsv`] does: an unverified
+    /// version is never distinguishable from a flagged one at write time, so neither is ever
+    /// planned.
+    LatestUnverified,
 }
 
 /// One [`crate::lsp_helpers::RequirementStatus::Outdated`] dependency's planning outcome.
@@ -666,6 +680,17 @@ pub fn collect_update_candidates(
     // Built once and reused for every dependency below (matches the pre-extraction
     // `collect_update_all_edits`'s own rationale for doing so).
     let line_offsets = LineOffsetTable::new(content);
+    // Issue #1517: shared by both the LSP code lens (`collect_update_edits`) and `deps-cli
+    // update`'s default mode planner — the single gate neither can bypass.
+    let vuln_keys = versions.ecosystem.map(|ecosystem| {
+        crate::osv::vulnerability_keys(
+            parse_result,
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )
+    });
 
     for dep in deps {
         let Some(version_range) = dep.version_range() else {
@@ -721,6 +746,41 @@ pub fn collect_update_candidates(
                 reason: UnplannableReason::UnsafeLatestVersion,
             });
             continue;
+        }
+
+        // Issue #1517: never plan an edit that writes a flagged/unverified `latest` into the
+        // manifest — the exact live-exploitable gap this issue closes (`deps-cli update`'s
+        // default mode previously wrote a known-malicious version straight into the manifest).
+        // Checked before the literal-span/no-op guards below: those are about *whether* an
+        // edit can be produced at all, this is about whether the edit's *target* is safe to
+        // write, and the latter must never be skipped just because the former also failed.
+        match crate::lsp_helpers::latest_verdict(
+            versions.latest_status,
+            dep,
+            vuln_keys.as_ref(),
+            &normalized_name,
+            latest.as_str(),
+        ) {
+            crate::lsp_helpers::LatestVerdict::Verified
+            | crate::lsp_helpers::LatestVerdict::NotApplicable => {}
+            crate::lsp_helpers::LatestVerdict::Flagged { .. } => {
+                candidates.push(UpdateCandidate::Unplannable {
+                    name,
+                    normalized_name,
+                    name_range,
+                    reason: UnplannableReason::LatestFlaggedByOsv,
+                });
+                continue;
+            }
+            crate::lsp_helpers::LatestVerdict::Unverified => {
+                candidates.push(UpdateCandidate::Unplannable {
+                    name,
+                    normalized_name,
+                    name_range,
+                    reason: UnplannableReason::LatestUnverified,
+                });
+                continue;
+            }
         }
 
         // Intentionally not calling `dependency_version_range_is_literal` (#919) —
@@ -833,8 +893,14 @@ pub enum VulnFixSkip {
 ///
 /// # Errors
 ///
-/// Returns [`VulnFixSkip::NoRecommendedFix`] when `dv.recommended_fix()` is `None`, or
+/// Returns [`VulnFixSkip::NoRecommendedFix`] when `dv.recommended_fix(latest)` is `None`, or
 /// [`VulnFixSkip::UnsafeVersion`] when the fix's version fails [`is_safe_version_string`].
+///
+/// # Arguments
+///
+/// * `latest` - This dependency's entry in the shared [`crate::osv::LatestStatusMap`] (issue
+///   #1517), forwarded verbatim to [`crate::osv::DependencyVulnerabilities::recommended_fix`] —
+///   see that method's doc for its effect.
 ///
 /// # Examples
 ///
@@ -866,15 +932,18 @@ pub enum VulnFixSkip {
 ///
 /// let dv = DependencyVulnerabilities::new(Capped::new(Vec::<Arc<Advisory>>::new(), 0));
 /// assert_eq!(
-///     resolve_recommended_fix(&dv, &MockFormatter),
+///     resolve_recommended_fix(&dv, None, &MockFormatter),
 ///     Err(VulnFixSkip::NoRecommendedFix)
 /// );
 /// ```
 pub fn resolve_recommended_fix(
     dv: &crate::osv::DependencyVulnerabilities,
+    latest: Option<&crate::osv::UpgradeStatus>,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<(crate::osv::FixRecommendation, String), VulnFixSkip> {
-    let fix = dv.recommended_fix().ok_or(VulnFixSkip::NoRecommendedFix)?;
+    let fix = dv
+        .recommended_fix(latest)
+        .ok_or(VulnFixSkip::NoRecommendedFix)?;
     let version_native = formatter.osv_version_to_native(&fix.version).into_string();
     if !is_safe_version_string(&version_native) {
         warn_rejected_value(
@@ -918,6 +987,7 @@ pub(crate) fn fix_target_is_verified(
         UpgradeStatus::CandidateVulnerable {
             version,
             advisory_ids,
+            ..
         } => {
             if version != version_native || !advisory_ids.is_complete() {
                 return false;
@@ -933,7 +1003,7 @@ pub(crate) fn fix_target_is_verified(
                 .iter()
                 .all(|id| known_ids.contains(id.as_str()) && !fix.advisory_ids.contains(id))
         }
-        UpgradeStatus::NotChecked => false,
+        UpgradeStatus::NotChecked | UpgradeStatus::CandidateUnverified { .. } => false,
     }
 }
 
@@ -1001,19 +1071,20 @@ pub(crate) fn fix_target_is_verified(
 /// // `fix_target_status` left at its `NotChecked` default — never live-checked yet.
 /// let unverified = DependencyVulnerabilities::new(Capped::new(vec![advisory.clone()], 1));
 /// assert_eq!(
-///     resolve_verified_fix(&unverified, &MockFormatter),
+///     resolve_verified_fix(&unverified, None, &MockFormatter),
 ///     Err(VulnFixSkip::UnverifiedTarget)
 /// );
 ///
 /// let verified = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
 ///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: "1.2.0".to_string() });
-/// assert!(resolve_verified_fix(&verified, &MockFormatter).is_ok());
+/// assert!(resolve_verified_fix(&verified, None, &MockFormatter).is_ok());
 /// ```
 pub fn resolve_verified_fix(
     dv: &crate::osv::DependencyVulnerabilities,
+    latest: Option<&crate::osv::UpgradeStatus>,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<(crate::osv::FixRecommendation, String), VulnFixSkip> {
-    let (fix, version_native) = resolve_recommended_fix(dv, formatter)?;
+    let (fix, version_native) = resolve_recommended_fix(dv, latest, formatter)?;
     if !fix_target_is_verified(dv, &fix, &version_native) {
         return Err(VulnFixSkip::UnverifiedTarget);
     }
@@ -1127,7 +1198,8 @@ pub fn resolve_verified_fix(
 /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
 ///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: "1.2.0".to_string() });
 ///
-/// let planned = plan_vulnerability_fix(&dep, dep.version_range, "1.0.0", &dv, &MockFormatter);
+/// let planned =
+///     plan_vulnerability_fix(&dep, dep.version_range, "1.0.0", &dv, None, &MockFormatter);
 /// assert_eq!(planned.unwrap().edit.new_text, "1.2.0");
 /// ```
 ///
@@ -1140,9 +1212,10 @@ pub fn plan_vulnerability_fix(
     version_range: crate::position::Range,
     current: &str,
     dv: &crate::osv::DependencyVulnerabilities,
+    latest: Option<&crate::osv::UpgradeStatus>,
     formatter: &dyn EcosystemFormatter,
 ) -> Result<PlannedUpdate, VulnFixSkip> {
-    let (_fix, version_native) = resolve_verified_fix(dv, formatter)?;
+    let (_fix, version_native) = resolve_verified_fix(dv, latest, formatter)?;
     plan_verified_fix(dep, version_range, current, &version_native, formatter)
 }
 
@@ -1500,6 +1573,74 @@ mod tests {
             );
         }
 
+        /// Issue #1517 (the P0 this fix addresses): OSV flagged the registry's "latest" as
+        /// malicious — `collect_update_candidates` (shared by the LSP code lens and
+        /// `deps-cli update`'s default mode) must never plan writing it into the manifest.
+        #[test]
+        fn test_collect_update_candidates_osv_flagged_latest_is_unplannable() {
+            let content = "feed-widget-helper = \"1.0.4\"\n";
+            let pr = parse_result(vec![dep(
+                "feed-widget-helper",
+                "1.0.4",
+                range(0, 22, 0, 29),
+            )]);
+            let mut cached = HashMap::new();
+            cached.insert(
+                "feed-widget-helper".into(),
+                PackageVersions::latest_only("1.0.8"),
+            );
+            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            let mut latest_status = crate::osv::LatestStatusMap::new();
+            latest_status.insert(
+                crate::test_util::vuln_key("feed-widget-helper"),
+                crate::osv::UpgradeStatus::CandidateVulnerable {
+                    version: "1.0.8".to_string(),
+                    advisory_ids: crate::osv::Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                    worst_severity: Some(crate::osv::VulnSeverity::Malicious),
+                },
+            );
+            let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
+
+            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
+            assert_eq!(candidates.len(), 1, "{candidates:?}");
+            assert!(matches!(
+                candidates[0],
+                UpdateCandidate::Unplannable {
+                    reason: UnplannableReason::LatestFlaggedByOsv,
+                    ..
+                }
+            ));
+            assert!(
+                collect_update_edits(&pr, content, versions, &MOCK_FORMATTER).is_empty(),
+                "a flagged latest must never reach collect_update_edits's writable subset"
+            );
+        }
+
+        /// Issue #1517 AC4: a `latest_status` map with no entry for this dependency (the
+        /// pre-phase-B window, or a transient skip) must fail closed, never be planned as if
+        /// verified safe.
+        #[test]
+        fn test_collect_update_candidates_unverified_latest_is_unplannable() {
+            let content = "pkg = \"1.0.0\"\n";
+            let pr = parse_result(vec![dep("pkg", "1.0.0", range(0, 6, 0, 13))]);
+            let mut cached = HashMap::new();
+            cached.insert("pkg".into(), PackageVersions::latest_only("2.0.0"));
+            let resolved: HashMap<PackageName, ConcreteVersion> = HashMap::new();
+            // Empty map, not `None`: the pre-phase-B window attaches `Some(&empty_map)`.
+            let latest_status = crate::osv::LatestStatusMap::new();
+            let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
+
+            let candidates = collect_update_candidates(&pr, content, versions, &MOCK_FORMATTER);
+            assert_eq!(candidates.len(), 1, "{candidates:?}");
+            assert!(matches!(
+                candidates[0],
+                UpdateCandidate::Unplannable {
+                    reason: UnplannableReason::LatestUnverified,
+                    ..
+                }
+            ));
+        }
+
         #[test]
         fn test_collect_update_candidates_no_op_rewrite_is_unplannable() {
             struct NoOpFormatter;
@@ -1679,7 +1820,7 @@ mod tests {
             let dv = verified_dv("1.0.2");
 
             let planned =
-                plan_vulnerability_fix(&d, d.version_range, "1", &dv, &StrictSemverFormatter);
+                plan_vulnerability_fix(&d, d.version_range, "1", &dv, None, &StrictSemverFormatter);
             assert_eq!(planned, Err(VulnFixSkip::RequirementAlreadyResolves));
         }
 
@@ -1718,9 +1859,15 @@ mod tests {
             let d = dep("serde", "0.9", range(0, 8, 0, 11));
             let dv = verified_dv("1.0.2");
 
-            let planned =
-                plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &StrictSemverFormatter)
-                    .expect("0.9 does not admit 1.0.2, so an edit must be planned");
+            let planned = plan_vulnerability_fix(
+                &d,
+                d.version_range,
+                "0.9",
+                &dv,
+                None,
+                &StrictSemverFormatter,
+            )
+            .expect("0.9 does not admit 1.0.2, so an edit must be planned");
             assert_eq!(planned.edit.new_text, "1.0.2");
             assert_eq!(planned.target.as_str(), "1.0.2");
         }
@@ -1734,7 +1881,8 @@ mod tests {
             let dv = verified_dv("1.0.2");
 
             let planned =
-                plan_vulnerability_fix(&d, d.version_range, "1", &dv, &MOCK_FORMATTER).unwrap();
+                plan_vulnerability_fix(&d, d.version_range, "1", &dv, None, &MOCK_FORMATTER)
+                    .unwrap();
             assert_eq!(planned.edit.new_text, "\"1.0.2\"");
         }
 
@@ -1747,7 +1895,8 @@ mod tests {
             // A space is not in `is_safe_version_string`'s allowlist.
             let dv = verified_dv("1.2.0 evil");
 
-            let planned = plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &MOCK_FORMATTER);
+            let planned =
+                plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, None, &MOCK_FORMATTER);
             assert_eq!(planned, Err(VulnFixSkip::UnsafeVersion));
         }
 
@@ -1762,8 +1911,14 @@ mod tests {
 
             // `MOCK_FORMATTER.format_version_for_text_edit` quotes its input, so the
             // already-quoted literal fallback below is byte-identical to the planned rewrite.
-            let planned =
-                plan_vulnerability_fix(&d, d.version_range, "\"1.0.2\"", &dv, &MOCK_FORMATTER);
+            let planned = plan_vulnerability_fix(
+                &d,
+                d.version_range,
+                "\"1.0.2\"",
+                &dv,
+                None,
+                &MOCK_FORMATTER,
+            );
             assert_eq!(planned, Err(VulnFixSkip::NoOpRewrite));
         }
 
@@ -1808,8 +1963,9 @@ mod tests {
                 });
 
             let d = dep("serde", "0.9", range(0, 8, 0, 11));
-            let planned = plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, &MOCK_FORMATTER)
-                .expect("fix beyond the display cap must still be recommended and verified");
+            let planned =
+                plan_vulnerability_fix(&d, d.version_range, "0.9", &dv, None, &MOCK_FORMATTER)
+                    .expect("fix beyond the display cap must still be recommended and verified");
             assert_eq!(planned.edit.new_text, "\"2.0.0\"");
             assert_eq!(planned.target.as_str(), "2.0.0");
         }
@@ -1887,7 +2043,7 @@ mod tests {
             );
 
             let planned =
-                plan_vulnerability_fix(&d, d.version_range, "1.0.0", &dv, &FloorFormatter)
+                plan_vulnerability_fix(&d, d.version_range, "1.0.0", &dv, None, &FloorFormatter)
                     .expect("a floor-shaped requirement must not suppress the fix");
             assert_eq!(planned.edit.new_text, "1.0.2");
         }
@@ -1907,6 +2063,7 @@ mod tests {
                 action_dep.version_range,
                 "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 &dv,
+                None,
                 &ShaPinFormatter,
             );
 

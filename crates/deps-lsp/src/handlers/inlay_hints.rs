@@ -38,11 +38,12 @@ pub async fn handle_inlay_hints(
     }
 
     // Snapshot config before the document lookup (Copy value, no lock held across the call)
-    let (loading_config, offline) = {
+    let (loading_config, offline, vulnerabilities_enabled) = {
         let full_config = full_config.read().await;
         (
             full_config.loading_indicator.clone(),
             full_config.policy.network.offline,
+            full_config.policy.diagnostics.vulnerabilities_enabled,
         )
     };
 
@@ -58,14 +59,21 @@ pub async fn handle_inlay_hints(
             .signals
             .snapshot()
             .with_resolved_version_candidates()
+            .with_latest_status(vulnerabilities_enabled && !offline)
             .finish();
-        Some((ecosystem, parse_result, snapshot, doc.loading_state()))
+        Some((
+            ecosystem,
+            doc.ecosystem,
+            parse_result,
+            snapshot,
+            doc.loading_state(),
+        ))
     }) else {
         tracing::warn!("Document not found: {:?}", uri);
         return vec![];
     };
 
-    let Some((ecosystem, parse_result, snapshot, loading_state)) = extracted else {
+    let Some((ecosystem, ecosystem_id, parse_result, snapshot, loading_state)) = extracted else {
         return vec![];
     };
 
@@ -78,10 +86,13 @@ pub async fn handle_inlay_hints(
         .with_show_loading_hints(loading_config.enabled && loading_config.fallback_to_hints)
         .with_offline(offline);
 
+    // Issue #1517: `with_ecosystem` is needed for `generate_inlay_hints`'s own OSV
+    // latest-verdict lookup to disambiguate duplicate dependency names, mirroring every
+    // other renderer's identical `vuln_keys` derivation.
     ecosystem
         .generate_inlay_hints(
             parse_result.as_ref(),
-            snapshot.version_data(),
+            snapshot.version_data().with_ecosystem(ecosystem_id),
             loading_state,
             &ecosystem_config,
         )

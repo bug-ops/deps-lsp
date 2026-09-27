@@ -168,6 +168,145 @@ pub fn build_scan_targets(
 
     (targets, skipped)
 }
+/// Builds phase B.1's latest-check targets for **every** dependency with a registry-cached
+/// latest (issue #1517).
+///
+/// Not just ones phase A already flagged [`deps_core::osv::ScanOutcome::Vulnerable`] at their
+/// pinned version — closes the gap that let a cleanly-pinned dependency's malicious/vulnerable
+/// `latest` go completely unchecked while every renderer (hover, diagnostics, code actions,
+/// code lens, inlay hints, completion) and `deps-cli update`'s default mode still recommended
+/// it as a safe upgrade.
+///
+/// `osv_name` comes from `formatter.osv_package_name(dep)` directly, not from phase A's
+/// `osv_name_by_key` — that map only has entries for dependencies phase A actually built a
+/// [`deps_core::osv::ScanTarget`] for, which excludes any dependency phase A skipped for
+/// [`deps_core::osv::SkipReason::NoConcreteVersion`] (e.g. a `^1.0.4` requirement with no
+/// committed lock file) — such a dependency still has a resolvable registry `latest` and must
+/// still have it checked.
+///
+/// Every dependency considered gets either a [`deps_core::osv::ScanTarget`] in the returned
+/// `Vec` or an explicit structural entry in the returned [`deps_core::osv::LatestStatusMap`] —
+/// never silently neither, mirroring [`build_scan_targets`]'s own invariant 0 discipline
+/// (absence must never be read as "clean" or "not applicable"). A dependency with no
+/// registry-cached `latest` at all (the fetch hasn't completed, or the registry doesn't know
+/// the package) gets neither: it isn't a structural gap, since a later commit populating
+/// `cached_versions` can turn it into a real target — the map's absence there falls through to
+/// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail-closed), not
+/// [`deps_core::lsp_helpers::LatestVerdict::NotApplicable`].
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{
+///     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+///     PackageVersions, RequirementResolution, SourcePolicy,
+/// };
+/// use deps_core::osv::{UpgradeStatus, vulnerability_keys};
+/// use deps_core::test_util::stub_parse_result_with_dependencies;
+/// use deps_core::{ConcreteVersion, EcosystemId, PackageName};
+/// use deps_engine::classify::osv::build_latest_check_targets;
+/// use std::collections::HashMap;
+///
+/// struct SimpleFormatter;
+/// impl PackageNaming for SimpleFormatter {}
+/// impl PackageRendering for SimpleFormatter {
+///     fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+///         version.to_string()
+///     }
+///     fn package_url(&self, name: &PackageName) -> String {
+///         name.as_str().to_string()
+///     }
+/// }
+/// impl RequirementResolution for SimpleFormatter {}
+/// impl DiagnosticMessages for SimpleFormatter {}
+/// impl DiagnosticPolicy for SimpleFormatter {}
+/// impl SourcePolicy for SimpleFormatter {}
+/// impl OsvNaming for SimpleFormatter {}
+///
+/// let parsed = stub_parse_result_with_dependencies(1);
+/// let mut cached_versions = HashMap::new();
+/// cached_versions.insert(
+///     PackageName::new("dep-0"),
+///     PackageVersions::latest_only("2.0.0"),
+/// );
+/// let vuln_keys = vulnerability_keys(
+///     parsed.as_ref(),
+///     &HashMap::new(),
+///     None,
+///     &SimpleFormatter,
+///     EcosystemId::Cargo,
+/// );
+///
+/// let (targets, structural) = build_latest_check_targets(
+///     parsed.as_ref(),
+///     &cached_versions,
+///     &vuln_keys,
+///     &SimpleFormatter,
+/// );
+///
+/// assert_eq!(targets.len(), 1);
+/// assert_eq!(targets[0].display_version, "2.0.0");
+/// assert!(structural.is_empty(), "the one dependency became a real target, nothing structural");
+/// ```
+pub fn build_latest_check_targets(
+    parse_result: &dyn deps_core::ParseResult,
+    cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    vuln_keys: &deps_core::osv::VulnKeys,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> (
+    Vec<deps_core::osv::ScanTarget>,
+    deps_core::osv::LatestStatusMap,
+) {
+    use deps_core::osv::{SkipReason, UpgradeStatus, vuln_key_for};
+
+    let mut targets = Vec::new();
+    let mut structural = deps_core::osv::LatestStatusMap::new();
+
+    for dep in parse_result.dependencies() {
+        let normalized_name = formatter.normalize_package_name(dep.name());
+        let key = vuln_key_for(dep, Some(vuln_keys), formatter);
+
+        if !formatter.source_is_public_registry_content(&dep.source()) {
+            structural.insert(
+                key,
+                UpgradeStatus::CandidateUnverified {
+                    version: String::new(),
+                    reason: SkipReason::NonRegistrySource,
+                },
+            );
+            continue;
+        }
+
+        let Some(latest) = cached_versions
+            .get(normalized_name.as_str())
+            .or_else(|| cached_versions.get(dep.name()))
+        else {
+            // No registry-cached latest yet — absence, not a structural skip (see doc above).
+            continue;
+        };
+
+        let Some(osv_name) = formatter.osv_package_name(dep) else {
+            structural.insert(
+                key,
+                UpgradeStatus::CandidateUnverified {
+                    version: latest.latest.to_string(),
+                    reason: SkipReason::UnmappableName,
+                },
+            );
+            continue;
+        };
+
+        targets.push(deps_core::osv::ScanTarget::from_native(
+            key,
+            osv_name,
+            latest.latest.clone(),
+            formatter,
+        ));
+    }
+
+    (targets, structural)
+}
+
 /// Outcome of `resolve_fix_target` for one vulnerable dependency.
 #[derive(Debug, PartialEq, Eq)]
 enum FixTargetResolution {
@@ -192,19 +331,21 @@ enum FixTargetResolution {
 fn resolve_fix_target(
     dv: &deps_core::osv::DependencyVulnerabilities,
     key: &deps_core::osv::VulnKey,
-    latest_native_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    latest_status: &deps_core::osv::LatestStatusMap,
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> FixTargetResolution {
     use deps_core::edit::{VulnFixSkip, resolve_recommended_fix};
-    use deps_core::osv::ScanTarget;
+    use deps_core::osv::{ScanTarget, UpgradeStatus};
+
+    let latest = latest_status.get(key);
 
     // #1350: `resolve_recommended_fix` is the shared prefix (`recommended_fix` ->
     // `osv_version_to_native` -> `is_safe_version_string`) this function used to duplicate.
     // Deliberately the *unverified* helper, not `resolve_verified_fix`: this function is
     // itself the producer of `dv.fix_target_status`, so it must not gate on a status it
     // has not computed yet.
-    let (fix, version_native) = match resolve_recommended_fix(dv, formatter) {
+    let (fix, version_native) = match resolve_recommended_fix(dv, latest, formatter) {
         Ok(pair) => pair,
         Err(VulnFixSkip::NoRecommendedFix) => return FixTargetResolution::Skip,
         // `resolve_recommended_fix` already emits a WARN via `warn_rejected_value` for this
@@ -233,8 +374,24 @@ fn resolve_fix_target(
         ) => return FixTargetResolution::Skip,
     };
 
-    if latest_native_by_key.get(key) == Some(&version_native) {
-        return FixTargetResolution::Resolved(dv.upgrade_status.clone());
+    // Issue #1517: only a *resolved* latest verdict (`CandidateClean`/`CandidateVulnerable`)
+    // can be reused — `NotChecked`/`CandidateUnverified` (transient failure, structural skip,
+    // or simply never checked) must always fall through to a live check below, never be
+    // silently treated as "F already covered by the latest check".
+    let reused_latest_version: Option<&str> = match latest {
+        Some(
+            UpgradeStatus::CandidateClean { version }
+            | UpgradeStatus::CandidateVulnerable { version, .. },
+        ) => Some(version.as_str()),
+        // `UpgradeStatus` is `#[non_exhaustive]` across the crate boundary: the wildcard is
+        // required by the compiler, not a stylistic shortcut — every variant defined *today*
+        // (`NotChecked`, `CandidateUnverified`) is still handled by the fall-through-to-`None`
+        // (never-reuse) behavior, matching this project's `EcosystemId`-style exhaustive-match
+        // convention as closely as a foreign `#[non_exhaustive]` type allows.
+        Some(_) | None => None,
+    };
+    if reused_latest_version == Some(version_native.as_str()) {
+        return FixTargetResolution::Resolved(latest.cloned().unwrap_or(UpgradeStatus::NotChecked));
     }
 
     let Some(osv_name) = osv_name_by_key.get(key).cloned() else {
@@ -306,14 +463,13 @@ fn resolve_fix_target(
 /// let latest_status = UpgradeStatus::CandidateClean {
 ///     version: "1.2.0".to_string(),
 /// };
-/// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
-///     .with_upgrade_status(latest_status.clone());
+/// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
 ///
 /// let mut vulnerabilities = VulnerabilityMap::new();
 /// vulnerabilities.insert(vuln_key("pkg"), ScanOutcome::Vulnerable(dv));
 ///
-/// let mut latest_native_by_key = HashMap::new();
-/// latest_native_by_key.insert(vuln_key("pkg"), "1.2.0".to_string());
+/// let mut latest_status_map = HashMap::new();
+/// latest_status_map.insert(vuln_key("pkg"), latest_status.clone());
 ///
 /// // F (the fix, 1.2.0) equals the already-checked "latest" candidate — resolved without a
 /// // live network check.
@@ -321,7 +477,7 @@ fn resolve_fix_target(
 ///     &vulnerabilities,
 ///     &[vuln_key("pkg")],
 ///     &HashMap::new(),
-///     &latest_native_by_key,
+///     &latest_status_map,
 ///     &SimpleFormatter,
 /// );
 ///
@@ -332,7 +488,7 @@ pub fn collect_fix_target_resolutions(
     vulnerabilities: &deps_core::osv::VulnerabilityMap,
     vulnerable_keys: &[deps_core::osv::VulnKey],
     osv_name_by_key: &HashMap<deps_core::osv::VulnKey, String>,
-    latest_native_by_key: &HashMap<deps_core::osv::VulnKey, String>,
+    latest_status: &deps_core::osv::LatestStatusMap,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> (
     Vec<(deps_core::osv::VulnKey, deps_core::osv::UpgradeStatus)>,
@@ -347,7 +503,7 @@ pub fn collect_fix_target_resolutions(
         let Some(ScanOutcome::Vulnerable(dv)) = vulnerabilities.get(key) else {
             continue;
         };
-        match resolve_fix_target(dv, key, latest_native_by_key, osv_name_by_key, formatter) {
+        match resolve_fix_target(dv, key, latest_status, osv_name_by_key, formatter) {
             FixTargetResolution::Skip => {}
             FixTargetResolution::Resolved(status) => resolved.push((key.clone(), status)),
             FixTargetResolution::NeedsLiveCheck(target) => live_check_candidates.push(target),
@@ -1166,19 +1322,22 @@ mod tests {
             )
         }
 
-        fn dv(
-            advisories: Vec<Arc<Advisory>>,
-            upgrade_status: UpgradeStatus,
-        ) -> DependencyVulnerabilities {
+        fn dv(advisories: Vec<Arc<Advisory>>) -> DependencyVulnerabilities {
             let total = advisories.len();
             DependencyVulnerabilities::new(Capped::new(advisories, total))
-                .with_upgrade_status(upgrade_status)
+        }
+
+        /// Builds a one-entry [`deps_core::osv::LatestStatusMap`] for `"pkg"`.
+        fn latest_status_map(status: UpgradeStatus) -> deps_core::osv::LatestStatusMap {
+            let mut map = deps_core::osv::LatestStatusMap::new();
+            map.insert(deps_core::test_util::vuln_key("pkg"), status);
+            map
         }
 
         #[test]
         fn resolve_fix_target_skips_when_no_fix_is_recommended() {
             // No advisory has a known fix, so `recommended_fix()` returns `None`.
-            let dv = dv(vec![advisory("A1", &[])], UpgradeStatus::NotChecked);
+            let dv = dv(vec![advisory("A1", &[])]);
             let resolution = resolve_fix_target(
                 &dv,
                 &deps_core::test_util::vuln_key("pkg"),
@@ -1196,14 +1355,13 @@ mod tests {
             let latest_status = UpgradeStatus::CandidateClean {
                 version: "1.2.0".to_string(),
             };
-            let dv = dv(vec![advisory("A1", &["1.2.0"])], latest_status.clone());
-            let mut latest_native_by_key = HashMap::new();
-            latest_native_by_key.insert(deps_core::test_util::vuln_key("pkg"), "1.2.0".to_string());
+            let dv = dv(vec![advisory("A1", &["1.2.0"])]);
+            let latest_status_map = latest_status_map(latest_status.clone());
 
             let resolution = resolve_fix_target(
                 &dv,
                 &deps_core::test_util::vuln_key("pkg"),
-                &latest_native_by_key,
+                &latest_status_map,
                 &HashMap::new(),
                 &StubFormatter::DEFAULT,
             );
@@ -1216,21 +1374,49 @@ mod tests {
             // advisories, so "F <= advisories' fix" is a tautology that proves nothing about
             // an advisory phase A never fetched. F (1.2.0) != latest (3.0.0) must always
             // queue a live check.
-            let dv = dv(
-                vec![advisory("A1", &["1.2.0"])],
-                UpgradeStatus::CandidateClean {
-                    version: "3.0.0".to_string(),
-                },
-            );
-            let mut latest_native_by_key = HashMap::new();
-            latest_native_by_key.insert(deps_core::test_util::vuln_key("pkg"), "3.0.0".to_string());
+            let dv = dv(vec![advisory("A1", &["1.2.0"])]);
+            let latest_status_map = latest_status_map(UpgradeStatus::CandidateClean {
+                version: "3.0.0".to_string(),
+            });
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(deps_core::test_util::vuln_key("pkg"), "pkg".to_string());
 
             let resolution = resolve_fix_target(
                 &dv,
                 &deps_core::test_util::vuln_key("pkg"),
-                &latest_native_by_key,
+                &latest_status_map,
+                &osv_name_by_key,
+                &StubFormatter::DEFAULT,
+            );
+            assert_eq!(
+                resolution,
+                FixTargetResolution::NeedsLiveCheck(deps_core::osv::ScanTarget::new(
+                    deps_core::test_util::vuln_key("pkg"),
+                    "pkg".to_string(),
+                    OsvVersion::new("1.2.0"),
+                    ConcreteVersion::new("1.2.0"),
+                ))
+            );
+        }
+
+        #[test]
+        fn resolve_fix_target_never_reuses_a_candidate_unverified_latest() {
+            // Issue #1517: a transient (or structural) `CandidateUnverified` latest-check
+            // result must never be mistaken for a resolved "F == latest" match — even when
+            // its own `version` field happens to equal F, that field is not a confirmed
+            // clean/vulnerable verdict, so this must still queue a live check.
+            let dv = dv(vec![advisory("A1", &["1.2.0"])]);
+            let latest_status_map = latest_status_map(UpgradeStatus::CandidateUnverified {
+                version: "1.2.0".to_string(),
+                reason: deps_core::osv::SkipReason::QueryFailed,
+            });
+            let mut osv_name_by_key = HashMap::new();
+            osv_name_by_key.insert(deps_core::test_util::vuln_key("pkg"), "pkg".to_string());
+
+            let resolution = resolve_fix_target(
+                &dv,
+                &deps_core::test_util::vuln_key("pkg"),
+                &latest_status_map,
                 &osv_name_by_key,
                 &StubFormatter::DEFAULT,
             );
@@ -1250,7 +1436,7 @@ mod tests {
             // A live check is needed (F != latest) but no `osv_name` is on record for this
             // key — nothing to query, so this degrades to `Skip` rather than panicking or
             // building a `ScanTarget` with an empty name.
-            let dv = dv(vec![advisory("A1", &["1.0.0"])], UpgradeStatus::NotChecked);
+            let dv = dv(vec![advisory("A1", &["1.0.0"])]);
             let resolution = resolve_fix_target(
                 &dv,
                 &deps_core::test_util::vuln_key("pkg"),
@@ -1267,10 +1453,7 @@ mod tests {
             // `advisories` despite OSV's own wire-boundary validation) must never be queued
             // for a live check or treated as any kind of resolvable target — `is_safe_version_string`
             // rejects it before anything else runs.
-            let dv = dv(
-                vec![advisory("A1", &["1.2.0\", \"evil\": \"true"])],
-                UpgradeStatus::NotChecked,
-            );
+            let dv = dv(vec![advisory("A1", &["1.2.0\", \"evil\": \"true"])]);
             let resolution = resolve_fix_target(
                 &dv,
                 &deps_core::test_util::vuln_key("pkg"),
@@ -1292,26 +1475,15 @@ mod tests {
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
                 deps_core::test_util::vuln_key("reused"),
-                ScanOutcome::Vulnerable(dv(
-                    vec![advisory("A1", &["1.0.0"])],
-                    UpgradeStatus::CandidateClean {
-                        version: "1.0.0".to_string(),
-                    },
-                )),
+                ScanOutcome::Vulnerable(dv(vec![advisory("A1", &["1.0.0"])])),
             );
             vulnerabilities.insert(
                 deps_core::test_util::vuln_key("live-a"),
-                ScanOutcome::Vulnerable(dv(
-                    vec![advisory("A2", &["1.2.0"])],
-                    UpgradeStatus::NotChecked,
-                )),
+                ScanOutcome::Vulnerable(dv(vec![advisory("A2", &["1.2.0"])])),
             );
             vulnerabilities.insert(
                 deps_core::test_util::vuln_key("live-b"),
-                ScanOutcome::Vulnerable(dv(
-                    vec![advisory("A3", &["2.2.0"])],
-                    UpgradeStatus::NotChecked,
-                )),
+                ScanOutcome::Vulnerable(dv(vec![advisory("A3", &["2.2.0"])])),
             );
 
             let vulnerable_keys = vec![
@@ -1319,18 +1491,24 @@ mod tests {
                 deps_core::test_util::vuln_key("live-a"),
                 deps_core::test_util::vuln_key("live-b"),
             ];
-            let mut latest_native_by_key = HashMap::new();
-            latest_native_by_key.insert(
+            let mut latest_status: deps_core::osv::LatestStatusMap = HashMap::new();
+            latest_status.insert(
                 deps_core::test_util::vuln_key("reused"),
-                "1.0.0".to_string(),
+                UpgradeStatus::CandidateClean {
+                    version: "1.0.0".to_string(),
+                },
             );
-            latest_native_by_key.insert(
+            latest_status.insert(
                 deps_core::test_util::vuln_key("live-a"),
-                "9.0.0".to_string(),
+                UpgradeStatus::CandidateClean {
+                    version: "9.0.0".to_string(),
+                },
             );
-            latest_native_by_key.insert(
+            latest_status.insert(
                 deps_core::test_util::vuln_key("live-b"),
-                "9.0.0".to_string(),
+                UpgradeStatus::CandidateClean {
+                    version: "9.0.0".to_string(),
+                },
             );
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(
@@ -1350,7 +1528,7 @@ mod tests {
                 &vulnerabilities,
                 &vulnerable_keys,
                 &osv_name_by_key,
-                &latest_native_by_key,
+                &latest_status,
                 &StubFormatter::DEFAULT,
             );
 
@@ -1375,17 +1553,11 @@ mod tests {
             let mut vulnerabilities = VulnerabilityMap::new();
             vulnerabilities.insert(
                 deps_core::test_util::vuln_key("checked"),
-                ScanOutcome::Vulnerable(dv(
-                    vec![advisory("A1", &["1.0.0"])],
-                    UpgradeStatus::NotChecked,
-                )),
+                ScanOutcome::Vulnerable(dv(vec![advisory("A1", &["1.0.0"])])),
             );
             vulnerabilities.insert(
                 deps_core::test_util::vuln_key("timed-out"),
-                ScanOutcome::Vulnerable(dv(
-                    vec![advisory("A2", &["1.0.0"])],
-                    UpgradeStatus::NotChecked,
-                )),
+                ScanOutcome::Vulnerable(dv(vec![advisory("A2", &["1.0.0"])])),
             );
 
             let mut statuses = HashMap::new();

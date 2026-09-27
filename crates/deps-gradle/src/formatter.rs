@@ -853,8 +853,9 @@ mod tests {
         };
 
         let dv = vuln_fix_dv("1.2.0");
-        let planned = plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, &GradleFormatter)
-            .expect("a resolved requirement must still be rewritten to the fix version");
+        let planned =
+            plan_vulnerability_fix(&dep, version_range, "1.0.0", &dv, None, &GradleFormatter)
+                .expect("a resolved requirement must still be rewritten to the fix version");
         assert_eq!(planned.edit.new_text, "1.2.0");
     }
 
@@ -883,7 +884,8 @@ mod tests {
         let version_range = dep.version_range().expect("templated version has a range");
 
         let dv = vuln_fix_dv("33.0.0-jre");
-        let planned = plan_vulnerability_fix(*dep, version_range, current, &dv, &GradleFormatter);
+        let planned =
+            plan_vulnerability_fix(*dep, version_range, current, &dv, None, &GradleFormatter);
 
         assert_eq!(
             planned,

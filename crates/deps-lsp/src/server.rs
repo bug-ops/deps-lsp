@@ -4,7 +4,7 @@ use crate::document::{
     change_task_triggers, handle_document_change, handle_document_open, refresh_with_timeout,
     reload_resolved_versions, rescan_after_resolved_version_change, run_license_prefetch,
     spawn_supervised, trigger_gossip_prefetch_for_open_documents,
-    trigger_typosquat_prefetch_for_open_documents,
+    trigger_osv_rescan_for_open_documents, trigger_typosquat_prefetch_for_open_documents,
 };
 use crate::file_watcher;
 use crate::handlers::{
@@ -140,6 +140,10 @@ struct ConfigSideEffects {
     license_policy: deps_core::LicensePolicy,
     typosquat_enabled: bool,
     gossip_enabled: bool,
+    /// Issue #1517 critique S5: `vulnerabilities_enabled && !offline`, the same effective
+    /// condition `document::lifecycle`'s phase-A spawn gate and every renderer's
+    /// `with_latest_status` attach already check (critique S3).
+    osv_latest_check_enabled: bool,
 }
 
 impl ConfigSideEffects {
@@ -157,6 +161,8 @@ impl ConfigSideEffects {
             license_policy: config.policy.license_policy.to_policy(),
             typosquat_enabled: config.policy.typosquat.enabled,
             gossip_enabled: config.policy.gossip.enabled,
+            osv_latest_check_enabled: config.policy.diagnostics.vulnerabilities_enabled
+                && !config.policy.network.offline,
         }
     }
 }
@@ -225,6 +231,9 @@ impl Backend {
         self.state.set_typosquat_enabled(effects.typosquat_enabled);
         // Issue #1456, spec 072: same rationale, for GOSSIP's opt-in flag.
         self.state.set_gossip_enabled(effects.gossip_enabled);
+        // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
+        self.state
+            .set_osv_latest_check_enabled(effects.osv_latest_check_enabled);
     }
 
     /// Handles opening a document using unified ecosystem registry.
@@ -881,6 +890,14 @@ impl LanguageServer for Backend {
         let gossip_enabled = effects.gossip_enabled;
         let was_gossip_enabled = self.state.is_gossip_enabled();
         let gossip_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
+        // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective
+        // (`vulnerabilities_enabled && !offline`) state — neither flag alone is a
+        // parse-affecting change (`config::reparse_scope`), so without this trigger an
+        // already-open document's `latest_status` would stay stuck at whatever it held before
+        // the toggle until its next edit or reopen.
+        let osv_latest_check_enabled = effects.osv_latest_check_enabled;
+        let was_osv_latest_check_enabled = self.state.is_osv_latest_check_enabled();
+        let osv_trigger_fetch_timeout_secs = config.policy.cache.fetch_timeout_secs;
 
         // Diff old vs new for parse-affecting changes (#592) under one write-guard
         // acquisition: `DepsConfig` has no `Clone`, so the diff must read the
@@ -919,6 +936,16 @@ impl LanguageServer for Backend {
                 &self.client,
                 Arc::clone(&self.config),
                 gossip_trigger_fetch_timeout_secs,
+            )
+            .await;
+        }
+        // Issue #1517 critique S5: same rationale, for the OSV latest-check's effective state.
+        if osv_latest_check_enabled && !was_osv_latest_check_enabled {
+            trigger_osv_rescan_for_open_documents(
+                &self.state,
+                &self.client,
+                Arc::clone(&self.config),
+                osv_trigger_fetch_timeout_secs,
             )
             .await;
         }
@@ -3685,6 +3712,63 @@ mod tests {
                 mirrored.deny,
                 vec!["GPL-3.0".to_string(), "AGPL-3.0".to_string()]
             );
+        }
+
+        /// Issue #1517 critique S5: `osv_latest_check_enabled` must start `true` (the
+        /// opt-out feature's own default, unlike typosquat/gossip's opt-in `false`), track a
+        /// disable, and track a re-enable — the transition
+        /// `did_change_configuration` actually watches for before triggering
+        /// `trigger_osv_rescan_for_open_documents`.
+        #[tokio::test]
+        async fn test_did_change_configuration_tracks_osv_latest_check_enabled_transitions() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            assert!(
+                backend.state.is_osv_latest_check_enabled(),
+                "must start true, matching DepsConfig::default()'s own \
+                 vulnerabilities_enabled: true / offline: false"
+            );
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "diagnostics": { "vulnerabilities_enabled": false }
+                    }),
+                })
+                .await;
+            assert!(!backend.state.is_osv_latest_check_enabled());
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({
+                        "diagnostics": { "vulnerabilities_enabled": true }
+                    }),
+                })
+                .await;
+            assert!(backend.state.is_osv_latest_check_enabled());
+        }
+
+        /// Same transition, driven by `network.offline` instead of `vulnerabilities_enabled` —
+        /// both flags must degrade the effective state identically (issue #1517 critique S3).
+        #[tokio::test]
+        async fn test_did_change_configuration_tracks_osv_latest_check_enabled_via_offline() {
+            let (service, _socket) = tower_lsp_server::LspService::build(Backend::new).finish();
+            let backend = service.inner();
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "network": { "offline": true } }),
+                })
+                .await;
+            assert!(!backend.state.is_osv_latest_check_enabled());
+
+            backend
+                .did_change_configuration(DidChangeConfigurationParams {
+                    settings: serde_json::json!({ "network": { "offline": false } }),
+                })
+                .await;
+            assert!(backend.state.is_osv_latest_check_enabled());
         }
 
         /// Issue #1437, mirroring `initialize_tests::test_initialize_applies_valid_typosquat_config`:

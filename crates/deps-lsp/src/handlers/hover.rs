@@ -27,13 +27,14 @@ pub async fn handle_hover(
     }
 
     // Acquires the config RwLock before the DashMap shard guard, never the reverse (matches diagnostics.rs).
-    let (freshness, offline, supply_chain_enabled, gossip_enabled) = {
+    let (freshness, offline, supply_chain_enabled, gossip_enabled, vulnerabilities_enabled) = {
         let config = config.read().await;
         (
             config.policy.freshness.to_settings(),
             config.policy.network.offline,
             config.policy.supply_chain.enabled,
             config.policy.gossip.enabled,
+            config.policy.diagnostics.vulnerabilities_enabled,
         )
     };
 
@@ -57,6 +58,7 @@ pub async fn handle_hover(
                 .snapshot()
                 .with_resolved_version_candidates()
                 .with_vulnerabilities()
+                .with_latest_status(vulnerabilities_enabled && !offline)
                 .with_outcomes()
                 .with_license_prefetch()
                 .with_gossip_prefetch(gossip_visibility)

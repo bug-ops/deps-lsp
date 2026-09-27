@@ -24,10 +24,12 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
+use types::worst_severity;
 pub use types::{
-    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, OsvEcosystem, OsvVersion,
-    ScanOutcome, ScanTarget, SkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity,
-    VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
+    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, LatestStatusMap, OsvEcosystem,
+    OsvVersion, ScanOutcome, ScanTarget, SkipReason, UpgradeStatus, VulnKey, VulnKeys,
+    VulnSeverity, VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for,
+    vulnerability_keys,
 };
 use types::{
     OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
@@ -175,8 +177,9 @@ pub struct OsvClient {
     record_cache: DashMap<String, RecordCacheEntry>,
     /// Overridable in test builds only, so `mockito` can stand in for
     /// `https://api.osv.dev` — mirrors [`crate::cache::ensure_https`]'s existing
-    /// `#[cfg(test)]` relaxation for the same reason.
-    #[cfg(test)]
+    /// `#[cfg(test)]` relaxation for the same reason, and [`crate::deps_dev::DepsDevClient`]'s
+    /// own `base_url` field.
+    #[cfg(any(test, feature = "test-util"))]
     base_url: String,
 }
 
@@ -190,12 +193,23 @@ impl OsvClient {
             cache,
             query_cache: DashMap::new(),
             record_cache: DashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-util"))]
             base_url: OSV_API_BASE.to_string(),
         }
     }
 
-    #[cfg(test)]
+    /// Creates a client pointed at `base_url` instead of the real OSV.dev API, for
+    /// `mockito`-backed tests — issue #1517 critique S6, so a downstream crate (e.g.
+    /// `deps-lsp`, via its `test-util`-featured dev-dependency on this crate) can exercise
+    /// [`Self::scan`]/[`Self::check_candidates`] against a mock server the same way
+    /// [`crate::deps_dev::DepsDevClient::for_test`] already lets it do for deps.dev calls.
+    #[cfg(any(test, feature = "test-util"))]
+    #[must_use]
+    pub fn for_test(cache: Arc<HttpCache>, base_url: impl Into<String>) -> Self {
+        Self::with_base_url(cache, base_url.into())
+    }
+
+    #[cfg(any(test, feature = "test-util"))]
     fn with_base_url(cache: Arc<HttpCache>, base_url: String) -> Self {
         Self {
             cache,
@@ -205,12 +219,12 @@ impl OsvClient {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-util"))]
     fn api_base(&self) -> &str {
         &self.base_url
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-util")))]
     const fn api_base(&self) -> &str {
         OSV_API_BASE
     }
@@ -258,15 +272,23 @@ impl OsvClient {
     /// Phase B: checks whether the versions about to be recommended (e.g.
     /// "latest" from the registry) are themselves affected.
     ///
-    /// Only meaningful for dependencies phase A already flagged — callers
-    /// should build `candidates` from that subset. `timeout` has the same
-    /// meaning as in [`Self::scan`].
+    /// Callers may build `candidates` from any subset of dependencies with a registry-cached
+    /// candidate to check — issue #1517 removed the earlier restriction to only dependencies
+    /// phase A already flagged [`ScanOutcome::Vulnerable`], since a cleanly-pinned dependency's
+    /// "latest" must be checked too (a phase-A-only gate silently let a malicious/vulnerable
+    /// "latest" through for every dependency that was clean at its *pinned* version). `timeout`
+    /// has the same meaning as in [`Self::scan`].
+    ///
+    /// Every `candidates` entry gets exactly one result back (never silently dropped): a
+    /// [`ScanOutcome::Skipped`] outcome, or a target this call never resolved a result for at
+    /// all, becomes [`UpgradeStatus::CandidateUnverified`] rather than an absent map entry — a
+    /// caller must fail closed on that, never treat "absent" as "safe" (issue #1517 AC4).
     pub async fn check_candidates(
         &self,
         ecosystem: crate::EcosystemId,
         candidates: &[ScanTarget],
         timeout: Duration,
-    ) -> HashMap<VulnKey, UpgradeStatus> {
+    ) -> LatestStatusMap {
         if candidates.is_empty() {
             return HashMap::new();
         }
@@ -278,24 +300,56 @@ impl OsvClient {
             .map(|c| (&c.key, c.display_version.as_str()))
             .collect();
 
-        let outcomes = self.resolve(ecosystem, candidates, timeout).await;
+        let mut outcomes = self.resolve(ecosystem, candidates, timeout).await;
 
-        outcomes
-            .into_iter()
-            .filter_map(|(key, outcome)| {
-                let version = (*versions.get(&key)?).to_string();
-                let status = match outcome {
-                    ScanOutcome::Clean => UpgradeStatus::CandidateClean { version },
-                    ScanOutcome::Vulnerable(dv) => UpgradeStatus::CandidateVulnerable {
+        candidates
+            .iter()
+            .map(|candidate| {
+                let key = candidate.key.clone();
+                let version = (*versions
+                    .get(&key)
+                    .unwrap_or(&candidate.display_version.as_str()))
+                .to_string();
+                let status = match outcomes.remove(&key) {
+                    Some(ScanOutcome::Clean) => UpgradeStatus::CandidateClean { version },
+                    Some(ScanOutcome::Vulnerable(dv)) => {
+                        // Issue #1517 critique S2: `dv.advisories.items()` only holds the
+                        // records that were actually fetched and passed validation — a record
+                        // dropped by `fetch_records` (network failure, parse failure) or
+                        // truncated by `MAX_ADVISORY_RECORDS` is silently absent from `items()`
+                        // but still counted in `total()`. Computing `worst_severity` over an
+                        // incomplete `items()` can under-report (an Informational record fetched
+                        // alongside a higher-severity one that failed to fetch would otherwise
+                        // read as `Some(Informational)` -> `Verified`, fail-open). `None` here
+                        // is the same "could not be determined" signal `worst_severity` already
+                        // returns for an empty slice, and `CandidateVulnerable::worst_severity`'s
+                        // own contract already treats `None` as blocking.
+                        let worst_severity = dv
+                            .advisories
+                            .is_complete()
+                            .then(|| worst_severity(dv.advisories.items()))
+                            .flatten();
+                        UpgradeStatus::CandidateVulnerable {
+                            version,
+                            advisory_ids: Capped::new(
+                                dv.advisories.items().iter().map(|a| a.id.clone()).collect(),
+                                dv.advisories.total(),
+                            ),
+                            worst_severity,
+                        }
+                    }
+                    Some(ScanOutcome::Skipped(reason)) => {
+                        UpgradeStatus::CandidateUnverified { version, reason }
+                    }
+                    // `resolve` is documented to always produce one outcome per target, but a
+                    // caller must still fail closed here rather than assume it, per this
+                    // method's own contract above (issue #1517 AC4).
+                    None => UpgradeStatus::CandidateUnverified {
                         version,
-                        advisory_ids: Capped::new(
-                            dv.advisories.items().iter().map(|a| a.id.clone()).collect(),
-                            dv.advisories.total(),
-                        ),
+                        reason: SkipReason::QueryFailed,
                     },
-                    ScanOutcome::Skipped(_) => return None,
                 };
-                Some((key, status))
+                (key, status)
             })
             .collect()
     }
@@ -563,7 +617,6 @@ impl OsvClient {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(advisories, total),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             })
         }
     }
@@ -591,7 +644,6 @@ impl OsvClient {
         ScanOutcome::Vulnerable(DependencyVulnerabilities {
             advisories: Capped::new(advisories, vuln_ids.len()),
             fix_target_status: UpgradeStatus::NotChecked,
-            upgrade_status: UpgradeStatus::NotChecked,
         })
     }
 
@@ -1457,7 +1509,7 @@ mod tests {
             "every advisory must be fetched: advisory_count is well under MAX_ADVISORY_RECORDS"
         );
 
-        let fix = dv.recommended_fix().expect("a fix must be recommended");
+        let fix = dv.recommended_fix(None).expect("a fix must be recommended");
         assert_eq!(
             fix.version, "0.56.0",
             "recommended_fix must consider the advisory beyond ADVISORY_DISPLAY_CAP"
@@ -1519,10 +1571,120 @@ mod tests {
         );
         assert_matches!(
             statuses.get(&crate::test_util::vuln_key("bad-pkg")),
-            Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids })
+            Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids, .. })
                 if version == "2.0.0"
                     && advisory_ids.items() == ["ADV-1".to_string()]
                     && advisory_ids.total() == 1
+        );
+    }
+
+    /// Issue #1517: `check_candidates` must never silently drop a target it queried —
+    /// [`SkipReason::UnmappableEcosystem`] (a whole-batch skip, since GitLab CI has no
+    /// `osv_ecosystem`) must surface as `CandidateUnverified`, not an absent map entry.
+    #[tokio::test]
+    async fn check_candidates_maps_unmappable_ecosystem_to_candidate_unverified() {
+        let client = client();
+        let candidates = vec![target("pkg", "2.0.0")];
+
+        let statuses = client
+            .check_candidates(EcosystemId::GitlabCi, &candidates, TEST_TIMEOUT)
+            .await;
+
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("pkg")),
+            Some(UpgradeStatus::CandidateUnverified {
+                version,
+                reason: SkipReason::UnmappableEcosystem
+            }) if version == "2.0.0"
+        );
+    }
+
+    /// Issue #1517 critique S2: a record that failed to fetch must never be silently excluded
+    /// from `worst_severity`'s input — an `Informational`-only record that *did* fetch,
+    /// alongside a second, unfetched record, must not read as `Some(Informational)` (which
+    /// `latest_verdict` treats as `Verified`, the exact fail-open gap S2 found). `worst_severity`
+    /// must come back `None` (blocking, per `CandidateVulnerable::worst_severity`'s own
+    /// contract) whenever `advisories.items().len() < advisories.total()`.
+    #[tokio::test]
+    async fn check_candidates_forces_none_severity_when_a_record_failed_to_fetch() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"vulns":[
+                    {"id":"ADV-OK","modified":"2023-01-01T00:00:00Z"},
+                    {"id":"ADV-MISSING","modified":"2023-01-01T00:00:00Z"}
+                ]}]}"#,
+            )
+            .create_async()
+            .await;
+        let _fetched = server
+            .mock("GET", "/v1/vulns/ADV-OK")
+            .with_status(200)
+            .with_body(r#"{"id":"ADV-OK","modified":"2023-01-01T00:00:00Z"}"#)
+            .create_async()
+            .await;
+        let _missing = server
+            .mock("GET", "/v1/vulns/ADV-MISSING")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let candidates = vec![target("bad-pkg", "2.0.0")];
+        let statuses = client
+            .check_candidates(EcosystemId::Npm, &candidates, TEST_TIMEOUT)
+            .await;
+
+        let Some(UpgradeStatus::CandidateVulnerable {
+            advisory_ids,
+            worst_severity,
+            ..
+        }) = statuses.get(&crate::test_util::vuln_key("bad-pkg"))
+        else {
+            panic!(
+                "expected CandidateVulnerable, got {:?}",
+                statuses.get(&crate::test_util::vuln_key("bad-pkg"))
+            );
+        };
+        assert_eq!(advisory_ids.items(), ["ADV-OK".to_string()]);
+        assert_eq!(
+            advisory_ids.total(),
+            2,
+            "the unfetched record still counts toward total"
+        );
+        assert_eq!(
+            *worst_severity, None,
+            "an incomplete advisory set must never report a severity — the caller's \
+             `latest_verdict` treats only `Some(Informational)` as non-blocking, and `None` \
+             must stay blocking (Flagged), never silently pass as clean"
+        );
+    }
+
+    /// Issue #1517 critique S6: `check_candidates` must never silently drop a target whose
+    /// query never even got a chance to run because the deadline had already elapsed —
+    /// [`resolve`](OsvClient::resolve)'s own deadline check (checked before each chunk) marks
+    /// the whole remaining batch [`SkipReason::QueryFailed`], and `check_candidates` must map
+    /// that to [`UpgradeStatus::CandidateUnverified`], the fail-closed outcome every caller's
+    /// [`crate::lsp_helpers::latest_verdict`] treats as `Unverified`, never as an absent
+    /// (implicitly "safe") entry.
+    #[tokio::test]
+    async fn check_candidates_deadline_exceeded_yields_candidate_unverified() {
+        let client = client();
+        let candidates = vec![target("pkg", "2.0.0")];
+
+        // A zero-duration budget: `resolve`'s deadline (`Instant::now() + timeout`) has
+        // already elapsed by the time the first chunk is checked, before any network call.
+        let statuses = client
+            .check_candidates(EcosystemId::Npm, &candidates, Duration::ZERO)
+            .await;
+
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("pkg")),
+            Some(UpgradeStatus::CandidateUnverified {
+                version,
+                reason: SkipReason::QueryFailed,
+            }) if version == "2.0.0"
         );
     }
 

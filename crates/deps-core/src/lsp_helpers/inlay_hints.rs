@@ -4,8 +4,8 @@ use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
 use super::diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 use super::{
-    EcosystemFormatter, RequirementStatus, VersionData, in_use_version,
-    sanitize_and_truncate_for_diagnostic,
+    EcosystemFormatter, LatestVerdict, RequirementStatus, VersionData, in_use_version,
+    latest_verdict, sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for
@@ -37,6 +37,19 @@ pub fn generate_inlay_hints(
 ) -> Vec<InlayHint> {
     let deps = parse_result.dependencies();
     let mut hints = Vec::with_capacity(deps.len());
+
+    // Issue #1517: shared per-occurrence OSV lookup keys, mirroring every other renderer's
+    // identical `versions.ecosystem.map(..)` pattern — needed so `latest_verdict` below can
+    // tell one duplicated-name occurrence's latest-check result apart from another's.
+    let vuln_keys = versions.ecosystem.map(|ecosystem| {
+        crate::osv::vulnerability_keys(
+            parse_result,
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )
+    });
 
     for dep in deps {
         let Some(version_range) = dep.version_range() else {
@@ -169,6 +182,7 @@ pub fn generate_inlay_hints(
             }
         };
 
+        let mut flagged_tooltip: Option<String> = None;
         let label_text = match status {
             RequirementStatus::UpToDate => {
                 if config.show_up_to_date_hints {
@@ -185,9 +199,38 @@ pub fn generate_inlay_hints(
                     continue;
                 }
             }
-            RequirementStatus::Outdated => config
-                .needs_update_text
-                .replace("{}", &sanitize_hint_version(latest.as_str())),
+            RequirementStatus::Outdated => {
+                // Issue #1517: an OSV-flagged/malicious latest must never render with the same
+                // plain "needs update" icon as an ordinary outdated version — that icon alone
+                // reads as a routine, safe-to-click upgrade nudge on this always-visible surface.
+                let verdict = latest_verdict(
+                    versions.latest_status,
+                    dep,
+                    vuln_keys.as_ref(),
+                    normalized_name.as_str(),
+                    latest.as_str(),
+                );
+                if let LatestVerdict::Flagged {
+                    advisory_ids,
+                    malicious,
+                } = verdict
+                {
+                    let icon = if malicious { "🚫" } else { "⚠️" };
+                    flagged_tooltip = Some(if advisory_ids.is_empty() {
+                        "Flagged by OSV.dev — do not upgrade to this version".to_string()
+                    } else {
+                        format!(
+                            "Flagged by OSV.dev ({}) — do not upgrade to this version",
+                            advisory_ids.join(", ")
+                        )
+                    });
+                    format!("{icon} {} flagged", sanitize_hint_version(latest.as_str()))
+                } else {
+                    config
+                        .needs_update_text
+                        .replace("{}", &sanitize_hint_version(latest.as_str()))
+                }
+            }
             // Resolution failed (e.g. dangling alias/unexpanded variable) — neither
             // "up to date" nor "outdated" was actually verified, so show nothing.
             RequirementStatus::Unresolved => continue,
@@ -209,7 +252,7 @@ pub fn generate_inlay_hints(
             padding_left: Some(true),
             padding_right: None,
             text_edits: None,
-            tooltip: None,
+            tooltip: flagged_tooltip.map(InlayHintTooltip::String),
             data: None,
         });
     }
@@ -425,6 +468,81 @@ mod tests {
                 assert_eq!(text, "❌ 2.1.1");
             }
             _ => panic!("Expected string label"),
+        }
+    }
+
+    /// Issue #1517 (the P0 this fix addresses): an OSV-flagged/malicious latest must render
+    /// with a distinct icon and tooltip, never the plain "needs update" `❌` badge that reads
+    /// as a routine, safe-to-click upgrade nudge.
+    #[test]
+    fn test_inlay_hint_outdated_flagged_by_osv_uses_distinct_label_and_tooltip() {
+        use crate::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MOCK_FORMATTER;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "feed-widget-helper".into(),
+            PackageVersions::latest_only("1.0.8"),
+        );
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    !text.starts_with('❌'),
+                    "must not use the plain badge: {text}"
+                );
+                assert!(text.contains("1.0.8"), "got: {text}");
+                assert!(text.contains("flagged"), "got: {text}");
+            }
+            InlayHintLabel::LabelParts(_) => panic!("Expected string label"),
+        }
+        match &hints[0].tooltip {
+            Some(InlayHintTooltip::String(tooltip)) => {
+                assert!(tooltip.contains("MAL-2026-16332"), "got: {tooltip}");
+            }
+            other => panic!("expected a tooltip naming the advisory, got: {other:?}"),
         }
     }
 

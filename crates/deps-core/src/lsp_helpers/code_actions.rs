@@ -6,10 +6,10 @@ use crate::osv::ScanOutcome;
 use crate::{Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
-    DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LineOffsetTable, UNSATISFIABLE_DIAGNOSTIC_CODE,
-    VersionData, await_versions_fetch, is_safe_version_string, literal_span_matches,
-    requirement_is_unsatisfiable, resolve_scan_outcome, single_file_edit, slice_for_range,
-    strip_whitespace, warn_rejected_value,
+    DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LatestVerdict, LineOffsetTable,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_versions_fetch, is_safe_version_string,
+    latest_verdict, literal_span_matches, requirement_is_unsatisfiable, resolve_latest_status,
+    resolve_scan_outcome, single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -73,22 +73,34 @@ fn build_vulnerability_fix_action(
     let ScanOutcome::Vulnerable(dv) = outcome else {
         return None;
     };
+    // Issue #1517: the same per-key "latest" status `recommended_fix` needs to exclude ids
+    // phase B's latest-check found still applying — looked up once and threaded through both
+    // calls below rather than re-deriving it twice.
+    let latest = versions
+        .latest_status
+        .and_then(|m| resolve_latest_status(m, dep, vuln_keys.as_ref(), &normalized_name));
 
     // Planning core (the no-op guard, `is_safe_version_string`, `osv_version_to_native`,
     // `format_version_replacing_for`, and the #462 fix-target-verification gate) lives in
     // `deps_core::edit::plan_vulnerability_fix` — moved there so `deps-cli update
     // --security-only` (#1329) reuses the identical decision logic instead of
     // reimplementing it.
-    let planned =
-        crate::edit::plan_vulnerability_fix(dep, version_range.into(), version_req, dv, formatter)
-            .ok()?;
+    let planned = crate::edit::plan_vulnerability_fix(
+        dep,
+        version_range.into(),
+        version_req,
+        dv,
+        latest,
+        formatter,
+    )
+    .ok()?;
     let version_native = planned.target.as_str().to_string();
     let new_text = planned.edit.new_text;
 
     // Recomputed for the title/data payload below only — `plan_vulnerability_fix` already
     // confirmed a fix exists and F is verified; `recommended_fix` is a pure, deterministic
-    // function of `dv` alone, so calling it again here is not a second decision.
-    let fix = dv.recommended_fix()?;
+    // function of `dv`/`latest` alone, so calling it again here is not a second decision.
+    let fix = dv.recommended_fix(latest)?;
 
     // #1422 follow-up: `fix.advisory_ids` is computed over the full `MAX_ADVISORY_RECORDS`-capped
     // fetch set, but only `dv.advisories_for_display()`'s ids are ever published as `Diagnostic`s
@@ -602,6 +614,21 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         emitted_texts.insert(unsat_text);
     }
 
+    // Issue #1517: computed once, only needed for the `item.is_latest` gate below — the
+    // separate, non-latest offer of an unverified intermediate version is a known, tracked
+    // follow-up (HIGH, not fixed here; see the security audit's handoff), not something this
+    // lookup is meant to cover.
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    let latest_vuln_keys = versions.ecosystem.map(|ecosystem| {
+        crate::osv::vulnerability_keys(
+            parse_result,
+            versions.resolved,
+            versions.resolved_version_candidates,
+            formatter,
+            ecosystem,
+        )
+    });
+
     let mut latest_refactor_idx = None;
     // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
     // text a REFACTOR "Update to X" action could ever replace, so the whole loop is skipped
@@ -629,6 +656,26 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                     item.version.as_str(),
                 );
                 continue;
+            }
+            // Issue #1517: never offer the "update to latest" quickfix unless OSV has
+            // actually verified this exact version (or does not apply at all) — a
+            // Flagged/Unverified latest must never be one keystroke away from landing in
+            // the manifest. Only gates the `is_latest` item; a non-latest item's own
+            // unverified status is the tracked HIGH follow-up, not this fix's scope.
+            if item.is_latest {
+                let verdict = latest_verdict(
+                    versions.latest_status,
+                    dep,
+                    latest_vuln_keys.as_ref(),
+                    &normalized_name,
+                    item.version.as_str(),
+                );
+                if !matches!(
+                    verdict,
+                    LatestVerdict::Verified | LatestVerdict::NotApplicable
+                ) {
+                    continue;
+                }
             }
             // Unreachable after the gate above; fails closed rather than unwrapping.
             let Some(new_text) =
@@ -734,7 +781,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.0".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -831,7 +877,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "2.0.0".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -919,7 +964,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "2.0.0".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1003,17 +1047,25 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
                     advisory_ids: Capped::new(vec!["A1".to_string()], 1),
-                },
-                upgrade_status: UpgradeStatus::CandidateVulnerable {
-                    version: "3.0.0".to_string(),
-                    advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::High),
                 },
             }),
+        );
+        let mut latest_status = crate::osv::LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "3.0.0".to_string(),
+                advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                worst_severity: Some(VulnSeverity::High),
+            },
         );
 
         let cached = HashMap::new();
         let resolved = HashMap::new();
-        let versions = VersionData::new(&cached, &resolved).with_vulnerabilities(&vulnerabilities);
+        let versions = VersionData::new(&cached, &resolved)
+            .with_vulnerabilities(&vulnerabilities)
+            .with_latest_status(&latest_status);
 
         let actions = generate_code_actions(
             &parse_result,
@@ -1077,8 +1129,8 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
                     advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::High),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1140,8 +1192,8 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
                     advisory_ids: Capped::new(vec!["A2".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::High),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1207,8 +1259,8 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
                     advisory_ids: Capped::new(vec!["A1".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::High),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1285,8 +1337,8 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
                     version: "1.2.0".to_string(),
                     advisory_ids: Capped::new(vec!["A2".to_string()], 2),
+                    worst_severity: Some(VulnSeverity::High),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1344,7 +1396,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1401,7 +1452,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "2.0.0".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1462,7 +1512,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1520,7 +1569,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1692,7 +1740,6 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::NotChecked,
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -1796,7 +1843,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "2.17.1".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
         vulnerabilities.insert(patched_key, ScanOutcome::Clean);
@@ -1877,7 +1923,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.5".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -2003,7 +2048,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.0.2".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -2066,7 +2110,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.0".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -2132,7 +2175,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.0".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -2200,7 +2242,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.2.0".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -2304,6 +2345,63 @@ mod tests {
                 .filter(|a| !a.title.starts_with("2.0.0"))
                 .all(|a| a.is_preferred.is_none()),
             "every other action must be None, not Some(false): {actions:?}"
+        );
+    }
+
+    /// Issue #1517 (the P0 this fix addresses): OSV flagged the registry's "latest" as
+    /// malicious — the "Update to 2.0.0" quickfix must never be offered, even though nothing
+    /// about the pinned version itself (1.0.0) is vulnerable.
+    #[tokio::test]
+    async fn test_generate_code_actions_omits_latest_refactor_when_osv_flags_it() {
+        use crate::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "2.0.0".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+        let versions = VersionData::new(&cached, &resolved).with_latest_status(&latest_status);
+        let registry = FixedVersionRegistry {
+            versions: vec![("2.0.0", false), ("1.5.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MOCK_FORMATTER,
+        )
+        .await;
+
+        let refactor_titles = refactor_titles(&actions);
+        assert!(
+            !refactor_titles.iter().any(|t| t.starts_with("2.0.0")),
+            "a malicious-flagged latest must never be offered as an update target: {refactor_titles:?}"
+        );
+        assert!(
+            refactor_titles.iter().any(|t| t.starts_with("1.5.0")),
+            "a non-latest, non-flagged version stays offered (separate follow-up scope): \
+             {refactor_titles:?}"
+        );
+        assert!(
+            actions.iter().all(|a| a.is_preferred.is_none()),
+            "no action may claim isPreferred once the only latest candidate was dropped: \
+             {actions:?}"
         );
     }
 
@@ -2560,7 +2658,6 @@ mod tests {
                 fix_target_status: UpgradeStatus::CandidateClean {
                     version: "1.0.2".to_string(),
                 },
-                upgrade_status: UpgradeStatus::NotChecked,
             }),
         );
 
@@ -2846,7 +2943,6 @@ mod tests {
                         1,
                     ),
                     fix_target_status: UpgradeStatus::NotChecked,
-                    upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
             let cached = HashMap::new();
@@ -3535,7 +3631,6 @@ mod tests {
                     fix_target_status: UpgradeStatus::CandidateClean {
                         version: "5.5.5".to_string(),
                     },
-                    upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
             // "9.9.9" (unsat target) differs from "5.5.5" (vuln target), so both
@@ -3619,7 +3714,6 @@ mod tests {
                     fix_target_status: UpgradeStatus::CandidateClean {
                         version: "9.9.9".to_string(),
                     },
-                    upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
             let cached = cached_versions("9.9.9", &["9.9.9"]);
@@ -3683,7 +3777,6 @@ mod tests {
                     fix_target_status: UpgradeStatus::CandidateClean {
                         version: "9.9.5".to_string(),
                     },
-                    upgrade_status: UpgradeStatus::NotChecked,
                 }),
             );
             // Unsat fix's own gate/verification data (distinct from the registry

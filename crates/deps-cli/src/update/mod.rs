@@ -171,6 +171,14 @@ impl PlannedUpdateItem {
             Outcome::Skipped(SkipReason::NotSafelyEditable(
                 deps_core::edit::UnplannableReason::NoOpRewrite,
             )) => "no single unambiguous rewrite exists for this dependency's requirement syntax",
+            Outcome::Skipped(SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestFlaggedByOsv,
+            )) => "the registry's latest version is flagged by OSV.dev — refusing to write it",
+            Outcome::Skipped(SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestUnverified,
+            )) => {
+                "the registry's latest version could not be verified against OSV.dev — refusing to write it"
+            }
             Outcome::Skipped(SkipReason::OverlapsAnotherEdit) => {
                 "this edit's span overlapped another item's and was dropped"
             }
@@ -289,6 +297,7 @@ pub fn is_requested(
 ///     resolved_version_candidates: HashMap::new(),
 ///     outcomes: DependencyOutcomes::new(),
 ///     vulnerabilities: None,
+///     latest_status: None,
 ///     licenses: HashMap::new(),
 ///     license_policy: deps_core::licenses::LicensePolicy::default(),
 ///     license_source: deps_core::LicenseSource::default(),
@@ -617,6 +626,7 @@ mod tests {
             resolved_version_candidates: HashMap::new(),
             outcomes: deps_core::lsp_helpers::DependencyOutcomes::new(),
             vulnerabilities: None,
+            latest_status: None,
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
             license_source: deps_core::LicenseSource::default(),
@@ -690,6 +700,106 @@ mod tests {
         assert!(
             !plan.items.iter().any(|i| i.name == "libc"),
             "an up-to-date dependency must never appear as a candidate at all"
+        );
+    }
+
+    /// Issue #1517 critique S6: no test covered `plan_updates`/`collect_update_candidates`'s
+    /// actual gate on a `Flagged` OSV verdict for the registry's cached "latest" — this pins
+    /// the whole wiring end to end: the candidate must come back
+    /// `Skipped(NotSafelyEditable(LatestFlaggedByOsv))`, never `Applied`, and
+    /// `deps_cli::exit::update_exit_code` must treat that as a nonzero (policy-violation) exit,
+    /// the same as any other `NotSafelyEditable` reason.
+    #[test]
+    fn test_plan_updates_refuses_a_flagged_latest() {
+        use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+
+        let content = "serde = \"1.0.0\"\n";
+        let versions = cached("serde", "1.2.0");
+        let mut analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            deps_core::test_util::vuln_key("serde"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.2.0".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+        analysis.latest_status = Some(latest_status);
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+            )),
+            "got: {:?}",
+            plan.items[0].outcome
+        );
+        assert_eq!(
+            crate::exit::update_exit_code(&plan),
+            crate::exit::EXIT_POLICY_VIOLATION,
+            "a flagged latest must never exit clean"
+        );
+    }
+
+    /// Issue #1517 critique S6: same as the flagged case above, for an `Unverified` OSV
+    /// verdict (no phase-B/scan result for this dependency at all) — the shared gate must
+    /// fail closed the same way, not only for a confirmed-malicious `Flagged` verdict.
+    #[test]
+    fn test_plan_updates_refuses_an_unverified_latest() {
+        use deps_core::osv::LatestStatusMap;
+
+        let content = "serde = \"1.0.0\"\n";
+        let versions = cached("serde", "1.2.0");
+        let mut analysis = test_analysis(
+            vec![test_dep(
+                "serde",
+                "1.0.0",
+                Range::new(Position::new(0, 9), Position::new(0, 14)),
+            )],
+            versions,
+        );
+        // `Some(&empty map)`: OSV checking is on, but nothing has verified this dependency's
+        // latest yet — the pre-phase-B state, distinct from `None` (checking disabled/offline).
+        analysis.latest_status = Some(LatestStatusMap::new());
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &STUB_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+        );
+
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestUnverified
+            )),
+            "got: {:?}",
+            plan.items[0].outcome
+        );
+        assert_eq!(
+            crate::exit::update_exit_code(&plan),
+            crate::exit::EXIT_POLICY_VIOLATION,
+            "an unverified latest must never exit clean"
         );
     }
 
