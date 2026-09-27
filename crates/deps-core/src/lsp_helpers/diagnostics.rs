@@ -6111,6 +6111,7 @@ mod tests {
                 available: Arc::from(vec!["1.0.8".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6192,6 +6193,7 @@ mod tests {
                 available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6250,6 +6252,7 @@ mod tests {
                 available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
+                gossip_excluded_version: None,
             },
         );
         let resolved_versions = HashMap::new();
