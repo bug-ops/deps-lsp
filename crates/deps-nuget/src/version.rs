@@ -160,9 +160,12 @@ pub(crate) type VersionRange = deps_core::interval::VersionRange<ParsedVersion>;
 /// A bare version (no leading bracket) is a floor — `Minimum { inclusive: true }` — under
 /// `PackageReference`/`PackageVersion` semantics. A bracketed range delegates to
 /// [`deps_core::interval::parse_interval`] under [`deps_core::interval::BracketStyle::Standard`]
-/// (NuGet has no reversed-bracket notation), which rejects nested/stray brackets, a third
-/// comma-separated component, and a no-comma body that isn't the matching inclusive pair
-/// `[...]` — malformed shapes this function used to accept silently before #821.
+/// (NuGet has no reversed-bracket notation), which returns `None` for malformed syntax —
+/// nested/stray brackets, a third comma-separated component, a no-comma body that isn't the
+/// matching inclusive pair `[...]` (all silently accepted by this function before #821) — and
+/// returns `Some(VersionRange::Empty)`, per #1595, for a bounded range that parses but can
+/// never be satisfied (`[5.0,3.0]`, `(3.0,3.0)`), validated with `compare_parsed` rather than
+/// a raw component-wise comparison of the unparsed strings.
 pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
     let range = range.trim();
     if range.is_empty() {
@@ -178,9 +181,12 @@ pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
         });
     }
 
-    deps_core::interval::parse_interval(range, deps_core::interval::BracketStyle::Standard, |b| {
-        Some(ParsedVersion::parse(b))
-    })
+    deps_core::interval::parse_interval(
+        range,
+        deps_core::interval::BracketStyle::Standard,
+        |b| Some(ParsedVersion::parse(b)),
+        compare_parsed,
+    )
 }
 
 /// Compares an "up to date" reference version against `range`'s floor, for range shapes
@@ -609,6 +615,29 @@ mod tests {
     #[test]
     fn test_parse_range_rejects_bracketed_msbuild_property_reference() {
         assert!(parse_range("[$(MinVersion),$(MaxVersion))").is_none());
+    }
+
+    /// #1595: a bounded range that can never be satisfied — inverted bounds, or a
+    /// zero-width range with either bound exclusive — parses to `VersionRange::Empty`
+    /// (well-formed, unsatisfiable), not `None` (malformed syntax): `Empty` keeps the
+    /// requirement decidable so `satisfies` correctly reports `false` for every candidate,
+    /// rather than becoming undecidable as a `None` would.
+    #[test]
+    fn test_parse_range_degenerate_bounded_range_is_empty() {
+        for degenerate in ["[5.0,3.0]", "(3.0,3.0)", "[3.0,3.0)", "(3.0,3.0]"] {
+            assert!(
+                matches!(
+                    parse_range(degenerate),
+                    Some(deps_core::interval::VersionRange::Empty)
+                ),
+                "expected {degenerate:?} to parse to Empty"
+            );
+            assert!(!satisfies("1.5.0", degenerate));
+        }
+        assert!(!matches!(
+            parse_range("[3.0,3.0]"),
+            Some(deps_core::interval::VersionRange::Empty)
+        ));
     }
 
     /// #821: these shapes must be rejected (`parse_range` returns `None`), not silently

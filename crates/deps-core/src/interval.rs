@@ -55,6 +55,16 @@ pub enum VersionRange<V> {
         /// Whether `max` itself is included in the range.
         max_inclusive: bool,
     },
+    /// A syntactically well-formed bounded interval that can never be satisfied by any
+    /// version: `min > max` (`[5.0,3.0]`), or `min == max` with either bound exclusive
+    /// (`(3.0,3.0)`, `[3.0,3.0)`) — see #1595. Distinct from [`parse_interval`] returning
+    /// `None` (malformed syntax): a malformed member invalidates a whole union for callers
+    /// like Maven's, while `Empty` is a well-formed member that legitimately contributes
+    /// nothing — [`contains`] reports `false` for every candidate, so a requirement made up
+    /// entirely of `Empty` members is correctly reported as unsatisfiable rather than
+    /// undecidable, and an `Empty` member alongside valid ones in a union does not corrupt
+    /// gap detection over the valid members with a fabricated edge.
+    Empty,
 }
 
 /// Selects the delimiter grammar [`parse_interval`] accepts.
@@ -108,15 +118,23 @@ fn parse_bound_side<V>(s: &str, parse_bound: &impl Fn(&str) -> Option<V>) -> Par
 /// `[[1.0,2.0)`, `[1.0,2.0)]`), a third comma-separated component (`[1.0,2.0,3.0]`), a
 /// no-comma body whose delimiters aren't the matching inclusive pair `[...]` (`[1.0)`,
 /// `(1.0]`, `(1.0)` — neither grammar has a reversed-bracket exact-pin form), or a bound
-/// substring `parse_bound` itself rejects. Callers treat an unparseable interval as satisfying
-/// nothing rather than panicking.
+/// substring `parse_bound` itself rejects. Callers treat an unparseable interval as
+/// satisfying nothing rather than panicking.
+///
+/// Returns `Some(VersionRange::Empty)` — not `None` — for a bounded range that parses
+/// syntactically but can never be satisfied: `min > max` per `cmp_bound` (`[5.0,3.0]`), or
+/// `min == max` with either bound exclusive (`(3.0,3.0)`, `[3.0,3.0)`) — see #1595 and
+/// [`VersionRange::Empty`]'s own doc for why this must not be conflated with the malformed-
+/// syntax `None` case.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::interval::{BracketStyle, VersionRange, parse_interval};
 ///
-/// let range = parse_interval("[1.0,2.0)", BracketStyle::Standard, |b| Some(b.to_string()));
+/// let cmp = |a: &String, b: &String| a.cmp(b);
+///
+/// let range = parse_interval("[1.0,2.0)", BracketStyle::Standard, |b| Some(b.to_string()), cmp);
 /// assert_eq!(
 ///     range,
 ///     Some(VersionRange::Bounded {
@@ -128,8 +146,15 @@ fn parse_bound_side<V>(s: &str, parse_bound: &impl Fn(&str) -> Option<V>) -> Par
 /// );
 ///
 /// // Malformed shapes are rejected, not silently accepted.
-/// assert_eq!(parse_interval::<String>("[1.0,2.0,3.0]", BracketStyle::Standard, |b| Some(b.to_string())), None);
-/// assert_eq!(parse_interval::<String>("(1.0)", BracketStyle::Standard, |b| Some(b.to_string())), None);
+/// assert_eq!(parse_interval::<String>("[1.0,2.0,3.0]", BracketStyle::Standard, |b| Some(b.to_string()), cmp), None);
+/// assert_eq!(parse_interval::<String>("(1.0)", BracketStyle::Standard, |b| Some(b.to_string()), cmp), None);
+///
+/// // An inverted or zero-width-exclusive bounded range parses to `Empty`, not `None`.
+/// assert_eq!(parse_interval::<String>("[5.0,3.0]", BracketStyle::Standard, |b| Some(b.to_string()), cmp), Some(VersionRange::Empty));
+/// assert_eq!(parse_interval::<String>("(3.0,3.0)", BracketStyle::Standard, |b| Some(b.to_string()), cmp), Some(VersionRange::Empty));
+///
+/// // A zero-width range with both bounds inclusive is a valid single-point match.
+/// assert!(parse_interval::<String>("[3.0,3.0]", BracketStyle::Standard, |b| Some(b.to_string()), cmp).is_some_and(|r| r != VersionRange::Empty));
 /// ```
 #[expect(
     clippy::string_slice,
@@ -140,6 +165,7 @@ pub fn parse_interval<V>(
     s: &str,
     style: BracketStyle,
     parse_bound: impl Fn(&str) -> Option<V>,
+    cmp_bound: impl Fn(&V, &V) -> Ordering,
 ) -> Option<VersionRange<V>> {
     let s = s.trim();
     let first = s.chars().next()?;
@@ -177,12 +203,21 @@ pub fn parse_interval<V>(
         let max = parse_bound_side(hi.trim(), &parse_bound);
         match (min, max) {
             (ParsedBound::Invalid, _) | (_, ParsedBound::Invalid) => None,
-            (ParsedBound::Value(min), ParsedBound::Value(max)) => Some(VersionRange::Bounded {
-                min,
-                min_inclusive,
-                max,
-                max_inclusive,
-            }),
+            (ParsedBound::Value(min), ParsedBound::Value(max)) => {
+                let ord = cmp_bound(&min, &max);
+                let unsatisfiable = ord == Ordering::Greater
+                    || (ord == Ordering::Equal && !(min_inclusive && max_inclusive));
+                if unsatisfiable {
+                    Some(VersionRange::Empty)
+                } else {
+                    Some(VersionRange::Bounded {
+                        min,
+                        min_inclusive,
+                        max,
+                        max_inclusive,
+                    })
+                }
+            }
             (ParsedBound::Value(version), ParsedBound::Open) => Some(VersionRange::Minimum {
                 version,
                 inclusive: min_inclusive,
@@ -242,7 +277,7 @@ fn satisfies_max<Q: ?Sized, V>(
 /// ```
 /// use deps_core::interval::{BracketStyle, contains, parse_interval};
 ///
-/// let range = parse_interval("[1.0,2.0)", BracketStyle::Standard, |b| Some(b.to_string())).unwrap();
+/// let range = parse_interval("[1.0,2.0)", BracketStyle::Standard, |b| Some(b.to_string()), |a, b| a.cmp(b)).unwrap();
 /// let cmp = |a: &str, b: &String| a.cmp(b.as_str());
 /// assert!(contains("1.5", &range, cmp));
 /// assert!(!contains("2.0", &range, cmp));
@@ -265,6 +300,8 @@ pub fn contains<Q: ?Sized, V>(
             satisfies_min(v, min, *min_inclusive, &cmp)
                 && satisfies_max(v, max, *max_inclusive, &cmp)
         }
+        // A well-formed but unsatisfiable range admits nothing — see `VersionRange::Empty`.
+        VersionRange::Empty => false,
     }
 }
 
@@ -273,7 +310,7 @@ mod tests {
     use super::*;
 
     fn parse_str(s: &str, style: BracketStyle) -> Option<VersionRange<String>> {
-        parse_interval(s, style, |b| Some(b.to_string()))
+        parse_interval(s, style, |b| Some(b.to_string()), |a, b| a.cmp(b))
     }
 
     fn parses(s: &str, style: BracketStyle) -> bool {
@@ -376,14 +413,71 @@ mod tests {
     #[test]
     fn test_unparseable_bound_rejects_whole_interval() {
         let parse_u32 = |b: &str| b.parse::<u32>().ok();
+        let cmp_u32 = |a: &u32, b: &u32| a.cmp(b);
         assert_eq!(
-            parse_interval("[1,not-a-number)", BracketStyle::Standard, parse_u32),
+            parse_interval(
+                "[1,not-a-number)",
+                BracketStyle::Standard,
+                parse_u32,
+                cmp_u32
+            ),
             None
         );
         assert_eq!(
-            parse_interval("[not-a-number]", BracketStyle::Standard, parse_u32),
+            parse_interval("[not-a-number]", BracketStyle::Standard, parse_u32, cmp_u32),
             None
         );
+    }
+
+    /// #1595: a bounded range that can never be satisfied — inverted bounds, or a
+    /// zero-width range with either bound exclusive — parses to `Empty`, not `None`: it is
+    /// well-formed syntax, just an unsatisfiable one (see `VersionRange::Empty`'s doc for why
+    /// this must stay distinct from a malformed-syntax rejection).
+    #[test]
+    fn test_bounded_range_min_greater_than_max_is_empty() {
+        for style in [BracketStyle::Standard, BracketStyle::AllowReversed] {
+            assert_eq!(
+                parse_str("[5.0,3.0]", style),
+                Some(VersionRange::Empty),
+                "style={style:?}"
+            );
+            assert_eq!(
+                parse_str("(5.0,3.0)", style),
+                Some(VersionRange::Empty),
+                "style={style:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bounded_range_zero_width_exclusive_is_empty() {
+        for style in [BracketStyle::Standard, BracketStyle::AllowReversed] {
+            for s in ["(3.0,3.0)", "[3.0,3.0)", "(3.0,3.0]"] {
+                assert_eq!(
+                    parse_str(s, style),
+                    Some(VersionRange::Empty),
+                    "style={style:?}"
+                );
+            }
+        }
+    }
+
+    /// An `Empty` range admits no candidate, unlike an unparseable `None` interval which the
+    /// caller must handle separately (e.g. Maven's whole-union rejection).
+    #[test]
+    fn test_empty_range_contains_nothing() {
+        let range: VersionRange<String> = VersionRange::Empty;
+        assert!(!contains_str("3.0", &range));
+        assert!(!contains_str("0.0", &range));
+    }
+
+    #[test]
+    fn test_bounded_range_zero_width_inclusive_is_a_valid_single_point() {
+        for style in [BracketStyle::Standard, BracketStyle::AllowReversed] {
+            let range = parse_str("[3.0,3.0]", style).unwrap();
+            assert!(contains_str("3.0", &range));
+            assert!(!contains_str("2.9", &range));
+        }
     }
 
     #[test]
