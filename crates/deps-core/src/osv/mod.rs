@@ -70,8 +70,15 @@ const BATCH_CHUNK_SIZE: usize = 1000;
 /// [`OsvClient::check_candidates`] call (§8 invariant 2).
 const MAX_TRUNCATED_REQUERY_BUDGET: usize = 20;
 
-/// Bounded concurrency for the `/v1/vulns/{id}` fan-out (§8 invariant 3),
-/// mirroring the registry fetch fan-out's `buffer_unordered` usage.
+/// Bounded concurrency for the `/v1/vulns/{id}` and `/v1/query` (truncation recovery) fan-out
+/// (§8 invariant 3), mirroring the registry fetch fan-out's `buffer_unordered` usage.
+///
+/// Enforced by [`OsvClient::record_fetch_semaphore`], shared across every call on the client —
+/// not by `buffer_unordered` alone, which only bounds concurrency *within* a single call. Issue
+/// #1535: `deps-lsp`'s round-based candidate check fires up to `MAX_CANDIDATE_CHECK_VERSIONS`
+/// concurrent [`OsvClient::check_candidates`] calls, each of which used to get its own fresh
+/// `buffer_unordered(RECORD_FETCH_CONCURRENCY)` window — multiplying the real fan-out to OSV.dev
+/// well past this constant's intended bound.
 const RECORD_FETCH_CONCURRENCY: usize = 10;
 
 /// Entry-count bound shared by `query_cache` and `record_cache`.
@@ -175,6 +182,19 @@ pub struct OsvClient {
     cache: Arc<HttpCache>,
     query_cache: DashMap<(OsvEcosystem, String, OsvVersion), QueryCacheEntry>,
     record_cache: DashMap<String, RecordCacheEntry>,
+    /// Client-wide bound (permits = [`RECORD_FETCH_CONCURRENCY`]) on concurrent
+    /// `/v1/vulns/{id}`/`/v1/query` requests — see [`RECORD_FETCH_CONCURRENCY`]'s doc for why
+    /// this must be a field shared via `Arc` rather than a per-call `buffer_unordered` bound
+    /// (issue #1535).
+    record_fetch_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Coalesces concurrent fetches of the *same advisory id* — across every call sharing this
+    /// client, not just one [`Self::fetch_records`] invocation — into a single in-flight `GET
+    /// /v1/vulns/{id}` (issue #1535). Keyed by advisory id alone, not `(id, osv_name, osv_eco)`:
+    /// only the raw [`OsvVulnRecord`] fetch is shared; each caller still derives its own
+    /// [`Advisory`] via `into_advisory` for the package it actually queried, since one record
+    /// can describe several unrelated packages (see the `scan_filters_affected_entries_to_the_queried_package`
+    /// test).
+    record_in_flight: DashMap<String, Arc<tokio::sync::OnceCell<Option<Arc<OsvVulnRecord>>>>>,
     /// Overridable in test builds only, so `mockito` can stand in for
     /// `https://api.osv.dev` — mirrors [`crate::cache::ensure_https`]'s existing
     /// `#[cfg(test)]` relaxation for the same reason, and [`crate::deps_dev::DepsDevClient`]'s
@@ -193,6 +213,8 @@ impl OsvClient {
             cache,
             query_cache: DashMap::new(),
             record_cache: DashMap::new(),
+            record_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(RECORD_FETCH_CONCURRENCY)),
+            record_in_flight: DashMap::new(),
             #[cfg(any(test, feature = "test-util"))]
             base_url: OSV_API_BASE.to_string(),
         }
@@ -215,6 +237,8 @@ impl OsvClient {
             cache,
             query_cache: DashMap::new(),
             record_cache: DashMap::new(),
+            record_fetch_semaphore: Arc::new(tokio::sync::Semaphore::new(RECORD_FETCH_CONCURRENCY)),
+            record_in_flight: DashMap::new(),
             base_url,
         }
     }
@@ -549,6 +573,16 @@ impl OsvClient {
         // outer `tokio::spawn` — `fetch_records` hit the same issue and fixed it with `.cloned()`.
         let recovered: Vec<(VulnKey, ScanOutcome)> = stream::iter(to_recover.iter().cloned())
             .map(|target| async move {
+                // Same client-wide OSV request budget as `fetch_record_single_flight` (issue
+                // #1535) — a `/v1/query` requery is as expensive as a `/v1/vulns/{id}` fetch,
+                // so it draws from the same semaphore rather than its own separate window.
+                // TODO(critic): bound this acquire by the scan deadline — see #1539.
+                let Ok(_permit) = Arc::clone(&self.record_fetch_semaphore)
+                    .acquire_owned()
+                    .await
+                else {
+                    return (target.key.clone(), ScanOutcome::Skipped(SkipReason::QueryFailed));
+                };
                 let outcome = match self.query_single(osv_eco, &target).await {
                     // `/v1/query` can itself paginate — never trust its
                     // `vulns.len()` as complete when it says there is more
@@ -669,8 +703,8 @@ impl OsvClient {
                     return Some(advisory);
                 }
 
-                let record = self.fetch_single_record(&id).await?;
-                let advisory = Arc::new(record.into_advisory(osv_name, osv_eco)?);
+                let record = self.fetch_record_single_flight(&id).await?;
+                let advisory = Arc::new((*record).clone().into_advisory(osv_name, osv_eco)?);
                 self.store_record_cache(&advisory);
                 Some(advisory)
             })
@@ -680,6 +714,43 @@ impl OsvClient {
             .into_iter()
             .flatten()
             .collect()
+    }
+
+    /// Coalesces concurrent fetches of the same advisory id — across every call sharing this
+    /// client, not just one [`Self::fetch_records`] invocation — into a single in-flight `GET
+    /// /v1/vulns/{id}`, and gates the underlying HTTP fetch through `record_fetch_semaphore` so
+    /// [`RECORD_FETCH_CONCURRENCY`] bounds fetch concurrency client-wide (issue #1535) rather
+    /// than resetting to a fresh window on every call.
+    async fn fetch_record_single_flight(&self, id: &str) -> Option<Arc<OsvVulnRecord>> {
+        let cell = Arc::clone(
+            self.record_in_flight
+                .entry(id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::OnceCell::new()))
+                .value(),
+        );
+
+        let result = cell
+            .get_or_init(|| async {
+                // TODO(critic): bound this acquire by the scan deadline — see #1539.
+                let permit = Arc::clone(&self.record_fetch_semaphore)
+                    .acquire_owned()
+                    .await
+                    .ok()?;
+                let record = self.fetch_single_record(id).await.map(Arc::new);
+                drop(permit);
+                record
+            })
+            .await
+            .clone();
+
+        // Only a dedup window for concurrently-overlapping requests, not a persistent cache
+        // (`record_cache` already serves that role) — drop the entry once resolved so a later,
+        // non-overlapping fetch of the same id re-queries rather than growing this map forever
+        // over a server-lifetime client.
+        self.record_in_flight
+            .remove_if(id, |_, v| Arc::ptr_eq(v, &cell));
+
+        result
     }
 
     /// Fetches a single advisory record. Uses [`HttpCache::get_transport_only`]
@@ -848,6 +919,7 @@ mod tests {
     use super::*;
     use crate::{ConcreteVersion, EcosystemId};
     use std::assert_matches;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn client() -> OsvClient {
         OsvClient::new(Arc::new(HttpCache::new()))
@@ -1103,8 +1175,6 @@ mod tests {
 
     #[tokio::test]
     async fn scan_over_chunk_size_input_issues_exactly_two_batch_requests() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
         let (mut server, client) = mock_client().await;
 
         let n = BATCH_CHUNK_SIZE + 1;
@@ -1850,5 +1920,158 @@ mod tests {
             Some("updated summary")
         );
         record.assert_async().await;
+    }
+
+    /// A minimal raw-TCP `GET /v1/vulns/{id}` responder for the concurrency tests below.
+    ///
+    /// `mockito` 1.7.2 has no delay/hold-open API, so it can't force concurrent requests to
+    /// overlap deterministically — a real accept loop with an artificial per-request delay is
+    /// the only way to make "N requests were in flight at once" or "only one request landed"
+    /// assertions reliable rather than racy. Returns the listener address, the current-in-flight
+    /// counter, the peak-in-flight watermark, and the total-accepted-connections counter.
+    async fn spawn_mock_vuln_server(
+        delay: Duration,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("listener has a local addr");
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let watermark = Arc::new(AtomicUsize::new(0));
+        let total = Arc::new(AtomicUsize::new(0));
+
+        let (in_flight2, watermark2, total2) = (
+            Arc::clone(&in_flight),
+            Arc::clone(&watermark),
+            Arc::clone(&total),
+        );
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let (in_flight, watermark, total) = (
+                    Arc::clone(&in_flight2),
+                    Arc::clone(&watermark2),
+                    Arc::clone(&total2),
+                );
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 4096];
+                    let n = stream.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+                    let id = request
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .and_then(|path| path.rsplit('/').next())
+                        .unwrap_or("unknown")
+                        .to_string();
+
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    watermark.fetch_max(now, Ordering::SeqCst);
+                    total.fetch_add(1, Ordering::SeqCst);
+
+                    tokio::time::sleep(delay).await;
+
+                    let body = format!(r#"{{"id":"{id}","modified":"2023-01-01T00:00:00Z"}}"#);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        });
+
+        (addr, in_flight, watermark, total)
+    }
+
+    /// Issue #1535: `RECORD_FETCH_CONCURRENCY` must bound `fetch_record_single_flight`'s
+    /// underlying HTTP fetches *client-wide*, not reset to a fresh window per call — a
+    /// regression here (e.g. a semaphore constructed per-call instead of stored on `OsvClient`)
+    /// would still pass every other test in this module, since none of them exercise
+    /// cross-call concurrency.
+    #[tokio::test]
+    async fn record_fetch_semaphore_bounds_client_wide_concurrent_fetches() {
+        let (addr, _in_flight, watermark, total) =
+            spawn_mock_vuln_server(Duration::from_millis(50)).await;
+        let client = Arc::new(OsvClient::with_base_url(
+            Arc::new(HttpCache::new()),
+            format!("http://{addr}"),
+        ));
+
+        let handles: Vec<_> = (0..20)
+            .map(|i| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    client
+                        .fetch_record_single_flight(&format!("ADVISORY-{i}"))
+                        .await
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            assert!(handle.await.expect("task did not panic").is_some());
+        }
+
+        let peak = watermark.load(Ordering::SeqCst);
+        assert!(
+            peak <= RECORD_FETCH_CONCURRENCY,
+            "peak concurrent in-flight fetches ({peak}) exceeded the client-wide bound \
+             ({RECORD_FETCH_CONCURRENCY})"
+        );
+        assert_eq!(
+            total.load(Ordering::SeqCst),
+            20,
+            "all 20 distinct-id fetches must still land, just not all at once"
+        );
+    }
+
+    /// Issue #1535: concurrent fetches of the *same* advisory id must coalesce into one
+    /// in-flight `GET /v1/vulns/{id}` via `record_in_flight`'s single-flight `OnceCell`, not
+    /// fire one request per caller.
+    #[tokio::test]
+    async fn fetch_record_single_flight_coalesces_concurrent_same_id_requests() {
+        let (addr, _in_flight, _watermark, total) =
+            spawn_mock_vuln_server(Duration::from_millis(50)).await;
+        let client = Arc::new(OsvClient::with_base_url(
+            Arc::new(HttpCache::new()),
+            format!("http://{addr}"),
+        ));
+
+        let handles: Vec<_> = (0..20)
+            .map(|_| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move { client.fetch_record_single_flight("SAME-ID").await })
+            })
+            .collect();
+
+        for handle in handles {
+            let record = handle.await.expect("task did not panic");
+            assert_eq!(
+                record.map(|r| r.id.clone()),
+                Some("SAME-ID".to_string()),
+                "every follower must observe the leader's real fetched value"
+            );
+        }
+
+        assert_eq!(
+            total.load(Ordering::SeqCst),
+            1,
+            "20 concurrent fetches of the same id must land exactly one HTTP request"
+        );
     }
 }
