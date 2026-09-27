@@ -259,6 +259,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-engine**: `fetch_and_classify_package` decomposed into `gossip_floor_protected_pick`/`get_latest_matching_fallback`; no behavior change (resolves #1560) (#1583)
 - **deps-lsp**: `run_document_open_background_task`/`run_document_change_task`'s near-identical OSV/license/typosquat/GOSSIP spawn blocks now share `spawn_osv_and_license_prefetch`/`refresh_and_maybe_spawn_typosquat`/`spawn_and_track_gossip`; no behavior change (resolves #1560) (#1583)
 - **deps-core, deps-lsp, deps-maven**: new configurable `deps_core::test_util::MockVersion`/`MockRegistry`/`SearchBehavior` replace 17 hand-rolled `Registry` test doubles in `deps-lsp`'s completion tests and 4 `Version`/`Registry` doubles in `deps-maven`; remaining duplicated doubles in `deps-engine`'s `fetch.rs` and `deps-core`'s own `MockVersion` tracked in #1582 (resolves #1559) (#1583)
+- **deps-engine**: `in_use_versions` in the cooldown/GOSSIP floor path is now `Vec<ConcreteVersion>` instead of `Vec<String>`, comparing via typed equality instead of raw string comparison; no behavior change (part of #1557, resolves #1574) (#1586)
 - **deps-core, deps-engine**: migrate `deps-core` and `deps-engine`'s remaining hand-rolled `Registry`/`Version` test doubles onto the shared `deps_core::test_util::MockVersion`/`MockRegistry` fixture; no behavior change (resolves #1582) (#1588)
 
 ### Documentation

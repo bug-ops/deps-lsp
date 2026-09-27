@@ -117,7 +117,7 @@ pub(crate) async fn fetch_registry_versions_for_change(
     // and the added/changed dependencies' resolved sources (spec FR-001/FR-011) from the
     // freshly-committed parse result and the resolved versions just loaded above.
     let (in_use, selection_context, dep_sources, collided_names): (
-        HashMap<PackageName, Vec<String>>,
+        HashMap<PackageName, Vec<ConcreteVersion>>,
         deps_core::SelectionContext,
         DepSources,
         HashSet<PackageName>,
@@ -605,7 +605,7 @@ dependencies = ["requests>=2.0.0"]
             // `==` comparator must already be stripped here.
             assert_eq!(
                 in_use.get(&PackageName::new(raw_name)),
-                Some(&vec![pinned_version.to_string()])
+                Some(&vec![ConcreteVersion::from(pinned_version)])
             );
 
             let registry: Arc<dyn Registry> = Arc::new(MockYankedRegistry { pinned_version });
