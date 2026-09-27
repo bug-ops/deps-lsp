@@ -8,7 +8,7 @@ use crate::diagnostic::{CodeDescription, Diagnostic, RelatedInformation, Severit
 use crate::licenses::{
     ViolationReason, evaluate as evaluate_license_policy, resolve_license_entries,
 };
-use crate::osv::{ScanOutcome, SkipReason, diagnostic_severity_for};
+use crate::osv::{ScanOutcome, SkipReason, UpgradeStatus, diagnostic_severity_for};
 use crate::position::{Position, Range};
 use crate::redact::{RedactedUrl, redact_declaration_key, sanitize_invisible};
 use crate::{
@@ -1013,7 +1013,8 @@ pub fn generate_diagnostics_from_cache(
 
         // R2, R3, R4 run before both terminal guards below: an OSV / deprecation / in-use-yanked
         // finding must never be hidden by an unrelated "latest" lookup failure (FR-007/US-004).
-        apply_vulnerability_rule(&mut diagnostics, &ctx, vuln_keys.as_ref());
+        let vulnerable_in_use =
+            apply_vulnerability_rule(&mut diagnostics, &ctx, vuln_keys.as_ref());
         apply_license_policy_rule(&mut diagnostics, &ctx);
         apply_typosquat_rule(&mut diagnostics, &ctx);
         let deprecation_found = apply_deprecation_rule(&mut diagnostics, &ctx);
@@ -1050,7 +1051,13 @@ pub fn generate_diagnostics_from_cache(
         {
             continue;
         }
-        apply_outdated_rule(&mut diagnostics, &ctx, &resolved, vuln_keys.as_ref());
+        apply_outdated_rule(
+            &mut diagnostics,
+            &ctx,
+            &resolved,
+            vuln_keys.as_ref(),
+            vulnerable_in_use,
+        );
     }
 
     push_collapsed_fetch_failures(&mut diagnostics, fetch_failed, uri);
@@ -1671,17 +1678,24 @@ fn push_collapsed_registry_diagnostics<O: RegistryOccurrence>(
 /// "+N more advisories" entry, via [`push_vulnerability_diagnostics`].
 /// Suppressed by: nothing — not gated on `can_resolve_source`.
 /// Suppresses: nothing.
-fn apply_vulnerability_rule(
+///
+/// Returns the resolved [`crate::osv::DependencyVulnerabilities`] (`None` when this
+/// dependency is clean/skipped/unchecked) so the orchestrator can thread it into R7's
+/// [`flagged_latest_duplicates_vulnerability_finding`] (issue #1532 code-review finding 3)
+/// instead of that function re-running the identical [`resolve_scan_outcome`] lookup.
+fn apply_vulnerability_rule<'a>(
     diagnostics: &mut Vec<Diagnostic>,
-    ctx: &RuleContext<'_>,
+    ctx: &RuleContext<'a>,
     vuln_keys: Option<&crate::osv::VulnKeys>,
-) {
-    if let Some(vulnerabilities) = ctx.versions.vulnerabilities
-        && let Some(ScanOutcome::Vulnerable(dv)) =
-            resolve_scan_outcome(vulnerabilities, ctx.dep, vuln_keys, ctx.normalized_name)
-    {
-        push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
-    }
+) -> Option<&'a crate::osv::DependencyVulnerabilities> {
+    let vulnerabilities = ctx.versions.vulnerabilities?;
+    let Some(ScanOutcome::Vulnerable(dv)) =
+        resolve_scan_outcome(vulnerabilities, ctx.dep, vuln_keys, ctx.normalized_name)
+    else {
+        return None;
+    };
+    push_vulnerability_diagnostics(diagnostics, ctx.dep, dv);
+    Some(dv)
 }
 
 /// R2a — SPDX license-policy violation (issue #661, spec 010 Phase 2).
@@ -2461,55 +2475,188 @@ fn apply_yanked_only_rule(
 /// B for every dependency, not only ones already `Outdated`) was never surfaced: no
 /// diagnostic, and the inlay-hint/up-to-date rendering showed a plain checkmark.
 ///
-/// Deliberately scoped to [`LatestVerdict::Flagged`] only, not [`LatestVerdict::Unverified`]:
-/// `Unverified` is the common, transient state for every dependency before phase B first
-/// completes, and introducing a brand-new diagnostic on every up-to-date dependency during
-/// that window would be a broad noise regression — unlike the `Outdated` branch above, where
-/// `Unverified` only adjusts the wording of a diagnostic that was already firing regardless.
-// TODO(critic): UpToDate + attempted-but-failed Unverified latest is never surfaced
+/// Deliberately scoped to [`LatestVerdict::Flagged`] mostly, not the common
+/// "not-yet-checked" case of [`LatestVerdict::Unverified`]: that state is the ordinary,
+/// transient window every dependency sits in before phase B first completes, and a new
+/// diagnostic on every up-to-date dependency during that window would be a broad noise
+/// regression — unlike the `Outdated` branch above, where `Unverified` only adjusts the
+/// wording of a diagnostic that was already firing regardless. See
+/// [`push_flagged_latest_admitted_by_requirement`]'s own doc for the narrower,
+/// persistent-check-failure case it still surfaces (issue #1533).
 fn push_flagged_latest_admitted_by_requirement(
     diagnostics: &mut Vec<Diagnostic>,
     ctx: &RuleContext<'_>,
     resolved: &ResolvedData<'_>,
     vuln_keys: Option<&crate::osv::VulnKeys>,
     latest: &str,
+    vulnerable_in_use: Option<&crate::osv::DependencyVulnerabilities>,
 ) {
-    let verdict = crate::lsp_helpers::latest_verdict(
-        ctx.versions.latest_status,
+    // Inlines `latest_verdict` (rather than calling it) to also keep the raw
+    // `UpgradeStatus` lookup around for `push_unverified_latest_check_failed` (issue #1533
+    // code-review finding 2) — re-running `resolve_latest_status` there would be a second,
+    // redundant lookup of the same map entry this function already resolved.
+    let (verdict, raw_status) = match ctx.versions.latest_status {
+        None => (LatestVerdict::NotApplicable, None),
+        Some(map) => {
+            let raw_status =
+                super::resolve_latest_status(map, ctx.dep, vuln_keys, ctx.normalized_name);
+            (
+                super::upgrade_status_to_verdict(raw_status, latest, ctx.dep, ctx.formatter),
+                raw_status,
+            )
+        }
+    };
+    match verdict {
+        LatestVerdict::Flagged {
+            advisory_ids,
+            malicious,
+        } => {
+            let severity = if malicious {
+                Severity::Error
+            } else {
+                Severity::Warning
+            };
+
+            if flagged_latest_duplicates_vulnerability_finding(
+                ctx,
+                latest,
+                severity,
+                vulnerable_in_use,
+            ) {
+                return;
+            }
+
+            let ids = if advisory_ids.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", advisory_ids.join(", "))
+            };
+            let latest = sanitize_and_truncate_for_diagnostic(latest, MAX_VERSION_DIAGNOSTIC_CHARS);
+            diagnostics.push(
+                Diagnostic::new(
+                    resolved.version_range,
+                    format!(
+                        "This requirement already admits {latest}{ids}, which OSV.dev flags as \
+                         vulnerable/malicious"
+                    ),
+                )
+                .with_severity(severity),
+            );
+        }
+        LatestVerdict::Unverified => {
+            push_unverified_latest_check_failed(diagnostics, resolved, raw_status, latest);
+        }
+        LatestVerdict::Verified | LatestVerdict::NotApplicable => {}
+    }
+}
+
+/// Issue #1532: whether R2 (`apply_vulnerability_rule`) already covered this exact finding at
+/// least as severely as this rule's own `would_be_severity` — the in-use version *is* the
+/// flagged `latest` a declared requirement admits, and `vulnerable_in_use` (R2's own resolved
+/// [`crate::osv::DependencyVulnerabilities`] for this dependency, threaded in by the caller
+/// rather than re-resolved here — code-review finding 3) is `Some`. In that case R2's
+/// per-advisory diagnostic on the same dependency is strictly more specific (individual
+/// advisory ids/severities vs. a generic "admits a flagged version" summary), so this rule's
+/// diagnostic would be pure duplication on the same range — **but only if it would not also
+/// downgrade the severity a user sees** (critic S1): R2's severity is capped at
+/// [`Severity::Warning`] by [`diagnostic_severity_for`] even for a
+/// [`crate::osv::VulnSeverity::Malicious`] advisory, while this rule's own severity for
+/// `malicious` is [`Severity::Error`] — deduping unconditionally there would silently drop a
+/// malicious finding from Error to Warning. Uses [`Severity`]'s own `Ord` (declaration order:
+/// `Error` most severe) rather than a hand-rolled rank (code-review finding 1).
+///
+/// Conservative by construction: with no `ecosystem` to resolve the in-use version against
+/// (a handful of test fixtures and pre-#394 call sites), or no advisories to compare a
+/// severity against, this returns `false` — the diagnostic still fires, matching this rule's
+/// pre-#1532 behavior, rather than risk hiding or downgrading a real finding on an unprovable
+/// guess.
+fn flagged_latest_duplicates_vulnerability_finding(
+    ctx: &RuleContext<'_>,
+    latest: &str,
+    would_be_severity: Severity,
+    vulnerable_in_use: Option<&crate::osv::DependencyVulnerabilities>,
+) -> bool {
+    let Some(dv) = vulnerable_in_use else {
+        return false;
+    };
+    let Some(ecosystem) = ctx.versions.ecosystem else {
+        return false;
+    };
+    let in_use_version = super::resolve_in_use_version(
         ctx.dep,
-        vuln_keys,
         ctx.normalized_name,
-        latest,
+        ctx.versions.resolved,
+        ctx.versions.resolved_version_candidates,
         ctx.formatter,
+        ecosystem,
     );
-    let LatestVerdict::Flagged {
-        advisory_ids,
-        malicious,
-    } = verdict
-    else {
+    if in_use_version.as_deref() != Some(latest) {
+        return false;
+    }
+    let Some(worst_advisory) = dv.advisories_for_display().items().first().map(Arc::clone) else {
+        return false;
+    };
+    diagnostic_severity_for(worst_advisory.severity) <= would_be_severity
+}
+
+/// Issue #1533: surfaces a *persistent* OSV check failure for a requirement's admitted
+/// `latest`, distinct from the ordinary "not yet checked" window
+/// [`push_flagged_latest_admitted_by_requirement`] otherwise stays silent for.
+///
+/// [`LatestVerdict::Unverified`] collapses two different causes: "not yet checked at all" (no
+/// map entry, or [`UpgradeStatus::NotChecked`] — transient, clears on phase B's very first
+/// run) and "checked, and the check itself failed"
+/// ([`UpgradeStatus::CandidateUnverified`] with a non-structural [`SkipReason`], e.g.
+/// [`SkipReason::QueryFailed`]). The second case persists until the *next* phase B run
+/// succeeds, not just until the current one finishes — a dependency whose OSV check
+/// genuinely failed (network issue, OSV.dev outage) could otherwise show a plain "up to
+/// date" checkmark indefinitely with no user-visible signal the check never actually
+/// succeeded. Surfaced at [`Severity::Hint`], distinct from the [`LatestVerdict::Flagged`]
+/// diagnostic's warning/error severity, so it never competes for attention with a confirmed
+/// finding.
+///
+/// A structural [`SkipReason`] (e.g. [`SkipReason::UnmappableName`]) already resolves to
+/// [`LatestVerdict::NotApplicable`], not `Unverified` (see `upgrade_status_to_verdict`) — so by
+/// construction, `raw_status`'s `reason` here can never be structural (this function is only
+/// ever called from the `LatestVerdict::Unverified` arm; code-review finding 2 removed the
+/// now-provably-dead `is_structural` guard that used to sit here).
+///
+/// `raw_status` is the caller's already-resolved [`UpgradeStatus`] lookup (code-review finding
+/// 2), not re-resolved here — the caller needs it anyway to compute `verdict` before choosing
+/// this branch.
+///
+/// Requires `CandidateUnverified.version == latest` (issue #1533 critic S2): a stored entry
+/// only ever describes the exact version phase B attempted, so a stale entry left over from a
+/// previous phase B run — from before the requirement's admitted `latest` changed — must not
+/// be reported as a failed check for the *current* `latest`. A version mismatch here is really
+/// the ordinary "not yet checked" case for the current `latest` and stays silent, same as an
+/// absent map entry.
+fn push_unverified_latest_check_failed(
+    diagnostics: &mut Vec<Diagnostic>,
+    resolved: &ResolvedData<'_>,
+    raw_status: Option<&UpgradeStatus>,
+    latest: &str,
+) {
+    let Some(UpgradeStatus::CandidateUnverified { version, reason }) = raw_status else {
+        return;
+    };
+    if version != latest {
+        return;
+    }
+    let Some(clause) = reason.unchecked_reason() else {
         return;
     };
 
-    let ids = if advisory_ids.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", advisory_ids.join(", "))
-    };
     let latest = sanitize_and_truncate_for_diagnostic(latest, MAX_VERSION_DIAGNOSTIC_CHARS);
-    let severity = if malicious {
-        Severity::Error
-    } else {
-        Severity::Warning
-    };
     diagnostics.push(
         Diagnostic::new(
             resolved.version_range,
             format!(
-                "This requirement already admits {latest}{ids}, which OSV.dev flags as \
-                 vulnerable/malicious"
+                "This requirement already admits {latest}; whether it is safe could not be \
+                 confirmed because {clause}"
             ),
         )
-        .with_severity(severity),
+        .with_severity(Severity::Hint),
     );
 }
 
@@ -2518,6 +2665,7 @@ fn apply_outdated_rule(
     ctx: &RuleContext<'_>,
     resolved: &ResolvedData<'_>,
     vuln_keys: Option<&crate::osv::VulnKeys>,
+    vulnerable_in_use: Option<&crate::osv::DependencyVulnerabilities>,
 ) {
     let dep = ctx.dep;
     let package_versions = resolved.package_versions;
@@ -2538,6 +2686,7 @@ fn apply_outdated_rule(
                 resolved,
                 vuln_keys,
                 latest.as_str(),
+                vulnerable_in_use,
             );
         }
         return;
@@ -6409,6 +6558,559 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
         assert!(diagnostics[0].message().contains("already admits"));
+    }
+
+    /// Issue #1532: the in-use (lockfile-resolved) version is itself the flagged `latest` a
+    /// declared requirement admits — R2 (`apply_vulnerability_rule`) already emits the more
+    /// specific advisory diagnostic for that same dependency, so R7's admits-flagged-latest
+    /// diagnostic must not duplicate it. Non-malicious case: R7 would be `Warning`, and R2's
+    /// `High`-severity advisory also renders `Warning` (`diagnostic_severity_for`), so R2's
+    /// severity is at least as severe as R7's and dedup applies — critic S1: the surviving
+    /// diagnostic's severity must be checked explicitly, not just its presence.
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_flagged_dedups_when_r2_severity_covers_r7()
+     {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
+        };
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "^1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "feed-widget-helper".into(),
+            PackageVersions {
+                latest: "1.0.8".into(),
+                available: Arc::from(vec!["1.0.8".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+            },
+        );
+        // The lock file resolves this dependency to exactly the flagged `latest`.
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(PackageName::new("feed-widget-helper"), "1.0.8".into());
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
+                worst_severity: Some(VulnSeverity::High),
+            },
+        );
+
+        let mut vulnerabilities: VulnerabilityMap = VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(vec![sample_advisory("GHSA-xxxx", VulnSeverity::High)], 1),
+                fix_target_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status)
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(EcosystemId::Npm),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(
+            diagnostics.len(),
+            1,
+            "R2's advisory diagnostic alone, not duplicated by R7: {diagnostics:?}"
+        );
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(Severity::Warning),
+            "R2's own severity must be preserved, not silently changed by dedup: {diagnostics:?}"
+        );
+        assert!(diagnostics[0].message().contains("GHSA-xxxx"));
+        assert!(
+            !diagnostics[0].message().contains("already admits"),
+            "R7's admits-flagged-latest wording must not also appear: {}",
+            diagnostics[0].message()
+        );
+    }
+
+    /// Sibling negative case (critic S1): a `Malicious` finding renders R7 at `Error`, but R2's
+    /// own severity is capped at `Warning` by `diagnostic_severity_for` even for a `Malicious`
+    /// advisory. Deduping here would silently downgrade the user-visible severity from Error to
+    /// Warning, not just change the wording — so dedup must not apply, and both diagnostics
+    /// (R2's Warning advisory finding and R7's Error admits-flagged-latest finding) must fire.
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_flagged_keeps_both_when_r2_severity_is_lower()
+     {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
+        };
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "^1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "feed-widget-helper".into(),
+            PackageVersions {
+                latest: "1.0.8".into(),
+                available: Arc::from(vec!["1.0.8".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+            },
+        );
+        // The lock file resolves this dependency to exactly the flagged `latest`.
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(PackageName::new("feed-widget-helper"), "1.0.8".into());
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+
+        let mut vulnerabilities: VulnerabilityMap = VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![sample_advisory("MAL-2026-16332", VulnSeverity::Malicious)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status)
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(EcosystemId::Npm),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let r2_diag = diagnostics
+            .iter()
+            .find(|d| {
+                d.message().contains("MAL-2026-16332") && !d.message().contains("already admits")
+            })
+            .expect("R2's advisory finding must still fire");
+        assert_eq!(r2_diag.severity, Some(Severity::Warning));
+
+        let r7_diag = diagnostics
+            .iter()
+            .find(|d| d.message().contains("already admits"))
+            .expect("R7's finding must not be suppressed — it carries the stronger Error severity");
+        assert_eq!(
+            r7_diag.severity,
+            Some(Severity::Error),
+            "the malicious finding's Error severity must not be silently downgraded to Warning"
+        );
+    }
+
+    /// Sibling to the dedup test above: when the in-use version is *not* the flagged `latest`
+    /// (e.g. an older, separately-vulnerable pinned version), R2's finding is about a different
+    /// version than R7's — both diagnostics are genuine and must both fire.
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_flagged_keeps_both_when_in_use_differs()
+    {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, UpgradeStatus,
+            VulnSeverity, VulnerabilityMap,
+        };
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "^1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "feed-widget-helper".into(),
+            PackageVersions {
+                latest: "1.0.8".into(),
+                available: Arc::from(vec!["1.0.8".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+            },
+        );
+        // The lock file resolves this dependency to an older version than the flagged latest.
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(PackageName::new("feed-widget-helper"), "1.0.4".into());
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+
+        let mut vulnerabilities: VulnerabilityMap = VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status)
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(EcosystemId::Npm),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message().contains("RUSTSEC-2020-0071")),
+            "R2's finding on the in-use version must still fire: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message().contains("already admits")),
+            "R7's finding on the flagged latest must still fire too: {diagnostics:?}"
+        );
+    }
+
+    /// Issue #1533: a persistent OSV check failure ([`UpgradeStatus::CandidateUnverified`] with
+    /// a non-structural [`SkipReason`], e.g. [`SkipReason::QueryFailed`]) on an already-admitted
+    /// `latest` must surface at [`Severity::Hint`] — distinct from the ordinary "not yet
+    /// checked" window, which stays silent (see the sibling tests below).
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_query_failed_surfaces_hint() {
+        use crate::osv::{LatestStatusMap, SkipReason, UpgradeStatus};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateUnverified {
+                version: "1.5.0".to_string(),
+                reason: SkipReason::QueryFailed,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Some(Severity::Hint));
+        assert!(diagnostics[0].message().contains("already admits"));
+        assert!(diagnostics[0].message().contains("1.5.0"));
+        assert!(
+            diagnostics[0].message().contains("OSV.dev query failed"),
+            "got: {}",
+            diagnostics[0].message()
+        );
+    }
+
+    /// Issue #1533 critic S2: a `CandidateUnverified` entry only describes the exact version
+    /// phase B attempted. A stale entry left over from a *previous* phase B run — recorded for
+    /// an older `latest` before the requirement's admitted `latest` changed — must not be
+    /// reported as a failed check for the *current* `latest`; that would be misleading (the
+    /// current `latest` was never actually attempted at all, which is the ordinary "not yet
+    /// checked" case, not a persistent failure).
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_stale_query_failed_entry_stays_silent()
+    {
+        use crate::osv::{LatestStatusMap, SkipReason, UpgradeStatus};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        // The registry now reports a newer `latest` than the stale entry below describes.
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.6.0"));
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateUnverified {
+                // Stale: describes a previous phase B run's `latest`, not the current one.
+                version: "1.5.0".to_string(),
+                reason: SkipReason::QueryFailed,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// Tester gap 1: the in-use (lockfile-resolved) version is independently vulnerable (R2
+    /// fires) while the *separate* `latest` OSV check failed (R7's #1533 Hint fires) — the two
+    /// diagnostics are genuinely independent claims about two different versions on the same
+    /// range, so both must fire undeduped (#1532's dedup only applies to `LatestVerdict::Flagged`,
+    /// never to `Unverified`).
+    #[test]
+    fn test_generate_diagnostics_up_to_date_vulnerable_in_use_and_unverified_latest_both_fire() {
+        use crate::osv::{
+            Capped, DependencyVulnerabilities, LatestStatusMap, ScanOutcome, SkipReason,
+            UpgradeStatus, VulnSeverity, VulnerabilityMap,
+        };
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(PackageName::new("pkg"), "1.2.0".into());
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateUnverified {
+                version: "1.5.0".to_string(),
+                reason: SkipReason::QueryFailed,
+            },
+        );
+
+        let mut vulnerabilities: VulnerabilityMap = VulnerabilityMap::new();
+        vulnerabilities.insert(
+            crate::test_util::vuln_key("pkg"),
+            ScanOutcome::Vulnerable(DependencyVulnerabilities {
+                advisories: Capped::new(
+                    vec![sample_advisory("RUSTSEC-2020-0071", VulnSeverity::High)],
+                    1,
+                ),
+                fix_target_status: UpgradeStatus::NotChecked,
+            }),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status)
+                .with_vulnerabilities(&vulnerabilities)
+                .with_ecosystem(EcosystemId::Cargo),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message().contains("RUSTSEC-2020-0071")),
+            "R2's finding on the in-use version must fire: {diagnostics:?}"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.severity == Some(Severity::Hint)
+                    && d.message().contains("already admits")),
+            "R7's Hint on the separately-failed latest check must also fire: {diagnostics:?}"
+        );
+    }
+
+    /// Sibling negative case: the ordinary "not yet checked" window (no entry for this
+    /// dependency in `latest_status`, i.e. before phase B first completes) must stay silent —
+    /// the #1533 fix must not reintroduce noise on every up-to-date dependency during that
+    /// window.
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_not_yet_checked_stays_silent() {
+        use crate::osv::LatestStatusMap;
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        let resolved_versions = HashMap::new();
+        // Empty map, not `None`: the pre-phase-B window attaches `Some(&empty_map)`.
+        let latest_status = LatestStatusMap::new();
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    /// Sibling negative case: a structural [`SkipReason`] (e.g.
+    /// [`SkipReason::UnmappableName`]) resolves to [`LatestVerdict::NotApplicable`], not
+    /// `Unverified` — it must stay silent too, since it can never turn into a real check on a
+    /// later phase B run for this same dependency (unlike the transient case above).
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_structural_skip_stays_silent() {
+        use crate::osv::{LatestStatusMap, SkipReason, UpgradeStatus};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateUnverified {
+                version: "1.5.0".to_string(),
+                reason: SkipReason::UnmappableName,
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     /// Issue #1517 AC4: a `latest_status` map with no entry for this dependency (the

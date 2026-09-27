@@ -2,7 +2,6 @@
 
 use super::{DryRun, severity_str};
 use crate::report::CheckReport;
-use deps_core::diagnostic::Severity;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
@@ -34,13 +33,11 @@ pub fn render(report: &CheckReport) -> String {
 
     let mut out = String::new();
     for (path, mut findings) in by_file {
-        findings.sort_by_key(|f| {
-            (
-                severity_rank(f.severity),
-                f.range.start.line,
-                f.range.start.character,
-            )
-        });
+        // `Severity`'s own `Ord` (declaration order: `Error` most severe, `Hint` least)
+        // sorts error-first for free — issue #1532 code-review finding 1: this used to be a
+        // hand-rolled rank function that had drifted out of sync with an oppositely-signed
+        // one in `deps-core`.
+        findings.sort_by_key(|f| (f.severity, f.range.start.line, f.range.start.character));
         let _ = writeln!(out, "{}", path.display());
         for finding in findings {
             let dependency = finding.dependency_name.as_deref().unwrap_or("-");
@@ -66,16 +63,6 @@ pub fn render(report: &CheckReport) -> String {
     let _ = writeln!(out);
 
     out
-}
-
-/// Sort key for severity within one file's findings — error first, hint last.
-fn severity_rank(severity: Severity) -> u8 {
-    match severity {
-        Severity::Error => 0,
-        Severity::Warning => 1,
-        Severity::Information => 2,
-        Severity::Hint => 3,
-    }
 }
 
 /// Renders an `update` run's plan: one line per item (name, current, target, outcome,
@@ -143,6 +130,7 @@ mod tests {
     use super::*;
     use crate::report::{Category, CheckFinding};
     use deps_core::EcosystemId;
+    use deps_core::diagnostic::Severity;
     use deps_core::position::{Position, Range};
     use std::path::PathBuf;
 
