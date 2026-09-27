@@ -6,7 +6,9 @@
 pub mod ignore;
 pub mod security;
 
+use deps_core::ConcreteVersion;
 use deps_core::PackageName;
+use deps_core::VersionReq;
 use deps_core::edit::{
     EditSpan, ManifestEdit, ManifestReparse, UnplannableReason, UpdateCandidate, UpdateKind,
     apply_edits, classify_update, collect_update_candidates, dedup_overlapping_edits,
@@ -19,6 +21,100 @@ use std::collections::HashMap;
 
 use crate::analyze::ManifestAnalysis;
 use ignore::IgnoreRules;
+
+/// A dependency's "current" version for `deps-cli update`'s report.
+///
+/// Replaces the historical three-way `String`/`""` convention (issue #1593) with an
+/// exhaustive state, so an unresolved current version can no longer be silently confused with
+/// a resolved empty-string one.
+///
+/// # Examples
+///
+/// ```
+/// use deps_cli::update::CurrentVersion;
+/// use deps_core::ConcreteVersion;
+/// use deps_core::edit::UpdateKind;
+///
+/// let current = CurrentVersion::Resolved(ConcreteVersion::from("1.0.0"));
+/// assert_eq!(
+///     current.update_kind_to(&ConcreteVersion::from("2.0.0")),
+///     UpdateKind::Major
+/// );
+/// assert_eq!(
+///     CurrentVersion::Unknown.update_kind_to(&ConcreteVersion::from("2.0.0")),
+///     UpdateKind::Unknown
+/// );
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CurrentVersion {
+    /// A lockfile/registry-resolved in-use version.
+    Resolved(ConcreteVersion),
+    /// No in-use version could be resolved; falls back to the dependency's declared
+    /// requirement text (`--security-only` mode only — see `security`'s `security_current`).
+    Declared(VersionReq),
+    /// Neither a resolved in-use version nor a declared requirement was available.
+    Unknown,
+}
+
+impl From<Option<ConcreteVersion>> for CurrentVersion {
+    /// `Some` maps to [`Self::Resolved`], `None` to [`Self::Unknown`] — the default planner's
+    /// only two possible states (it never produces [`Self::Declared`]; only `--security-only`
+    /// does, via `security_current`).
+    fn from(value: Option<ConcreteVersion>) -> Self {
+        match value {
+            Some(version) => Self::Resolved(version),
+            None => Self::Unknown,
+        }
+    }
+}
+
+impl CurrentVersion {
+    /// Classifies the update from this current version to `target`.
+    ///
+    /// [`Self::Declared`] and [`Self::Unknown`] both classify as [`UpdateKind::Unknown`] —
+    /// behavior-identical to pre-#1593, though for two different reasons per variant: the
+    /// default planner (the only caller that ever classifies `current`) never produced
+    /// [`Self::Declared`] to begin with, and `--security-only` (the only caller that could)
+    /// never called [`classify_update`] on `current` at all before this refactor. Neither
+    /// caller's classification behavior changes; this method exists so a *future* caller
+    /// cannot classify a [`Self::Declared`] requirement range as if it were a resolved version.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_cli::update::CurrentVersion;
+    /// use deps_core::{ConcreteVersion, VersionReq};
+    /// use deps_core::edit::UpdateKind;
+    ///
+    /// let declared = CurrentVersion::Declared(VersionReq::new("^1.0"));
+    /// assert_eq!(
+    ///     declared.update_kind_to(&ConcreteVersion::from("2.0.0")),
+    ///     UpdateKind::Unknown
+    /// );
+    /// ```
+    #[must_use]
+    pub fn update_kind_to(&self, target: &ConcreteVersion) -> UpdateKind {
+        match self {
+            Self::Resolved(version) => classify_update(version.as_str(), target.as_str()),
+            Self::Declared(_) | Self::Unknown => UpdateKind::Unknown,
+        }
+    }
+
+    /// Renders this version for the `--format json`/`table` wire boundary — [`Self::Unknown`]
+    /// renders as an empty string, matching this field's pre-#1593 `""` convention.
+    ///
+    /// Deliberately not [`std::fmt::Display`] (issue #1593 critic M3): a `Display` impl invites
+    /// a caller to reach for `.to_string().is_empty()` as an `Unknown` check, reintroducing the
+    /// same stringly-typed comparison this type exists to remove. This method is the one
+    /// sanctioned render boundary, used by `format::json`/`format::table` only.
+    pub(crate) fn render_text(&self) -> String {
+        match self {
+            Self::Resolved(version) => version.to_string(),
+            Self::Declared(req) => req.as_str().to_string(),
+            Self::Unknown => String::new(),
+        }
+    }
+}
 
 /// One completed `update` run's per-dependency plan.
 #[derive(Debug, Clone, Default)]
@@ -46,11 +142,13 @@ impl UpdatePlan {
 pub struct PlannedUpdateItem {
     /// The dependency's declared (raw) name.
     pub name: String,
-    /// The version this dependency is currently pinned to (or its declared requirement text,
-    /// when no concrete in-use version could be resolved).
-    pub current: String,
+    /// The version this dependency is currently pinned to, its declared requirement text when
+    /// no concrete in-use version could be resolved, or [`CurrentVersion::Unknown`] when
+    /// neither is available.
+    pub current: CurrentVersion,
     /// The version this item's edit (when [`Self::outcome`] is [`Outcome::Applied`]) would
     /// move the dependency to — the target considered, even when no edit was written.
+    // TODO(critic): retype target's "" sentinel (follow-up issue)
     pub target: String,
     /// This item's disposition — the edit that would apply [`Self::target`] lives inside
     /// [`Outcome::Applied`] itself (#1349: folding it in here as a second, independently
@@ -107,11 +205,11 @@ pub enum CooldownFallbackNote {
 /// anything. `edit` no longer exists as a separate field, so that state fails to compile:
 ///
 /// ```compile_fail
-/// use deps_cli::update::{Outcome, PlannedUpdateItem};
+/// use deps_cli::update::{CurrentVersion, Outcome, PlannedUpdateItem};
 ///
 /// let item = PlannedUpdateItem {
 ///     name: "serde".to_string(),
-///     current: "1.0.0".to_string(),
+///     current: CurrentVersion::Unknown,
 ///     target: "1.2.0".to_string(),
 ///     outcome: Outcome::Applied,
 ///     edit: None,
@@ -239,7 +337,7 @@ impl PlannedUpdateItem {
     )]
     pub fn new(
         name: String,
-        current: String,
+        current: CurrentVersion,
         target: String,
         outcome: Outcome,
         advisory_ids: Vec<String>,
@@ -773,10 +871,13 @@ fn candidate_identity(candidate: &UpdateCandidate) -> (String, deps_core::positi
 /// `(current, target)` for a `WithinFreshnessCooldown`/`NotRequested` item built directly from
 /// the latest view — a `Planned` candidate carries both; an `Unplannable` one carries neither
 /// (matches this planner's pre-#1543 convention for an item with no concrete write target).
-fn latest_current_target(candidate: &UpdateCandidate) -> (String, String) {
+fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, String) {
     match candidate {
-        UpdateCandidate::Planned(p) => (p.current.clone(), p.target.to_string()),
-        UpdateCandidate::Unplannable { .. } => (String::new(), String::new()),
+        UpdateCandidate::Planned(p) => (
+            CurrentVersion::from(p.current.clone()),
+            p.target.to_string(),
+        ),
+        UpdateCandidate::Unplannable { .. } => (CurrentVersion::Unknown, String::new()),
     }
 }
 
@@ -789,15 +890,16 @@ fn latest_current_target(candidate: &UpdateCandidate) -> (String, String) {
 fn resolve_from_latest(
     latest_candidate: UpdateCandidate,
     ignore_rules: &IgnoreRules,
-) -> (String, String, Outcome, Vec<String>) {
+) -> (CurrentVersion, String, Outcome, Vec<String>) {
     match latest_candidate {
         UpdateCandidate::Planned(p) => {
             let target = p.target.to_string();
-            let kind = classify_update(&p.current, &target);
+            let current = CurrentVersion::from(p.current);
+            let kind = current.update_kind_to(&p.target);
             if let Some(reason) = ignore_rules.skip_reason(&p.normalized_name, kind) {
-                (p.current, target, Outcome::Skipped(reason), Vec::new())
+                (current, target, Outcome::Skipped(reason), Vec::new())
             } else {
-                (p.current, target, Outcome::Applied(p.edit), Vec::new())
+                (current, target, Outcome::Applied(p.edit), Vec::new())
             }
         }
         UpdateCandidate::Unplannable {
@@ -812,7 +914,7 @@ fn resolve_from_latest(
             } else {
                 Outcome::Skipped(SkipReason::NotSafelyEditable(reason))
             };
-            (String::new(), String::new(), outcome, Vec::new())
+            (CurrentVersion::Unknown, String::new(), outcome, Vec::new())
         }
     }
 }
@@ -883,7 +985,7 @@ fn resolve_occurrence(
     let gossip_excluded = gossip_excluded_version(analysis, &normalized_name, &name);
     let fallback_candidate = fallback_by_key.remove(&key);
 
-    let build = |current: String,
+    let build = |current: CurrentVersion,
                  target: String,
                  outcome: Outcome,
                  advisory_ids: Vec<String>,
@@ -1037,10 +1139,11 @@ fn resolve_occurrence(
                         // the SELECTED (fallback) target unconditionally, regardless of
                         // whether latest is OSV-blocked — previously row 7 wrote the fallback
                         // edit without ever consulting `[update].ignore`.
-                        let kind = classify_update(&fb.current, fb.target.as_str());
+                        let current = CurrentVersion::from(fb.current);
+                        let kind = current.update_kind_to(&fb.target);
                         if let Some(reason) = ignore_rules.skip_reason(&fb.normalized_name, kind) {
                             build(
-                                fb.current,
+                                current,
                                 fb.target.to_string(),
                                 Outcome::Skipped(reason),
                                 Vec::new(),
@@ -1061,7 +1164,7 @@ fn resolve_occurrence(
                                     )
                                 });
                             build(
-                                fb.current,
+                                current,
                                 fb.target.to_string(),
                                 Outcome::Applied(fb.edit),
                                 advisory_ids,
@@ -1070,7 +1173,7 @@ fn resolve_occurrence(
                         } else {
                             // Row 9: the ordinary cooldown-fallback substitution.
                             build(
-                                fb.current,
+                                current,
                                 fb.target.to_string(),
                                 Outcome::Applied(fb.edit),
                                 Vec::new(),
@@ -1113,7 +1216,7 @@ fn resolve_occurrence(
                         // current/target pair here either, the same fail-closed
                         // `UpdateKind::Unknown` treatment applies).
                         build(
-                            String::new(),
+                            CurrentVersion::Unknown,
                             String::new(),
                             Outcome::Skipped(rule_reason),
                             Vec::new(),
@@ -1303,6 +1406,18 @@ mod tests {
 
     const STUB_FORMATTER: deps_core::test_util::StubFormatter =
         deps_core::test_util::StubFormatter::new().with_package_url_prefix("");
+
+    /// Issue #1593 critic M5: a `Declared` current version must never classify as anything
+    /// but `Unknown` — guards against a future caller feeding it into a classification path
+    /// (e.g. `ignore_rules.skip_reason`) that starts treating a declared range as comparable.
+    #[test]
+    fn test_current_version_declared_update_kind_is_always_unknown() {
+        let declared = CurrentVersion::Declared(deps_core::VersionReq::new("^1.0"));
+        assert_eq!(
+            declared.update_kind_to(&ConcreteVersion::from("2.0.0")),
+            UpdateKind::Unknown
+        );
+    }
 
     struct TestDep {
         name: PackageName,
@@ -2183,7 +2298,7 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
-                current: "1.0.0".to_string(),
+                current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
                 target: "1.2.0".to_string(),
                 outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
@@ -2218,7 +2333,7 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
-                current: "1.0.0".to_string(),
+                current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
                 target: "1.2.0".to_string(),
                 outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
@@ -2253,7 +2368,7 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
-                current: "1.0.0".to_string(),
+                current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
                 target: "1.2.0".to_string(),
                 outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
@@ -2288,7 +2403,7 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
-                current: "1.0.0".to_string(),
+                current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
                 target: "1.2.0".to_string(),
                 outcome: Outcome::Skipped(SkipReason::IgnoreRule),
                 advisory_ids: Vec::new(),
@@ -2317,7 +2432,7 @@ mod tests {
     fn applied_item(name: &str, range: Range) -> PlannedUpdateItem {
         PlannedUpdateItem {
             name: name.to_string(),
-            current: "1.0.0".to_string(),
+            current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
             target: "1.2.0".to_string(),
             outcome: Outcome::Applied(ManifestEdit {
                 range,
