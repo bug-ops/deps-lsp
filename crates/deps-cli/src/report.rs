@@ -1565,6 +1565,7 @@ mod tests {
             vulnerabilities: None,
             latest_status: None,
             fallback_status: None,
+            cooldown_fallback_view: None,
             gossip_findings,
             licenses: HashMap::new(),
             license_policy: deps_core::licenses::LicensePolicy::default(),

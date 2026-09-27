@@ -175,13 +175,86 @@ pub enum CooldownDisposition<'a> {
     },
 }
 
+/// Outcome of [`cooldown_precedence`]: whether a single version is currently blocked by the
+/// freshness cooldown, and by what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CooldownPrecedence {
+    /// Not blocked (no active GOSSIP verdict, or a past one; no active local heuristic result).
+    Cleared,
+    /// Currently blocked, and by what.
+    Blocked(CooldownBlocker),
+}
+
+/// The GOSSIP-vs-local cooldown precedence rule for a single `(name, version)` pair.
+///
+/// An authoritative GOSSIP verdict wins outright, and only when GOSSIP has none does the local
+/// `freshness.cooldown_secs`/`published_at` heuristic apply.
+///
+/// Extracted from [`cooldown_disposition`] (spec 075 FR-004) so `deps-engine`'s fetch-time
+/// fallback-candidate search (`compute_cooldown_fallback`) can share the exact same rule
+/// without first needing a full [`PackageVersions`] — that type doesn't exist yet at fetch
+/// time for any version other than the one being classified (issue #1551).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{CooldownPrecedence, cooldown_precedence};
+/// use deps_core::{PackageName, PublishTime};
+///
+/// let cleared = cooldown_precedence(
+///     None,
+///     &PackageName::new("left-pad"),
+///     "2.0.0",
+///     Some(PublishTime::from_unix_secs(1_000)),
+///     500,
+///     PublishTime::from_unix_secs(2_000),
+/// );
+/// assert_eq!(cleared, CooldownPrecedence::Cleared);
+///
+/// let blocked = cooldown_precedence(
+///     None,
+///     &PackageName::new("left-pad"),
+///     "2.0.0",
+///     Some(PublishTime::from_unix_secs(1_000)),
+///     5_000,
+///     PublishTime::from_unix_secs(2_000),
+/// );
+/// assert!(matches!(blocked, CooldownPrecedence::Blocked(_)));
+/// ```
+#[must_use]
+pub fn cooldown_precedence(
+    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
+    name: &PackageName,
+    version: &str,
+    published_at: Option<PublishTime>,
+    cooldown_secs: u64,
+    now: PublishTime,
+) -> CooldownPrecedence {
+    match gossip_cooldown_for(gossip_prefetch, name, version, now) {
+        GossipCooldownLookup::Active => CooldownPrecedence::Blocked(CooldownBlocker::Gossip),
+        GossipCooldownLookup::NotActive => CooldownPrecedence::Cleared,
+        GossipCooldownLookup::Unavailable => match published_at {
+            Some(published_at)
+                if crate::freshness::is_within_cooldown(
+                    published_at.age_secs_from(now),
+                    cooldown_secs,
+                ) =>
+            {
+                CooldownPrecedence::Blocked(CooldownBlocker::Local { published_at })
+            }
+            _ => CooldownPrecedence::Cleared,
+        },
+    }
+}
+
 /// Evaluates, at read time, whether [`PackageVersions::latest`] is blocked by the freshness
 /// cooldown and whether a stored [`PackageVersions::cooldown_fallback`] candidate is available.
 ///
 /// Spec 075 FR-004's single precedence function, shared by `apply_outdated_rule`
 /// (check/diagnostics wording) and `deps-cli update`'s planner so the two commands can no
 /// longer disagree (spec 075 NFR-001 steps 0-4; OSV verification is deliberately NOT this
-/// function's job — see spec 075 FR-010/FR-011).
+/// function's job — see spec 075 FR-010/FR-011). The GOSSIP-vs-local precedence itself is
+/// [`cooldown_precedence`]; this function adds the read-time fallback re-evaluation on top.
 ///
 /// # Examples
 ///
@@ -245,26 +318,16 @@ pub fn cooldown_disposition<'a>(
         )
     });
 
-    match gossip_cooldown_for(gossip_prefetch, name, versions.latest.as_str(), now) {
-        GossipCooldownLookup::Active => CooldownDisposition::Blocked {
-            by: CooldownBlocker::Gossip,
-            fallback,
-        },
-        GossipCooldownLookup::NotActive => CooldownDisposition::Cleared,
-        GossipCooldownLookup::Unavailable => match versions.published_at {
-            Some(published_at)
-                if crate::freshness::is_within_cooldown(
-                    published_at.age_secs_from(now),
-                    freshness.cooldown_secs,
-                ) =>
-            {
-                CooldownDisposition::Blocked {
-                    by: CooldownBlocker::Local { published_at },
-                    fallback,
-                }
-            }
-            _ => CooldownDisposition::Cleared,
-        },
+    match cooldown_precedence(
+        gossip_prefetch,
+        name,
+        versions.latest.as_str(),
+        versions.published_at,
+        freshness.cooldown_secs,
+        now,
+    ) {
+        CooldownPrecedence::Cleared => CooldownDisposition::Cleared,
+        CooldownPrecedence::Blocked(by) => CooldownDisposition::Blocked { by, fallback },
     }
 }
 

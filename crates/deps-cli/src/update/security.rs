@@ -62,6 +62,7 @@ const OSV_CHECK_TIMEOUT_CEILING_SECS: u64 = 30;
 ///     vulnerabilities: None,
 ///     latest_status: None,
 ///     fallback_status: None,
+///     cooldown_fallback_view: None,
 ///     gossip_findings: HashMap::new(),
 ///     licenses: HashMap::new(),
 ///     license_policy: deps_core::licenses::LicensePolicy::default(),
@@ -356,18 +357,19 @@ fn classify_vulnerable_dependency(
         &version_native,
         formatter,
     ) {
-        Ok(planned) => PlannedUpdateItem {
-            name: dep.name().as_str().to_string(),
+        // FR-014: `--security-only`'s fix target comes from the advisory, never a
+        // GOSSIP-filtered registry `latest` (issue #1521 item 1) — `gossip_excluded_version`
+        // and `cooldown_fallback` both stay `None` (PlannedUpdateItem::new's defaults).
+        Ok(planned) => PlannedUpdateItem::new(
+            dep.name().as_str().to_string(),
             current,
-            target: version_native,
-            outcome: Outcome::Applied(planned.edit),
-            advisory_ids: fix.advisory_ids,
+            version_native,
+            Outcome::Applied(planned.edit),
+            fix.advisory_ids,
             ignore_rule_overridden,
-            // FR-014: `--security-only`'s fix target comes from the advisory, never a
-            // GOSSIP-filtered registry `latest` (issue #1521 item 1).
-            gossip_excluded_version: None,
-            cooldown_fallback: None,
-        },
+            None,
+            None,
+        ),
         // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
         // forward to the fix target — see `requirement_already_resolves_to`'s and
         // `NuGetFormatter`'s doc for why this is not simply "the requirement admits the fix")
@@ -431,16 +433,16 @@ fn skipped_not_requested(
     )
     .or_else(|| dep.version_requirement().map(|r| r.as_str().to_string()))
     .unwrap_or_default();
-    PlannedUpdateItem {
-        name: dep.name().as_str().to_string(),
+    PlannedUpdateItem::new(
+        dep.name().as_str().to_string(),
         current,
-        target: String::new(),
-        outcome: Outcome::Skipped(crate::update::SkipReason::NotRequested),
-        advisory_ids: Vec::new(),
-        ignore_rule_overridden: false,
-        gossip_excluded_version: None,
-        cooldown_fallback: None,
-    }
+        String::new(),
+        Outcome::Skipped(crate::update::SkipReason::NotRequested),
+        Vec::new(),
+        false,
+        None,
+        None,
+    )
 }
 
 fn unfixable_item(
@@ -449,16 +451,16 @@ fn unfixable_item(
     reason: UnfixableReason,
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
-    PlannedUpdateItem {
-        name: dep.name().as_str().to_string(),
-        current: current.to_string(),
-        target: String::new(),
-        outcome: Outcome::Unfixable(reason),
-        advisory_ids: Vec::new(),
+    PlannedUpdateItem::new(
+        dep.name().as_str().to_string(),
+        current.to_string(),
+        String::new(),
+        Outcome::Unfixable(reason),
+        Vec::new(),
         ignore_rule_overridden,
-        gossip_excluded_version: None,
-        cooldown_fallback: None,
-    }
+        None,
+        None,
+    )
 }
 
 fn requires_lockfile_update_item(
@@ -468,16 +470,16 @@ fn requires_lockfile_update_item(
     advisory_ids: &[String],
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
-    PlannedUpdateItem {
-        name: dep.name().as_str().to_string(),
-        current: current.to_string(),
-        target: target.to_string(),
-        outcome: Outcome::RequiresLockfileUpdate,
-        advisory_ids: advisory_ids.to_vec(),
+    PlannedUpdateItem::new(
+        dep.name().as_str().to_string(),
+        current.to_string(),
+        target.to_string(),
+        Outcome::RequiresLockfileUpdate,
+        advisory_ids.to_vec(),
         ignore_rule_overridden,
-        gossip_excluded_version: None,
-        cooldown_fallback: None,
-    }
+        None,
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -637,6 +639,7 @@ mod tests {
             vulnerabilities: None,
             latest_status: None,
             fallback_status: None,
+            cooldown_fallback_view: None,
             gossip_findings: HashMap::new(),
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
