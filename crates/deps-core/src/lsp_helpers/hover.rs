@@ -382,7 +382,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     //
     // Keys on `resolve_in_use_version`, not the weaker `resolved` the Current/Requirement line
     // uses — it adds a `concrete_pin_version` fallback for an exact pin with no lock file.
-    let in_use_version_str: Option<String> = versions.ecosystem.and_then(|ecosystem| {
+    let in_use_version: Option<ConcreteVersion> = versions.ecosystem.and_then(|ecosystem| {
         resolve_in_use_version(
             dep,
             normalized_name.as_str(),
@@ -396,7 +396,10 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // further down — both must agree, or the shortcut can miss a version the lookup found
     // (round 3 M1 regression: comparing against the weaker `resolved` reintroduced S1's
     // spurious "unavailable" note).
-    let resolved_key: Option<&str> = in_use_version_str.as_deref().or(resolved);
+    let resolved_key: Option<&str> = in_use_version
+        .as_ref()
+        .map(ConcreteVersion::as_str)
+        .or(resolved);
     let license_source = versions.license_source.unwrap_or_default();
     // `normalize_tag` on both sides, not `==` (#664 S1): a bare pin with no `v` (Composer's
     // `"8.1.6"`) must still match a `v`-prefixed registry tag, and vice versa.
@@ -568,7 +571,7 @@ fn spawn_trust_signal_fetch(
         let client = Arc::clone(client);
         let name = dep.name().as_str().to_string();
         Some(tokio::spawn(async move {
-            client.trust_signal(system, &name, &version).await
+            client.trust_signal(system, &name, version.as_str()).await
         }))
     })
 }
@@ -609,7 +612,7 @@ fn spawn_gossip_low_usage_fetch(
         let name = dep.name().as_str().to_string();
         Some(tokio::spawn(async move {
             client
-                .gossip_findings_for_version(system, &name, &version)
+                .gossip_findings_for_version(system, &name, version.as_str())
                 .await
         }))
     })
@@ -2811,7 +2814,7 @@ mod tests {
     /// shortcut MUST use the same `resolve_in_use_version`-derived key the resolved-license
     /// lookup itself used, not the weaker bare `resolved`. An earlier draft compared
     /// the shortcut against `resolved` (which stays `None` here — no lock-file entry
-    /// matches an exact `=4.19.2` pin) while the lookup used `in_use_version_str`
+    /// matches an exact `=4.19.2` pin) while the lookup used `in_use_version`
     /// (which resolves the pin via `concrete_pin_version`): the mismatch made the
     /// shortcut miss, falling through to the empty-by-default native-list branch and
     /// re-introducing S1's spurious "(latest version license unavailable)" note right

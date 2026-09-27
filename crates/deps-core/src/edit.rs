@@ -898,6 +898,7 @@ pub fn collect_update_candidates(
                     ecosystem,
                 )
             })
+            .map(ConcreteVersion::into_string)
             .unwrap_or_default();
 
         candidates.push(UpdateCandidate::Planned(PlannedUpdate {

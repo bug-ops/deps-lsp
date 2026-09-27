@@ -199,7 +199,7 @@ pub fn tier3_license_targets(
                 formatter,
                 ecosystem_id,
             )?;
-            Some((d.name().clone(), version))
+            Some((d.name().clone(), version.into_string()))
         })
         .filter(|target| seen.insert(target.clone()))
         .collect()

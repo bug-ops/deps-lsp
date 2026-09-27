@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::edit::{VulnFixSkip, plan_verified_fix, resolve_verified_fix};
 use deps_core::lsp_helpers::{resolve_in_use_version, resolve_scan_outcome};
@@ -256,6 +257,7 @@ fn classify_vulnerable_dependency(
         formatter,
         ecosystem_id,
     )
+    .map(ConcreteVersion::into_string)
     .or_else(|| dep.version_requirement().map(|r| r.as_str().to_string()))
     .unwrap_or_default();
     let ignore_rule_overridden = ignore_override(ignore_rules, normalized_name);
@@ -485,6 +487,7 @@ fn skipped_not_requested(
         formatter,
         ecosystem_id,
     )
+    .map(ConcreteVersion::into_string)
     .or_else(|| dep.version_requirement().map(|r| r.as_str().to_string()))
     .unwrap_or_default();
     PlannedUpdateItem::new(
