@@ -74,8 +74,9 @@ pub use diagnostics::requirement_is_oversized;
 #[cfg(feature = "lsp-responses")]
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
-    DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming, PackageNaming,
-    PackageRendering, RequirementResolution, SourcePolicy,
+    BareMeaning, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming,
+    PackageNaming, PackageRendering, RequirementResolution, RequirementRewriteShape, SourcePolicy,
+    classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
 };
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, TagIndex, byte_span_to_range, is_full_sha,

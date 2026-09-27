@@ -9,7 +9,7 @@ use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
-    requirement_contains_template_placeholder,
+    requirement_contains_template_placeholder, requirement_is_compound,
 };
 
 /// Whether every character of `name` is in RubyGems' gem-name charset
@@ -134,8 +134,13 @@ fn exact_pin_version(requirement: &str) -> Option<&str> {
     // pin, even when its first constraint looks like one — without this guard, a bare-pin
     // first constraint followed by another fell through to the `is_range_op` check below,
     // which only inspects the leading operator, and returned the whole comma-joined string as
-    // if it were one version.
-    if req.is_empty() || req == "*" || req.contains(',') {
+    // if it were one version. Shares the same multi-comparator detector (`requirement_is_compound`
+    // — comma-, `||`-, or whitespace-joined) `deps-cargo`'s and `deps-npm`'s rewrite-shape
+    // classification use (#1577) — RubyGems' bare (exact-pin) `=` semantics mean this crate's
+    // own `format_version_replacing_for` above (unlike Cargo's) never needs to REFUSE a rewrite
+    // for this shape, only detect it for this pin/yanked classification, so only the detection
+    // primitive is shared here, not the refusal policy.
+    if req.is_empty() || req == "*" || requirement_is_compound(req) {
         return None;
     }
     if let Some(rest) = req.strip_prefix('=') {

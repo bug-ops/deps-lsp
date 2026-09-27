@@ -202,6 +202,293 @@ pub trait PackageRendering: Send + Sync {
     }
 }
 
+/// Whether a "no operator" (bare) version-requirement string means an auto-following range or
+/// an exact pin.
+///
+/// This is the axis [`format_version_replacing_by_shape`] needs to decide whether a
+/// bounded/compound/wildcard requirement can be safely collapsed to a bare version. It is NOT
+/// the same question as [`RequirementRewriteShape`] answers: that type classifies
+/// a requirement's own *syntax* (does it have an operator, is it a range); this type answers
+/// what the *absence* of an operator means for a given ecosystem, which is not universal — the
+/// #1576/impl-critic finding that motivated this type was exactly the bug of assuming Cargo's
+/// bare-means-caret convention held for npm/Dart too, when their bare-means-exact-pin
+/// convention makes every "collapse to bare" rewrite a narrowing, never a widening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BareMeaning {
+    /// A bare version auto-follows compatible future releases (Cargo's implicit `^`) — so
+    /// replacing a bounded requirement ([`RequirementRewriteShape::SingleBound`],
+    /// [`RequirementRewriteShape::PartialWildcard`], [`RequirementRewriteShape::Compound`])
+    /// with a bare version WIDENS what it accepts, and must be refused.
+    Caret,
+    /// A bare version means exactly that version and nothing else (npm/node-semver, Dart's pub
+    /// constraint grammar, RubyGems) — so replacing any bounded requirement with a bare
+    /// version NARROWS (or leaves identical) what it accepts, and is always safe.
+    ExactPin,
+}
+
+/// Structural shape of a version-requirement string, classified for
+/// [`format_version_replacing_by_shape`]'s decision on whether replacing it with a single
+/// concrete version preserves what it accepts.
+///
+/// Whether [`Compound`](Self::Compound), [`PartialWildcard`](Self::PartialWildcard), and
+/// [`SingleBound`](Self::SingleBound) have a safe rewrite depends on [`BareMeaning`] — see that
+/// type's docs. [`AnyVersion`](Self::AnyVersion), [`Bare`](Self::Bare),
+/// [`ExactPin`](Self::ExactPin), and [`Tilde`](Self::Tilde) always have one, regardless of
+/// `BareMeaning`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequirementRewriteShape {
+    /// No operator at all (a plain version number) — the ecosystem's own `bare` rewrite
+    /// closure decides the replacement text, since what "no operator" should render as on
+    /// rewrite differs per ecosystem (a plain version string for Cargo/npm/Dart's own bare
+    /// constraint — never a `^`-prefixed one, even for an ecosystem whose *new-dependency*
+    /// insertion convention is caret-prefixed, e.g. Dart's `pub add`).
+    Bare,
+    /// An explicit `^` caret operator. Under [`BareMeaning::Caret`] this is redundant with
+    /// [`Bare`](Self::Bare) (bare already means caret), so the rewrite may drop it and call
+    /// `bare` like any other no-special-operator shape; under [`BareMeaning::ExactPin`] this is
+    /// a genuinely wider range than bare, so the rewrite must keep the `^` prefix.
+    ExplicitCaret,
+    /// A leading `=` exact-pin operator — the rewrite must keep the `=` prefix.
+    ExactPin,
+    /// A leading tilde-family operator (Cargo's `~`, RubyGems' `~>`) — the rewrite must keep
+    /// the tilde spelling.
+    Tilde,
+    /// A bare existence wildcard (`*`, empty, or Dart's `any`) that matches every version —
+    /// collapsing it to one concrete version is always a narrowing, regardless of
+    /// [`BareMeaning`], since "anything" can only ever shrink.
+    AnyVersion,
+    /// A version with a `*`/`x`/`X` core segment (e.g. `1.2.*`, `1.x`) — no single concrete
+    /// version re-expresses "any patch/minor", so under [`BareMeaning::Caret`] there is no safe
+    /// rewrite (see [`BareMeaning::Caret`]'s docs).
+    PartialWildcard,
+    /// A single asymmetric bound (`<`, `<=`, `>`, `>=`) — under [`BareMeaning::Caret`],
+    /// collapsing to a bare version would silently turn an open-ended bound into an
+    /// auto-following range (see [`BareMeaning::Caret`]'s docs).
+    SingleBound,
+    /// More than one comparator, joined by a comma (Cargo, RubyGems: `">=1.2, <1.5"`) or
+    /// whitespace (npm/Dart AND-ranges: `">=1.2.0 <2.0.0"`, a hyphen range), or an npm `||`
+    /// OR-set — no single comparator's rewrite represents the whole set, so under
+    /// [`BareMeaning::Caret`] there is no safe rewrite (see [`BareMeaning::Caret`]'s docs).
+    Compound,
+}
+
+/// Single-operator prefixes this module recognizes, longest-first so `~>` is never mistaken
+/// for bare `~`, `<=`/`>=` are never mistaken for bare `<`/`>`, and `!=` is never mistaken for
+/// bare `=` (only RubyGems has `!=`, but recognizing it keeps [`requirement_is_compound`]
+/// correct for it too).
+const REWRITE_OPERATOR_PREFIXES: [&str; 9] = ["~>", "!=", "<=", ">=", "=", "~", "^", "<", ">"];
+
+/// Strips a single leading operator (see [`REWRITE_OPERATOR_PREFIXES`]) and any whitespace
+/// immediately following it, leaving only the operand — e.g. `"= 1.6.13"` -> `"1.6.13"`,
+/// `"~> 1.2.3"` -> `"1.2.3"`, `"^ 1.2.3"` -> `"1.2.3"`. Returns `trimmed` unchanged when no
+/// recognized operator prefixes it (a bare version).
+fn strip_requirement_operator(trimmed: &str) -> &str {
+    REWRITE_OPERATOR_PREFIXES
+        .iter()
+        .find_map(|op| trimmed.strip_prefix(op))
+        .map_or(trimmed, str::trim_start)
+}
+
+/// Whether `requirement` is built from more than one comparator.
+///
+/// Comma-joined (Cargo, RubyGems: `">=1.2, <1.5"`), `||`-joined (npm OR-sets, spaced or not:
+/// `"^1||^2"`), or whitespace-joined once a single leading operator and its own adjacent
+/// spacing are stripped via `strip_requirement_operator` (npm/Dart AND-ranges, hyphen
+/// ranges). Stripping only the operator's own spacing — not every occurrence of a comparator
+/// symbol — means a single bound written with a space after its operator (`"> 1.0"`,
+/// `"= 1.6.13"`) is not mistaken for a two-comparator requirement.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::requirement_is_compound;
+///
+/// assert!(requirement_is_compound(">=1.2, <1.5"));
+/// assert!(requirement_is_compound(">=1.2.0 <2.0.0"));
+/// assert!(requirement_is_compound("^1||^2"));
+/// assert!(!requirement_is_compound("<1.5"));
+/// assert!(!requirement_is_compound("> 1.0"));
+/// assert!(!requirement_is_compound("= 1.6.13"));
+/// assert!(!requirement_is_compound("^ 1.2.3"));
+/// assert!(!requirement_is_compound("^1.2.3"));
+/// ```
+#[must_use]
+pub fn requirement_is_compound(requirement: &str) -> bool {
+    let trimmed = requirement.trim();
+    trimmed.contains(',')
+        || trimmed.contains("||")
+        || strip_requirement_operator(trimmed).contains(char::is_whitespace)
+}
+
+/// Whether `requirement` — assumed already checked via [`requirement_is_compound`] and found
+/// not compound, and not already recognized as an operator-prefixed shape — is a bare
+/// existence wildcard that matches every version (see
+/// [`RequirementRewriteShape::AnyVersion`]).
+fn requirement_is_any_version_wildcard(requirement: &str) -> bool {
+    crate::is_existence_wildcard_str(requirement) || requirement.eq_ignore_ascii_case("any")
+}
+
+/// Whether `requirement` — assumed already checked via [`requirement_is_any_version_wildcard`]
+/// and found not a bare wildcard — has a `*`/`x`/`X` wildcard segment in its version core (see
+/// [`RequirementRewriteShape::PartialWildcard`]).
+///
+/// Checks only the segments before the first `-`/`+` (the version core, before any
+/// prerelease/build-metadata part) so a prerelease identifier that happens to be a single
+/// letter `x` (e.g. `1.0.0-alpha.x`) is not mistaken for a wildcard segment.
+fn requirement_is_partial_wildcard_shape(requirement: &str) -> bool {
+    let core = requirement.split(['-', '+']).next().unwrap_or(requirement);
+    core.split('.')
+        .any(|segment| matches!(segment, "*" | "x" | "X"))
+}
+
+/// Classifies `requirement`'s structural shape for
+/// [`format_version_replacing_by_shape`].
+///
+/// Known limitation: `!=` is one of `REWRITE_OPERATOR_PREFIXES` (so
+/// [`requirement_is_compound`] strips it correctly), but this function has no dedicated shape
+/// variant for it — a requirement like `"!=1.0.0"` falls through to
+/// [`RequirementRewriteShape::Bare`]. Harmless today: no ecosystem that calls this function
+/// (Cargo, npm, Dart) has a `!=` operator in its grammar; only RubyGems does, and Bundler
+/// doesn't call this function (see its `format_version_replacing_for`'s own docs).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{RequirementRewriteShape, classify_requirement_rewrite_shape};
+///
+/// assert_eq!(classify_requirement_rewrite_shape("1.2.3"), RequirementRewriteShape::Bare);
+/// assert_eq!(
+///     classify_requirement_rewrite_shape("^1.2.3"),
+///     RequirementRewriteShape::ExplicitCaret
+/// );
+/// assert_eq!(classify_requirement_rewrite_shape("=1.2.3"), RequirementRewriteShape::ExactPin);
+/// assert_eq!(classify_requirement_rewrite_shape("~1.2.3"), RequirementRewriteShape::Tilde);
+/// assert_eq!(classify_requirement_rewrite_shape("~>1.2.3"), RequirementRewriteShape::Tilde);
+/// assert_eq!(classify_requirement_rewrite_shape("*"), RequirementRewriteShape::AnyVersion);
+/// assert_eq!(
+///     classify_requirement_rewrite_shape("1.2.*"),
+///     RequirementRewriteShape::PartialWildcard
+/// );
+/// assert_eq!(classify_requirement_rewrite_shape("<1.5"), RequirementRewriteShape::SingleBound);
+/// assert_eq!(
+///     classify_requirement_rewrite_shape(">=1.2, <1.5"),
+///     RequirementRewriteShape::Compound
+/// );
+/// ```
+#[must_use]
+pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewriteShape {
+    let trimmed = requirement.trim();
+    if requirement_is_compound(trimmed) {
+        return RequirementRewriteShape::Compound;
+    }
+    if trimmed.starts_with('=') {
+        return RequirementRewriteShape::ExactPin;
+    }
+    if trimmed.starts_with("~>") || trimmed.starts_with('~') {
+        return RequirementRewriteShape::Tilde;
+    }
+    if trimmed.starts_with('^') {
+        return RequirementRewriteShape::ExplicitCaret;
+    }
+    if requirement_is_any_version_wildcard(trimmed) {
+        return RequirementRewriteShape::AnyVersion;
+    }
+    if requirement_is_partial_wildcard_shape(trimmed) {
+        return RequirementRewriteShape::PartialWildcard;
+    }
+    if ["<=", "<", ">=", ">"]
+        .iter()
+        .any(|op| trimmed.starts_with(op))
+    {
+        return RequirementRewriteShape::SingleBound;
+    }
+    RequirementRewriteShape::Bare
+}
+
+/// Default requirement-rewrite policy driven by [`classify_requirement_rewrite_shape`] and
+/// `bare_meaning`.
+///
+/// Always preserves an [`ExactPin`](RequirementRewriteShape::ExactPin) or
+/// [`Tilde`](RequirementRewriteShape::Tilde) operator, and always calls `bare` for
+/// [`AnyVersion`](RequirementRewriteShape::AnyVersion) or
+/// [`Bare`](RequirementRewriteShape::Bare) (collapsing either is always safe, regardless of
+/// `bare_meaning` — see those variants' docs). For
+/// [`ExplicitCaret`](RequirementRewriteShape::ExplicitCaret),
+/// [`PartialWildcard`](RequirementRewriteShape::PartialWildcard),
+/// [`SingleBound`](RequirementRewriteShape::SingleBound), and
+/// [`Compound`](RequirementRewriteShape::Compound), the answer depends on `bare_meaning`: under
+/// [`BareMeaning::Caret`] the requirement is echoed back unchanged (no safe single-value
+/// rewrite — `ExplicitCaret` is the one exception, which collapses via `bare` instead, since
+/// under this `bare_meaning` a bare version already means caret); under
+/// [`BareMeaning::ExactPin`] every one of them collapses safely (`ExplicitCaret` keeping its
+/// `^` prefix, since bare would narrow it to something other than a range).
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::ConcreteVersion;
+/// use deps_core::lsp_helpers::{BareMeaning, format_version_replacing_by_shape};
+///
+/// let new_version = ConcreteVersion::new("2.0.0");
+/// assert_eq!(
+///     format_version_replacing_by_shape(&new_version, "=1.5.0", BareMeaning::Caret, || {
+///         new_version.to_string()
+///     }),
+///     "=2.0.0"
+/// );
+/// assert_eq!(
+///     format_version_replacing_by_shape(
+///         &new_version,
+///         ">=1.2, <1.5",
+///         BareMeaning::Caret,
+///         || new_version.to_string()
+///     ),
+///     ">=1.2, <1.5"
+/// );
+/// assert_eq!(
+///     format_version_replacing_by_shape(
+///         &new_version,
+///         ">=1.2.0 <1.5.0",
+///         BareMeaning::ExactPin,
+///         || new_version.to_string()
+///     ),
+///     "2.0.0"
+/// );
+/// ```
+#[must_use]
+pub fn format_version_replacing_by_shape(
+    version: &ConcreteVersion,
+    current: &str,
+    bare_meaning: BareMeaning,
+    bare: impl FnOnce() -> String,
+) -> String {
+    match classify_requirement_rewrite_shape(current) {
+        RequirementRewriteShape::Compound
+        | RequirementRewriteShape::PartialWildcard
+        | RequirementRewriteShape::SingleBound => match bare_meaning {
+            BareMeaning::Caret => current.to_string(),
+            BareMeaning::ExactPin => bare(),
+        },
+        RequirementRewriteShape::ExplicitCaret => match bare_meaning {
+            BareMeaning::Caret => bare(),
+            BareMeaning::ExactPin => format!("^{}", version.as_str()),
+        },
+        RequirementRewriteShape::AnyVersion | RequirementRewriteShape::Bare => bare(),
+        RequirementRewriteShape::ExactPin => format!("={}", version.as_str()),
+        RequirementRewriteShape::Tilde => {
+            // Reconstructs whichever tilde spelling `current` actually used, rather than
+            // hardcoding `~` — `~>` is RubyGems' spelling (Bundler doesn't call this function
+            // today, but nothing here should silently mangle it if that ever changes).
+            let prefix = if current.trim_start().starts_with("~>") {
+                "~>"
+            } else {
+                "~"
+            };
+            format!("{prefix}{}", version.as_str())
+        }
+    }
+}
+
 /// Requirement parsing, matching, and up-to-date status.
 ///
 /// Implementors guarantee every method here is a pure function of its arguments — no network
@@ -1087,6 +1374,307 @@ mod tests {
         assert_eq!(
             MOCK_FORMATTER.requirement_status(&requirement, &latest),
             RequirementStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn test_classify_requirement_rewrite_shape_bare() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("1.2.3"),
+            RequirementRewriteShape::Bare
+        );
+    }
+
+    /// Split from [`RequirementRewriteShape::Bare`] (impl-critic S3): an explicit `^` means
+    /// something genuinely different from "no operator" on a `BareMeaning::ExactPin`
+    /// ecosystem, so the two must classify separately even though they used to share a bucket.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_explicit_caret() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("^1.2.3"),
+            RequirementRewriteShape::ExplicitCaret
+        );
+    }
+
+    /// impl-critic M4: a space after `^` (valid in both Cargo's and node-semver's grammar)
+    /// must not be mistaken for a second comparator.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_explicit_caret_with_space() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("^ 1.2.3"),
+            RequirementRewriteShape::ExplicitCaret
+        );
+    }
+
+    #[test]
+    fn test_classify_requirement_rewrite_shape_exact_pin() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("=1.2.3"),
+            RequirementRewriteShape::ExactPin
+        );
+    }
+
+    #[test]
+    fn test_classify_requirement_rewrite_shape_tilde_both_spellings() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("~1.2.3"),
+            RequirementRewriteShape::Tilde
+        );
+        assert_eq!(
+            classify_requirement_rewrite_shape("~>1.2.3"),
+            RequirementRewriteShape::Tilde
+        );
+    }
+
+    /// impl-critic S2: a bare existence wildcard (`*`, empty, Dart's `any`) matches every
+    /// version, so collapsing it to one concrete version always narrows — split from
+    /// [`RequirementRewriteShape::PartialWildcard`], which has no such guarantee.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_any_version() {
+        for requirement in ["*", "", "any", "ANY"] {
+            assert_eq!(
+                classify_requirement_rewrite_shape(requirement),
+                RequirementRewriteShape::AnyVersion,
+                "expected {requirement:?} to classify as AnyVersion"
+            );
+        }
+    }
+
+    /// #1577: a partial wildcard requirement (`1.2.*`, `1.x`) has no single-version rewrite
+    /// that preserves "any patch/minor" semantics.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_partial_wildcard() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("1.2.*"),
+            RequirementRewriteShape::PartialWildcard
+        );
+        assert_eq!(
+            classify_requirement_rewrite_shape("1.x"),
+            RequirementRewriteShape::PartialWildcard
+        );
+    }
+
+    /// impl-critic M6: a prerelease identifier that happens to be a single letter `x` must not
+    /// be mistaken for a wildcard segment — only the version core (before `-`/`+`) is checked.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_prerelease_x_not_wildcard() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("1.0.0-alpha.x"),
+            RequirementRewriteShape::Bare
+        );
+    }
+
+    /// Same root cause as the prerelease case above, for build metadata instead: a `+build.x`
+    /// segment must not be mistaken for a wildcard component either — `split(['-', '+'])`
+    /// isolates the version core before either separator.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_build_metadata_x_not_wildcard() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("1.2.3+build.x"),
+            RequirementRewriteShape::Bare
+        );
+    }
+
+    /// Same "always safe to collapse" treatment as bare `*` (impl-critic S2) — an empty
+    /// requirement string also matches [`crate::is_existence_wildcard_str`] and must not be
+    /// refused as an ordinary partial wildcard.
+    #[test]
+    fn test_format_version_replacing_by_shape_empty_requirement_always_collapses() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        for bare_meaning in [BareMeaning::Caret, BareMeaning::ExactPin] {
+            assert_eq!(
+                format_version_replacing_by_shape(&new_version, "", bare_meaning, || {
+                    new_version.to_string()
+                }),
+                "2.0.0"
+            );
+        }
+    }
+
+    /// #1577: a single asymmetric bound in either direction has no safe single-version
+    /// rewrite — collapsing to bare would silently turn it into an auto-following range.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_single_bound_both_directions() {
+        for requirement in ["<1.5", "<=1.5.0", ">1.0", ">=1.2"] {
+            assert_eq!(
+                classify_requirement_rewrite_shape(requirement),
+                RequirementRewriteShape::SingleBound,
+                "expected {requirement:?} to classify as SingleBound"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_requirement_rewrite_shape_compound_comma_and_whitespace() {
+        assert_eq!(
+            classify_requirement_rewrite_shape(">=1.2, <1.5"),
+            RequirementRewriteShape::Compound
+        );
+        assert_eq!(
+            classify_requirement_rewrite_shape(">=1.2.0 <2.0.0"),
+            RequirementRewriteShape::Compound
+        );
+    }
+
+    /// impl-critic M5: an unspaced npm OR-set must classify as compound identically to a
+    /// spaced one.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_or_set_spaced_and_unspaced() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("^1||^2"),
+            RequirementRewriteShape::Compound
+        );
+        assert_eq!(
+            classify_requirement_rewrite_shape("^1 || ^2"),
+            RequirementRewriteShape::Compound
+        );
+    }
+
+    #[test]
+    fn test_requirement_is_compound_ignores_operator_adjacent_whitespace() {
+        assert!(!requirement_is_compound("> 1.0"));
+        assert!(!requirement_is_compound("<= 1.5.0"));
+        assert!(requirement_is_compound(">=1.2.0 <2.0.0"));
+        assert!(requirement_is_compound(">=1.2, <1.5"));
+    }
+
+    #[test]
+    fn test_requirement_is_compound_ignores_spacing_after_non_angle_operators() {
+        assert!(!requirement_is_compound("= 1.6.13"));
+        assert!(!requirement_is_compound("~ 1.2.3"));
+        assert!(!requirement_is_compound("~> 1.2.3"));
+        assert!(!requirement_is_compound("^ 1.2.3"));
+        assert!(!requirement_is_compound("!= 1.0.0"));
+    }
+
+    #[test]
+    fn test_format_version_replacing_by_shape_preserves_exact_pin_and_tilde() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        assert_eq!(
+            format_version_replacing_by_shape(&new_version, "=1.5.0", BareMeaning::Caret, || {
+                new_version.to_string()
+            }),
+            "=2.0.0"
+        );
+        assert_eq!(
+            format_version_replacing_by_shape(
+                &new_version,
+                "~1.5.0",
+                BareMeaning::ExactPin,
+                || { new_version.to_string() }
+            ),
+            "~2.0.0"
+        );
+    }
+
+    /// N2: the rewrite must reconstruct whichever tilde spelling `current` actually used, not
+    /// hardcode `~` — a RubyGems-spelled `~>` requirement must stay `~>` on rewrite, matching
+    /// this variant's own doc promise to "keep the tilde spelling".
+    #[test]
+    fn test_format_version_replacing_by_shape_preserves_rubygems_tilde_spelling() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        assert_eq!(
+            format_version_replacing_by_shape(
+                &new_version,
+                "~>1.5.0",
+                BareMeaning::ExactPin,
+                || { new_version.to_string() }
+            ),
+            "~>2.0.0"
+        );
+    }
+
+    /// impl-critic S1: under `BareMeaning::Caret`, a bounded/compound requirement has no safe
+    /// single-value rewrite and must be echoed back unchanged.
+    #[test]
+    fn test_format_version_replacing_by_shape_caret_meaning_refuses_unsafe_shapes() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        for requirement in ["1.2.*", "<1.5", ">=1.2, <1.5", ">=1.2.0 <2.0.0"] {
+            assert_eq!(
+                format_version_replacing_by_shape(
+                    &new_version,
+                    requirement,
+                    BareMeaning::Caret,
+                    || new_version.to_string()
+                ),
+                requirement,
+                "expected {requirement:?} to be echoed back unchanged under BareMeaning::Caret"
+            );
+        }
+    }
+
+    /// impl-critic S1: under `BareMeaning::ExactPin`, the same shapes collapse safely instead —
+    /// a bare version there is a narrower single point, never a widening.
+    #[test]
+    fn test_format_version_replacing_by_shape_exact_pin_meaning_collapses_unsafe_shapes() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        for requirement in ["1.2.*", "<1.5", ">=1.2, <1.5", ">=1.2.0 <2.0.0"] {
+            assert_eq!(
+                format_version_replacing_by_shape(
+                    &new_version,
+                    requirement,
+                    BareMeaning::ExactPin,
+                    || new_version.to_string()
+                ),
+                "2.0.0",
+                "expected {requirement:?} to collapse to bare under BareMeaning::ExactPin"
+            );
+        }
+    }
+
+    /// impl-critic S2: a bare existence wildcard always collapses, regardless of
+    /// `BareMeaning` — matching *anything* can only narrow when replaced with one version.
+    #[test]
+    fn test_format_version_replacing_by_shape_any_version_always_collapses() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        for bare_meaning in [BareMeaning::Caret, BareMeaning::ExactPin] {
+            assert_eq!(
+                format_version_replacing_by_shape(&new_version, "*", bare_meaning, || {
+                    new_version.to_string()
+                }),
+                "2.0.0"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_version_replacing_by_shape_bare_calls_bare_closure() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        assert_eq!(
+            format_version_replacing_by_shape(&new_version, "1.5.0", BareMeaning::ExactPin, || {
+                new_version.as_str().to_string()
+            }),
+            "2.0.0"
+        );
+    }
+
+    /// impl-critic S3: under `BareMeaning::Caret`, an explicit `^` is redundant with bare (both
+    /// mean caret), so it may collapse via the `bare` closure just like a no-operator shape.
+    #[test]
+    fn test_format_version_replacing_by_shape_explicit_caret_collapses_under_caret_meaning() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        assert_eq!(
+            format_version_replacing_by_shape(&new_version, "^1.5.0", BareMeaning::Caret, || {
+                new_version.to_string()
+            }),
+            "2.0.0"
+        );
+    }
+
+    /// impl-critic S3: under `BareMeaning::ExactPin`, an explicit `^` is a genuinely wider
+    /// range than bare — the rewrite must keep the `^` prefix, or it silently narrows a
+    /// compatible-range requirement into an exact pin.
+    #[test]
+    fn test_format_version_replacing_by_shape_explicit_caret_preserved_under_exact_pin_meaning() {
+        let new_version = ConcreteVersion::new("2.0.0");
+        assert_eq!(
+            format_version_replacing_by_shape(
+                &new_version,
+                "^1.5.0",
+                BareMeaning::ExactPin,
+                || { new_version.to_string() }
+            ),
+            "^2.0.0"
         );
     }
 }

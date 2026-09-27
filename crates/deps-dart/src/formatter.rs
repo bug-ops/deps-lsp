@@ -6,8 +6,8 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy,
+    BareMeaning, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, format_version_replacing_by_shape,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -73,6 +73,31 @@ impl PackageRendering for DartFormatter {
         format!("^{version}")
     }
 
+    /// Delegates to [`format_version_replacing_by_shape`] with [`BareMeaning::ExactPin`] — a
+    /// bare pubspec constraint (no operator) means an *exact* version match, not an implicit
+    /// caret range (confirmed by this crate's own `match_single_constraint`, `version.rs`,
+    /// whose final fallback is `compare_versions(version, constraint) == Ordering::Equal`). So
+    /// collapsing a bounded/compound constraint (a space-separated AND range like
+    /// `">=1.2.0 <2.0.0"`, or a single asymmetric bound like `<2.0.0`) to a bare version always
+    /// narrows what it accepts, never widens it — the original #1576 concern (modeled on
+    /// Cargo's bare-means-caret convention) does not apply to Dart.
+    ///
+    /// The `bare` closure deliberately does **not** reuse
+    /// [`Self::format_version_for_text_edit`] (which prepends `^`, correct only for a brand-new
+    /// dependency's insertion text): a *no-operator* constraint must be rewritten to a plain
+    /// version, or the rewrite would silently turn an exact pin into a caret-compatible range
+    /// (impl-critic S3) — the opposite direction of the widening #1576 was written to prevent,
+    /// but a widening all the same. An *explicit* `^`, by contrast, is preserved with its `^`
+    /// prefix (via [`RequirementRewriteShape::ExplicitCaret`]'s `BareMeaning::ExactPin` branch)
+    /// since it is a genuinely wider range than bare on this ecosystem.
+    ///
+    /// [`RequirementRewriteShape::ExplicitCaret`]: deps_core::lsp_helpers::RequirementRewriteShape::ExplicitCaret
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        format_version_replacing_by_shape(version, current, BareMeaning::ExactPin, || {
+            version.as_str().to_string()
+        })
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -133,6 +158,58 @@ mod tests {
         assert_eq!(
             f.format_version_for_text_edit(&ConcreteVersion::new("6.1.2")),
             "^6.1.2"
+        );
+    }
+
+    /// impl-critic S1: a bare pubspec constraint means an exact version match, not an implicit
+    /// caret range (unlike Cargo) — so collapsing a space-separated compound constraint to a
+    /// bare version always narrows what it accepts, never widens it, and must be allowed
+    /// rather than refused.
+    #[test]
+    fn test_format_version_replacing_compound_constraint_collapses_to_bare() {
+        let f = DartFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.4.0"), ">=1.2.0 <2.0.0"),
+            "1.4.0"
+        );
+    }
+
+    /// impl-critic S3: a *bare* (no-operator) constraint means an exact pin — rewriting it must
+    /// produce a plain version, not a caret-prefixed one, or the rewrite silently widens an
+    /// exact pin into a caret-compatible range.
+    #[test]
+    fn test_format_version_replacing_bare_constraint_stays_bare_not_caret() {
+        let f = DartFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("2.0.0"), "1.5.0"),
+            "2.0.0"
+        );
+    }
+
+    /// impl-critic S3: an *explicit* `^` constraint is a genuinely wider range than bare on
+    /// this ecosystem, so it must keep its `^` prefix on rewrite rather than collapsing.
+    #[test]
+    fn test_format_version_replacing_explicit_caret_constraint_preserved() {
+        let f = DartFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("2.0.0"), "^1.5.0"),
+            "^2.0.0"
+        );
+    }
+
+    /// N1: locks in the exact collapsed output (not just that it isn't refused) for a single
+    /// asymmetric bound and pub's `any` keyword — both narrow safely on this ecosystem, same
+    /// as the compound-range case above.
+    #[test]
+    fn test_format_version_replacing_single_bound_and_any_collapse_to_bare_pin() {
+        let f = DartFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.4.0"), ">=1.2.0"),
+            "1.4.0"
+        );
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.4.0"), "any"),
+            "1.4.0"
         );
     }
 
