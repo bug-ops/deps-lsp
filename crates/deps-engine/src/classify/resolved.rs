@@ -67,7 +67,7 @@ use std::sync::Arc;
 /// );
 /// assert_eq!(
 ///     in_use.get(&PackageName::new("dep-0")),
-///     Some(&vec!["1.0.0".to_string()])
+///     Some(&vec![ConcreteVersion::from("1.0.0")])
 /// );
 /// ```
 pub fn collect_in_use_versions(
@@ -76,8 +76,8 @@ pub fn collect_in_use_versions(
     resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem: EcosystemId,
-) -> HashMap<PackageName, Vec<String>> {
-    let mut map: HashMap<PackageName, Vec<String>> = HashMap::new();
+) -> HashMap<PackageName, Vec<ConcreteVersion>> {
+    let mut map: HashMap<PackageName, Vec<ConcreteVersion>> = HashMap::new();
     for dep in parse_result
         .dependencies()
         .into_iter()
@@ -92,7 +92,9 @@ pub fn collect_in_use_versions(
             formatter,
             ecosystem,
         ) {
-            map.entry(dep.name().clone()).or_default().push(v);
+            map.entry(dep.name().clone())
+                .or_default()
+                .push(ConcreteVersion::from(v));
         }
     }
     map
