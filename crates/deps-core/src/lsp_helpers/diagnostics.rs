@@ -2501,7 +2501,7 @@ fn push_flagged_latest_admitted_by_requirement(
             let raw_status =
                 super::resolve_latest_status(map, ctx.dep, vuln_keys, ctx.normalized_name);
             (
-                super::upgrade_status_to_verdict(raw_status, latest),
+                super::upgrade_status_to_verdict(raw_status, latest, ctx.dep, ctx.formatter),
                 raw_status,
             )
         }
