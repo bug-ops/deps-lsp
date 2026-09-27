@@ -1,16 +1,15 @@
 //! Bundler ecosystem implementation for deps-lsp.
 
-use std::any::Any;
-use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
-use url::Url;
-
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
+use std::any::Any;
+use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Range};
+use url::Url;
 
 use crate::formatter::BundlerFormatter;
 use crate::registry::RubyGemsRegistry;
@@ -18,6 +17,10 @@ use crate::registry::RubyGemsRegistry;
 /// Leading version-constraint operators stripped from a completion prefix before matching
 /// it against registry versions: Ruby/Bundler's pessimistic `~>`, comparisons `>=`/`<=`/`>`/
 /// `<`/`=`, and `!=`. No `^` — Ruby gem constraints have no caret syntax (#1137).
+///
+/// Not extracted into a submodule (unlike this crate's peers with a multi-item completion
+/// surface): a single gated const isn't worth a `mod` declaration of its own, since that
+/// declaration would itself need a gate — net more gates, not fewer.
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['~', '>', '<', '=', '!'];
 
@@ -140,11 +143,6 @@ impl Ecosystem for BundlerEcosystem {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
-
-    #[cfg(feature = "lsp-responses")]
-    deps_core::complete_versions_test_shim!(BundlerEcosystem);
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
@@ -171,88 +169,6 @@ mod tests {
         reachable: true;
         fixture: "Gemfile" =>
             "gem 'rails', \"~> #{RAILS_VERSION}\"\ngem 'sidekiq', \"~> #@sidekiq_version\"\ngem 'puma', \"~> #$PUMA_VERSION\"\n";
-    }
-
-    // #758: the shared completion-prefix-length guard
-    // (`deps_core::completion::complete_package_names_generic`), replacing
-    // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod bundler_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (Bundler's `~>`/comparison/`!=` grammar), so an edit to one without
-    // the other fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod bundler_operator_chars_conformance;
-        ecosystem: "bundler";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['~', '>', '<', '=', '!'];
-    }
-
-    // #1136: a gem pinned to a per-gem inline `source:` must yield zero version completions
-    // and never reach the public RubyGems registry.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_source_gate_conformance! {
-        mod bundler_completion_source_gate_conformance;
-        build: async {
-            let mut server = mockito::Server::new_async().await;
-            let mock = server
-                .mock("GET", mockito::Matcher::Any)
-                .expect(0)
-                .create_async()
-                .await;
-            let cache = Arc::new(deps_core::HttpCache::new());
-            let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
-            let eco = BundlerEcosystem::with_registry_for_test(registry);
-            (eco, mock, server)
-        };
-        manifest: "Gemfile" => "gem \"internal-gem\", \"1.0.0\", source: \"https://gems.corp\"\n";
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_has_real_range() {
-        // Regression test for #232: the textEdit range for a package-name completion
-        // must be the real name token span, not the (0,0)-(0,0) placeholder.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        let content = "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(1, 7); // cursor after "ra" in "rails"
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        match context {
-            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                assert_eq!(prefix, "ra");
-                assert_ne!(range, Range::default());
-                assert_eq!(range, Range::new(Position::new(1, 5), Position::new(1, 10)));
-            }
-            other => panic!("Expected PackageName context, got {other:?}"),
-        }
     }
 
     #[tokio::test]
@@ -334,309 +250,389 @@ gem 'rails', '~> 7.0'";
         );
     }
 
-    // --- #793 characterization: `generate_completions` dispatch, pinned before the
-    // wildcard-match refactor.
-
     #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        let content = "gem 'r'";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position: Position = parse_result.dependencies()[0].name_range().end.into();
-        let freshness = deps_core::FreshnessSettings::default();
+    mod lsp_tests {
+        use super::*;
 
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
-        else {
-            panic!("expected PackageName context, got {context:?}");
-        };
-        let direct = ecosystem.complete_package_names(&prefix, range).await;
-        let via_dispatch = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-    }
+        use tower_lsp_server::ls_types::Position;
 
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_none_context_returns_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        let content = "source \"https://rubygems.org\"\n";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let result = ecosystem
-            .generate_completions(
+        deps_core::complete_versions_test_shim!(BundlerEcosystem);
+
+        // #758: the shared completion-prefix-length guard
+        // (`deps_core::completion::complete_package_names_generic`), replacing
+        // test_complete_package_names_minimum_prefix/test_complete_package_names_max_length.
+        deps_core::completion_guard_conformance! {
+            mod bundler_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (Bundler's `~>`/comparison/`!=` grammar), so an edit to one without
+        // the other fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod bundler_operator_chars_conformance;
+            ecosystem: "bundler";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['~', '>', '<', '=', '!'];
+        }
+
+        // #1136: a gem pinned to a per-gem inline `source:` must yield zero version completions
+        // and never reach the public RubyGems registry.
+        deps_core::completion_source_gate_conformance! {
+            mod bundler_completion_source_gate_conformance;
+            build: async {
+                let mut server = mockito::Server::new_async().await;
+                let mock = server
+                    .mock("GET", mockito::Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let cache = Arc::new(deps_core::HttpCache::new());
+                let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
+                let eco = BundlerEcosystem::with_registry_for_test(registry);
+                (eco, mock, server)
+            };
+            manifest: "Gemfile" => "gem \"internal-gem\", \"1.0.0\", source: \"https://gems.corp\"\n";
+        }
+
+        #[tokio::test]
+        async fn test_package_name_completion_context_has_real_range() {
+            // Regression test for #232: the textEdit range for a package-name completion
+            // must be the real name token span, not the (0,0)-(0,0) placeholder.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = BundlerEcosystem::new(cache);
+            let content = "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(1, 7); // cursor after "ra" in "rails"
+
+            let context = deps_core::completion::detect_completion_context(
                 parse_result.as_ref(),
-                Position::new(0, 0),
+                position,
                 content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert_eq!(result, Completions::default());
-    }
+            );
 
-    /// CI-enforced (not `#[ignore]`d) counterpart to the happy-path test below: exercises the
-    /// same dispatch path (`package_name`/`prefix` threaded from the resolved `Version`
-    /// context to `complete_versions`) the ignored test below leaves uncovered in an ordinary
-    /// CI run, but against a mocked 404 rather than the live `rubygems.org` (#1038) — a
-    /// regression that makes zero requests (and so also produces an empty result) can no
-    /// longer pass vacuously, since `mock.assert_async()` requires the request to actually
-    /// have been made.
-    ///
-    /// `.expect(2)`, not `.expect_at_least(1)`: this test calls both `complete_versions`
-    /// directly and `generate_completions` (which must dispatch to the same
-    /// `complete_versions`), and `HttpCache` never caches a non-2xx response (a 404 becomes
-    /// `DepsError::HttpStatus`, never stored) — so exactly 2 requests reach the mock on the
-    /// unregressed path. A regression that dropped the `generate_completions` dispatch would
-    /// leave the mock at 1 hit, which `.expect_at_least(1)` alone would not catch.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_unknown_package_is_empty() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/versions/this-gem-does-not-exist-12345.json")
-            .with_status(404)
-            .expect(2)
-            .create_async()
-            .await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
-        let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
-        let content = "gem \"this-gem-does-not-exist-12345\", \"~> 1.0\"";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position: Position = parse_result.dependencies()[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-        let freshness = deps_core::FreshnessSettings::default();
+            match context {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    assert_eq!(prefix, "ra");
+                    assert_ne!(range, Range::default());
+                    assert_eq!(range, Range::new(Position::new(1, 5), Position::new(1, 10)));
+                }
+                other => panic!("Expected PackageName context, got {other:?}"),
+            }
+        }
 
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
-            panic!("expected Version context, got {context:?}");
-        };
-        let direct = ecosystem
-            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
-            .await;
-        let via_dispatch = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
-        mock.assert_async().await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-    }
+        // --- #793 characterization: `generate_completions` dispatch, pinned before the
+        // wildcard-match refactor.
 
-    /// #793 S1: pins that a `Version` context threads `package_name`/`prefix` through to
-    /// `complete_versions` — requires live network for a real, non-empty result (RubyGems
-    /// has no offline test seam here), mirroring this codebase's existing convention for
-    /// completion tests that need a genuine registry round-trip (e.g.
-    /// `deps_cargo::ecosystem::tests::test_complete_versions_real`).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_generate_completions_version_context_dispatches_to_registry() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = BundlerEcosystem::new(cache);
-        let content = "gem \"rails\", \"~> 7.0\"";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position: Position = parse_result.dependencies()[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-        let freshness = deps_core::FreshnessSettings::default();
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = BundlerEcosystem::new(cache);
+            let content = "gem 'r'";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies()[0].name_range().end.into();
+            let freshness = deps_core::FreshnessSettings::default();
 
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
-            panic!("expected Version context, got {context:?}");
-        };
-        let direct = ecosystem
-            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
-            .await;
-        let via_dispatch = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(!direct.is_empty());
-    }
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+            let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
+            else {
+                panic!("expected PackageName context, got {context:?}");
+            };
+            let direct = ecosystem.complete_package_names(&prefix, range).await;
+            let via_dispatch = ecosystem
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+        }
 
-    // --- #1366 impl-critic S1/S2: `generate_code_actions` end-to-end, not just the planner ---
+        #[tokio::test]
+        async fn test_generate_completions_none_context_returns_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = BundlerEcosystem::new(cache);
+            let content = "source \"https://rubygems.org\"\n";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let result = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    Position::new(0, 0),
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert_eq!(result, Completions::default());
+        }
 
-    /// S1 regression: before `BundlerDependency::version_literal` was overridden, the shared
-    /// literal-span guard (`deps_core::lsp_helpers::literal_span_matches`) compared the
-    /// document slice at `version_range` (the raw `>= 5.0', '< 6.0` text, quotes and comma
-    /// included) against `version_req` (the `", "`-joined comparator `">= 5.0, < 6.0"`, no
-    /// quotes at all) and always disagreed — so `generate_code_actions` silently returned no
-    /// actions at all for *every* multi-constraint gem, even though the formatter-level unit
-    /// tests (calling `plan_vulnerability_fix` directly) never exercised that guard and so
-    /// never caught it.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_code_actions_multi_constraint_offers_update_actions() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/versions/rails.json")
-            .with_status(200)
-            .with_body(
-                r#"[{"number": "7.1.0", "prerelease": false, "yanked": false, "platform": "ruby"}]"#,
-            )
-            .create_async()
-            .await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
-        let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
-        let content = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let dep = &parse_result.dependencies()[0];
-        assert_eq!(
-            dep.version_requirement().map(deps_core::VersionReq::as_str),
-            Some(">= 5.0, < 6.0"),
-        );
-        let position: Position = dep.version_range().unwrap().start.into();
+        /// CI-enforced (not `#[ignore]`d) counterpart to the happy-path test below: exercises the
+        /// same dispatch path (`package_name`/`prefix` threaded from the resolved `Version`
+        /// context to `complete_versions`) the ignored test below leaves uncovered in an ordinary
+        /// CI run, but against a mocked 404 rather than the live `rubygems.org` (#1038) — a
+        /// regression that makes zero requests (and so also produces an empty result) can no
+        /// longer pass vacuously, since `mock.assert_async()` requires the request to actually
+        /// have been made.
+        ///
+        /// `.expect(2)`, not `.expect_at_least(1)`: this test calls both `complete_versions`
+        /// directly and `generate_completions` (which must dispatch to the same
+        /// `complete_versions`), and `HttpCache` never caches a non-2xx response (a 404 becomes
+        /// `DepsError::HttpStatus`, never stored) — so exactly 2 requests reach the mock on the
+        /// unregressed path. A regression that dropped the `generate_completions` dispatch would
+        /// leave the mock at 1 hit, which `.expect_at_least(1)` alone would not catch.
+        #[tokio::test]
+        async fn test_generate_completions_version_context_unknown_package_is_empty() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/versions/this-gem-does-not-exist-12345.json")
+                .with_status(404)
+                .expect(2)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
+            let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
+            let content = "gem \"this-gem-does-not-exist-12345\", \"~> 1.0\"";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies()[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+            let freshness = deps_core::FreshnessSettings::default();
 
-        let cached_versions = std::collections::HashMap::new();
-        let resolved_versions = std::collections::HashMap::new();
-        let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+            let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+                panic!("expected Version context, got {context:?}");
+            };
+            let direct = ecosystem
+                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .await;
+            let via_dispatch = ecosystem
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
+            mock.assert_async().await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+        }
 
-        let actions = ecosystem
-            .generate_code_actions(parse_result.as_ref(), position, &uri, versions, content)
-            .await;
+        /// #793 S1: pins that a `Version` context threads `package_name`/`prefix` through to
+        /// `complete_versions` — requires live network for a real, non-empty result (RubyGems
+        /// has no offline test seam here), mirroring this codebase's existing convention for
+        /// completion tests that need a genuine registry round-trip (e.g.
+        /// `deps_cargo::ecosystem::tests::test_complete_versions_real`).
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_generate_completions_version_context_dispatches_to_registry() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = BundlerEcosystem::new(cache);
+            let content = "gem \"rails\", \"~> 7.0\"";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies()[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+            let freshness = deps_core::FreshnessSettings::default();
 
-        mock.assert_async().await;
-        assert!(
-            !actions.is_empty(),
-            "S1 regression: a multi-constraint dependency must still offer \"update to X\" \
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+            let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+                panic!("expected Version context, got {context:?}");
+            };
+            let direct = ecosystem
+                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .await;
+            let via_dispatch = ecosystem
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(!direct.is_empty());
+        }
+
+        // --- #1366 impl-critic S1/S2: `generate_code_actions` end-to-end, not just the planner ---
+
+        /// S1 regression: before `BundlerDependency::version_literal` was overridden, the shared
+        /// literal-span guard (`deps_core::lsp_helpers::literal_span_matches`) compared the
+        /// document slice at `version_range` (the raw `>= 5.0', '< 6.0` text, quotes and comma
+        /// included) against `version_req` (the `", "`-joined comparator `">= 5.0, < 6.0"`, no
+        /// quotes at all) and always disagreed — so `generate_code_actions` silently returned no
+        /// actions at all for *every* multi-constraint gem, even though the formatter-level unit
+        /// tests (calling `plan_vulnerability_fix` directly) never exercised that guard and so
+        /// never caught it.
+        #[tokio::test]
+        async fn test_generate_code_actions_multi_constraint_offers_update_actions() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                    .mock("GET", "/versions/rails.json")
+                    .with_status(200)
+                    .with_body(
+                        r#"[{"number": "7.1.0", "prerelease": false, "yanked": false, "platform": "ruby"}]"#,
+                    )
+                    .create_async()
+                    .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
+            let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
+            let content = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            assert_eq!(
+                dep.version_requirement().map(deps_core::VersionReq::as_str),
+                Some(">= 5.0, < 6.0"),
+            );
+            let position: Position = dep.version_range().unwrap().start.into();
+
+            let cached_versions = std::collections::HashMap::new();
+            let resolved_versions = std::collections::HashMap::new();
+            let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
+
+            let actions = ecosystem
+                .generate_code_actions(parse_result.as_ref(), position, &uri, versions, content)
+                .await;
+
+            mock.assert_async().await;
+            assert!(
+                !actions.is_empty(),
+                "S1 regression: a multi-constraint dependency must still offer \"update to X\" \
              code actions once version_literal makes the literal-span guard pass"
-        );
-    }
+            );
+        }
 
-    /// S2 regression: `deps-cli`'s `plan_verified_fix` has no separate guard against the live
-    /// document text (unlike the LSP's `literal_span_matches`), so `format_version_replacing_for`
-    /// must itself refuse a mixed-quote-style collapse — verified here through the *LSP*
-    /// path too, not just `plan_verified_fix`, since both must agree no action ever proposes
-    /// splicing `6.1.0` into `'>= 5.0', "< 6.0"` (which would leave the mismatched-quote
-    /// `'6.1.0"` behind).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_code_actions_multi_constraint_mixed_quotes_offers_no_actions() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/versions/rails.json")
-            .with_status(200)
-            .with_body(
-                r#"[{"number": "7.1.0", "prerelease": false, "yanked": false, "platform": "ruby"}]"#,
-            )
-            .create_async()
-            .await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
-        let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
-        let content = "gem \"rails\", '>= 5.0', \"< 6.0\"";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let dep = &parse_result.dependencies()[0];
-        assert_eq!(
-            dep.version_requirement().map(deps_core::VersionReq::as_str),
-            Some(">= 5.0, < 6.0"),
-        );
-        let position: Position = dep.version_range().unwrap().start.into();
+        /// S2 regression: `deps-cli`'s `plan_verified_fix` has no separate guard against the live
+        /// document text (unlike the LSP's `literal_span_matches`), so `format_version_replacing_for`
+        /// must itself refuse a mixed-quote-style collapse — verified here through the *LSP*
+        /// path too, not just `plan_verified_fix`, since both must agree no action ever proposes
+        /// splicing `6.1.0` into `'>= 5.0', "< 6.0"` (which would leave the mismatched-quote
+        /// `'6.1.0"` behind).
+        #[tokio::test]
+        async fn test_generate_code_actions_multi_constraint_mixed_quotes_offers_no_actions() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                    .mock("GET", "/versions/rails.json")
+                    .with_status(200)
+                    .with_body(
+                        r#"[{"number": "7.1.0", "prerelease": false, "yanked": false, "platform": "ruby"}]"#,
+                    )
+                    .create_async()
+                    .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
+            let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
+            let content = "gem \"rails\", '>= 5.0', \"< 6.0\"";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            assert_eq!(
+                dep.version_requirement().map(deps_core::VersionReq::as_str),
+                Some(">= 5.0, < 6.0"),
+            );
+            let position: Position = dep.version_range().unwrap().start.into();
 
-        let cached_versions = std::collections::HashMap::new();
-        let resolved_versions = std::collections::HashMap::new();
-        let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
+            let cached_versions = std::collections::HashMap::new();
+            let resolved_versions = std::collections::HashMap::new();
+            let versions = deps_core::VersionData::new(&cached_versions, &resolved_versions);
 
-        let actions = ecosystem
-            .generate_code_actions(parse_result.as_ref(), position, &uri, versions, content)
-            .await;
+            let actions = ecosystem
+                .generate_code_actions(parse_result.as_ref(), position, &uri, versions, content)
+                .await;
 
-        mock.assert_async().await;
-        assert!(
-            actions.is_empty(),
-            "S2 regression: a mixed-quote-style multi-constraint dependency must never offer \
+            mock.assert_async().await;
+            assert!(
+                actions.is_empty(),
+                "S2 regression: a mixed-quote-style multi-constraint dependency must never offer \
              a rewrite that would splice mismatched quote characters into the Gemfile, got \
              {actions:?}"
-        );
-    }
+            );
+        }
 
-    /// #1366 impl-critic S1's completion side: before `version_literal` was overridden, the
-    /// shared `dependency_version_range_is_literal` gate (which
-    /// `deps_core::completion::detect_completion_context` consults to decide whether a cursor
-    /// inside `version_range` is a `Version` completion context at all) compared the raw
-    /// multi-literal slice against the joined comparator string and always disagreed, so a
-    /// cursor anywhere inside a multi-constraint gem's version text got `CompletionContext::None`
-    /// — completion silently withheld for every multi-constraint dependency. A deliberate
-    /// choice (documented in the handoff), not the only option: `version_literal` makes this
-    /// pass again rather than adding ecosystem-local logic to keep completion withheld, since
-    /// `deps-bundler` uses `Ecosystem::complete_version`'s shared default (no per-dependency
-    /// replace range of its own to get wrong either way — see `complete_versions_at_position`).
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_multi_constraint_offers_items() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/versions/rails.json")
-            .with_status(200)
-            .with_body(
-                r#"[{"number": "7.1.0", "prerelease": false, "yanked": false, "platform": "ruby"}]"#,
-            )
-            .create_async()
-            .await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
-        let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
-        let content = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
-        let uri = deps_core::test_util::test_uri("/test/Gemfile");
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let dep = &parse_result.dependencies()[0];
-        // Cursor at the very start of the multi-literal span (empty prefix — no candidate
-        // filtered out), the same span
-        // `test_parse_multi_constraint_version_range_collapses_to_single_pin` (parser.rs)
-        // proves covers the raw `>= 5.0', '< 6.0` text.
-        let position: Position = dep.version_range().unwrap().start.into();
+        /// #1366 impl-critic S1's completion side: before `version_literal` was overridden, the
+        /// shared `dependency_version_range_is_literal` gate (which
+        /// `deps_core::completion::detect_completion_context` consults to decide whether a cursor
+        /// inside `version_range` is a `Version` completion context at all) compared the raw
+        /// multi-literal slice against the joined comparator string and always disagreed, so a
+        /// cursor anywhere inside a multi-constraint gem's version text got `CompletionContext::None`
+        /// — completion silently withheld for every multi-constraint dependency. A deliberate
+        /// choice (documented in the handoff), not the only option: `version_literal` makes this
+        /// pass again rather than adding ecosystem-local logic to keep completion withheld, since
+        /// `deps-bundler` uses `Ecosystem::complete_version`'s shared default (no per-dependency
+        /// replace range of its own to get wrong either way — see `complete_versions_at_position`).
+        #[tokio::test]
+        async fn test_generate_completions_multi_constraint_offers_items() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                    .mock("GET", "/versions/rails.json")
+                    .with_status(200)
+                    .with_body(
+                        r#"[{"number": "7.1.0", "prerelease": false, "yanked": false, "platform": "ruby"}]"#,
+                    )
+                    .create_async()
+                    .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = RubyGemsRegistry::with_base_for_test(Arc::clone(&cache), server.url());
+            let ecosystem = BundlerEcosystem::with_registry_for_test(registry);
+            let content = "gem \"rails\", \">= 5.0\", \"< 6.0\"";
+            let uri = deps_core::test_util::test_uri("/test/Gemfile");
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            // Cursor at the very start of the multi-literal span (empty prefix — no candidate
+            // filtered out), the same span
+            // `test_parse_multi_constraint_version_range_collapses_to_single_pin` (parser.rs)
+            // proves covers the raw `>= 5.0', '< 6.0` text.
+            let position: Position = dep.version_range().unwrap().start.into();
 
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        assert!(
-            matches!(
-                context,
-                deps_core::completion::CompletionContext::Version { .. }
-            ),
-            "S1 regression: a cursor inside a multi-constraint dependency's version text must \
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+            assert!(
+                matches!(
+                    context,
+                    deps_core::completion::CompletionContext::Version { .. }
+                ),
+                "S1 regression: a cursor inside a multi-constraint dependency's version text must \
              still resolve to a Version completion context, got {context:?}"
-        );
+            );
 
-        let freshness = deps_core::FreshnessSettings::default();
-        let completions = ecosystem
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
+            let freshness = deps_core::FreshnessSettings::default();
+            let completions = ecosystem
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
 
-        mock.assert_async().await;
-        assert!(
-            !completions.items.is_empty(),
-            "a multi-constraint dependency must still offer version completions"
-        );
+            mock.assert_async().await;
+            assert!(
+                !completions.items.is_empty(),
+                "a multi-constraint dependency must still offer version completions"
+            );
+        }
     }
 }

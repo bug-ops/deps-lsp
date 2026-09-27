@@ -742,6 +742,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
+    use crate::lsp_helpers::test_support_lsp::*;
     use crate::lsp_helpers::*;
     use crate::position::{Position, Range};
     use crate::{Dependency, PackageName, VersionReq};

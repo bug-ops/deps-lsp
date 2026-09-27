@@ -296,6 +296,7 @@ pub fn generate_inlay_hints(
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
+    use crate::lsp_helpers::test_support_lsp::*;
     use crate::lsp_helpers::*;
 
     /// #1161 M1 (critic follow-up): a dependency whose `version_range()` is `Some` but which

@@ -3,16 +3,15 @@
 //! This module implements the `Ecosystem` trait for PHP/Composer projects,
 //! providing LSP functionality for `composer.json` files.
 
-use std::any::Any;
-use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
-
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
+use std::any::Any;
+use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Range};
 
 use crate::formatter::ComposerFormatter;
 use crate::registry::PackagistRegistry;
@@ -23,6 +22,10 @@ use crate::registry::PackagistRegistry;
 /// version_satisfies_requirement` accepts all of these, including `!=`, which was
 /// missing here (#1137). `*` covers the bare wildcard requirement; the trailing-wildcard
 /// form (`"1.0.*"`) has no leading operator to strip.
+///
+/// Not extracted into a submodule (unlike this crate's peers with a multi-item completion
+/// surface): a single gated const isn't worth a `mod` declaration of its own, since that
+/// declaration would itself need a gate — net more gates, not fewer.
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['^', '~', '=', '<', '>', '*', '!'];
 
@@ -223,12 +226,6 @@ fn extract_prefix(line: &str, character: u32) -> (&str, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use deps_core::{EcosystemConfig, VersionData};
-    #[cfg(feature = "lsp-responses")]
-    use std::collections::HashMap;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
 
     // #758: exact-value `Ecosystem` conformance, replacing test_ecosystem_id,
     // test_ecosystem_manifest_filenames, and test_ecosystem_lockfile_filenames. Also closes
@@ -271,40 +268,6 @@ mod tests {
             }}"#;
     }
 
-    // #758: the shared completion-prefix-length guard
-    // (`deps_core::completion::complete_package_names_generic`), replacing
-    // test_complete_package_names_short_prefix — also closes the missing max-length case.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod composer_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`ComposerFormatter::version_satisfies_requirement`'s operator set),
-    // so an edit to one without the other fails loudly instead of silently degrading
-    // completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod composer_operator_chars_conformance;
-        ecosystem: "composer";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['^', '~', '=', '<', '>', '*', '!'];
-    }
-
     #[test]
     fn test_lockfile_provider_returns_some() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -336,353 +299,6 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_has_real_range() {
-        // Regression test for #232: the textEdit range for a package-name completion
-        // must be the real name token span, not the (0,0)-(0,0) placeholder.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-        let content = "{\n  \"require\": {\n    \"symfony/console\": \"^6.0\"\n  }\n}";
-        let uri = deps_core::test_util::test_uri("/test/composer.json");
-
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(2, 9); // cursor after "symf" in "symfony/console"
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        match context {
-            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                assert_eq!(prefix, "symf");
-                assert_ne!(range, Range::default());
-                assert_eq!(range, Range::new(Position::new(2, 5), Position::new(2, 20)));
-            }
-            other => panic!("Expected PackageName context, got {other:?}"),
-        }
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_inlay_hints_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/composer.json");
-
-        let content = r#"{"require": {}}"#;
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-
-        let hints = ecosystem
-            .generate_inlay_hints(
-                parse_result.as_ref(),
-                VersionData::new(&HashMap::new(), &HashMap::new()),
-                deps_core::LoadingState::Loaded,
-                &EcosystemConfig::default(),
-            )
-            .await;
-
-        assert!(hints.is_empty());
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_no_context() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-        let uri = deps_core::test_util::test_uri("/test/composer.json");
-
-        let content = r#"{"name": "test/project"}"#;
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let position = Position {
-            line: 0,
-            character: 0,
-        };
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert!(completions.items.is_empty());
-    }
-
-    /// #1171: end-to-end counterpart of `deps_core::completion`'s
-    /// `test_complete_versions_generic_operator_stripping_composer_not_equal` — that test
-    /// proves the shared helper strips a `!=` prefix against a hard-coded *copy* of
-    /// Composer's operator array (`deps-core` cannot depend on `deps-composer` to reference
-    /// the real one). This drives the same scenario through the real
-    /// `ComposerEcosystem::generate_completions` against a mocked Packagist response,
-    /// proving the actual shipped `VERSION_OPERATOR_CHARS` constant above.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_strips_not_equal_operator_against_real_registry() {
-        let mut server = mockito::Server::new_async().await;
-        let base = server.url();
-        server
-            .mock("GET", "/p2/monolog/monolog.json")
-            .with_status(200)
-            .with_body(
-                r#"{"packages": {"monolog/monolog": [
-                    {"version": "2.0.0", "version_normalized": "2.0.0.0", "abandoned": null},
-                    {"version": "1.0.0", "version_normalized": "1.0.0.0"}
-                ]}}"#,
-                // "1.0.0" doesn't match the "!=2.0"-stripped "2.0" prefix — its presence
-                // proves the assertion below reflects filtering, not just an unfiltered list.
-            )
-            .create_async()
-            .await;
-
-        let ecosystem = ComposerEcosystem {
-            registry: Arc::new(PackagistRegistry::with_base(
-                Arc::new(deps_core::HttpCache::new()),
-                base,
-            )),
-            formatter: ComposerFormatter,
-            lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
-        };
-        let uri = deps_core::test_util::test_uri("/test/composer.json");
-        let content = r#"{"require": {"monolog/monolog": "!=2.0"}}"#;
-        let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
-        let dep = &parse_result.dependencies()[0];
-        let position = dep.version_range().unwrap().end.into();
-
-        let completions = ecosystem
-            .generate_completions(
-                parse_result.as_ref(),
-                position,
-                content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-
-        assert_eq!(completions.items.len(), 1);
-        assert_eq!(completions.items[0].label, "2.0.0 (latest)");
-    }
-
-    /// #1433: hover, completion, and code actions must all agree with diagnostics about
-    /// what "latest" means for the same dependency once the manifest sets
-    /// `minimum-stability: alpha` — reproduces the issue's live repro (Packagist's newest
-    /// tag is a `v`-prefixed alpha, the newest *stable* release is older).
-    #[cfg(feature = "lsp-responses")]
-    mod minimum_stability_selection_context_tests {
-        use super::*;
-        use deps_core::VersionData;
-
-        async fn composer_ecosystem_with_alpha_and_stable(
-            server: &mut mockito::ServerGuard,
-        ) -> ComposerEcosystem {
-            server
-                .mock("GET", "/p2/twig/twig.json")
-                .with_status(200)
-                .with_body(
-                    r#"{"packages": {"twig/twig": [
-                        {"version": "v4.0.0-alpha1", "version_normalized": "4.0.0.0-alpha1", "abandoned": null},
-                        {"version": "v3.29.0", "version_normalized": "3.29.0.0"}
-                    ]}}"#,
-                )
-                .create_async()
-                .await;
-
-            ComposerEcosystem {
-                registry: Arc::new(PackagistRegistry::with_base(
-                    Arc::new(deps_core::HttpCache::new()),
-                    server.url(),
-                )),
-                formatter: ComposerFormatter,
-                lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
-            }
-        }
-
-        const MANIFEST: &str = r#"{
-  "minimum-stability": "alpha",
-  "require": {
-    "twig/twig": "3.28.0"
-  }
-}"#;
-
-        /// #1433: hover's `**Latest**` line must report the alpha version, matching
-        /// diagnostics/inlay-hints' own `minimum-stability`-aware pick.
-        #[tokio::test]
-        async fn test_generate_hover_respects_manifest_minimum_stability() {
-            let mut server = mockito::Server::new_async().await;
-            let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
-            let uri = deps_core::test_util::test_uri("/test/composer.json");
-            let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
-            let dep = &parse_result.dependencies()[0];
-            let position = dep.version_range().unwrap().start.into();
-
-            let hover = ecosystem
-                .generate_hover(
-                    parse_result.as_ref(),
-                    position,
-                    VersionData::new(&HashMap::new(), &HashMap::new()),
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await
-                .expect("hover must fire on the version token");
-
-            assert!(
-                hover.markdown().contains("4.0.0-alpha1"),
-                "hover must report the alpha version as latest under minimum-stability: \
-                 alpha, got: {}",
-                hover.markdown()
-            );
-        }
-
-        /// #1433: completion's "(latest)" tag must land on the alpha version. #1435: the
-        /// item's insert text must stay unprefixed (matching the requirement already typed,
-        /// `"3.28.0"`) even though the label legitimately shows Packagist's real, `v`-prefixed
-        /// tag text — `label` is informational, `insert_text` is what gets spliced in.
-        #[tokio::test]
-        async fn test_generate_completions_respects_manifest_minimum_stability() {
-            let mut server = mockito::Server::new_async().await;
-            let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
-            let uri = deps_core::test_util::test_uri("/test/composer.json");
-            let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
-            let dep = &parse_result.dependencies()[0];
-            let position = dep.version_range().unwrap().end.into();
-
-            let completions = ecosystem
-                .generate_completions(
-                    parse_result.as_ref(),
-                    position,
-                    MANIFEST,
-                    deps_core::FreshnessSettings::default(),
-                )
-                .await;
-
-            let latest_item = completions
-                .items
-                .iter()
-                .find(|item| item.label == "v4.0.0-alpha1 (latest)")
-                .unwrap_or_else(|| {
-                    panic!(
-                        "completion must tag the alpha version as latest under \
-                         minimum-stability: alpha, got: {:?}",
-                        completions
-                            .items
-                            .iter()
-                            .map(|i| &i.label)
-                            .collect::<Vec<_>>()
-                    )
-                });
-            assert_eq!(
-                latest_item.insert_text.as_deref(),
-                Some("4.0.0-alpha1"),
-                "insert text must stay unprefixed, matching the already-typed requirement, \
-                 not Packagist's raw v-tagged text (#1435)"
-            );
-        }
-
-        /// #1433: the "update to latest" code action must target the alpha version.
-        #[tokio::test]
-        async fn test_generate_code_actions_respects_manifest_minimum_stability() {
-            let mut server = mockito::Server::new_async().await;
-            let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
-            let uri = deps_core::test_util::test_uri("/test/composer.json");
-            let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
-            let dep = &parse_result.dependencies()[0];
-            let position = dep.version_range().unwrap().start.into();
-
-            let actions = ecosystem
-                .generate_code_actions(
-                    parse_result.as_ref(),
-                    position,
-                    &uri,
-                    VersionData::new(&HashMap::new(), &HashMap::new()),
-                    MANIFEST,
-                )
-                .await;
-
-            // Exact match, not `.contains` (impl-critic M1): the manifest's own requirement
-            // ("3.28.0") is unprefixed, so this also end-to-end-proves #1435's fix through
-            // `generate_code_actions` — a `.contains("4.0.0-alpha1")` check would pass just
-            // as well for the unfixed, `v`-prefixed `"v4.0.0-alpha1"`.
-            let latest_action_targets_alpha = actions.iter().any(|action| {
-                action
-                    .edit
-                    .as_ref()
-                    .and_then(|edit| edit.changes.as_ref())
-                    .into_iter()
-                    .flat_map(|changes| changes.values())
-                    .flatten()
-                    .any(|edit| edit.new_text == "4.0.0-alpha1")
-            });
-            assert!(
-                latest_action_targets_alpha,
-                "an update-version code action must target the unprefixed alpha version \
-                 under minimum-stability: alpha, got: {actions:?}"
-            );
-        }
-
-        /// #1444 end-to-end: a real `composer.json` with an unrecognized `minimum-stability`
-        /// value produces a WARNING diagnostic through the full `Ecosystem::generate_diagnostics`
-        /// path — parse -> `ParseResult::invalid_minimum_stability` ->
-        /// `invalid_minimum_stability_notice`. No mock registry needed:
-        /// `generate_diagnostics_from_cache` never performs network I/O.
-        #[tokio::test]
-        async fn test_generate_diagnostics_reports_invalid_minimum_stability() {
-            let manifest = r#"{
-  "minimum-stability": "betta",
-  "require": {
-    "twig/twig": "3.28.0"
-  }
-}"#;
-            let cache = Arc::new(deps_core::HttpCache::new());
-            let ecosystem = ComposerEcosystem::new(cache);
-            let uri = deps_core::test_util::test_uri("/test/composer.json");
-            let parse_result = ecosystem.parse_manifest(manifest, &uri).await.unwrap();
-
-            let diagnostics = ecosystem
-                .generate_diagnostics(
-                    parse_result.as_ref(),
-                    VersionData::new(&HashMap::new(), &HashMap::new()),
-                    &uri,
-                    deps_core::FreshnessSettings::default(),
-                    deps_core::lsp_helpers::DiagnosticSeverities::default(),
-                )
-                .await;
-
-            let notice = diagnostics
-                .iter()
-                .find(|d| d.message().contains("minimum-stability"))
-                .unwrap_or_else(|| {
-                    panic!("expected an invalid-minimum-stability diagnostic, got: {diagnostics:?}")
-                });
-            assert!(notice.message().contains("\"betta\""));
-            // `manifest`'s second line (index 1) is `  "minimum-stability": "betta",`.
-            assert_eq!(notice.range.start.line, 1);
-            let line = "  \"minimum-stability\": \"betta\",";
-            assert_eq!(
-                notice.range.start.character,
-                line.find("betta").unwrap() as u32
-            );
-        }
-    }
-
-    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
-    /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
-    /// trait method on realistic multi-line content.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let ecosystem = ComposerEcosystem::new(cache);
-        let content = "{\n  \"require\": {\n    \"monolog/mono";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(
-            ecosystem.fallback_completion_prefix(content, position.into()),
-            Some("monolog/mono")
-        );
-    }
-
     #[test]
     fn test_is_in_dependencies_section_basic() {
         let content = "{\n  \"require\": {\n    \"monolog/monolog\": \"^2.0\"\n  },\n  \"scripts\": {\n    \"test\": \"phpunit\"\n  }\n}";
@@ -705,46 +321,6 @@ mod tests {
         // bare-inserting there would duplicate the closed key's quote.
         let line = "    \"monolog/monolog\"";
         assert_eq!(extract_prefix(line, line.len() as u32), ("", false));
-    }
-
-    /// #729: a closed key (`"monolog/monolog"`, cursor past both quotes) must
-    /// suppress the completion entirely — the same "no safe text to offer" outcome as
-    /// Maven's non-`artifactId` open tag — which this trait method achieves by
-    /// returning `None`, same as "no completable position at all".
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_closed_key_is_suppressed() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = ComposerEcosystem::new(cache);
-        let content = "{\n  \"require\": {\n    \"monolog/monolog\"";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            None
-        );
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_inside_open_key() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = ComposerEcosystem::new(cache);
-        let content = "{\n  \"require\": {\n    \"monolog/mono";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(eco.fallback_completion_is_bare(content, position.into()));
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_is_bare_false_with_no_open_key() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = ComposerEcosystem::new(cache);
-        let content = "{\n  \"require\": {\n    monolog";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert!(!eco.fallback_completion_is_bare(content, position.into()));
     }
 
     /// #729: `ComposerEcosystem` has no `fallback_bare_insert_text` override — the
@@ -800,5 +376,428 @@ mod tests {
             ecosystem.completion_insert_text(&meta),
             Some("\"monolog/monolog\": \"^3.5.0\"".to_string())
         );
+    }
+
+    #[cfg(feature = "lsp-responses")]
+    mod lsp_tests {
+        use super::*;
+
+        use deps_core::{EcosystemConfig, VersionData};
+
+        use std::collections::HashMap;
+
+        use tower_lsp_server::ls_types::Position;
+
+        // #758: the shared completion-prefix-length guard
+        // (`deps_core::completion::complete_package_names_generic`), replacing
+        // test_complete_package_names_short_prefix — also closes the missing max-length case.
+        deps_core::completion_guard_conformance! {
+            mod composer_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (`ComposerFormatter::version_satisfies_requirement`'s operator set),
+        // so an edit to one without the other fails loudly instead of silently degrading
+        // completion.
+        deps_core::operator_chars_conformance! {
+            mod composer_operator_chars_conformance;
+            ecosystem: "composer";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['^', '~', '=', '<', '>', '*', '!'];
+        }
+
+        #[tokio::test]
+        async fn test_package_name_completion_context_has_real_range() {
+            // Regression test for #232: the textEdit range for a package-name completion
+            // must be the real name token span, not the (0,0)-(0,0) placeholder.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = ComposerEcosystem::new(cache);
+            let content = "{\n  \"require\": {\n    \"symfony/console\": \"^6.0\"\n  }\n}";
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(2, 9); // cursor after "symf" in "symfony/console"
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+
+            match context {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    assert_eq!(prefix, "symf");
+                    assert_ne!(range, Range::default());
+                    assert_eq!(range, Range::new(Position::new(2, 5), Position::new(2, 20)));
+                }
+                other => panic!("Expected PackageName context, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn test_generate_inlay_hints_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = ComposerEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+
+            let content = r#"{"require": {}}"#;
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+
+            let hints = ecosystem
+                .generate_inlay_hints(
+                    parse_result.as_ref(),
+                    VersionData::new(&HashMap::new(), &HashMap::new()),
+                    deps_core::LoadingState::Loaded,
+                    &EcosystemConfig::default(),
+                )
+                .await;
+
+            assert!(hints.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_no_context() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = ComposerEcosystem::new(cache);
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+
+            let content = r#"{"name": "test/project"}"#;
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let position = Position {
+                line: 0,
+                character: 0,
+            };
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert!(completions.items.is_empty());
+        }
+
+        /// #1171: end-to-end counterpart of `deps_core::completion`'s
+        /// `test_complete_versions_generic_operator_stripping_composer_not_equal` — that test
+        /// proves the shared helper strips a `!=` prefix against a hard-coded *copy* of
+        /// Composer's operator array (`deps-core` cannot depend on `deps-composer` to reference
+        /// the real one). This drives the same scenario through the real
+        /// `ComposerEcosystem::generate_completions` against a mocked Packagist response,
+        /// proving the actual shipped `VERSION_OPERATOR_CHARS` constant above.
+        #[tokio::test]
+        async fn test_generate_completions_strips_not_equal_operator_against_real_registry() {
+            let mut server = mockito::Server::new_async().await;
+            let base = server.url();
+            server
+                .mock("GET", "/p2/monolog/monolog.json")
+                .with_status(200)
+                .with_body(
+                    r#"{"packages": {"monolog/monolog": [
+                    {"version": "2.0.0", "version_normalized": "2.0.0.0", "abandoned": null},
+                    {"version": "1.0.0", "version_normalized": "1.0.0.0"}
+                ]}}"#,
+                    // "1.0.0" doesn't match the "!=2.0"-stripped "2.0" prefix — its presence
+                    // proves the assertion below reflects filtering, not just an unfiltered list.
+                )
+                .create_async()
+                .await;
+
+            let ecosystem = ComposerEcosystem {
+                registry: Arc::new(PackagistRegistry::with_base(
+                    Arc::new(deps_core::HttpCache::new()),
+                    base,
+                )),
+                formatter: ComposerFormatter,
+                lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+            };
+            let uri = deps_core::test_util::test_uri("/test/composer.json");
+            let content = r#"{"require": {"monolog/monolog": "!=2.0"}}"#;
+            let parse_result = ecosystem.parse_manifest(content, &uri).await.unwrap();
+            let dep = &parse_result.dependencies()[0];
+            let position = dep.version_range().unwrap().end.into();
+
+            let completions = ecosystem
+                .generate_completions(
+                    parse_result.as_ref(),
+                    position,
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+
+            assert_eq!(completions.items.len(), 1);
+            assert_eq!(completions.items[0].label, "2.0.0 (latest)");
+        }
+
+        /// #1433: hover, completion, and code actions must all agree with diagnostics about
+        /// what "latest" means for the same dependency once the manifest sets
+        /// `minimum-stability: alpha` — reproduces the issue's live repro (Packagist's newest
+        /// tag is a `v`-prefixed alpha, the newest *stable* release is older).
+        mod minimum_stability_selection_context_tests {
+            use super::*;
+            use deps_core::VersionData;
+
+            async fn composer_ecosystem_with_alpha_and_stable(
+                server: &mut mockito::ServerGuard,
+            ) -> ComposerEcosystem {
+                server
+                        .mock("GET", "/p2/twig/twig.json")
+                        .with_status(200)
+                        .with_body(
+                            r#"{"packages": {"twig/twig": [
+                        {"version": "v4.0.0-alpha1", "version_normalized": "4.0.0.0-alpha1", "abandoned": null},
+                        {"version": "v3.29.0", "version_normalized": "3.29.0.0"}
+                    ]}}"#,
+                        )
+                        .create_async()
+                        .await;
+
+                ComposerEcosystem {
+                    registry: Arc::new(PackagistRegistry::with_base(
+                        Arc::new(deps_core::HttpCache::new()),
+                        server.url(),
+                    )),
+                    formatter: ComposerFormatter,
+                    lockfile_cache: Arc::new(deps_core::lockfile::LockFileCache::new()),
+                }
+            }
+
+            const MANIFEST: &str = r#"{
+  "minimum-stability": "alpha",
+  "require": {
+    "twig/twig": "3.28.0"
+  }
+}"#;
+
+            /// #1433: hover's `**Latest**` line must report the alpha version, matching
+            /// diagnostics/inlay-hints' own `minimum-stability`-aware pick.
+            #[tokio::test]
+            async fn test_generate_hover_respects_manifest_minimum_stability() {
+                let mut server = mockito::Server::new_async().await;
+                let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
+                let uri = deps_core::test_util::test_uri("/test/composer.json");
+                let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
+                let dep = &parse_result.dependencies()[0];
+                let position = dep.version_range().unwrap().start.into();
+
+                let hover = ecosystem
+                    .generate_hover(
+                        parse_result.as_ref(),
+                        position,
+                        VersionData::new(&HashMap::new(), &HashMap::new()),
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await
+                    .expect("hover must fire on the version token");
+
+                assert!(
+                    hover.markdown().contains("4.0.0-alpha1"),
+                    "hover must report the alpha version as latest under minimum-stability: \
+                 alpha, got: {}",
+                    hover.markdown()
+                );
+            }
+
+            /// #1433: completion's "(latest)" tag must land on the alpha version. #1435: the
+            /// item's insert text must stay unprefixed (matching the requirement already typed,
+            /// `"3.28.0"`) even though the label legitimately shows Packagist's real, `v`-prefixed
+            /// tag text — `label` is informational, `insert_text` is what gets spliced in.
+            #[tokio::test]
+            async fn test_generate_completions_respects_manifest_minimum_stability() {
+                let mut server = mockito::Server::new_async().await;
+                let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
+                let uri = deps_core::test_util::test_uri("/test/composer.json");
+                let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
+                let dep = &parse_result.dependencies()[0];
+                let position = dep.version_range().unwrap().end.into();
+
+                let completions = ecosystem
+                    .generate_completions(
+                        parse_result.as_ref(),
+                        position,
+                        MANIFEST,
+                        deps_core::FreshnessSettings::default(),
+                    )
+                    .await;
+
+                let latest_item = completions
+                    .items
+                    .iter()
+                    .find(|item| item.label == "v4.0.0-alpha1 (latest)")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "completion must tag the alpha version as latest under \
+                         minimum-stability: alpha, got: {:?}",
+                            completions
+                                .items
+                                .iter()
+                                .map(|i| &i.label)
+                                .collect::<Vec<_>>()
+                        )
+                    });
+                assert_eq!(
+                    latest_item.insert_text.as_deref(),
+                    Some("4.0.0-alpha1"),
+                    "insert text must stay unprefixed, matching the already-typed requirement, \
+                 not Packagist's raw v-tagged text (#1435)"
+                );
+            }
+
+            /// #1433: the "update to latest" code action must target the alpha version.
+            #[tokio::test]
+            async fn test_generate_code_actions_respects_manifest_minimum_stability() {
+                let mut server = mockito::Server::new_async().await;
+                let ecosystem = composer_ecosystem_with_alpha_and_stable(&mut server).await;
+                let uri = deps_core::test_util::test_uri("/test/composer.json");
+                let parse_result = ecosystem.parse_manifest(MANIFEST, &uri).await.unwrap();
+                let dep = &parse_result.dependencies()[0];
+                let position = dep.version_range().unwrap().start.into();
+
+                let actions = ecosystem
+                    .generate_code_actions(
+                        parse_result.as_ref(),
+                        position,
+                        &uri,
+                        VersionData::new(&HashMap::new(), &HashMap::new()),
+                        MANIFEST,
+                    )
+                    .await;
+
+                // Exact match, not `.contains` (impl-critic M1): the manifest's own requirement
+                // ("3.28.0") is unprefixed, so this also end-to-end-proves #1435's fix through
+                // `generate_code_actions` — a `.contains("4.0.0-alpha1")` check would pass just
+                // as well for the unfixed, `v`-prefixed `"v4.0.0-alpha1"`.
+                let latest_action_targets_alpha = actions.iter().any(|action| {
+                    action
+                        .edit
+                        .as_ref()
+                        .and_then(|edit| edit.changes.as_ref())
+                        .into_iter()
+                        .flat_map(|changes| changes.values())
+                        .flatten()
+                        .any(|edit| edit.new_text == "4.0.0-alpha1")
+                });
+                assert!(
+                    latest_action_targets_alpha,
+                    "an update-version code action must target the unprefixed alpha version \
+                 under minimum-stability: alpha, got: {actions:?}"
+                );
+            }
+
+            /// #1444 end-to-end: a real `composer.json` with an unrecognized `minimum-stability`
+            /// value produces a WARNING diagnostic through the full `Ecosystem::generate_diagnostics`
+            /// path — parse -> `ParseResult::invalid_minimum_stability` ->
+            /// `invalid_minimum_stability_notice`. No mock registry needed:
+            /// `generate_diagnostics_from_cache` never performs network I/O.
+            #[tokio::test]
+            async fn test_generate_diagnostics_reports_invalid_minimum_stability() {
+                let manifest = r#"{
+  "minimum-stability": "betta",
+  "require": {
+    "twig/twig": "3.28.0"
+  }
+}"#;
+                let cache = Arc::new(deps_core::HttpCache::new());
+                let ecosystem = ComposerEcosystem::new(cache);
+                let uri = deps_core::test_util::test_uri("/test/composer.json");
+                let parse_result = ecosystem.parse_manifest(manifest, &uri).await.unwrap();
+
+                let diagnostics = ecosystem
+                    .generate_diagnostics(
+                        parse_result.as_ref(),
+                        VersionData::new(&HashMap::new(), &HashMap::new()),
+                        &uri,
+                        deps_core::FreshnessSettings::default(),
+                        deps_core::lsp_helpers::DiagnosticSeverities::default(),
+                    )
+                    .await;
+
+                let notice = diagnostics
+                    .iter()
+                    .find(|d| d.message().contains("minimum-stability"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "expected an invalid-minimum-stability diagnostic, got: {diagnostics:?}"
+                        )
+                    });
+                assert!(notice.message().contains("\"betta\""));
+                // `manifest`'s second line (index 1) is `  "minimum-stability": "betta",`.
+                assert_eq!(notice.range.start.line, 1);
+                let line = "  \"minimum-stability\": \"betta\",";
+                assert_eq!(
+                    notice.range.start.character,
+                    line.find("betta").unwrap() as u32
+                );
+            }
+        }
+
+        /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+        /// `is_in_json_dependencies` + quote-stripping compose correctly through the real
+        /// trait method on realistic multi-line content.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let ecosystem = ComposerEcosystem::new(cache);
+            let content = "{\n  \"require\": {\n    \"monolog/mono";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert_eq!(
+                ecosystem.fallback_completion_prefix(content, position.into()),
+                Some("monolog/mono")
+            );
+        }
+
+        /// #729: a closed key (`"monolog/monolog"`, cursor past both quotes) must
+        /// suppress the completion entirely — the same "no safe text to offer" outcome as
+        /// Maven's non-`artifactId` open tag — which this trait method achieves by
+        /// returning `None`, same as "no completable position at all".
+        #[test]
+        fn test_fallback_completion_prefix_closed_key_is_suppressed() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = ComposerEcosystem::new(cache);
+            let content = "{\n  \"require\": {\n    \"monolog/monolog\"";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                None
+            );
+        }
+
+        #[test]
+        fn test_fallback_completion_is_bare_inside_open_key() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = ComposerEcosystem::new(cache);
+            let content = "{\n  \"require\": {\n    \"monolog/mono";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(eco.fallback_completion_is_bare(content, position.into()));
+        }
+
+        #[test]
+        fn test_fallback_completion_is_bare_false_with_no_open_key() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = ComposerEcosystem::new(cache);
+            let content = "{\n  \"require\": {\n    monolog";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert!(!eco.fallback_completion_is_bare(content, position.into()));
+        }
     }
 }

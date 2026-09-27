@@ -1427,6 +1427,7 @@ mod tests {
     use crate::RemovalStatus;
     use crate::deps_dev::DepsDevSystem;
     use crate::lsp_helpers::test_support::*;
+    use crate::lsp_helpers::test_support_lsp::*;
     use crate::lsp_helpers::*;
     use crate::position::{Position, Range};
 

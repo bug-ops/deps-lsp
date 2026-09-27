@@ -1,16 +1,15 @@
 //! Dart ecosystem implementation for deps-lsp.
 
-use std::any::Any;
-use std::sync::Arc;
-#[cfg(feature = "lsp-responses")]
-use tower_lsp_server::ls_types::{CompletionItem, Range};
-use url::Url;
-
 #[cfg(feature = "lsp-responses")]
 use deps_core::completion::Completions;
 use deps_core::{
     Ecosystem, ParseResult as ParseResultTrait, Registry, Result, lsp_helpers::EcosystemFormatter,
 };
+use std::any::Any;
+use std::sync::Arc;
+#[cfg(feature = "lsp-responses")]
+use tower_lsp_server::ls_types::{CompletionItem, Range};
+use url::Url;
 
 use crate::formatter::DartFormatter;
 use crate::registry::PubDevRegistry;
@@ -22,6 +21,10 @@ use crate::registry::PubDevRegistry;
 /// has no explicit `=`-prefix arm, since an exact-match constraint is written as a bare
 /// version with no leading operator; keeping `=` in this array is a no-op for real Dart
 /// input, never a wrongly-stripped prefix (#1137).
+///
+/// Not extracted into a submodule (unlike this crate's peers with a multi-item completion
+/// surface): a single gated const isn't worth a `mod` declaration of its own, since that
+/// declaration would itself need a gate — net more gates, not fewer.
 #[cfg(feature = "lsp-responses")]
 const VERSION_OPERATOR_CHARS: &[char] = &['^', '>', '<', '='];
 
@@ -210,11 +213,6 @@ fn extract_prefix(line: &str, character: u32) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "lsp-responses")]
-    use tower_lsp_server::ls_types::Position;
-
-    #[cfg(feature = "lsp-responses")]
-    deps_core::complete_versions_test_shim!(DartEcosystem);
 
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
@@ -256,88 +254,6 @@ dependencies:
 ";
     }
 
-    // #758: the shared completion-prefix-length guard
-    // (`deps_core::completion::complete_package_names_generic`), replacing
-    // test_complete_package_names_min_prefix/test_complete_package_names_max_length.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_guard_conformance! {
-        mod dart_completion_guard_conformance;
-        complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
-        > {
-            Box::pin(async move {
-                deps_core::completion::complete_package_names_generic(
-                    registry,
-                    &prefix,
-                    20,
-                    Range::default(),
-                )
-                .await
-            })
-        };
-    }
-
-    // #1137: regression guard, not independent parser verification (see
-    // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
-    // own doc comment (`version::match_single_constraint`'s operator set), so an edit to
-    // one without the other fails loudly instead of silently degrading completion.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::operator_chars_conformance! {
-        mod dart_operator_chars_conformance;
-        ecosystem: "dart";
-        operator_chars: VERSION_OPERATOR_CHARS;
-        required: &['^', '>', '<', '='];
-    }
-
-    // #1136: a `hosted:` package pointing at a custom (unresolved) registry must yield zero
-    // version completions and never reach pub.dev.
-    #[cfg(feature = "lsp-responses")]
-    deps_core::completion_source_gate_conformance! {
-        mod dart_completion_source_gate_conformance;
-        build: async {
-            let mut server = mockito::Server::new_async().await;
-            let mock = server
-                .mock("GET", mockito::Matcher::Any)
-                .expect(0)
-                .create_async()
-                .await;
-            let cache = Arc::new(deps_core::HttpCache::new());
-            let registry = PubDevRegistry::with_base(Arc::clone(&cache), server.url());
-            let eco = DartEcosystem::with_registry_for_test(registry);
-            (eco, mock, server)
-        };
-        manifest: "pubspec.yaml" => "name: my_app\ndependencies:\n  custom_pkg:\n    hosted: https://custom-registry.example.com\n    version: ^1.0.0\n";
-    }
-
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_package_name_completion_context_has_real_range() {
-        // Regression test for #232: the textEdit range for a package-name completion
-        // must be the real name token span, not the (0,0)-(0,0) placeholder.
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
-        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(2, 4); // cursor after "ht" in "http"
-
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-
-        match context {
-            deps_core::completion::CompletionContext::PackageName { prefix, range } => {
-                assert_eq!(prefix, "ht");
-                assert_ne!(range, Range::default());
-                assert_eq!(range, Range::new(Position::new(2, 2), Position::new(2, 6)));
-            }
-            other => panic!("Expected PackageName context, got {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn test_lockfile_provider() {
         let cache = Arc::new(deps_core::HttpCache::new());
@@ -359,23 +275,6 @@ dependencies:
 
         let result = eco.parse_manifest(yaml, &uri).await.unwrap();
         assert_eq!(result.dependencies().len(), 1);
-    }
-
-    /// Composition regression guard (#390/#282 bug class): proves `line_at` +
-    /// `is_in_dependencies_section`'s top-level-key scan compose correctly through
-    /// the real trait method on realistic multi-line `pubspec.yaml` content.
-    #[cfg(feature = "lsp-responses")]
-    #[test]
-    fn test_fallback_completion_prefix_multi_line_composition() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        let content = "name: myapp\ndependencies:\n  pa";
-        let line = content.lines().nth(2).unwrap();
-        let position = Position::new(2, line.chars().count() as u32);
-        assert_eq!(
-            eco.fallback_completion_prefix(content, position.into()),
-            Some("pa")
-        );
     }
 
     #[test]
@@ -433,146 +332,246 @@ dependencies:
         );
     }
 
-    // --- #793 characterization: `generate_completions` dispatch, pinned before the
-    // wildcard-match refactor.
-
     #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        let content = "name: my_app\ndependencies:\n  h: ^1.0.0\n";
-        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position = Position::new(2, 3); // cursor right after "h"
-        let freshness = deps_core::FreshnessSettings::default();
+    mod lsp_tests {
+        use super::*;
 
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
-        else {
-            panic!("expected PackageName context, got {context:?}");
-        };
-        let direct = eco.complete_package_names(&prefix, range).await;
-        let via_dispatch = eco
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-    }
+        use tower_lsp_server::ls_types::Position;
 
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_none_context_returns_empty() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        let content = "name: my_app\n";
-        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let result = eco
-            .generate_completions(
+        deps_core::complete_versions_test_shim!(DartEcosystem);
+
+        // #758: the shared completion-prefix-length guard
+        // (`deps_core::completion::complete_package_names_generic`), replacing
+        // test_complete_package_names_min_prefix/test_complete_package_names_max_length.
+        deps_core::completion_guard_conformance! {
+            mod dart_completion_guard_conformance;
+            complete: |registry: &dyn deps_core::Registry, prefix: String| -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<tower_lsp_server::ls_types::CompletionItem>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    deps_core::completion::complete_package_names_generic(
+                        registry,
+                        &prefix,
+                        20,
+                        Range::default(),
+                    )
+                    .await
+                })
+            };
+        }
+
+        // #1137: regression guard, not independent parser verification (see
+        // `operator_chars_conformance!`'s doc) — `required` mirrors `VERSION_OPERATOR_CHARS`'s
+        // own doc comment (`version::match_single_constraint`'s operator set), so an edit to
+        // one without the other fails loudly instead of silently degrading completion.
+        deps_core::operator_chars_conformance! {
+            mod dart_operator_chars_conformance;
+            ecosystem: "dart";
+            operator_chars: VERSION_OPERATOR_CHARS;
+            required: &['^', '>', '<', '='];
+        }
+
+        // #1136: a `hosted:` package pointing at a custom (unresolved) registry must yield zero
+        // version completions and never reach pub.dev.
+        deps_core::completion_source_gate_conformance! {
+            mod dart_completion_source_gate_conformance;
+            build: async {
+                let mut server = mockito::Server::new_async().await;
+                let mock = server
+                    .mock("GET", mockito::Matcher::Any)
+                    .expect(0)
+                    .create_async()
+                    .await;
+                let cache = Arc::new(deps_core::HttpCache::new());
+                let registry = PubDevRegistry::with_base(Arc::clone(&cache), server.url());
+                let eco = DartEcosystem::with_registry_for_test(registry);
+                (eco, mock, server)
+            };
+            manifest: "pubspec.yaml" => "name: my_app\ndependencies:\n  custom_pkg:\n    hosted: https://custom-registry.example.com\n    version: ^1.0.0\n";
+        }
+
+        #[tokio::test]
+        async fn test_package_name_completion_context_has_real_range() {
+            // Regression test for #232: the textEdit range for a package-name completion
+            // must be the real name token span, not the (0,0)-(0,0) placeholder.
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = DartEcosystem::new(cache);
+            let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
+            let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(2, 4); // cursor after "ht" in "http"
+
+            let context = deps_core::completion::detect_completion_context(
                 parse_result.as_ref(),
-                Position::new(0, 0),
+                position,
                 content,
-                deps_core::FreshnessSettings::default(),
-            )
-            .await;
-        assert_eq!(result, Completions::default());
-    }
+            );
 
-    /// CI-enforced (not `#[ignore]`d) counterpart to the happy-path test below: exercises the
-    /// same dispatch path (`package_name`/`prefix` threaded from the resolved `Version`
-    /// context to `complete_versions`) the ignored test below leaves uncovered in an ordinary
-    /// CI run, but against a mocked 404 rather than the live `pub.dev` (#1038) — a regression
-    /// that makes zero requests (and so also produces an empty result) can no longer pass
-    /// vacuously, since `mock.assert_async()` requires the request to actually have been made.
-    ///
-    /// `.expect(2)`, not `.expect_at_least(1)`: this test calls both `complete_versions`
-    /// directly and `generate_completions` (which must dispatch to the same
-    /// `complete_versions`), and `HttpCache` never caches a non-2xx response (a 404 becomes
-    /// `DepsError::HttpStatus`, never stored) — so exactly 2 requests reach the mock on the
-    /// unregressed path. A regression that dropped the `generate_completions` dispatch would
-    /// leave the mock at 1 hit, which `.expect_at_least(1)` alone would not catch.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    async fn test_generate_completions_version_context_unknown_package_is_empty() {
-        let mut server = mockito::Server::new_async().await;
-        let mock = server
-            .mock("GET", "/packages/this_package_does_not_exist_12345")
-            .with_status(404)
-            .expect(2)
-            .create_async()
-            .await;
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let registry = PubDevRegistry::with_base(Arc::clone(&cache), server.url());
-        let eco = DartEcosystem::with_registry_for_test(registry);
-        let content = "name: my_app\ndependencies:\n  this_package_does_not_exist_12345: ^1.0.0\n";
-        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position: Position = parse_result.dependencies()[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-        let freshness = deps_core::FreshnessSettings::default();
+            match context {
+                deps_core::completion::CompletionContext::PackageName { prefix, range } => {
+                    assert_eq!(prefix, "ht");
+                    assert_ne!(range, Range::default());
+                    assert_eq!(range, Range::new(Position::new(2, 2), Position::new(2, 6)));
+                }
+                other => panic!("Expected PackageName context, got {other:?}"),
+            }
+        }
 
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
-            panic!("expected Version context, got {context:?}");
-        };
-        let direct = eco
-            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
-            .await;
-        let via_dispatch = eco
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
-        mock.assert_async().await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(direct.is_empty());
-    }
+        /// Composition regression guard (#390/#282 bug class): proves `line_at` +
+        /// `is_in_dependencies_section`'s top-level-key scan compose correctly through
+        /// the real trait method on realistic multi-line `pubspec.yaml` content.
+        #[test]
+        fn test_fallback_completion_prefix_multi_line_composition() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = DartEcosystem::new(cache);
+            let content = "name: myapp\ndependencies:\n  pa";
+            let line = content.lines().nth(2).unwrap();
+            let position = Position::new(2, line.chars().count() as u32);
+            assert_eq!(
+                eco.fallback_completion_prefix(content, position.into()),
+                Some("pa")
+            );
+        }
 
-    /// #793 S1: pins that a `Version` context threads `package_name`/`prefix` through to
-    /// `complete_versions` — requires live network for a real, non-empty result (pub.dev has
-    /// no offline test seam here), mirroring this codebase's existing convention for
-    /// completion tests that need a genuine registry round-trip.
-    #[cfg(feature = "lsp-responses")]
-    #[tokio::test]
-    #[ignore = "requires network access"]
-    async fn test_generate_completions_version_context_dispatches_to_registry() {
-        let cache = Arc::new(deps_core::HttpCache::new());
-        let eco = DartEcosystem::new(cache);
-        let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
-        let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
-        let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
-        let position: Position = parse_result.dependencies()[0]
-            .version_range()
-            .unwrap()
-            .start
-            .into();
-        let freshness = deps_core::FreshnessSettings::default();
+        // --- #793 characterization: `generate_completions` dispatch, pinned before the
+        // wildcard-match refactor.
 
-        let context = deps_core::completion::detect_completion_context(
-            parse_result.as_ref(),
-            position,
-            content,
-        );
-        let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
-            panic!("expected Version context, got {context:?}");
-        };
-        let direct = eco
-            .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
-            .await;
-        let via_dispatch = eco
-            .generate_completions(parse_result.as_ref(), position, content, freshness)
-            .await;
-        assert_eq!(via_dispatch.items, direct);
-        assert!(!direct.is_empty());
+        #[tokio::test]
+        async fn test_generate_completions_package_name_context_below_length_guard_is_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = DartEcosystem::new(cache);
+            let content = "name: my_app\ndependencies:\n  h: ^1.0.0\n";
+            let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position = Position::new(2, 3); // cursor right after "h"
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+            let deps_core::completion::CompletionContext::PackageName { prefix, range } = context
+            else {
+                panic!("expected PackageName context, got {context:?}");
+            };
+            let direct = eco.complete_package_names(&prefix, range).await;
+            let via_dispatch = eco
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+        }
+
+        #[tokio::test]
+        async fn test_generate_completions_none_context_returns_empty() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = DartEcosystem::new(cache);
+            let content = "name: my_app\n";
+            let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let result = eco
+                .generate_completions(
+                    parse_result.as_ref(),
+                    Position::new(0, 0),
+                    content,
+                    deps_core::FreshnessSettings::default(),
+                )
+                .await;
+            assert_eq!(result, Completions::default());
+        }
+
+        /// CI-enforced (not `#[ignore]`d) counterpart to the happy-path test below: exercises the
+        /// same dispatch path (`package_name`/`prefix` threaded from the resolved `Version`
+        /// context to `complete_versions`) the ignored test below leaves uncovered in an ordinary
+        /// CI run, but against a mocked 404 rather than the live `pub.dev` (#1038) — a regression
+        /// that makes zero requests (and so also produces an empty result) can no longer pass
+        /// vacuously, since `mock.assert_async()` requires the request to actually have been made.
+        ///
+        /// `.expect(2)`, not `.expect_at_least(1)`: this test calls both `complete_versions`
+        /// directly and `generate_completions` (which must dispatch to the same
+        /// `complete_versions`), and `HttpCache` never caches a non-2xx response (a 404 becomes
+        /// `DepsError::HttpStatus`, never stored) — so exactly 2 requests reach the mock on the
+        /// unregressed path. A regression that dropped the `generate_completions` dispatch would
+        /// leave the mock at 1 hit, which `.expect_at_least(1)` alone would not catch.
+        #[tokio::test]
+        async fn test_generate_completions_version_context_unknown_package_is_empty() {
+            let mut server = mockito::Server::new_async().await;
+            let mock = server
+                .mock("GET", "/packages/this_package_does_not_exist_12345")
+                .with_status(404)
+                .expect(2)
+                .create_async()
+                .await;
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = PubDevRegistry::with_base(Arc::clone(&cache), server.url());
+            let eco = DartEcosystem::with_registry_for_test(registry);
+            let content =
+                "name: my_app\ndependencies:\n  this_package_does_not_exist_12345: ^1.0.0\n";
+            let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies()[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+            let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+                panic!("expected Version context, got {context:?}");
+            };
+            let direct = eco
+                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .await;
+            let via_dispatch = eco
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
+            mock.assert_async().await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(direct.is_empty());
+        }
+
+        /// #793 S1: pins that a `Version` context threads `package_name`/`prefix` through to
+        /// `complete_versions` — requires live network for a real, non-empty result (pub.dev has
+        /// no offline test seam here), mirroring this codebase's existing convention for
+        /// completion tests that need a genuine registry round-trip.
+        #[tokio::test]
+        #[ignore = "requires network access"]
+        async fn test_generate_completions_version_context_dispatches_to_registry() {
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let eco = DartEcosystem::new(cache);
+            let content = "name: my_app\ndependencies:\n  http: ^1.0.0\n";
+            let uri = deps_core::test_util::test_uri("/test/pubspec.yaml");
+            let parse_result = eco.parse_manifest(content, &uri).await.unwrap();
+            let position: Position = parse_result.dependencies()[0]
+                .version_range()
+                .unwrap()
+                .start
+                .into();
+            let freshness = deps_core::FreshnessSettings::default();
+
+            let context = deps_core::completion::detect_completion_context(
+                parse_result.as_ref(),
+                position,
+                content,
+            );
+            let deps_core::completion::CompletionContext::Version { prefix, .. } = context else {
+                panic!("expected Version context, got {context:?}");
+            };
+            let direct = eco
+                .complete_versions(parse_result.as_ref(), position, &prefix, freshness)
+                .await;
+            let via_dispatch = eco
+                .generate_completions(parse_result.as_ref(), position, content, freshness)
+                .await;
+            assert_eq!(via_dispatch.items, direct);
+            assert!(!direct.is_empty());
+        }
     }
 }
