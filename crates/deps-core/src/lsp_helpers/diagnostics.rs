@@ -2448,10 +2448,70 @@ fn apply_yanked_only_rule(
 /// gated on `ctx.freshness.enabled` + `package_versions.published_at` +
 /// `is_within_cooldown(age, cooldown_secs)`; **severity is identical in both cases**
 /// (already the floor — see the module docs).
-// TODO(critic): a semver range that already admits a flagged/unverified latest (e.g. `^1.0.4`
-// with no lockfile, registry latest 1.0.8 flagged) renders `UpToDate`/no diagnostic here, since
-// this rule only fires on `RequirementStatus::Outdated` — surface `LatestVerdict::Flagged`
-// for a requirement that admits a flagged latest too (#1517 D1).
+///
+/// `RequirementStatus::UpToDate` is not simply "nothing to report" (#1526, resolving the
+/// `#1517 D1` TODO formerly here): see
+/// [`push_flagged_latest_admitted_by_requirement`], consulted before returning in that case.
+///
+/// #1526: a declared requirement can already admit `latest` (so `requirement_status_for`
+/// returns `UpToDate`, not `Outdated`) while `latest` itself is [`LatestVerdict::Flagged`] —
+/// e.g. `^1.0.4` with no lock file, where the registry's `latest` is `1.0.8`, itself flagged
+/// malicious. Before this fix `apply_outdated_rule` returned immediately in this branch,
+/// so the flagged verdict already sitting in `ctx.versions.latest_status` (populated by phase
+/// B for every dependency, not only ones already `Outdated`) was never surfaced: no
+/// diagnostic, and the inlay-hint/up-to-date rendering showed a plain checkmark.
+///
+/// Deliberately scoped to [`LatestVerdict::Flagged`] only, not [`LatestVerdict::Unverified`]:
+/// `Unverified` is the common, transient state for every dependency before phase B first
+/// completes, and introducing a brand-new diagnostic on every up-to-date dependency during
+/// that window would be a broad noise regression — unlike the `Outdated` branch above, where
+/// `Unverified` only adjusts the wording of a diagnostic that was already firing regardless.
+// TODO(critic): UpToDate + attempted-but-failed Unverified latest is never surfaced
+fn push_flagged_latest_admitted_by_requirement(
+    diagnostics: &mut Vec<Diagnostic>,
+    ctx: &RuleContext<'_>,
+    resolved: &ResolvedData<'_>,
+    vuln_keys: Option<&crate::osv::VulnKeys>,
+    latest: &str,
+) {
+    let verdict = crate::lsp_helpers::latest_verdict(
+        ctx.versions.latest_status,
+        ctx.dep,
+        vuln_keys,
+        ctx.normalized_name,
+        latest,
+    );
+    let LatestVerdict::Flagged {
+        advisory_ids,
+        malicious,
+    } = verdict
+    else {
+        return;
+    };
+
+    let ids = if advisory_ids.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", advisory_ids.join(", "))
+    };
+    let latest = sanitize_and_truncate_for_diagnostic(latest, MAX_VERSION_DIAGNOSTIC_CHARS);
+    let severity = if malicious {
+        Severity::Error
+    } else {
+        Severity::Warning
+    };
+    diagnostics.push(
+        Diagnostic::new(
+            resolved.version_range,
+            format!(
+                "This requirement already admits {latest}{ids}, which OSV.dev flags as \
+                 vulnerable/malicious"
+            ),
+        )
+        .with_severity(severity),
+    );
+}
+
 fn apply_outdated_rule(
     diagnostics: &mut Vec<Diagnostic>,
     ctx: &RuleContext<'_>,
@@ -2470,6 +2530,15 @@ fn apply_outdated_rule(
     };
 
     if status != RequirementStatus::Outdated {
+        if status == RequirementStatus::UpToDate {
+            push_flagged_latest_admitted_by_requirement(
+                diagnostics,
+                ctx,
+                resolved,
+                vuln_keys,
+                latest.as_str(),
+            );
+        }
         return;
     }
 
@@ -6222,6 +6291,122 @@ mod tests {
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
         assert!(diagnostics[0].message().contains("flagged by OSV"));
+    }
+
+    /// Issue #1526: a caret requirement already admits `latest` (`requirement_status_for`
+    /// returns `UpToDate`, not `Outdated`), but `latest` itself is OSV-flagged malicious —
+    /// `apply_outdated_rule` must not return silently in the `UpToDate` branch.
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_flagged_malicious_renders_error() {
+        use crate::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "^1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "feed-widget-helper".into(),
+            PackageVersions {
+                latest: "1.0.8".into(),
+                available: Arc::from(vec!["1.0.8".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: None,
+                gossip_excluded_version: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Some(Severity::Error));
+        assert!(
+            diagnostics[0].message().contains("already admits"),
+            "got: {}",
+            diagnostics[0].message()
+        );
+        assert!(diagnostics[0].message().contains("1.0.8"));
+        assert!(diagnostics[0].message().contains("MAL-2026-16332"));
+    }
+
+    /// Sibling to the malicious case above: a `Flagged` but non-malicious verdict on an
+    /// already-admitted `latest` renders at Warning, not Error — matching the `Outdated`
+    /// branch's severity split.
+    #[test]
+    fn test_generate_diagnostics_up_to_date_admitted_latest_flagged_non_malicious_renders_warning()
+    {
+        use crate::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use crate::position::{Position, Range};
+        use std::collections::HashMap;
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg".into(),
+                version_req: "^1.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert("pkg".into(), PackageVersions::latest_only("1.5.0"));
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.5.0".to_string(),
+                advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
+                worst_severity: Some(VulnSeverity::High),
+            },
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Some(Severity::Warning));
+        assert!(diagnostics[0].message().contains("already admits"));
     }
 
     /// Issue #1517 AC4: a `latest_status` map with no entry for this dependency (the

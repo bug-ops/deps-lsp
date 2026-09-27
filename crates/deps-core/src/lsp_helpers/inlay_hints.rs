@@ -185,18 +185,48 @@ pub fn generate_inlay_hints(
         let mut flagged_tooltip: Option<String> = None;
         let label_text = match status {
             RequirementStatus::UpToDate => {
-                if config.show_up_to_date_hints {
-                    if let Some(resolved) = &resolved_version {
-                        format!(
-                            "{} {}",
-                            config.up_to_date_text,
-                            sanitize_hint_version(resolved.as_str())
-                        )
-                    } else {
-                        config.up_to_date_text.clone()
-                    }
-                } else {
+                if !config.show_up_to_date_hints {
                     continue;
+                }
+                // #1526: a requirement can already admit `latest` (so `UpToDate`, not
+                // `Outdated`) while `latest` itself is flagged — mirrors the `Outdated` arm's
+                // identical `latest_verdict` check below, so this always-visible surface never
+                // shows a plain checkmark for a range that already admits an OSV-flagged
+                // version. Deliberately gated on `Flagged` only (not `Unverified`) — see
+                // `diagnostics.rs`'s `push_flagged_latest_admitted_by_requirement` for why.
+                let verdict = latest_verdict(
+                    versions.latest_status,
+                    dep,
+                    vuln_keys.as_ref(),
+                    normalized_name.as_str(),
+                    latest.as_str(),
+                );
+                if let LatestVerdict::Flagged {
+                    advisory_ids,
+                    malicious,
+                } = verdict
+                {
+                    let icon = if malicious { "🚫" } else { "⚠️" };
+                    flagged_tooltip = Some(if advisory_ids.is_empty() {
+                        "This requirement already admits a version OSV.dev flags — do not \
+                         rely on it being safe"
+                            .to_string()
+                    } else {
+                        format!(
+                            "This requirement already admits a version OSV.dev flags ({}) — \
+                             do not rely on it being safe",
+                            advisory_ids.join(", ")
+                        )
+                    });
+                    format!("{icon} {}", sanitize_hint_version(latest.as_str()))
+                } else if let Some(resolved) = &resolved_version {
+                    format!(
+                        "{} {}",
+                        config.up_to_date_text,
+                        sanitize_hint_version(resolved.as_str())
+                    )
+                } else {
+                    config.up_to_date_text.clone()
                 }
             }
             RequirementStatus::Outdated => {
@@ -535,6 +565,82 @@ mod tests {
                 );
                 assert!(text.contains("1.0.8"), "got: {text}");
                 assert!(text.contains("flagged"), "got: {text}");
+            }
+            InlayHintLabel::LabelParts(_) => panic!("Expected string label"),
+        }
+        match &hints[0].tooltip {
+            Some(InlayHintTooltip::String(tooltip)) => {
+                assert!(tooltip.contains("MAL-2026-16332"), "got: {tooltip}");
+            }
+            other => panic!("expected a tooltip naming the advisory, got: {other:?}"),
+        }
+    }
+
+    /// Issue #1526: a caret requirement already admits `latest` (`UpToDate`, not `Outdated`),
+    /// but `latest` itself is OSV-flagged malicious — the inlay hint must not render a plain
+    /// up-to-date checkmark for it.
+    #[test]
+    fn test_inlay_hint_up_to_date_admitted_latest_flagged_by_osv_uses_distinct_label_and_tooltip() {
+        use crate::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use std::collections::HashMap;
+        use tower_lsp_server::ls_types::{Position, Range};
+
+        let formatter = MOCK_FORMATTER;
+        let config = EcosystemConfig {
+            show_up_to_date_hints: true,
+            up_to_date_text: "✅".to_string(),
+            needs_update_text: "❌ {}".to_string(),
+            loading_text: "⏳".to_string(),
+            show_loading_hints: true,
+            offline: false,
+        };
+
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "feed-widget-helper".into(),
+                version_req: "^1.0.4".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)).into(),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)).into(),
+            }],
+            uri: crate::test_util::test_uri("/test/package.json"),
+        };
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "feed-widget-helper".into(),
+            PackageVersions::latest_only("1.0.8"),
+        );
+        // No lock file / resolved version — status comes from `requirement_status_for`
+        // admitting `1.0.8` under `^1.0.4`, not from a resolved==latest comparison.
+        let resolved_versions = HashMap::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+
+        let hints = generate_inlay_hints(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_latest_status(&latest_status),
+            crate::LoadingState::Loaded,
+            &config,
+            &formatter,
+        );
+
+        assert_eq!(hints.len(), 1);
+        match &hints[0].label {
+            InlayHintLabel::String(text) => {
+                assert!(
+                    !text.starts_with('✅'),
+                    "must not use the plain up-to-date badge: {text}"
+                );
+                assert!(text.contains("1.0.8"), "got: {text}");
             }
             InlayHintLabel::LabelParts(_) => panic!("Expected string label"),
         }

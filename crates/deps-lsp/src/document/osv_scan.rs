@@ -354,7 +354,10 @@ pub(crate) async fn run_osv_phase_b_and_commit(
     // vulnerable subset. `vuln_keys` is recomputed fresh here (cheap, pure) rather than
     // carried from phase A, since it must reflect the document as of *this* snapshot, not
     // phase A's possibly-earlier one.
-    let (targets, mut latest_status) = {
+    //
+    // B.1b (#1524): candidate-check rounds for the same snapshot, sharing this one
+    // `vuln_keys`/`parse_result`/`cached_versions` read rather than a second document lookup.
+    let (targets, mut latest_status, candidate_rounds, mut candidate_status) = {
         let Some(doc) = state.get_document(uri) else {
             return;
         };
@@ -368,12 +371,20 @@ pub(crate) async fn run_osv_phase_b_and_commit(
             formatter,
             ecosystem_id,
         );
-        deps_engine::classify::osv::build_latest_check_targets(
+        let (targets, latest_status) = deps_engine::classify::osv::build_latest_check_targets(
             parse_result,
             &doc.signals.cached_versions,
             &vuln_keys,
             formatter,
-        )
+        );
+        let (candidate_rounds, candidate_status) =
+            deps_engine::classify::osv::build_candidate_check_targets(
+                parse_result,
+                &doc.signals.cached_versions,
+                &vuln_keys,
+                formatter,
+            );
+        (targets, latest_status, candidate_rounds, candidate_status)
     };
 
     if !targets.is_empty() {
@@ -385,6 +396,12 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         latest_status.extend(checked);
     }
 
+    // B.2 runs before the B.1b candidate rounds below (impl-critic S1): both draw from the
+    // same shared `phase_b_deadline`, and B.2 verifies the recommended-fix quickfix's target F
+    // — an existing, higher-value feature than #1524's new candidate rounds. Running the
+    // rounds first could starve B.2's budget on a cold cache/large manifest, making the
+    // Fix-Vulnerability quickfix silently disappear; ordering B.2 first means only the newer
+    // feature ever degrades under time pressure, never the older one.
     if !vulnerable_keys.is_empty() {
         run_osv_fix_target_verification(
             &mut result.vulnerabilities,
@@ -399,18 +416,99 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         .await;
     }
 
-    if let Some(mut doc) = state.documents.get_mut(uri) {
+    // First commit (impl-critic S1): `vulnerabilities`/`latest_status` land as soon as B.1/B.2
+    // finish, independent of how long the B.1b candidate rounds below take — hover/diagnostics
+    // consume these two, not `candidate_status`, so gating their staleness on an unrelated,
+    // newer (#1524) check would only make already-stale-feeling data stay stale longer.
+    //
+    // Impl-critic N1: also the early-exit gate for the candidate rounds below. A document that
+    // is already stale here (or has been closed entirely) will be stale for the second commit
+    // too — nothing has happened in between that could make it fresh again — so there is no
+    // point spending a further 6 rounds of OSV network calls whose result is guaranteed to be
+    // discarded.
+    let stale = if let Some(mut doc) = state.documents.get_mut(uri) {
         if doc.content != result.content_snapshot {
             tracing::debug!("dropping stale OSV scan result: document content changed mid-scan");
+            true
         } else if doc.signals.resolved_versions_generation != result.resolved_generation {
             // Issue #1395 critic S3: `content` alone can't order two racing phase-A/B
             // pairs whose resolved-version snapshots differ (e.g. a lock-file-only
             // reload racing a slower manifest-edit scan) — a newer `update_resolved_versions`
             // call landed on this document after this scan's snapshot was taken.
             tracing::debug!("dropping stale OSV scan result: resolved versions changed mid-scan");
+            true
         } else {
             doc.update_vulnerabilities(result.vulnerabilities);
             doc.update_latest_status(latest_status);
+            false
+        }
+    } else {
+        // Document closed entirely — nothing to commit, and nothing to check candidates for.
+        true
+    };
+    if stale {
+        return;
+    }
+
+    // B.1b (#1524): one round trip per candidate-version rank, each batched across every
+    // dependency that has a rank-th non-yanked version — never more than one target per
+    // `VulnKey` per round, so `check_candidates` never collapses two of one dependency's own
+    // candidates together. Runs after B.1/B.2 commit above (impl-critic S1) and concurrently
+    // across rounds (`join_all`, not sequential `.await`s): the rounds are independent of each
+    // other, so running them one at a time would multiply phase B's worst-case wall-clock time
+    // for no correctness benefit — they still share `phase_b_deadline`'s remaining budget, just
+    // spend it in parallel instead of serially.
+    let round_results =
+        futures::future::join_all(candidate_rounds.into_iter().filter_map(|round| {
+            if round.is_empty() {
+                return None;
+            }
+            let timeout_duration = phase_b_deadline.saturating_duration_since(Instant::now());
+            Some(async move {
+                state
+                    .osv
+                    .check_candidates(ecosystem_id, &round, timeout_duration)
+                    .await
+            })
+        }))
+        .await;
+    for checked in round_results {
+        for (key, status) in checked {
+            let version = match &status {
+                deps_core::osv::UpgradeStatus::CandidateClean { version }
+                | deps_core::osv::UpgradeStatus::CandidateVulnerable { version, .. }
+                | deps_core::osv::UpgradeStatus::CandidateUnverified { version, .. } => {
+                    version.clone()
+                }
+                // `check_candidates` never returns `NotChecked` — a target it could not
+                // resolve at all becomes `CandidateUnverified` instead (see its own doc).
+                // `#[non_exhaustive]` requires this wildcard even though every real variant
+                // is already matched above (`NotChecked` included); a future new variant with
+                // no known version string here is nothing to record, not a bug.
+                _ => continue,
+            };
+            candidate_status
+                .entry(key)
+                .or_default()
+                .insert(version, status);
+        }
+    }
+
+    // Second commit (impl-critic S1): `candidate_status` alone, gated by the same staleness
+    // guard as the first commit — a slow candidate round never delays the primary commit
+    // above, and re-checking staleness here (rather than reusing a flag from the first commit)
+    // catches a document change that landed *between* the two commits too.
+    if let Some(mut doc) = state.documents.get_mut(uri) {
+        if doc.content != result.content_snapshot {
+            tracing::debug!(
+                "dropping stale OSV candidate-status result: document content changed mid-scan"
+            );
+        } else if doc.signals.resolved_versions_generation != result.resolved_generation {
+            tracing::debug!(
+                "dropping stale OSV candidate-status result: resolved versions changed mid-scan"
+            );
+        } else {
+            doc.update_candidate_status(candidate_status);
         }
     }
 }

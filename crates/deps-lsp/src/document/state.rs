@@ -515,6 +515,15 @@ impl DocumentState {
         self.signals.latest_status = latest_status;
     }
 
+    /// Updates phase B's per-(dependency, candidate-version) check result (#1524) — the same
+    /// full-replace contract [`Self::update_latest_status`] has.
+    pub fn update_candidate_status(
+        &mut self,
+        candidate_status: deps_core::osv::CandidateStatusMap,
+    ) {
+        self.signals.candidate_status = candidate_status;
+    }
+
     /// Full-replace update of [`PackageSignals::licenses`] — every existing entry is discarded and
     /// replaced with exactly `licenses`, the same "one background task owns the whole
     /// map" contract [`Self::update_vulnerabilities`] has for `vulnerabilities`.

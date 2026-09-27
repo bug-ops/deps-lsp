@@ -50,6 +50,7 @@ pub async fn handle_code_actions(
                 .with_resolved_version_candidates()
                 .with_vulnerabilities()
                 .with_latest_status(vulnerabilities_enabled && !offline)
+                .with_candidate_status(vulnerabilities_enabled && !offline)
                 .with_outcomes()
                 .finish();
             Some((
@@ -1033,6 +1034,17 @@ serde = "0.9.0"
                 };
 
                 let (client, config) = create_test_client_and_config();
+                // This test is about canonical-URI edit keying, not OSV verification — with
+                // vulnerability checking on by default (#1517/#1524), every REFACTOR item
+                // would otherwise fail closed as `Unverified` (no `latest_status`/
+                // `candidate_status` entry is ever populated here), leaving `result` empty
+                // regardless of canonicalization and defeating this test's own purpose.
+                config
+                    .write()
+                    .await
+                    .policy
+                    .diagnostics
+                    .vulnerabilities_enabled = false;
                 let result = handle_code_actions(state, params, client, config).await;
 
                 let has_correctly_keyed_edit = result.iter().any(|action| {
@@ -1051,6 +1063,125 @@ serde = "0.9.0"
                      by the canonical Uri: {result:?}"
                 );
             }
+        }
+
+        /// Impl-critic S3 (#1524): guards the actual `.with_candidate_status(...)` call site in
+        /// `handle_code_actions` itself, not just the downstream `candidate_verdict` gate at
+        /// the `deps-core::lsp_helpers::code_actions` unit level (which only ever sees whatever
+        /// `VersionData` a caller happens to pass in, so it can't catch a dropped wiring call
+        /// here). A dropped `.with_candidate_status(...)` would silently fail *open*:
+        /// `candidate_verdict` reads a `None` map as `NotApplicable`, which offers every
+        /// candidate, not `Unverified`.
+        #[tokio::test]
+        async fn test_handle_code_actions_candidate_status_gates_non_latest_refactor_items() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            use deps_core::osv::{CandidateStatusMap, UpgradeStatus};
+
+            let content = "[dependencies]\nserde = \"0.9.0\"\n".to_string();
+
+            /// Runs `handle_code_actions` against a fresh document/state and returns every
+            /// REFACTOR action's title (which is exactly the offered version string, "(latest)"
+            /// suffix included for that one item — see `generate_code_actions`'s REFACTOR-loop
+            /// `title: item.label`).
+            async fn refactor_titles(
+                content: &str,
+                vulnerabilities_enabled: bool,
+                populate_candidate: Option<&str>,
+            ) -> Vec<String> {
+                let state = Arc::new(ServerState::new());
+                let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+                let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+                let ecosystem = state
+                    .ecosystem_registry
+                    .get(deps_core::EcosystemId::Cargo)
+                    .unwrap();
+                let parse_result = ecosystem
+                    .parse_manifest(content, &url)
+                    .await
+                    .expect("Failed to parse manifest");
+                let mut doc_state = DocumentState::new_from_parse_result(
+                    EcosystemId::Cargo,
+                    content.to_string(),
+                    parse_result,
+                );
+                if let Some(version) = populate_candidate {
+                    let mut candidate_status = CandidateStatusMap::new();
+                    candidate_status.insert(
+                        deps_core::test_util::vuln_key("serde"),
+                        std::iter::once((
+                            version.to_string(),
+                            UpgradeStatus::CandidateClean {
+                                version: version.to_string(),
+                            },
+                        ))
+                        .collect(),
+                    );
+                    doc_state.signals.candidate_status = candidate_status;
+                }
+                state.update_document(uri.clone(), doc_state);
+
+                let params = CodeActionParams {
+                    text_document: TextDocumentIdentifier { uri },
+                    range: Range::new(Position::new(1, 9), Position::new(1, 16)),
+                    context: Default::default(),
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+                let (client, config) = create_test_client_and_config();
+                config
+                    .write()
+                    .await
+                    .policy
+                    .diagnostics
+                    .vulnerabilities_enabled = vulnerabilities_enabled;
+                let result = handle_code_actions(state, params, client, config).await;
+                result
+                    .into_iter()
+                    .filter_map(|action| {
+                        let CodeActionOrCommand::CodeAction(action) = action else {
+                            return None;
+                        };
+                        (action.kind == Some(CodeActionKind::REFACTOR)).then_some(action.title)
+                    })
+                    .collect()
+            }
+
+            // (a) Vulnerabilities on, `candidate_status` left at its unpopulated default: every
+            // REFACTOR item — including the one identified as latest, equally unpopulated via
+            // `latest_status` — must fail closed and be excluded entirely.
+            let gated_titles = refactor_titles(&content, true, None).await;
+            assert!(
+                gated_titles.is_empty(),
+                "an unpopulated candidate_status/latest_status must exclude every REFACTOR \
+                 item: {gated_titles:?}"
+            );
+
+            // Discover a real, live-registry-reported non-latest version to mark clean without
+            // hardcoding one that will go stale as crates.io publishes new serde releases:
+            // vulnerabilities off entirely means every item passes through unconditionally
+            // (pre-#1517/#1524 behavior), so pick any one that isn't the "(latest)" item.
+            let unfiltered_titles = refactor_titles(&content, false, None).await;
+            let some_non_latest_version = unfiltered_titles
+                .iter()
+                .find(|title| !title.ends_with(" (latest)"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected at least one non-latest REFACTOR item from a live registry \
+                         fetch to test against: {unfiltered_titles:?}"
+                    )
+                })
+                .clone();
+
+            // (b) That exact version marked `CandidateClean`: it must now be offered again,
+            // proving the populated map path (not just the fail-closed default) is reached
+            // through this same handler-level wiring.
+            let cleared_titles =
+                refactor_titles(&content, true, Some(&some_non_latest_version)).await;
+            assert!(
+                cleared_titles.contains(&some_non_latest_version),
+                "a version marked CandidateClean in candidate_status must be offered again: \
+                 expected {some_non_latest_version:?} in {cleared_titles:?}"
+            );
         }
     }
 

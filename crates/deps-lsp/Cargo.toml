@@ -50,6 +50,7 @@ deps-engine = { workspace = true, features = ["lsp-responses"] }
 
 # External dependencies
 dashmap = { workspace = true }
+futures = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "io-std"] }
@@ -70,7 +71,6 @@ deps-deno = { workspace = true, features = ["lsp-responses"] }
 deps-github-actions = { workspace = true, features = ["lsp-responses"] }
 deps-gitlab-ci = { workspace = true, features = ["lsp-responses"] }
 deps-npm = { workspace = true, features = ["lsp-responses"] }
-futures = { workspace = true }
 insta = { workspace = true, features = ["json"] }
 mockito = { workspace = true }
 tempfile = { workspace = true }
