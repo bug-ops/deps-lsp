@@ -1705,7 +1705,7 @@ pub(super) struct OsvSingleQueryResponse {
     pub(super) next_page_token: Option<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub(super) struct OsvVulnRecord {
     pub(super) id: String,
     #[serde(default)]
@@ -1722,7 +1722,7 @@ pub(super) struct OsvVulnRecord {
     pub(super) affected: Vec<OsvAffected>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct OsvSeverityEntry {
     #[serde(rename = "type", default)]
     pub(super) kind: String,
@@ -1730,7 +1730,7 @@ pub(super) struct OsvSeverityEntry {
     pub(super) score: String,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub(super) struct OsvAffected {
     /// Which package this entry describes. A single OSV record can cover
     /// several packages sharing one advisory id (e.g. a GHSA affecting both
@@ -1781,7 +1781,7 @@ pub(super) enum OsvRangeType {
     Unknown,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub(super) struct OsvRange {
     #[serde(rename = "type", default)]
     pub(super) range_type: OsvRangeType,
@@ -1789,7 +1789,7 @@ pub(super) struct OsvRange {
     pub(super) events: Vec<OsvEvent>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub(super) struct OsvEvent {
     #[serde(default)]
     pub(super) fixed: Option<String>,
