@@ -415,7 +415,8 @@ impl OsvNaming for ComposerFormatter {
     /// This is the mirror image of NuGet: there, lowercasing kills the
     /// ecosystem; here, *not* lowercasing does (OSV is case-sensitive for
     /// every ecosystem except PyPI).
-    #[cfg(feature = "lsp-responses")]
+    ///
+    /// Must stay ungated: this is plain OSV-classification logic reachable from `deps-cli`, not LSP-response code (#1545).
     fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
         Some(self.normalize_package_name(dep.name()))
     }
