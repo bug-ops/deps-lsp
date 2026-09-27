@@ -2081,45 +2081,8 @@ mod tests {
     /// the test suite.
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_zero_max_concurrent_still_completes() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
-
-        struct InstantRegistry;
-
-        impl Registry for InstantRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let registry: Arc<dyn Registry> = Arc::new(InstantRegistry);
+        use deps_core::Registry;
+        let registry: Arc<dyn Registry> = Arc::new(deps_core::test_util::MockRegistry::new());
         let packages = vec![PackageName::new("some-package")];
 
         let result = tokio::time::timeout(
@@ -2149,28 +2112,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_partial_success_with_mixed_outcomes() {
+        use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
         use std::time::Duration;
-
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-
-            fn is_prerelease(&self) -> bool {
-                false
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct MixedOutcomeRegistry;
 
@@ -2182,9 +2127,12 @@ mod tests {
             {
                 Box::pin(async move {
                     match name.as_str() {
-                        "package-fast" => Ok(vec![Box::new(MockVersion {
-                            version: "1.0.0".into(),
-                        }) as Box<dyn Version>]),
+                        "package-fast" => {
+                            Ok(vec![
+                                Box::new(MockVersion::new("1.0.0").with_prerelease(false))
+                                    as Box<dyn Version>,
+                            ])
+                        }
                         "package-slow" => {
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             Ok(vec![])
@@ -2206,9 +2154,9 @@ mod tests {
             {
                 Box::pin(async move {
                     match name.as_str() {
-                        "package-fast" => Ok(Some(Box::new(MockVersion {
-                            version: "1.0.0".into(),
-                        }) as Box<dyn Version>)),
+                        "package-fast" => Ok(Some(Box::new(
+                            MockVersion::new("1.0.0").with_prerelease(false),
+                        ) as Box<dyn Version>)),
                         "package-slow" => {
                             tokio::time::sleep(Duration::from_secs(10)).await;
                             Ok(None)
@@ -2296,85 +2244,15 @@ mod tests {
     /// requirement that is satisfiable only by a yanked version.
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_carries_yanked_flag_into_cache() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
+        use deps_core::Registry;
+        use deps_core::test_util::MockVersion;
 
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-            yanked: bool,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn removal_status(&self) -> deps_core::RemovalStatus {
-                deps_core::RemovalStatus::from_yanked(self.yanked)
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct YankedRegistry;
-
-        impl Registry for YankedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![
-                        Box::new(MockVersion {
-                            version: "1.0.214".into(),
-                            yanked: false,
-                        }) as Box<dyn Version>,
-                        Box::new(MockVersion {
-                            version: "1.0.213".into(),
-                            yanked: true,
-                        }) as Box<dyn Version>,
-                    ])
-                })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn select_latest_matching(
-                &self,
-                versions: &[Box<dyn Version>],
-                _req: &deps_core::VersionReq,
-                _selection_context: &deps_core::SelectionContext,
-            ) -> Option<usize> {
-                versions
-                    .iter()
-                    .position(|v| !v.removal_status().blocks_resolution())
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let registry: Arc<dyn Registry> = Arc::new(YankedRegistry);
+        let registry: Arc<dyn Registry> = Arc::new(
+            deps_core::test_util::MockRegistry::new().with_versions(vec![
+                MockVersion::new("1.0.214"),
+                MockVersion::new("1.0.213").yanked(true),
+            ]),
+        );
         let packages = vec![PackageName::new("serde")];
 
         let result = fetch_latest_versions_parallel(
@@ -2421,94 +2299,20 @@ mod tests {
     /// are set from the same `Box<dyn Version>` in the same match arm.
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_carries_published_at_for_latest_only() {
+        use deps_core::Registry;
         use deps_core::freshness::PublishTime;
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
+        use deps_core::test_util::MockVersion;
 
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-            yanked: bool,
-            published_at: Option<PublishTime>,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn removal_status(&self) -> deps_core::RemovalStatus {
-                deps_core::RemovalStatus::from_yanked(self.yanked)
-            }
-            fn published_at(&self) -> Option<PublishTime> {
-                self.published_at
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        struct DatedRegistry;
-
-        impl Registry for DatedRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move {
-                    Ok(vec![
-                        Box::new(MockVersion {
-                            version: "1.0.214".into(),
-                            yanked: false,
-                            published_at: Some(PublishTime::from_unix_secs(2_000)),
-                        }) as Box<dyn Version>,
-                        Box::new(MockVersion {
-                            version: "1.0.213".into(),
-                            yanked: true,
-                            // Deliberately a different timestamp — proves the fetch loop
-                            // never accidentally attaches this entry's age to `latest`.
-                            published_at: Some(PublishTime::from_unix_secs(1_000)),
-                        }) as Box<dyn Version>,
-                    ])
-                })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn select_latest_matching(
-                &self,
-                versions: &[Box<dyn Version>],
-                _req: &deps_core::VersionReq,
-                _selection_context: &deps_core::SelectionContext,
-            ) -> Option<usize> {
-                versions
-                    .iter()
-                    .position(|v| !v.removal_status().blocks_resolution())
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let registry: Arc<dyn Registry> = Arc::new(DatedRegistry);
+        let registry: Arc<dyn Registry> = Arc::new(
+            deps_core::test_util::MockRegistry::new().with_versions(vec![
+                MockVersion::new("1.0.214").with_published_at(PublishTime::from_unix_secs(2_000)),
+                // Deliberately a different timestamp — proves the fetch loop never
+                // accidentally attaches this entry's age to `latest`.
+                MockVersion::new("1.0.213")
+                    .yanked(true)
+                    .with_published_at(PublishTime::from_unix_secs(1_000)),
+            ]),
+        );
         let packages = vec![PackageName::new("serde")];
 
         let result = fetch_latest_versions_parallel(
@@ -2547,26 +2351,9 @@ mod tests {
     /// accidentally overwrite real data with a spurious empty entry.
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_carries_license_into_fetch_result() {
+        use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
-
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-            license: Vec<String>,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-            fn license(&self) -> &[String] {
-                &self.license
-            }
-        }
 
         struct LicensedRegistry;
 
@@ -2582,10 +2369,10 @@ mod tests {
                     vec![]
                 };
                 Box::pin(async move {
-                    Ok(vec![Box::new(MockVersion {
-                        version: "1.0.0".into(),
-                        license,
-                    }) as Box<dyn Version>])
+                    Ok(vec![
+                        Box::new(MockVersion::new("1.0.0").with_license(license))
+                            as Box<dyn Version>,
+                    ])
                 })
             }
 
@@ -2661,26 +2448,9 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_uses_get_versions_with_for_freshness() {
         use deps_core::freshness::{FreshnessSettings, PublishTime};
+        use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
-
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-            published_at: Option<PublishTime>,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn published_at(&self) -> Option<PublishTime> {
-                self.published_at
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct FreshnessAwareRegistry;
 
@@ -2693,10 +2463,7 @@ mod tests {
                 // Deliberately returns no `published_at` — if the fetch loop ever calls
                 // this instead of `get_versions_with`, the assertion below catches it.
                 Box::pin(async move {
-                    Ok(vec![Box::new(MockVersion {
-                        version: "1.0.0".into(),
-                        published_at: None,
-                    }) as Box<dyn Version>])
+                    Ok(vec![Box::new(MockVersion::new("1.0.0")) as Box<dyn Version>])
                 })
             }
 
@@ -2706,14 +2473,15 @@ mod tests {
                 freshness: FreshnessSettings,
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
-                Box::pin(async move {
-                    Ok(vec![Box::new(MockVersion {
-                        version: "1.0.0".into(),
-                        published_at: freshness
-                            .is_enabled()
-                            .then(|| PublishTime::from_unix_secs(5_000)),
-                    }) as Box<dyn Version>])
-                })
+                let version = MockVersion::new("1.0.0");
+                let version = match freshness
+                    .is_enabled()
+                    .then(|| PublishTime::from_unix_secs(5_000))
+                {
+                    Some(published_at) => version.with_published_at(published_at),
+                    None => version,
+                };
+                Box::pin(async move { Ok(vec![Box::new(version) as Box<dyn Version>]) })
             }
 
             fn get_latest_matching<'a>(
@@ -2785,23 +2553,10 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_select_latest_matching()
      {
+        use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, StabilityFloor, Version};
         use std::any::Any;
         use std::sync::Mutex;
-
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct ContextAwareRegistry {
             // Records every `minimum_stability` value observed, in call order — an empty
@@ -2816,9 +2571,7 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Ok(vec![Box::new(MockVersion {
-                        version: "1.0.0".into(),
-                    }) as Box<dyn Version>])
+                    Ok(vec![Box::new(MockVersion::new("1.0.0")) as Box<dyn Version>])
                 })
             }
 
@@ -2896,23 +2649,10 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_latest_versions_parallel_threads_minimum_stability_into_get_latest_matching_fallback()
      {
+        use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, StabilityFloor, Version};
         use std::any::Any;
         use std::sync::Mutex;
-
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         struct FallbackContextAwareRegistry {
             // Records every `minimum_stability` value observed, in call order — an empty
@@ -2943,9 +2683,9 @@ mod tests {
                     .unwrap_or_else(|p| p.into_inner())
                     .push(selection_context.minimum_stability());
                 Box::pin(async move {
-                    Ok(Some(Box::new(MockVersion {
-                        version: "2.0.0-beta1".into(),
-                    }) as Box<dyn Version>))
+                    Ok(Some(
+                        Box::new(MockVersion::new("2.0.0-beta1")) as Box<dyn Version>
+                    ))
                 })
             }
 
@@ -3003,22 +2743,9 @@ mod tests {
     /// fall back to the registry's own `get_latest_matching`.
     #[tokio::test]
     async fn test_fetch_falls_back_to_get_latest_matching_when_list_based_pick_finds_nothing() {
+        use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Registry, Version};
         use std::any::Any;
-
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         /// Mimics an untagged Go module: `get_versions` (the list endpoint) is empty, but
         /// `get_latest_matching` (a different, more complete endpoint) still resolves a
@@ -3044,9 +2771,10 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Ok(Some(Box::new(MockVersion {
-                        version: "v0.0.0-20191109021931-daa7c04131f5".into(),
-                    }) as Box<dyn Version>))
+                    Ok(Some(
+                        Box::new(MockVersion::new("v0.0.0-20191109021931-daa7c04131f5"))
+                            as Box<dyn Version>,
+                    ))
                 })
             }
 
@@ -3389,45 +3117,9 @@ mod tests {
     /// it out and returns `Ok(vec![])`.
     #[tokio::test]
     async fn test_fetch_success_with_zero_versions_is_recorded_as_no_comparable_versions() {
-        use deps_core::{Metadata, Registry, Version};
-        use std::any::Any;
+        use deps_core::Registry;
 
-        struct EmptyButRealRegistry;
-
-        impl Registry for EmptyButRealRegistry {
-            fn get_versions<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn get_latest_matching<'a>(
-                &'a self,
-                _name: &'a deps_core::PackageName,
-                _req: &'a deps_core::VersionReq,
-                _selection_context: &'a deps_core::SelectionContext,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Option<Box<dyn Version>>>>
-            {
-                Box::pin(async move { Ok(None) })
-            }
-
-            fn search_raw<'a>(
-                &'a self,
-                _query: &'a str,
-                _limit: usize,
-            ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Metadata>>>>
-            {
-                Box::pin(async move { Ok(vec![]) })
-            }
-
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
-
-        let registry: Arc<dyn Registry> = Arc::new(EmptyButRealRegistry);
+        let registry: Arc<dyn Registry> = Arc::new(deps_core::test_util::MockRegistry::new());
         let packages = vec![PackageName::new("dtolnay/rust-toolchain")];
 
         let result = fetch_latest_versions_parallel(
@@ -4007,27 +3699,10 @@ mod tests {
     }
     mod yanked_check_tests {
         use super::*;
+        use deps_core::test_util::MockVersion;
         use deps_core::{Metadata, Version};
         use std::any::Any;
         use std::sync::atomic::{AtomicUsize, Ordering};
-
-        #[derive(Debug, Clone)]
-        struct MockYankVersion {
-            version: ConcreteVersion,
-            yanked: bool,
-        }
-
-        impl Version for MockYankVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn removal_status(&self) -> deps_core::RemovalStatus {
-                deps_core::RemovalStatus::from_yanked(self.yanked)
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         /// Per-package outcome for the primary (and, under #206, only)
         /// `get_versions` fetch.
@@ -4066,10 +3741,7 @@ mod tests {
                         Some(FetchOutcome::Versions(vs)) => Ok(vs
                             .iter()
                             .map(|(v, y)| {
-                                Box::new(MockYankVersion {
-                                    version: (*v).into(),
-                                    yanked: *y,
-                                }) as Box<dyn Version>
+                                Box::new(MockVersion::new(*v).yanked(*y)) as Box<dyn Version>
                             })
                             .collect()),
                         Some(FetchOutcome::Error) => Err(deps_core::error::DepsError::CacheError(
@@ -4104,12 +3776,8 @@ mod tests {
             {
                 let outcome = self.latest_fallback.get(name.as_str()).copied();
                 Box::pin(async move {
-                    Ok(outcome.map(|(v, y)| {
-                        Box::new(MockYankVersion {
-                            version: v.into(),
-                            yanked: y,
-                        }) as Box<dyn Version>
-                    }))
+                    Ok(outcome
+                        .map(|(v, y)| Box::new(MockVersion::new(v).yanked(y)) as Box<dyn Version>))
                 })
             }
 
@@ -4407,10 +4075,9 @@ mod tests {
             ) -> deps_core::ecosystem::BoxFuture<'a, deps_core::Result<Vec<Box<dyn Version>>>>
             {
                 Box::pin(async move {
-                    Ok(vec![Box::new(MockYankVersion {
-                        version: "1.0.0".into(),
-                        yanked: true,
-                    }) as Box<dyn Version>])
+                    Ok(vec![
+                        Box::new(MockVersion::new("1.0.0").yanked(true)) as Box<dyn Version>
+                    ])
                 })
             }
 
@@ -4696,7 +4363,7 @@ mod tests {
 
     /// #205: the `fetch_latest_versions_parallel` wiring that derives `FetchResult::deprecations`
     /// from the `resolved`/"latest" pick, self-contained rather than extending
-    /// `yanked_check_tests`'s shared `MockYankVersion`/`FetchOutcome` (whose tuple shape has
+    /// `yanked_check_tests`'s shared `MockRegistry`/`FetchOutcome` (whose tuple shape has
     /// no room for a per-version `Deprecation` payload without touching its many existing
     /// call sites).
     mod deprecation_derivation_tests {
@@ -4834,25 +4501,11 @@ mod tests {
     /// rather than the private [`fetch_and_classify_package`] directly.
     mod gossip_cooldown_filter_tests {
         use super::*;
-        use deps_core::test_util::stub_gossip_findings;
+        use deps_core::test_util::{MockVersion, stub_gossip_findings};
         use deps_core::{
             GossipCooldown, GossipRiskLevel, Metadata, PublishTime, Registry, Version,
         };
         use std::any::Any;
-
-        #[derive(Debug)]
-        struct MockVersion {
-            version: ConcreteVersion,
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         /// Returns a fixed, newest-first version list regardless of the queried package name.
         ///
@@ -4920,7 +4573,7 @@ mod tests {
                 Box::pin(async move {
                     Ok(versions
                         .into_iter()
-                        .map(|v| Box::new(MockVersion { version: v.into() }) as Box<dyn Version>)
+                        .map(|v| Box::new(MockVersion::new(v)) as Box<dyn Version>)
                         .collect())
                 })
             }
@@ -4938,8 +4591,7 @@ mod tests {
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let fallback = self.fallback;
                 Box::pin(async move {
-                    Ok(fallback
-                        .map(|v| Box::new(MockVersion { version: v.into() }) as Box<dyn Version>))
+                    Ok(fallback.map(|v| Box::new(MockVersion::new(v)) as Box<dyn Version>))
                 })
             }
 
@@ -5333,55 +4985,9 @@ mod tests {
     /// entry point `gossip_cooldown_filter_tests` uses for its sibling spec 074 feature.
     mod cooldown_fallback_tests {
         use super::*;
-        use deps_core::{PublishTime, Registry, RemovalStatus, Version};
+        use deps_core::test_util::MockVersion;
+        use deps_core::{PublishTime, Registry, Version};
         use std::any::Any;
-
-        #[derive(Debug, Clone)]
-        struct MockVersion {
-            version: ConcreteVersion,
-            published_at: Option<PublishTime>,
-            removal_status: RemovalStatus,
-            prerelease: bool,
-        }
-
-        impl MockVersion {
-            fn new(version: &str, published_at: PublishTime) -> Self {
-                Self {
-                    version: version.into(),
-                    published_at: Some(published_at),
-                    removal_status: RemovalStatus::Available,
-                    prerelease: false,
-                }
-            }
-
-            fn yanked(mut self) -> Self {
-                self.removal_status = RemovalStatus::Yanked;
-                self
-            }
-
-            fn prerelease(mut self) -> Self {
-                self.prerelease = true;
-                self
-            }
-        }
-
-        impl Version for MockVersion {
-            fn version_string(&self) -> &ConcreteVersion {
-                &self.version
-            }
-            fn published_at(&self) -> Option<PublishTime> {
-                self.published_at
-            }
-            fn removal_status(&self) -> RemovalStatus {
-                self.removal_status
-            }
-            fn is_prerelease(&self) -> bool {
-                self.prerelease
-            }
-            fn as_any(&self) -> &dyn Any {
-                self
-            }
-        }
 
         /// A fixed, newest-first version list — `select_latest_matching` mirrors a real
         /// ecosystem's own selection rules (skip yanked/prerelease), same contract
@@ -5564,9 +5170,13 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60); // cleared
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old).yanked(),
-                MockVersion::new("1.0.0", old).yanked(),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0")
+                    .with_published_at(old)
+                    .yanked(true),
+                MockVersion::new("1.0.0")
+                    .with_published_at(old)
+                    .yanked(true),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.0.0"], cooldown_secs)
@@ -5591,9 +5201,9 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.0.0"], cooldown_secs)
@@ -5620,10 +5230,12 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60); // cleared
 
             let versions = vec![
-                MockVersion::new("0.23.0-rc.1", recent).prerelease(),
-                MockVersion::new("0.22.8", recent),
-                MockVersion::new("0.22.7", old),
-                MockVersion::new("0.22.6", old), // in-use floor
+                MockVersion::new("0.23.0-rc.1")
+                    .with_published_at(recent)
+                    .with_prerelease(true),
+                MockVersion::new("0.22.8").with_published_at(recent),
+                MockVersion::new("0.22.7").with_published_at(old),
+                MockVersion::new("0.22.6").with_published_at(old), // in-use floor
             ];
 
             let package_versions = fetch_pkg(versions, vec!["0.22.6"], cooldown_secs)
@@ -5652,10 +5264,12 @@ mod tests {
             let older = PublishTime::from_unix_secs(now.as_unix_secs() - 31 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("2.0.0", recent), // fresh, not cooled
-                MockVersion::new("2.0.0-rc.1", old).prerelease(), // cooled, but a prerelease
-                MockVersion::new("1.9.0", older),  // cooled, stable
-                MockVersion::new("1.8.0", older),  // in-use floor
+                MockVersion::new("2.0.0").with_published_at(recent), // fresh, not cooled
+                MockVersion::new("2.0.0-rc.1")
+                    .with_published_at(old)
+                    .with_prerelease(true), // cooled, but a prerelease
+                MockVersion::new("1.9.0").with_published_at(older),  // cooled, stable
+                MockVersion::new("1.8.0").with_published_at(older),  // in-use floor
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.8.0"], cooldown_secs)
@@ -5683,8 +5297,8 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(versions, Vec::new(), cooldown_secs)
@@ -5710,8 +5324,8 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(
@@ -5747,9 +5361,9 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
 
             // The lockfile/manifest pin is the non-normalized bare "1.0" — the registry's own
@@ -5780,9 +5394,9 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60); // cleared
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg_with_registry(
@@ -5818,8 +5432,8 @@ mod tests {
             // `latest` (1.2.0) is itself already cooldown-cleared, so the gate must skip the
             // scan entirely rather than compute a (redundant) fallback below it.
             let versions = vec![
-                MockVersion::new("1.2.0", old),
-                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.2.0").with_published_at(old),
+                MockVersion::new("1.1.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.1.0"], cooldown_secs)
@@ -5845,8 +5459,8 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", old),
-                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.2.0").with_published_at(old),
+                MockVersion::new("1.1.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.1.0"], cooldown_secs)
@@ -5883,8 +5497,8 @@ mod tests {
             let one_day_ago = PublishTime::from_unix_secs(now.as_unix_secs() - 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", one_day_ago),
-                MockVersion::new("1.1.0", one_day_ago),
+                MockVersion::new("1.2.0").with_published_at(one_day_ago),
+                MockVersion::new("1.1.0").with_published_at(one_day_ago),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.1.0"], fetch_cooldown_secs)
@@ -5930,9 +5544,9 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg_with_registry(
@@ -5985,10 +5599,10 @@ mod tests {
             // locally within cooldown once substituted in as `latest`), "1.5.0" (cleared, the
             // expected fallback), "1.0.0" (the in-use floor).
             let versions = vec![
-                MockVersion::new("3.0.0", recent),
-                MockVersion::new("2.0.0", recent),
-                MockVersion::new("1.5.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("3.0.0").with_published_at(recent),
+                MockVersion::new("2.0.0").with_published_at(recent),
+                MockVersion::new("1.5.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
             let mut gossip = HashMap::new();
             gossip.insert(

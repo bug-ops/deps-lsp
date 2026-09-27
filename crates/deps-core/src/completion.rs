@@ -2147,51 +2147,7 @@ mod tests {
         }
     }
 
-    struct MockVersion {
-        version: ConcreteVersion,
-        yanked: bool,
-        prerelease: bool,
-    }
-
-    impl crate::registry::Version for MockVersion {
-        fn version_string(&self) -> &ConcreteVersion {
-            &self.version
-        }
-
-        fn removal_status(&self) -> crate::RemovalStatus {
-            crate::RemovalStatus::from_yanked(self.yanked)
-        }
-
-        fn is_prerelease(&self) -> bool {
-            self.prerelease
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
-
-    /// A [`MockVersion`] variant that reports a `published_at`, used only by the
-    /// freshness-specific tests below — kept separate so the many pre-existing
-    /// `MockVersion` literals do not need a new field added to every call site.
-    struct MockVersionWithAge {
-        version: ConcreteVersion,
-        published_at: Option<PublishTime>,
-    }
-
-    impl crate::registry::Version for MockVersionWithAge {
-        fn version_string(&self) -> &ConcreteVersion {
-            &self.version
-        }
-
-        fn published_at(&self) -> Option<PublishTime> {
-            self.published_at
-        }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-    }
+    use crate::test_util::MockVersion;
 
     #[derive(Clone)]
     struct MockMetadata {
@@ -2241,13 +2197,8 @@ mod tests {
             let versions: Vec<Box<dyn crate::Version>> = self
                 .versions
                 .iter()
-                .map(|v| {
-                    Box::new(MockVersion {
-                        version: v.version.clone(),
-                        yanked: v.yanked,
-                        prerelease: v.prerelease,
-                    }) as Box<dyn crate::Version>
-                })
+                .cloned()
+                .map(|v| Box::new(v) as Box<dyn crate::Version>)
                 .collect();
             Box::pin(async move { Ok(versions) })
         }
@@ -3991,11 +3942,9 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_stable() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("1.0.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, false);
@@ -4012,11 +3961,9 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_with_replacement_sets_text_edit_and_filter_text() {
-        let version = MockVersion {
-            version: "1.2.3".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("1.2.3")
+            .yanked(false)
+            .with_prerelease(false);
         let range = Range {
             start: Position::new(3, 6),
             end: Position::new(3, 17),
@@ -4051,11 +3998,9 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_without_replacement_omits_filter_text_and_format() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("1.0.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, false);
@@ -4067,11 +4012,9 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_latest() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("1.0.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
@@ -4088,11 +4031,9 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_not_latest() {
-        let version = MockVersion {
-            version: "0.9.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("0.9.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let now = PublishTime::now();
         let display_item = VersionDisplayItem::new(&version, &pkg("tokio"), 1, false);
@@ -4108,21 +4049,15 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_sort_order() {
-        let v1 = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
-        let v2 = MockVersion {
-            version: "0.9.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
-        let v3 = MockVersion {
-            version: "0.8.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let v1 = MockVersion::new("1.0.0")
+            .yanked(false)
+            .with_prerelease(false);
+        let v2 = MockVersion::new("0.9.0")
+            .yanked(false)
+            .with_prerelease(false);
+        let v3 = MockVersion::new("0.8.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let display_item1 = VersionDisplayItem::new(&v1, &pkg("test"), 0, true);
         let display_item2 = VersionDisplayItem::new(&v2, &pkg("test"), 1, false);
@@ -4147,21 +4082,15 @@ mod tests {
     #[test]
     fn test_version_completion_semantic_ordering() {
         let versions = [
-            MockVersion {
-                version: "0.14.0".into(),
-                yanked: false,
-                prerelease: false,
-            },
-            MockVersion {
-                version: "0.8.0".into(),
-                yanked: false,
-                prerelease: false,
-            },
-            MockVersion {
-                version: "0.2.0".into(),
-                yanked: false,
-                prerelease: false,
-            },
+            MockVersion::new("0.14.0")
+                .yanked(false)
+                .with_prerelease(false),
+            MockVersion::new("0.8.0")
+                .yanked(false)
+                .with_prerelease(false),
+            MockVersion::new("0.2.0")
+                .yanked(false)
+                .with_prerelease(false),
         ];
 
         let now = PublishTime::now();
@@ -4200,11 +4129,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(idx, ver)| {
-                let v = MockVersion {
-                    version: (*ver).into(),
-                    yanked: false,
-                    prerelease: false,
-                };
+                let v = MockVersion::new(*ver).yanked(false).with_prerelease(false);
                 let display_item = VersionDisplayItem::new(&v, &pkg("test"), idx, idx == 0);
                 build_version_completion(&display_item, None, now, FreshnessSettings::default())
             })
@@ -4233,11 +4158,9 @@ mod tests {
 
     #[test]
     fn test_version_display_item_latest() {
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("1.0.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
@@ -4250,11 +4173,9 @@ mod tests {
 
     #[test]
     fn test_version_display_item_not_latest() {
-        let version = MockVersion {
-            version: "0.9.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("0.9.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let item = VersionDisplayItem::new(&version, &pkg("tokio"), 1, false);
 
@@ -4268,21 +4189,21 @@ mod tests {
     #[test]
     fn test_prepare_version_display_items_filters_yanked() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "1.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "0.9.0".into(),
-                yanked: true,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "0.8.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("0.9.0")
+                    .yanked(true)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("0.8.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
         ];
 
         let items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
@@ -4300,11 +4221,11 @@ mod tests {
     fn test_prepare_version_display_items_limits_to_5() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = (0..10)
             .map(|i| {
-                std::sync::Arc::new(MockVersion {
-                    version: format!("1.0.{}", i).into(),
-                    yanked: false,
-                    prerelease: false,
-                }) as std::sync::Arc<dyn crate::Version>
+                std::sync::Arc::new(
+                    MockVersion::new(format!("1.0.{}", i))
+                        .yanked(false)
+                        .with_prerelease(false),
+                ) as std::sync::Arc<dyn crate::Version>
             })
             .collect();
 
@@ -4329,16 +4250,16 @@ mod tests {
     #[test]
     fn test_prepare_version_display_items_all_yanked() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "1.0.0".into(),
-                yanked: true,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "0.9.0".into(),
-                yanked: true,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("1.0.0")
+                    .yanked(true)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("0.9.0")
+                    .yanked(true)
+                    .with_prerelease(false),
+            ),
         ];
 
         let items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
@@ -4352,21 +4273,21 @@ mod tests {
         // (#952) — even when that index isn't 0, e.g. because the registry ranked a
         // pre-release below a stable release in its own `select_latest_matching`.
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "13.0.5-beta1".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "13.0.4".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "13.0.3".into(),
-                yanked: false,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("13.0.5-beta1")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("13.0.4")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("13.0.3")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
         ];
 
         let items = prepare_version_display_items(&versions, &pkg("test"), Some(1));
@@ -4385,12 +4306,11 @@ mod tests {
     fn test_prepare_version_display_items_none_latest_idx_tags_nothing() {
         // A registry-delegated pick of `None` (e.g. every candidate filtered/exhausted)
         // must not fall back to tagging raw index 0.
-        let versions: Vec<std::sync::Arc<dyn crate::Version>> =
-            vec![std::sync::Arc::new(MockVersion {
-                version: "1.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            })];
+        let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![std::sync::Arc::new(
+            MockVersion::new("1.0.0")
+                .yanked(false)
+                .with_prerelease(false),
+        )];
 
         let items = prepare_version_display_items(&versions, &pkg("test"), None);
 
@@ -4404,21 +4324,21 @@ mod tests {
         // `latest_idx` refers to a position in the *pre-filter* `versions` slice; this
         // function's own internal yanked filter must not shift which entry it points to.
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0".into(),
-                yanked: true,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.9.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.8.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0")
+                    .yanked(true)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.9.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.8.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
         ];
 
         // Caller picked pre-filter index 2 ("1.8.0") as latest.
@@ -4439,36 +4359,36 @@ mod tests {
     #[test]
     fn test_prepare_version_display_items_bumps_pick_outside_raw_order_window() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc5".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc4".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc3".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc2".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc1".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc5")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc4")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc3")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc2")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc1")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
         ];
 
         let items = prepare_version_display_items(&versions, &pkg("test"), Some(5));
@@ -4496,31 +4416,31 @@ mod tests {
     #[test]
     fn test_prepare_version_display_items_pick_at_last_window_slot_not_bumped() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc4".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc3".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc2".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "2.0.0-rc1".into(),
-                yanked: false,
-                prerelease: true,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc4")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc3")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc2")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("2.0.0-rc1")
+                    .yanked(false)
+                    .with_prerelease(true),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
         ];
 
         let items = prepare_version_display_items(&versions, &pkg("test"), Some(4));
@@ -4543,41 +4463,41 @@ mod tests {
     #[test]
     fn test_prepare_version_display_items_pick_filtered_out_with_many_survivors() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "9.9.9".into(),
-                yanked: true,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.6.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.5.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.4.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.3.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.2.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "1.1.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("9.9.9")
+                    .yanked(true)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.6.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.5.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.4.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.3.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.2.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("1.1.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
         ];
 
         // The registry picked the yanked raw-index-0 entry as "latest" — an edge case
@@ -4621,11 +4541,11 @@ mod tests {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = specs
             .into_iter()
             .map(|(version, yanked, prerelease)| {
-                std::sync::Arc::new(MockVersion {
-                    version: version.into(),
-                    yanked,
-                    prerelease,
-                }) as std::sync::Arc<dyn crate::Version>
+                std::sync::Arc::new(
+                    MockVersion::new(version)
+                        .yanked(yanked)
+                        .with_prerelease(prerelease),
+                ) as std::sync::Arc<dyn crate::Version>
             })
             .collect();
 
@@ -5069,26 +4989,18 @@ mod tests {
     async fn test_complete_versions_generic_operator_stripping() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "1.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "1.0.1".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "1.1.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "2.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("1.0.1")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("1.1.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("2.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5163,16 +5075,12 @@ mod tests {
     async fn test_complete_versions_generic_prefix_matches_v_tagged_version() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "v4.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "v3.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("v4.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("v3.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5232,11 +5140,11 @@ mod tests {
     #[tokio::test]
     async fn test_complete_versions_generic_preserves_prefix_v_style_on_insert() {
         let registry = MockRegistry {
-            versions: vec![MockVersion {
-                version: "v4.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }],
+            versions: vec![
+                MockVersion::new("v4.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ],
         };
 
         let items = complete_versions_generic_from(
@@ -5273,11 +5181,11 @@ mod tests {
     #[tokio::test]
     async fn test_complete_versions_generic_preserves_prefix_v_style_with_leading_operator() {
         let registry = MockRegistry {
-            versions: vec![MockVersion {
-                version: "v4.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }],
+            versions: vec![
+                MockVersion::new("v4.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ],
         };
 
         let items = complete_versions_generic_from(
@@ -5309,11 +5217,11 @@ mod tests {
     #[tokio::test]
     async fn test_complete_versions_generic_default_completion_style_hook_is_identity() {
         let registry = MockRegistry {
-            versions: vec![MockVersion {
-                version: "1.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }],
+            versions: vec![
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ],
         };
 
         let items = complete_versions_generic_from(
@@ -5352,16 +5260,12 @@ mod tests {
     async fn test_complete_versions_generic_operator_stripping_composer_not_equal() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "1.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "2.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("2.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5388,16 +5292,12 @@ mod tests {
     async fn test_complete_versions_generic_replacing_threads_replacement_into_every_item() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "1.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "1.0.1".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("1.0.1")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
         let range = Range {
@@ -5443,11 +5343,11 @@ mod tests {
     #[tokio::test]
     async fn test_complete_versions_generic_replacing_drops_unsafe_version_before_render() {
         let registry = MockRegistry {
-            versions: vec![MockVersion {
-                version: "1.0.0</version><parent><groupId>evil".into(),
-                yanked: false,
-                prerelease: false,
-            }],
+            versions: vec![
+                MockVersion::new("1.0.0</version><parent><groupId>evil")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ],
         };
         let replacement = VersionReplacement {
             range: Range::default(),
@@ -5551,11 +5451,11 @@ mod tests {
         ) -> crate::ecosystem::BoxFuture<'a, crate::error::Result<Vec<Box<dyn crate::Version>>>>
         {
             Box::pin(async move {
-                Ok(vec![Box::new(MockVersion {
-                    version: "9.9.9".into(),
-                    yanked: false,
-                    prerelease: false,
-                }) as Box<dyn crate::Version>])
+                Ok(vec![Box::new(
+                    MockVersion::new("9.9.9")
+                        .yanked(false)
+                        .with_prerelease(false),
+                ) as Box<dyn crate::Version>])
             })
         }
 
@@ -5575,11 +5475,11 @@ mod tests {
                 "1.0.0"
             };
             Box::pin(async move {
-                Ok(vec![Box::new(MockVersion {
-                    version: version.into(),
-                    yanked: false,
-                    prerelease: false,
-                }) as Box<dyn crate::Version>])
+                Ok(vec![Box::new(
+                    MockVersion::new(version)
+                        .yanked(false)
+                        .with_prerelease(false),
+                ) as Box<dyn crate::Version>])
             })
         }
 
@@ -5653,26 +5553,18 @@ mod tests {
     async fn test_complete_versions_generic_fallback_when_no_prefix_match() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "1.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "1.1.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "2.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "2.1.0".into(),
-                    yanked: true, // Yanked version
-                    prerelease: false,
-                },
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("1.1.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("2.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("2.1.0")
+                    .yanked(true)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5716,21 +5608,15 @@ mod tests {
     async fn test_complete_versions_generic_filters_yanked_in_prefix_match() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "1.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "1.0.1".into(),
-                    yanked: true, // Yanked version
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "1.0.2".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("1.0.1")
+                    .yanked(true)
+                    .with_prerelease(false),
+                MockVersion::new("1.0.2")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5758,16 +5644,12 @@ mod tests {
         // registry-reported version, the same untrusted source as the REFACTOR code-action loop.
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "1.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "1.0.1\", \"evil\": \"true".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("1.0.1\", \"evil\": \"true")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5796,10 +5678,10 @@ mod tests {
     #[tokio::test]
     async fn test_complete_versions_generic_limit_5() {
         let versions: Vec<_> = (0..10)
-            .map(|i| MockVersion {
-                version: format!("1.0.{}", i).into(),
-                yanked: false,
-                prerelease: false,
+            .map(|i| {
+                MockVersion::new(format!("1.0.{}", i))
+                    .yanked(false)
+                    .with_prerelease(false)
             })
             .collect();
 
@@ -5826,21 +5708,15 @@ mod tests {
     async fn test_complete_versions_generic_go_no_operators() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "v1.9.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "v1.9.1".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "v1.10.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("v1.9.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("v1.9.1")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("v1.10.0")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5869,21 +5745,15 @@ mod tests {
         // `Registry::select_latest_matching`, not raw index 0.
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "13.0.5-beta1".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
-                MockVersion {
-                    version: "13.0.4".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
-                MockVersion {
-                    version: "13.0.3".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("13.0.5-beta1")
+                    .yanked(false)
+                    .with_prerelease(true),
+                MockVersion::new("13.0.4")
+                    .yanked(false)
+                    .with_prerelease(false),
+                MockVersion::new("13.0.3")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -5922,16 +5792,12 @@ mod tests {
         // hover's fallback (ranking the newest overall) rather than tagging nothing.
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "2.0.0-beta2".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
-                MockVersion {
-                    version: "2.0.0-beta1".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
+                MockVersion::new("2.0.0-beta2")
+                    .yanked(false)
+                    .with_prerelease(true),
+                MockVersion::new("2.0.0-beta1")
+                    .yanked(false)
+                    .with_prerelease(true),
             ],
         };
 
@@ -6010,43 +5876,29 @@ mod tests {
     async fn test_complete_versions_generic_from_bump_survives_prefix_filtering() {
         let registry = MockRegistry {
             versions: vec![
-                MockVersion {
-                    version: "2.0.0-rc5".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
-                MockVersion {
-                    version: "2.0.0-rc4".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
-                MockVersion {
-                    version: "2.0.0-rc3".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
-                MockVersion {
-                    version: "2.0.0-rc2".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
-                MockVersion {
-                    version: "2.0.0-rc1".into(),
-                    yanked: false,
-                    prerelease: true,
-                },
-                MockVersion {
-                    version: "2.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("2.0.0-rc5")
+                    .yanked(false)
+                    .with_prerelease(true),
+                MockVersion::new("2.0.0-rc4")
+                    .yanked(false)
+                    .with_prerelease(true),
+                MockVersion::new("2.0.0-rc3")
+                    .yanked(false)
+                    .with_prerelease(true),
+                MockVersion::new("2.0.0-rc2")
+                    .yanked(false)
+                    .with_prerelease(true),
+                MockVersion::new("2.0.0-rc1")
+                    .yanked(false)
+                    .with_prerelease(true),
+                MockVersion::new("2.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
                 // Does not match the "2." prefix below, so it must not affect the
                 // prefix-narrowed slice's own bump computation.
-                MockVersion {
-                    version: "1.0.0".into(),
-                    yanked: false,
-                    prerelease: false,
-                },
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
             ],
         };
 
@@ -6381,10 +6233,8 @@ mod tests {
 
     #[test]
     fn test_version_display_item_captures_published_at() {
-        let version = MockVersionWithAge {
-            version: "1.0.0".into(),
-            published_at: Some(PublishTime::from_unix_secs(1_000)),
-        };
+        let version =
+            MockVersion::new("1.0.0").with_published_at(PublishTime::from_unix_secs(1_000));
 
         let item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
@@ -6395,11 +6245,9 @@ mod tests {
     fn test_version_display_item_published_at_none_when_unavailable() {
         // Plain `MockVersion` doesn't override `published_at`, so it falls back to
         // the `Version` trait's default `None` — the ecosystems-without-metadata case.
-        let version = MockVersion {
-            version: "1.0.0".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("1.0.0")
+            .yanked(false)
+            .with_prerelease(false);
 
         let item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
@@ -6410,10 +6258,7 @@ mod tests {
     fn test_build_version_completion_label_details_present_when_published_at_known() {
         let now = PublishTime::from_unix_secs(10_000);
         let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
-        let version = MockVersionWithAge {
-            version: "1.2.3".into(),
-            published_at: Some(published_two_hours_ago),
-        };
+        let version = MockVersion::new("1.2.3").with_published_at(published_two_hours_ago);
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
         let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
@@ -6433,10 +6278,7 @@ mod tests {
         // published_at is known — the escape hatch must be all-or-nothing.
         let now = PublishTime::from_unix_secs(10_000);
         let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
-        let version = MockVersionWithAge {
-            version: "1.2.3".into(),
-            published_at: Some(published_two_hours_ago),
-        };
+        let version = MockVersion::new("1.2.3").with_published_at(published_two_hours_ago);
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
         let item = build_version_completion(&display_item, None, now, FreshnessSettings::Disabled);
@@ -6446,11 +6288,9 @@ mod tests {
 
     #[test]
     fn test_build_version_completion_label_details_absent_when_published_at_unknown() {
-        let version = MockVersion {
-            version: "1.2.3".into(),
-            yanked: false,
-            prerelease: false,
-        };
+        let version = MockVersion::new("1.2.3")
+            .yanked(false)
+            .with_prerelease(false);
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
         let item = build_version_completion(
@@ -6471,10 +6311,7 @@ mod tests {
         let now = PublishTime::from_unix_secs(10_000);
         // 4 days ago — outside the default 3-day cooldown.
         let published = PublishTime::from_unix_secs(10_000 - 4 * 24 * 3600);
-        let version = MockVersionWithAge {
-            version: "1.2.3".into(),
-            published_at: Some(published),
-        };
+        let version = MockVersion::new("1.2.3").with_published_at(published);
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
         let item = build_version_completion(&display_item, None, now, FreshnessSettings::default());
@@ -6489,10 +6326,7 @@ mod tests {
     fn test_build_version_completion_respects_custom_cooldown_window() {
         let now = PublishTime::from_unix_secs(10_000);
         let published_two_hours_ago = PublishTime::from_unix_secs(10_000 - 2 * 3600);
-        let version = MockVersionWithAge {
-            version: "1.2.3".into(),
-            published_at: Some(published_two_hours_ago),
-        };
+        let version = MockVersion::new("1.2.3").with_published_at(published_two_hours_ago);
         let display_item = VersionDisplayItem::new(&version, &pkg("serde"), 0, true);
 
         let item = build_version_completion(
@@ -6516,21 +6350,21 @@ mod tests {
     #[test]
     fn test_build_version_completion_byte_identical_output_without_freshness_data() {
         let versions: Vec<std::sync::Arc<dyn crate::Version>> = vec![
-            std::sync::Arc::new(MockVersion {
-                version: "1.0.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "0.9.0".into(),
-                yanked: true,
-                prerelease: false,
-            }),
-            std::sync::Arc::new(MockVersion {
-                version: "0.8.0".into(),
-                yanked: false,
-                prerelease: false,
-            }),
+            std::sync::Arc::new(
+                MockVersion::new("1.0.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("0.9.0")
+                    .yanked(true)
+                    .with_prerelease(false),
+            ),
+            std::sync::Arc::new(
+                MockVersion::new("0.8.0")
+                    .yanked(false)
+                    .with_prerelease(false),
+            ),
         ];
 
         let display_items = prepare_version_display_items(&versions, &pkg("test"), Some(0));
