@@ -84,7 +84,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
-- **deps-core, deps-maven, deps-gradle, deps-nuget**: fix bounded version-range parser accepting min>max / degenerate zero-width ranges as satisfiable requirements (#1595)
+- **deps-core, deps-maven, deps-gradle, deps-nuget**: fix bounded version-range parser accepting min>max / degenerate zero-width ranges as satisfiable requirements (resolves #1595) (#1599)
 - **deps-maven**: cooldown-fallback guard now rejects a fallback candidate excluded by a disjoint-range gap (e.g. `[1.0,1.5),(1.5,2.0)`), Maven's only way to express a `!=`-style exclusion (resolves #1590) (#1594)
 - **deps-core, deps-pypi, deps-composer, deps-bundler**: cooldown-fallback guard now rejects a fallback candidate the declared requirement excludes via a `!=` term or a `||` gap (resolves #1571) (#1589)
 - **deps-composer**: cooldown-fallback guard's Composer re-parse is now deterministic instead of racing an async lockfile read (resolves #1570) (#1589)
