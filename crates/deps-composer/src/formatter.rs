@@ -86,63 +86,199 @@ impl RequirementMatcher for ComposerMatcher {
     }
 }
 
-/// Fix-cycle (#1571): mirrors [`ComposerFormatter::version_satisfies_requirement`]'s own
-/// OR/AND-splitting and `v`-prefix/stability-flag normalization, but only looks for a `!=`
-/// leaf that individually bans exactly `version`.
+/// Shared OR (`||`)/AND (whitespace)-splitting tree-walker for Composer's requirement
+/// grammar, including its `v`-prefix and `@stability`-flag stripping — the traversal
+/// [`ComposerFormatter::version_satisfies_requirement`] and [`composer_explicitly_excludes`]
+/// both need identically (PR #1589 had to fix the same `normalize_operator_spacing` spacing
+/// bug in both functions because they did not share this walker; #1591 extracted it).
 ///
-/// The intensional signal [`RequirementMatcher::explicitly_excludes`] needs, since scanning
-/// `available` for "does something newer also match" cannot distinguish a `!=`-punched hole
-/// from a fallback that legitimately exceeds the requirement's ceiling (both make
-/// `version_satisfies_requirement` return `false` identically).
-///
-/// Fix-cycle M2: an OR (`||`) excludes `version` when ANY branch individually excludes it via
-/// `!=`, not only when every branch does. The caller only ever asks this once
-/// `r0_matcher.matches(fallback) == Some(false)` already holds — i.e. no branch admits
-/// `fallback` at all — so a single branch's `!=` term naming it explicitly is enough signal:
-/// `^0.9 || >=1.0 !=1.5.0 <2.0` bans 1.5.0 in its second branch even though the first branch
-/// simply doesn't cover that range at all (an `all` reading would miss this, since the first
-/// branch never explicitly excludes anything).
-fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
+/// Only leaf evaluation and the AND-group's fold differ between the two callers — see
+/// [`RequirementLeaf`].
+fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &str) -> bool {
     let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
     let requirement = requirement.trim();
+    // Only strip when it leaves something behind — a bare "v"/"V" requirement must fall
+    // through to the exact/partial match, not collapse to "" and hit the wildcard guard below.
     let requirement = match requirement.strip_prefix(['v', 'V']) {
         Some(rest) if !rest.is_empty() => rest,
         _ => requirement,
     };
+    // Must run before the operator branches below see `requirement`, or a `@flag` is parsed
+    // as part of the numeric core (#424).
     let (requirement, _stability_flag) = strip_stability_flag(requirement);
     let requirement = requirement.trim();
 
     if requirement.is_empty() || requirement == "*" {
-        return false;
+        return leaf.on_wildcard();
     }
 
     if requirement.contains("||") {
         return requirement
             .split("||")
-            .any(|part| composer_explicitly_excludes(version, part.trim()));
+            .any(|part| walk_requirement(leaf, version, part.trim()));
     }
 
+    // Runs on every candidate version `ComposerMatcher::matches` checks; borrows unchanged
+    // when there is nothing to collapse, so the common no-spaced-operator case must not allocate.
     let requirement = normalize_operator_spacing(requirement);
     let requirement = &*requirement;
 
+    // Only treat as an AND-range if there are multiple space-separated tokens that look like
+    // constraints — a bare multi-word string (e.g. "1.0.0" alone) must not be split here.
     let parts: Vec<&str> = requirement.split_whitespace().collect();
     if parts.len() > 1
         && parts
             .iter()
             .any(|p| p.starts_with('>') || p.starts_with('<'))
     {
-        return parts
-            .iter()
-            .any(|part| composer_explicitly_excludes(version, part));
+        return leaf.combine_and(
+            parts
+                .iter()
+                .map(|part| walk_requirement(leaf, version, part)),
+        );
     }
 
-    if let Some(req) = requirement.strip_prefix("!=") {
+    leaf.eval_leaf(version, requirement)
+}
+
+/// A single non-combinator requirement clause's evaluation, plumbed into [`walk_requirement`].
+/// The OR/AND splitting and `v`-prefix/stability-flag normalization are identical for both
+/// [`ComposerFormatter::version_satisfies_requirement`]'s "does this admit `version`" question
+/// ([`AdmitLeaf`]) and [`composer_explicitly_excludes`]'s "does this explicitly ban `version`"
+/// question ([`ExcludeLeaf`]) — only what a leaf decides, and how an AND-group folds its
+/// clauses' results, differ.
+///
+/// The AND fold genuinely differs, not just the leaf: an "admit" AND-group needs every clause
+/// satisfied (`>=1.0 <2.0` requires both bounds), but an "exclude" AND-group only needs one
+/// `!=` clause to fire (`>=1.0 !=1.5.0 <2.0` bans 1.5.0 even though the range clauses never
+/// individually exclude anything) — an `all()` fold would miss this, since the range clauses
+/// never explicitly exclude anything on their own (fix-cycle #1571 M2).
+trait RequirementLeaf {
+    /// Result for an empty or `*` (wildcard) clause.
+    fn on_wildcard(&self) -> bool;
+
+    /// Evaluates one clause with no `||` and no multi-token AND group left to split.
+    fn eval_leaf(&self, version: &str, clause: &str) -> bool;
+
+    /// Folds an AND-separated clause group's per-clause results.
+    fn combine_and(&self, results: impl Iterator<Item = bool>) -> bool;
+}
+
+/// [`RequirementLeaf`] for "does this admit `version`" — Composer's full requirement grammar
+/// (`^`, `~`, `>=`/`<=`/`>`/`<`/`=`/`!=`, `X.Y.*` wildcard, exact/partial match).
+struct AdmitLeaf;
+
+impl RequirementLeaf for AdmitLeaf {
+    fn on_wildcard(&self) -> bool {
+        true
+    }
+
+    fn combine_and(&self, mut results: impl Iterator<Item = bool>) -> bool {
+        results.all(|r| r)
+    }
+
+    // `version.starts_with(prefix)` short-circuits before `prefix.len()` is used as a slice
+    // bound, so it is always a char boundary.
+    #[allow(clippy::string_slice)]
+    fn eval_leaf(&self, version: &str, requirement: &str) -> bool {
+        if let Some(req) = requirement.strip_prefix('^') {
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return satisfies_caret(version, req);
+        }
+
+        if let Some(req) = requirement.strip_prefix('~') {
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return satisfies_tilde_composer(version, req);
+        }
+
+        // `req` may itself be `v`-prefixed (e.g. ">=v1.0.0"); strip it independently of
+        // `walk_requirement`'s leading strip, or it falls into
+        // `split_composer_core_and_suffix`'s qualifier-suffix branch and compares as core `0`.
+        if let Some(req) = requirement.strip_prefix(">=") {
+            let req = req.trim();
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return compare_versions(version, req) >= 0;
+        }
+        if let Some(req) = requirement.strip_prefix("<=") {
+            let req = req.trim();
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return compare_versions(version, req) <= 0;
+        }
+        if let Some(req) = requirement.strip_prefix('>') {
+            let req = req.trim();
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return compare_versions(version, req) > 0;
+        }
+        if let Some(req) = requirement.strip_prefix('<') {
+            let req = req.trim();
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return compare_versions(version, req) < 0;
+        }
+        if let Some(req) = requirement.strip_prefix('=') {
+            let req = req.trim();
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return compare_versions(version, req) == 0;
+        }
+        if let Some(req) = requirement.strip_prefix("!=") {
+            let req = req.trim();
+            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+            return compare_versions(version, req) != 0;
+        }
+
+        if requirement.ends_with(".*") {
+            let prefix = requirement.trim_end_matches(".*");
+            return version.starts_with(prefix) && version[prefix.len()..].starts_with('.');
+        }
+
+        let req_parts: Vec<&str> = requirement.split('.').collect();
+        let ver_parts: Vec<&str> = version.split('.').collect();
+
+        if req_parts.len() == ver_parts.len() {
+            return version == requirement;
+        }
+
+        if req_parts.len() < ver_parts.len() {
+            return ver_parts.starts_with(&req_parts);
+        }
+
+        false
+    }
+}
+
+/// [`RequirementLeaf`] for "does this explicitly ban `version`" (fix-cycle #1571): only a
+/// `!=` leaf naming `version` exactly counts — every other clause shape has "no opinion"
+/// rather than affirmatively excluding anything, which is why its AND fold is `any()` rather
+/// than [`AdmitLeaf`]'s `all()`.
+///
+/// The intensional signal [`RequirementMatcher::explicitly_excludes`] needs, since scanning
+/// `available` for "does something newer also match" cannot distinguish a `!=`-punched hole
+/// from a fallback that legitimately exceeds the requirement's ceiling (both make
+/// `version_satisfies_requirement` return `false` identically).
+struct ExcludeLeaf;
+
+impl RequirementLeaf for ExcludeLeaf {
+    fn on_wildcard(&self) -> bool {
+        false
+    }
+
+    fn combine_and(&self, mut results: impl Iterator<Item = bool>) -> bool {
+        results.any(|r| r)
+    }
+
+    fn eval_leaf(&self, version: &str, requirement: &str) -> bool {
+        let Some(req) = requirement.strip_prefix("!=") else {
+            return false;
+        };
         let req = req.trim();
         let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-        return compare_versions(version, req) == 0;
+        compare_versions(version, req) == 0
     }
+}
 
-    false
+/// Thin [`walk_requirement`] wrapper for "does this explicitly ban `version`" — see
+/// [`ExcludeLeaf`].
+fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
+    walk_requirement(&ExcludeLeaf, version, requirement)
 }
 
 /// Composer-specific LSP formatting.
@@ -201,7 +337,7 @@ impl PackageRendering for ComposerFormatter {
     /// `v4.0.0-alpha1`), so without this override an unprefixed requirement like `3.28.0`
     /// would be rewritten to a `v`-prefixed one on every "update version" action even though
     /// Composer itself already strips `v`/`V` before comparing
-    /// (`version_satisfies_requirement`'s own leading strip above).
+    /// (`walk_requirement`'s own leading strip).
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
         match_v_prefix_style(current, version.as_str())
     }
@@ -270,131 +406,12 @@ impl RequirementResolution for ComposerFormatter {
     /// - `X.Y.*` — wildcard patch
     /// - `>=X <Y` — range (space = AND)
     /// - `X || Y` — OR combinator
-    // `version.starts_with(prefix)` short-circuits before `prefix.len()` is used as a slice
-    // bound, so it is always a char boundary.
-    #[allow(clippy::string_slice)]
+    ///
+    /// Delegates the OR/AND-splitting and `v`-prefix/`@stability`-flag normalization to the
+    /// shared `walk_requirement` tree-walker (see `AdmitLeaf` for this method's leaf
+    /// semantics).
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
-        let version = version.as_str();
-        let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
-        let requirement = requirement.trim();
-        // Composer's own version parser strips a leading `v`/`V` from every version string
-        // it normalizes, tags and constraints alike (case-insensitively, per
-        // `VersionParser::normalize()`'s `#^v#i` regex). Mirroring that only for `version`
-        // above and not here made an exact/wildcard/caret/tilde requirement pinned with a
-        // `v`/`V` prefix (e.g. `"v1.2.3"`, `"^v1.2.0"`) never match, since `version` had
-        // already lost its prefix while `requirement` had not. Only strip when it leaves
-        // something behind — a bare `"v"`/`"V"` requirement is not a valid version prefix
-        // and must fall through to the exact/partial match below (which correctly rejects
-        // it), rather than collapsing to `""` and being swallowed by the empty/wildcard
-        // guard next.
-        let requirement = match requirement.strip_prefix(['v', 'V']) {
-            Some(rest) if !rest.is_empty() => rest,
-            _ => requirement,
-        };
-        // A per-dependency `@stability` flag (`@stable`, `@RC`, `@beta`, `@alpha`, `@dev`) is
-        // a constraint-grammar element, not part of the version-range text — see
-        // `strip_stability_flag`. Must run before the range operators below see the
-        // requirement, or the flag text is parsed as part of the numeric core (#424).
-        let (requirement, _stability_flag) = strip_stability_flag(requirement);
-        let requirement = requirement.trim();
-
-        if requirement.is_empty() || requirement == "*" {
-            return true;
-        }
-
-        // OR combinator: "1.0 || 2.0"
-        if requirement.contains("||") {
-            return requirement.split("||").any(|part| {
-                self.version_satisfies_requirement(&ConcreteVersion::new(version), part.trim())
-            });
-        }
-
-        // Collapse whitespace between a range operator and its version (">= 1.0" ->
-        // ">=1.0") so the AND split below treats the operator and its version as one
-        // token instead of two separate (and individually meaningless) clauses. Borrows
-        // `requirement` unchanged when there is nothing to collapse — this runs on every
-        // candidate version `ComposerMatcher::matches` checks, so the common case (no
-        // spaced operators) must not allocate.
-        let requirement = normalize_operator_spacing(requirement);
-        let requirement = &*requirement;
-
-        // Range with AND (space-separated constraints like ">=1.0 <2.0")
-        // Only treat as AND if there are multiple space-separated tokens that look like constraints
-        let parts: Vec<&str> = requirement.split_whitespace().collect();
-        if parts.len() > 1
-            && parts
-                .iter()
-                .any(|p| p.starts_with('>') || p.starts_with('<'))
-        {
-            return parts.iter().all(|part| {
-                self.version_satisfies_requirement(&ConcreteVersion::new(version), part)
-            });
-        }
-
-        if let Some(req) = requirement.strip_prefix('^') {
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return satisfies_caret(version, req);
-        }
-
-        // Tilde operator — Composer-specific semantics
-        if let Some(req) = requirement.strip_prefix('~') {
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return satisfies_tilde_composer(version, req);
-        }
-
-        // Comparison operators. `req` may itself be `v`-prefixed (e.g. ">=v1.0.0"); strip it
-        // the same way the caret/tilde branches above do, so it does not fall into
-        // `split_composer_core_and_suffix`'s qualifier-suffix branch and compare as core `0`.
-        if let Some(req) = requirement.strip_prefix(">=") {
-            let req = req.trim();
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return compare_versions(version, req) >= 0;
-        }
-        if let Some(req) = requirement.strip_prefix("<=") {
-            let req = req.trim();
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return compare_versions(version, req) <= 0;
-        }
-        if let Some(req) = requirement.strip_prefix('>') {
-            let req = req.trim();
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return compare_versions(version, req) > 0;
-        }
-        if let Some(req) = requirement.strip_prefix('<') {
-            let req = req.trim();
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return compare_versions(version, req) < 0;
-        }
-        if let Some(req) = requirement.strip_prefix('=') {
-            let req = req.trim();
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return compare_versions(version, req) == 0;
-        }
-        if let Some(req) = requirement.strip_prefix("!=") {
-            let req = req.trim();
-            let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
-            return compare_versions(version, req) != 0;
-        }
-
-        // Wildcard: "1.0.*" means >=1.0.0 <1.1.0
-        if requirement.ends_with(".*") {
-            let prefix = requirement.trim_end_matches(".*");
-            return version.starts_with(prefix) && version[prefix.len()..].starts_with('.');
-        }
-
-        let req_parts: Vec<&str> = requirement.split('.').collect();
-        let ver_parts: Vec<&str> = version.split('.').collect();
-
-        if req_parts.len() == ver_parts.len() {
-            return version == requirement;
-        }
-
-        // Partial version: "1" matches "1.x.x", "1.2" matches "1.2.x"
-        if req_parts.len() < ver_parts.len() {
-            return ver_parts.starts_with(&req_parts);
-        }
-
-        false
+        walk_requirement(&AdmitLeaf, version.as_str(), requirement)
     }
 
     /// Compiles `requirement` into a `ComposerMatcher` using the same
@@ -796,6 +813,17 @@ mod tests {
         let f = ComposerFormatter;
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.3"), "*"));
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("99.0.0"), "*"));
+    }
+
+    /// `RequirementLeaf::on_wildcard` is the one branch of the #1591 tree-walker extraction
+    /// with no existing direct assertion on the `ExcludeLeaf` side (all other exclude coverage
+    /// runs through `!=`-bearing requirements via `test_fallback_edit_excludes_newer_*` in
+    /// `ecosystem.rs`) — an empty/`*` requirement never explicitly excludes anything, unlike
+    /// `AdmitLeaf::on_wildcard` (see `test_wildcard` above), which always admits.
+    #[test]
+    fn test_composer_explicitly_excludes_wildcard_never_excludes() {
+        assert!(!composer_explicitly_excludes("1.5.0", "*"));
+        assert!(!composer_explicitly_excludes("1.5.0", ""));
     }
 
     #[test]

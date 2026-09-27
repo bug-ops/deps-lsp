@@ -265,6 +265,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-lsp, deps-maven**: new configurable `deps_core::test_util::MockVersion`/`MockRegistry`/`SearchBehavior` replace 17 hand-rolled `Registry` test doubles in `deps-lsp`'s completion tests and 4 `Version`/`Registry` doubles in `deps-maven`; remaining duplicated doubles in `deps-engine`'s `fetch.rs` and `deps-core`'s own `MockVersion` tracked in #1582 (resolves #1559) (#1583)
 - **deps-engine**: `in_use_versions` in the cooldown/GOSSIP floor path is now `Vec<ConcreteVersion>` instead of `Vec<String>`, comparing via typed equality instead of raw string comparison; no behavior change (part of #1557, resolves #1574) (#1586)
 - **deps-core, deps-engine**: migrate `deps-core` and `deps-engine`'s remaining hand-rolled `Registry`/`Version` test doubles onto the shared `deps_core::test_util::MockVersion`/`MockRegistry` fixture; no behavior change (resolves #1582) (#1588)
+- **deps-composer**: `version_satisfies_requirement`/`composer_explicitly_excludes` now share one `walk_requirement`/`RequirementLeaf` tree-walker instead of independently duplicating the OR/AND-splitting traversal; no behavior change (resolves #1591)
 - **deps-bundler**: `version_matches_requirement`/`version_explicitly_excluded_by_requirement` now share one typed `Constraint` enum and parse function instead of two independently hand-rolled per-part operator parses; no behavior change (resolves #1597) (#1598)
 
 ### Documentation
