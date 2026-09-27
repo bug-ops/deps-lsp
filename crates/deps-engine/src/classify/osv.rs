@@ -159,10 +159,7 @@ pub fn build_scan_targets(
         };
 
         targets.push(deps_core::osv::ScanTarget::from_native(
-            key,
-            osv_name,
-            ConcreteVersion::new(version),
-            formatter,
+            key, osv_name, version, formatter,
         ));
     }
 

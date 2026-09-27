@@ -92,9 +92,7 @@ pub fn collect_in_use_versions(
             formatter,
             ecosystem,
         ) {
-            map.entry(dep.name().clone())
-                .or_default()
-                .push(ConcreteVersion::from(v));
+            map.entry(dep.name().clone()).or_default().push(v);
         }
     }
     map

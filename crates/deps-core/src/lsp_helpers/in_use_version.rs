@@ -485,7 +485,7 @@ pub(crate) fn resolve_occurrence_version<'a>(
 /// // back to it, stripped of its `=` marker.
 /// assert_eq!(
 ///     resolve_in_use_version(&dep, "time", &resolved_versions, None, &SimpleFormatter, EcosystemId::Cargo),
-///     Some("0.1.43".to_string())
+///     Some(ConcreteVersion::new("0.1.43"))
 /// );
 /// ```
 pub fn resolve_in_use_version(
@@ -495,12 +495,12 @@ pub fn resolve_in_use_version(
     resolved_version_candidates: Option<&HashMap<PackageName, Vec<ConcreteVersion>>>,
     formatter: &dyn EcosystemFormatter,
     ecosystem: EcosystemId,
-) -> Option<String> {
+) -> Option<ConcreteVersion> {
     if formatter.manifest_requirement_is_resolved_version(dep) {
         return dep
             .version_requirement()
             .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-            .map(str::to_string);
+            .map(ConcreteVersion::from);
     }
 
     if let Some(version) = resolve_occurrence_version(
@@ -510,7 +510,7 @@ pub fn resolve_in_use_version(
         resolved_version_candidates,
         formatter,
     ) {
-        return Some(version.to_string());
+        return Some(version.clone());
     }
 
     // #1556: an ecosystem's own out-of-band resolution (e.g. GitHub Actions' `TagIndex`)
@@ -521,14 +521,14 @@ pub fn resolve_in_use_version(
     // (`v1`, `v2.9`) that is not itself a queryable version (#503).
     if let Some(resolved) = formatter
         .resolved_pin_version(dep)
-        .and_then(|v| concrete_pin_version(v.as_str(), ecosystem).map(str::to_string))
+        .and_then(|v| concrete_pin_version(v.as_str(), ecosystem).map(ConcreteVersion::from))
     {
         return Some(resolved);
     }
 
     dep.version_requirement()
         .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-        .map(str::to_string)
+        .map(ConcreteVersion::from)
 }
 
 #[cfg(test)]
@@ -651,7 +651,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            Some("v9.9.9".to_string()),
+            Some(ConcreteVersion::from("v9.9.9")),
             "the lock-file-resolved version must win over resolved_pin_version's hook output"
         );
     }
@@ -679,7 +679,7 @@ mod tests {
             &FixedResolvedPinFormatter("v1.3.0"),
             EcosystemId::GithubActions,
         );
-        assert_eq!(result, Some("v1.3.0".to_string()));
+        assert_eq!(result, Some(ConcreteVersion::from("v1.3.0")));
     }
 
     #[test]
@@ -1050,8 +1050,8 @@ mod tests {
             EcosystemId::Cargo,
         );
 
-        assert_eq!(renamed_result, Some("0.9.15".to_string()));
-        assert_eq!(plain_result, Some("1.0.219".to_string()));
+        assert_eq!(renamed_result, Some(ConcreteVersion::from("0.9.15")));
+        assert_eq!(plain_result, Some(ConcreteVersion::from("1.0.219")));
     }
 
     /// FR-003: when no lock-file candidate satisfies the occurrence's own requirement, the
@@ -1124,7 +1124,7 @@ mod tests {
             EcosystemId::Cargo,
         );
 
-        assert_eq!(result, Some("1.0.219".to_string()));
+        assert_eq!(result, Some(ConcreteVersion::from("1.0.219")));
     }
 
     /// FR-005/NFR-001: a single-candidate name (the dominant case, no rename involved)
@@ -1167,7 +1167,7 @@ mod tests {
             EcosystemId::Cargo,
         );
 
-        assert_eq!(with_candidates, Some("1.0.219".to_string()));
+        assert_eq!(with_candidates, Some(ConcreteVersion::from("1.0.219")));
         assert_eq!(with_candidates, without_candidates);
     }
 
@@ -1294,7 +1294,7 @@ mod tests {
             EcosystemId::Cargo,
         );
 
-        assert_eq!(result, Some("1.0.5".to_string()));
+        assert_eq!(result, Some(ConcreteVersion::from("1.0.5")));
     }
 
     // --- in_use_version end-to-end: #664's exact repro (no lock file, bare full version) ---
@@ -1324,7 +1324,7 @@ mod tests {
             EcosystemId::Npm,
         );
 
-        assert_eq!(result, Some("4.17.0".to_string()));
+        assert_eq!(result, Some(ConcreteVersion::from("4.17.0")));
     }
 
     /// Composer counterpart of the #664 repro: `"monolog/monolog": "2.0.0"` in
@@ -1350,7 +1350,7 @@ mod tests {
             EcosystemId::Composer,
         );
 
-        assert_eq!(result, Some("2.0.0".to_string()));
+        assert_eq!(result, Some(ConcreteVersion::from("2.0.0")));
     }
 
     /// Regression guard: Cargo's identically-shaped bare full version must still resolve
@@ -1406,7 +1406,7 @@ mod tests {
             EcosystemId::Deno,
         );
 
-        assert_eq!(result, Some("4.17.0".to_string()));
+        assert_eq!(result, Some(ConcreteVersion::from("4.17.0")));
     }
 
     /// #669's exact scenario: a `.csproj` `<PackageReference Include="Newtonsoft.Json"
@@ -1442,6 +1442,6 @@ mod tests {
             EcosystemId::NuGet,
         );
 
-        assert_eq!(result, Some("1.0.0".to_string()));
+        assert_eq!(result, Some(ConcreteVersion::from("1.0.0")));
     }
 }

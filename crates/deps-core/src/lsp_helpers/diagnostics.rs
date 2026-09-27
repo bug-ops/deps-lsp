@@ -2186,8 +2186,8 @@ fn apply_in_use_yanked_rule(
                 ctx.formatter,
                 ecosystem,
             )
-            .as_deref()
-                == Some(yanked_version.as_str())
+            .as_ref()
+                == Some(yanked_version)
         })
     {
         let yanked_version = sanitize_and_truncate_for_diagnostic(
@@ -2614,7 +2614,7 @@ fn flagged_latest_duplicates_vulnerability_finding(
         ctx.formatter,
         ecosystem,
     );
-    if in_use_version.as_deref() != Some(latest) {
+    if in_use_version.as_ref().map(ConcreteVersion::as_str) != Some(latest) {
         return false;
     }
     let Some(worst_advisory) = dv.advisories_for_display().items().first().map(Arc::clone) else {
