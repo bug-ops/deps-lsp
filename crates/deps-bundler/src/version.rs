@@ -324,10 +324,7 @@ pub fn compare_versions(a: &str, b: &str) -> Ordering {
 /// behavior exactly, and an empty part (e.g. a trailing comma) still fails closed via the same
 /// final `is_valid_rubygems_version` check.
 pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
-    requirement
-        .trim()
-        .split(',')
-        .all(|part| single_constraint_matches(version, part))
+    constraints(requirement).all(|c| c.admits(version))
 }
 
 /// Fix-cycle (#1571): whether one of `requirement`'s comma-separated constraints is a `!=` term
@@ -335,68 +332,138 @@ pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
 ///
 /// The intensional signal [`deps_core::lsp_helpers::RequirementMatcher::explicitly_excludes`]
 /// needs, since scanning `available` for "does something newer also match" cannot distinguish a
-/// `!=`-punched hole from a fallback that legitimately exceeds the requirement's ceiling.
-/// Mirrors `single_constraint_matches`'s own `!=` branch's comparator exactly, scoped to only
-/// that operator.
+/// `!=`-punched hole from a fallback that legitimately exceeds the requirement's ceiling. Shares
+/// `Constraint::parse` with [`version_matches_requirement`], scoped to only the `!=` operator.
 pub fn version_explicitly_excluded_by_requirement(version: &str, requirement: &str) -> bool {
-    requirement.trim().split(',').any(|part| {
-        part.trim()
-            .strip_prefix("!=")
-            .is_some_and(|req_ver| compare_versions(version, req_ver.trim()) == Ordering::Equal)
-    })
+    constraints(requirement).any(|c| c.explicitly_excludes(version))
 }
 
-/// A single, non-comma-separated constraint check — the body [`version_matches_requirement`]
-/// applies to each comma-separated part of a requirement.
-fn single_constraint_matches(version: &str, requirement: &str) -> bool {
-    let req = requirement.trim();
+/// A single parsed comma-separated constraint from a Bundler requirement string.
+///
+/// Parsing each part once into this exhaustive enum, rather than re-sniffing the operator
+/// prefix independently per caller, is what closed the #1589 bug class (two functions parsing
+/// the same grammar differently).
+///
+/// This stays a local, `deps-bundler`-only type rather than a `deps-core` generic tree-walker
+/// (#1597): Bundler's grammar is a flat, comma-AND-only list with no `||`, no recursion, and no
+/// `v`-prefix/`@stability`-flag normalization, unlike Composer's recursive OR/AND grammar
+/// (`RequirementLeaf`, PR #1596 — itself kept private to `deps-composer`), so a shared walker
+/// abstraction would be premature ceremony over what is really just a single per-part parse.
+#[derive(Clone, Copy, Debug)]
+enum Constraint<'a> {
+    /// `*` — matches any version.
+    Any,
+    /// `~> x` — pessimistic version constraint.
+    Pessimistic(&'a str),
+    /// `>= x`
+    GreaterOrEqual(&'a str),
+    /// `> x`
+    Greater(&'a str),
+    /// `<= x`
+    LessOrEqual(&'a str),
+    /// `< x`
+    Less(&'a str),
+    /// `!= x` — stores the whole trimmed part, `!=` prefix included, rather than an already-
+    /// extracted operand: [`Self::admits`] and [`Self::explicitly_excludes`] each apply their own
+    /// pre-refactor operand-extraction convention (`trim_start_matches` vs. a single
+    /// `strip_prefix`) at use time, since the two conventions disagree on a malformed
+    /// doubled-operator input (`!=!=x`) and #1597 must not change either function's existing
+    /// behavior on it (impl-critic finding M1).
+    NotEqual(&'a str),
+    /// `= x`, or a bare version — RubyGems compiles a bare requirement to `=` (#345).
+    Exact(&'a str),
+}
 
-    if req == "*" {
-        return true;
+impl<'a> Constraint<'a> {
+    /// Parses a single, non-comma-separated constraint, mirroring RubyGems' own operator
+    /// dispatch order (`*`, `~>`, `>=`, `>`, `<=`, `<`, `!=`, `=`, then bare).
+    fn parse(part: &'a str) -> Self {
+        let req = part.trim();
+
+        if req == "*" {
+            return Self::Any;
+        }
+
+        if req.starts_with("~>") {
+            return Self::Pessimistic(req.trim_start_matches("~>").trim());
+        }
+
+        if req.starts_with(">=") {
+            return Self::GreaterOrEqual(req.trim_start_matches(">=").trim());
+        }
+
+        if req.starts_with('>') && !req.starts_with(">=") {
+            return Self::Greater(req.trim_start_matches('>').trim());
+        }
+
+        if req.starts_with("<=") {
+            return Self::LessOrEqual(req.trim_start_matches("<=").trim());
+        }
+
+        if req.starts_with('<') && !req.starts_with("<=") {
+            return Self::Less(req.trim_start_matches('<').trim());
+        }
+
+        if req.starts_with("!=") {
+            return Self::NotEqual(req);
+        }
+
+        if let Some(req_ver) = req.strip_prefix('=') {
+            return Self::Exact(req_ver.trim());
+        }
+
+        // A bare requirement compiles to `=` in RubyGems (#345), so it shares that variant's
+        // canonical equality and malformed-operand rejection, not a raw string/prefix match.
+        Self::Exact(req)
     }
 
-    if req.starts_with("~>") {
-        let req_ver = req.trim_start_matches("~>").trim();
-        return matches_pessimistic(version, req_ver);
+    /// Whether `version` is admitted by this single constraint — the per-part check
+    /// [`version_matches_requirement`] ANDs across every comma-separated part.
+    fn admits(&self, version: &str) -> bool {
+        match *self {
+            Self::Any => true,
+            Self::Pessimistic(req_ver) => matches_pessimistic(version, req_ver),
+            Self::GreaterOrEqual(req_ver) => compare_versions(version, req_ver) != Ordering::Less,
+            Self::Greater(req_ver) => compare_versions(version, req_ver) == Ordering::Greater,
+            Self::LessOrEqual(req_ver) => compare_versions(version, req_ver) != Ordering::Greater,
+            Self::Less(req_ver) => compare_versions(version, req_ver) == Ordering::Less,
+            // Pre-refactor `version_matches_requirement`'s own extraction: `trim_start_matches`
+            // strips every leading `!=` run, not just one (matters only for malformed doubled
+            // input like `!=!=x` — see the variant's doc).
+            Self::NotEqual(req) => {
+                let req_ver = req.trim_start_matches("!=").trim();
+                compare_versions(version, req_ver) != Ordering::Equal
+            }
+            // `compare_versions` skips bytes outside its token alphabet, so a malformed operand
+            // like `= 1.0.0!!!` must be rejected via `is_valid_rubygems_version` first, or it
+            // would silently match `1.0.0` where RubyGems raises `BadRequirementError` (#345 M1).
+            Self::Exact(req_ver) => {
+                is_valid_rubygems_version(req_ver)
+                    && compare_versions(version, req_ver) == Ordering::Equal
+            }
+        }
     }
 
-    if req.starts_with(">=") {
-        let req_ver = req.trim_start_matches(">=").trim();
-        return compare_versions(version, req_ver) != Ordering::Less;
+    /// Whether this constraint is a `!=` term that individually bans exactly `version` — the
+    /// per-part check [`version_explicitly_excluded_by_requirement`] ORs across every
+    /// comma-separated part.
+    ///
+    /// Pre-refactor `version_explicitly_excluded_by_requirement`'s own extraction: a single
+    /// `strip_prefix("!=")`, not a `trim_start_matches` loop — see [`Self::NotEqual`]'s doc.
+    fn explicitly_excludes(&self, version: &str) -> bool {
+        let Self::NotEqual(req) = self else {
+            return false;
+        };
+        req.strip_prefix("!=")
+            .is_some_and(|req_ver| compare_versions(version, req_ver.trim()) == Ordering::Equal)
     }
+}
 
-    if req.starts_with('>') && !req.starts_with(">=") {
-        let req_ver = req.trim_start_matches('>').trim();
-        return compare_versions(version, req_ver) == Ordering::Greater;
-    }
-
-    if req.starts_with("<=") {
-        let req_ver = req.trim_start_matches("<=").trim();
-        return compare_versions(version, req_ver) != Ordering::Greater;
-    }
-
-    if req.starts_with('<') && !req.starts_with("<=") {
-        let req_ver = req.trim_start_matches('<').trim();
-        return compare_versions(version, req_ver) == Ordering::Less;
-    }
-
-    if req.starts_with("!=") {
-        let req_ver = req.trim_start_matches("!=").trim();
-        return compare_versions(version, req_ver) != Ordering::Equal;
-    }
-
-    // `compare_versions` skips bytes outside its token alphabet, so a malformed operand like
-    // `= 1.0.0!!!` must be rejected via `is_valid_rubygems_version` first, or it would
-    // silently match `1.0.0` where RubyGems raises `BadRequirementError` (#345 M1).
-    if let Some(req_ver) = req.strip_prefix('=') {
-        let req_ver = req_ver.trim();
-        return is_valid_rubygems_version(req_ver)
-            && compare_versions(version, req_ver) == Ordering::Equal;
-    }
-
-    // A bare requirement compiles to `=` in RubyGems (#345), so it shares that branch's
-    // canonical equality and malformed-operand rejection, not a raw string/prefix match.
-    is_valid_rubygems_version(req) && compare_versions(version, req) == Ordering::Equal
+/// Splits a Bundler requirement string on its top-level commas and parses each part once — the
+/// single split/parse point [`version_matches_requirement`] and
+/// [`version_explicitly_excluded_by_requirement`] both build on.
+fn constraints(requirement: &str) -> impl Iterator<Item = Constraint<'_>> {
+    requirement.trim().split(',').map(Constraint::parse)
 }
 
 /// Joins a token slice back into a dot-separated version string.
@@ -893,6 +960,25 @@ mod tests {
         // instead, matching their pre-#345 raw-string-equality behavior.
         assert!(!version_matches_requirement("1.0.0", "= 1.0.0!!!"));
         assert!(!version_matches_requirement("1.0.0", "1.0.0!!!"));
+    }
+
+    #[test]
+    fn test_version_matches_requirement_doubled_not_equal_pins_divergent_extraction() {
+        // Regression/pinning test for #1597 impl-critic finding M1: `Constraint::admits`'s and
+        // `Constraint::explicitly_excludes`'s `!=` operand extraction are intentionally kept
+        // different (`trim_start_matches` vs. a single `strip_prefix`) to preserve each
+        // function's pre-refactor behavior exactly, including on a malformed doubled operator
+        // like `!=!=x`. A future edit that "simplifies" these into one shared extraction would
+        // silently change `version_explicitly_excluded_by_requirement`'s answer here from
+        // `false` to `true` without this test failing to say so. `0.beta` (not a plain numeric
+        // version) is required to reproduce the divergence: `canonicalize`'s start-anchored
+        // `strip_padding_before_tag` is defeated by a leftover leading `!=` only when the
+        // version string contains an alpha tag.
+        assert!(!version_matches_requirement("0.beta", "!=!=0.beta"));
+        assert!(!version_explicitly_excluded_by_requirement(
+            "0.beta",
+            "!=!=0.beta"
+        ));
     }
 
     /// Oracle-equivalence test for #1472: the linear rewrites of `strip_trailing_padding` and
