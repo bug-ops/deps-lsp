@@ -403,6 +403,11 @@ pub enum FallbackEditRejection {
     /// changed. Checked once, shared by both d0 and d1, before either can read `fallback`'s
     /// position: never infer "not a downgrade" from the absence of evidence.
     FallbackUnlisted,
+    /// Phase 1, a0 pre-check (issue #1580, CWE-400 defense-in-depth mirroring #1472/#1578):
+    /// R0's raw string exceeds [`crate::lsp_helpers::MAX_REQUIREMENT_LEN`] —
+    /// `compile_requirement` is never called for it. A size-based fail-closed guard, distinct
+    /// from [`Self::OriginalUncompilable`] (a confirmed parse failure on an attempted compile).
+    OriginalOversized,
     /// Phase 1, a0: the ORIGINAL declared requirement has no compiled matcher (e.g. GitHub
     /// Actions/GitLab CI tag pins) — unchanged from spec 075.
     OriginalUncompilable,
@@ -422,6 +427,9 @@ pub enum FallbackEditRejection {
     /// The re-parsed manifest did not contain exactly one dependency matching this occurrence's
     /// `(normalized name, version_range.start)`.
     OccurrenceNotUnique,
+    /// Phase 2, a1 pre-check: same guard as [`Self::OriginalOversized`], applied to R1 (the
+    /// re-parsed EDITED requirement) before its own `compile_requirement` attempt.
+    EditedOversized,
     /// Phase 2, a1: the re-parsed, EDITED requirement has no compiled matcher.
     EditedUncompilable,
     /// Phase 2, b1: the edited requirement's matcher does not accept the fallback itself — the
@@ -446,7 +454,9 @@ pub enum FallbackEditRejection {
 /// Two phases, evaluated in this exact order, first failure wins:
 ///
 /// - **Phase 1**, on `R0 = dep.version_requirement()` (the ORIGINAL declared requirement, no
-///   parse needed): a0 `compile_requirement(R0)` must be `Some`; c0
+///   parse needed): a0-pre (issue #1580, CWE-400 defense-in-depth) R0 must not be
+///   [`requirement_is_oversized`] — `compile_requirement` is never called for an oversized
+///   requirement; a0 `compile_requirement(R0)` must be `Some`; c0
 ///   `is_requirement_up_to_date(R0, fallback)` must be `false` (closes a NuGet bare-floor gap,
 ///   spec 076 round-1 critic S2); d0 no `available` entry STRICTLY newer than `fallback` may
 ///   satisfy `requirement_already_resolves_to(R0, entry)` (anti-downgrade — writing `fallback`
@@ -458,8 +468,10 @@ pub enum FallbackEditRejection {
 ///   element order, Gradle's map notation) put the version before the name, so `name_range`
 ///   would shift under the edit and silently fail closed. Exactly one match is required; zero
 ///   or more than one is [`FallbackEditRejection::OccurrenceNotUnique`].
-/// - **Phase 2**, on `R1` = the located occurrence's re-parsed requirement: a1
-///   `compile_requirement(R1)` must be `Some`; b1 R1's matcher must accept `fallback` itself
+/// - **Phase 2**, on `R1` = the located occurrence's re-parsed requirement: a1-pre, the same
+///   [`requirement_is_oversized`] guard as a0-pre, applied to R1 before its own
+///   `compile_requirement` attempt; a1 `compile_requirement(R1)` must be `Some`; b1 R1's
+///   matcher must accept `fallback` itself
 ///   (`Some(true)`) — proving the written edit actually expresses `fallback`, failing closed for
 ///   an unmodellable/unsatisfiable written requirement; d1 no `available` entry STRICTLY newer
 ///   than `fallback` may satisfy `requirement_already_resolves_to(R1, entry)` (the edit must not
@@ -575,9 +587,9 @@ pub fn fallback_edit_excludes_newer(
     available: &[ConcreteVersion],
 ) -> FallbackEditVerdict {
     use FallbackEditRejection::{
-        CandidateSpanMismatch, EditedAdmitsNewer, EditedExcludesFallback, EditedUncompilable,
-        FallbackUnlisted, OccurrenceNotUnique, OriginalAlreadyUpToDate,
-        OriginalResolvesPastFallback, OriginalUncompilable, ReparseFailed,
+        CandidateSpanMismatch, EditedAdmitsNewer, EditedExcludesFallback, EditedOversized,
+        EditedUncompilable, FallbackUnlisted, OccurrenceNotUnique, OriginalAlreadyUpToDate,
+        OriginalOversized, OriginalResolvesPastFallback, OriginalUncompilable, ReparseFailed,
     };
 
     // Precondition (D5, fix-cycle M2): `candidate` must target THIS occurrence's own span.
@@ -589,6 +601,11 @@ pub fn fallback_edit_excludes_newer(
     let Some(r0) = dep.version_requirement() else {
         return FallbackEditVerdict::Rejected(OriginalUncompilable);
     };
+    // a0-pre (issue #1580, CWE-400 defense-in-depth mirroring #1472/#1578): fail closed before
+    // `compile_requirement` ever sees an oversized requirement string.
+    if requirement_is_oversized(r0) {
+        return FallbackEditVerdict::Rejected(OriginalOversized);
+    }
     let Some(r0_matcher) = formatter.compile_requirement(r0) else {
         return FallbackEditVerdict::Rejected(OriginalUncompilable);
     };
@@ -652,6 +669,10 @@ pub fn fallback_edit_excludes_newer(
     let Some(r1) = edited_dep.version_requirement() else {
         return FallbackEditVerdict::Rejected(EditedUncompilable);
     };
+    // a1-pre: same guard as a0-pre, applied to R1.
+    if requirement_is_oversized(r1) {
+        return FallbackEditVerdict::Rejected(EditedOversized);
+    }
     let Some(matcher) = formatter.compile_requirement(r1) else {
         return FallbackEditVerdict::Rejected(EditedUncompilable);
     };
@@ -6149,6 +6170,40 @@ mod tests {
         impl SourcePolicy for NoCompileFormatter {}
         impl OsvNaming for NoCompileFormatter {}
 
+        /// Issue #1580 (CWE-400 defense-in-depth mirroring #1472/#1578): otherwise
+        /// semver-backed like [`SemverFormatter`], but asserts `compile_requirement` is never
+        /// called with an oversized requirement — proves the a0-pre/a1-pre gates in
+        /// `fallback_edit_excludes_newer` short-circuit before either `compile_requirement`
+        /// call site, rather than merely happening to also reject via a downstream check.
+        struct PanicsOnOversizedFormatter;
+        impl PackageNaming for PanicsOnOversizedFormatter {}
+        impl PackageRendering for PanicsOnOversizedFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for PanicsOnOversizedFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                assert!(
+                    !requirement_is_oversized(requirement),
+                    "compile_requirement must not be called for an oversized requirement (#1580)"
+                );
+                semver::VersionReq::parse(requirement.as_str())
+                    .ok()
+                    .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
+            }
+        }
+        impl DiagnosticMessages for PanicsOnOversizedFormatter {}
+        impl DiagnosticPolicy for PanicsOnOversizedFormatter {}
+        impl SourcePolicy for PanicsOnOversizedFormatter {}
+        impl OsvNaming for PanicsOnOversizedFormatter {}
+
         /// A floor matcher: `matches` is membership at-or-above the floor (mirrors NuGet's
         /// bare `Version="X"` shape), but resolution never goes below OR above the floor
         /// itself — a floor always resolves to its own lowest member.
@@ -6293,6 +6348,27 @@ mod tests {
             }
         }
 
+        /// Issue #1580: R0 exceeds `MAX_REQUIREMENT_LEN` — the a0-pre gate must reject before
+        /// `compile_requirement` is ever called; `PanicsOnOversizedFormatter` proves it (an
+        /// unguarded call site would panic instead of returning `Rejected`).
+        #[test]
+        fn original_oversized_a0_pre() {
+            let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+            let verdict = fallback_edit_excludes_newer(
+                &PanicsOnOversizedFormatter,
+                &reparsed_to("1.1.0"),
+                "content",
+                &dep(&oversized),
+                &edit(),
+                &ConcreteVersion::new("1.1.0"),
+                &versions(&["1.1.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::OriginalOversized)
+            );
+        }
+
         #[test]
         fn original_uncompilable_a0() {
             let verdict = fallback_edit_excludes_newer(
@@ -6398,6 +6474,27 @@ mod tests {
             assert_eq!(
                 verdict,
                 FallbackEditVerdict::Rejected(FallbackEditRejection::OccurrenceNotUnique)
+            );
+        }
+
+        /// Issue #1580: R1 (the re-parsed EDITED requirement) exceeds `MAX_REQUIREMENT_LEN` —
+        /// R0 ("1.0") is small and compiles fine, so phase 1 passes and phase 2 is reached; the
+        /// a1-pre gate must then reject before `compile_requirement(R1)` is ever called.
+        #[test]
+        fn edited_oversized_a1_pre() {
+            let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+            let verdict = fallback_edit_excludes_newer(
+                &PanicsOnOversizedFormatter,
+                &reparsed_to(&oversized),
+                "content",
+                &dep("1.0"),
+                &edit(),
+                &ConcreteVersion::new("1.5.0"),
+                &versions(&["1.5.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::EditedOversized)
             );
         }
 
