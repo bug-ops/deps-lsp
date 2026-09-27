@@ -1032,6 +1032,38 @@ mod tests {
             );
         }
 
+        /// #1545: `ComposerFormatter::osv_package_name`'s lowercase override had an
+        /// incorrect `#[cfg(feature = "lsp-responses")]` gate, so a `deps-cli` build
+        /// (which never enables `lsp-responses`) silently fell back to `OsvNaming`'s
+        /// identity default and sent Packagist's mixed-case spelling to OSV.dev's
+        /// case-sensitive API. Exercises the real `ComposerFormatter` end-to-end (not
+        /// just `osv_package_name`'s own unit test in isolation) so this regression
+        /// class — a gated `OsvNaming` override silently no-op'ing — is caught by CI
+        /// under a non-`lsp-responses` build, mirroring the Deno/jsr precedent above.
+        #[cfg(feature = "composer")]
+        #[test]
+        fn build_scan_targets_composer_mixed_case_name_is_lowercased_for_osv() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("Symfony/Http-Kernel"),
+                    version_req: Some(VersionReq::new("4.4.0")),
+                    source: DependencySource::Registry,
+                }],
+            };
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &deps_composer::ComposerFormatter,
+                EcosystemId::Composer,
+            );
+
+            assert_eq!(targets.len(), 1);
+            assert_eq!(targets[0].osv_name, "symfony/http-kernel");
+            assert!(skipped.is_empty());
+        }
+
         #[test]
         fn build_scan_targets_step2_uses_concrete_requirement_verbatim() {
             let parse_result = MockParseResult {
