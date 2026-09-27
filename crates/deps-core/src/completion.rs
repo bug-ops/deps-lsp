@@ -483,12 +483,53 @@ pub fn literal_version_dependency_in_scope<'a>(
     value_range: Range,
     scope: DeclarationScope,
 ) -> Option<&'a dyn crate::ecosystem::Dependency> {
+    let dep = version_dependency_at_position(parse_result, position, scope)?;
+
+    crate::lsp_helpers::dependency_version_range_is_literal(dep, content, value_range.into())
+        .then_some(dep)
+}
+
+/// The lookup half of [`literal_version_dependency_in_scope`] (#1524 impl-critic S5).
+///
+/// For a caller that needs to locate the same dependency an ecosystem's own
+/// version-completion dispatch would, but has no `content`/`value_range` in hand to also run
+/// the literal-value check — e.g. `deps-lsp`'s OSV-verdict post-process step, which only reads
+/// signals, never edits.
+///
+/// Pass 1: the dependency whose `version_range` contains `position` (`find`, first match —
+/// `version_range`s can only tie at one shared character). Never affected by `scope`.
+///
+/// Pass 2 (the `or_else` fallback, `scope`-gated): among dependencies on the same line as
+/// `position`, the one whose own `version_range` is nearest to `position` — falling back to
+/// `name_range`'s line when `version_range` is absent entirely (e.g. Maven's self-closing
+/// `<version/>` tag, which has no version *text* to range over). See
+/// [`literal_version_dependency_in_scope`]'s doc for the full `scope`/tiebreak rationale.
+///
+/// # Examples
+///
+/// ```no_run
+/// use deps_core::completion::{DeclarationScope, version_dependency_at_position};
+/// use tower_lsp_server::ls_types::Position;
+///
+/// # fn example(parse_result: &dyn deps_core::ParseResult) {
+/// let position = Position { line: 3, character: 12 };
+/// if let Some(dep) =
+///     version_dependency_at_position(parse_result, position, DeclarationScope::Unchecked)
+/// {
+///     // dep.name() / dep.source() are now safe to look an OSV verdict up for.
+///     let _ = dep.name();
+/// }
+/// # }
+/// ```
+#[must_use]
+pub fn version_dependency_at_position(
+    parse_result: &dyn ParseResult,
+    position: Position,
+    scope: DeclarationScope,
+) -> Option<&dyn crate::ecosystem::Dependency> {
     let deps = parse_result.dependencies();
 
-    // Pass 1 uses `find` (first match); `version_range`s can only tie at one shared character.
-    // Never affected by `scope` — only pass 2 (the `or_else` fallback below) is.
-    let dep = deps
-        .iter()
+    deps.iter()
         .copied()
         .find(|d| {
             d.version_range()
@@ -516,10 +557,7 @@ pub fn literal_version_dependency_in_scope<'a>(
                     crate::lsp_helpers::position_in_range(anchor, span)
                 })
                 .min_by_key(|d| version_range_distance(d.version_range(), position.character))
-        })?;
-
-    crate::lsp_helpers::dependency_version_range_is_literal(dep, content, value_range.into())
-        .then_some(dep)
+        })
 }
 
 /// Thin wrapper over [`literal_version_dependency_in_scope`] with `scope:

@@ -7,7 +7,8 @@ use std::time::Duration;
 use crate::error::DepsError;
 use crate::licenses::LicensePolicy;
 use crate::osv::{
-    LatestStatusMap, ScanOutcome, UpgradeStatus, VulnKey, VulnSeverity, VulnerabilityMap,
+    CandidateStatusMap, LatestStatusMap, ScanOutcome, UpgradeStatus, VulnKey, VulnSeverity,
+    VulnerabilityMap,
 };
 use crate::position::{Position, Range};
 use crate::{
@@ -719,6 +720,13 @@ pub struct VersionData<'a> {
     /// completion) must consult [`latest_verdict`] with this field before treating that `latest`
     /// as safe.
     pub latest_status: Option<&'a LatestStatusMap>,
+    /// Phase B's per-(dependency, candidate-version) OSV check result (#1524) — see
+    /// [`crate::osv::CandidateStatusMap`]. `None` means OSV checking is disabled or offline for
+    /// this scan entirely, mirroring [`Self::latest_status`]'s identical distinction. A
+    /// candidate-offering surface (code actions' "update to X" list, completion's version
+    /// items) must consult [`candidate_verdict`] with this field for every version it is about
+    /// to offer, not only the one [`Self::latest_status`] already covers.
+    pub candidate_status: Option<&'a CandidateStatusMap>,
 }
 
 impl<'a> VersionData<'a> {
@@ -759,6 +767,7 @@ impl<'a> VersionData<'a> {
             gossip_prefetch: None,
             gossip_client: None,
             latest_status: None,
+            candidate_status: None,
         }
     }
 
@@ -827,6 +836,29 @@ impl<'a> VersionData<'a> {
     #[must_use]
     pub fn with_latest_status(mut self, latest_status: &'a LatestStatusMap) -> Self {
         self.latest_status = Some(latest_status);
+        self
+    }
+
+    /// Attaches phase B's per-candidate-version check result to this `VersionData`. See
+    /// [`Self::candidate_status`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionData;
+    /// use deps_core::osv::CandidateStatusMap;
+    /// use std::collections::HashMap;
+    ///
+    /// let cached = HashMap::new();
+    /// let resolved = HashMap::new();
+    /// let candidate_status = CandidateStatusMap::new();
+    /// let versions =
+    ///     VersionData::new(&cached, &resolved).with_candidate_status(&candidate_status);
+    /// assert!(versions.candidate_status.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_candidate_status(mut self, candidate_status: &'a CandidateStatusMap) -> Self {
+        self.candidate_status = Some(candidate_status);
         self
     }
 
@@ -1553,8 +1585,22 @@ pub fn latest_verdict(
     let Some(map) = latest_status else {
         return LatestVerdict::NotApplicable;
     };
+    upgrade_status_to_verdict(
+        resolve_latest_status(map, dep, keys, normalized_name),
+        displayed_latest,
+    )
+}
 
-    match resolve_latest_status(map, dep, keys, normalized_name) {
+/// Shared `UpgradeStatus -> LatestVerdict` mapping behind both [`latest_verdict`] and
+/// [`candidate_verdict`] (#1524) — factored out so the two never drift on what "clean" vs.
+/// "vulnerable" vs. "unverified"/"not applicable" means for a checked candidate.
+// TODO(critic): structural OSV verdict ignores version and survives a source change until
+// next phase B
+fn upgrade_status_to_verdict(
+    status: Option<&UpgradeStatus>,
+    expected_version: &str,
+) -> LatestVerdict {
+    match status {
         None | Some(UpgradeStatus::NotChecked) => LatestVerdict::Unverified,
         Some(UpgradeStatus::CandidateUnverified { reason, .. }) => {
             if reason.is_structural() {
@@ -1564,7 +1610,7 @@ pub fn latest_verdict(
             }
         }
         Some(UpgradeStatus::CandidateClean { version }) => {
-            if version == displayed_latest {
+            if version == expected_version {
                 LatestVerdict::Verified
             } else {
                 LatestVerdict::Unverified
@@ -1575,7 +1621,7 @@ pub fn latest_verdict(
             advisory_ids,
             worst_severity,
         }) => {
-            if version != displayed_latest {
+            if version != expected_version {
                 return LatestVerdict::Unverified;
             }
             if *worst_severity == Some(VulnSeverity::Informational) {
@@ -1588,6 +1634,163 @@ pub fn latest_verdict(
             }
         }
     }
+}
+
+/// Resolves `dep`'s per-version candidate status from `candidate_status` (typically
+/// [`VersionData::candidate_status`]), using the same three-tier `VulnKey` resolution
+/// [`resolve_latest_status`] uses.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::resolve_candidate_status;
+/// use deps_core::osv::{CandidateStatusMap, UpgradeStatus};
+/// use deps_core::position::{Position, Range};
+/// use deps_core::{Dependency, PackageName, VersionReq};
+/// use std::any::Any;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     name_range: Range,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         self.name_range
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("time"),
+///     name_range: Range::new(Position::new(0, 0), Position::new(0, 4)).into(),
+/// };
+///
+/// let mut candidate_status = CandidateStatusMap::new();
+/// candidate_status.insert(
+///     deps_core::test_util::vuln_key("time"),
+///     std::iter::once((
+///         "0.1.43".to_string(),
+///         UpgradeStatus::CandidateClean {
+///             version: "0.1.43".to_string(),
+///         },
+///     ))
+///     .collect(),
+/// );
+///
+/// let per_version = resolve_candidate_status(&candidate_status, &dep, None, "time").unwrap();
+/// assert!(matches!(
+///     per_version.get("0.1.43"),
+///     Some(UpgradeStatus::CandidateClean { .. })
+/// ));
+/// ```
+#[must_use]
+pub fn resolve_candidate_status<'a>(
+    candidate_status: &'a CandidateStatusMap,
+    dep: &dyn Dependency,
+    keys: Option<&crate::osv::VulnKeys>,
+    normalized_name: &str,
+) -> Option<&'a HashMap<String, UpgradeStatus>> {
+    resolve_by_vuln_key(candidate_status, dep, keys, normalized_name)
+}
+
+/// Computes `dep`'s [`LatestVerdict`] for one specific candidate version (#1524).
+///
+/// The sibling of [`latest_verdict`] for a candidate-offering surface (code actions' "update
+/// to X" list, completion's version items) that needs a verdict for more than just the
+/// registry's single "latest" pick.
+///
+/// A dependency with no entry at all in `candidate_status` (phase B's candidate-check round
+/// never covered it) resolves to [`LatestVerdict::Unverified`], matching [`latest_verdict`]'s
+/// identical fail-closed default. A structural skip is recorded once per dependency under the
+/// empty-string sentinel key (see [`crate::osv::CandidateStatusMap`]'s doc) and is consulted
+/// only when `version` itself has no entry of its own.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{LatestVerdict, candidate_verdict};
+/// use deps_core::osv::{CandidateStatusMap, UpgradeStatus};
+/// use deps_core::position::{Position, Range};
+/// use deps_core::{Dependency, PackageName, VersionReq};
+/// use std::any::Any;
+///
+/// struct SimpleDep {
+///     name: PackageName,
+///     name_range: Range,
+/// }
+///
+/// impl Dependency for SimpleDep {
+///     fn name(&self) -> &PackageName {
+///         &self.name
+///     }
+///     fn name_range(&self) -> Range {
+///         self.name_range
+///     }
+///     fn version_requirement(&self) -> Option<&VersionReq> {
+///         None
+///     }
+///     fn version_range(&self) -> Option<Range> {
+///         None
+///     }
+///     fn source(&self) -> deps_core::parser::DependencySource {
+///         deps_core::parser::DependencySource::Registry
+///     }
+///     fn as_any(&self) -> &dyn Any {
+///         self
+///     }
+/// }
+///
+/// let dep = SimpleDep {
+///     name: PackageName::new("left-pad"),
+///     name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
+/// };
+///
+/// // No map attached at all (OSV disabled/offline) — not applicable, mirrors `latest_verdict`.
+/// assert_eq!(
+///     candidate_verdict(None, &dep, None, "left-pad", "1.0.6"),
+///     LatestVerdict::NotApplicable
+/// );
+///
+/// // A map with an entry for this dependency, but not for this exact version — fails closed
+/// // to `Unverified`, never silently treated as safe.
+/// let mut candidate_status = CandidateStatusMap::new();
+/// candidate_status.insert(deps_core::test_util::vuln_key("left-pad"), std::collections::HashMap::new());
+/// assert_eq!(
+///     candidate_verdict(Some(&candidate_status), &dep, None, "left-pad", "1.0.6"),
+///     LatestVerdict::Unverified
+/// );
+/// ```
+#[must_use]
+pub fn candidate_verdict(
+    candidate_status: Option<&CandidateStatusMap>,
+    dep: &dyn Dependency,
+    keys: Option<&crate::osv::VulnKeys>,
+    normalized_name: &str,
+    version: &str,
+) -> LatestVerdict {
+    let Some(map) = candidate_status else {
+        return LatestVerdict::NotApplicable;
+    };
+    let Some(per_version) = resolve_candidate_status(map, dep, keys, normalized_name) else {
+        return LatestVerdict::Unverified;
+    };
+    let status = per_version.get(version).or_else(|| per_version.get(""));
+    upgrade_status_to_verdict(status, version)
 }
 
 /// Converts byte offsets in source text to LSP `Position` values.

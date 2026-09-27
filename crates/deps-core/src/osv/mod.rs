@@ -26,10 +26,10 @@ use dashmap::DashMap;
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
-    Advisory, Capped, DependencyVulnerabilities, FixRecommendation, LatestStatusMap, OsvEcosystem,
-    OsvVersion, ScanOutcome, ScanTarget, SkipReason, UpgradeStatus, VulnKey, VulnKeys,
-    VulnSeverity, VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for,
-    vulnerability_keys,
+    Advisory, CandidateStatusMap, Capped, DependencyVulnerabilities, FixRecommendation,
+    LatestStatusMap, OsvEcosystem, OsvVersion, ScanOutcome, ScanTarget, SkipReason, UpgradeStatus,
+    VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, is_valid_osv_id, validated_osv_url,
+    vuln_key_for, vulnerability_keys,
 };
 use types::{
     OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,

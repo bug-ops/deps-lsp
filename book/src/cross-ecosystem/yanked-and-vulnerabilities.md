@@ -184,10 +184,11 @@ an empty status map (nothing checked yet) yields `Unverified`, never a silent pa
 Every renderer that can surface `latest` as an upgrade consults this gate: hover, diagnostics,
 code actions, code lens, inlay hints, and completion.
 
-- The **"Fix Vulnerability" / "update to version X" code actions** (see below) never offer the
-  `latest` item unless its verdict is `Verified` or `NotApplicable`; a `Flagged` or `Unverified`
-  `latest` is simply omitted from the list rather than offered with a warning, so it can never
-  be applied with one click.
+- The **"Fix Vulnerability" / "update to version X" code actions** (see below) and **completion's
+  version items** never offer an item — `latest` or otherwise (issue #1524) — unless its own
+  verdict is `Verified` or `NotApplicable`; a `Flagged` or `Unverified` item is simply omitted
+  (code actions) or demoted/tagged (completion) rather than offered with no warning, so it can
+  never be applied with one click.
 - **`deps-cli update`'s default mode** refuses to write a `Flagged` or `Unverified` `latest`
   into the manifest at all — the dependency is reported as `Unplannable` with reason
   `LatestFlaggedByOsv` or `LatestUnverified` rather than silently dropped or silently applied.
@@ -201,19 +202,60 @@ code actions, code lens, inlay hints, and completion.
   that version — a confirmed-unsafe version must never also read as a benign "just released,
   wait it out" notice.
 
-### Known limitations
+### Non-latest candidate versions (issue #1524)
 
-- **Only the `latest` item is gated today.** Code actions and completion can still offer a
-  non-latest intermediate version (e.g. picking from the full version list rather than jumping
-  straight to `latest`) without an independent OSV check on that specific version — tracked
-  separately as issue #1524.
-- **A permissive semver range can still mask a flagged `latest`.** If a dependency's declared
-  requirement is broad enough to already admit the registry's `latest` (e.g. `^1.0.4` with no
-  lock file, where `1.0.4` is itself the flagged version), the dependency reads as
-  `RequirementStatus::UpToDate` rather than `Outdated`, and this check — which only runs on the
-  `Outdated` path — never fires. The dependency shows no OSV caveat, and no diagnostic is
-  raised, even though the version already in scope is the one OSV flagged. Tracked separately
-  as issue #1526.
+Phase B's candidate check also runs a bounded set of "candidate-check rounds" (up to 6, one per
+rank among each dependency's newest non-yanked registry versions), independent of the single
+`latest` check above, and stores each version's own verdict in `osv::CandidateStatusMap` —
+looked up via `lsp_helpers::candidate_verdict`, the sibling of `latest_verdict` for a version
+that isn't necessarily `latest`. Code actions' REFACTOR "update to X" list and completion's
+version items both consult it for every item except the one identified as `latest` (which still
+goes through `latest_verdict`/`LatestStatusMap`), so a non-latest intermediate version that was
+never independently checked is demoted/excluded exactly like an unsafe `latest` already is.
+
+The candidate-check rounds select the newest non-yanked entries from the registry's plain
+version list (not the richer, `dyn Version`-based selection code actions/completion use to
+choose what to *display*), so a display item outside that bounded set reads as `Unverified` and
+is excluded/demoted; this is a deliberate over-conservative gap, never an under-conservative
+one. In practice this is rare for **code actions** (they display the same unfiltered top
+non-yanked set the rounds check), but **not** rare for **completion**: typing an
+older-line prefix (e.g. `serde = "0.9.`) filters the display list down to versions the rounds
+never cover at all, so every one of them reads as `Unverified` rather than transiently so.
+Completion's rendering accounts for this — an `Unverified` item is demoted (sort order,
+explanatory `detail` text) but not tagged `DEPRECATED` (no strikethrough), since that would
+otherwise read as "OSV actively flagged this" rather than "not independently checked."
+
+Completion's own gate for whether to run this check *at all* is `CompletionOrigin::Version` —
+the typed signal `Ecosystem::generate_completions` already resolved — not a position-based
+heuristic. PyPI's and Composer's `is_position_on_dependency` overrides widen the span they
+consider "on this dependency" to include the package-name position too (PyPI extras
+completion, Composer's alias forms), so using it as the sole gate would also reach
+package-name completion on those two ecosystems and demote every item on every keystroke while
+vulnerabilities checking is enabled.
+
+Once a version-completion context is confirmed, locating *which* dependency is being completed
+uses `completion::version_dependency_at_position` — the same two-pass lookup
+(`version_range`-based, falling back to a same-line candidate when `version_range` is absent or
+the cursor sits just outside it) an ecosystem's own version-completion dispatch already applies
+to produce the completion items in the first place — not `is_position_on_dependency`, whose
+default has no such fallback and live-verified misses Maven's self-closing `<version/>` tag (no
+version text to have a `version_range` over). A lookup miss past this point — which shouldn't
+happen once the context is confirmed, but the document can still have changed between the
+request and this check — fails closed: every item is marked unverified rather than left
+untouched.
+
+### Requirement admits a flagged `latest` (issue #1526)
+
+A permissive semver range can admit the registry's `latest` without the dependency ever reading
+as `Outdated` (e.g. `^1.0.4` with no lock file, where `1.0.4` is itself the flagged version) —
+`requirement_status_for` returns `RequirementStatus::UpToDate` in this case, not `Outdated`. The
+outdated-diagnostic rule and the up-to-date inlay-hint rendering both now consult
+`latest_verdict` in this branch too, surfacing a diagnostic/warning icon when it resolves to
+`Flagged`, instead of silently returning as if there were nothing to report. Deliberately scoped
+to `Flagged` only, not `Unverified`: `Unverified` is the common, transient state for every
+dependency before phase B first completes, and introducing a brand-new diagnostic on every
+up-to-date dependency during that window would be a broad noise regression neither surface had
+before.
 
 ## Code Action: Fix Vulnerability
 

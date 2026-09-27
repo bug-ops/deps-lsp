@@ -5,7 +5,9 @@
 use crate::config::DepsConfig;
 use crate::document::{ServerState, ensure_document_loaded};
 use deps_core::EcosystemId;
-use deps_core::completion::{COMPLETION_SEARCH_TIMEOUT, is_valid_completion_prefix_len};
+use deps_core::completion::{
+    COMPLETION_SEARCH_TIMEOUT, CompletionOrigin, is_valid_completion_prefix_len,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tower_lsp_server::Client;
@@ -123,7 +125,13 @@ pub async fn handle_completion(
     // OR'd with `package_search_is_incomplete()` whenever `fallback_completion` actually
     // runs: it always does a raw package-name search regardless of the primary context, so
     // it only coincidentally inherits the primary's completeness signal.
-    let (mut items, is_incomplete) = if let Some(parse_result) = parse_result {
+    // Impl-critic S4 (#1524): threaded through to `apply_osv_latest_verdict_to_completions`
+    // below alongside `items`/`is_incomplete` — the fallback (raw-text package-name search)
+    // path is always a package-name search regardless of which branch reached it, never
+    // `Version`, so it's hardcoded to `PackageName` rather than inheriting whatever origin the
+    // ecosystem itself returned (which could be `Version` on the "ecosystem returned empty,
+    // trying fallback" branch).
+    let (mut items, is_incomplete, origin) = if let Some(parse_result) = parse_result {
         match state.ecosystem_registry.get(ecosystem_id) {
             Some(ecosystem) => {
                 // The DashMap shard `Ref` was already dropped above: holding it across
@@ -156,9 +164,14 @@ pub async fn handle_completion(
                         (
                             fallback_items,
                             completions.is_incomplete || ecosystem.package_search_is_incomplete(),
+                            CompletionOrigin::PackageName,
                         )
                     }
-                    Ok(completions) => (completions.items, completions.is_incomplete),
+                    Ok(completions) => (
+                        completions.items,
+                        completions.is_incomplete,
+                        completions.origin,
+                    ),
                     // Timed out, not genuinely empty: a fallback search against the same
                     // slow registry would likely time out too, doubling the worst case.
                     Err(_) => {
@@ -167,13 +180,13 @@ pub async fn handle_completion(
                              {}s, skipping fallback search",
                             COMPLETION_SEARCH_TIMEOUT.as_secs()
                         );
-                        (vec![], false)
+                        (vec![], false, CompletionOrigin::Unresolved)
                     }
                 }
             }
             None => {
                 tracing::warn!("completion: ecosystem not found for id: {ecosystem_id}");
-                (vec![], false)
+                (vec![], false, CompletionOrigin::Unresolved)
             }
         }
     } else {
@@ -183,18 +196,20 @@ pub async fn handle_completion(
         (
             fallback_completion(&state, ecosystem_id, position, &content).await,
             package_search_is_incomplete,
+            CompletionOrigin::PackageName,
         )
     };
 
-    // Issue #1517: the sealed `Ecosystem::generate_completions` has no `VersionData` in scope
-    // (spec 072 N6b), so the OSV latest-verdict gate every other renderer applies runs here as
-    // a post-process step instead — demoting/flagging whichever item is displayed as "latest"
-    // when it is not `Verified`/`NotApplicable`.
+    // Issue #1517/#1524: the sealed `Ecosystem::generate_completions` has no `VersionData` in
+    // scope (spec 072 N6b), so the OSV verdict gate every other renderer applies runs here as
+    // a post-process step instead — demoting/flagging every item that is not
+    // `Verified`/`NotApplicable`, not only whichever one is displayed as "latest".
     apply_osv_latest_verdict_to_completions(
         &state,
         uri,
         position,
         vulnerabilities_enabled && !offline,
+        origin,
         &mut items,
     );
 
@@ -214,118 +229,211 @@ pub async fn handle_completion(
     }
 }
 
-/// Issue #1517: demotes/flags whichever `items` entry is displayed as "latest" (preselected,
-/// or labeled `"... (latest)"`) unless [`deps_core::lsp_helpers::latest_verdict`] says it is
-/// `Verified` or `NotApplicable` — the completion-specific counterpart of every other
-/// renderer's identical gate.
+/// Demotes/flags every entry in `items` unless its own [`LatestVerdict`] is `Verified` or
+/// `NotApplicable` — the completion-specific counterpart of every other renderer's identical
+/// gate (issue #1517 for the item displayed as "latest"; issue #1524 for every other item).
+///
+/// [`LatestVerdict`]: deps_core::lsp_helpers::LatestVerdict
 ///
 /// Runs as a post-process step rather than inside `Ecosystem::generate_completions` itself:
 /// that trait method is sealed and has no `VersionData` in scope to consult (spec 072 N6b), so
 /// there is no way for an ecosystem's own implementation to reach `DocumentState::signals`.
 ///
-/// Critique S1 fixed two fail-open gaps in an earlier version of this function: it returned
-/// early (leaving the latest item's `preselect: true` untouched) whenever there was no
-/// `latest_status` map entry at all — including the entire pre-phase-B window, before OSV has
-/// ever checked this document once — and it only ever demoted an item whose version matched a
-/// *stale* map entry's own recorded version, so a freshly re-fetched "latest" that had since
-/// diverged from that stale entry passed through unexamined. Calling `latest_verdict` directly
-/// (the same function every other renderer calls) closes both: an absent/stale entry resolves
-/// to [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail closed), not "untouched".
+/// Critique S1 fixed two fail-open gaps in an earlier version of this function that only ever
+/// covered the one item displayed as "latest": it returned early (leaving that item's
+/// `preselect: true` untouched) whenever there was no `latest_status` map entry at all —
+/// including the entire pre-phase-B window, before OSV has ever checked this document once —
+/// and it only ever demoted an item whose version matched a *stale* map entry's own recorded
+/// version, so a freshly re-fetched "latest" that had since diverged from that stale entry
+/// passed through unexamined. Calling `latest_verdict`/`candidate_verdict` directly (the same
+/// functions every other renderer calls) closes both: an absent/stale entry resolves to
+/// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] (fail closed), not "untouched".
 ///
 /// `vulnerabilities_enabled` (`policy.diagnostics.vulnerabilities_enabled && !offline`, resolved
-/// by the caller) selects whether `Some(&doc.signals.latest_status)` or `None` is passed to
-/// `latest_verdict` — mirrors `SignalsSnapshotBuilder::with_latest_status`'s same gate (issue
-/// #1517 design point 7): `None` means OSV checking does not apply to this scan at all
-/// (`NotApplicable`), while `Some(&empty map)` means checking is on but phase B has not
-/// committed a result for this dependency yet (`Unverified`, fail closed).
+/// by the caller) selects whether `Some(&doc.signals.latest_status)`/`Some(&doc.signals.
+/// candidate_status)` or `None` is passed to `latest_verdict`/`candidate_verdict` — mirrors
+/// `SignalsSnapshotBuilder::with_latest_status`'s same gate (issue #1517 design point 7):
+/// `None` means OSV checking does not apply to this scan at all (`NotApplicable`), while
+/// `Some(&empty map)` means checking is on but phase B has not committed a result for this
+/// dependency yet (`Unverified`, fail closed).
+///
+/// The gate for whether to run at all is `origin == CompletionOrigin::Version` (impl-critic
+/// S4): the typed signal `Ecosystem::generate_completions` already resolved and returned,
+/// mirroring `CompletionOrigin::allows_package_name_fallback`'s own precedent for trusting this
+/// field over a positional/shape heuristic. Positional heuristics don't transfer across
+/// ecosystems here: `EcosystemFormatter::is_position_on_dependency`'s default only checks
+/// `version_range`, but PyPI's and Composer's overrides widen that span to include the
+/// package-name position too (PyPI extras completion, Composer's alias forms), so using it as
+/// the *sole* gate would also reach package-name completion items on those two ecosystems and
+/// demote every one of them as `Unverified` on every keystroke.
 ///
 /// A single, synchronous [`ServerState::with_document`] snapshot (no guard crosses an await —
-/// issue #319) resolves the dependency at `position`; `None` (no dependency at cursor, or no
-/// item in `items` looks like "the latest") leaves `items` untouched.
+/// issue #319) locates the dependency at `position` via
+/// [`deps_core::completion::version_dependency_at_position`] (impl-critic S5) — the same
+/// two-pass lookup an ecosystem's own version-completion dispatch applies (pass 1 by
+/// `version_range`; pass 2 a same-line fallback using `name_range` when `version_range` is
+/// absent, e.g. Maven's self-closing `<version/>` tag), not `is_position_on_dependency`, whose
+/// default misses exactly that case. A lookup miss past this point — `origin == Version`
+/// already confirmed this is genuinely a version context, so one shouldn't happen, but the
+/// document/ecosystem/parse_result can still have disappeared between the request and this
+/// post-process step — fails *closed*: every item is marked
+/// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] rather than left untouched (see the
+/// body's `unwrap_or_else`).
 fn apply_osv_latest_verdict_to_completions(
     state: &ServerState,
     uri: &Uri,
     position: Position,
     vulnerabilities_enabled: bool,
+    origin: CompletionOrigin,
     items: &mut [CompletionItem],
 ) {
     use deps_core::lsp_helpers::LatestVerdict;
 
-    let Some((latest_idx, latest_item)) = items
-        .iter()
-        .enumerate()
-        .find(|(_, item)| item.preselect == Some(true) || item.label.ends_with(" (latest)"))
-    else {
+    // Impl-critic S4 (#1524): `origin != Version` covers every non-version completion,
+    // including the fallback (raw-text package-name search) path, which `handle_completion`
+    // always reports as `PackageName` regardless of which branch reached it.
+    //
+    // Impl-critic N3: `!vulnerabilities_enabled` must also return here, before the fail-closed
+    // fallback further down — OSV checking not applying to this scan at all is `NotApplicable`
+    // (untouched), never `Unverified`. Checking it this early, alongside `origin`, means a
+    // later lookup miss can safely fail closed unconditionally, without needing to re-check
+    // this flag at that point too.
+    if items.is_empty() || origin != CompletionOrigin::Version || !vulnerabilities_enabled {
         return;
-    };
-    let latest_version = latest_item.insert_text.clone().unwrap_or_else(|| {
-        latest_item
-            .label
-            .strip_suffix(" (latest)")
-            .unwrap_or(&latest_item.label)
-            .to_string()
-    });
+    }
 
-    let verdict = state.with_document(uri, |doc| {
-        let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
-        let formatter = ecosystem.formatter();
-        let parse_result = doc.parse_result()?;
-        let dep = parse_result
-            .dependencies()
-            .into_iter()
-            .find(|d| formatter.is_position_on_dependency(*d, position.into()))?;
-        let vuln_keys = deps_core::osv::vulnerability_keys(
-            parse_result,
-            &doc.signals.resolved_versions,
-            Some(&doc.signals.resolved_version_candidates),
-            formatter,
-            doc.ecosystem,
-        );
-        let normalized_name = formatter.normalize_package_name(dep.name());
-        let latest_status = vulnerabilities_enabled.then_some(&doc.signals.latest_status);
-        Some(deps_core::lsp_helpers::latest_verdict(
-            latest_status,
-            dep,
-            Some(&vuln_keys),
-            &normalized_name,
-            &latest_version,
-        ))
-    });
+    // Impl-critic M1 (#1524): which item (if any) is "the latest" is only a per-item *routing*
+    // signal now (`latest_verdict` vs `candidate_verdict` below), never the gate that decides
+    // whether to run at all. Gating on `items`' own shape instead (the pre-#1524 code's
+    // approach) meant a dropped/adversarial "latest" item — e.g. `select_latest_matching`
+    // returning `None`, or an unsafe registry string filtered out by `is_safe_version_string` —
+    // left every *other* item ungated too, the same fail-open bug class #1524 itself fixes for
+    // code actions.
+    //
+    // Issue #1524: every item's own candidate version, extracted the same way the pre-#1524
+    // code already did for the "latest" item alone — `insert_text` when present (the actual
+    // text a client would insert), falling back to the label with any "(latest)" suffix
+    // stripped.
+    let versions: Vec<String> = items
+        .iter()
+        .map(|item| {
+            item.insert_text.clone().unwrap_or_else(|| {
+                item.label
+                    .strip_suffix(" (latest)")
+                    .unwrap_or(&item.label)
+                    .to_string()
+            })
+        })
+        .collect();
+    let latest_idx = items
+        .iter()
+        .position(|item| item.preselect == Some(true) || item.label.ends_with(" (latest)"));
 
-    let (detail_suffix, tag) = match verdict.flatten() {
-        None | Some(LatestVerdict::Verified | LatestVerdict::NotApplicable) => return,
-        Some(LatestVerdict::Flagged { advisory_ids, .. }) => (
-            if advisory_ids.is_empty() {
-                " (flagged by OSV)".to_string()
-            } else {
-                format!(" (flagged by OSV: {})", advisory_ids.join(", "))
-            },
-            CompletionItemTag::DEPRECATED,
-        ),
-        Some(LatestVerdict::Unverified) => (
-            " (not yet verified against OSV)".to_string(),
-            CompletionItemTag::DEPRECATED,
-        ),
-    };
+    let verdicts: Option<Vec<LatestVerdict>> = state
+        .with_document(uri, |doc| {
+            let ecosystem = state.ecosystem_registry.get(doc.ecosystem)?;
+            let formatter = ecosystem.formatter();
+            let parse_result = doc.parse_result()?;
+            // Impl-critic S5 (#1524): the same two-pass lookup
+            // `literal_version_dependency_in_scope` applies before its own literal-value check
+            // — pass 1 by `version_range`, pass 2 a same-line fallback using `name_range` when
+            // `version_range` is absent entirely — not `is_position_on_dependency`, whose
+            // default only checks `version_range` and live-verified misses Maven's
+            // self-closing `<version/>` tag (no version *text* to have a `version_range` over),
+            // even though the ecosystem's own completion dispatch found the dependency fine via
+            // this same lookup to produce the very items being gated here.
+            let dep = deps_core::completion::version_dependency_at_position(
+                parse_result,
+                position,
+                deps_core::completion::DeclarationScope::Unchecked,
+            )?;
+            let vuln_keys = deps_core::osv::vulnerability_keys(
+                parse_result,
+                &doc.signals.resolved_versions,
+                Some(&doc.signals.resolved_version_candidates),
+                formatter,
+                doc.ecosystem,
+            );
+            let normalized_name = formatter.normalize_package_name(dep.name());
+            let latest_status = vulnerabilities_enabled.then_some(&doc.signals.latest_status);
+            let candidate_status = vulnerabilities_enabled.then_some(&doc.signals.candidate_status);
 
-    // Indexing, not `.get_mut()` + `?`: `latest_idx` was resolved from this same `items` slice
-    // above and neither its length nor order changes in between.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "latest_idx is in-bounds by construction"
-    )]
-    let item = &mut items[latest_idx];
-    item.preselect = Some(false);
-    item.tags = Some(vec![tag]);
-    // Demoted with a `~` prefix (sorts after every plain-digit `sortText` this crate
-    // generates elsewhere — `build_completion_sort_text`/version-index-based schemes never
-    // emit one) rather than a fixed replacement, so relative ordering among every other
-    // (non-flagged) item is preserved.
-    item.sort_text = Some(format!("~{}", item.sort_text.clone().unwrap_or_default()));
-    item.detail = Some(match item.detail.take() {
-        Some(existing) => format!("{existing}{detail_suffix}"),
-        None => detail_suffix.trim_start().to_string(),
-    });
+            // The item identified as "latest" is checked against `latest_status` (#1517, phase
+            // B's single "latest" check); every other item against `candidate_status` (#1524,
+            // phase B's separate multi-candidate check) — the two are deliberately different maps
+            // (see each field's own doc), so an item must be routed to the one that actually
+            // covers it, not merged into a single lookup.
+            Some(
+                versions
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, version)| {
+                        if Some(idx) == latest_idx {
+                            deps_core::lsp_helpers::latest_verdict(
+                                latest_status,
+                                dep,
+                                Some(&vuln_keys),
+                                &normalized_name,
+                                version,
+                            )
+                        } else {
+                            deps_core::lsp_helpers::candidate_verdict(
+                                candidate_status,
+                                dep,
+                                Some(&vuln_keys),
+                                &normalized_name,
+                                version,
+                            )
+                        }
+                    })
+                    .collect(),
+            )
+        })
+        .flatten();
+
+    // Impl-critic S5 (#1524): `origin == Version` (checked above) already confirmed this is
+    // genuinely a version-completion context, so a lookup miss past that point — the document
+    // closed between the request and this post-process step, the ecosystem/parse_result
+    // disappeared, or (should no longer happen after the S5 fix above, but kept as a fail-safe)
+    // `version_dependency_at_position` itself finds nothing — must fail CLOSED: every item
+    // unverified, never silently left ungated the way returning early here would.
+    let verdicts = verdicts.unwrap_or_else(|| vec![LatestVerdict::Unverified; items.len()]);
+
+    for (item, verdict) in items.iter_mut().zip(verdicts) {
+        let (detail_suffix, tag) = match verdict {
+            LatestVerdict::Verified | LatestVerdict::NotApplicable => continue,
+            LatestVerdict::Flagged { advisory_ids, .. } => (
+                if advisory_ids.is_empty() {
+                    " (flagged by OSV)".to_string()
+                } else {
+                    format!(" (flagged by OSV: {})", advisory_ids.join(", "))
+                },
+                Some(CompletionItemTag::DEPRECATED),
+            ),
+            // Impl-critic S2 (#1524): no `DEPRECATED` strikethrough for merely `Unverified` —
+            // `complete_versions_generic_replacing`'s prefix filtering means a completion for
+            // an older-line prefix (e.g. `serde = "0.9.`) can show *only* versions outside the
+            // bounded candidate-check rounds, so every one of them would render as if
+            // permanently broken rather than "not yet independently checked". The demotion
+            // (sort order, explanatory `detail` text) still applies; only the strikethrough,
+            // which reads as an active-defect signal, is withheld.
+            LatestVerdict::Unverified => (" (not yet verified against OSV)".to_string(), None),
+        };
+
+        item.preselect = Some(false);
+        if let Some(tag) = tag {
+            item.tags = Some(vec![tag]);
+        }
+        // Demoted with a `~` prefix (sorts after every plain-digit `sortText` this crate
+        // generates elsewhere — `build_completion_sort_text`/version-index-based schemes never
+        // emit one) rather than a fixed replacement, so relative ordering among every other
+        // (non-flagged) item is preserved.
+        item.sort_text = Some(format!("~{}", item.sort_text.clone().unwrap_or_default()));
+        item.detail = Some(match item.detail.take() {
+            Some(existing) => format!("{existing}{detail_suffix}"),
+            None => detail_suffix.trim_start().to_string(),
+        });
+    }
 }
 
 /// Fallback completion when document parsing fails.
@@ -834,12 +942,17 @@ mod tests {
     /// Issue #1517 (the P0 this fix addresses, live-verified against a real npm/OSV.dev
     /// scenario with `probe1517.py` before this test was added): a completion item whose
     /// version matches a dependency's OSV-flagged `latest` must be demoted (never preselected,
-    /// tagged deprecated, sorted last) and get an explanatory `detail` suffix — an item for a
-    /// different, non-flagged version must be left untouched.
+    /// tagged deprecated, sorted last) and get an explanatory `detail` suffix. Issue #1524
+    /// extends the same test: a *different*, non-latest item whose own candidate status is
+    /// independently verified clean must be left untouched — proving the two lookups
+    /// (`latest_verdict` for the latest item, `candidate_verdict` for every other one) are
+    /// each consulted correctly, not that non-latest items are skipped entirely.
     #[cfg(feature = "cargo")]
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_demotes_flagged_item() {
-        use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
+        use deps_core::osv::{
+            CandidateStatusMap, Capped, LatestStatusMap, UpgradeStatus, VulnSeverity,
+        };
 
         // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and this
         // test shares a binary with document/loader.rs's diffing test.
@@ -867,6 +980,22 @@ mod tests {
             },
         );
         doc.update_latest_status(latest_status);
+
+        // #1524: the non-latest "1.0.0" item is independently verified clean, so it must stay
+        // untouched — distinct from `test_apply_osv_latest_verdict_to_completions_fails_closed_before_phase_b`
+        // below, which deliberately leaves this map empty to prove the fail-closed default.
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            deps_core::test_util::vuln_key("serde"),
+            std::iter::once((
+                "1.0.0".to_string(),
+                UpgradeStatus::CandidateClean {
+                    version: "1.0.0".to_string(),
+                },
+            ))
+            .collect(),
+        );
+        doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);
 
         let mut items = vec![
@@ -893,6 +1022,7 @@ mod tests {
             &uri,
             Position::new(1, 9),
             true,
+            CompletionOrigin::Version,
             &mut items,
         );
 
@@ -972,6 +1102,7 @@ mod tests {
             &uri,
             Position::new(1, 9),
             true,
+            CompletionOrigin::Version,
             &mut items,
         );
 
@@ -1040,6 +1171,7 @@ mod tests {
             &uri,
             Position::new(1, 9),
             true,
+            CompletionOrigin::Version,
             &mut items,
         );
 
@@ -1047,6 +1179,100 @@ mod tests {
             items[0].preselect,
             Some(false),
             "a live latest diverged from a stale clean entry must never stay preselected"
+        );
+    }
+
+    /// Impl-critic M1 (#1524): no item in `items` looks like "the latest" (no `preselect: true`,
+    /// no `"(latest)"`-suffixed label — e.g. `select_latest_matching` returned `None`, or an
+    /// unsafe registry string was filtered out by `is_safe_version_string` before this ever
+    /// ran), but the cursor is genuinely on a dependency's version range. Every item must still
+    /// be gated via `candidate_verdict` — the pre-fix code used item *shape* as its gate and
+    /// left every item ungated in exactly this case, the same fail-open bug class #1524 itself
+    /// fixes for code actions.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_gates_every_item_when_none_looks_like_latest()
+     {
+        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let mut doc =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            deps_core::test_util::vuln_key("serde"),
+            std::iter::once((
+                "1.2.0".to_string(),
+                UpgradeStatus::CandidateVulnerable {
+                    version: "1.2.0".to_string(),
+                    advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::Malicious),
+                },
+            ))
+            .collect(),
+        );
+        doc.update_candidate_status(candidate_status);
+        state.update_document(uri.clone(), doc);
+
+        // Neither item is preselected or "(latest)"-suffixed — the exact shape the pre-fix
+        // code's own gate required to run at all.
+        let mut items = vec![
+            CompletionItem {
+                label: "1.2.0".to_string(),
+                insert_text: Some("1.2.0".to_string()),
+                sort_text: Some("00000".to_string()),
+                preselect: Some(false),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "1.1.0".to_string(),
+                insert_text: Some("1.1.0".to_string()),
+                sort_text: Some("00001".to_string()),
+                preselect: Some(false),
+                ..Default::default()
+            },
+        ];
+
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            Position::new(1, 9),
+            true,
+            CompletionOrigin::Version,
+            &mut items,
+        );
+
+        assert_eq!(
+            items[0].tags,
+            Some(vec![CompletionItemTag::DEPRECATED]),
+            "the flagged item must be demoted even though no item in `items` looks like \
+             \"the latest\": {:?}",
+            items[0].tags
+        );
+        assert!(
+            items[1].tags.is_none(),
+            "an independently unverified item (no candidate_status entry for it) is demoted \
+             via sort/detail, but not tagged DEPRECATED (impl-critic S2): {:?}",
+            items[1].tags
+        );
+        assert!(
+            items[1]
+                .sort_text
+                .as_deref()
+                .is_some_and(|s| s.starts_with('~')),
+            "must still be demoted in sort order: {:?}",
+            items[1].sort_text
         );
     }
 
@@ -1084,6 +1310,7 @@ mod tests {
             &uri,
             Position::new(1, 9),
             false,
+            CompletionOrigin::Version,
             &mut items,
         );
 
@@ -1093,6 +1320,470 @@ mod tests {
             "OSV disabled/offline must resolve to NotApplicable, leaving the item untouched"
         );
         assert!(items[0].tags.is_none());
+    }
+
+    /// Impl-critic N3 (#1524): the S5 fail-closed fallback (a dependency-lookup miss marks
+    /// every item `Unverified`) must not fire when OSV checking is disabled/offline — that
+    /// combination is still `NotApplicable`, never `Unverified`, the same distinction
+    /// `test_apply_osv_latest_verdict_to_completions_not_applicable_when_disabled` covers for
+    /// the lookup-succeeds case. Uses a position with no dependency in the document at all
+    /// (empty content) to force the lookup miss that would otherwise trigger the fail-closed
+    /// path.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_lookup_miss_stays_not_applicable_when_disabled()
+     {
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let content = "[dependencies]\n".to_string();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        assert!(
+            parse_result.dependencies().is_empty(),
+            "fixture must have no dependency to guarantee a lookup miss"
+        );
+        let doc = DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+        state.update_document(uri.clone(), doc);
+
+        let mut items = vec![CompletionItem {
+            label: "1.2.0 (latest)".to_string(),
+            insert_text: Some("1.2.0".to_string()),
+            sort_text: Some("00000".to_string()),
+            preselect: Some(true),
+            ..Default::default()
+        }];
+
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            Position::new(0, 0),
+            false,
+            CompletionOrigin::Version,
+            &mut items,
+        );
+
+        assert_eq!(
+            items[0].preselect,
+            Some(true),
+            "disabled + lookup miss must still resolve to NotApplicable, not fail closed to \
+             Unverified: {:?}",
+            items[0]
+        );
+        assert!(items[0].tags.is_none());
+        assert_eq!(items[0].sort_text.as_deref(), Some("00000"));
+        assert!(items[0].detail.is_none());
+    }
+
+    /// Issue #1524's original repro: `feed-widget-helper` pinned at "1.0.4", with both an
+    /// intermediate candidate ("1.0.6") and the registry's "latest" ("1.0.8") independently
+    /// flagged by OSV. Unlike `test_apply_osv_latest_verdict_to_completions_demotes_flagged_item`
+    /// (which proves a *non-flagged* non-latest item stays untouched), this proves a
+    /// *flagged* non-latest item is itself demoted via `candidate_verdict` — not only the
+    /// item identified as "latest" via `latest_verdict`.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_demotes_flagged_non_latest_item() {
+        use deps_core::osv::{
+            CandidateStatusMap, Capped, LatestStatusMap, UpgradeStatus, VulnSeverity,
+        };
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let content = "[dependencies]\nfeed-widget-helper = \"1.0.4\"\n".to_string();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let mut doc =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            deps_core::test_util::vuln_key("feed-widget-helper"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.0.8".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+        doc.update_latest_status(latest_status);
+
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            deps_core::test_util::vuln_key("feed-widget-helper"),
+            std::iter::once((
+                "1.0.6".to_string(),
+                UpgradeStatus::CandidateVulnerable {
+                    version: "1.0.6".to_string(),
+                    advisory_ids: Capped::new(vec!["MAL-2026-16331".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::Malicious),
+                },
+            ))
+            .collect(),
+        );
+        doc.update_candidate_status(candidate_status);
+        state.update_document(uri.clone(), doc);
+
+        let mut items = vec![
+            CompletionItem {
+                label: "1.0.8 (latest)".to_string(),
+                insert_text: Some("1.0.8".to_string()),
+                sort_text: Some("00000".to_string()),
+                preselect: Some(true),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "1.0.6".to_string(),
+                insert_text: Some("1.0.6".to_string()),
+                sort_text: Some("00001".to_string()),
+                preselect: Some(false),
+                ..Default::default()
+            },
+        ];
+
+        // Column 24 sits inside the `"1.0.4"` version range.
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            Position::new(1, 24),
+            true,
+            CompletionOrigin::Version,
+            &mut items,
+        );
+
+        assert_eq!(
+            items[0].preselect,
+            Some(false),
+            "the flagged latest item must never stay preselected"
+        );
+        assert_eq!(
+            items[1].tags,
+            Some(vec![CompletionItemTag::DEPRECATED]),
+            "the flagged non-latest candidate must be demoted via candidate_verdict, not just \
+             the one identified as latest: {:?}",
+            items[1].tags
+        );
+        assert!(
+            items[1]
+                .sort_text
+                .as_deref()
+                .is_some_and(|s| s.starts_with('~')),
+            "must sort after any non-flagged item: {:?}",
+            items[1].sort_text
+        );
+        assert!(
+            items[1]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("MAL-2026-16331")),
+            "got: {:?}",
+            items[1].detail
+        );
+    }
+
+    /// Impl-critic S4 (#1524): PyPI's `is_position_on_dependency` override
+    /// (`deps-pypi/src/formatter.rs`) widens the span to `name_range.start - 2` through
+    /// `version_range.end + 2`, so a cursor on the *package name* — a genuine
+    /// `CompletionOrigin::PackageName` completion, not a version one — still satisfies it.
+    /// Before the `origin`-based gate, this meant every package-name completion item on
+    /// PyPI (and Composer, same shape) would have been demoted/flagged on every keystroke
+    /// while vulnerabilities checking is enabled (the default): a UX regression, not a
+    /// fail-open security bug, but still wrong. Passing `CompletionOrigin::PackageName`
+    /// (what `handle_completion` would actually determine for this cursor position) must
+    /// leave every item untouched, even though `is_position_on_dependency` alone would
+    /// have matched and even though `candidate_status` holds a malicious verdict for this
+    /// exact dependency name.
+    #[cfg(feature = "pypi")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_untouched_for_pypi_package_name_completion()
+     {
+        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/requirements.txt");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let content = "requests==2.28.0\n".to_string();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Pypi)
+            .unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let mut doc =
+            DocumentState::new_from_parse_result(EcosystemId::Pypi, content, parse_result);
+
+        // A malicious verdict for "requests" itself, so this test would fail loudly (a
+        // demoted/flagged item) if the `origin` gate were ever removed or bypassed, rather
+        // than passing vacuously because there was nothing to demote.
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            deps_core::test_util::vuln_key("requests"),
+            std::iter::once((
+                "2.31.0".to_string(),
+                UpgradeStatus::CandidateVulnerable {
+                    version: "2.31.0".to_string(),
+                    advisory_ids: Capped::new(vec!["MAL-2026-00003".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::Malicious),
+                },
+            ))
+            .collect(),
+        );
+        doc.update_candidate_status(candidate_status);
+        state.update_document(uri.clone(), doc);
+
+        let mut items = vec![CompletionItem {
+            label: "requests".to_string(),
+            insert_text: Some("requests".to_string()),
+            sort_text: Some("00000".to_string()),
+            preselect: Some(false),
+            ..Default::default()
+        }];
+
+        // Character 3 ("req|uests") sits squarely inside the package-name span PyPI's
+        // `is_position_on_dependency` widens to also cover, not inside a version range.
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            Position::new(0, 3),
+            true,
+            CompletionOrigin::PackageName,
+            &mut items,
+        );
+
+        assert_eq!(items[0].preselect, Some(false));
+        assert!(
+            items[0].tags.is_none(),
+            "a package-name completion item must never be gated: {:?}",
+            items[0].tags
+        );
+        assert_eq!(items[0].sort_text.as_deref(), Some("00000"));
+        assert!(items[0].detail.is_none());
+    }
+
+    /// Impl-critic S5 (#1524), live-verified against real Maven Central + OSV.dev: a
+    /// self-closing `<version/>` tag has no version *text*, so its `version_range()` is a
+    /// zero-width range (see `deps-maven`'s own
+    /// `test_generate_completions_offers_completion_for_self_closing_version_tag`) sitting at
+    /// exactly one point — right after `<version`, before `/>`. A cursor anywhere else inside
+    /// the visually self-closing tag (e.g. right after the opening `<`, well before that
+    /// zero-width point) fails pass 1 of the lookup, exactly like `deps-maven`'s own
+    /// `complete_self_closing_version` dispatch does — which is why it falls back to the
+    /// same-line pass 2 via `literal_version_dependency`, not `is_position_on_dependency`
+    /// (whose default has no pass 2 at all). Before this fix, the OSV-verdict gate used
+    /// `is_position_on_dependency` directly, missed here, and returned early — every
+    /// completion item, including the malicious one, passed through completely untouched.
+    #[cfg(feature = "maven")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_gates_self_closing_maven_version_tag() {
+        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/pom.xml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let content = "<project>\n  <dependencies>\n    <dependency>\n      \
+                       <groupId>org.example</groupId>\n      \
+                       <artifactId>evil-lib</artifactId>\n      \
+                       <version/>\n    </dependency>\n  </dependencies>\n</project>"
+            .to_string();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Maven)
+            .unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        assert_eq!(dep.name().as_str(), "org.example:evil-lib");
+        let version_range = dep
+            .version_range()
+            .expect("self-closing <version/> must still yield a zero-width range");
+        assert_eq!(version_range.start, version_range.end);
+        let mut doc =
+            DocumentState::new_from_parse_result(EcosystemId::Maven, content.clone(), parse_result);
+
+        let mut latest_status = deps_core::osv::LatestStatusMap::new();
+        latest_status.insert(
+            deps_core::test_util::vuln_key("org.example:evil-lib"),
+            UpgradeStatus::CandidateVulnerable {
+                version: "9.9.9".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-00004".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+        doc.update_latest_status(latest_status);
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            deps_core::test_util::vuln_key("org.example:evil-lib"),
+            std::iter::once((
+                "9.8.0".to_string(),
+                UpgradeStatus::CandidateVulnerable {
+                    version: "9.8.0".to_string(),
+                    advisory_ids: Capped::new(vec!["MAL-2026-00005".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::Malicious),
+                },
+            ))
+            .collect(),
+        );
+        doc.update_candidate_status(candidate_status);
+        state.update_document(uri.clone(), doc);
+
+        // One character before the zero-width point `version_range()` sits at (right after
+        // `<version`, before `/>`) — still visually inside the self-closing tag, but landing
+        // in `n` of `versio[n]` rather than exactly on the point pass 1 requires, so pass 1
+        // misses and this must fall through to pass 2.
+        let position = Position::new(
+            version_range.start.line,
+            version_range.start.character.saturating_sub(1),
+        );
+
+        let mut items = vec![
+            CompletionItem {
+                label: "9.9.9 (latest)".to_string(),
+                insert_text: Some("9.9.9".to_string()),
+                sort_text: Some("00000".to_string()),
+                preselect: Some(true),
+                ..Default::default()
+            },
+            CompletionItem {
+                label: "9.8.0".to_string(),
+                insert_text: Some("9.8.0".to_string()),
+                sort_text: Some("00001".to_string()),
+                preselect: Some(false),
+                ..Default::default()
+            },
+        ];
+
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            position,
+            true,
+            CompletionOrigin::Version,
+            &mut items,
+        );
+
+        assert_eq!(
+            items[0].preselect,
+            Some(false),
+            "the flagged latest item must never stay preselected, even behind a self-closing \
+             <version/> tag: {:?}",
+            items[0]
+        );
+        assert_eq!(
+            items[0].tags,
+            Some(vec![CompletionItemTag::DEPRECATED]),
+            "got: {:?}",
+            items[0].tags
+        );
+        assert_eq!(
+            items[1].tags,
+            Some(vec![CompletionItemTag::DEPRECATED]),
+            "the non-latest candidate must be demoted via candidate_verdict too: {:?}",
+            items[1].tags
+        );
+    }
+
+    /// Impl-critic S5's second regression case: a default-dispatch ecosystem (Cargo, which
+    /// never overrides `is_position_on_dependency`) where the completion-context scanner's
+    /// cursor lands just *before* the dependency's own `version_range` (the exact same-line
+    /// pass-2 boundary case `deps-core`'s own
+    /// `test_literal_version_dependency_same_line_fallback_rescues_single_dependency_at_version_range_boundary`
+    /// covers at the shared-logic unit level) — proving the `deps-lsp` integration actually
+    /// benefits from that fallback too, not only ecosystems with their own
+    /// `is_position_on_dependency` override.
+    #[cfg(feature = "cargo")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_gates_position_just_before_version_range()
+    {
+        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+        use tower_lsp_server::ls_types::Range;
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/Cargo.toml");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let content = "[dependencies]\nserde = \"1.0.0\"\n".to_string();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Cargo)
+            .unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let version_range: Range = dep
+            .version_range()
+            .expect("declared version has a range")
+            .into();
+        let mut doc =
+            DocumentState::new_from_parse_result(EcosystemId::Cargo, content, parse_result);
+
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            deps_core::test_util::vuln_key("serde"),
+            std::iter::once((
+                "0.5.0".to_string(),
+                UpgradeStatus::CandidateVulnerable {
+                    version: "0.5.0".to_string(),
+                    advisory_ids: Capped::new(vec!["MAL-2026-00006".to_string()], 1),
+                    worst_severity: Some(VulnSeverity::Malicious),
+                },
+            ))
+            .collect(),
+        );
+        doc.update_candidate_status(candidate_status);
+        state.update_document(uri.clone(), doc);
+
+        // One character before `version_range.start` — `position_in_range` (pass 1) requires
+        // `position.character >= range.start.character` on the start line, so this deliberately
+        // misses pass 1 and must fall through to the same-line pass 2.
+        let position = Position::new(
+            version_range.start.line,
+            version_range.start.character.saturating_sub(1),
+        );
+
+        let mut items = vec![CompletionItem {
+            label: "0.5.0".to_string(),
+            insert_text: Some("0.5.0".to_string()),
+            sort_text: Some("00000".to_string()),
+            preselect: Some(false),
+            ..Default::default()
+        }];
+
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            position,
+            true,
+            CompletionOrigin::Version,
+            &mut items,
+        );
+
+        assert_eq!(
+            items[0].tags,
+            Some(vec![CompletionItemTag::DEPRECATED]),
+            "a position just outside version_range must still resolve via the same-line \
+             pass-2 fallback, not fail closed to a blanket Unverified/untouched result: {:?}",
+            items[0].tags
+        );
+        assert!(
+            items[0]
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("MAL-2026-00006")),
+            "got: {:?}",
+            items[0].detail
+        );
     }
 
     /// #319 liveness regression: `handle_completion` must release the DashMap shard

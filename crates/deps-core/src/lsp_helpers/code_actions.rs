@@ -7,9 +7,10 @@ use crate::{Dependency, ParseResult, Registry, VersionReq};
 
 use super::{
     DEPRECATED_DIAGNOSTIC_CODE, EcosystemFormatter, LatestVerdict, LineOffsetTable,
-    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_versions_fetch, is_safe_version_string,
-    latest_verdict, literal_span_matches, requirement_is_unsatisfiable, resolve_latest_status,
-    resolve_scan_outcome, single_file_edit, slice_for_range, strip_whitespace, warn_rejected_value,
+    UNSATISFIABLE_DIAGNOSTIC_CODE, VersionData, await_versions_fetch, candidate_verdict,
+    is_safe_version_string, latest_verdict, literal_span_matches, requirement_is_unsatisfiable,
+    resolve_latest_status, resolve_scan_outcome, single_file_edit, slice_for_range,
+    strip_whitespace, warn_rejected_value,
 };
 
 /// The vulnerability-fix quickfix built by [`build_vulnerability_fix_action`],
@@ -614,10 +615,9 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
         emitted_texts.insert(unsat_text);
     }
 
-    // Issue #1517: computed once, only needed for the `item.is_latest` gate below — the
-    // separate, non-latest offer of an unverified intermediate version is a known, tracked
-    // follow-up (HIGH, not fixed here; see the security audit's handoff), not something this
-    // lookup is meant to cover.
+    // Issue #1517/#1524: computed once, shared by both the `item.is_latest` gate (via
+    // `latest_verdict`) and every other display item's own gate (via `candidate_verdict`)
+    // below.
     let normalized_name = formatter.normalize_package_name(dep.name());
     let latest_vuln_keys = versions.ecosystem.map(|ecosystem| {
         crate::osv::vulnerability_keys(
@@ -657,25 +657,34 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                 );
                 continue;
             }
-            // Issue #1517: never offer the "update to latest" quickfix unless OSV has
+            // Issue #1517/#1524: never offer an "update to X" quickfix unless OSV has
             // actually verified this exact version (or does not apply at all) — a
-            // Flagged/Unverified latest must never be one keystroke away from landing in
-            // the manifest. Only gates the `is_latest` item; a non-latest item's own
-            // unverified status is the tracked HIGH follow-up, not this fix's scope.
-            if item.is_latest {
-                let verdict = latest_verdict(
+            // Flagged/Unverified candidate must never be one keystroke away from landing in
+            // the manifest. `latest_verdict` (phase B's single "latest" check) covers the
+            // `is_latest` item; every other display item is covered by `candidate_verdict`
+            // (phase B's separate multi-candidate check, #1524).
+            let verdict = if item.is_latest {
+                latest_verdict(
                     versions.latest_status,
                     dep,
                     latest_vuln_keys.as_ref(),
                     &normalized_name,
                     item.version.as_str(),
-                );
-                if !matches!(
-                    verdict,
-                    LatestVerdict::Verified | LatestVerdict::NotApplicable
-                ) {
-                    continue;
-                }
+                )
+            } else {
+                candidate_verdict(
+                    versions.candidate_status,
+                    dep,
+                    latest_vuln_keys.as_ref(),
+                    &normalized_name,
+                    item.version.as_str(),
+                )
+            };
+            if !matches!(
+                verdict,
+                LatestVerdict::Verified | LatestVerdict::NotApplicable
+            ) {
+                continue;
             }
             // Unreachable after the gate above; fails closed rather than unwrapping.
             let Some(new_text) =
@@ -2395,13 +2404,90 @@ mod tests {
         );
         assert!(
             refactor_titles.iter().any(|t| t.starts_with("1.5.0")),
-            "a non-latest, non-flagged version stays offered (separate follow-up scope): \
+            "no `candidate_status` map is attached in this fixture, so `candidate_verdict` \
+             resolves to `NotApplicable` and 1.5.0 passes the gate unchecked — see the \
+             sibling test below for the populated-map, flagged-intermediate-candidate case: \
              {refactor_titles:?}"
         );
         assert!(
             actions.iter().all(|a| a.is_preferred.is_none()),
             "no action may claim isPreferred once the only latest candidate was dropped: \
              {actions:?}"
+        );
+    }
+
+    /// Issue #1524: unlike the sibling test above (no `candidate_status` map attached at
+    /// all, so every non-latest item resolves to `NotApplicable` and passes unchecked), a
+    /// populated `candidate_status` map with a `Flagged` verdict for a non-latest candidate
+    /// must exclude exactly that candidate from the REFACTOR list, while the clean latest
+    /// and any other unflagged candidate stay offered.
+    #[tokio::test]
+    async fn test_generate_code_actions_omits_flagged_intermediate_candidate_refactor() {
+        use crate::osv::{
+            CandidateStatusMap, Capped, LatestStatusMap, UpgradeStatus, VulnSeverity,
+        };
+
+        let (dep, version_range, content) = vulnerable_dep("1.0.0");
+        let parse_result = MockParseResult {
+            deps: vec![dep],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+
+        let cached = HashMap::new();
+        let resolved = HashMap::new();
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateClean {
+                version: "2.0.0".to_string(),
+            },
+        );
+        let mut candidate_status = CandidateStatusMap::new();
+        let mut per_version = HashMap::new();
+        per_version.insert(
+            "1.5.0".to_string(),
+            UpgradeStatus::CandidateVulnerable {
+                version: "1.5.0".to_string(),
+                advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
+                worst_severity: Some(VulnSeverity::Malicious),
+            },
+        );
+        candidate_status.insert(crate::test_util::vuln_key("pkg"), per_version);
+
+        let versions = VersionData::new(&cached, &resolved)
+            .with_latest_status(&latest_status)
+            .with_candidate_status(&candidate_status);
+        let registry = FixedVersionRegistry {
+            versions: vec![("2.0.0", false), ("1.5.0", false), ("1.2.0", false)],
+        };
+
+        let actions = generate_code_actions(
+            &parse_result,
+            version_range.start,
+            parse_result.uri(),
+            versions,
+            &content,
+            &registry,
+            &MOCK_FORMATTER,
+        )
+        .await;
+
+        let refactor_titles = refactor_titles(&actions);
+        assert!(
+            !refactor_titles.iter().any(|t| t.starts_with("1.5.0")),
+            "a malicious-flagged intermediate candidate must never be offered as an update \
+             target: {refactor_titles:?}"
+        );
+        assert!(
+            refactor_titles.iter().any(|t| t.starts_with("2.0.0")),
+            "the clean, verified latest must stay offered: {refactor_titles:?}"
+        );
+        assert!(
+            !refactor_titles.iter().any(|t| t.starts_with("1.2.0")),
+            "once a `candidate_status` map is attached for this dependency, a candidate with \
+             no entry of its own (outside the bounded check round, and no structural-skip \
+             sentinel either) must fail closed to `Unverified` and be excluded — never read \
+             as silently safe just because it wasn't the one flagged: {refactor_titles:?}"
         );
     }
 

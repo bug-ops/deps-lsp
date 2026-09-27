@@ -1232,6 +1232,26 @@ pub type VulnerabilityMap = HashMap<VulnKey, ScanOutcome>;
 /// scan entirely — `crate::lsp_helpers::latest_verdict` treats the two differently.
 pub type LatestStatusMap = HashMap<VulnKey, UpgradeStatus>;
 
+/// Per-dependency, per-candidate-version OSV verdict (#1524).
+///
+/// The sibling of [`LatestStatusMap`] for callers that need more than one candidate version's
+/// own status, not only the registry's single "latest" pick.
+///
+/// The inner `HashMap<String, UpgradeStatus>` is keyed by the exact ecosystem-native version
+/// string a candidate-offering surface (code actions' "update to X" list, completion's version
+/// items) is about to display — one entry per version phase B's candidate-check round actually
+/// covered for this dependency. A structural skip (this dependency's source/ecosystem is never
+/// checked against OSV at all) is recorded once per dependency under the empty-string key
+/// (`""`), a version no ecosystem's `ScanTarget::display_version` can ever equal, rather than
+/// duplicated under every candidate version — [`crate::lsp_helpers::candidate_verdict`] falls
+/// back to it when the exact version being asked about has no entry of its own.
+///
+/// A dependency entirely absent from this map (not even the empty-string sentinel) means phase
+/// B's candidate-check round simply never covered it yet — [`crate::lsp_helpers::candidate_verdict`]
+/// treats that the same as an unchecked version: [`crate::lsp_helpers::LatestVerdict::Unverified`],
+/// never silently safe.
+pub type CandidateStatusMap = HashMap<VulnKey, HashMap<String, UpgradeStatus>>;
+
 /// A single occurrence's [`VulnerabilityMap`] lookup key, as computed by [`vulnerability_keys`]
 /// or [`vuln_key_for`].
 ///

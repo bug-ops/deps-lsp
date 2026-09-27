@@ -9,7 +9,7 @@
 //! items are visible to descendant modules, and `signals` is a descendant of `state`.
 
 use deps_core::lsp_helpers::EcosystemFormatter;
-use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
+use deps_core::osv::{CandidateStatusMap, LatestStatusMap, VulnerabilityMap};
 use deps_core::{
     ConcreteVersion, DependencyOutcomes, GossipFindings, PackageName, PackageVersions,
     TyposquatSignal, VersionData,
@@ -66,6 +66,14 @@ pub struct PackageSignals {
     /// `Some(&empty map)`, not `None` — [`deps_core::lsp_helpers::latest_verdict`] treats an
     /// empty map's absent entry as `Unverified` (fail closed), never `NotApplicable`.
     pub latest_status: LatestStatusMap,
+    /// Phase B's per-(dependency, candidate-version) check result (#1524), keyed the same way
+    /// as [`Self::latest_status`] — see [`deps_core::osv::CandidateStatusMap`]. Populated for a
+    /// bounded set of candidate versions per dependency (the ones a candidate-offering surface
+    /// might display), not only the registry's single "latest" pick [`Self::latest_status`]
+    /// already covers. Empty until the first phase B commits; carried across document edits by
+    /// `preserve_cache`. Every handler attaches this unconditionally, mirroring
+    /// [`Self::latest_status`]'s own unconditional attach.
+    pub candidate_status: CandidateStatusMap,
     /// Yanked, deprecation, and fetch-failure findings from the lifecycle's registry
     /// fetch, keyed by **normalized** package name. This is deliberately a different
     /// type from `FetchResult`'s raw-keyed triple: the split makes a forgotten
@@ -180,6 +188,7 @@ impl std::fmt::Debug for PackageSignals {
             resolved_versions_generation,
             vulnerabilities,
             latest_status,
+            candidate_status,
             outcomes,
             licenses,
             typosquats,
@@ -196,6 +205,7 @@ impl std::fmt::Debug for PackageSignals {
             .field("resolved_versions_generation", resolved_versions_generation)
             .field("vulnerabilities_count", &vulnerabilities.len())
             .field("latest_status_count", &latest_status.len())
+            .field("candidate_status_count", &candidate_status.len())
             .field("licenses_count", &licenses.len())
             .field("typosquats_count", &typosquats.len())
             .field(
@@ -226,6 +236,7 @@ impl Default for PackageSignals {
             resolved_versions_generation: ResolvedGeneration::INITIAL,
             vulnerabilities: VulnerabilityMap::new(),
             latest_status: LatestStatusMap::new(),
+            candidate_status: CandidateStatusMap::new(),
             outcomes: DependencyOutcomes::new(),
             licenses: HashMap::new(),
             typosquats: HashMap::new(),
@@ -264,6 +275,7 @@ impl PackageSignals {
             resolved_versions_generation: _,
             vulnerabilities,
             latest_status,
+            candidate_status,
             outcomes,
             licenses,
             typosquats,
@@ -280,6 +292,7 @@ impl PackageSignals {
             let normalized = formatter.normalize_package_name(removed_dep);
             vulnerabilities.retain(|key, _| key.as_str() != normalized);
             latest_status.retain(|key, _| key.as_str() != normalized);
+            candidate_status.retain(|key, _| key.as_str() != normalized);
             outcomes.remove(&normalized);
         }
     }
@@ -298,6 +311,7 @@ impl PackageSignals {
             candidates: None,
             vulnerabilities: None,
             latest_status: None,
+            candidate_status: None,
             outcomes: None,
             licenses: None,
             typosquats: None,
@@ -336,6 +350,7 @@ pub(crate) struct SignalsSnapshotBuilder<'a> {
     candidates: Option<HashMap<PackageName, Vec<ConcreteVersion>>>,
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
+    candidate_status: Option<CandidateStatusMap>,
     outcomes: Option<DependencyOutcomes>,
     licenses: Option<HashMap<PackageName, Vec<String>>>,
     typosquats: Option<HashMap<PackageName, TyposquatSignal>>,
@@ -377,6 +392,18 @@ impl SignalsSnapshotBuilder<'_> {
     pub(crate) fn with_latest_status(mut self, enabled: bool) -> Self {
         if enabled {
             self.latest_status = Some(self.signals.latest_status.clone());
+        }
+        self
+    }
+
+    /// Attaches [`PackageSignals::candidate_status`] (issue #1524) when `enabled` is `true`,
+    /// leaving it `None` otherwise — mirrors [`Self::with_latest_status`]'s exact gating
+    /// rationale (an absent map means [`deps_core::lsp_helpers::LatestVerdict::NotApplicable`],
+    /// a present-but-empty one means [`deps_core::lsp_helpers::LatestVerdict::Unverified`]).
+    #[must_use]
+    pub(crate) fn with_candidate_status(mut self, enabled: bool) -> Self {
+        if enabled {
+            self.candidate_status = Some(self.signals.candidate_status.clone());
         }
         self
     }
@@ -429,6 +456,7 @@ impl SignalsSnapshotBuilder<'_> {
             candidates: self.candidates,
             vulnerabilities: self.vulnerabilities,
             latest_status: self.latest_status,
+            candidate_status: self.candidate_status,
             outcomes: self.outcomes,
             licenses: self.licenses,
             typosquats: self.typosquats,
@@ -450,6 +478,7 @@ pub(crate) struct SignalsSnapshot {
     candidates: Option<HashMap<PackageName, Vec<ConcreteVersion>>>,
     vulnerabilities: Option<VulnerabilityMap>,
     latest_status: Option<LatestStatusMap>,
+    candidate_status: Option<CandidateStatusMap>,
     outcomes: Option<DependencyOutcomes>,
     licenses: Option<HashMap<PackageName, Vec<String>>>,
     typosquats: Option<HashMap<PackageName, TyposquatSignal>>,
@@ -472,6 +501,9 @@ impl SignalsSnapshot {
         }
         if let Some(latest_status) = &self.latest_status {
             data = data.with_latest_status(latest_status);
+        }
+        if let Some(candidate_status) = &self.candidate_status {
+            data = data.with_candidate_status(candidate_status);
         }
         if let Some(outcomes) = &self.outcomes {
             data = data.with_outcomes(outcomes);

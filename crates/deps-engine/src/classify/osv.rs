@@ -307,6 +307,120 @@ pub fn build_latest_check_targets(
     (targets, structural)
 }
 
+/// Bounds how many candidate versions per dependency [`build_candidate_check_targets`] checks
+/// (#1524) — code actions/completion display at most a handful of "update to X" items per
+/// dependency, so checking a small superset of that is enough to cover what a
+/// candidate-offering surface could actually display, without unbounded OSV traffic for a
+/// dependency with hundreds of published versions.
+const MAX_CANDIDATE_CHECK_VERSIONS: usize = 6;
+
+/// Builds phase B's candidate-check targets for #1524.
+///
+/// Organized into up to `MAX_CANDIDATE_CHECK_VERSIONS` "rounds": round `r`'s
+/// `Vec<ScanTarget>` holds, for every dependency that has one, its `r`-th newest non-yanked
+/// registry version (rank 0 = newest). Callers batch-check one round at a time via
+/// [`deps_core::osv::OsvClient::check_candidates`]
+/// — at most one target per [`deps_core::osv::VulnKey`] per round, so a single call never
+/// collapses two of one dependency's own candidates into one result — and merge each round's
+/// [`deps_core::osv::LatestStatusMap`]-shaped result into a
+/// [`deps_core::osv::CandidateStatusMap`] keyed by the version each round actually checked.
+///
+/// Mirrors [`build_latest_check_targets`]'s exact structural-skip handling (non-public-registry
+/// source, unmappable OSV name) — recorded once per dependency in the returned `structural` map
+/// under the empty-string sentinel key (see [`deps_core::osv::CandidateStatusMap`]'s doc),
+/// never duplicated per round.
+///
+/// Selection is deliberately simpler than
+/// [`deps_core::completion::prepare_version_display_items`]'s exact display-item algorithm
+/// (which needs the full `dyn Version` registry response this background task never has
+/// cached, only the bare [`ConcreteVersion`] list [`deps_core::lsp_helpers::PackageVersions`]
+/// carries): the newest `MAX_CANDIDATE_CHECK_VERSIONS` non-yanked entries from
+/// [`deps_core::lsp_helpers::PackageVersions::available`], newest-first. A display item this
+/// selection doesn't happen to cover (rare: `prepare_version_display_items`'s own "bump the
+/// latest pick in" `#956` behavior) simply reads as
+/// [`deps_core::lsp_helpers::LatestVerdict::Unverified`] and is excluded — over-conservative,
+/// never under-conservative.
+pub fn build_candidate_check_targets(
+    parse_result: &dyn deps_core::ParseResult,
+    cached_versions: &HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    vuln_keys: &deps_core::osv::VulnKeys,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> (
+    Vec<Vec<deps_core::osv::ScanTarget>>,
+    deps_core::osv::CandidateStatusMap,
+) {
+    use deps_core::osv::{SkipReason, UpgradeStatus, vuln_key_for};
+
+    let mut rounds: Vec<Vec<deps_core::osv::ScanTarget>> =
+        vec![Vec::new(); MAX_CANDIDATE_CHECK_VERSIONS];
+    let mut structural = deps_core::osv::CandidateStatusMap::new();
+
+    for dep in parse_result.dependencies() {
+        let normalized_name = formatter.normalize_package_name(dep.name());
+        let key = vuln_key_for(dep, Some(vuln_keys), formatter);
+
+        if !formatter.source_is_public_registry_content(&dep.source()) {
+            structural.entry(key).or_default().insert(
+                String::new(),
+                UpgradeStatus::CandidateUnverified {
+                    version: String::new(),
+                    reason: SkipReason::NonRegistrySource,
+                },
+            );
+            continue;
+        }
+
+        let Some(package_versions) = cached_versions
+            .get(normalized_name.as_str())
+            .or_else(|| cached_versions.get(dep.name()))
+        else {
+            // No registry-cached version list yet — absence, not a structural skip (see doc
+            // above), matching `build_latest_check_targets`'s identical treatment.
+            continue;
+        };
+
+        let Some(osv_name) = formatter.osv_package_name(dep) else {
+            structural.entry(key).or_default().insert(
+                String::new(),
+                UpgradeStatus::CandidateUnverified {
+                    version: String::new(),
+                    reason: SkipReason::UnmappableName,
+                },
+            );
+            continue;
+        };
+
+        let yanked: std::collections::HashSet<&ConcreteVersion> = package_versions
+            .yanked
+            .iter()
+            .map(|(version, _)| version)
+            .collect();
+
+        for (rank, version) in package_versions
+            .available
+            .iter()
+            .filter(|v| !yanked.contains(v))
+            .take(MAX_CANDIDATE_CHECK_VERSIONS)
+            .enumerate()
+        {
+            // `rank` is in `0..MAX_CANDIDATE_CHECK_VERSIONS` by construction (bounded by the
+            // `take` above), matching `rounds`' own length — but a bare index would still
+            // panic if that invariant were ever broken, so this fails closed instead.
+            let Some(bucket) = rounds.get_mut(rank) else {
+                continue;
+            };
+            bucket.push(deps_core::osv::ScanTarget::from_native(
+                key.clone(),
+                osv_name.clone(),
+                version.clone(),
+                formatter,
+            ));
+        }
+    }
+
+    (rounds, structural)
+}
+
 /// Outcome of `resolve_fix_target` for one vulnerable dependency.
 #[derive(Debug, PartialEq, Eq)]
 enum FixTargetResolution {

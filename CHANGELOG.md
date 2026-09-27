@@ -30,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-cli, deps-engine**: `check`/`update` now honor `[gossip].enabled`, floor-protected against ever excluding an already-in-use version, plus an `ignored_sections`/`[typosquat]` warning-parity fix for explicit `--config` files (resolves #1474) (#1520)
 
 ### Security
+- **deps-core, deps-lsp, deps-engine**: code actions and completion now independently OSV-check every version offered as an "update to X" item, not only `latest`, excluding a flagged or unverified candidate the same way an unsafe `latest` is already excluded (resolves #1524) (#1530)
+- **deps-core, deps-lsp**: the outdated-diagnostic rule and the up-to-date inlay-hint rendering now surface a flagged verdict instead of a plain "up to date" checkmark when a declared requirement already admits a `latest` version OSV.dev flags as vulnerable/malicious (resolves #1526) (#1530)
 - **deps-lsp, deps-cli, deps-core**: closes several residual fail-open gaps in the OSV latest-check across completion, diagnostics, and `deps-cli update` (part of #1517) (#1523)
 - **deps-lsp, deps-cli, deps-core, deps-engine**: OSV phase B now checks every dependency's registry `latest`, not only ones already flagged vulnerable at their pinned version, closing a gap where a malicious/vulnerable `latest` could be recommended or auto-written as a safe upgrade (resolves #1517) (#1523)
 - **deps-lsp**: a GOSSIP cooldown sentinel no longer masks an OSV-flagged malicious/critical latest version as a benign "recently published" notice (part of #1517) (#1523)
