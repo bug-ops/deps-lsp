@@ -622,6 +622,60 @@ mod tests {
         );
     }
 
+    /// Issue #1571: R0 `>=1.0,!=1.5.0,<2.0` explicitly excludes 1.5.0 via PEP 440's `!=`
+    /// operator, but 1.5.0 sits inside the requirement's nominal `[1.0,2.0)` span and 1.6.0
+    /// still matches and is strictly newer — a bare floor-position comparison alone cannot see
+    /// this hole. The naive fallback candidate must not be approved as `fallback` = 1.5.0.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback() {
+        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "pkg>=1.0,!=1.5.0,<2.0\n".to_string();
+        let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &PypiFormatter,
+            &uri,
+            &content,
+            "pkg",
+            "1.5.0",
+            &["1.6.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
+    /// Impl-critic fix-cycle S1: NO listed `available` entry strictly newer than the excluded
+    /// `fallback` matches R0 here (2.0.0 fails the `<2.0` ceiling too), so a purely structural
+    /// "does something newer also match" scan is vacuous — this only rejects because
+    /// `Pep440Matcher::explicitly_excludes` asks the `!=` specifier directly.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_vacuous_case() {
+        let ecosystem = PypiEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = "pkg>=1.0,!=1.5.0,<2.0\n".to_string();
+        let uri = deps_core::test_util::test_uri("/test/requirements.txt");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &PypiFormatter,
+            &uri,
+            &content,
+            "pkg",
+            "1.5.0",
+            &["2.0.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing the hand-written
     // test_ecosystem_id/test_ecosystem_display_name/test_ecosystem_manifest_filenames/
     // test_ecosystem_lockfile_filenames/test_as_any/test_registry_returns_arc family.

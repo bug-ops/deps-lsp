@@ -421,8 +421,19 @@ pub enum FallbackEditRejection {
     /// nearly every permissive/auto-following requirement, and from a "no evidence means safe"
     /// vacuous accept on an unlisted declared pin).
     OriginalResolvesPastFallback,
-    /// The edited manifest could not be re-parsed (FR-024) — e.g. Composer's genuinely-awaiting
-    /// `parse_manifest` for a bare vcs/path/artifact repository plus a lockfile.
+    /// Fix-cycle (#1571): the original declared requirement admits some entry strictly newer
+    /// than `fallback`, or a matcher-reported `!=`-style term explicitly bans `fallback`
+    /// (`RequirementMatcher::explicitly_excludes`), yet `fallback` itself fails
+    /// `r0_matcher.matches` — `fallback` sits inside R0's nominal span (or one of its `||`
+    /// branches, for an ecosystem with alternation) but is punched out of it (a `!=` term, or a
+    /// `||`-alternation gap), which a bare floor-position comparison (d0 above) cannot see since
+    /// neither hole shape moves the floor. Distinct from the legitimate case where `fallback`
+    /// fails `r0_matcher.matches` only because it exceeds every branch's ceiling entirely
+    /// (FR-025's out-of-range acceptance).
+    OriginalExcludesFallback,
+    /// The edited manifest could not be re-parsed (FR-024) — [`crate::edit::ManifestReparse`]
+    /// returned `None`, e.g. an `Ecosystem::parse_manifest_sync` override or default that itself
+    /// fails to parse the edited scratch copy.
     ReparseFailed,
     /// The re-parsed manifest did not contain exactly one dependency matching this occurrence's
     /// `(normalized name, version_range.start)`.
@@ -460,7 +471,13 @@ pub enum FallbackEditRejection {
 ///   `is_requirement_up_to_date(R0, fallback)` must be `false` (closes a NuGet bare-floor gap,
 ///   spec 076 round-1 critic S2); d0 no `available` entry STRICTLY newer than `fallback` may
 ///   satisfy `requirement_already_resolves_to(R0, entry)` (anti-downgrade — writing `fallback`
-///   must not move resolution backward relative to what R0 already resolves to).
+///   must not move resolution backward relative to what R0 already resolves to); fix-cycle #1571:
+///   when `fallback` itself does not match R0's compiled matcher, R0 must not directly report
+///   `fallback` as `!=`-excluded ([`RequirementMatcher::explicitly_excludes`]) and it must not
+///   be the case that some entry strictly newer than `fallback` still matches R0 — otherwise
+///   `fallback` sits inside R0's nominal span (or a `||` branch's) but not R0 itself (a `!=`
+///   term or a `||`-alternation gap), which the floor comparison alone cannot see
+///   ([`FallbackEditRejection::OriginalExcludesFallback`]).
 /// - **Re-parse** (only if phase 1 passes, FR-024): `candidate` is applied to a scratch copy of
 ///   `content`, the copy is re-parsed via `reparse`, and the edited occurrence is located by
 ///   `(formatter.normalize_package_name(dep.name()), version_range().start)` — NOT `name_range`,
@@ -589,7 +606,8 @@ pub fn fallback_edit_excludes_newer(
     use FallbackEditRejection::{
         CandidateSpanMismatch, EditedAdmitsNewer, EditedExcludesFallback, EditedOversized,
         EditedUncompilable, FallbackUnlisted, OccurrenceNotUnique, OriginalAlreadyUpToDate,
-        OriginalOversized, OriginalResolvesPastFallback, OriginalUncompilable, ReparseFailed,
+        OriginalExcludesFallback, OriginalOversized, OriginalResolvesPastFallback,
+        OriginalUncompilable, ReparseFailed,
     };
 
     // Precondition (D5, fix-cycle M2): `candidate` must target THIS occurrence's own span.
@@ -641,6 +659,41 @@ pub fn fallback_edit_excludes_newer(
         .rposition(|v| r0_matcher.matches(v) == Some(true));
     if r0_floor.is_none_or(|floor| floor < fallback_pos) {
         return FallbackEditVerdict::Rejected(OriginalResolvesPastFallback);
+    }
+    // Fix-cycle (#1571): R0 admitting `fallback` inside its nominal span yet not `fallback`
+    // itself — a `!=`-style exclusion (PyPI/Composer/Bundler) or a `||`-alternation gap
+    // (Composer) punches a hole rather than shifting the floor, so the floor comparison above
+    // alone cannot see it. Two independent signals, either one rejects. `r0_floor ==
+    // Some(fallback_pos)` (code-review perf finding) means the floor scan above already proved
+    // `fallback` matches R0 — the floor is BY DEFINITION a matching index, so no need to call
+    // `matches` on `fallback` again for that common case.
+    let fallback_matches_r0 =
+        r0_floor == Some(fallback_pos) || r0_matcher.matches(fallback) == Some(true);
+    if !fallback_matches_r0 {
+        // (i) Intensional: the matcher itself names `fallback` as explicitly banned (critic
+        // fix-cycle S1 — `r0_matcher.explicitly_excludes` is the only way to tell a `!=` hole
+        // apart from a legitimate ceiling-exceeding fallback when NO listed `available` entry
+        // happens to evidence the hole either, e.g. `>=1.0,!=1.5.0,<2.0` with `fallback` ==
+        // 1.5.0 and `available` = [2.0.0, 1.5.0, 1.0.0] — 2.0.0 fails `matches` too (it's past
+        // the `<2.0` ceiling), so (ii) below is vacuous and only this direct check catches it).
+        if r0_matcher.explicitly_excludes(fallback) {
+            return FallbackEditVerdict::Rejected(OriginalExcludesFallback);
+        }
+        // (ii) Extensional, structural fallback net: some LISTED entry strictly newer than
+        // `fallback` still matches R0 (e.g. `r0_floor` (4) >= `fallback_pos` (2) passed above
+        // even though R0 explicitly excludes `fallback`, or a `||`-alternation gap like
+        // `^1.0 || ^3.0` with `fallback` = 2.5.0). A legitimate out-of-range fallback (e.g.
+        // Cargo's `^1.0` with fallback 2.5.0) has no R0-matching entry newer than it at all —
+        // FR-025's intentional ceiling-exceeding acceptance — so this never misfires on that
+        // case.
+        #[allow(clippy::indexing_slicing)]
+        let newer_than_fallback = &available[..fallback_pos];
+        if newer_than_fallback
+            .iter()
+            .any(|v| r0_matcher.matches(v) == Some(true))
+        {
+            return FallbackEditVerdict::Rejected(OriginalExcludesFallback);
+        }
     }
 
     // Re-parse (FR-024): apply the candidate edit to a scratch copy and re-parse it.
@@ -3279,6 +3332,46 @@ pub trait RequirementMatcher: Send + Sync {
     /// assert!(!NonStrictMatcher.strict_prerelease_exclusion());
     /// ```
     fn strict_prerelease_exclusion(&self) -> bool;
+
+    /// Whether this requirement's own grammar contains an explicit exclusion term (PyPI's
+    /// `!=`/`!=X.*`, Composer's `!=`, Bundler's `!=`) that individually bans exactly `version`,
+    /// independent of whether `version` would otherwise fall inside the requirement's nominal
+    /// range.
+    ///
+    /// Fix-cycle (#1571): [`crate::lsp_helpers::fallback_edit_excludes_newer`]'s
+    /// `OriginalExcludesFallback` check needs this as an intensional signal — scanning
+    /// `available` for "does some newer entry also match" cannot distinguish a `!=`-punched
+    /// hole from a fallback that legitimately exceeds the requirement's ceiling, since both
+    /// produce the same `matches(fallback) == Some(false)` result and, when no newer entry
+    /// happens to be listed in `available` either, the identical "nothing newer matches" scan
+    /// outcome (critic-reproduced: `>=1.0,!=1.5.0,<2.0` and `>=1.0,<1.5` give the same verdict
+    /// over `available = [2.0.0, 1.5.0, 1.0.0]` unless the matcher is asked directly).
+    ///
+    /// Default `false` — most ecosystems have no such operator (range/caret/tilde bounds only
+    /// ever exclude by falling outside an interval, never by naming one banned value inside
+    /// it). Only a matcher whose grammar has a real `!=`-style term overrides this.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::lsp_helpers::RequirementMatcher;
+    ///
+    /// struct RangeOnlyMatcher;
+    /// impl RequirementMatcher for RangeOnlyMatcher {
+    ///     fn matches(&self, _version: &ConcreteVersion) -> Option<bool> {
+    ///         Some(true)
+    ///     }
+    ///     fn strict_prerelease_exclusion(&self) -> bool {
+    ///         false
+    ///     }
+    /// }
+    ///
+    /// assert!(!RangeOnlyMatcher.explicitly_excludes(&ConcreteVersion::new("1.5.0")));
+    /// ```
+    fn explicitly_excludes(&self, _version: &ConcreteVersion) -> bool {
+        false
+    }
 }
 
 /// Parses `version` as [`semver::Version`] and tests it against `req`, `None` on parse failure.
@@ -6267,6 +6360,73 @@ mod tests {
         impl SourcePolicy for NugetFloorFormatter {}
         impl OsvNaming for NugetFloorFormatter {}
 
+        /// Fix-cycle (#1571) stub matcher for a `!=`-exclusion requirement grammar
+        /// (PyPI/Composer/Bundler all support one): `requirement` is `"<range>,!=<excluded>"`,
+        /// `<range>` compiled with real `semver::VersionReq` and `<excluded>` an exact,
+        /// string-compared exclusion — mirrors the shape enough to prove the guard's floor
+        /// comparison alone cannot see a hole punched inside an otherwise-matching span.
+        struct ExclusionMatcher {
+            range: semver::VersionReq,
+            excluded: String,
+        }
+        impl RequirementMatcher for ExclusionMatcher {
+            fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
+                if version.as_str() == self.excluded {
+                    return Some(false);
+                }
+                semver::Version::parse(version.as_str())
+                    .ok()
+                    .map(|v| self.range.matches(&v))
+            }
+            fn strict_prerelease_exclusion(&self) -> bool {
+                true
+            }
+            // Fix-cycle (#1571 critic S1): the intensional signal a real `!=` matcher
+            // (PyPI/Composer/Bundler) provides — mirrors this stub's own `excluded` field
+            // directly, the same way `Pep440Matcher`/`ComposerMatcher`/`RubygemsMatcher` read
+            // their own parsed `!=` term instead of inferring it from `available`.
+            fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
+                version.as_str() == self.excluded
+            }
+        }
+
+        struct ExclusionFormatter;
+        impl PackageNaming for ExclusionFormatter {}
+        impl PackageRendering for ExclusionFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for ExclusionFormatter {
+            fn compile_requirement(
+                &self,
+                requirement: &VersionReq,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                let (range, excluded) = requirement.as_str().split_once(",!=")?;
+                let range = semver::VersionReq::parse(range).ok()?;
+                Some(Box::new(ExclusionMatcher {
+                    range,
+                    excluded: excluded.to_string(),
+                }) as Box<dyn RequirementMatcher>)
+            }
+            // Never "already up to date" — isolates the new check from c0, mirroring how
+            // `SemverFormatter`'s own default already keeps c0/d0 independent for its tests.
+            fn is_requirement_up_to_date(
+                &self,
+                _requirement: &VersionReq,
+                _latest: &ConcreteVersion,
+            ) -> bool {
+                false
+            }
+        }
+        impl DiagnosticMessages for ExclusionFormatter {}
+        impl DiagnosticPolicy for ExclusionFormatter {}
+        impl SourcePolicy for ExclusionFormatter {}
+        impl OsvNaming for ExclusionFormatter {}
+
         struct StubDep {
             name: PackageName,
             requirement: Option<VersionReq>,
@@ -6421,6 +6581,68 @@ mod tests {
                 verdict,
                 FallbackEditVerdict::Rejected(FallbackEditRejection::OriginalResolvesPastFallback)
             );
+        }
+
+        #[test]
+        fn original_excludes_fallback_via_not_equal() {
+            // R0 ">=1.0.0,<2.0.0,!=1.5.0" (PyPI/Composer/Bundler `!=` shape): 1.5.0 sits inside
+            // the nominal `[1.0.0,2.0.0)` span but is punched out by the exclusion, while 1.6.0
+            // still matches and is strictly newer — the floor comparison alone (d0) would pass
+            // this (the floor, 1.0.0, is not newer than 1.5.0), so only the #1571 check catches
+            // it.
+            let verdict = fallback_edit_excludes_newer(
+                &ExclusionFormatter,
+                &reparsed_to("1.5.0"),
+                "content",
+                &dep(">=1.0.0,<2.0.0,!=1.5.0"),
+                &edit(),
+                &ConcreteVersion::new("1.5.0"),
+                &versions(&["1.6.0", "1.5.0", "1.0.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::OriginalExcludesFallback)
+            );
+        }
+
+        #[test]
+        fn original_excludes_fallback_via_not_equal_is_caught_even_when_vacuous() {
+            // Critic fix-cycle S1: NO listed `available` entry strictly newer than `fallback`
+            // matches R0 here (2.0.0 fails the `<2.0.0` ceiling too), so the purely structural
+            // "some newer entry still matches" heuristic alone is vacuous — it cannot tell this
+            // apart from `>=1.0.0,<1.5.0` (a legitimate ceiling) over the identical `available`
+            // list. Only `RequirementMatcher::explicitly_excludes` catches it.
+            let verdict = fallback_edit_excludes_newer(
+                &ExclusionFormatter,
+                &reparsed_to("1.5.0"),
+                "content",
+                &dep(">=1.0.0,<2.0.0,!=1.5.0"),
+                &edit(),
+                &ConcreteVersion::new("1.5.0"),
+                &versions(&["2.0.0", "1.5.0", "1.0.0"]),
+            );
+            assert_eq!(
+                verdict,
+                FallbackEditVerdict::Rejected(FallbackEditRejection::OriginalExcludesFallback)
+            );
+        }
+
+        #[test]
+        fn ceiling_exceeding_fallback_is_not_excluded_via_not_equal_check() {
+            // Cargo-shaped out-of-range acceptance (FR-025): `^1.0` fails `matches` for a
+            // fallback of 2.5.0 too, but no R0-matching entry is newer than it — the #1571
+            // check must not fire here, or it would reject spec 076's intentional
+            // ceiling-exceeding case.
+            let verdict = fallback_edit_excludes_newer(
+                &SemverFormatter,
+                &reparsed_to("^2.5.0"),
+                "content",
+                &dep("^1.0"),
+                &edit(),
+                &ConcreteVersion::new("2.5.0"),
+                &versions(&["3.0.0", "2.5.0", "1.0.0"]),
+            );
+            assert_eq!(verdict, FallbackEditVerdict::Writable);
         }
 
         #[test]

@@ -330,6 +330,22 @@ pub fn version_matches_requirement(version: &str, requirement: &str) -> bool {
         .all(|part| single_constraint_matches(version, part))
 }
 
+/// Fix-cycle (#1571): whether one of `requirement`'s comma-separated constraints is a `!=` term
+/// that individually bans exactly `version`.
+///
+/// The intensional signal [`deps_core::lsp_helpers::RequirementMatcher::explicitly_excludes`]
+/// needs, since scanning `available` for "does something newer also match" cannot distinguish a
+/// `!=`-punched hole from a fallback that legitimately exceeds the requirement's ceiling.
+/// Mirrors `single_constraint_matches`'s own `!=` branch's comparator exactly, scoped to only
+/// that operator.
+pub fn version_explicitly_excluded_by_requirement(version: &str, requirement: &str) -> bool {
+    requirement.trim().split(',').any(|part| {
+        part.trim()
+            .strip_prefix("!=")
+            .is_some_and(|req_ver| compare_versions(version, req_ver.trim()) == Ordering::Equal)
+    })
+}
+
 /// A single, non-comma-separated constraint check — the body [`version_matches_requirement`]
 /// applies to each comma-separated part of a requirement.
 fn single_constraint_matches(version: &str, requirement: &str) -> bool {

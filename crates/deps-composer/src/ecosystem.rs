@@ -125,6 +125,23 @@ impl Ecosystem for ComposerEcosystem {
         })
     }
 
+    /// Issue #1570: overrides the default `now_or_never()`-driven implementation, which races
+    /// [`Self::parse_manifest`]'s genuine `composer.lock` await (bare vcs/path/artifact
+    /// repository plus a lockfile) and non-deterministically saw `Pending` or `Ready` depending
+    /// on scheduler timing. FR-024's fallback-edit guard only needs the re-parsed requirement's
+    /// text/shape, never the lockfile-derived source classification
+    /// [`crate::parser::parse_composer_json_with_lockfile`] adds on top of
+    /// [`crate::parser::parse_composer_json`] — so this calls the latter directly, synchronously,
+    /// with no lockfile I/O at all.
+    fn parse_manifest_sync(
+        &self,
+        content: &str,
+        uri: &url::Url,
+    ) -> Option<Box<dyn ParseResultTrait>> {
+        let result = crate::parser::parse_composer_json(content, uri).ok()?;
+        Some(Box::new(result) as Box<dyn ParseResultTrait>)
+    }
+
     fn registry(&self) -> Arc<dyn Registry> {
         self.registry.clone() as Arc<dyn Registry>
     }
@@ -252,19 +269,132 @@ mod tests {
         );
     }
 
-    /// Spec 076 FR-024 known limitation (architect handoff `2026-09-27T17-56-09`, §3 amendment
-    /// callout): a bare vcs/path/artifact repository plus a real `composer.lock` on disk makes
-    /// `parse_manifest` genuinely await (`LockFileCache::get_or_parse` -> `tokio::fs::metadata`).
-    /// `parse_manifest_now`'s `now_or_never()` polls this exactly once: on most platforms the
-    /// `spawn_blocking`-backed metadata read is still `Pending` at that point, so `parse_manifest_now`
-    /// returns `None` and the guard's re-parse step maps that to `ReparseFailed` rather than
-    /// blocking — but this is a genuine scheduler race, not a guarantee (CI on Linux has observed
-    /// the blocking task complete synchronously within the single poll, yielding `Writable`
-    /// instead). Both outcomes are safe: `ReparseFailed` fails closed as intended, and `Writable`
-    /// means the re-parse happened to complete and was validated normally, same as the ordinary
-    /// case. Only assert that no OTHER outcome occurs, which would indicate a real bug.
+    /// Issue #1571: R0 `>=1.0 !=1.5.0 <2.0` (Composer's space-separated AND form) explicitly
+    /// excludes 1.5.0 via `!=`, but 1.5.0 sits inside the requirement's nominal `[1.0,2.0)`
+    /// span and 1.6.0 still matches and is strictly newer — a bare floor-position comparison
+    /// alone cannot see this hole. The naive fallback candidate must not be approved as
+    /// `fallback` = 1.5.0.
     #[tokio::test]
-    async fn test_fallback_edit_excludes_newer_pins_reparse_failed_for_bare_repo_plus_lockfile() {
+    async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback() {
+        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"require": {"acme/pkg": ">=1.0 !=1.5.0 <2.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &ComposerFormatter,
+            &uri,
+            &content,
+            "acme/pkg",
+            "1.5.0",
+            &["1.6.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
+    /// Code-review fix-cycle critical finding: a `!=` written with a space before its operand
+    /// (`"!= 1.5.0"`, valid Composer syntax) used to survive `normalize_operator_spacing`
+    /// unnormalized, tokenizing into a bare `!=` (its operand stripped to empty, matching
+    /// everything) and a bare `"1.5.0"` token misread as an ordinary version pin — silently
+    /// inverting the exclusion for BOTH `version_satisfies_requirement` and
+    /// `composer_explicitly_excludes`, since both consume `normalize_operator_spacing`'s output.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_spaced_operator()
+    {
+        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"require": {"acme/pkg": ">=1.0 != 1.5.0 <2.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &ComposerFormatter,
+            &uri,
+            &content,
+            "acme/pkg",
+            "1.5.0",
+            &["1.6.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
+    /// Impl-critic fix-cycle S1: NO listed `available` entry strictly newer than the excluded
+    /// `fallback` matches R0 here (2.0.0 fails the `<2.0` ceiling too), so a purely structural
+    /// "does something newer also match" scan is vacuous — this only rejects because
+    /// `ComposerMatcher::explicitly_excludes` asks the `!=` clause directly.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_vacuous_case() {
+        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"require": {"acme/pkg": ">=1.0 !=1.5.0 <2.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &ComposerFormatter,
+            &uri,
+            &content,
+            "acme/pkg",
+            "1.5.0",
+            &["2.0.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
+    /// Impl-critic fix-cycle M2: `^0.9` (the first `||` branch) simply doesn't cover 1.5.0 at
+    /// all, while `>=1.0 !=1.5.0 <2.0` (the second branch) explicitly bans it — an `all`-branches
+    /// reading of "explicitly excluded" would miss this (the first branch never explicitly
+    /// excludes anything), so `composer_explicitly_excludes` must use `any` across `||` branches.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_not_equal_excluded_fallback_across_or_branches()
+     {
+        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"require": {"acme/pkg": "^0.9 || >=1.0 !=1.5.0 <2.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &ComposerFormatter,
+            &uri,
+            &content,
+            "acme/pkg",
+            "1.5.0",
+            &["2.0.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
+    /// Issue #1570 fix (was: spec 076 FR-024 known limitation, architect handoff
+    /// `2026-09-27T17-56-09`, §3 amendment callout): a bare vcs/path/artifact repository plus a
+    /// real `composer.lock` on disk makes [`Ecosystem::parse_manifest`] genuinely await
+    /// (`LockFileCache::get_or_parse` -> `tokio::fs::metadata`), which used to make
+    /// `parse_manifest_now`'s single `now_or_never()` poll a genuine scheduler race between
+    /// `Pending` (`ReparseFailed`) and a completed read (`Writable`) — both safe, but
+    /// non-deterministic. [`ComposerEcosystem::parse_manifest_sync`] now overrides the default
+    /// `now_or_never()`-driven re-parse to call [`crate::parser::parse_composer_json`] directly
+    /// instead, with no lockfile I/O at all — the guard only needs `acme/pkg`'s re-parsed
+    /// requirement text, never its lockfile-derived source classification — so this is
+    /// deterministically `Writable` on every platform, never a race.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_writable_for_bare_repo_plus_lockfile() {
         let temp_dir = tempfile::tempdir().unwrap();
         let manifest_path = temp_dir.path().join("composer.json");
         let content = r#"{
@@ -316,15 +446,11 @@ mod tests {
             &fallback,
             &available,
         );
-        use deps_core::lsp_helpers::{FallbackEditRejection, FallbackEditVerdict};
-        assert!(
-            matches!(
-                verdict,
-                FallbackEditVerdict::Writable
-                    | FallbackEditVerdict::Rejected(FallbackEditRejection::ReparseFailed)
-            ),
-            "expected either Writable (re-parse raced ahead of the single now_or_never poll) \
-             or Rejected(ReparseFailed) (re-parse still Pending at that poll) — got {verdict:?}"
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Writable,
+            "parse_manifest_sync must skip lockfile classification deterministically, never \
+             race now_or_never() against it"
         );
     }
 

@@ -172,13 +172,17 @@ pub fn extract_pypi_min_version(version_req: &str) -> Option<String> {
     None
 }
 
-/// Collapses whitespace between a range operator (`>=`, `<=`, `>`, `<`) and its version
-/// number, e.g. `">= 1.0 < 2.0"` becomes `">=1.0 <2.0"`.
+/// Collapses whitespace between a range/exclusion operator (`>=`, `<=`, `>`, `<`, `!=`) and its
+/// version number, e.g. `">= 1.0 < 2.0"` becomes `">=1.0 <2.0"`.
 ///
 /// Several ecosystem requirement grammars (Dart's pubspec constraints, Composer's version
-/// constraints) accept a space after a range operator, but the ecosystem's own AND-splitting
-/// logic (splitting a requirement on whitespace to get individual clauses) would otherwise
-/// treat the operator and its version as separate clauses.
+/// constraints) accept a space after an operator, but the ecosystem's own AND-splitting logic
+/// (splitting a requirement on whitespace to get individual clauses) would otherwise treat the
+/// operator and its version as separate clauses — for `!=` specifically (fix-cycle, code-review
+/// finding), an unnormalized `"!= 1.5.0"` splits into a bare `!=` token (its own version operand
+/// stripped to empty, so it never excludes anything) and a bare `"1.5.0"` token that a
+/// caller's exact-match fallback then misreads as an ordinary version PIN rather than part of
+/// the exclusion — silently inverting the exclusion's effect.
 ///
 /// Borrows `requirement` unchanged when there is no spaced operator to collapse (the common
 /// case) instead of always allocating — callers that check many candidate versions against
@@ -191,6 +195,7 @@ pub fn extract_pypi_min_version(version_req: &str) -> Option<String> {
 /// # use deps_core::version_matcher::normalize_operator_spacing;
 /// assert_eq!(normalize_operator_spacing(">= 1.0 < 2.0"), ">=1.0 <2.0");
 /// assert_eq!(normalize_operator_spacing(">=1.0 <2.0"), ">=1.0 <2.0");
+/// assert_eq!(normalize_operator_spacing(">=1.0 != 1.5.0 <2.0"), ">=1.0 !=1.5.0 <2.0");
 /// ```
 pub fn normalize_operator_spacing(requirement: &str) -> Cow<'_, str> {
     if !has_spaced_operator(requirement) {
@@ -209,14 +214,20 @@ pub fn normalize_operator_spacing(requirement: &str) -> Cow<'_, str> {
             while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
                 chars.next();
             }
+        } else if c == '!' && chars.peek() == Some(&'=') {
+            result.push('=');
+            chars.next();
+            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                chars.next();
+            }
         }
     }
     Cow::Owned(result)
 }
 
-/// Reports whether `requirement` contains a `>`/`<`/`>=`/`<=` operator immediately followed
-/// by whitespace, i.e. whether [`normalize_operator_spacing`] would need to allocate. Pure
-/// scan, no allocation, so the common no-op case stays cheap.
+/// Reports whether `requirement` contains a `>`/`<`/`>=`/`<=`/`!=` operator immediately
+/// followed by whitespace, i.e. whether [`normalize_operator_spacing`] would need to allocate.
+/// Pure scan, no allocation, so the common no-op case stays cheap.
 fn has_spaced_operator(requirement: &str) -> bool {
     let mut chars = requirement.chars().peekable();
     while let Some(c) = chars.next() {
@@ -224,6 +235,11 @@ fn has_spaced_operator(requirement: &str) -> bool {
             if chars.peek() == Some(&'=') {
                 chars.next();
             }
+            if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                return true;
+            }
+        } else if c == '!' && chars.peek() == Some(&'=') {
+            chars.next();
             if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
                 return true;
             }
@@ -368,6 +384,19 @@ mod tests {
         assert_eq!(normalize_operator_spacing(">= 1.0 < 2.0"), ">=1.0 <2.0");
         assert_eq!(normalize_operator_spacing("> 1.0"), ">1.0");
         assert_eq!(normalize_operator_spacing("<= 1.0"), "<=1.0");
+    }
+
+    /// Code-review fix-cycle critical finding: an unnormalized spaced `!=` used to tokenize
+    /// into a no-op bare `!=` and a bare version PIN, silently inverting an exclusion for every
+    /// caller of this shared helper (Composer's `version_satisfies_requirement` and
+    /// `composer_explicitly_excludes` both consume it).
+    #[test]
+    fn test_normalize_operator_spacing_collapses_spaced_not_equal() {
+        assert_eq!(
+            normalize_operator_spacing(">=1.0 != 1.5.0 <2.0"),
+            ">=1.0 !=1.5.0 <2.0"
+        );
+        assert_eq!(normalize_operator_spacing("!= 1.5.0"), "!=1.5.0");
     }
 
     #[test]
