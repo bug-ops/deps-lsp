@@ -1,6 +1,7 @@
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    BareMeaning, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_semver_requirement,
+    format_version_replacing_by_shape,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
@@ -89,24 +90,38 @@ impl PackageRendering for CargoFormatter {
     /// rewrite, and for `~1.2.3` silently widens a patch-level-only-compatible requirement into
     /// a minor-level-compatible one.
     ///
-    /// A compound (comma-separated) requirement like `">=1.2, <1.5"` has no single-operator
-    /// rewrite that preserves its semantics: collapsing it to a bare version drops the upper
-    /// bound entirely and re-admits versions (e.g. `1.9.0`) the original requirement excluded
-    /// (#1566). Rather than guess, `current` is echoed back unchanged — the caller's
-    /// [`deps_core::edit::collect_update_candidates`] no-op guard then classifies the
-    /// dependency as [`deps_core::edit::UnplannableReason::NoOpRewrite`] instead of silently
-    /// writing a rewrite that changes what the requirement admits.
+    /// Delegates to the shared [`format_version_replacing_by_shape`] with
+    /// [`BareMeaning::Caret`] (#1577) — Cargo reads a bare version as an implicit caret range,
+    /// so under that `BareMeaning` the shared policy also refuses to rewrite two further shapes
+    /// with no safe single-value replacement:
+    ///
+    /// - A compound (comma-separated) requirement like `">=1.2, <1.5"` — collapsing it to a
+    ///   bare version drops the upper bound entirely and re-admits versions (e.g. `1.9.0`) the
+    ///   original requirement excluded (#1566).
+    /// - A partial wildcard (`1.2.*`) or single asymmetric bound (`<1.5`, `<=1.5.0`, `>1.0`,
+    ///   `>=1.2`) — collapsing either to bare silently widens what the requirement admits
+    ///   (#1577). This is a deliberate conservative simplification for the single-bound case:
+    ///   only `<`/`<=` genuinely risk widening (`>`/`>=` bounds are already open-ended above, so
+    ///   collapsing them narrows or leaves the accepted set equivalent) — both directions are
+    ///   refused anyway for one consistent, easy-to-explain rule, matching #1577's literal
+    ///   wording ("single bounded operators ... still collapse").
+    ///
+    /// #1577 also floated a shape-preserving rewrite for the wildcard case (`1.2.*` ->
+    /// `1.4.*`, keeping the wildcard rather than refusing outright) — not implemented here as
+    /// out of scope for this fix; refusal is simpler and consistent with the single-bound
+    /// policy above. A bare existence wildcard (`*`, no version at all) is unaffected by any of
+    /// this: it always collapses safely regardless of `BareMeaning`, since replacing "matches
+    /// anything" with one concrete version can only narrow (see
+    /// [`deps_core::lsp_helpers::RequirementRewriteShape::AnyVersion`]).
+    ///
+    /// Rather than guess, `current` is echoed back unchanged for the three genuinely unsafe
+    /// shapes above — the caller's [`deps_core::edit::collect_update_candidates`] no-op guard
+    /// then classifies the dependency as [`deps_core::edit::UnplannableReason::NoOpRewrite`]
+    /// instead of silently writing a rewrite that changes what the requirement admits.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        let trimmed = current.trim_start();
-        if current.contains(',') {
-            current.to_string()
-        } else if trimmed.starts_with('=') {
-            format!("={}", version.as_str())
-        } else if trimmed.starts_with('~') {
-            format!("~{}", version.as_str())
-        } else {
+        format_version_replacing_by_shape(version, current, BareMeaning::Caret, || {
             self.format_version_for_text_edit(version)
-        }
+        })
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -353,6 +368,48 @@ mod tests {
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("1.4.0"), "~1.2, <1.5"),
             "~1.2, <1.5"
+        );
+    }
+
+    /// Issue #1577: a wildcard requirement (`1.2.*`) reads as an implicit caret range once
+    /// collapsed to a bare version — Cargo has no bare syntax that re-expresses "any patch",
+    /// so it is left unchanged instead of silently widened.
+    #[test]
+    fn test_format_version_replacing_wildcard_requirement_left_unchanged() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("1.4.0"), "1.2.*"),
+            "1.2.*"
+        );
+    }
+
+    /// Issue #1577: a single asymmetric bound in either direction is refused as a deliberate
+    /// conservative simplification — collapsing `<1.5`/`<=1.5.0` to a bare version would
+    /// genuinely widen (silently admit versions above the original upper bound), while
+    /// `>1.0`/`>=1.2` are already open-ended above (collapsing them narrows or leaves the
+    /// accepted set equivalent, never widens); both directions are refused anyway for one
+    /// consistent, easy-to-explain rule.
+    #[test]
+    fn test_format_version_replacing_single_bound_requirement_left_unchanged() {
+        let formatter = CargoFormatter;
+        for requirement in ["<1.5", "<=1.5.0", ">1.0", ">=1.2"] {
+            assert_eq!(
+                formatter.format_version_replacing(&ConcreteVersion::new("1.4.0"), requirement),
+                requirement,
+                "expected {requirement:?} to be echoed back unchanged"
+            );
+        }
+    }
+
+    /// impl-critic S2: a bare existence wildcard (`*`) matches every version, so collapsing it
+    /// to one concrete version always narrows — unlike a partial wildcard (`1.2.*`), it must
+    /// not be refused.
+    #[test]
+    fn test_format_version_replacing_any_version_wildcard_collapses_to_bare() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "*"),
+            "2.0.0"
         );
     }
 

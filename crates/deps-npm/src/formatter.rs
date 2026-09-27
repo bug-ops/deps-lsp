@@ -183,6 +183,21 @@ impl PackageRendering for NpmFormatter {
         version.to_string()
     }
 
+    // #1576, impl-critic S1: no override needed here. `format_version_replacing`'s shared
+    // default (ignore `current`, always write a bare version) already ignores every
+    // requirement shape uniformly — bare, compound, wildcard, single-bound, or an explicit
+    // `=`/`~`/`^` operator alike. The original #1576 report modeled npm on Cargo's
+    // bare-means-caret convention, but node-semver reads a bare version as an *exact pin*
+    // (verified empirically: a bare `node_semver::Range` for `"2.0.6"` matches only that one
+    // version), so collapsing ANY requirement shape to bare always narrows what it accepts,
+    // never widens it — the shared default was already correct, and a first attempt at this
+    // fix that added a Cargo-style refusal override here was itself the actual bug (it
+    // silently dropped a real, safe rewrite, including a vulnerability-fix rewrite for a
+    // dependency declared as a range). This matches `deps-lsp`'s existing, deliberately tested
+    // "Update all outdated" code-lens contract for npm (`code_lens.rs`'s
+    // `test_npm_literal_version_is_edited`: `"^4.0.0"` -> `"5.0.0"`, caret dropped) — unlike
+    // Dart, whose analogous contract preserves an explicit `^` (see `DartFormatter`'s own
+    // override and its doc for why the two ecosystems' policies genuinely differ here).
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -372,6 +387,51 @@ mod tests {
         assert_eq!(
             formatter.format_version_for_text_edit(&ConcreteVersion::new("18.3.1")),
             "18.3.1"
+        );
+    }
+
+    /// impl-critic S1: node-semver's bare version is an exact pin, not an implicit caret range
+    /// (unlike Cargo) — so collapsing a space-separated AND range (or any other bounded shape)
+    /// to a bare version always narrows what it accepts, never widens it, and must be allowed
+    /// rather than refused (a refusal here would silently drop a real, safe rewrite, including
+    /// a vulnerability-fix rewrite for a dependency declared as a range). No override needed:
+    /// the shared default (ignore `current`, always write bare) already does this.
+    #[test]
+    fn test_format_version_replacing_space_separated_and_range_collapses_to_bare() {
+        let formatter = NpmFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("1.4.0"), ">=1.2.0 <2.0.0"),
+            "1.4.0"
+        );
+    }
+
+    /// A bare requirement has no operator to protect — always rewritten to a plain version
+    /// string.
+    #[test]
+    fn test_format_version_replacing_bare_requirement_stays_bare() {
+        let formatter = NpmFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "1.5.0"),
+            "2.0.0"
+        );
+    }
+
+    /// Deliberately the opposite of Dart's/Cargo's behavior: an explicit `^`/`~` is dropped,
+    /// not preserved, on npm rewrite — matches `deps-lsp`'s existing, tested "Update all
+    /// outdated" code-lens contract for npm (`code_lens.rs`'s `test_npm_literal_version_is_edited`,
+    /// which asserts `"^4.0.0"` -> `"5.0.0"`). An earlier version of this fix added
+    /// operator-preserving behavior here as a speculative improvement; it broke that existing
+    /// test and was reverted.
+    #[test]
+    fn test_format_version_replacing_explicit_caret_and_tilde_dropped() {
+        let formatter = NpmFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "^1.5.0"),
+            "2.0.0"
+        );
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "~1.5.0"),
+            "2.0.0"
         );
     }
 
