@@ -277,6 +277,44 @@ impl RequirementResolution for GitlabCiFormatter {
         };
         status_for_pin(pin, requirement.as_str(), latest.as_str())
     }
+
+    /// #1556: mirrors `deps_github_actions::GithubActionsFormatter`'s identical override —
+    /// a `PinStyle::Sha` pin's exact version is knowable from the shared [`TagIndex`]'s
+    /// `sha_to_tag` even though the SHA text itself always fails
+    /// [`deps_core::lsp_helpers::concrete_pin_version`]'s shape check (no dots to parse).
+    ///
+    /// Unlike GitHub Actions, GitLab CI's `PinStyle::Sha` has no comment-tag convention to
+    /// distrust (see `Self::resolved_tag_for_sha`'s doc) — `version_req` is always the
+    /// bare SHA text for this pin style, already validated full-40-hex-shaped by
+    /// [`PinStyle::Sha`]'s own classification (`crate::parser::classify_project_pin`,
+    /// `crate::component::classify_component_pin_style`), so no extra shape re-check is
+    /// needed here the way GitHub Actions' comment-extraction path requires.
+    ///
+    /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2) — same
+    /// disambiguation `Self::resolved_tag_for_sha` applies, since a `project:` and
+    /// `component:` include can textually collide on name across endpoints.
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ConcreteVersion> {
+        let gl_dep = dep.as_any().downcast_ref::<GitlabCiDependency>()?;
+        if gl_dep.pin != Some(PinStyle::Sha) {
+            return None;
+        }
+        let sha = gl_dep.version_req.as_ref().map(VersionReq::as_str)?;
+        let tag = self
+            .tag_index
+            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()))?
+            .sha_to_tag
+            .get(sha)?
+            .clone();
+        Some(ConcreteVersion::new(tag))
+    }
+
+    /// `tag_index` is populated as a side effect of [`GitlabCiRegistry`]'s own tags fetch,
+    /// not before — see [`RequirementResolution::resolved_pin_version_depends_on_registry_fetch`].
+    ///
+    /// [`GitlabCiRegistry`]: crate::registry::GitlabCiRegistry
+    fn resolved_pin_version_depends_on_registry_fetch(&self) -> bool {
+        true
+    }
 }
 
 /// Whether `text` contains an unresolved GitLab CI variable/interpolation placeholder:
@@ -703,6 +741,119 @@ mod tests {
             fmt.requirement_status_for(&d, &requirement, &ConcreteVersion::new("1.3.0")),
             RequirementStatus::Outdated
         );
+    }
+
+    // --- #1556: resolved_pin_version ---
+
+    /// A `PinStyle::Sha` pin's exact version is knowable from the shared `TagIndex` even
+    /// though the bare SHA text itself always fails
+    /// `deps_core::lsp_helpers::concrete_pin_version`'s shape check.
+    #[test]
+    fn test_resolved_pin_version_sha_pin_resolves_via_tag_index() {
+        use deps_core::lsp_helpers::CommitSha;
+
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "v1.2.3".to_string());
+        fmt.tag_index.insert(
+            (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
+            Arc::new(index),
+        );
+
+        let mut d = dep(
+            Some(PinStyle::Sha),
+            "gitlab.com/org/proj",
+            DependencySource::AlternateRegistry {
+                index: "gitlab:abc".into(),
+                mirrors_crates_io: false,
+            },
+        );
+        d.version_req = Some(sha.into());
+
+        assert_eq!(
+            fmt.resolved_pin_version(&d),
+            Some(ConcreteVersion::new("v1.2.3"))
+        );
+    }
+
+    /// Keyed by `(endpoint, name)`, not `name` alone (validation finding S2): a
+    /// `component:` (Releases) include's `TagIndex` entry must never resolve a `project:`
+    /// (Tags) include sharing the same textual name.
+    #[test]
+    fn test_resolved_pin_version_sha_pin_does_not_cross_endpoint_kinds() {
+        use deps_core::lsp_helpers::CommitSha;
+
+        let sha = "b".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "v1.0.0".to_string());
+        // Only the Releases (component:) endpoint has an entry for this name.
+        fmt.tag_index.insert(
+            (
+                EndpointKind::Releases,
+                PackageName::new("gitlab.com/org/proj"),
+            ),
+            Arc::new(index),
+        );
+
+        let mut d = dep(
+            Some(PinStyle::Sha),
+            "gitlab.com/org/proj",
+            DependencySource::AlternateRegistry {
+                index: "gitlab:abc".into(),
+                mirrors_crates_io: false,
+            },
+        );
+        d.version_req = Some(sha.into());
+        assert_eq!(d.kind.endpoint(), EndpointKind::Tags);
+
+        assert_eq!(
+            fmt.resolved_pin_version(&d),
+            None,
+            "a project: (Tags) include must not resolve through a component: (Releases) entry"
+        );
+    }
+
+    /// Cold cache (no `TagIndex` entry yet) must stay the honest `None`.
+    #[test]
+    fn test_resolved_pin_version_sha_pin_tag_index_miss_returns_none() {
+        let sha = "c".repeat(40);
+        let fmt = formatter();
+        let mut d = dep(
+            Some(PinStyle::Sha),
+            "gitlab.com/org/proj",
+            DependencySource::AlternateRegistry {
+                index: "gitlab:abc".into(),
+                mirrors_crates_io: false,
+            },
+        );
+        d.version_req = Some(sha.into());
+
+        assert_eq!(fmt.resolved_pin_version(&d), None);
+    }
+
+    /// A `Tag`/`Branch`/`Partial`/`Latest` pin has no SHA to resolve — must stay `None`.
+    #[test]
+    fn test_resolved_pin_version_non_sha_pin_returns_none() {
+        let fmt = formatter();
+        for pin in [
+            PinStyle::Tag,
+            PinStyle::Branch,
+            PinStyle::Latest,
+            PinStyle::Partial,
+        ] {
+            let d = dep(
+                Some(pin.clone()),
+                "gitlab.com/org/proj",
+                DependencySource::Registry,
+            );
+            assert_eq!(fmt.resolved_pin_version(&d), None, "{pin:?}");
+        }
     }
 
     #[test]

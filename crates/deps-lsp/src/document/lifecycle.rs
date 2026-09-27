@@ -10,7 +10,8 @@ use super::fetch::{
 use super::gossip_prefetch::{run_gossip_prefetch, spawn_gossip_mismatch_refetch_if_needed};
 use super::loader::{MAX_FILE_SIZE, load_document_from_disk};
 use super::osv_scan::{
-    OsvScanResult, run_license_prefetch, run_osv_phase_b_and_commit, run_osv_scan_phase_a,
+    OsvScanResult, rescan_osv_if_tag_index_now_warm, run_license_prefetch,
+    run_osv_phase_b_and_commit, run_osv_scan_phase_a,
 };
 use super::resolved::RefetchPolicy;
 use super::state::{DocumentState, ServerState, spawn_supervised};
@@ -512,6 +513,19 @@ async fn run_document_open_background_task(
         &state,
         &client,
         ecosystem.as_ref(),
+        diagnostics_snapshot.fetch_timeout_secs,
+    )
+    .await;
+
+    // #1556 critic S2: phase A above ran concurrently with (not after) the registry fetch,
+    // so a GitHub Actions/GitLab CI `TagIndex`-dependent resolution can have missed this
+    // fetch's own tags — re-check now that they're warm. No-op unless this ecosystem opts in
+    // and phase A actually left something unresolved.
+    rescan_osv_if_tag_index_now_warm(
+        &uri,
+        &state,
+        &client,
+        &ecosystem,
         diagnostics_snapshot.fetch_timeout_secs,
     )
     .await;
@@ -1257,6 +1271,19 @@ async fn run_document_change_task(
             config.diagnostics.fetch_timeout_secs,
         )
         .await;
+
+        // #1556 critic S2: no fetch ran on this branch, but a `TagIndex`-dependent
+        // resolution left unresolved by a still-in-flight fetch from elsewhere (e.g. the
+        // document's own initial open) may have warmed since. No-op otherwise.
+        rescan_osv_if_tag_index_now_warm(
+            &uri,
+            &state,
+            &client,
+            &ecosystem,
+            config.diagnostics.fetch_timeout_secs,
+        )
+        .await;
+
         await_license_prefetch(license_task).await;
 
         diagnostics::publish_document_diagnostics(&state, &client, &uri, &config.diagnostics, 0)
@@ -1348,6 +1375,18 @@ async fn run_document_change_task(
         config.diagnostics.fetch_timeout_secs,
     )
     .await;
+
+    // #1556 critic S2: same re-check as the open path — this branch's own registry fetch
+    // (just above) may have just warmed a `TagIndex`-dependent resolution phase A missed.
+    rescan_osv_if_tag_index_now_warm(
+        &uri,
+        &state,
+        &client,
+        &ecosystem,
+        config.diagnostics.fetch_timeout_secs,
+    )
+    .await;
+
     await_license_prefetch(license_task).await;
 
     diagnostics::publish_document_diagnostics(

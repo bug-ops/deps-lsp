@@ -503,19 +503,32 @@ pub fn resolve_in_use_version(
             .map(str::to_string);
     }
 
-    resolve_occurrence_version(
+    if let Some(version) = resolve_occurrence_version(
         dep,
         normalized_name,
         resolved_versions,
         resolved_version_candidates,
         formatter,
-    )
-    .map(ConcreteVersion::to_string)
-    .or_else(|| {
-        dep.version_requirement()
-            .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
-            .map(str::to_string)
-    })
+    ) {
+        return Some(version.to_string());
+    }
+
+    // #1556: an ecosystem's own out-of-band resolution (e.g. GitHub Actions' `TagIndex`)
+    // wins over the manifest-text fallback below — but never over a lock-file-resolved
+    // version above (impl-critic M2: a stronger existing resolution source must not be
+    // silently superseded) — and still must pass the same full-version shape gate as
+    // manifest text, since `TagIndex` can resolve a SHA to a moving/partial tag name
+    // (`v1`, `v2.9`) that is not itself a queryable version (#503).
+    if let Some(resolved) = formatter
+        .resolved_pin_version(dep)
+        .and_then(|v| concrete_pin_version(v.as_str(), ecosystem).map(str::to_string))
+    {
+        return Some(resolved);
+    }
+
+    dep.version_requirement()
+        .and_then(|req| concrete_pin_version(req.as_str(), ecosystem))
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -552,6 +565,122 @@ mod tests {
     impl crate::lsp_helpers::DiagnosticPolicy for CaretFormatter {}
     impl crate::lsp_helpers::SourcePolicy for CaretFormatter {}
     impl crate::lsp_helpers::OsvNaming for CaretFormatter {}
+
+    /// A formatter whose `resolved_pin_version` always returns a fixed value regardless of
+    /// `dep` — exercises `resolve_in_use_version`'s own full-semver-shape gate on the hook's
+    /// output (#1556 critic S1), independent of any ecosystem's own `TagIndex` plumbing.
+    struct FixedResolvedPinFormatter(&'static str);
+
+    impl crate::lsp_helpers::PackageNaming for FixedResolvedPinFormatter {}
+    impl crate::lsp_helpers::PackageRendering for FixedResolvedPinFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl crate::lsp_helpers::RequirementResolution for FixedResolvedPinFormatter {
+        fn resolved_pin_version(&self, _dep: &dyn Dependency) -> Option<ConcreteVersion> {
+            Some(ConcreteVersion::new(self.0))
+        }
+    }
+    impl crate::lsp_helpers::DiagnosticMessages for FixedResolvedPinFormatter {}
+    impl crate::lsp_helpers::DiagnosticPolicy for FixedResolvedPinFormatter {}
+    impl crate::lsp_helpers::SourcePolicy for FixedResolvedPinFormatter {}
+    impl crate::lsp_helpers::OsvNaming for FixedResolvedPinFormatter {}
+
+    /// #1556 impl-critic S1: `resolved_pin_version`'s raw output (e.g. GitHub Actions'
+    /// `TagIndex`-resolved tag) must not bypass the same full-semver-shape check manifest
+    /// text goes through — a moving-major/partial tag name (`v1`, `2.9`) is not a real
+    /// queryable version, and treating it as one regresses the #503 invariant this
+    /// resolution hook must not query OSV.dev with a fabricated version.
+    #[test]
+    fn resolve_in_use_version_rejects_hook_output_that_is_not_full_semver_shape() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new("deadbeef"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+
+        for partial in ["v1", "2.9", "cargo-deny"] {
+            let result = resolve_in_use_version(
+                &dep,
+                "actions/checkout",
+                &HashMap::new(),
+                None,
+                &FixedResolvedPinFormatter(partial),
+                EcosystemId::GithubActions,
+            );
+            assert_eq!(result, None, "{partial:?} must not resolve as concrete");
+        }
+    }
+
+    /// #1556 impl-critic M2: a lock-file-resolved version, when one exists, must win over
+    /// `resolved_pin_version` — the hook only fills a gap the lock file leaves open, it must
+    /// never silently supersede a stronger existing resolution source.
+    #[test]
+    fn resolve_in_use_version_lockfile_wins_over_resolved_pin_version_hook() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new("deadbeef"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+
+        let mut resolved_versions = HashMap::new();
+        resolved_versions.insert(
+            PackageName::new("actions/checkout"),
+            ConcreteVersion::from("v9.9.9"),
+        );
+
+        let result = resolve_in_use_version(
+            &dep,
+            "actions/checkout",
+            &resolved_versions,
+            None,
+            &FixedResolvedPinFormatter("v1.3.0"),
+            EcosystemId::GithubActions,
+        );
+        assert_eq!(
+            result,
+            Some("v9.9.9".to_string()),
+            "the lock-file-resolved version must win over resolved_pin_version's hook output"
+        );
+    }
+
+    /// The actually-intended case (#1556's original bug): a `resolved_pin_version` hook
+    /// output that IS a full `major.minor.patch` tag must still win outright over the
+    /// manifest-text ladder, exactly as before this gate was added.
+    #[test]
+    fn resolve_in_use_version_accepts_hook_output_that_is_full_semver_shape() {
+        use crate::VersionReq;
+        use crate::lsp_helpers::test_support::MockDep;
+
+        let dep = MockDep {
+            name: PackageName::new("actions/checkout"),
+            version_req: VersionReq::new("deadbeef"),
+            version_range: Range::default(),
+            name_range: Range::default(),
+        };
+
+        let result = resolve_in_use_version(
+            &dep,
+            "actions/checkout",
+            &HashMap::new(),
+            None,
+            &FixedResolvedPinFormatter("v1.3.0"),
+            EcosystemId::GithubActions,
+        );
+        assert_eq!(result, Some("v1.3.0".to_string()));
+    }
 
     #[test]
     fn is_concrete_version_accepts_explicit_pins_in_any_ecosystem() {

@@ -1064,6 +1064,105 @@ mod tests {
             assert!(skipped.is_empty());
         }
 
+        /// #1556 impl-critic S1: a GitHub Actions SHA pin whose `TagIndex`-resolved tag is
+        /// itself a moving-major/partial name (here, `v1`, from a `# v1` comment) is NOT a
+        /// queryable OSV version — `TagIndex.sha_to_tag` is first-wins over every tag
+        /// pointing at that commit, so it can just as easily hand back `"v1"` or `"2.9"` as
+        /// a genuine full tag, and querying OSV.dev with a fabricated version is exactly
+        /// the #503 invariant this must not regress. `resolved_pin_version`'s raw output
+        /// must still pass through the same full-semver-shape gate
+        /// (`concrete_pin_version`) as manifest text before `resolve_in_use_version`
+        /// accepts it — see the positive case below for the tag shape that IS accepted.
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_sha_pin_with_moving_major_comment_stays_skipped() {
+            use deps_core::lsp_helpers::{CommitSha, TagIndex};
+            use deps_core::osv::{ScanOutcome, SkipReason};
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let sha = "d".repeat(40);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v1\n");
+            let parse_result =
+                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = GithubActionsRegistry::new(cache);
+            let tag_index = registry.tag_index();
+            let mut index = TagIndex::default();
+            index
+                .sha_to_tag
+                .insert(CommitSha::parse(&sha).unwrap(), "v1".to_string());
+            tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
+            let formatter = GithubActionsFormatter::new(tag_index);
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &formatter,
+                EcosystemId::GithubActions,
+            );
+
+            assert!(
+                targets.is_empty(),
+                "a moving-major TagIndex-resolved tag must not reach OSV as a fabricated version: {targets:?}"
+            );
+            assert_matches!(
+                skipped.get(&deps_core::test_util::vuln_key("actions/checkout")),
+                Some(ScanOutcome::Skipped(SkipReason::NoConcreteVersion))
+            );
+        }
+
+        /// #1556: the actually-intended fix — a GitHub Actions SHA pin whose `TagIndex`
+        /// resolves it to a genuine full `major.minor.patch` tag (here `v1.3.0`, matching
+        /// the issue's own `moonrepo/setup-rust@<sha> # v1` example where the SHA's real
+        /// tag turns out to be a full release) must reach a real OSV scan target, even
+        /// though the pin's own trailing `# v1` comment alone is not full-semver-shaped.
+        /// Exercises the real `deps-github-actions` formatter end-to-end (not just
+        /// `resolve_in_use_version`'s isolated unit tests), mirroring the Deno/Composer
+        /// end-to-end precedent above.
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_sha_pin_tag_index_resolves_to_full_semver_tag() {
+            use deps_core::lsp_helpers::{CommitSha, TagIndex};
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let sha = "e".repeat(40);
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v1\n");
+            let parse_result =
+                deps_github_actions::parse_workflow_yaml(&content, &uri).expect("valid yaml");
+
+            let cache = Arc::new(deps_core::HttpCache::new());
+            let registry = GithubActionsRegistry::new(cache);
+            let tag_index = registry.tag_index();
+            let mut index = TagIndex::default();
+            index
+                .sha_to_tag
+                .insert(CommitSha::parse(&sha).unwrap(), "v1.3.0".to_string());
+            tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
+            let formatter = GithubActionsFormatter::new(tag_index);
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &formatter,
+                EcosystemId::GithubActions,
+            );
+
+            assert_eq!(
+                targets.len(),
+                1,
+                "expected the SHA pin to reach a real OSV scan target: {skipped:?}"
+            );
+            assert!(skipped.is_empty());
+            assert_eq!(targets[0].display_version, "v1.3.0");
+        }
+
         #[test]
         fn build_scan_targets_step2_uses_concrete_requirement_verbatim() {
             let parse_result = MockParseResult {
