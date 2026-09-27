@@ -5299,8 +5299,8 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(
@@ -5336,9 +5336,9 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
 
             // The lockfile/manifest pin is the non-normalized bare "1.0" — the registry's own
@@ -5407,8 +5407,8 @@ mod tests {
             // `latest` (1.2.0) is itself already cooldown-cleared, so the gate must skip the
             // scan entirely rather than compute a (redundant) fallback below it.
             let versions = vec![
-                MockVersion::new("1.2.0", old),
-                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.2.0").with_published_at(old),
+                MockVersion::new("1.1.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.1.0"], cooldown_secs)
@@ -5434,8 +5434,8 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", old),
-                MockVersion::new("1.1.0", old),
+                MockVersion::new("1.2.0").with_published_at(old),
+                MockVersion::new("1.1.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.1.0"], cooldown_secs)
@@ -5472,8 +5472,8 @@ mod tests {
             let one_day_ago = PublishTime::from_unix_secs(now.as_unix_secs() - 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", one_day_ago),
-                MockVersion::new("1.1.0", one_day_ago),
+                MockVersion::new("1.2.0").with_published_at(one_day_ago),
+                MockVersion::new("1.1.0").with_published_at(one_day_ago),
             ];
 
             let package_versions = fetch_pkg(versions, vec!["1.1.0"], fetch_cooldown_secs)
@@ -5519,9 +5519,9 @@ mod tests {
             let old = PublishTime::from_unix_secs(now.as_unix_secs() - 30 * 24 * 60 * 60);
 
             let versions = vec![
-                MockVersion::new("1.2.0", recent),
-                MockVersion::new("1.1.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("1.2.0").with_published_at(recent),
+                MockVersion::new("1.1.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
 
             let package_versions = fetch_pkg_with_registry(
@@ -5574,10 +5574,10 @@ mod tests {
             // locally within cooldown once substituted in as `latest`), "1.5.0" (cleared, the
             // expected fallback), "1.0.0" (the in-use floor).
             let versions = vec![
-                MockVersion::new("3.0.0", recent),
-                MockVersion::new("2.0.0", recent),
-                MockVersion::new("1.5.0", old),
-                MockVersion::new("1.0.0", old),
+                MockVersion::new("3.0.0").with_published_at(recent),
+                MockVersion::new("2.0.0").with_published_at(recent),
+                MockVersion::new("1.5.0").with_published_at(old),
+                MockVersion::new("1.0.0").with_published_at(old),
             ];
             let mut gossip = HashMap::new();
             gossip.insert(
