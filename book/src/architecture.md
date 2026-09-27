@@ -324,13 +324,18 @@ user/workspace-configurable registry host (Cargo custom registries, npm `.npmrc`
 indexes, GitLab self-hosted instances, NuGet feeds) routes through before fetching from it.
 
 **`HostClass`** classifies a URL's host from the URL string alone (no DNS resolution — see
-below for why): `Loopback`, `LinkLocal`, `CloudMetadata` (the specific `169.254.169.254`/
-`fd00:ec2::254` instance-metadata address and provider-documented metadata hostnames),
-`PrivateV4` (RFC 1918), `Cgnat` (`100.64.0.0/10`), `UniqueLocalV6` (`fc00::/7`), `Unspecified`
-(`0.0.0.0`/`::`), `InternalName` (a `.internal`/`.local`/`.home.arpa`-suffixed or single-label
-hostname), or `Global` (everything else). Classification also unwraps IPv4-mapped
-(`::ffff:a.b.c.d`) and NAT64 well-known-prefix (`64:ff9b::/96`) IPv6 addresses to their embedded
-IPv4 form first, so a bypass can't be written by re-encoding the same address in either form.
+below for why): `Loopback`, `LinkLocal`, `CloudMetadata` (the `169.254.169.254`/
+`fd00:ec2::254`/`100.100.100.200` instance-metadata addresses — AWS/GCP/Azure and Alibaba Cloud
+respectively — and provider-documented metadata hostnames), `PrivateV4` (RFC 1918), `Cgnat`
+(`100.64.0.0/10`), `UniqueLocalV6` (`fc00::/7`), `Unspecified` (`0.0.0.0/8`, widened from just
+the exact `0.0.0.0`, and `::`), `InternalName` (a `.internal`/`.local`/`.home.arpa`-suffixed or
+single-label hostname), `Reserved` (an IETF special-purpose range that is neither globally
+routable nor a plausible internal network: `192.0.0.0/24` IETF Protocol Assignments and
+`fec0::/10` deprecated IPv6 site-local), or `Global` (everything else). Classification also
+unwraps IPv4-mapped (`::ffff:a.b.c.d`) and NAT64 addresses to their embedded IPv4 form first, so
+a bypass can't be written by re-encoding the same address in another form — both the well-known
+prefix (`64:ff9b::/96`, RFC 6052) and the entire local-use prefix (`64:ff9b:1::/48`, RFC 8215,
+every `/96` subnet within it, not only the zero subnet).
 
 **`WorkspaceRegistryAccess`** — the user-facing policy (`registries.workspace_registries` in
 [Configuration](configuration.md)) — decides which classes a *workspace-declared* registry URL

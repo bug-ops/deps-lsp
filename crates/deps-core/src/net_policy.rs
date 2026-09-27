@@ -66,6 +66,13 @@ pub enum HostClass {
     /// A name ending in `.internal`/`.local`/`.home.arpa`, or any single-label host (no dot) —
     /// never a real public registry's hostname.
     InternalName,
+    /// An IETF-reserved special-purpose range that is neither publicly routable nor a
+    /// plausible internal-network address: `192.0.0.0/24` (IETF Protocol Assignments, RFC
+    /// 6890 — includes the NAT64/DNS64 discovery addresses `192.0.0.170`/`.171`) and
+    /// `fec0::/10` (deprecated IPv6 site-local, RFC 3879). Kept distinct from
+    /// [`Self::PrivateV4`]/[`Self::UniqueLocalV6`], which name ranges real corporate networks
+    /// legitimately use (#1562).
+    Reserved,
     /// Everything else: a public IP literal, or a multi-label name not matching any of the
     /// above suffixes.
     Global,
@@ -90,7 +97,11 @@ impl HostClass {
     pub const fn never_a_registry(self) -> bool {
         matches!(
             self,
-            Self::Loopback | Self::LinkLocal | Self::CloudMetadata | Self::Unspecified
+            Self::Loopback
+                | Self::LinkLocal
+                | Self::CloudMetadata
+                | Self::Unspecified
+                | Self::Reserved
         )
     }
 }
@@ -108,15 +119,17 @@ impl std::fmt::Display for HostClass {
             Self::UniqueLocalV6 => "unique-local IPv6",
             Self::Unspecified => "unspecified",
             Self::InternalName => "internal name",
+            Self::Reserved => "reserved (IETF special-purpose)",
             Self::Global => "global",
         })
     }
 }
 
-/// Unwraps an IPv4-mapped (`::ffff:a.b.c.d`) or NAT64-embedded (`64:ff9b::a.b.c.d`, RFC 6052
-/// well-known prefix) IPv6 address to its embedded IPv4 form, so classification cannot be
-/// bypassed by writing the same address in either v4-in-v6 form (e.g. `::ffff:169.254.169.254`
-/// or `64:ff9b::a9fe:a9fe`). The NAT64 case matters here specifically because an attacker's DNS
+/// Unwraps an IPv4-mapped (`::ffff:a.b.c.d`) or NAT64-embedded (`64:ff9b::a.b.c.d` well-known
+/// prefix, RFC 6052, or `64:ff9b:1::a.b.c.d` local-use prefix, RFC 8215) IPv6 address to its
+/// embedded IPv4 form, so classification cannot be bypassed by writing the same address in
+/// either v4-in-v6 form (e.g. `::ffff:169.254.169.254`, `64:ff9b::a9fe:a9fe`, or
+/// `64:ff9b:1::a9fe:a9fe`). The NAT64 case matters here specifically because an attacker's DNS
 /// answer can return any AAAA record it likes, and a client behind a NAT64/DNS64 gateway (or a
 /// local 464XLAT/CLAT translator) treats `64:ff9b::/96` as routable to the embedded IPv4 address
 /// (impl-critic finding, verified empirically: `64:ff9b::a9fe:a9fe` classified `Global` before
@@ -143,11 +156,24 @@ fn unwrap_mapped_v4(addr: IpAddr) -> IpAddr {
     }
 }
 
-/// Extracts the IPv4 address embedded in a NAT64 well-known-prefix (RFC 6052 `64:ff9b::/96`)
-/// IPv6 address, e.g. `64:ff9b::a9fe:a9fe` -> `169.254.169.254`.
+/// Extracts the IPv4 address embedded in a NAT64 well-known-prefix (RFC 6052 `64:ff9b::/96`,
+/// e.g. `64:ff9b::a9fe:a9fe` -> `169.254.169.254`) or local-use prefix (RFC 8215
+/// `64:ff9b:1::/48`, e.g. `64:ff9b:1:1::a9fe:a9fe` -> `169.254.169.254`) IPv6 address.
+///
+/// RFC 8215 §4.1 reserves the *entire* `64:ff9b:1::/48` for local use precisely so operators
+/// can run multiple independent translation prefixes inside it — nothing restricts it to the
+/// single zero `/96` subnet (`64:ff9b:1::/96`). Any `/96`-length translation prefix still
+/// embeds its IPv4 address in the last 32 bits per RFC 6052 §2.2 regardless of what the
+/// middle segments (`segments[3..6]`) hold, so this only matches the fixed `/48` prefix
+/// (`segments[0..3]`) and decodes the last 32 bits unconditionally — matching on
+/// `segments[3..6] == [0, 0, 0]` would leave every non-zero subnet inside the /48 (e.g.
+/// `64:ff9b:1:1::a9fe:a9fe`) misclassified as `Global` (#1562 S1).
 fn nat64_embedded_v4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let segments = v6.segments();
-    if segments[0] == 0x0064 && segments[1] == 0xff9b && segments[2..6] == [0, 0, 0, 0] {
+    let is_64_ff9b = segments[0] == 0x0064 && segments[1] == 0xff9b;
+    let is_well_known = is_64_ff9b && segments[2..6] == [0, 0, 0, 0];
+    let is_local_use = is_64_ff9b && segments[2] == 0x0001;
+    if is_well_known || is_local_use {
         let [a, b] = segments[6].to_be_bytes();
         let [c, d] = segments[7].to_be_bytes();
         Some(Ipv4Addr::new(a, b, c, d))
@@ -162,17 +188,28 @@ fn classify_ip(addr: IpAddr) -> HostClass {
         IpAddr::V4(v4) => {
             if v4.is_loopback() {
                 HostClass::Loopback
-            } else if v4 == Ipv4Addr::new(169, 254, 169, 254) {
+            } else if v4 == Ipv4Addr::new(169, 254, 169, 254)
+                || v4 == Ipv4Addr::new(100, 100, 100, 200)
+            {
+                // 169.254.169.254 (AWS/GCP/Azure) and 100.100.100.200 (Alibaba Cloud) — the
+                // latter falls inside 100.64.0.0/10 (Cgnat) below, so it must be special-cased
+                // ahead of that check the same way the AWS/GCP/Azure address is (#1562).
                 HostClass::CloudMetadata
             } else if v4.is_link_local() {
                 HostClass::LinkLocal
-            } else if v4.is_unspecified() {
+            } else if v4.octets()[0] == 0 {
+                // 0.0.0.0/8 ("this network", RFC 791) — not just the exact 0.0.0.0 address
+                // `is_unspecified()` alone would catch (#1562).
                 HostClass::Unspecified
             } else if v4.is_private() {
                 HostClass::PrivateV4
             } else if v4.octets()[0] == 100 && (v4.octets()[1] & 0b1100_0000) == 0b0100_0000 {
                 // 100.64.0.0/10
                 HostClass::Cgnat
+            } else if v4.octets()[0..3] == [192, 0, 0] {
+                // 192.0.0.0/24, IETF Protocol Assignments (RFC 6890) — includes the
+                // NAT64/DNS64 discovery addresses 192.0.0.170/.171 (#1562).
+                HostClass::Reserved
             } else {
                 HostClass::Global
             }
@@ -190,6 +227,9 @@ fn classify_ip(addr: IpAddr) -> HostClass {
             } else if (v6.segments()[0] & 0xfe00) == 0xfc00 {
                 // fc00::/7
                 HostClass::UniqueLocalV6
+            } else if (v6.segments()[0] & 0xffc0) == 0xfec0 {
+                // fec0::/10, deprecated IPv6 site-local (RFC 3879) (#1562)
+                HostClass::Reserved
             } else {
                 HostClass::Global
             }
@@ -1385,6 +1425,40 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_cloud_metadata_nat64_local_use_bypass() {
+        // #1562: the RFC 8215 local-use NAT64 prefix (`64:ff9b:1::/48`) was not unwrapped like
+        // the well-known prefix above, so its zero `/96` subnet fell through to `Global`.
+        assert_eq!(
+            host_class("https://[64:ff9b:1::a9fe:a9fe]/"),
+            HostClass::CloudMetadata
+        );
+    }
+
+    #[test]
+    fn test_classify_cloud_metadata_nat64_local_use_non_zero_subnet() {
+        // #1562 S1 (impl-critic): the /48 holds multiple independent /96 translation
+        // prefixes, not just the zero subnet — a non-zero `segments[3..6]` must still unwrap.
+        assert_eq!(
+            host_class("https://[64:ff9b:1:1::a9fe:a9fe]/"),
+            HostClass::CloudMetadata
+        );
+        assert_eq!(
+            host_class("https://[64:ff9b:1:ffff:0:0:a9fe:a9fe]/"),
+            HostClass::CloudMetadata
+        );
+    }
+
+    #[test]
+    fn test_classify_cloud_metadata_alibaba_v4() {
+        // #1562: 100.100.100.200 (Alibaba Cloud metadata) falls inside 100.64.0.0/10 (Cgnat)
+        // and must be special-cased ahead of that check, the same as the AWS/GCP/Azure address.
+        assert_eq!(
+            host_class("https://100.100.100.200/"),
+            HostClass::CloudMetadata
+        );
+    }
+
+    #[test]
     fn test_classify_cloud_metadata_ec2_ipv6() {
         assert_eq!(
             host_class("https://[fd00:ec2::254]/"),
@@ -1420,6 +1494,26 @@ mod tests {
     #[test]
     fn test_classify_unspecified_v4() {
         assert_eq!(host_class("https://0.0.0.0/"), HostClass::Unspecified);
+    }
+
+    #[test]
+    fn test_classify_unspecified_v4_slash_8() {
+        // #1562: only the exact 0.0.0.0 address was blocked, not the whole 0.0.0.0/8
+        // ("this network") range.
+        assert_eq!(host_class("https://0.1.2.3/"), HostClass::Unspecified);
+    }
+
+    #[test]
+    fn test_classify_reserved_ietf_protocol_assignment_v4() {
+        // #1562: 192.0.0.0/24 (IETF Protocol Assignments, includes the NAT64/DNS64 discovery
+        // addresses) classified as `Global`, allowing it through `WorkspaceRegistryAccess::PublicOnly`.
+        assert_eq!(host_class("https://192.0.0.192/"), HostClass::Reserved);
+    }
+
+    #[test]
+    fn test_classify_reserved_deprecated_site_local_v6() {
+        // #1562: fec0::/10 (deprecated IPv6 site-local, RFC 3879) classified as `Global`.
+        assert_eq!(host_class("https://[fec0::1]/"), HostClass::Reserved);
     }
 
     #[test]
@@ -1534,6 +1628,7 @@ mod tests {
         assert!(HostClass::LinkLocal.never_a_registry());
         assert!(HostClass::CloudMetadata.never_a_registry());
         assert!(HostClass::Unspecified.never_a_registry());
+        assert!(HostClass::Reserved.never_a_registry());
         assert!(!HostClass::PrivateV4.never_a_registry());
         assert!(!HostClass::Cgnat.never_a_registry());
         assert!(!HostClass::UniqueLocalV6.never_a_registry());
