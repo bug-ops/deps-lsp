@@ -78,6 +78,10 @@ impl RequirementMatcher for RubygemsMatcher {
     fn strict_prerelease_exclusion(&self) -> bool {
         false
     }
+
+    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
+        crate::version::version_explicitly_excluded_by_requirement(version.as_str(), &self.0)
+    }
 }
 
 /// Whether `requirement` contains an unresolved Ruby string-interpolation placeholder —

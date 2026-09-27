@@ -77,9 +77,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 /// this is not universally true — Composer's `parse_manifest` genuinely awaits
 /// (`LockFileCache::get_or_parse` → `tokio::fs::metadata`) when the manifest declares a bare
 /// vcs/path/artifact repository and a `composer.lock` exists. `block_on` still resolves
-/// correctly here since it runs inside `spawn_blocking` on a real tokio worker thread, but
-/// [`parse_manifest_now`]'s `now_or_never()` cannot drive that same await to completion — see
-/// its own doc.
+/// correctly here since it runs inside `spawn_blocking` on a real tokio worker thread, but an
+/// unoverridden [`Ecosystem::parse_manifest_sync`] default's `now_or_never()` cannot drive that
+/// same await to completion — [`parse_manifest_now`] uses that method rather than
+/// [`Ecosystem::parse_manifest`] directly for exactly this reason (issue #1570): Composer
+/// overrides it instead of racing the await, see its own doc.
 ///
 /// # Errors
 ///
@@ -126,23 +128,23 @@ pub async fn parse_manifest_blocking(
 /// Synchronous sibling of [`parse_manifest_blocking`], for a caller that cannot `.await`.
 ///
 /// Spec 076 FR-024: the fallback-edit re-parse guard, evaluated inside `deps-cli`'s synchronous
-/// planner. Drives [`Ecosystem::parse_manifest`] via [`futures::FutureExt::now_or_never`]
-/// instead of spawning onto the blocking-thread pool, then applies the SAME
-/// [`crate::dependency_cap::cap_dependencies`] chokepoint [`parse_manifest_blocking`] applies —
-/// a raw `now_or_never()` call site with no cap would otherwise be a second, uncapped parse
-/// entry point (round-3 critic M2, #796).
+/// planner. Drives [`Ecosystem::parse_manifest_sync`] instead of spawning onto the
+/// blocking-thread pool, then applies the SAME [`crate::dependency_cap::cap_dependencies`]
+/// chokepoint [`parse_manifest_blocking`] applies — a raw `now_or_never()` call site with no cap
+/// would otherwise be a second, uncapped parse entry point (round-3 critic M2, #796).
 ///
-/// Returns `None` when called outside a tokio runtime context, when the future does not
-/// resolve on its first poll (`Pending`), or when the parse itself fails. Per
-/// [`Ecosystem::parse_manifest`]'s documented invariant, almost every implementation resolves
-/// immediately — but Composer's genuinely awaits in one narrow case (bare vcs/path/artifact
-/// repository plus a `composer.lock`, see [`parse_manifest_blocking`]'s doc), and this function
-/// fails closed (`None`) for that subset rather than blocking the caller's own async runtime to
-/// drive it to completion. Polling that same await with no tokio runtime entered at all would
-/// otherwise panic ("there is no reactor running") instead of returning `None` — this function
-/// checks for a current runtime handle first specifically to keep the `None` contract a true
-/// fail-closed guarantee, not merely a fail-closed guarantee "as long as a runtime happens to be
-/// active".
+/// Returns `None` when called outside a tokio runtime context, when
+/// [`Ecosystem::parse_manifest_sync`] itself returns `None` (the default impl: the future does
+/// not resolve on its first poll), or when the parse fails. Per [`Ecosystem::parse_manifest`]'s
+/// documented invariant, almost every implementation resolves immediately via
+/// [`Ecosystem::parse_manifest_sync`]'s default — Composer overrides that method instead of
+/// racing a genuine await (bare vcs/path/artifact repository plus a `composer.lock`, see
+/// [`parse_manifest_blocking`]'s doc and issue #1570) so this guard never depends on
+/// `now_or_never()` scheduler timing for that case. Polling an unoverridden default's future
+/// with no tokio runtime entered at all would otherwise panic ("there is no reactor running")
+/// instead of returning `None` — this function checks for a current runtime handle first
+/// specifically to keep the `None` contract a true fail-closed guarantee, not merely a
+/// fail-closed guarantee "as long as a runtime happens to be active".
 ///
 /// **Re-parse is not pure** (spec 076 round-4 critic M4): Cargo, Go, Deno, and npm's
 /// `parse_manifest` register alternate indices or GOPROXY chains into shared context as a side
@@ -169,19 +171,14 @@ pub fn parse_manifest_now(
     content: &str,
     uri: &url::Url,
 ) -> Option<Box<dyn ParseResult>> {
-    use futures::FutureExt;
-
     // Fail closed instead of panicking when called outside a tokio runtime context (fix-cycle
-    // security LOW-1): Composer's `parse_manifest` genuinely awaits `tokio::fs::metadata` in
-    // its bare-repo + `composer.lock` case (see this fn's doc), which panics ("there is no
-    // reactor running") if polled with no runtime entered — this check turns that into a
-    // documented `None`, never a crash.
+    // security LOW-1): an unoverridden `parse_manifest_sync` default drives a real future via
+    // `now_or_never()`, which panics ("there is no reactor running") if that future touches
+    // tokio with no runtime entered — this check turns that into a documented `None`, never a
+    // crash.
     tokio::runtime::Handle::try_current().ok()?;
 
-    let parsed = ecosystem
-        .parse_manifest(content, uri)
-        .now_or_never()?
-        .ok()?;
+    let parsed = ecosystem.parse_manifest_sync(content, uri)?;
     Some(crate::dependency_cap::cap_dependencies(
         parsed,
         crate::dependency_cap::MAX_DEPENDENCIES_PER_DOCUMENT,
@@ -1220,6 +1217,21 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
         content: &'a str,
         uri: &'a url::Url,
     ) -> BoxFuture<'a, crate::error::Result<Box<dyn ParseResult>>>;
+
+    /// Synchronous variant of [`Self::parse_manifest`] for [`parse_manifest_now`]'s FR-024
+    /// fallback-edit-guard re-parse (spec 076, issue #1570), which only needs the re-parsed
+    /// requirement's text/shape, never fully resolved source classification.
+    ///
+    /// The default drives [`Self::parse_manifest`]'s future via `now_or_never()`, relying on
+    /// this trait's documented no-real-`.await` invariant. Override this — never make
+    /// [`Self::parse_manifest`] itself lie about that invariant — when a genuine await exists
+    /// (Composer's `ComposerEcosystem` overrides this for its bare vcs/path/artifact repository
+    /// plus a `composer.lock` case) so this guard-only call can skip whatever that await would
+    /// have resolved instead of racing `now_or_never()` against it.
+    fn parse_manifest_sync(&self, content: &str, uri: &url::Url) -> Option<Box<dyn ParseResult>> {
+        use futures::FutureExt;
+        self.parse_manifest(content, uri).now_or_never()?.ok()
+    }
 
     /// Get the registry client for this ecosystem
     ///

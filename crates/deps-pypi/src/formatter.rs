@@ -7,7 +7,7 @@ use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy,
 };
-use pep440_rs::{Version, VersionSpecifiers};
+use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::str::FromStr;
 
 /// Precise PEP 440 specifier-set matcher, compiled once per dependency by
@@ -23,6 +23,20 @@ impl RequirementMatcher for Pep440Matcher {
     /// PEP 440's own pre-release handling is not SemVer 2.0.0's (#299) — must not opt in.
     fn strict_prerelease_exclusion(&self) -> bool {
         false
+    }
+
+    /// Fix-cycle (#1571): a `!=`/`!=X.*` specifier's own [`pep440_rs::VersionSpecifier::contains`]
+    /// already returns `false` exactly for the version(s) it bans — reusing it here (rather than
+    /// re-deriving the ban from `self.0.contains`, which folds every specifier together) is the
+    /// same precise comparator `matches` uses, scoped to only the exclusion-shaped specifiers.
+    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
+        let Ok(version) = Version::from_str(version.as_str()) else {
+            return false;
+        };
+        self.0.iter().any(|spec| {
+            matches!(spec.operator(), Operator::NotEqual | Operator::NotEqualStar)
+                && !spec.contains(&version)
+        })
     }
 }
 

@@ -80,6 +80,69 @@ impl RequirementMatcher for ComposerMatcher {
     fn strict_prerelease_exclusion(&self) -> bool {
         false
     }
+
+    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
+        composer_explicitly_excludes(version.as_str(), &self.0)
+    }
+}
+
+/// Fix-cycle (#1571): mirrors [`ComposerFormatter::version_satisfies_requirement`]'s own
+/// OR/AND-splitting and `v`-prefix/stability-flag normalization, but only looks for a `!=`
+/// leaf that individually bans exactly `version`.
+///
+/// The intensional signal [`RequirementMatcher::explicitly_excludes`] needs, since scanning
+/// `available` for "does something newer also match" cannot distinguish a `!=`-punched hole
+/// from a fallback that legitimately exceeds the requirement's ceiling (both make
+/// `version_satisfies_requirement` return `false` identically).
+///
+/// Fix-cycle M2: an OR (`||`) excludes `version` when ANY branch individually excludes it via
+/// `!=`, not only when every branch does. The caller only ever asks this once
+/// `r0_matcher.matches(fallback) == Some(false)` already holds — i.e. no branch admits
+/// `fallback` at all — so a single branch's `!=` term naming it explicitly is enough signal:
+/// `^0.9 || >=1.0 !=1.5.0 <2.0` bans 1.5.0 in its second branch even though the first branch
+/// simply doesn't cover that range at all (an `all` reading would miss this, since the first
+/// branch never explicitly excludes anything).
+fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
+    let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
+    let requirement = requirement.trim();
+    let requirement = match requirement.strip_prefix(['v', 'V']) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => requirement,
+    };
+    let (requirement, _stability_flag) = strip_stability_flag(requirement);
+    let requirement = requirement.trim();
+
+    if requirement.is_empty() || requirement == "*" {
+        return false;
+    }
+
+    if requirement.contains("||") {
+        return requirement
+            .split("||")
+            .any(|part| composer_explicitly_excludes(version, part.trim()));
+    }
+
+    let requirement = normalize_operator_spacing(requirement);
+    let requirement = &*requirement;
+
+    let parts: Vec<&str> = requirement.split_whitespace().collect();
+    if parts.len() > 1
+        && parts
+            .iter()
+            .any(|p| p.starts_with('>') || p.starts_with('<'))
+    {
+        return parts
+            .iter()
+            .any(|part| composer_explicitly_excludes(version, part));
+    }
+
+    if let Some(req) = requirement.strip_prefix("!=") {
+        let req = req.trim();
+        let req = req.strip_prefix(['v', 'V']).unwrap_or(req);
+        return compare_versions(version, req) == 0;
+    }
+
+    false
 }
 
 /// Composer-specific LSP formatting.
