@@ -12,9 +12,9 @@ use crate::osv::{
 };
 use crate::position::{Position, Range};
 use crate::{
-    ConcreteVersion, Dependency, Deprecation, DepsDevClient, EcosystemId, FetchFailure,
-    GossipFindings, LicenseSource, PackageName, PublishTime, RemovalStatus, TyposquatSignal,
-    VersionReq,
+    ConcreteVersion, CooldownWindow, Dependency, Deprecation, DepsDevClient, EcosystemId,
+    FetchFailure, GossipFindings, LicenseSource, PackageName, PublishTime, RemovalStatus,
+    TyposquatSignal, VersionReq,
 };
 
 #[cfg(feature = "lsp-responses")]
@@ -145,8 +145,8 @@ impl CooldownFallback {
 pub enum CooldownBlocker {
     /// GOSSIP reported an active cooldown for this exact version (spec 072 FR-005).
     Gossip,
-    /// The local `freshness.cooldown_secs` heuristic reports this version as recently
-    /// published, with no authoritative GOSSIP answer available for it.
+    /// The local [`CooldownWindow`] heuristic reports this version as
+    /// recently published, with no authoritative GOSSIP answer available for it.
     Local {
         /// When `latest` was published, per the registry.
         published_at: PublishTime,
@@ -188,25 +188,31 @@ pub enum CooldownPrecedence {
 /// The GOSSIP-vs-local cooldown precedence rule for a single `(name, version)` pair.
 ///
 /// An authoritative GOSSIP verdict wins outright, and only when GOSSIP has none does the local
-/// `freshness.cooldown_secs`/`published_at` heuristic apply.
+/// heuristic ([`local_cooldown_precedence`]) apply.
 ///
 /// Extracted from [`cooldown_disposition`] (spec 075 FR-004) so `deps-engine`'s fetch-time
 /// fallback-candidate search (`compute_cooldown_fallback`) can share the exact same rule
 /// without first needing a full [`PackageVersions`] — that type doesn't exist yet at fetch
 /// time for any version other than the one being classified (issue #1551).
 ///
+/// Takes a [`CooldownWindow`] rather than the [`FreshnessSettings`
+/// enum](crate::FreshnessSettings) so callers naturally go through
+/// [`FreshnessSettings::Enabled`](crate::FreshnessSettings::Enabled) — the only place a window
+/// value is produced — though `CooldownWindow::from_secs` being `pub` means this is a
+/// convention, not a hard type-level guarantee.
+///
 /// # Examples
 ///
 /// ```
 /// use deps_core::lsp_helpers::{CooldownPrecedence, cooldown_precedence};
-/// use deps_core::{PackageName, PublishTime};
+/// use deps_core::{CooldownWindow, PackageName, PublishTime};
 ///
 /// let cleared = cooldown_precedence(
 ///     None,
 ///     &PackageName::new("left-pad"),
 ///     "2.0.0",
 ///     Some(PublishTime::from_unix_secs(1_000)),
-///     500,
+///     CooldownWindow::from_secs(500),
 ///     PublishTime::from_unix_secs(2_000),
 /// );
 /// assert_eq!(cleared, CooldownPrecedence::Cleared);
@@ -216,7 +222,7 @@ pub enum CooldownPrecedence {
 ///     &PackageName::new("left-pad"),
 ///     "2.0.0",
 ///     Some(PublishTime::from_unix_secs(1_000)),
-///     5_000,
+///     CooldownWindow::from_secs(5_000),
 ///     PublishTime::from_unix_secs(2_000),
 /// );
 /// assert!(matches!(blocked, CooldownPrecedence::Blocked(_)));
@@ -227,23 +233,62 @@ pub fn cooldown_precedence(
     name: &PackageName,
     version: &str,
     published_at: Option<PublishTime>,
-    cooldown_secs: u64,
+    cooldown: CooldownWindow,
     now: PublishTime,
 ) -> CooldownPrecedence {
     match gossip_cooldown_for(gossip_prefetch, name, version, now) {
         GossipCooldownLookup::Active => CooldownPrecedence::Blocked(CooldownBlocker::Gossip),
         GossipCooldownLookup::NotActive => CooldownPrecedence::Cleared,
-        GossipCooldownLookup::Unavailable => match published_at {
-            Some(published_at)
-                if crate::freshness::is_within_cooldown(
-                    published_at.age_secs_from(now),
-                    cooldown_secs,
-                ) =>
-            {
-                CooldownPrecedence::Blocked(CooldownBlocker::Local { published_at })
-            }
-            _ => CooldownPrecedence::Cleared,
-        },
+        GossipCooldownLookup::Unavailable => local_cooldown_precedence(published_at, cooldown, now),
+    }
+}
+
+/// The local freshness heuristic alone (`published_at` age against `cooldown`), without GOSSIP.
+///
+/// Extracted from [`cooldown_precedence`]'s `Unavailable` arm so every site that evaluates the
+/// local rule by itself — that arm, and [`cooldown_disposition`]'s read-time fallback
+/// re-evaluation — shares one implementation rather than reimplementing the age comparison.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::lsp_helpers::{CooldownPrecedence, local_cooldown_precedence};
+/// use deps_core::{CooldownWindow, PublishTime};
+///
+/// let now = PublishTime::from_unix_secs(2_000);
+/// let cooldown = CooldownWindow::from_secs(500);
+///
+/// // No known publish time: never blocked.
+/// assert_eq!(
+///     local_cooldown_precedence(None, cooldown, now),
+///     CooldownPrecedence::Cleared
+/// );
+///
+/// // Published recently: blocked.
+/// let recent = PublishTime::from_unix_secs(1_900);
+/// assert!(matches!(
+///     local_cooldown_precedence(Some(recent), cooldown, now),
+///     CooldownPrecedence::Blocked(_)
+/// ));
+///
+/// // Age exactly equal to the window: cleared (the bound is exclusive).
+/// let at_boundary = PublishTime::from_unix_secs(1_500);
+/// assert_eq!(
+///     local_cooldown_precedence(Some(at_boundary), cooldown, now),
+///     CooldownPrecedence::Cleared
+/// );
+/// ```
+#[must_use]
+pub fn local_cooldown_precedence(
+    published_at: Option<PublishTime>,
+    cooldown: CooldownWindow,
+    now: PublishTime,
+) -> CooldownPrecedence {
+    match published_at {
+        Some(published_at) if cooldown.contains(published_at.age_secs_from(now)) => {
+            CooldownPrecedence::Blocked(CooldownBlocker::Local { published_at })
+        }
+        _ => CooldownPrecedence::Cleared,
     }
 }
 
@@ -272,9 +317,8 @@ pub fn cooldown_precedence(
 /// let disposition = cooldown_disposition(
 ///     &versions,
 ///     &PackageName::new("left-pad"),
-///     FreshnessSettings {
-///         enabled: true,
-///         cooldown_secs: 500,
+///     FreshnessSettings::Enabled {
+///         cooldown: deps_core::CooldownWindow::from_secs(500),
 ///     },
 ///     None,
 ///     PublishTime::from_unix_secs(2_000),
@@ -284,9 +328,8 @@ pub fn cooldown_precedence(
 /// let blocked = cooldown_disposition(
 ///     &versions,
 ///     &PackageName::new("left-pad"),
-///     FreshnessSettings {
-///         enabled: true,
-///         cooldown_secs: 5_000,
+///     FreshnessSettings::Enabled {
+///         cooldown: deps_core::CooldownWindow::from_secs(5_000),
 ///     },
 ///     None,
 ///     PublishTime::from_unix_secs(2_000),
@@ -301,20 +344,20 @@ pub fn cooldown_disposition<'a>(
     gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
     now: PublishTime,
 ) -> CooldownDisposition<'a> {
-    if !freshness.enabled {
+    let crate::freshness::FreshnessSettings::Enabled { cooldown } = freshness else {
         return CooldownDisposition::NotEvaluated;
-    }
+    };
 
     // NFR-002 (M3): the stored fallback candidate is itself re-evaluated at read time — a
-    // `cooldown_secs` narrowed between fetch and read (or, for a long-lived LSP cache, simply
+    // cooldown window narrowed between fetch and read (or, for a long-lived LSP cache, simply
     // enough wall-clock time passing that the fetch-time computation has gone stale in the
     // *other* direction the caller didn't ask about) must never let a candidate that no
     // longer clears the window keep reading as usable. This can only make the outcome
     // stricter, never less safe — a `None` fallback stays `None`.
     let fallback = versions.cooldown_fallback.as_ref().filter(|fallback| {
-        !crate::freshness::is_within_cooldown(
-            fallback.published_at.age_secs_from(now),
-            freshness.cooldown_secs,
+        matches!(
+            local_cooldown_precedence(Some(fallback.published_at), cooldown, now),
+            CooldownPrecedence::Cleared
         )
     });
 
@@ -323,7 +366,7 @@ pub fn cooldown_disposition<'a>(
         name,
         versions.latest.as_str(),
         versions.published_at,
-        freshness.cooldown_secs,
+        cooldown,
         now,
     ) {
         CooldownPrecedence::Cleared => CooldownDisposition::Cleared,
@@ -384,8 +427,9 @@ pub struct PackageVersions {
     /// Set when a version was excluded from being [`Self::latest`] solely because of an
     /// active GOSSIP cooldown finding whose version was strictly newer than the dependency's
     /// already-in-use version (`deps-cli` spec 074, FR-003/FR-005's floor-protected filter —
-    /// round 1 correction: there is no local `cooldown_secs`-based exclusion this unions
-    /// with, `freshness.cooldown_secs` only ever rewords a downstream diagnostic message).
+    /// round 1 correction: there is no local [`CooldownWindow`]-based
+    /// exclusion this unions with, the freshness cooldown window only ever rewords a
+    /// downstream diagnostic message).
     /// `None` in the common case (GOSSIP disabled, no matching finding, or no active
     /// cooldown), and in four further no-op cases where nothing was actually held back: the
     /// protect floor fully neutralized the exclusion because the flagged version was itself
@@ -846,13 +890,13 @@ pub struct VersionData<'a> {
     /// than one occurrence of a name has a distinct in-use version (S2).
     /// When `None`, both fall back to their pre-#394 name-only behavior.
     pub ecosystem: Option<EcosystemId>,
-    /// Whether `network.offline` is set (issue #483). When `true`, [`generate_hover`]
-    /// appends a footer stating that version *and vulnerability* data were not checked —
-    /// deliberately more specific than a bare "showing cached data" notice, since
-    /// `hover.rs`'s `Some(ScanOutcome::Skipped(_)) | None` arm renders nothing for an
-    /// offline OSV skip, which would otherwise look identical to a scanned-and-clean
-    /// dependency.
-    pub offline: bool,
+    /// The current [`NetworkMode`](crate::NetworkMode) (issue #483). When
+    /// [`NetworkMode::Offline`](crate::NetworkMode::Offline), [`generate_hover`] appends a
+    /// footer stating that version *and vulnerability* data were not checked — deliberately
+    /// more specific than a bare "showing cached data" notice, since `hover.rs`'s
+    /// `Some(ScanOutcome::Skipped(_)) | None` arm renders nothing for an offline OSV skip,
+    /// which would otherwise look identical to a scanned-and-clean dependency.
+    pub network: crate::NetworkMode,
     /// The deps.dev client to fetch a supply-chain trust signal through
     /// (spec 037), when the caller wants hover to attempt one. `None` by
     /// default and left `None` by every surface but `handlers/hover.rs`
@@ -948,7 +992,7 @@ pub struct VersionData<'a> {
     /// (spec 072 FR-008) — the entry's own [`crate::GossipFindings::version`] field must
     /// be compared against the version actually being displayed at each call site (hover's
     /// `latest_line`, diagnostics' `package_versions.latest`) before use; a mismatch is
-    /// treated as a cache miss and falls back to [`crate::is_within_cooldown`]. `None`
+    /// treated as a cache miss and falls back to [`local_cooldown_precedence`]. `None`
     /// when the feature is disabled, offline, the ecosystem isn't deps.dev-covered, or no
     /// dependency in the document has a prefetch result yet.
     pub gossip_prefetch: Option<&'a HashMap<PackageName, GossipFindings>>,
@@ -1011,7 +1055,7 @@ impl<'a> VersionData<'a> {
             vulnerabilities: None,
             outcomes: None,
             ecosystem: None,
-            offline: false,
+            network: crate::NetworkMode::Online,
             trust: None,
             license_prefetch: None,
             license_source: None,
@@ -1168,12 +1212,12 @@ impl<'a> VersionData<'a> {
     ///
     /// let cached = HashMap::new();
     /// let resolved = HashMap::new();
-    /// let versions = VersionData::new(&cached, &resolved).with_offline(true);
-    /// assert!(versions.offline);
+    /// let versions = VersionData::new(&cached, &resolved).with_network(deps_core::NetworkMode::Offline);
+    /// assert_eq!(versions.network, deps_core::NetworkMode::Offline);
     /// ```
     #[must_use]
-    pub const fn with_offline(mut self, offline: bool) -> Self {
-        self.offline = offline;
+    pub const fn with_network(mut self, network: crate::NetworkMode) -> Self {
+        self.network = network;
         self
     }
 
@@ -1349,8 +1393,8 @@ impl<'a> VersionData<'a> {
 pub enum GossipCooldownLookup {
     /// No GOSSIP data for this exact version — an absent entry, an FR-008 version mismatch,
     /// or a COOLDOWN finding with no cooldown at all (`findings.cooldown == None`, including
-    /// a missing/unparseable `end`, spec 075 FR-005) — the caller falls back to the local
-    /// `is_within_cooldown` heuristic, unattributed.
+    /// a missing/unparseable `end`, spec 075 FR-005) — the caller falls back to
+    /// [`local_cooldown_precedence`], unattributed.
     Unavailable,
     /// GOSSIP data is present for this exact version and confirms an active cooldown as of
     /// `now` (spec 072 FR-011's read-time `end > now` check) — the caller renders a
@@ -3830,9 +3874,9 @@ mod tests {
     // --- cooldown_disposition (spec 075 FR-004/NFR-002) ---
 
     /// Fix-cycle item 8 (M3/NFR-002): a stored fallback candidate is re-evaluated against
-    /// read-time `now`/`freshness.cooldown_secs`, not trusted as a fetch-time snapshot. A
+    /// read-time `now`/cooldown window, not trusted as a fetch-time snapshot. A
     /// fallback whose own `published_at` no longer clears a (narrower, read-time)
-    /// `cooldown_secs` must read as absent, not as a stale "still usable" answer.
+    /// cooldown window must read as absent, not as a stale "still usable" answer.
     #[test]
     fn cooldown_disposition_read_time_reevaluates_the_stored_fallback() {
         let now = PublishTime::from_unix_secs(10_000);
@@ -3849,9 +3893,8 @@ mod tests {
         let disposition = cooldown_disposition(
             &versions,
             &name,
-            crate::freshness::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 150,
+            crate::freshness::FreshnessSettings::Enabled {
+                cooldown: CooldownWindow::from_secs(150),
             },
             None,
             now,
@@ -3873,9 +3916,8 @@ mod tests {
         let disposition = cooldown_disposition(
             &versions,
             &name,
-            crate::freshness::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 10_000,
+            crate::freshness::FreshnessSettings::Enabled {
+                cooldown: CooldownWindow::from_secs(10_000),
             },
             None,
             now,

@@ -398,11 +398,12 @@ fn run_update_command(runtime: &tokio::runtime::Runtime, args: &UpdateArgs) -> E
     } else if freshness_non_default && !policy.freshness.enabled {
         // Critique M4: a non-default `freshness.cooldown_secs` (from `--cooldown` or an
         // explicit `--config`'s `[freshness]` section) is silently a no-op once
-        // `[freshness].enabled = false` — `within_freshness_cooldown` gates on `enabled`
-        // before ever reading `cooldown_secs`. Consistent with `check`'s existing
-        // `enabled`-gated cooldown badge, but an explicit override having zero effect with no
-        // signal at all is surprising enough to warn about, unlike `--security-only`'s
-        // structural (never-applicable) case above.
+        // `[freshness].enabled = false` — `to_freshness()` yields `FreshnessSettings::Disabled`
+        // in that case, and every cooldown-evaluating call site (`cooldown_disposition` et al.)
+        // short-circuits on it before ever reading the configured window. Consistent with
+        // `check`'s existing `enabled`-gated cooldown badge, but an explicit override having
+        // zero effect with no signal at all is surprising enough to warn about, unlike
+        // `--security-only`'s structural (never-applicable) case above.
         eprintln!(
             "deps-cli: warning: a non-default freshness cooldown has no effect because [freshness].enabled is false"
         );
@@ -611,7 +612,7 @@ async fn run_update(
             formatter,
             &args.package,
             &ignore_rules,
-            ctx.policy.freshness.to_settings(),
+            ctx.policy.freshness.to_freshness(),
             // Fix-cycle item 9/security L3: reuses the SAME `now` `analyze_manifest`'s own
             // fallback-OSV-round gate evaluated against — never a second, independent
             // `PublishTime::now()` call that backward clock skew could desync from it.

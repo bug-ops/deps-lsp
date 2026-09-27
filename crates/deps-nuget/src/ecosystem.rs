@@ -1491,10 +1491,7 @@ mod tests {
             // Freshness disabled: proves the unlisted marker doesn't depend on the freshness
             // toggle at all (unlike `published_at`, which is gated by it) — see
             // `unlisted_versions`'s doc comment.
-            let freshness = deps_core::FreshnessSettings {
-                enabled: false,
-                cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-            };
+            let freshness = deps_core::FreshnessSettings::Disabled;
 
             let hover = eco
                 .generate_hover(
@@ -1563,10 +1560,7 @@ mod tests {
                     parse_result.as_ref(),
                     Position::new(0, 49),
                     deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings {
-                        enabled: false,
-                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                    },
+                    deps_core::FreshnessSettings::Disabled,
                 )
                 .await
                 .expect("a registration-hive failure must still degrade to the base hover");
@@ -1614,10 +1608,7 @@ mod tests {
                     parse_result.as_ref(),
                     Position::new(0, 0), // outside any dependency's name/version range
                     deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings {
-                        enabled: false,
-                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                    },
+                    deps_core::FreshnessSettings::Disabled,
                 )
                 .await;
 
@@ -2011,10 +2002,7 @@ mod tests {
                     parse_result.as_ref(),
                     position,
                     deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings {
-                        enabled: false,
-                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                    },
+                    deps_core::FreshnessSettings::Disabled,
                 )
                 .await;
 
@@ -2101,10 +2089,7 @@ mod tests {
                     parse_result.as_ref(),
                     position,
                     deps_core::VersionData::new(&cached, &resolved),
-                    deps_core::FreshnessSettings {
-                        enabled: false,
-                        cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-                    },
+                    deps_core::FreshnessSettings::Disabled,
                 )
                 .await
                 .expect("hover for a resolvable alternate-feed dependency must not be None");

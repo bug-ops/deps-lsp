@@ -2213,7 +2213,7 @@ mod tests {
             &uri,
             deps_core::FreshnessSettings::default(),
             deps_core::DiagnosticSeverities::default(),
-            false,
+            deps_core::NetworkMode::Online,
             diagnostics::loading_ceiling(
                 crate::config::CacheConfig::default().fetch_timeout_secs,
                 cap,
@@ -2278,7 +2278,7 @@ mod tests {
             &uri,
             deps_core::FreshnessSettings::default(),
             deps_core::DiagnosticSeverities::default(),
-            false,
+            deps_core::NetworkMode::Online,
             diagnostics::loading_ceiling(
                 crate::config::CacheConfig::default().fetch_timeout_secs,
                 cap,
@@ -2454,7 +2454,7 @@ mod tests {
                 &uri,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
-                false,
+                deps_core::NetworkMode::Online,
                 diagnostics::loading_ceiling(
                     crate::config::CacheConfig::default().fetch_timeout_secs,
                     1,
@@ -2557,7 +2557,7 @@ mod tests {
                 &uri,
                 deps_core::FreshnessSettings::default(),
                 deps_core::DiagnosticSeverities::default(),
-                false,
+                deps_core::NetworkMode::Online,
                 diagnostics::loading_ceiling(
                     crate::config::CacheConfig::default().fetch_timeout_secs,
                     1,

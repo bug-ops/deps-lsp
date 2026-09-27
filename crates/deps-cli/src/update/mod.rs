@@ -511,7 +511,7 @@ fn resolve_cooldown_fallback_view(
 ///     licenses: HashMap::new(),
 ///     license_policy: deps_core::licenses::LicensePolicy::default(),
 ///     license_source: deps_core::LicenseSource::default(),
-///     offline: false,
+///     network: deps_core::NetworkMode::Online,
 ///     fetch_failed: HashSet::new(),
 ///     registry_unreachable: false,
 ///     license_fetch_incomplete: false,
@@ -1353,11 +1353,11 @@ mod tests {
     /// [`plan_updates`] with freshness cooldown filtering disabled — the pre-#1525 behavior
     /// every test not specifically about that filter wants.
     ///
-    /// Critique M5: actually passes `enabled: false`, not [`deps_core::FreshnessSettings::default`]
-    /// (which is `enabled: true` — a prior version of this helper passed that and only
-    /// happened to work because every fixture omitted `published_at`; a fixture that later set
-    /// one via [`PackageVersions::with_published_at`] would have been silently skipped instead
-    /// of applied).
+    /// Critique M5: actually passes [`deps_core::FreshnessSettings::Disabled`], not
+    /// [`deps_core::FreshnessSettings::default`] (which is enabled — a prior version of this
+    /// helper passed that and only happened to work because every fixture omitted
+    /// `published_at`; a fixture that later set one via [`PackageVersions::with_published_at`]
+    /// would have been silently skipped instead of applied).
     fn plan_updates_no_cooldown(
         analysis: &ManifestAnalysis,
         content: &str,
@@ -1371,10 +1371,7 @@ mod tests {
             formatter,
             package_filter,
             ignore_rules,
-            deps_core::FreshnessSettings {
-                enabled: false,
-                cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-            },
+            deps_core::FreshnessSettings::Disabled,
             deps_core::PublishTime::now(),
         )
     }
@@ -1403,7 +1400,7 @@ mod tests {
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
             license_source: deps_core::LicenseSource::default(),
-            offline: false,
+            network: deps_core::NetworkMode::Online,
             fetch_failed: HashSet::new(),
             registry_unreachable: false,
             license_fetch_incomplete: false,
@@ -1444,9 +1441,8 @@ mod tests {
             &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 2_000, // wider than the 1000s age above
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(2_000), // wider than the 1000s age above
             },
             now,
         );
@@ -1490,10 +1486,7 @@ mod tests {
             &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: false,
-                cooldown_secs: 2_000,
-            },
+            deps_core::FreshnessSettings::Disabled,
             now,
         );
 
@@ -1575,9 +1568,8 @@ mod tests {
             &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 2_000, // wider than the 1000s age above
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(2_000), // wider than the 1000s age above
             },
             now,
         );
@@ -1756,9 +1748,8 @@ mod tests {
             &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 2_000,
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(2_000),
             },
             now,
         );
@@ -1815,9 +1806,8 @@ mod tests {
             &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 2_000,
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(2_000),
             },
             now,
         );
@@ -1870,9 +1860,8 @@ mod tests {
             &STUB_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 2_000,
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(2_000),
             },
             now,
         );
@@ -2517,9 +2506,8 @@ mod tests {
             )],
             versions,
         );
-        let freshness = deps_core::FreshnessSettings {
-            enabled: true,
-            cooldown_secs: 1_000,
+        let freshness = deps_core::FreshnessSettings::Enabled {
+            cooldown: deps_core::CooldownWindow::from_secs(1_000),
         };
         (analysis, freshness, now)
     }
@@ -2561,9 +2549,8 @@ mod tests {
             )],
             versions,
         );
-        let freshness = deps_core::FreshnessSettings {
-            enabled: true,
-            cooldown_secs: 1_000,
+        let freshness = deps_core::FreshnessSettings::Enabled {
+            cooldown: deps_core::CooldownWindow::from_secs(1_000),
         };
         (analysis, freshness, now)
     }
@@ -3175,9 +3162,8 @@ mod tests {
             &lowercase_formatter,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 1_000,
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(1_000),
             },
             now,
         );
@@ -3244,9 +3230,8 @@ mod tests {
             &FALLBACK_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 1_000,
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(1_000),
             },
             now,
         );
@@ -3321,9 +3306,8 @@ mod tests {
             &FALLBACK_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 1_000,
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(1_000),
             },
             now,
         );
@@ -3400,9 +3384,8 @@ mod tests {
             &FALLBACK_FORMATTER,
             &[],
             &IgnoreRules::empty(),
-            deps_core::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: 1_000,
+            deps_core::FreshnessSettings::Enabled {
+                cooldown: deps_core::CooldownWindow::from_secs(1_000),
             },
             now,
         );

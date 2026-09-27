@@ -593,7 +593,7 @@ mod tests {
             deps_core::EcosystemId::Npm,
             parse_result.as_ref(),
             ecosystem.formatter(),
-            false,
+            deps_core::NetworkMode::Online,
             Some(&deps_dev),
         )
         .await;
@@ -1114,10 +1114,7 @@ mod tests {
                     &parse_result,
                     position,
                     "4",
-                    deps_core::FreshnessSettings {
-                        enabled: false,
-                        cooldown_secs: 0,
-                    },
+                    deps_core::FreshnessSettings::Disabled,
                 )
                 .await;
             mock.assert_async().await;

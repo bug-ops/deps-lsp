@@ -308,7 +308,7 @@ impl deps_core::Registry for SwiftRegistry {
         freshness: deps_core::FreshnessSettings,
     ) -> deps_core::ecosystem::BoxFuture<'a, Result<Vec<Box<dyn deps_core::Version>>>> {
         Box::pin(async move {
-            let versions = if freshness.enabled {
+            let versions = if freshness.is_enabled() {
                 self.get_versions_with(name.as_str(), freshness).await?
             } else {
                 self.get_versions(name.as_str()).await?
@@ -734,7 +734,7 @@ mod tests {
         );
     }
 
-    // --- Registry::get_versions_with: freshness.enabled gate (M2) ---
+    // --- Registry::get_versions_with: freshness.is_enabled() gate (M2) ---
 
     #[tokio::test]
     async fn test_get_versions_with_disabled_freshness_skips_release_dates_fetch() {
@@ -761,10 +761,7 @@ mod tests {
 
         let registry = mock_registry(&server.url(), true);
         let name = PackageName::new("owner/repo");
-        let freshness = FreshnessSettings {
-            enabled: false,
-            ..Default::default()
-        };
+        let freshness = FreshnessSettings::Disabled;
 
         let versions = Registry::get_versions_with(&registry, &name, freshness)
             .await
@@ -799,10 +796,7 @@ mod tests {
 
         let registry = mock_registry(&server.url(), true);
         let name = PackageName::new("owner/repo");
-        let freshness = FreshnessSettings {
-            enabled: true,
-            ..Default::default()
-        };
+        let freshness = FreshnessSettings::default();
 
         let versions = Registry::get_versions_with(&registry, &name, freshness)
             .await

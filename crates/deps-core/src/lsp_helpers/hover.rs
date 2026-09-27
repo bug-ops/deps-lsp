@@ -11,7 +11,7 @@ use crate::osv::ScanOutcome;
 use crate::{
     ConcreteVersion, Dependency, DependencySource, Deprecation, GossipLowUsage, LicenseSource,
     ParseResult, ProvenanceStatus, PublishTime, Registry, SupplyChainTrustSignal, Version,
-    VersionReq, is_within_cooldown,
+    VersionReq,
 };
 
 use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
@@ -22,9 +22,10 @@ use super::diagnostics::{MAX_DIAGNOSTIC_NAME_CHARS, MAX_DIAGNOSTIC_VALUE_CHARS};
 use super::diagnostics::{MAX_DIAGNOSTIC_PROSE_CHARS, MAX_VERSION_DIAGNOSTIC_CHARS};
 use super::hover_markdown::{FieldKind, HoverMarkdown};
 use super::{
-    EcosystemFormatter, GossipCooldownLookup, HOVER_RECENT_VERSIONS, LatestVerdict, VersionData,
-    await_versions_fetch, escape_markdown, gossip_cooldown_for, in_use_version, latest_verdict,
-    markdown_code_span, position_in_range, resolve_in_use_version, resolve_scan_outcome,
+    CooldownBlocker, CooldownPrecedence, EcosystemFormatter, HOVER_RECENT_VERSIONS, LatestVerdict,
+    VersionData, await_versions_fetch, cooldown_precedence, escape_markdown, in_use_version,
+    latest_verdict, markdown_code_span, position_in_range, resolve_in_use_version,
+    resolve_scan_outcome,
 };
 use crate::github::normalize_tag;
 
@@ -280,11 +281,19 @@ pub async fn generate_hover<R: Registry + ?Sized>(
     // Issue #1456, spec 072 FR-008: a hit is only trustworthy when its own recorded
     // version exactly matches `latest_ver` — no live network wait, this is a synchronous
     // read of the document-level prefetch populated ahead of time.
-    let gossip_cooldown = match latest_line {
-        Some((latest_ver, _)) => {
-            gossip_cooldown_for(versions.gossip_prefetch, dep.name(), latest_ver, now)
-        }
-        None => GossipCooldownLookup::Unavailable,
+    let precedence = match (freshness, latest_line) {
+        (
+            crate::freshness::FreshnessSettings::Enabled { cooldown },
+            Some((latest_ver, published_at)),
+        ) => cooldown_precedence(
+            versions.gossip_prefetch,
+            dep.name(),
+            latest_ver,
+            published_at,
+            cooldown,
+            now,
+        ),
+        _ => CooldownPrecedence::Cleared,
     };
     // #394 S2: version-qualified key so a hover on one occurrence of a duplicated name never
     // shows another occurrence's OSV result. Computed before `push_latest_hover_section` (issue
@@ -316,7 +325,7 @@ pub async fn generate_hover<R: Registry + ?Sized>(
         latest_line,
         freshness,
         now,
-        gossip_cooldown,
+        precedence,
         &latest_verdict_result,
     );
 
@@ -490,19 +499,15 @@ pub async fn generate_hover<R: Registry + ?Sized>(
             cached_latest,
             vuln_outcome,
             deprecation,
-            offline: versions.offline,
+            offline: versions.network.is_offline(),
             requirement_is_placeholder,
             latest_verdict: latest_verdict_result.clone(),
         },
     );
 
-    push_offline_footer_hover_section(&mut markdown, resolvable, versions.offline);
-    push_skip_reason_footer_hover_section(
-        &mut markdown,
-        resolvable,
-        versions.offline,
-        vuln_outcome,
-    );
+    let offline = versions.network.is_offline();
+    push_offline_footer_hover_section(&mut markdown, resolvable, offline);
+    push_skip_reason_footer_hover_section(&mut markdown, resolvable, offline, vuln_outcome);
 
     Some(markdown.finish(Some(dep.name_range())))
 }
@@ -548,7 +553,8 @@ fn spawn_trust_signal_fetch(
     versions.trust.and_then(|client| {
         let ecosystem = versions.ecosystem?;
         let system = deps_dev_system(ecosystem)?;
-        if versions.offline || !formatter.source_is_public_registry_content(dep_source) {
+        if versions.network.is_offline() || !formatter.source_is_public_registry_content(dep_source)
+        {
             return None;
         }
         let version = resolve_in_use_version(
@@ -587,7 +593,8 @@ fn spawn_gossip_low_usage_fetch(
     versions.gossip_client.and_then(|client| {
         let ecosystem = versions.ecosystem?;
         let system = deps_dev_system(ecosystem)?;
-        if versions.offline || !formatter.source_is_public_registry_content(dep_source) {
+        if versions.network.is_offline() || !formatter.source_is_public_registry_content(dep_source)
+        {
             return None;
         }
         let version = resolve_in_use_version(
@@ -689,13 +696,13 @@ fn push_latest_hover_section(
     latest_line: Option<(&str, Option<PublishTime>)>,
     freshness: crate::freshness::FreshnessSettings,
     now: PublishTime,
-    gossip_cooldown: GossipCooldownLookup,
+    precedence: CooldownPrecedence,
     latest_verdict: &LatestVerdict,
 ) {
     let Some((latest_ver, raw_published_at)) = latest_line else {
         return;
     };
-    let published_at = freshness.enabled.then_some(raw_published_at).flatten();
+    let published_at = freshness.is_enabled().then_some(raw_published_at).flatten();
     let age_secs = published_at.map(|p| p.age_secs_from(now));
     // `latest_ver` is registry-reported and unbounded — `FieldKind::Version` matches
     // diagnostics.rs's sibling sink (#1311).
@@ -739,32 +746,32 @@ fn push_latest_hover_section(
     // Issue #1456, spec 072 FR-002/NFR-004, S2: a GOSSIP-sourced cooldown answer is
     // authoritative whenever available — both `Active` (render the attributed callout) and
     // `NotActive` (render nothing, and do NOT fall back to the local heuristic, which could
-    // contradict what GOSSIP already knows) skip the local heuristic entirely. Only
-    // `Unavailable` (no GOSSIP data for this exact version) falls back. Both branches
-    // respect `freshness.enabled` — disabling the freshness feature entirely disables this
-    // callout regardless of source.
-    if !freshness.enabled {
+    // contradict what GOSSIP already knows) skip the local heuristic entirely. Only an
+    // unavailable GOSSIP answer falls back to the local rule (`precedence`'s
+    // `Blocked(Local { .. })` case). Kept as a defensive early return in addition to
+    // `precedence` already being `Cleared` whenever freshness is disabled (see the caller in
+    // `generate_hover`) — disabling the freshness feature entirely disables this callout
+    // regardless of source.
+    if !freshness.is_enabled() {
         return;
     }
-    match gossip_cooldown {
-        GossipCooldownLookup::Active => {
+    match precedence {
+        CooldownPrecedence::Blocked(CooldownBlocker::Gossip) => {
             markdown.push_static(
                 "> ⏳ **Recently published** — deps.dev/GOSSIP reports this release is still \
                  within its cooldown window.\n\
                  > It may still be yanked or superseded; consider verifying before upgrading.\n\n",
             );
         }
-        GossipCooldownLookup::NotActive => {}
-        GossipCooldownLookup::Unavailable => {
-            if age_secs.is_some_and(|age| is_within_cooldown(age, freshness.cooldown_secs)) {
-                markdown.push_static(
-                    "> ⏳ **Recently published** — this release is still within the cooldown \
-                     window.\n\
-                     > It may still be yanked or superseded; consider verifying before \
-                     upgrading.\n\n",
-                );
-            }
+        CooldownPrecedence::Blocked(CooldownBlocker::Local { .. }) => {
+            markdown.push_static(
+                "> ⏳ **Recently published** — this release is still within the cooldown \
+                 window.\n\
+                 > It may still be yanked or superseded; consider verifying before \
+                 upgrading.\n\n",
+            );
         }
+        CooldownPrecedence::Cleared => {}
     }
 }
 
@@ -843,7 +850,7 @@ fn push_recent_versions_hover_section(
     markdown.push_static("**Recent versions**:\n");
     for (i, version) in entries {
         let age_secs = freshness
-            .enabled
+            .is_enabled()
             .then(|| version_age_secs(version.as_ref(), now))
             .flatten();
         markdown.push_static("- ");
@@ -1695,7 +1702,7 @@ mod tests {
             Some((long.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            GossipCooldownLookup::Unavailable,
+            CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
         );
         assert!(markdown.as_str().len() < long.len(), "got: {markdown}");
@@ -1714,7 +1721,7 @@ mod tests {
             Some((at_cap.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            GossipCooldownLookup::Unavailable,
+            CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
         );
         assert_eq!(markdown.as_str(), format!("**Latest**: `{at_cap}`\n\n"));
@@ -1726,7 +1733,7 @@ mod tests {
             Some((over_cap.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            GossipCooldownLookup::Unavailable,
+            CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
         );
         assert_eq!(
@@ -1747,7 +1754,7 @@ mod tests {
             Some((value.as_str(), None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            GossipCooldownLookup::Unavailable,
+            CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
         );
         assert!(!markdown.as_str().contains('\u{0600}'), "got: {markdown}");
@@ -1763,7 +1770,7 @@ mod tests {
             Some(("8.3.1", None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::from_unix_secs(1_000),
-            GossipCooldownLookup::Active,
+            CooldownPrecedence::Blocked(CooldownBlocker::Gossip),
             &LatestVerdict::NotApplicable,
         );
         assert!(
@@ -1782,7 +1789,9 @@ mod tests {
             Some(("8.3.1", Some(PublishTime::from_unix_secs(999_999)))),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::from_unix_secs(1_000_000),
-            GossipCooldownLookup::Unavailable,
+            CooldownPrecedence::Blocked(CooldownBlocker::Local {
+                published_at: PublishTime::from_unix_secs(999_999),
+            }),
             &LatestVerdict::NotApplicable,
         );
         assert!(
@@ -1807,7 +1816,7 @@ mod tests {
             Some(("8.3.1", Some(PublishTime::from_unix_secs(999_999)))),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::from_unix_secs(1_000_000),
-            GossipCooldownLookup::NotActive,
+            CooldownPrecedence::Cleared,
             &LatestVerdict::NotApplicable,
         );
         assert!(
@@ -1831,7 +1840,7 @@ mod tests {
             Some(("1.0.8", Some(PublishTime::from_unix_secs(999_999)))),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::from_unix_secs(1_000_000),
-            GossipCooldownLookup::Active,
+            CooldownPrecedence::Blocked(CooldownBlocker::Gossip),
             &verdict,
         );
         assert!(
@@ -1862,7 +1871,7 @@ mod tests {
             Some(("2.0.0", None)),
             crate::freshness::FreshnessSettings::default(),
             PublishTime::now(),
-            GossipCooldownLookup::Unavailable,
+            CooldownPrecedence::Cleared,
             &verdict,
         );
         assert!(
@@ -3846,10 +3855,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &HashMap::new()),
             &registry,
             &MOCK_FORMATTER,
-            crate::freshness::FreshnessSettings {
-                enabled: false,
-                cooldown_secs: crate::freshness::DEFAULT_COOLDOWN_SECS,
-            },
+            crate::freshness::FreshnessSettings::Disabled,
             PublishTime::now(),
         )
         .await
@@ -3956,6 +3962,160 @@ mod tests {
         assert!(!content.contains("Recently published"));
     }
 
+    /// Issue #1551 caller-side mapping: GOSSIP's authoritative `NotActive` answer for
+    /// `latest` must suppress the callout even though the local heuristic alone (a
+    /// 1-hour-old publish, well within the default 3-day cooldown) would otherwise render it.
+    #[tokio::test]
+    async fn test_generate_hover_gossip_not_active_suppresses_local_callout() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::from_unix_secs(1_000_000);
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                // 1 hour ago — well within the default 3-day cooldown.
+                published_at: Some(PublishTime::from_unix_secs(now.as_unix_secs() - 60 * 60)),
+                gossip_excluded_version: None,
+                cooldown_fallback: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+        let mut gossip_prefetch = HashMap::new();
+        gossip_prefetch.insert(
+            crate::PackageName::new("serde"),
+            crate::GossipFindings {
+                version: "2.0.0".to_string(),
+                // Expired cooldown: GOSSIP has an authoritative "not active" answer.
+                cooldown: Some(crate::GossipCooldown::new(
+                    PublishTime::from_unix_secs(now.as_unix_secs() - 1),
+                    crate::GossipRiskLevel::High,
+                )),
+                low_usage: None,
+            },
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_gossip_prefetch(&gossip_prefetch),
+            &MockRegistry,
+            &MOCK_FORMATTER,
+            crate::freshness::FreshnessSettings::default(),
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let content = hover.markdown();
+        assert!(
+            !content.contains("Recently published"),
+            "GOSSIP's authoritative NotActive answer must suppress the local heuristic: {content}"
+        );
+    }
+
+    /// Issue #1551 caller-side mapping: with no GOSSIP prefetch data at all, a recent local
+    /// publish still renders the unattributed "Recently published" callout (no GOSSIP wording).
+    #[tokio::test]
+    async fn test_generate_hover_no_gossip_prefetch_renders_unattributed_local_callout() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::from_unix_secs(1_000_000);
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                // 1 hour ago — well within the default 3-day cooldown.
+                published_at: Some(PublishTime::from_unix_secs(now.as_unix_secs() - 60 * 60)),
+                gossip_excluded_version: None,
+                cooldown_fallback: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&cached_versions, &resolved_versions),
+            &MockRegistry,
+            &MOCK_FORMATTER,
+            crate::freshness::FreshnessSettings::default(),
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let content = hover.markdown();
+        assert!(content.contains("Recently published"), "got: {content}");
+        assert!(
+            !content.contains("deps.dev/GOSSIP"),
+            "no prefetch data means the local heuristic renders unattributed: {content}"
+        );
+    }
+
+    /// Issue #1551 caller-side mapping: `FreshnessSettings::Disabled` must suppress the
+    /// callout even when GOSSIP's prefetch reports an active cooldown for `latest`.
+    #[tokio::test]
+    async fn test_generate_hover_freshness_disabled_suppresses_callout_despite_active_gossip() {
+        use std::collections::HashMap;
+
+        let now = PublishTime::from_unix_secs(1_000_000);
+        let parse_result = freshness_test_parse_result("serde");
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            "serde".into(),
+            PackageVersions {
+                latest: "2.0.0".into(),
+                available: Arc::from(vec!["2.0.0".into()]),
+                yanked: Arc::from(Vec::new()),
+                published_at: Some(PublishTime::from_unix_secs(now.as_unix_secs() - 60 * 60)),
+                gossip_excluded_version: None,
+                cooldown_fallback: None,
+            },
+        );
+        let resolved_versions = HashMap::new();
+        let mut gossip_prefetch = HashMap::new();
+        gossip_prefetch.insert(
+            crate::PackageName::new("serde"),
+            crate::GossipFindings {
+                version: "2.0.0".to_string(),
+                cooldown: Some(crate::GossipCooldown::new(
+                    PublishTime::from_unix_secs(now.as_unix_secs() + 1_000),
+                    crate::GossipRiskLevel::High,
+                )),
+                low_usage: None,
+            },
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_gossip_prefetch(&gossip_prefetch),
+            &MockRegistry,
+            &MOCK_FORMATTER,
+            crate::freshness::FreshnessSettings::Disabled,
+            now,
+        )
+        .await
+        .expect("hover should be generated for a dependency at the cursor");
+
+        let content = hover.markdown();
+        assert!(
+            !content.contains("Recently published"),
+            "FreshnessSettings::Disabled must suppress the callout regardless of GOSSIP: {content}"
+        );
+    }
+
     /// A `latest` with no known publish time renders exactly the pre-feature line — no age
     /// suffix, no callout.
     #[tokio::test]
@@ -3985,7 +4145,7 @@ mod tests {
         assert!(!content.contains("Recently published"));
     }
 
-    /// `freshness.enabled: false` suppresses both the age suffix and the cooldown callout
+    /// `FreshnessSettings::Disabled` suppresses both the age suffix and the cooldown callout
     /// on the `**Latest**` line, even when the publish time would otherwise qualify.
     #[tokio::test]
     async fn test_generate_hover_latest_line_respects_freshness_disabled() {
@@ -4014,10 +4174,7 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MOCK_FORMATTER,
-            crate::freshness::FreshnessSettings {
-                enabled: false,
-                cooldown_secs: crate::freshness::DEFAULT_COOLDOWN_SECS,
-            },
+            crate::freshness::FreshnessSettings::Disabled,
             PublishTime::now(),
         )
         .await
@@ -4030,8 +4187,8 @@ mod tests {
     }
 
     /// Deterministic boundary test (issue #227 M4): `now` is threaded in as a parameter
-    /// rather than read internally, so `published_at`/`now`/`cooldown_secs` can be pinned
-    /// to fixed absolute values with no wall-clock dependency. `age == cooldown_secs`
+    /// rather than read internally, so `published_at`/`now`/the cooldown window can be pinned
+    /// to fixed absolute values with no wall-clock dependency. `age == cooldown window`
     /// exactly must NOT be within cooldown — the bound is exclusive (`age < cooldown`).
     #[tokio::test]
     async fn test_generate_hover_latest_line_cooldown_boundary_is_exclusive() {
@@ -4063,9 +4220,8 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MOCK_FORMATTER,
-            crate::freshness::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: COOLDOWN_SECS,
+            crate::freshness::FreshnessSettings::Enabled {
+                cooldown: crate::CooldownWindow::from_secs(COOLDOWN_SECS),
             },
             now,
         )
@@ -4075,7 +4231,7 @@ mod tests {
         let content = hover.markdown();
         assert!(
             !content.contains("Recently published"),
-            "age exactly equal to cooldown_secs must not be within cooldown, got: {}",
+            "age exactly equal to the cooldown window must not be within cooldown, got: {}",
             content
         );
     }
@@ -4111,9 +4267,8 @@ mod tests {
             VersionData::new(&cached_versions, &resolved_versions),
             &MockRegistry,
             &MOCK_FORMATTER,
-            crate::freshness::FreshnessSettings {
-                enabled: true,
-                cooldown_secs: COOLDOWN_SECS,
+            crate::freshness::FreshnessSettings::Enabled {
+                cooldown: crate::CooldownWindow::from_secs(COOLDOWN_SECS),
             },
             now,
         )
@@ -4123,7 +4278,7 @@ mod tests {
         let content = hover.markdown();
         assert!(
             content.contains("Recently published"),
-            "age == cooldown_secs - 1 must be within cooldown, got: {}",
+            "age == cooldown window - 1 must be within cooldown, got: {}",
             content
         );
     }
@@ -5882,7 +6037,7 @@ mod tests {
             &parse_result,
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new())
-                .with_offline(true)
+                .with_network(crate::NetworkMode::Offline)
                 .with_vulnerabilities(&vulns),
             &ErrorRegistry,
             &MOCK_FORMATTER,
@@ -5924,7 +6079,8 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2).into(),
-            VersionData::new(&HashMap::new(), &HashMap::new()).with_offline(true),
+            VersionData::new(&HashMap::new(), &HashMap::new())
+                .with_network(crate::NetworkMode::Offline),
             &registry,
             &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
@@ -5960,7 +6116,7 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2).into(),
-            VersionData::new(&cached, &resolved).with_offline(true),
+            VersionData::new(&cached, &resolved).with_network(crate::NetworkMode::Offline),
             &registry,
             &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
@@ -6006,7 +6162,8 @@ mod tests {
         let hover = generate_hover(
             &parse_result,
             Position::new(0, 2).into(),
-            VersionData::new(&cached_versions, &resolved_versions).with_offline(true),
+            VersionData::new(&cached_versions, &resolved_versions)
+                .with_network(crate::NetworkMode::Offline),
             &MockRegistry,
             &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
@@ -6080,7 +6237,7 @@ mod tests {
             Position::new(0, 2).into(),
             VersionData::new(&HashMap::new(), &HashMap::new())
                 .with_vulnerabilities(&vulns)
-                .with_offline(true),
+                .with_network(crate::NetworkMode::Offline),
             &MockRegistry,
             &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),
@@ -6556,7 +6713,7 @@ mod tests {
             VersionData::new(&HashMap::new(), &resolved_versions)
                 .with_ecosystem(crate::EcosystemId::Npm)
                 .with_trust(&deps_dev)
-                .with_offline(true),
+                .with_network(crate::NetworkMode::Offline),
             &registry,
             &MOCK_FORMATTER,
             crate::freshness::FreshnessSettings::default(),

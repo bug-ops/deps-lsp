@@ -3,9 +3,10 @@
 //! Mirrors GitHub Dependabot's default 3-day package cooldown: a version
 //! published very recently is a distinct signal from one that has been live
 //! for a while, independent of whether it is otherwise "the latest". This
-//! module is deliberately minimal (a Unix-seconds newtype plus two free
-//! functions) and stays confined to `deps-core` — ecosystem crates only ever
-//! produce a [`PublishTime`], never touch the `time` crate directly.
+//! module is deliberately minimal (a Unix-seconds newtype, a cooldown-window
+//! newtype, and the [`FreshnessSettings`] enum built from them) and stays
+//! confined to `deps-core` — ecosystem crates only ever produce a
+//! [`PublishTime`], never touch the `time` crate directly.
 
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -149,28 +150,86 @@ impl PublishTime {
     }
 }
 
-/// Whether an age (in seconds) falls within a cooldown window (in seconds).
+/// A cooldown window, in seconds, below which a publish age counts as "recent".
 ///
-/// The bound is exclusive: `age_secs < cooldown_secs`. A version published
-/// exactly `cooldown_secs` ago is **not** within cooldown; one published a
-/// second earlier is. This is the single rule applied uniformly across
-/// hover, diagnostics, and completion — no ecosystem overrides it.
-///
-/// Note the parameter order: **age first, cooldown second** — both are
-/// plain `u64`, so a swapped call site would compile silently.
+/// A newtype rather than a bare `u64` so a cooldown-window value and a plain
+/// age-in-seconds value can never be transposed at a call site without a
+/// compile error — the bug class a raw `is_within_cooldown(age, cooldown)`
+/// free function invited (swapped argument order compiled silently).
 ///
 /// # Examples
 ///
 /// ```
-/// use deps_core::is_within_cooldown;
+/// use deps_core::CooldownWindow;
 ///
-/// assert!(is_within_cooldown(100, 200));
-/// assert!(!is_within_cooldown(200, 200));
-/// assert!(is_within_cooldown(199, 200));
+/// let window = CooldownWindow::from_secs(200);
+/// assert!(window.contains(100));
+/// assert!(!window.contains(200));
+/// assert!(window.contains(199));
+/// assert_eq!(window.as_secs(), 200);
 /// ```
-#[must_use]
-pub const fn is_within_cooldown(age_secs: u64, cooldown_secs: u64) -> bool {
-    age_secs < cooldown_secs
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct CooldownWindow(u64);
+
+impl CooldownWindow {
+    /// Dependabot's default cooldown window (3 days).
+    pub const DEFAULT: Self = Self(DEFAULT_COOLDOWN_SECS);
+
+    /// Builds a cooldown window from a duration in seconds.
+    ///
+    /// `0` is a valid window: every publish age is then `>= 0`, so
+    /// [`Self::contains`] never fires and the freshness callout is simply
+    /// never shown, rather than being an error case.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::CooldownWindow;
+    ///
+    /// let window = CooldownWindow::from_secs(3600);
+    /// assert_eq!(window.as_secs(), 3600);
+    /// ```
+    #[must_use]
+    pub const fn from_secs(secs: u64) -> Self {
+        Self(secs)
+    }
+
+    /// Returns this window's length in seconds.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::CooldownWindow;
+    ///
+    /// assert_eq!(CooldownWindow::from_secs(42).as_secs(), 42);
+    /// ```
+    #[must_use]
+    pub const fn as_secs(self) -> u64 {
+        self.0
+    }
+
+    /// Whether a publish age (in seconds) falls within this cooldown window.
+    ///
+    /// The bound is exclusive: `age_secs < self.as_secs()`. A version
+    /// published exactly this window's length ago is **not** within
+    /// cooldown; one published a second earlier is. This is the single rule
+    /// applied uniformly across hover, diagnostics, and completion — no
+    /// ecosystem overrides it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::CooldownWindow;
+    ///
+    /// let window = CooldownWindow::from_secs(200);
+    /// assert!(window.contains(100));
+    /// assert!(!window.contains(200));
+    /// assert!(window.contains(199));
+    /// ```
+    #[must_use]
+    pub const fn contains(self, age_secs: u64) -> bool {
+        age_secs < self.0
+    }
 }
 
 const MINUTE: u64 = 60;
@@ -241,29 +300,70 @@ pub fn format_relative_age(age_secs: u64) -> String {
 /// # Examples
 ///
 /// ```
-/// use deps_core::FreshnessSettings;
+/// use deps_core::{CooldownWindow, FreshnessSettings};
 ///
 /// let settings = FreshnessSettings::default();
-/// assert!(settings.enabled);
-/// assert_eq!(settings.cooldown_secs, deps_core::DEFAULT_COOLDOWN_SECS);
+/// assert!(settings.is_enabled());
+/// assert_eq!(settings.cooldown(), Some(CooldownWindow::DEFAULT));
 /// ```
 // Exhaustive: built by literal construction in several ecosystem crates and
-// `deps-lsp`'s `const fn to_settings` — `#[non_exhaustive]` would break that for no
-// benefit, since both fields are simple, unlikely-to-change scalars (issue #755).
+// `deps-lsp`'s `const fn to_freshness` — `#[non_exhaustive]` would break that for no
+// benefit, and would let a new variant slip past an exhaustive `match` at compile
+// time, which is exactly the guarantee this enum exists to give (issue #755).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FreshnessSettings {
-    /// Whether the freshness signal is rendered at all.
-    pub enabled: bool,
-    /// Cooldown window, in seconds, below which a publish age is "recent".
-    pub cooldown_secs: u64,
+pub enum FreshnessSettings {
+    /// The freshness signal is not rendered at all.
+    Disabled,
+    /// The freshness signal is rendered, gated by `cooldown`.
+    Enabled {
+        /// Cooldown window below which a publish age is "recent".
+        cooldown: CooldownWindow,
+    },
 }
 
 impl Default for FreshnessSettings {
     fn default() -> Self {
-        Self {
-            enabled: true,
-            cooldown_secs: DEFAULT_COOLDOWN_SECS,
+        Self::Enabled {
+            cooldown: CooldownWindow::DEFAULT,
         }
+    }
+}
+
+impl FreshnessSettings {
+    /// Returns the cooldown window, if the freshness signal is enabled.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::{CooldownWindow, FreshnessSettings};
+    ///
+    /// assert_eq!(FreshnessSettings::Disabled.cooldown(), None);
+    /// assert_eq!(
+    ///     FreshnessSettings::Enabled { cooldown: CooldownWindow::from_secs(60) }.cooldown(),
+    ///     Some(CooldownWindow::from_secs(60))
+    /// );
+    /// ```
+    #[must_use]
+    pub const fn cooldown(self) -> Option<CooldownWindow> {
+        match self {
+            Self::Enabled { cooldown } => Some(cooldown),
+            Self::Disabled => None,
+        }
+    }
+
+    /// Whether the freshness signal is rendered at all.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::FreshnessSettings;
+    ///
+    /// assert!(!FreshnessSettings::Disabled.is_enabled());
+    /// assert!(FreshnessSettings::default().is_enabled());
+    /// ```
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled { .. })
     }
 }
 
@@ -344,24 +444,24 @@ mod tests {
         assert_eq!(published.age_secs_from(now), 0);
     }
 
-    // --- is_within_cooldown boundary ---
+    // --- CooldownWindow::contains boundary ---
 
     #[test]
-    fn test_is_within_cooldown_future_timestamp_counts_as_within() {
+    fn test_cooldown_window_contains_future_timestamp_counts_as_within() {
         let now = PublishTime::from_unix_secs(1_000);
         let published_in_future = PublishTime::from_unix_secs(1_500);
         let age = published_in_future.age_secs_from(now);
-        assert!(is_within_cooldown(age, DEFAULT_COOLDOWN_SECS));
+        assert!(CooldownWindow::DEFAULT.contains(age));
     }
 
     #[test]
-    fn test_is_within_cooldown_at_boundary_is_false() {
-        assert!(!is_within_cooldown(200, 200));
+    fn test_cooldown_window_contains_at_boundary_is_false() {
+        assert!(!CooldownWindow::from_secs(200).contains(200));
     }
 
     #[test]
-    fn test_is_within_cooldown_one_below_boundary_is_true() {
-        assert!(is_within_cooldown(199, 200));
+    fn test_cooldown_window_contains_one_below_boundary_is_true() {
+        assert!(CooldownWindow::from_secs(200).contains(199));
     }
 
     // --- format_relative_age bucket boundaries ---
@@ -419,7 +519,13 @@ mod tests {
     #[test]
     fn test_freshness_settings_default() {
         let settings = FreshnessSettings::default();
-        assert!(settings.enabled);
-        assert_eq!(settings.cooldown_secs, DEFAULT_COOLDOWN_SECS);
+        assert!(settings.is_enabled());
+        assert_eq!(settings.cooldown(), Some(CooldownWindow::DEFAULT));
+    }
+
+    #[test]
+    fn test_freshness_settings_disabled_has_no_cooldown() {
+        assert_eq!(FreshnessSettings::Disabled.cooldown(), None);
+        assert!(!FreshnessSettings::Disabled.is_enabled());
     }
 }

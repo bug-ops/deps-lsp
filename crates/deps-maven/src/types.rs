@@ -83,7 +83,7 @@ pub struct MavenVersion {
     ///
     /// `None` whenever the listing could not be fetched or parsed (Google Maven and the
     /// Gradle Plugin Portal never carry a date, and the fetch is disabled by
-    /// `freshness.enabled: false`) — this is graceful degradation, not an error.
+    /// `FreshnessSettings::Disabled`) — this is graceful degradation, not an error.
     pub published_at: Option<deps_core::PublishTime>,
 }
 

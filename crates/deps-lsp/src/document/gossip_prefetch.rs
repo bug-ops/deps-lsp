@@ -74,7 +74,7 @@ pub(crate) async fn run_gossip_prefetch(
             ecosystem.ecosystem_id(),
             parse_result.as_ref(),
             ecosystem.formatter(),
-            false, // already checked `state.cache.is_offline()` above.
+            deps_core::NetworkMode::Online, // already checked `state.cache.is_offline()` above.
             Some(&state.deps_dev),
         ),
     )

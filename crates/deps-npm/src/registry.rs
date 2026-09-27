@@ -365,12 +365,12 @@ impl NpmRegistry {
     }
 
     /// Same as [`Self::get_versions`], but attaches publish times from the npm registry's
-    /// `time` field when `freshness.enabled` (extracted from the `Registry` trait impl's
+    /// `time` field when `freshness.is_enabled()` (extracted from the `Registry` trait impl's
     /// inline logic to give this crate a true inherent `get_versions_with`, matching the
     /// canonical shape every other ecosystem uses — #834 critic S1/S2).
     ///
     /// A2: an alternate (`WorkspaceDeclared`-tier) registry always skips the full-packument
-    /// publish-times fetch, regardless of `freshness.enabled` — `HttpCache` has no
+    /// publish-times fetch, regardless of `freshness.is_enabled()` — `HttpCache` has no
     /// workspace-gated `get_transport_only_*` variant, and routing an alternate's multi-MB
     /// full packument through the ungated transport would reopen the redirect-hop hole
     /// FR-008's routing closes, for a cosmetic relative-age suffix. `Self::publish_times`
@@ -386,7 +386,7 @@ impl NpmRegistry {
         freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<NpmVersion>> {
         let mut versions = self.get_versions(name).await?;
-        if freshness.enabled && self.tier == NpmRegistryTier::Public {
+        if freshness.is_enabled() && self.tier == NpmRegistryTier::Public {
             let all_versions: Vec<String> =
                 versions.iter().map(|v| v.version.to_string()).collect();
             let top8 = top_n(&versions, HOVER_RECENT_VERSIONS);
@@ -2274,10 +2274,7 @@ mod tests {
         let versions = Registry::get_versions_with(
             &registry,
             &PackageName::new("widget"),
-            FreshnessSettings {
-                enabled: false,
-                cooldown_secs: deps_core::DEFAULT_COOLDOWN_SECS,
-            },
+            FreshnessSettings::Disabled,
         )
         .await
         .unwrap();

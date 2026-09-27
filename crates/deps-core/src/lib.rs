@@ -254,7 +254,7 @@ pub use edit::{
 };
 pub use error::{DepsError, FetchFailure, RateLimitEvidence, Result};
 pub use freshness::{
-    DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age, is_within_cooldown,
+    CooldownWindow, DEFAULT_COOLDOWN_SECS, FreshnessSettings, PublishTime, format_relative_age,
 };
 pub use interpolation::{
     MAX_INTERPOLATED_VALUE_BYTES, OversizedPropertyValue, PropertyValue, insert_bounded,

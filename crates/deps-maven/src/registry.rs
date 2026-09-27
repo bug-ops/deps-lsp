@@ -399,7 +399,7 @@ impl MavenCentralRegistry {
     }
 
     /// Same as [`Self::get_versions`], but attaches [`MavenVersion::published_at`]
-    /// from the `repo1.maven.org` directory listing when `freshness.enabled` and the
+    /// from the `repo1.maven.org` directory listing when `freshness.is_enabled()` and the
     /// artifact resolved through Maven Central.
     ///
     /// The listing fetch is gated on the winning base being Maven Central specifically —
@@ -423,7 +423,7 @@ impl MavenCentralRegistry {
         freshness: deps_core::FreshnessSettings,
     ) -> Result<Vec<MavenVersion>> {
         let (mut versions, release, base) = self.get_metadata(name).await?;
-        if freshness.enabled
+        if freshness.is_enabled()
             && let Some(base) = base.as_deref().filter(|b| should_fetch_listing(b))
         {
             let times = self.fetch_publish_times(base).await;
@@ -443,14 +443,8 @@ impl MavenCentralRegistry {
     /// Same as [`Self::get_versions_with`].
     #[tracing::instrument(skip_all, fields(package = %deps_core::net_policy::redact_declaration_key(name)), level = "debug")]
     pub async fn get_versions(&self, name: &str) -> Result<Vec<MavenVersion>> {
-        self.get_versions_with(
-            name,
-            deps_core::FreshnessSettings {
-                enabled: false,
-                ..Default::default()
-            },
-        )
-        .await
+        self.get_versions_with(name, deps_core::FreshnessSettings::Disabled)
+            .await
     }
 
     /// Returns the version matching `req` exactly, or the latest stable/release version
@@ -1106,9 +1100,10 @@ mod tests {
     use std::assert_matches;
 
     fn freshness(enabled: bool) -> deps_core::FreshnessSettings {
-        deps_core::FreshnessSettings {
-            enabled,
-            ..Default::default()
+        if enabled {
+            deps_core::FreshnessSettings::default()
+        } else {
+            deps_core::FreshnessSettings::Disabled
         }
     }
 

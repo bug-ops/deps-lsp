@@ -450,7 +450,7 @@ impl DenoRegistry {
     /// This dedupes plain cached GETs — the abbreviated packument `get_versions` fetches,
     /// and the JSR endpoints — between `package.json` and `deno.json` for the same npm
     /// package. It does **not** dedupe the *separate* full-packument fetch npm's own
-    /// freshness path (`fetch_publish_times`) issues when `freshness.enabled`: that path
+    /// freshness path (`fetch_publish_times`) issues when `freshness.is_enabled()`: that path
     /// deliberately bypasses `HttpCache`'s entry map (`deps-npm/src/registry.rs`) and is
     /// memoized in a per-`NpmRegistry`-instance `DashMap`, and this constructor builds its
     /// own private `NpmRegistry` rather than sharing `NpmEcosystem`'s — so with freshness

@@ -722,18 +722,24 @@ struct PackageOutcome {
     yanked: Option<(ConcreteVersion, RemovalStatus)>,
 }
 
+/// A successfully picked "latest" version's extracted fields — [`Pick::Resolved`]'s payload,
+/// named so the yanked/deprecation/license extraction in [`fetch_and_classify_package`] reads
+/// as field access (`r.removal_status`, `&r.license`) rather than a positional tuple whose
+/// members are distinguished only by comment.
+struct ResolvedPick {
+    version: ConcreteVersion,
+    removal_status: RemovalStatus,
+    published_at: Option<deps_core::freshness::PublishTime>,
+    deprecation: Option<Deprecation>,
+    license: Vec<String>,
+}
+
 /// The list-based pick's outcome, or the `get_latest_matching` fallback's outcome when the
 /// list-based pick found nothing — an intermediate result [`fetch_and_classify_package`]
 /// uses to run the yanked/deprecation/license extraction once, uniformly, before it settles
 /// on a final [`PackageStatus`].
 enum Pick {
-    Resolved {
-        version: ConcreteVersion,
-        removal_status: RemovalStatus,
-        published_at: Option<deps_core::freshness::PublishTime>,
-        deprecation: Option<Deprecation>,
-        license: Vec<String>,
-    },
+    Resolved(ResolvedPick),
     Unresolved(PackageStatus),
 }
 
@@ -741,13 +747,13 @@ impl Pick {
     /// Builds [`Self::Resolved`] from a picked `Version`, shared by the list-based pick and
     /// the `get_latest_matching` fallback pick so the two success arms can't drift.
     fn resolved(v: &dyn Version) -> Self {
-        Self::Resolved {
+        Self::Resolved(ResolvedPick {
             version: v.version_string().clone(),
             removal_status: v.removal_status(),
             published_at: v.published_at(),
             deprecation: v.deprecation().cloned(),
             license: v.license().to_vec(),
-        }
+        })
     }
 }
 
@@ -1043,14 +1049,8 @@ async fn fetch_and_classify_package(
                 }
             };
 
-            let resolved = match &pick {
-                Pick::Resolved {
-                    version,
-                    removal_status,
-                    published_at,
-                    deprecation,
-                    license,
-                } => Some((version, removal_status, published_at, deprecation, license)),
+            let resolved: Option<&ResolvedPick> = match &pick {
+                Pick::Resolved(r) => Some(r),
                 Pick::Unresolved(_) => None,
             };
 
@@ -1058,10 +1058,10 @@ async fn fetch_and_classify_package(
                 // Row 1 (§4.7): the picked "latest" itself yanked — free, already in hand.
                 // Unreachable in production under today's hardcoded wildcard, but stays
                 // correct as a defense-in-depth check.
-                if let Some((latest, status, _, _, _)) = resolved
-                    && status.is_flagged()
+                if let Some(r) = resolved
+                    && r.removal_status.is_flagged()
                 {
-                    yanked = Some((latest.clone(), *status));
+                    yanked = Some((r.version.clone(), r.removal_status));
                 }
 
                 // A yanked in-use version wins over an already-recorded yanked `latest`
@@ -1076,22 +1076,22 @@ async fn fetch_and_classify_package(
             // "latest"), covering the fallback branch too, whose `Version` isn't a member
             // of `versions` at all — see `FetchResult::deprecations`'s doc for why this
             // must not scan `versions` instead.
-            let deprecation = resolved.and_then(|(_, _, _, dep_info, _)| dep_info.clone());
+            let deprecation = resolved.and_then(|r| r.deprecation.clone());
 
             // #660/#661 tier-1 backfill. Filtered here so an empty license list —
             // indistinguishable from "no data" once merged into
             // `DocumentState::signals.licenses` — never gets inserted.
             let license = resolved
-                .map(|(_, _, _, _, lic)| lic)
+                .map(|r| &r.license)
                 .filter(|lic| !lic.is_empty())
                 .cloned();
 
             match pick {
-                Pick::Resolved {
+                Pick::Resolved(ResolvedPick {
                     version,
                     published_at,
                     ..
-                } => {
+                }) => {
                     let mut versions =
                         PackageVersions::new(version, available).with_yanked(yanked_list);
                     if let Some(published_at) = published_at {
@@ -1266,9 +1266,9 @@ fn compute_cooldown_fallback(
     now: deps_core::freshness::PublishTime,
     unfiltered_pick_idx: Option<usize>,
 ) -> Option<deps_core::lsp_helpers::CooldownFallback> {
-    if !freshness.enabled {
+    let deps_core::freshness::FreshnessSettings::Enabled { cooldown } = freshness else {
         return None;
-    }
+    };
 
     let unfiltered_pick = unfiltered_pick_idx.and_then(|idx| versions.get(idx));
     let latest_is_prerelease = unfiltered_pick.is_some_and(|v| v.is_prerelease());
@@ -1282,7 +1282,7 @@ fn compute_cooldown_fallback(
                 name,
                 pick.version_string().as_str(),
                 pick.published_at(),
-                freshness.cooldown_secs,
+                cooldown,
                 now,
             ),
             deps_core::lsp_helpers::CooldownPrecedence::Cleared
@@ -1310,7 +1310,7 @@ fn compute_cooldown_fallback(
                     name,
                     v.version_string().as_str(),
                     Some(published_at),
-                    freshness.cooldown_secs,
+                    cooldown,
                     now,
                 ),
                 deps_core::lsp_helpers::CooldownPrecedence::Cleared
@@ -2610,7 +2610,7 @@ mod tests {
                     Ok(vec![Box::new(MockVersion {
                         version: "1.0.0".into(),
                         published_at: freshness
-                            .enabled
+                            .is_enabled()
                             .then(|| PublishTime::from_unix_secs(5_000)),
                     }) as Box<dyn Version>])
                 })
@@ -5337,9 +5337,8 @@ mod tests {
                 with_registry_source(vec![PackageName::new("pkg")]),
                 &in_use_map,
                 None,
-                deps_core::freshness::FreshnessSettings {
-                    enabled: true,
-                    cooldown_secs,
+                deps_core::freshness::FreshnessSettings::Enabled {
+                    cooldown: deps_core::CooldownWindow::from_secs(cooldown_secs),
                 },
                 5,
                 10,

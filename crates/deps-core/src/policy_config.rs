@@ -712,14 +712,17 @@ impl FreshnessConfig {
     /// use deps_core::policy_config::FreshnessConfig;
     ///
     /// let config = FreshnessConfig::default();
-    /// let settings = config.to_settings();
-    /// assert!(settings.enabled);
+    /// let settings = config.to_freshness();
+    /// assert!(settings.is_enabled());
     /// ```
     #[must_use]
-    pub const fn to_settings(&self) -> crate::FreshnessSettings {
-        crate::FreshnessSettings {
-            enabled: self.enabled,
-            cooldown_secs: self.cooldown_secs,
+    pub const fn to_freshness(&self) -> crate::FreshnessSettings {
+        if self.enabled {
+            crate::FreshnessSettings::Enabled {
+                cooldown: crate::CooldownWindow::from_secs(self.cooldown_secs),
+            }
+        } else {
+            crate::FreshnessSettings::Disabled
         }
     }
 }
@@ -1149,6 +1152,23 @@ impl NetworkConfig {
     pub const fn with_offline(mut self, offline: bool) -> Self {
         self.offline = offline;
         self
+    }
+
+    /// Converts [`Self::offline`] into the typed [`crate::NetworkMode`] every
+    /// network-reachability call site reads instead of the raw config flag.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::NetworkMode;
+    /// use deps_core::policy_config::NetworkConfig;
+    ///
+    /// let config = NetworkConfig::new().with_offline(true);
+    /// assert_eq!(config.mode(), NetworkMode::Offline);
+    /// ```
+    #[must_use]
+    pub fn mode(&self) -> crate::NetworkMode {
+        crate::NetworkMode::from_offline_flag(self.offline)
     }
 }
 
