@@ -148,7 +148,7 @@ pub struct PlannedUpdateItem {
     pub current: CurrentVersion,
     /// The version this item's edit (when [`Self::outcome`] is [`Outcome::Applied`]) would
     /// move the dependency to — the target considered, even when no edit was written.
-    // TODO(critic): retype target's "" sentinel (follow-up issue)
+    // TODO(critic): retype target's "" sentinel (#1605)
     pub target: String,
     /// This item's disposition — the edit that would apply [`Self::target`] lives inside
     /// [`Outcome::Applied`] itself (#1349: folding it in here as a second, independently
