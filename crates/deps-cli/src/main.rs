@@ -612,7 +612,10 @@ async fn run_update(
             &args.package,
             &ignore_rules,
             ctx.policy.freshness.to_settings(),
-            deps_core::PublishTime::now(),
+            // Fix-cycle item 9/security L3: reuses the SAME `now` `analyze_manifest`'s own
+            // fallback-OSV-round gate evaluated against — never a second, independent
+            // `PublishTime::now()` call that backward clock skew could desync from it.
+            analysis.now,
         )
     };
     // M2: must run before the plan is reported/rendered — `plan_security_updates` does not

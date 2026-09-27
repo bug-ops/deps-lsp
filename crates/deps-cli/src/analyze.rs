@@ -8,9 +8,15 @@
 //! `generate_diagnostics`/`to_finding` — no behavior change to `check` itself.
 
 use deps_core::licenses::LicensePolicy;
-use deps_core::lsp_helpers::{DependencyOutcomes, LatestVerdict, latest_verdict};
+use deps_core::lsp_helpers::{
+    CooldownDisposition, DependencyOutcomes, LatestVerdict, PackageVersions, cooldown_disposition,
+    latest_verdict,
+};
 use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
-use deps_core::{ConcreteVersion, Ecosystem, EcosystemId, LicenseSource, PackageName, VersionData};
+use deps_core::{
+    ConcreteVersion, Ecosystem, EcosystemId, FreshnessSettings, GossipFindings, LicenseSource,
+    PackageName, PublishTime, VersionData,
+};
 use deps_engine::classify::diff::{
     merge_deprecations_after_fetch, merge_no_comparable_versions_after_fetch,
 };
@@ -52,12 +58,20 @@ const OSV_SCAN_TIMEOUT_CEILING_SECS: u64 = 30;
 /// assert!(!update_default_mode.licenses);
 /// assert!(!update_default_mode.vulnerabilities);
 /// assert!(update_default_mode.gossip);
+/// assert!(update_default_mode.cooldown_fallback);
 ///
 /// let update_security_only = AnalysisScope::vulnerabilities_only();
 /// assert!(!update_security_only.licenses);
 /// assert!(update_security_only.vulnerabilities);
 /// assert!(!update_security_only.gossip);
+/// assert!(!update_security_only.cooldown_fallback);
 /// ```
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each field is an independent phase-gate knob (license/vulnerability/gossip/\
+              cooldown-fallback), not overlapping state a two-variant enum could express \
+              more clearly — mirrors StubFormatter's identical rationale"
+)]
 #[derive(Debug, Clone, Copy)]
 pub struct AnalysisScope {
     /// Whether to run the tier-3 license prefetch (Dart/Swift/Gradle/Deno — a no-op for every
@@ -80,6 +94,13 @@ pub struct AnalysisScope {
     /// registry pick (FR-014), so the prefetch's result would never be read — an avoidable
     /// network call.
     pub gossip: bool,
+    /// Whether to run spec 075 FR-010's extra, uncapped OSV round verifying every occurrence's
+    /// cooldown-fallback candidate. Only `true` for `update`'s default mode: `check` never
+    /// writes a fallback candidate (spec 075 §1 Out of Scope) and `--security-only`'s fix
+    /// target always comes from the advisory, never a freshness/GOSSIP-filtered pick — so
+    /// neither reads [`ManifestAnalysis::fallback_status`], and running this round for them
+    /// would be a wasted network call (NFR-004).
+    pub cooldown_fallback: bool,
 }
 
 impl AnalysisScope {
@@ -91,6 +112,7 @@ impl AnalysisScope {
             licenses: true,
             vulnerabilities: true,
             gossip: true,
+            cooldown_fallback: false,
         }
     }
 
@@ -102,6 +124,7 @@ impl AnalysisScope {
             licenses: false,
             vulnerabilities: true,
             gossip: false,
+            cooldown_fallback: false,
         }
     }
 
@@ -111,13 +134,15 @@ impl AnalysisScope {
     /// **latest-check** (issue #1517) regardless of this scope: `update`'s default mode
     /// must never write a flagged/unverified `latest` into the manifest, so that check is
     /// not one of the two phases this scope can opt out of. `gossip` is `true`: default mode
-    /// is exactly the consumer spec 074's cooldown filter exists for.
+    /// is exactly the consumer spec 074's cooldown filter exists for. `cooldown_fallback` is
+    /// `true`: spec 075's fallback-candidate OSV round.
     #[must_use]
     pub const fn update_default() -> Self {
         Self {
             licenses: false,
             vulnerabilities: false,
             gossip: true,
+            cooldown_fallback: true,
         }
     }
 }
@@ -137,6 +162,16 @@ pub struct ManifestAnalysis {
     pub parse_result: Box<dyn deps_core::ParseResult>,
     /// The manifest's file URI (derived from the path `analyze_manifest` was given).
     pub uri: url::Url,
+    /// The instant this analysis ran, captured once (fix-cycle item 9/security L3).
+    ///
+    /// `analyze_manifest`'s own fallback-candidate OSV round (FR-010) and `deps-cli update`'s
+    /// planner (`plan_updates`) must evaluate `cooldown_disposition` against the SAME `now` —
+    /// two independent `PublishTime::now()` calls straddling the OSV round could, under
+    /// backward clock skew, let the planner see a dependency as `Blocked` that the OSV-gating
+    /// pass never verified a fallback for (`fallback_status` would then read `None`, degrading
+    /// to `NotApplicable` and writing an unverified fallback). Callers building `plan_updates`'s
+    /// `now` argument should use this field rather than calling `PublishTime::now()` again.
+    pub now: PublishTime,
     /// The manifest's ecosystem.
     pub ecosystem_id: EcosystemId,
     /// Latest known versions and full version lists from the registry.
@@ -155,6 +190,20 @@ pub struct ManifestAnalysis {
     /// needs this even though it opts out of both `licenses` and `vulnerabilities`. See
     /// [`deps_core::osv::LatestStatusMap`] for the map's fail-closed-on-absence contract.
     pub latest_status: Option<LatestStatusMap>,
+    /// Spec 075 FR-010: a separate OSV verdict map for every occurrence's cooldown-fallback
+    /// candidate, keyed identically to [`Self::latest_status`] but populated from a
+    /// fallback-substituted version view — NEVER merged into [`Self::latest_status`], since
+    /// [`LatestStatusMap`] has no version key and a merge would silently overwrite `latest`'s
+    /// own verdict. `None` when [`AnalysisScope::cooldown_fallback`] is `false`, the OSV
+    /// check is disabled/offline, or no dependency has a stored fallback candidate to verify
+    /// (NFR-004: this round costs zero extra network calls in that case).
+    pub fallback_status: Option<LatestStatusMap>,
+    /// Already-computed GOSSIP findings (spec 074/075 FR-006), retained here instead of being
+    /// discarded after the registry fetch — fixes `check`'s dead `with_gossip_prefetch` branch
+    /// (`ManifestAnalysis::version_data` never called it before this field existed), so `check`
+    /// and `update` consult the same [`deps_core::lsp_helpers::cooldown_disposition`] precedence
+    /// end to end. Empty when GOSSIP is disabled/offline/unsupported, never absent.
+    pub gossip_findings: HashMap<PackageName, deps_core::GossipFindings>,
     /// License data backfilled from the registry fetch (tier 1) and the tier-3 prefetch,
     /// keyed by raw package name.
     pub licenses: HashMap<PackageName, Vec<String>>,
@@ -187,7 +236,8 @@ impl ManifestAnalysis {
             .with_offline(self.offline)
             .with_license_source(self.license_source)
             .with_license_policy(&self.license_policy)
-            .with_license_prefetch(&self.licenses);
+            .with_license_prefetch(&self.licenses)
+            .with_gossip_prefetch(&self.gossip_findings);
         if let Some(vulnerabilities) = self.vulnerabilities.as_ref() {
             version_data = version_data.with_vulnerabilities(vulnerabilities);
         }
@@ -271,6 +321,37 @@ impl ManifestAnalysis {
     }
 }
 
+/// Builds a fallback view of `cached_versions`: every package whose [`cooldown_disposition`]
+/// is `Blocked { fallback: Some(_), .. }` has its `latest` swapped for the stored
+/// [`deps_core::lsp_helpers::CooldownFallback`] candidate, everything else left unchanged.
+///
+/// Feeds both spec 075 FR-010's OSV verification round (this module) and FR-007's unified
+/// planner pipeline (`crate::update`) the exact same substituted view, via
+/// [`deps_core::edit::collect_update_candidates`]/[`build_latest_check_targets`] reading
+/// `PackageVersions::latest` as they always do — so a fallback candidate is verified and
+/// planned against identically, with no separate code path to drift out of sync.
+pub(crate) fn cooldown_fallback_view(
+    cached_versions: &HashMap<PackageName, PackageVersions>,
+    gossip_prefetch: Option<&HashMap<PackageName, GossipFindings>>,
+    freshness: FreshnessSettings,
+    now: PublishTime,
+) -> HashMap<PackageName, PackageVersions> {
+    cached_versions
+        .iter()
+        .map(|(name, versions)| {
+            let mut substituted = versions.clone();
+            if let CooldownDisposition::Blocked {
+                fallback: Some(fallback),
+                ..
+            } = cooldown_disposition(versions, name, freshness, gossip_prefetch, now)
+            {
+                substituted.latest = fallback.version.clone();
+            }
+            (name.clone(), substituted)
+        })
+        .collect()
+}
+
 /// Parses `content`, resolves in-use/lock-file versions, and fetches latest registry versions.
 ///
 /// Per `scope`, also runs the tier-3 license prefetch and/or an OSV scan (each additionally
@@ -294,6 +375,10 @@ pub async fn analyze_manifest(
     ctx: &CheckContext,
     scope: AnalysisScope,
 ) -> Result<ManifestAnalysis, CheckError> {
+    // Fix-cycle item 9/security L3: captured once, threaded through this function's own
+    // fallback-OSV-round gate below and stored on the returned `ManifestAnalysis` for
+    // `plan_updates` to reuse — never a second independent `PublishTime::now()` call.
+    let now = PublishTime::now();
     let uri = crate::report::path_to_uri(manifest_path).ok_or_else(|| CheckError::InvalidPath {
         path: manifest_path.to_path_buf(),
     })?;
@@ -466,42 +551,104 @@ pub async fn analyze_manifest(
     // the same `vulnerabilities_enabled`/`!offline` policy every other OSV call respects.
     let run_latest_check =
         ctx.policy.diagnostics.vulnerabilities_enabled && !ctx.policy.network.offline;
-    let latest_check = async {
-        if run_latest_check {
-            let vuln_keys = deps_core::osv::vulnerability_keys(
-                parse_result.as_ref(),
-                &resolved_versions,
-                Some(&resolved_version_candidates),
-                formatter,
-                ecosystem_id,
-            );
-            let (targets, mut latest_status) = build_latest_check_targets(
-                parse_result.as_ref(),
+
+    // Spec 075 FR-010: the fallback-candidate OSV round only fires when
+    // `scope.cooldown_fallback` is set AND at least one dependency's `cooldown_disposition`
+    // actually found `Blocked { fallback: Some(_) }` — NFR-004: zero extra network calls
+    // otherwise (a view identical to `cached_versions` has nothing new to verify).
+    let cooldown_fallback_view_map = scope
+        .cooldown_fallback
+        .then(|| {
+            cooldown_fallback_view(
                 &cached_versions,
-                &vuln_keys,
-                formatter,
+                Some(&gossip_findings),
+                ctx.policy.freshness.to_settings(),
+                now,
+            )
+        })
+        .filter(|view| {
+            view.iter().any(|(name, v)| {
+                cached_versions
+                    .get(name)
+                    .is_none_or(|c| c.latest != v.latest)
+            })
+        });
+    let run_fallback_check = run_latest_check && cooldown_fallback_view_map.is_some();
+
+    // FR-010: computed once and shared between the latest-status and fallback-status futures
+    // below, instead of each independently re-deriving the same map.
+    let vuln_keys = (run_latest_check || run_fallback_check).then(|| {
+        deps_core::osv::vulnerability_keys(
+            parse_result.as_ref(),
+            &resolved_versions,
+            Some(&resolved_version_candidates),
+            formatter,
+            ecosystem_id,
+        )
+    });
+
+    let latest_check = async {
+        let (true, Some(vuln_keys)) = (run_latest_check, vuln_keys.as_ref()) else {
+            return None;
+        };
+        let (targets, mut latest_status) = build_latest_check_targets(
+            parse_result.as_ref(),
+            &cached_versions,
+            vuln_keys,
+            formatter,
+        );
+        if !targets.is_empty() {
+            let timeout = Duration::from_secs(
+                ctx.policy
+                    .cache
+                    .fetch_timeout_secs
+                    .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
             );
-            if !targets.is_empty() {
-                let timeout = Duration::from_secs(
-                    ctx.policy
-                        .cache
-                        .fetch_timeout_secs
-                        .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
-                );
-                let checked = ctx
-                    .osv
-                    .check_candidates(ecosystem_id, &targets, timeout)
-                    .await;
-                latest_status.extend(checked);
-            }
-            Some(latest_status)
-        } else {
-            None
+            let checked = ctx
+                .osv
+                .check_candidates(ecosystem_id, &targets, timeout)
+                .await;
+            latest_status.extend(checked);
         }
+        Some(latest_status)
     };
 
-    let (tier3_result, vulnerabilities, latest_status): (_, Option<VulnerabilityMap>, _) =
-        tokio::join!(tier3_license_fetch, osv_scan, latest_check);
+    // Spec 075 FR-010: reuses `build_latest_check_targets` (never a new OSV-request builder)
+    // over the fallback-substituted view, so the fallback candidate is verified exactly the
+    // way `latest` itself is. Result is a wholly separate map — never merged into
+    // `latest_status` (see `ManifestAnalysis::fallback_status`'s doc for why).
+    let fallback_check = async {
+        let (true, Some(vuln_keys), Some(view)) = (
+            run_fallback_check,
+            vuln_keys.as_ref(),
+            cooldown_fallback_view_map.as_ref(),
+        ) else {
+            return None;
+        };
+        let (targets, mut fallback_status) =
+            build_latest_check_targets(parse_result.as_ref(), view, vuln_keys, formatter);
+        if !targets.is_empty() {
+            let timeout = Duration::from_secs(
+                ctx.policy
+                    .cache
+                    .fetch_timeout_secs
+                    .min(OSV_SCAN_TIMEOUT_CEILING_SECS),
+            );
+            let checked = ctx
+                .osv
+                .check_candidates(ecosystem_id, &targets, timeout)
+                .await;
+            fallback_status.extend(checked);
+        }
+        Some(fallback_status)
+    };
+
+    let (tier3_result, vulnerabilities, latest_status, fallback_status): (
+        _,
+        Option<VulnerabilityMap>,
+        _,
+        _,
+    ) = tokio::join!(tier3_license_fetch, osv_scan, latest_check, fallback_check);
 
     // Merged (not replaced) alongside the tier-1 backfill above via `entry().or_insert()`,
     // not `extend` (critic nit): the two sources are disjoint today (only Composer
@@ -523,6 +670,7 @@ pub async fn analyze_manifest(
     Ok(ManifestAnalysis {
         parse_result,
         uri,
+        now,
         ecosystem_id,
         cached_versions,
         resolved_versions,
@@ -530,6 +678,8 @@ pub async fn analyze_manifest(
         outcomes,
         vulnerabilities,
         latest_status,
+        fallback_status,
+        gossip_findings,
         licenses,
         license_policy,
         license_source: ecosystem.license_source(),
@@ -620,6 +770,7 @@ mod has_unverified_latest_check_tests {
                 uri: uri.clone(),
             }),
             uri,
+            now: deps_core::PublishTime::now(),
             ecosystem_id: EcosystemId::Cargo,
             cached_versions,
             resolved_versions: HashMap::new(),
@@ -627,6 +778,8 @@ mod has_unverified_latest_check_tests {
             outcomes: DependencyOutcomes::new(),
             vulnerabilities: None,
             latest_status: Some(LatestStatusMap::new()),
+            fallback_status: None,
+            gossip_findings: HashMap::new(),
             licenses: HashMap::new(),
             license_policy: LicensePolicy::default(),
             license_source: deps_core::LicenseSource::default(),

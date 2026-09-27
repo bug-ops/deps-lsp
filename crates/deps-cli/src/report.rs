@@ -1462,4 +1462,152 @@ mod tests {
     fn test_advisory_severity_index_empty_without_vulnerabilities() {
         assert!(advisory_severity_index(None).is_empty());
     }
+
+    /// Spec 075 SC-007/FR-006: `ManifestAnalysis::version_data()` finally wires live GOSSIP
+    /// prefetch data into `check`'s diagnostic generation (`version_data()` never called
+    /// `with_gossip_prefetch` before this field existed) — an `Outdated` dependency with an
+    /// active GOSSIP cooldown finding for its exact `latest` renders the GOSSIP-attributed
+    /// message, not the unattributed local-heuristic one, through the same
+    /// `ecosystem.generate_diagnostics`/`generate_diagnostics_from_cache` path `check_manifest`
+    /// uses — and that message survives unchanged into the `to_finding`-produced
+    /// [`CheckFinding`].
+    #[test]
+    fn test_check_pipeline_surfaces_gossip_cooldown_wording_via_version_data() {
+        use crate::analyze::ManifestAnalysis;
+        use deps_core::position::{Position, Range as PosRange};
+        use deps_core::test_util::stub_gossip_findings;
+        use deps_core::{Dependency, GossipCooldown, GossipRiskLevel, PublishTime};
+        use std::any::Any;
+        use std::collections::HashSet;
+
+        struct FixtureDep {
+            name: PackageName,
+            version_req: deps_core::VersionReq,
+            version_range: PosRange,
+        }
+        impl Dependency for FixtureDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> PosRange {
+                PosRange::new(Position::new(0, 0), Position::new(0, 5))
+            }
+            fn version_requirement(&self) -> Option<&deps_core::VersionReq> {
+                Some(&self.version_req)
+            }
+            fn version_range(&self) -> Option<PosRange> {
+                Some(self.version_range)
+            }
+            fn source(&self) -> deps_core::parser::DependencySource {
+                deps_core::parser::DependencySource::Registry
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct FixtureParseResult {
+            dep: FixtureDep,
+            uri: url::Url,
+        }
+        impl deps_core::ParseResult for FixtureParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                vec![&self.dep]
+            }
+            fn workspace_root(&self) -> Option<&Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                &self.uri
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        let uri: url::Url = "file:///project/Cargo.toml".parse().expect("valid URI");
+        let parse_result: Box<dyn deps_core::ParseResult> = Box::new(FixtureParseResult {
+            dep: FixtureDep {
+                name: PackageName::new("serde"),
+                version_req: deps_core::VersionReq::new("1.0"),
+                version_range: PosRange::new(Position::new(0, 10), Position::new(0, 20)),
+            },
+            uri: uri.clone(),
+        });
+
+        let mut cached_versions = HashMap::new();
+        cached_versions.insert(
+            PackageName::new("serde"),
+            deps_core::lsp_helpers::PackageVersions::latest_only("2.0.0"),
+        );
+
+        let mut gossip_findings = HashMap::new();
+        gossip_findings.insert(
+            PackageName::new("serde"),
+            stub_gossip_findings(
+                "2.0.0",
+                Some(GossipCooldown::new(
+                    PublishTime::from_unix_secs(PublishTime::now().as_unix_secs() + 1_000),
+                    GossipRiskLevel::High,
+                )),
+            ),
+        );
+
+        let analysis = ManifestAnalysis {
+            parse_result,
+            uri: uri.clone(),
+            now: PublishTime::now(),
+            ecosystem_id: EcosystemId::Cargo,
+            cached_versions: cached_versions.clone(),
+            resolved_versions: HashMap::new(),
+            resolved_version_candidates: HashMap::new(),
+            outcomes: deps_core::lsp_helpers::DependencyOutcomes::new(),
+            vulnerabilities: None,
+            latest_status: None,
+            fallback_status: None,
+            gossip_findings,
+            licenses: HashMap::new(),
+            license_policy: deps_core::licenses::LicensePolicy::default(),
+            license_source: deps_core::LicenseSource::default(),
+            offline: false,
+            fetch_failed: HashSet::new(),
+            registry_unreachable: false,
+            license_fetch_incomplete: false,
+        };
+
+        let diagnostics = deps_core::lsp_helpers::generate_diagnostics_from_cache(
+            analysis.parse_result.as_ref(),
+            analysis.version_data(),
+            &STUB_FORMATTER,
+            &uri,
+            deps_core::FreshnessSettings::default(),
+            deps_core::lsp_helpers::DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message().contains("deps.dev/GOSSIP"),
+            "check's diagnostic generation must consult live GOSSIP prefetch data: {}",
+            diagnostics[0].message()
+        );
+
+        let dep_index = DependencyIndex::build(analysis.parse_result.as_ref());
+        let finding = to_finding(
+            analysis.ecosystem_id,
+            Path::new("Cargo.toml"),
+            &dep_index,
+            &STUB_FORMATTER,
+            diagnostics.into_iter().next().expect("one diagnostic"),
+            &HashMap::new(),
+            &VulnKeys::default(),
+            &cached_versions,
+        );
+        assert_eq!(finding.category, Category::Outdated);
+        assert!(
+            finding.message.contains("deps.dev/GOSSIP"),
+            "the GOSSIP wording must survive into the SARIF finding: {}",
+            finding.message
+        );
+    }
 }

@@ -15,12 +15,12 @@ use crate::{
     BlockedRegistryOccurrence, ConcreteVersion, Dependency, Deprecation, DepsDevClient,
     EcosystemId, FetchCompleteness, FetchFailure, PackageName, ParseResult, PublishTime,
     RegistryOccurrence, RejectedRegistryOccurrence, RemovalStatus, TyposquatSignal, VersionReq,
-    format_relative_age, is_within_cooldown,
+    format_relative_age,
 };
 
 use super::{
-    EcosystemFormatter, GossipCooldownLookup, LatestVerdict, PackageVersions, RequirementMatcher,
-    RequirementStatus, VersionData, gossip_cooldown_for, resolve_scan_outcome,
+    CooldownBlocker, CooldownDisposition, EcosystemFormatter, LatestVerdict, PackageVersions,
+    RequirementMatcher, RequirementStatus, VersionData, cooldown_disposition, resolve_scan_outcome,
     version_range_is_synthetic_empty,
 };
 
@@ -2705,28 +2705,6 @@ fn apply_outdated_rule(
         ctx.formatter,
     );
 
-    let published_at = ctx
-        .freshness
-        .enabled
-        .then_some(package_versions.published_at)
-        .flatten();
-    // Issue #1456, spec 072 FR-002/FR-008, S2: a GOSSIP-sourced answer is authoritative
-    // (and explicitly attributed) whenever available for this exact latest version — both
-    // `Active` and `NotActive` skip the local heuristic entirely; only `Unavailable` (no
-    // GOSSIP data for this version) falls back to it. Gated on `ctx.freshness.enabled` too
-    // — disabling the freshness feature entirely disables this differentiation regardless
-    // of source, matching hover's identical gate. Suppressed entirely when OSV already
-    // flagged this exact version (issue #1517 AC7) — a confirmed-unsafe version must never
-    // also read as a benign "recently published" notice.
-    let gossip_cooldown =
-        (ctx.freshness.enabled && !matches!(verdict, LatestVerdict::Flagged { .. })).then(|| {
-            gossip_cooldown_for(
-                ctx.versions.gossip_prefetch,
-                dep.name(),
-                latest.as_str(),
-                ctx.now,
-            )
-        });
     let latest =
         sanitize_and_truncate_for_diagnostic(latest.as_str(), MAX_VERSION_DIAGNOSTIC_CHARS);
     let (message, severity) = match &verdict {
@@ -2753,29 +2731,36 @@ fn apply_outdated_rule(
             format!("Newer version available: {latest} (not yet verified against OSV)"),
             ctx.severities.outdated,
         ),
+        // Issue #1517 AC7: a confirmed-unsafe version never also reads as a benign "recently
+        // published" notice — `cooldown_disposition` is only consulted here, never for
+        // `Flagged`/`Unverified` above. Spec 075 FR-004/NFR-001: the single precedence
+        // function shared with `deps-cli update`'s planner and LSP hover.
         LatestVerdict::Verified | LatestVerdict::NotApplicable => {
-            let message = match gossip_cooldown {
-                Some(GossipCooldownLookup::Active) => format!(
+            let disposition = cooldown_disposition(
+                package_versions,
+                dep.name(),
+                ctx.freshness,
+                ctx.versions.gossip_prefetch,
+                ctx.now,
+            );
+            let message = match disposition {
+                CooldownDisposition::Blocked {
+                    by: CooldownBlocker::Gossip,
+                    ..
+                } => format!(
                     "Newer version available: {latest} (deps.dev/GOSSIP reports this release is \
                      still within its cooldown window)"
                 ),
-                Some(GossipCooldownLookup::NotActive) => {
+                CooldownDisposition::Blocked {
+                    by: CooldownBlocker::Local { published_at },
+                    ..
+                } => format!(
+                    "Newer version available: {latest} (published {} — still within the release cooldown window)",
+                    format_relative_age(published_at.age_secs_from(ctx.now))
+                ),
+                CooldownDisposition::Cleared | CooldownDisposition::NotEvaluated => {
                     format!("Newer version available: {latest}")
                 }
-                Some(GossipCooldownLookup::Unavailable) | None => match published_at {
-                    Some(published_at)
-                        if is_within_cooldown(
-                            published_at.age_secs_from(ctx.now),
-                            ctx.freshness.cooldown_secs,
-                        ) =>
-                    {
-                        format!(
-                            "Newer version available: {latest} (published {} — still within the release cooldown window)",
-                            format_relative_age(published_at.age_secs_from(ctx.now))
-                        )
-                    }
-                    _ => format!("Newer version available: {latest}"),
-                },
             };
             (message, ctx.severities.outdated)
         }
@@ -4748,6 +4733,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6138,6 +6124,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6196,6 +6183,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 30 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6262,6 +6250,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6332,6 +6321,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6414,6 +6404,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6473,6 +6464,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -6597,6 +6589,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         // The lock file resolves this dependency to exactly the flagged `latest`.
@@ -6688,6 +6681,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         // The lock file resolves this dependency to exactly the flagged `latest`.
@@ -6781,6 +6775,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         // The lock file resolves this dependency to an older version than the flagged latest.
@@ -7142,6 +7137,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: None,
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -7173,13 +7169,13 @@ mod tests {
         );
     }
 
-    /// Issue #1456 security/impl-critic review S2: GOSSIP data is present and version-
-    /// matched but explicitly reports no cooldown at all (`cooldown: None`) — the message
-    /// must NOT fall back to the local heuristic, even though the local `published_at`
-    /// here is well within the local cooldown window (which would otherwise render a
-    /// contradicting message).
+    /// Spec 075 FR-005 (R-S3), inverting the earlier `..._suppresses_local_fallback`
+    /// expectation: GOSSIP data is present and version-matched but explicitly reports no
+    /// cooldown at all (`cooldown: None`) — this is now `Unavailable`, not `NotActive`, so
+    /// the message DOES fall back to the local heuristic (the local `published_at` here is
+    /// well within the local cooldown window).
     #[test]
-    fn test_generate_diagnostics_from_cache_outdated_gossip_not_active_suppresses_local_fallback() {
+    fn test_generate_diagnostics_from_cache_outdated_gossip_unavailable_falls_back_to_local() {
         use crate::position::{Position, Range};
         use std::collections::HashMap;
 
@@ -7202,12 +7198,13 @@ mod tests {
                 latest: "2.0.0".into(),
                 available: Arc::from(vec!["2.0.0".into()]),
                 yanked: Arc::from(Vec::new()),
-                // 1 hour ago — well within the default 3-day local cooldown, which would
-                // otherwise fire if this fell back.
+                // 1 hour ago — well within the default 3-day local cooldown, which must now
+                // fire since GOSSIP has no cooldown data for this version (`Unavailable`).
                 published_at: Some(PublishTime::from_unix_secs(
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -7233,7 +7230,13 @@ mod tests {
         );
 
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].message(), "Newer version available: 2.0.0");
+        assert!(
+            diagnostics[0]
+                .message()
+                .contains("still within the release cooldown window"),
+            "got: {}",
+            diagnostics[0].message()
+        );
     }
 
     /// Same setup, but `latest` was published well outside the cooldown window — the
@@ -7267,6 +7270,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -7315,6 +7319,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -7370,6 +7375,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -7426,6 +7432,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -8246,6 +8253,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             m
@@ -8301,6 +8309,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             m
@@ -8349,6 +8358,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             m
@@ -8403,6 +8413,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             m
@@ -8480,6 +8491,7 @@ mod tests {
                     yanked: Arc::from(Vec::new()),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             m
@@ -10109,6 +10121,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10164,6 +10177,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10237,6 +10251,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::AdvisoryDeprecated)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10309,6 +10324,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10388,6 +10404,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10454,6 +10471,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10503,6 +10521,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.0.0".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10601,6 +10620,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();
@@ -10665,6 +10685,7 @@ mod tests {
                     yanked: Arc::from(vec![("1.2.1".into(), RemovalStatus::Yanked)]),
                     published_at: None,
                     gossip_excluded_version: None,
+                    cooldown_fallback: None,
                 },
             );
             let resolved_versions = HashMap::new();

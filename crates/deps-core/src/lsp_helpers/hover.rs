@@ -3879,6 +3879,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -3929,6 +3930,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 10 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -4001,6 +4003,7 @@ mod tests {
                     PublishTime::now().as_unix_secs() - 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -4049,6 +4052,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_at_boundary),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -4096,6 +4100,7 @@ mod tests {
                 yanked: Arc::from(Vec::new()),
                 published_at: Some(published_at_just_inside),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
@@ -4167,6 +4172,7 @@ mod tests {
                     now.as_unix_secs() - 90 * 24 * 60 * 60,
                 )),
                 gossip_excluded_version: None,
+                cooldown_fallback: None,
             },
         );
         let resolved_versions = HashMap::new();
