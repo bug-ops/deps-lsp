@@ -153,7 +153,7 @@ pub struct FetchPreparation {
     /// dependencies).
     pub dep_sources: DepSources,
     /// `dep_name -> [in_use_version, ...]`, from [`crate::classify::resolved::collect_in_use_versions`].
-    pub in_use: HashMap<PackageName, Vec<String>>,
+    pub in_use: HashMap<PackageName, Vec<ConcreteVersion>>,
     /// The manifest's own [`deps_core::SelectionContext`], from
     /// [`deps_core::ParseResult::selection_context`].
     pub selection_context: deps_core::SelectionContext,
@@ -548,7 +548,7 @@ impl FetchResult {
 pub async fn fetch_latest_versions_parallel(
     registry: Arc<dyn Registry>,
     package_sources: DepSources,
-    in_use: &HashMap<PackageName, Vec<String>>,
+    in_use: &HashMap<PackageName, Vec<ConcreteVersion>>,
     progress_sender: Option<ProgressSender>,
     freshness: deps_core::freshness::FreshnessSettings,
     timeout_secs: u64,
@@ -773,7 +773,7 @@ async fn fetch_and_classify_package(
     registry: &dyn Registry,
     name: PackageName,
     source: deps_core::parser::DependencySource,
-    in_use_versions: Vec<String>,
+    in_use_versions: Vec<ConcreteVersion>,
     wildcard_req: &VersionReq,
     freshness: deps_core::freshness::FreshnessSettings,
     timeout: Duration,
@@ -835,10 +835,8 @@ async fn fetch_and_classify_package(
                     in_use_versions.iter().find_map(|iv| {
                         versions
                             .iter()
-                            .find(|v| {
-                                v.version_string() == iv.as_str() && v.removal_status().is_flagged()
-                            })
-                            .map(|v| (iv.as_str().into(), v.removal_status()))
+                            .find(|v| v.version_string() == iv && v.removal_status().is_flagged())
+                            .map(|v| (iv.clone(), v.removal_status()))
                     })
                 })
                 .flatten();
@@ -1058,7 +1056,7 @@ async fn fetch_and_classify_package(
 fn gossip_floor_protected_pick(
     registry: &dyn Registry,
     versions: Vec<Box<dyn Version>>,
-    in_use_versions: &[String],
+    in_use_versions: &[ConcreteVersion],
     wildcard_req: &VersionReq,
     selection_context: deps_core::SelectionContext,
     unfiltered_pick_idx: Option<usize>,
@@ -1282,7 +1280,7 @@ enum InUseFloor {
 /// (spec 076 FR-018): the GOSSIP filter still floors at `newest_located`, while
 /// `compute_cooldown_fallback` fails closed to no fallback at all — stricter than silently
 /// flooring at only the locatable entries and ignoring the unplaceable one.
-fn in_use_floor(in_use_versions: &[String], versions: &[Box<dyn Version>]) -> InUseFloor {
+fn in_use_floor(in_use_versions: &[ConcreteVersion], versions: &[Box<dyn Version>]) -> InUseFloor {
     if in_use_versions.is_empty() {
         return InUseFloor::Absent;
     }
@@ -1290,10 +1288,7 @@ fn in_use_floor(in_use_versions: &[String], versions: &[Box<dyn Version>]) -> In
     let mut newest_located: Option<usize> = None;
     let mut all_located = true;
     for iv in in_use_versions {
-        match versions
-            .iter()
-            .position(|v| v.version_string().as_str() == iv.as_str())
-        {
+        match versions.iter().position(|v| v.version_string() == iv) {
             Some(idx) => newest_located = Some(newest_located.map_or(idx, |cur| cur.min(idx))),
             None => all_located = false,
         }
@@ -1356,7 +1351,7 @@ fn compute_cooldown_fallback(
     registry: &dyn Registry,
     versions: &[Box<dyn Version>],
     name: &PackageName,
-    in_use_versions: &[String],
+    in_use_versions: &[ConcreteVersion],
     wildcard_req: &VersionReq,
     selection_context: deps_core::SelectionContext,
     freshness: deps_core::freshness::FreshnessSettings,
@@ -4152,7 +4147,10 @@ mod tests {
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4181,7 +4179,10 @@ mod tests {
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4243,7 +4244,10 @@ mod tests {
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4278,7 +4282,10 @@ mod tests {
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4313,7 +4320,10 @@ mod tests {
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4350,7 +4360,10 @@ mod tests {
                 fetch_calls: Arc::clone(&fetch_calls),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4447,7 +4460,10 @@ mod tests {
         #[tokio::test]
         async fn fallback_error_does_not_suppress_an_already_found_yanked_in_use_version() {
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 Arc::new(YankedThenFallbackErrorRegistry),
@@ -4501,7 +4517,10 @@ mod tests {
             let mut in_use = HashMap::new();
             in_use.insert(
                 PackageName::new("pkg"),
-                vec!["1.0.0".to_string(), "2.0.0".to_string()],
+                vec![
+                    ConcreteVersion::from("1.0.0"),
+                    ConcreteVersion::from("2.0.0"),
+                ],
             );
 
             let result = fetch_latest_versions_parallel(
@@ -4618,7 +4637,10 @@ mod tests {
                 fetch_calls: Arc::new(AtomicUsize::new(0)),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4648,7 +4670,10 @@ mod tests {
                 fetch_calls: Arc::new(AtomicUsize::new(0)),
             });
             let mut in_use = HashMap::new();
-            in_use.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
 
             let result = fetch_latest_versions_parallel(
                 registry,
@@ -4973,7 +4998,7 @@ mod tests {
             if !in_use.is_empty() {
                 in_use_map.insert(
                     PackageName::new("pkg"),
-                    in_use.into_iter().map(String::from).collect(),
+                    in_use.into_iter().map(ConcreteVersion::from).collect(),
                 );
             }
             let result = fetch_latest_versions_parallel(
@@ -5434,7 +5459,7 @@ mod tests {
             if !in_use.is_empty() {
                 in_use_map.insert(
                     PackageName::new("pkg"),
-                    in_use.into_iter().map(String::from).collect(),
+                    in_use.into_iter().map(ConcreteVersion::from).collect(),
                 );
             }
             let result = fetch_latest_versions_parallel(
@@ -5979,7 +6004,10 @@ mod tests {
 
             let registry: Arc<dyn Registry> = Arc::new(FixedRegistry(versions));
             let mut in_use_map = HashMap::new();
-            in_use_map.insert(PackageName::new("pkg"), vec!["1.0.0".to_string()]);
+            in_use_map.insert(
+                PackageName::new("pkg"),
+                vec![ConcreteVersion::from("1.0.0")],
+            );
             let result = fetch_latest_versions_parallel(
                 registry,
                 with_registry_source(vec![PackageName::new("pkg")]),

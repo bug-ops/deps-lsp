@@ -1395,7 +1395,7 @@ mod tests {
             );
             assert_eq!(
                 in_use.get(&PackageName::new("serde")),
-                Some(&vec!["1.0.195".to_string()])
+                Some(&vec![ConcreteVersion::from("1.0.195")])
             );
         }
 
@@ -1421,7 +1421,7 @@ mod tests {
             );
             assert_eq!(
                 in_use.get(&PackageName::new("log4j-core")),
-                Some(&vec!["2.14.1".to_string()])
+                Some(&vec![ConcreteVersion::from("2.14.1")])
             );
         }
 
@@ -1449,7 +1449,7 @@ mod tests {
             );
             assert_eq!(
                 in_use.get(&PackageName::new("typing_extensions")),
-                Some(&vec!["4.9.0".to_string()]),
+                Some(&vec![ConcreteVersion::from("4.9.0")]),
                 "pep440 '==' comparator must be stripped, not carried into the in-use version"
             );
         }
@@ -1532,7 +1532,10 @@ mod tests {
             );
             assert_eq!(
                 in_use.get(&PackageName::new("time")),
-                Some(&vec!["0.1.43".to_string(), "0.1.44".to_string()]),
+                Some(&vec![
+                    ConcreteVersion::from("0.1.43"),
+                    ConcreteVersion::from("0.1.44")
+                ]),
                 "both occurrences' in-use versions must be tracked, not just the last one"
             );
         }
