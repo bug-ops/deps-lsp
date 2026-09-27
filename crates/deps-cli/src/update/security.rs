@@ -373,24 +373,61 @@ fn classify_vulnerable_dependency(
         // #1344/#1350: `RequirementAlreadyResolves` (the declared requirement already resolves
         // forward to the fix target — see `requirement_already_resolves_to`'s and
         // `NuGetFormatter`'s doc for why this is not simply "the requirement admits the fix")
-        // and `NoOpRewrite` (no `compile_requirement` comparator, e.g. GitHub Actions/GitLab
-        // CI, and the declared literal already spells the fix text verbatim) both read as
-        // "nothing to rewrite here." Note this runs after the FR-012 yanked filter above, so a
-        // requirement that already resolves forward but whose fix target is yanked was already
-        // reported `Unfixable(Yanked)` and never reaches this match. `NoRecommendedFix`/
-        // `UnsafeVersion`/`UnverifiedTarget` are structurally unreachable here — `plan_verified_fix`
-        // only ever constructs `RequirementAlreadyResolves`/`NoOpRewrite`/`UnresolvedPlaceholder`
-        // — but `VulnFixSkip` has 6 variants regardless of which function returns it, so this
-        // match must still handle all of them exhaustively (a future `VulnFixSkip` variant is
-        // then a compile error here, not a silently-mishandled case).
-        Err(VulnFixSkip::RequirementAlreadyResolves | VulnFixSkip::NoOpRewrite) => {
-            requires_lockfile_update_item(
-                dep,
-                &current,
-                &version_native,
-                &fix.advisory_ids,
-                ignore_rule_overridden,
-            )
+        // reads as "nothing to rewrite here" — note this runs after the FR-012 yanked filter
+        // above, so a requirement that already resolves forward but whose fix target is yanked
+        // was already reported `Unfixable(Yanked)` and never reaches this match.
+        Err(VulnFixSkip::RequirementAlreadyResolves) => requires_lockfile_update_item(
+            dep,
+            &current,
+            &version_native,
+            &fix.advisory_ids,
+            ignore_rule_overridden,
+        ),
+        // #1566 S1: `NoOpRewrite` here no longer safely implies "the literal already reads as
+        // the fix." `plan_verified_fix` only reaches `NoOpRewrite` after `requirement_already_resolves_to`
+        // has already returned `false` above (a `true` answer would have hit
+        // `RequirementAlreadyResolves` instead), so the historical assumption — no
+        // `compile_requirement` comparator exists (e.g. GitHub Actions/GitLab CI tag pins), and
+        // the declared literal happens to already spell the fix text verbatim — no longer holds
+        // once an ecosystem's formatter can deliberately echo `current` back unchanged for a
+        // requirement shape it has no safe single-value rewrite for (Cargo's compound
+        // comma-separated requirements, #1566).
+        //
+        // Code review regression: checking only `compile_requirement(..).is_some()` (a matcher
+        // *exists*) is not enough, because `requirement_already_resolves_to` can diverge from
+        // the raw matcher's verdict — `NuGetFormatter` overrides it to always report `false`
+        // for a bare/open-ended-minimum floor requirement regardless of what the matcher itself
+        // says (floor semantics: leaving the manifest unedited restores the floor version, even
+        // when the floor mathematically admits the fix), and `Pep440Matcher::matches` can
+        // return `None` (indeterminate — the compared version failed to parse) rather than a
+        // confirmed `Some(false)`. Neither case means the requirement was *confirmed* to
+        // exclude the fix, so re-deriving the verdict from the underlying matcher directly —
+        // not `requirement_already_resolves_to`, which those two overrides deliberately bend
+        // away from the matcher's plain answer — and requiring exactly `Some(false)` is the
+        // only way to tell "confirmed excluded" apart from "unknown"/"overridden for other
+        // reasons". Only a confirmed exclusion is a real gap; anything else falls back to the
+        // legacy "assume already fixed" reading, preserving pre-#1566 behavior.
+        Err(VulnFixSkip::NoOpRewrite) => {
+            let fix_concrete = deps_core::ConcreteVersion::new(version_native.as_str());
+            let confirmed_excluded = formatter
+                .compile_requirement(version_req)
+                .is_some_and(|matcher| matcher.matches(&fix_concrete) == Some(false));
+            if confirmed_excluded {
+                unfixable_item(
+                    dep,
+                    &current,
+                    UnfixableReason::UnsupportedRequirementShape,
+                    ignore_rule_overridden,
+                )
+            } else {
+                requires_lockfile_update_item(
+                    dep,
+                    &current,
+                    &version_native,
+                    &fix.advisory_ids,
+                    ignore_rule_overridden,
+                )
+            }
         }
         // #1370: `UnresolvedPlaceholder` joins the `NoVerifiedFix` bucket, not the
         // `RequirementAlreadyResolves`/`NoOpRewrite` one above — "requires lockfile update"
@@ -596,6 +633,131 @@ mod tests {
         }
     }
 
+    /// #1566 S1: simulates an ecosystem formatter (like Cargo's compound comma-separated
+    /// requirement handling) whose `compile_requirement` comparator has already confirmed the
+    /// fix target is NOT admitted, yet whose `format_version_replacing` deliberately echoes
+    /// `current` back unchanged because no single-value rewrite preserves the requirement
+    /// shape's semantics.
+    struct UnsupportedShapeFormatter;
+    impl PackageNaming for UnsupportedShapeFormatter {}
+    impl PackageRendering for UnsupportedShapeFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+        fn format_version_replacing(
+            &self,
+            _version: &deps_core::ConcreteVersion,
+            current: &str,
+        ) -> String {
+            current.to_string()
+        }
+    }
+    impl RequirementResolution for UnsupportedShapeFormatter {
+        fn compile_requirement(
+            &self,
+            _requirement: &VersionReq,
+        ) -> Option<Box<dyn RequirementMatcher>> {
+            Some(Box::new(FixedMatcher(false)))
+        }
+    }
+    impl DiagnosticMessages for UnsupportedShapeFormatter {}
+    impl DiagnosticPolicy for UnsupportedShapeFormatter {}
+    impl SourcePolicy for UnsupportedShapeFormatter {}
+    impl OsvNaming for UnsupportedShapeFormatter {}
+
+    /// Code review regression (S1 fix): mirrors `NuGetFormatter::requirement_already_resolves_to`'s
+    /// real bare-floor override — the raw matcher mathematically admits the fix (`Some(true)`),
+    /// but the ecosystem overrides `requirement_already_resolves_to` to always report `false`
+    /// for a floor shape (floor semantics: leaving the manifest unedited keeps restoring the
+    /// declared floor). `format_version_replacing` echoes `current` back unchanged, so
+    /// `plan_verified_fix` reaches `NoOpRewrite` — but the raw matcher's `Some(true)` must never
+    /// be read as "confirmed excluded".
+    struct FloorLikeFormatter;
+    impl PackageNaming for FloorLikeFormatter {}
+    impl PackageRendering for FloorLikeFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+        fn format_version_replacing(
+            &self,
+            _version: &deps_core::ConcreteVersion,
+            current: &str,
+        ) -> String {
+            current.to_string()
+        }
+    }
+    impl RequirementResolution for FloorLikeFormatter {
+        fn compile_requirement(
+            &self,
+            _requirement: &VersionReq,
+        ) -> Option<Box<dyn RequirementMatcher>> {
+            Some(Box::new(FixedMatcher(true)))
+        }
+        fn requirement_already_resolves_to(
+            &self,
+            _requirement: &VersionReq,
+            _target: &deps_core::ConcreteVersion,
+        ) -> bool {
+            false
+        }
+    }
+    impl DiagnosticMessages for FloorLikeFormatter {}
+    impl DiagnosticPolicy for FloorLikeFormatter {}
+    impl SourcePolicy for FloorLikeFormatter {}
+    impl OsvNaming for FloorLikeFormatter {}
+
+    /// A matcher that cannot decide — mirrors `Pep440Matcher::matches` returning `None` when
+    /// the compared version fails to parse, rather than a confirmed `Some(false)`.
+    struct IndeterminateMatcher;
+    impl RequirementMatcher for IndeterminateMatcher {
+        fn matches(&self, _version: &deps_core::ConcreteVersion) -> Option<bool> {
+            None
+        }
+        fn strict_prerelease_exclusion(&self) -> bool {
+            false
+        }
+    }
+
+    /// Code review regression (S1 fix): a matcher exists but returns `None` (indeterminate),
+    /// never `Some(false)` (confirmed excluded) — must not be treated the same as a confirmed
+    /// exclusion. `format_version_replacing` echoes `current` back unchanged so `plan_verified_fix`
+    /// reaches `NoOpRewrite`.
+    struct IndeterminateFormatter;
+    impl PackageNaming for IndeterminateFormatter {}
+    impl PackageRendering for IndeterminateFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+        fn format_version_replacing(
+            &self,
+            _version: &deps_core::ConcreteVersion,
+            current: &str,
+        ) -> String {
+            current.to_string()
+        }
+    }
+    impl RequirementResolution for IndeterminateFormatter {
+        fn compile_requirement(
+            &self,
+            _requirement: &VersionReq,
+        ) -> Option<Box<dyn RequirementMatcher>> {
+            Some(Box::new(IndeterminateMatcher))
+        }
+    }
+    impl DiagnosticMessages for IndeterminateFormatter {}
+    impl DiagnosticPolicy for IndeterminateFormatter {}
+    impl SourcePolicy for IndeterminateFormatter {}
+    impl OsvNaming for IndeterminateFormatter {}
+
     /// A formatter with no `compile_requirement` override (like GitHub Actions/GitLab CI) —
     /// `plan_vulnerability_fix`'s own textual no-op guard is the only available signal.
     const NO_COMPILE_REQUIREMENT_FORMATTER: deps_core::test_util::StubFormatter =
@@ -778,6 +940,96 @@ mod tests {
             &IgnoreRules::empty(),
         );
         assert!(matches!(item.outcome, Outcome::RequiresLockfileUpdate));
+    }
+
+    /// #1566 S1 regression: a requirement shape (e.g. Cargo's compound `">=1.2, <1.5"`) whose
+    /// formatter echoes `current` back unchanged, while a real comparator has already
+    /// confirmed the fix is NOT admitted, must be `Unfixable(UnsupportedRequirementShape)` —
+    /// never `RequiresLockfileUpdate`, whose message would falsely tell the operator the
+    /// vulnerability is already resolved by regenerating the lock file.
+    #[test]
+    fn test_classify_unsupported_requirement_shape_is_unfixable_not_requires_lockfile_update() {
+        let dep = dep("foo", ">=1.2, <1.5");
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &UnsupportedShapeFormatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape)
+            ),
+            "expected Unfixable(UnsupportedRequirementShape), got {:?}",
+            item.outcome
+        );
+        assert!(
+            !item.reason().contains("regenerate the lock file"),
+            "message must not claim the fix is already admitted: {}",
+            item.reason()
+        );
+    }
+
+    /// Code review regression (S1 fix): a bare/open-ended-minimum floor requirement (like
+    /// NuGet's), whose raw matcher mathematically admits the fix (`Some(true)`) but whose
+    /// `requirement_already_resolves_to` override always reports `false` for floor shapes, must
+    /// still be `RequiresLockfileUpdate` — the matcher's `Some(true)` is not a confirmed
+    /// exclusion, so `NoOpRewrite` here means the declared floor already spells the fix
+    /// version, not that the shape is unsupported.
+    #[test]
+    fn test_classify_floor_requirement_matching_matcher_is_requires_lockfile_update_not_unfixable()
+    {
+        let dep = dep("foo", "1.5.2");
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &FloorLikeFormatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(item.outcome, Outcome::RequiresLockfileUpdate),
+            "expected RequiresLockfileUpdate, got {:?}",
+            item.outcome
+        );
+    }
+
+    /// Code review regression (S1 fix): a matcher that cannot decide (`None`, like
+    /// `Pep440Matcher::matches` on an unparseable comparison) must not be treated as a
+    /// confirmed exclusion — falls back to `RequiresLockfileUpdate`, the legacy "assume already
+    /// fixed" reading, rather than a false `Unfixable(UnsupportedRequirementShape)`.
+    #[test]
+    fn test_classify_indeterminate_matcher_is_requires_lockfile_update_not_unfixable() {
+        let dep = dep("foo", "1.5.2");
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &IndeterminateFormatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(item.outcome, Outcome::RequiresLockfileUpdate),
+            "expected RequiresLockfileUpdate, got {:?}",
+            item.outcome
+        );
     }
 
     /// US-003 mixed-outcome regression: spec.md's own US-003 fixture has one dependency whose

@@ -585,9 +585,20 @@ pub use crate::redact::{
 ///
 /// Only compiled into test builds (see [`validate_index_url`]): a non-loopback host must
 /// never be allowed to bypass the https requirement, even under `cfg(test)`/`test-util`.
+///
+/// Compares [`url::Url::host`]'s typed [`url::Host`] rather than [`url::Url::host_str`]'s
+/// string form (#1568) — `host_str` keeps the brackets on a bracketed IPv6 literal
+/// (`"[::1]"`, not `"::1"`), so a string match against `"::1"` can never succeed for
+/// `http://[::1]:PORT/...`. The typed comparison sidesteps the bracket entirely.
 #[cfg(any(test, feature = "test-util"))]
 fn is_loopback_url(url: &url::Url) -> bool {
-    url.scheme() == "http" && matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+    url.scheme() == "http"
+        && match url.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(addr)) => addr == Ipv4Addr::LOCALHOST,
+            Some(url::Host::Ipv6(addr)) => addr == Ipv6Addr::LOCALHOST,
+            _ => false,
+        }
 }
 
 /// Validates a candidate registry/index URL: `https` scheme, no userinfo, and — when `gate`
@@ -1672,6 +1683,53 @@ mod tests {
         assert_eq!(policy.get(), WorkspaceRegistryAccess::All);
         policy.set(WorkspaceRegistryAccess::Off);
         assert_eq!(policy.get(), WorkspaceRegistryAccess::Off);
+    }
+
+    /// #1568 regression: a bracketed IPv6 loopback literal (`http://[::1]:PORT`) must match —
+    /// `host_str()` keeps the brackets (`"[::1]"`), so a string match against `"::1"` could
+    /// never succeed for this form before the fix switched to the typed `url::Host` comparison.
+    #[test]
+    fn test_is_loopback_url_bracketed_ipv6() {
+        assert!(is_loopback_url(
+            &url::Url::parse("http://[::1]:9999/").unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_is_loopback_url_ipv6_no_port() {
+        assert!(is_loopback_url(&url::Url::parse("http://[::1]/").unwrap()));
+    }
+
+    #[test]
+    fn test_is_loopback_url_ipv4_and_localhost() {
+        assert!(is_loopback_url(
+            &url::Url::parse("http://127.0.0.1:9999/").unwrap()
+        ));
+        assert!(is_loopback_url(
+            &url::Url::parse("http://localhost:9999/").unwrap()
+        ));
+    }
+
+    /// Narrow original semantics preserved by the typed comparison: only the exact loopback
+    /// addresses match, not the rest of the `127.0.0.0/8` block or other non-loopback hosts.
+    #[test]
+    fn test_is_loopback_url_rejects_non_loopback_addresses() {
+        assert!(!is_loopback_url(
+            &url::Url::parse("http://127.0.0.2:9999/").unwrap()
+        ));
+        assert!(!is_loopback_url(
+            &url::Url::parse("http://[::2]:9999/").unwrap()
+        ));
+        assert!(!is_loopback_url(
+            &url::Url::parse("http://example.com:9999/").unwrap()
+        ));
+    }
+
+    #[test]
+    fn test_is_loopback_url_rejects_https_scheme() {
+        assert!(!is_loopback_url(
+            &url::Url::parse("https://127.0.0.1:9999/").unwrap()
+        ));
     }
 
     /// Load-bearing check order: userinfo must be rejected *before* the policy gate runs —

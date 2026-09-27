@@ -83,12 +83,27 @@ impl PackageRendering for CargoFormatter {
         version.to_string()
     }
 
-    /// Preserves Cargo's exact-pin `=` operator (#1563) — the shared default ignores `current`
-    /// and always writes the bare version, which for `=1.5.0` silently drops the operator and
-    /// turns an exact pin into an auto-following caret range on rewrite.
+    /// Preserves Cargo's exact-pin `=` operator (#1563) and tilde `~` operator (#1566) — the
+    /// shared default ignores `current` and always writes the bare version, which for `=1.5.0`
+    /// silently drops the operator and turns an exact pin into an auto-following caret range on
+    /// rewrite, and for `~1.2.3` silently widens a patch-level-only-compatible requirement into
+    /// a minor-level-compatible one.
+    ///
+    /// A compound (comma-separated) requirement like `">=1.2, <1.5"` has no single-operator
+    /// rewrite that preserves its semantics: collapsing it to a bare version drops the upper
+    /// bound entirely and re-admits versions (e.g. `1.9.0`) the original requirement excluded
+    /// (#1566). Rather than guess, `current` is echoed back unchanged — the caller's
+    /// [`deps_core::edit::collect_update_candidates`] no-op guard then classifies the
+    /// dependency as [`deps_core::edit::UnplannableReason::NoOpRewrite`] instead of silently
+    /// writing a rewrite that changes what the requirement admits.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        if current.trim_start().starts_with('=') {
+        let trimmed = current.trim_start();
+        if current.contains(',') {
+            current.to_string()
+        } else if trimmed.starts_with('=') {
             format!("={}", version.as_str())
+        } else if trimmed.starts_with('~') {
+            format!("~{}", version.as_str())
         } else {
             self.format_version_for_text_edit(version)
         }
@@ -300,6 +315,44 @@ mod tests {
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "^1.5.0"),
             "2.0.0"
+        );
+    }
+
+    /// Issue #1566: a tilde requirement (`~1.2.3`, patch-level-only compatible) must keep its
+    /// `~` operator on rewrite — collapsing to bare would widen it to Cargo's default caret
+    /// (minor-level compatible), silently admitting versions the original requirement excluded.
+    #[test]
+    fn test_format_version_replacing_preserves_tilde_operator() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("1.2.4"), "~1.2.3"),
+            "~1.2.4"
+        );
+    }
+
+    /// Issue #1566: a compound (comma-separated) requirement like `">=1.2, <1.5"` has no
+    /// single-operator rewrite that preserves its upper bound — collapsing it to a bare version
+    /// would silently re-admit versions (e.g. `1.9.0`) the original requirement excluded via
+    /// `<1.5`. Left unchanged instead, so the caller's no-op guard reports it as unplannable
+    /// rather than silently changing what the requirement admits.
+    #[test]
+    fn test_format_version_replacing_compound_requirement_left_unchanged() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("1.4.0"), ">=1.2, <1.5"),
+            ">=1.2, <1.5"
+        );
+    }
+
+    /// A compound requirement whose first term happens to start with `=` or `~` must still be
+    /// left unchanged — the comma check runs before the single-operator checks, since neither
+    /// operator alone can represent the compound requirement's full semantics.
+    #[test]
+    fn test_format_version_replacing_compound_requirement_with_leading_operator_left_unchanged() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("1.4.0"), "~1.2, <1.5"),
+            "~1.2, <1.5"
         );
     }
 
