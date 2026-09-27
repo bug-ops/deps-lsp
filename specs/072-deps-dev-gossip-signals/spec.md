@@ -19,6 +19,7 @@ related:
   - "[[049-osv-malicious-package-severity/spec]]"
   - "[[071-typosquat-similarity-diagnostic/spec]]"
   - "[[011-deprecation-replacement-diagnostics/spec]]"
+  - "[[075-cli-update-cooldown-fallback/spec]]"
 ---
 
 # Feature: Adopt deps.dev GOSSIP signals (Google Open Source Security Intelligence Platform)
@@ -167,6 +168,15 @@ table. FR-010 is dropped; FR-005, FR-006, and FR-009 are corrected below.
 |----|------------|----------|
 | FR-001 | WHEN GOSSIP's Low-Usage Packages signal is adopted THE SYSTEM SHALL surface it as a distinct, low-severity signal from existing typosquat-similarity ([[071-typosquat-similarity-diagnostic/spec\|#071]]) and vulnerability diagnostics, not merged into either. **Gated**: implementation SHALL NOT finalize `GossipFindingsWire`'s low-usage sub-schema until a real `LOW_USAGE` finding has been observed live at least once (none was, across ~20 combined probes across both critique rounds) | must, gated on live observation |
 | FR-002 | WHEN GOSSIP's Dynamic Cooldown is available for a dependency (ecosystem covered, `GossipConfig.enabled`, document-level cache has data whose version exactly matches the registry's own reported latest — see FR-008) THE SYSTEM SHALL treat it as authoritative for that dependency's cooldown status at hover and diagnostics (`diagnostics.rs:2262`); WHEN unavailable THE SYSTEM SHALL fall back to the existing local `is_within_cooldown`/`FreshnessConfig.cooldown_secs` check. The two SHALL NOT be shown as disagreeing without the hover/diagnostic text making the source explicit, since live windows differ materially (verified 2026-09-26: npm 15d, PyPI 5d, Cargo 10d vs. local 3d default) | must |
+
+> [!info] Amended by [[075-cli-update-cooldown-fallback/spec]]
+> The `GossipCooldownLookup::NotActive` state this FR relies on for "authoritative, not in cooldown"
+> (issue #1456, review finding S2 — recorded only in the `deps-core` code comment at
+> `crates/deps-core/src/lsp_helpers/mod.rs:1090-1103`, not as its own spec subsection here) is
+> redefined by spec 075: `NotActive` now requires a parsed, past cooldown `end`; a missing or
+> unparseable `end`, or no COOLDOWN finding at all, is `Unavailable` and falls through to the local
+> heuristic instead of being treated as authoritative. Fail-closed direction only — see spec 075
+> FR-005 and its 2 named inverted tests.
 | FR-003 | Malicious Packages / Critical Vulnerabilities cross-reference — **rejected** (issue #1475 coverage-gap study, 2026-09-26; see §9): GOSSIP's `MALICIOUS`/`VULNERABLE` findings add no observed coverage over OSV.dev for the pinned dependency version and are not adopted. If ever revisited, THE SYSTEM SHALL treat OSV.dev as authoritative on any disagreement | rejected |
 | FR-004 | WHEN GOSSIP is unavailable for a given ecosystem, disabled (FR-009), offline, or the dependency's source is not a public registry (per `SourcePolicy::source_is_public_registry_content`) THE SYSTEM SHALL degrade gracefully with no user-visible error | must |
 | FR-005 | **CORRECTED round 3 (critique N4), memo restored round 4 (critique N5): round 2's "await concurrently" framing does not fix hover's latency doubling, because cooldown and low-usage render at two different points in `hover.rs` (cooldown before the existing `trust_signal` join, low-usage at/after it).** THE SYSTEM SHALL instead source hover's cooldown callout from `VersionData.gossip_prefetch` (FR-006's storage, no live network wait at all for cooldown), and SHALL fetch low-usage live only for the pinned/resolved version, spawned alongside `spawn_trust_signal_fetch` and awaited at the same existing join point under its own `GOSSIP_WAIT_BUDGET`, backed by a version-keyed `DepsDevClient` memo entry so a response landing past the budget still warms something for the next hover instead of being lost (critique N5 — round 3 had no memo at all, so "spawn-and-warm" warmed nothing) | must |

@@ -15,6 +15,7 @@ related:
   - "[[072-deps-dev-gossip-signals/spec]]"
   - "[[068-cli-update-subcommand/spec]]"
   - "[[062-cli-check-mode/spec]]"
+  - "[[075-cli-update-cooldown-fallback/spec]]"
 ---
 
 # Feature: deps-cli GOSSIP parity with deps-lsp's cooldown/low-usage signals
@@ -152,6 +153,14 @@ need per-ecosystem `Registry` trait changes to filter the fallback itself); see 
 | FR-008 | WHEN `load()` (config.rs:217) parses a config file THE SYSTEM SHALL emit `ignored_sections`' per-section warning for **both** an auto-discovered file and an explicitly-given `--config` file — the warning-emission loop currently gated behind `if !required` (config.rs:233) SHALL run unconditionally. `safe_auto_discovered_config`'s field-reset (the untrusted-input hardening from spec 062's F1/F1-follow-up) SHALL remain gated to the auto-discovered (`!required`) path only — an explicit `--config` stays fully trusted as written (config.rs:210-211's existing doc comment), only the "this section has no effect in deps-cli" warning becomes unconditional | must |
 | FR-009 | WHEN GOSSIP is disabled, the run is offline, the ecosystem is not `deps_dev_system`-covered, or a dependency's source fails `EcosystemFormatter::source_is_public_registry_content` THE SYSTEM SHALL degrade to the existing local-freshness-only behavior with no user-visible error — `fetch_gossip_findings_batch` already implements every one of these gates (`diagnostics.rs:1938-1975`), reused as-is | must |
 
+> [!info] Amended by [[075-cli-update-cooldown-fallback/spec]]
+> FR-003(b)'s no-floor no-op (a dependency with no lockfile-resolved in-use version whose GOSSIP-flagged
+> `latest` was previously applied unfiltered) changes behavior: spec 075's engine-side cooldown
+> fallback requires the same in-use floor, and with no floor it computes no fallback either — so a
+> no-lockfile, GOSSIP-`Active` dependency is now skipped (`WithinFreshnessCooldown`) by `deps-cli
+> update` instead of being applied. Documented as a deliberate `### Changed` in `CHANGELOG.md` by
+> spec 075, not a regression of this spec.
+
 ## 4. Non-Functional Requirements
 
 | ID | Category | Requirement |
@@ -159,7 +168,7 @@ need per-ecosystem `Registry` trait changes to filter the fallback itself); see 
 | NFR-001 | Performance | One `GetFindingsBatch` POST per manifest per covered ecosystem (FR-002), not per package — reuses `DepsDevClient`'s existing per-package memo (1h TTL) and `gossip_semaphore`/`DEPS_DEV_BODY_LIMIT` bounds (spec 072 FR-012), unmodified. No new concurrency primitives needed in `deps-core` |
 | NFR-002 | Reliability | A `DepsDevClient` error, timeout, or empty batch result degrades silently to local-freshness-only exclusion (FR-009) — `deps-cli check`/`update` never fail or change exit code solely because a GOSSIP call errored |
 | NFR-003 | Privacy | Per FR-009, no dependency name reaches deps.dev unless `[gossip].enabled = true`, the run is not offline, and the dependency's source passes the same public-registry-content gate spec 072 already established — identical policy, no new opt-in surface |
-| NFR-004 | Consistency | `deps-cli` and `deps-lsp` are explicitly allowed to diverge in *how* GOSSIP data is surfaced (per spec 072 FR-007: `cooldown_secs` remains deps-cli's own, unchanged, non-GOSSIP-overridden source outside this feature's additive filter) — this spec does not attempt to unify the two surfaces' precedence models, only to give `deps-cli` a working GOSSIP signal of its own |
+| NFR-004 | Consistency | `deps-cli` and `deps-lsp` are explicitly allowed to diverge in *how* GOSSIP data is surfaced (per spec 072 FR-007: `cooldown_secs` remains deps-cli's own, unchanged, non-GOSSIP-overridden source outside this feature's additive filter) — this spec does not attempt to unify the two surfaces' precedence models, only to give `deps-cli` a working GOSSIP signal of its own. **Amended by [[075-cli-update-cooldown-fallback/spec]]**: this "explicitly allowed to diverge" statement is superseded — `check` and `update` now share one precedence function (`cooldown_disposition`), closing the divergence issue #1529 found (`deps-cli check` never actually wired GOSSIP data in, so it always fell back to the local heuristic regardless of this NFR) |
 | NFR-005 | Maintainability | No new deps.dev data types, endpoints, or client methods — every GOSSIP type (`GossipFindings`, `GossipCooldown`, `fetch_gossip_findings_batch`) and every concurrency/privacy control already ships from spec 072/PR #1473. **Corrected round 1**: `deps-core` does gain one small, additive outcome-reporting field (`PackageVersions::gossip_excluded_version`, §5), since the attribution requirement (FR-005) lives on a type shared with `deps-lsp` — "zero new deps-core code" was never literally true once that's accounted for, and this row's original wording contradicted §5's own data model from the start | 
 
 ## 5. Data Model
