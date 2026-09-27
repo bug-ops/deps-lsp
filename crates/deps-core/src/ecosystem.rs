@@ -1773,8 +1773,8 @@ pub trait Ecosystem: Send + Sync + private::Sealed {
     /// sync for a new override is the implementor's responsibility.
     fn fetch_license<'a>(
         &'a self,
-        _name: &'a str,
-        _version: &'a str,
+        _name: &'a crate::PackageName,
+        _version: &'a crate::ConcreteVersion,
     ) -> BoxFuture<'a, Vec<String>> {
         Box::pin(std::future::ready(Vec::new()))
     }

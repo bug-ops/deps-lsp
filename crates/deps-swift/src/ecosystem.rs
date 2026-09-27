@@ -183,10 +183,10 @@ impl Ecosystem for SwiftEcosystem {
     /// [`crate::registry::SwiftRegistry::get_license`].
     fn fetch_license<'a>(
         &'a self,
-        name: &'a str,
-        _version: &'a str,
+        name: &'a deps_core::PackageName,
+        _version: &'a deps_core::ConcreteVersion,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
-        Box::pin(self.registry.get_license(name))
+        Box::pin(self.registry.get_license(name.as_str()))
     }
 
     /// GitHub's `license.spdx_id` is `licensee` detector output on the repo's default

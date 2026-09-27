@@ -3,6 +3,7 @@
 //! verification.
 
 use super::state::{ResolvedGeneration, ServerState};
+use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
@@ -306,7 +307,7 @@ pub(crate) async fn run_license_prefetch(
     let (content_snapshot, resolved_generation, targets): (
         String,
         ResolvedGeneration,
-        Vec<(PackageName, String)>,
+        Vec<(PackageName, ConcreteVersion)>,
     ) = {
         let Some(doc) = state.get_document(&uri) else {
             return;
@@ -1128,8 +1129,8 @@ mod tests {
             }
             fn fetch_license<'a>(
                 &'a self,
-                _name: &'a str,
-                _version: &'a str,
+                _name: &'a PackageName,
+                _version: &'a ConcreteVersion,
             ) -> BoxFuture<'a, Vec<String>> {
                 Box::pin(async move {
                     self.started.wait().await;

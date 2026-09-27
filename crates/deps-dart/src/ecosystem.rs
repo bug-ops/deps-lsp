@@ -156,10 +156,10 @@ impl Ecosystem for DartEcosystem {
     /// "detected, not declared" caveat.
     fn fetch_license<'a>(
         &'a self,
-        name: &'a str,
-        _version: &'a str,
+        name: &'a deps_core::PackageName,
+        _version: &'a deps_core::ConcreteVersion,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
-        Box::pin(self.registry.get_license(name))
+        Box::pin(self.registry.get_license(name.as_str()))
     }
 
     /// pub.dev's `/score` endpoint is pana's own license-detection heuristic, not an
