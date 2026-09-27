@@ -558,15 +558,26 @@ pub fn plan_updates(
     // `collect_update_candidates` pass below on the same "something actually changed" check
     // either way — `None` means no dependency is cooldown-blocked with a usable fallback.
     let fallback_view = resolve_cooldown_fallback_view(analysis, freshness, now);
+    // Issue #1561 item 1 (defense-in-depth, library-API callers only — `deps-cli`'s own
+    // `analyze_manifest` always populates both together): an empty map, never a bare `None`,
+    // stands in for a missing `fallback_status` whenever `latest_status` IS populated — a bare
+    // `None` here would make `latest_verdict` treat every fallback candidate as
+    // `NotApplicable` ("no check needed"), silently bypassing OSV verification instead of
+    // failing closed to `Unverified` the way a genuinely never-checked candidate does.
+    let empty_fallback_status = deps_core::osv::LatestStatusMap::new();
     let fallback_candidates = match fallback_view.as_ref() {
         Some(view) => {
             let mut fallback_version_data =
                 deps_core::VersionData::new(view, &analysis.resolved_versions)
                     .with_resolved_version_candidates(&analysis.resolved_version_candidates)
                     .with_ecosystem(analysis.ecosystem_id);
-            if let Some(fallback_status) = analysis.fallback_status.as_ref() {
-                fallback_version_data = fallback_version_data.with_latest_status(fallback_status);
-            }
+            fallback_version_data = match analysis.fallback_status.as_ref() {
+                Some(fallback_status) => fallback_version_data.with_latest_status(fallback_status),
+                None if analysis.latest_status.is_some() => {
+                    fallback_version_data.with_latest_status(&empty_fallback_status)
+                }
+                None => fallback_version_data,
+            };
             collect_update_candidates(
                 analysis.parse_result.as_ref(),
                 content,
@@ -796,19 +807,26 @@ fn osv_advisory_ids(
     }
 }
 
-/// Spec 075 FR-003 (A1), corrected per fix-cycle item 1/S1: whether `fallback` may serve as
-/// this occurrence's fallback write target, given its declared `version_req`.
+/// Spec 075 FR-003 (A1), corrected for issues #1564/#1561: whether `fallback` may serve as this
+/// occurrence's fallback write target, given its declared `version_req`.
 ///
-/// **Not** "does `fallback` itself satisfy the requirement" — the fallback view (FR-008/009)
-/// only ever marks a candidate `Planned` when it does NOT satisfy the requirement under the
-/// loose default heuristic, so that reading made this guard self-contradictory and rejected
-/// every legitimate fallback outside the Go exception (proven with a real `NpmFormatter`,
-/// impl-critic S1). The correct question is whether `fallback` would be a **downgrade**: reject
-/// iff `compile_requirement` is unavailable, or it accepts some `available` entry strictly
-/// newer than `fallback` — meaning the declared requirement, left unedited, already resolves
-/// forward past `fallback` on its own, so writing `fallback` would move the manifest backward
-/// relative to what re-resolution already gives it. `available` is newest-first, so "newer" is
-/// every entry up to (not including) `fallback`'s own position.
+/// Not "does the requirement admit some entry newer than `fallback`" (#1564: for a permissive,
+/// auto-following requirement — Cargo's implicit caret, the common case — a cooldown-blocked
+/// `latest` almost always also matches, rejecting the fallback in essentially every real-world
+/// scenario) and not "does `fallback` itself satisfy the requirement" (self-contradictory — the
+/// fallback view FR-008/009 only ever marks a candidate `Planned` when it does NOT, under the
+/// loose default heuristic). The correct question is whether `fallback` is a **downgrade below
+/// the requirement's own floor** — the OLDEST `available` entry the compiled requirement still
+/// matches (`available` is newest-first, so the floor sits at the LARGEST matching index).
+/// `fallback` is safe iff it is at or after that index. Deliberately ignores the requirement's
+/// upper bound (a caret ceiling, ...): a fallback beyond it is a legitimate forward update (e.g.
+/// a major-version fallback the engine's own wildcard-ranked search selected), never a downgrade.
+///
+/// Fails closed (#1561, CWE-1284) whenever no listed entry evidences the floor at or below
+/// `fallback` — `compile_requirement` unavailable, `fallback` itself unlisted, or nothing
+/// matches the requirement at all (the declared pin is unlisted, e.g. yanked — the prior "no
+/// newer match found" reading treated this as vacuously safe and let the write downgrade below
+/// the declared pin). Never infer "not a downgrade" from absence of evidence.
 ///
 /// Exception: when `formatter.manifest_requirement_is_resolved_version(dep)` (Go's `require`
 /// directive) the declared requirement IS the in-use version, so the engine's D2 floor (spec
@@ -826,10 +844,13 @@ fn fallback_satisfies_requirement(
     let Some(matcher) = formatter.compile_requirement(version_req) else {
         return false;
     };
-    !available
+    let Some(fallback_pos) = available.iter().position(|v| v == fallback) else {
+        return false;
+    };
+    let floor_pos = available
         .iter()
-        .take_while(|v| *v != fallback)
-        .any(|v| matcher.matches(v) == Some(true))
+        .rposition(|v| matcher.matches(v) == Some(true));
+    floor_pos.is_some_and(|floor_pos| floor_pos >= fallback_pos)
 }
 
 /// Spec 075 FR-007: the unified per-occurrence planner pipeline. Builds `latest_candidate`'s
@@ -976,6 +997,27 @@ fn resolve_occurrence(
                     }
                 }
                 Some(UpdateCandidate::Planned(fb)) => {
+                    // Issue #1561 item 2 (defense-in-depth): `fb.target` (the fallback view's
+                    // own planned edit) and `fallback.version` (this occurrence's own
+                    // `cooldown_disposition` pick, computed independently above) must always
+                    // agree by construction — both ultimately derive from the same stored
+                    // `CooldownFallback`. Never write an edit neither computation fully
+                    // vouches for; a divergence falls through to the same fail-closed handling
+                    // as "fallback absent" above.
+                    if fb.target != fallback.version {
+                        return if latest_is_osv_unplannable {
+                            never_demoted(latest_candidate)
+                        } else {
+                            let (current, target) = latest_current_target(&latest_candidate);
+                            build(
+                                current,
+                                target,
+                                Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+                                Vec::new(),
+                                None,
+                            )
+                        };
+                    }
                     let requirement_ok = dep_by_key
                         .get(&key)
                         .copied()
@@ -2321,11 +2363,11 @@ mod tests {
     impl deps_core::lsp_helpers::SourcePolicy for RealSemverFormatter {}
     impl deps_core::lsp_helpers::OsvNaming for RealSemverFormatter {}
 
-    /// Spec 075 SC-004/FR-003 (A1 repro), corrected per fix-cycle item 1/S1: the guard rejects
-    /// a fallback iff the requirement, left unedited, already resolves forward past it (some
-    /// `available` entry newer than the fallback also satisfies the real semver requirement) —
-    /// not "does the fallback itself satisfy the requirement" (the inverted reading that made
-    /// `Applied(fallback)` unreachable outside the Go exception, impl-critic S1).
+    /// Spec 075 SC-004/FR-003 (A1 repro), corrected for #1564/#1561: the guard rejects a
+    /// fallback iff the requirement's own floor (the oldest `available` entry it still
+    /// matches) is newer than the fallback — not "does the fallback itself satisfy the
+    /// requirement" (the inverted reading that made `Applied(fallback)` unreachable outside the
+    /// Go exception, impl-critic S1).
     #[test]
     fn test_fallback_satisfies_requirement_rejects_a1_repro_downgrade() {
         let dep = test_dep(
@@ -2363,6 +2405,66 @@ mod tests {
                 &available_no_newer_match,
             ),
             "3.5.0 satisfies >=3.0.0 and nothing newer in `available` also does"
+        );
+    }
+
+    /// Issue #1564 repro: a permissive, auto-following requirement (Cargo's implicit caret)
+    /// already admits the cooldown-blocked `latest` (0.22.8) just as much as the fallback
+    /// (0.22.7) — the OLD "reject if anything newer also matches" reading rejected this in
+    /// essentially every real-world caret-range scenario, including the exact one spec 075's
+    /// own playbook documents as the primary use case. The requirement's own floor (0.22.6,
+    /// the oldest listed match) is older than the fallback, so this must be accepted.
+    #[test]
+    fn test_fallback_satisfies_requirement_accepts_permissive_range_repro_1564() {
+        let dep = test_dep(
+            "bevy_brp_mcp",
+            "0.22.6",
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+        );
+        let req = deps_core::VersionReq::new("0.22.6");
+        let available: Vec<deps_core::ConcreteVersion> =
+            vec!["0.22.8".into(), "0.22.7".into(), "0.22.6".into()];
+
+        assert!(
+            fallback_satisfies_requirement(
+                &RealSemverFormatter,
+                &dep,
+                &req,
+                &deps_core::ConcreteVersion::new("0.22.7"),
+                &available,
+            ),
+            "0.22.7 is still >= the requirement's own floor (0.22.6) — a cooldown-cleared \
+             fallback within the same already-permitted range is never a downgrade"
+        );
+    }
+
+    /// Issue #1561 repro (CWE-1284): the declared exact pin (`=1.5.0`) is absent from
+    /// `available` (unpublished/yanked/filtered) — the OLD "no newer match found" reading
+    /// treated this as vacuously safe and let the fallback (1.4.0, strictly older than the
+    /// declared pin) be written, a silent downgrade below what the manifest declares. Fail
+    /// closed: no listed entry evidences the floor at or below the fallback, so reject.
+    #[test]
+    fn test_fallback_satisfies_requirement_fails_closed_on_unlisted_pin_1561() {
+        let dep = test_dep(
+            "foo",
+            "=1.5.0",
+            Range::new(Position::new(0, 0), Position::new(0, 5)),
+        );
+        let req = deps_core::VersionReq::new("=1.5.0");
+        // 1.5.0 (the declared pin) is not listed — unpublished/yanked/filtered.
+        let available: Vec<deps_core::ConcreteVersion> =
+            vec!["2.0.0".into(), "1.4.0".into(), "1.0.0".into()];
+
+        assert!(
+            !fallback_satisfies_requirement(
+                &RealSemverFormatter,
+                &dep,
+                &req,
+                &deps_core::ConcreteVersion::new("1.4.0"),
+                &available,
+            ),
+            "the declared pin 1.5.0 is unlisted; nothing evidences that 1.4.0 is not a \
+             downgrade below it, so this must fail closed"
         );
     }
 
@@ -2470,11 +2572,13 @@ mod tests {
     /// actually fire with a real semver comparator, not only through the Go-exception stub —
     /// an exact Cargo-style pin (`=1.0.0`) is outdated relative to both `latest` and the
     /// fallback under the default heuristic, and the fallback (1.1.0) is not a downgrade
-    /// relative to what `=1.0.0` itself resolves to (nothing does, it's an exact pin).
+    /// relative to what `=1.0.0` itself resolves to (only `1.0.0` itself, listed here and
+    /// strictly older than the fallback).
     #[test]
     fn test_plan_updates_real_semver_formatter_applies_fallback() {
         let content = "pkg = \"=1.0.0\"\n";
-        let (analysis, freshness, now) = real_semver_scenario("=1.0.0", &["1.2.0"], "1.1.0");
+        let (analysis, freshness, now) =
+            real_semver_scenario("=1.0.0", &["1.2.0", "1.1.0", "1.0.0"], "1.1.0");
 
         let plan = plan_updates(
             &analysis,
@@ -2525,9 +2629,86 @@ mod tests {
         assert!(plan.items[0].cooldown_fallback.is_none());
     }
 
+    /// Issue #1564, end to end (crates.io `bevy_brp_mcp`-shaped repro): a three-version,
+    /// live-registry-shaped fixture — `0.22.8` (newest, cooldown-blocked, would be `latest`),
+    /// `0.22.7` (cleared, the stored fallback), `0.22.6` (declared/locked) — under a bare
+    /// (implicit-caret) Cargo-style requirement. Before the fix, `fallback_satisfies_requirement`
+    /// rejected this because `0.22.8` also matches the same permissive requirement as the
+    /// fallback; the requirement's actual floor (`0.22.6`) is older than the fallback, so this
+    /// must resolve to `Applied(0.22.7)`, not a silent `WithinFreshnessCooldown` skip.
+    #[test]
+    fn test_plan_updates_real_semver_formatter_applies_fallback_over_permissive_range_1564() {
+        let content = "pkg = \"0.22.6\"\n";
+        let (analysis, freshness, now) =
+            real_semver_scenario("0.22.6", &["0.22.8", "0.22.7", "0.22.6"], "0.22.7");
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &RealSemverFormatter,
+            &[],
+            &IgnoreRules::empty(),
+            freshness,
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(plan.items[0].target, "0.22.7");
+        assert!(
+            matches!(plan.items[0].outcome, Outcome::Applied(_)),
+            "got: {:?}",
+            plan.items[0].outcome
+        );
+        assert_eq!(
+            plan.items[0].cooldown_fallback,
+            Some(CooldownFallbackNote::AppliedInsteadOf("0.22.8".into()))
+        );
+    }
+
+    /// Issue #1561, end to end (CWE-1284): the declared exact pin (`=1.5.0`) is absent from the
+    /// registry's version list (unpublished/yanked/filtered) and the fallback (`1.4.0`) is
+    /// strictly older than it — must never be applied, regardless of how the fallback view
+    /// itself classifies the occurrence.
+    #[test]
+    fn test_plan_updates_fails_closed_on_unlisted_pin_downgrade_1561() {
+        let content = "pkg = \"=1.5.0\"\n";
+        let (analysis, freshness, now) =
+            real_semver_scenario("=1.5.0", &["2.0.0", "1.4.0", "1.0.0"], "1.4.0");
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &RealSemverFormatter,
+            &[],
+            &IgnoreRules::empty(),
+            freshness,
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+            "1.4.0 is a downgrade below the unlisted declared pin 1.5.0 and must never be \
+             applied: {:?}",
+            plan.items[0]
+        );
+        assert_eq!(
+            plan.items[0].target, "2.0.0",
+            "the rejected fallback must never leak into the reported target either"
+        );
+        assert!(plan.items[0].cooldown_fallback.is_none());
+    }
+
     /// Spec 075 SC-005/FR-012 (OQ3): a flagged latest with an independently Verified fallback
     /// candidate resolves to `Applied(fallback)`, keeping the flagged-latest attribution
     /// (advisory ids) in the same row.
+    ///
+    /// Issue #1561 item 1: `fallback_status` is populated alongside `latest_status` here (both,
+    /// not just one) — a bare `None` for `fallback_status` while `latest_status` is `Some` now
+    /// fails the fallback candidate closed to `Unverified` rather than silently bypassing OSV
+    /// verification, so a test genuinely claiming an "independently Verified" fallback must set
+    /// up that verification explicitly.
     #[test]
     fn test_plan_updates_flagged_latest_with_verified_fallback_applies_fallback() {
         use deps_core::osv::{Capped, LatestStatusMap, UpgradeStatus, VulnSeverity};
@@ -2544,6 +2725,14 @@ mod tests {
             },
         );
         analysis.latest_status = Some(latest_status);
+        let mut fallback_status = LatestStatusMap::new();
+        fallback_status.insert(
+            deps_core::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateClean {
+                version: "1.1.0".to_string(),
+            },
+        );
+        analysis.fallback_status = Some(fallback_status);
 
         let plan = plan_updates(
             &analysis,
@@ -2571,6 +2760,94 @@ mod tests {
             plan.items[0].cooldown_fallback,
             Some(CooldownFallbackNote::AppliedInsteadOf("1.2.0".into()))
         );
+    }
+
+    /// Issue #1561 item 1: `latest_status` is populated (OSV verification is in effect for
+    /// this run) but `fallback_status` was never set — a caller bug distinct from an
+    /// intentionally offline/no-OSV run. The fallback candidate must fail closed to
+    /// `Unverified` (never written) rather than silently bypassing OSV verification as
+    /// `NotApplicable` ("no check needed") the way a bare `None` for BOTH fields does.
+    #[test]
+    fn test_plan_updates_latest_status_without_fallback_status_treats_fallback_as_unverified() {
+        use deps_core::osv::{LatestStatusMap, UpgradeStatus};
+
+        let content = "pkg = \"1.0.0\"\n";
+        let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            deps_core::test_util::vuln_key("pkg"),
+            UpgradeStatus::CandidateClean {
+                version: "1.2.0".to_string(),
+            },
+        );
+        analysis.latest_status = Some(latest_status);
+        // `analysis.fallback_status` deliberately left `None`.
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &FALLBACK_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            freshness,
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestUnverified
+            )),
+            "got: {:?}",
+            plan.items[0].outcome
+        );
+    }
+
+    /// Issue #1561 item 2: `resolve_occurrence`'s `fb.target != fallback.version` guard
+    /// (update/mod.rs's `'occurrence` block). Simulates the divergence it defends against — a
+    /// stale/inconsistent precomputed `analysis.cooldown_fallback_view` (`latest` = `1.9.0`)
+    /// disagreeing with `cached_versions`' own stored `CooldownFallback` (`1.1.0`) that
+    /// `cooldown_disposition` independently picks inside `resolve_occurrence` — and confirms
+    /// the divergence falls through to the same fail-closed handling as "fallback absent",
+    /// never silently writing either version.
+    #[test]
+    fn test_plan_updates_fb_target_fallback_version_divergence_fails_closed() {
+        let content = "pkg = \"1.0.0\"\n";
+        let (mut analysis, freshness, now) = fallback_scenario_analysis("1.1.0");
+
+        let mut divergent_view = HashMap::new();
+        divergent_view.insert(
+            PackageName::new("pkg"),
+            PackageVersions::latest_only("1.9.0"),
+        );
+        analysis.cooldown_fallback_view = Some(divergent_view);
+
+        let plan = plan_updates(
+            &analysis,
+            content,
+            &FALLBACK_FORMATTER,
+            &[],
+            &IgnoreRules::empty(),
+            freshness,
+            now,
+        );
+
+        assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
+        assert_eq!(
+            plan.items[0].outcome,
+            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+            "a divergence between the fallback view's own planned target (1.9.0) and \
+             `cooldown_disposition`'s independently computed pick (1.1.0) must never be \
+             silently written: {:?}",
+            plan.items[0]
+        );
+        assert_eq!(
+            plan.items[0].target, "1.2.0",
+            "must fall back to the real (unmodified) latest, never either divergent fallback \
+             value"
+        );
+        assert!(plan.items[0].cooldown_fallback.is_none());
     }
 
     /// Spec 075 SC-006/FR-011 (OQ5'): the fallback candidate is itself OSV-`Flagged` — exit 1,

@@ -80,6 +80,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-cli**: `update`'s cooldown-fallback guard now applies against a caret-range requirement instead of always skipping it as a false "downgrade" (resolves #1564) (#1565)
+- **deps-cli**: `update`'s cooldown-fallback guard now fails closed instead of downgrading a pin unlisted in the registry (resolves #1561) (#1565)
+- **deps-cargo, deps-lsp**: an exact-pin `=` operator is now preserved when rewriting a Cargo requirement, in both `update` and the LSP "update to X" code action (resolves #1563) (#1565)
 - **deps-cli, deps-core, deps-engine**: `deps-cli update` now falls back to the newest cooled-down, OSV-verified candidate instead of skipping outright when `latest` is within the freshness cooldown window (partially addresses #1528, resolves #1529) (#1550)
 - **deps-core**: `GossipCooldownLookup::NotActive` now requires a parsed past cooldown `end`; a missing GOSSIP finding is `Unavailable` and falls back to the local heuristic instead of reading as "not in cooldown" (part of #1543) (#1550)
 - **deps-cli**: `update`'s default mode now skips a no-lockfile dependency whose `latest` is GOSSIP-`Active` instead of applying it, since no in-use version exists to floor a fallback (part of #1543) (#1550)

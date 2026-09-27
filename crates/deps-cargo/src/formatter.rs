@@ -83,6 +83,17 @@ impl PackageRendering for CargoFormatter {
         version.to_string()
     }
 
+    /// Preserves Cargo's exact-pin `=` operator (#1563) — the shared default ignores `current`
+    /// and always writes the bare version, which for `=1.5.0` silently drops the operator and
+    /// turns an exact pin into an auto-following caret range on rewrite.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        if current.trim_start().starts_with('=') {
+            format!("={}", version.as_str())
+        } else {
+            self.format_version_for_text_edit(version)
+        }
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::crate_url(name.as_str())
     }
@@ -254,6 +265,41 @@ mod tests {
         assert_eq!(
             formatter.format_version_for_text_edit(&ConcreteVersion::new("0.1.0")),
             "0.1.0"
+        );
+    }
+
+    /// Issue #1563: an exact-pinned dependency (`= "1.5.0"`) must keep its `=` operator on
+    /// rewrite — the shared `PackageRendering::format_version_replacing` default ignores
+    /// `current` and always writes the bare version, which silently turns the exact pin into
+    /// an auto-following caret range.
+    #[test]
+    fn test_format_version_replacing_preserves_exact_pin_operator() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "=1.5.0"),
+            "=2.0.0"
+        );
+    }
+
+    /// A bare (implicit-caret) requirement has no operator to preserve — unaffected by the
+    /// #1563 fix, still just the bare version.
+    #[test]
+    fn test_format_version_replacing_bare_requirement_stays_bare() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "1.5.0"),
+            "2.0.0"
+        );
+    }
+
+    /// A caret-prefixed requirement is not an exact pin — the `=`-only guard must not fire for
+    /// it, and the rewrite stays bare (implicit-caret) like the pre-#1563 behavior.
+    #[test]
+    fn test_format_version_replacing_caret_requirement_stays_bare() {
+        let formatter = CargoFormatter;
+        assert_eq!(
+            formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "^1.5.0"),
+            "2.0.0"
         );
     }
 
