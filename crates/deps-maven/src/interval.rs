@@ -27,9 +27,17 @@ pub type VersionRange = deps_core::interval::VersionRange<String>;
 
 /// Parses one bracketed interval under the given [`BracketStyle`].
 ///
-/// See [`deps_core::interval::parse_interval`] for the exact grammar and rejection rules.
+/// See [`deps_core::interval::parse_interval`] for the exact grammar and rejection rules,
+/// including the `min <= max` bounded-range validation (#1595), which uses
+/// `compare_versions_for_range` so a qualifier-bearing bound (`[1.0-beta,1.0-alpha)`) is
+/// validated with Maven's own precedence, not raw string ordering.
 pub fn parse_interval(s: &str, style: BracketStyle) -> Option<VersionRange> {
-    deps_core::interval::parse_interval(s, style, |bound| Some(bound.to_string()))
+    deps_core::interval::parse_interval(
+        s,
+        style,
+        |bound| Some(bound.to_string()),
+        |a, b| crate::version::compare_versions_for_range(a, b),
+    )
 }
 
 /// Whether `version` falls inside the parsed interval `range`.
@@ -163,6 +171,49 @@ mod tests {
             assert!(!contains("1.0-alpha", &range));
             assert!(!contains("2.0-rc", &range));
             assert!(contains("2.0-milestone", &range));
+        }
+    }
+
+    /// #1595: `min <= max` validation uses qualifier-aware comparison, not raw string
+    /// ordering. Under Maven's precedence `snapshot` (rank 4) sorts below `release`/`""`
+    /// (rank 5), even though `"release" < "snapshot"` lexically — the opposite order. So
+    /// `[1.0-snapshot,1.0-release)` is a valid (non-inverted) range, while
+    /// `[1.0-release,1.0-snapshot)` — which a raw string comparison would accept, since
+    /// `"release" < "snapshot"` lexically — is actually inverted under qualifier precedence
+    /// and parses to `Empty`, admitting no version.
+    #[test]
+    fn test_inverted_qualifier_bearing_bounds_is_empty() {
+        for style in [BracketStyle::Standard, BracketStyle::AllowReversed] {
+            let valid = parse_interval("[1.0-snapshot,1.0-release)", style).unwrap();
+            assert_ne!(valid, VersionRange::Empty, "style={style:?}");
+            let inverted = parse_interval("[1.0-release,1.0-snapshot)", style).unwrap();
+            assert_eq!(inverted, VersionRange::Empty, "style={style:?}");
+        }
+    }
+
+    /// #1595: a degenerate bounded range parses to `Empty` (well-formed, unsatisfiable), not
+    /// `None` (malformed syntax) — `Empty` still admits no candidate.
+    #[test]
+    fn test_degenerate_bounded_range_is_empty() {
+        for style in [BracketStyle::Standard, BracketStyle::AllowReversed] {
+            let inverted = parse_interval("[5.0,3.0]", style).unwrap();
+            assert_eq!(inverted, VersionRange::Empty, "style={style:?}");
+            let zero_width_exclusive = parse_interval("(3.0,3.0)", style).unwrap();
+            assert_eq!(zero_width_exclusive, VersionRange::Empty, "style={style:?}");
+            assert!(!contains("3.0", &inverted));
+        }
+    }
+
+    /// #1595 M3: Maven's qualifier ordering is non-transitive with a plain trailing-segment
+    /// comparison — an unrecognized qualifier (`jre`) ranks above every known one, including
+    /// the release rank, so `1.0-jre` sorts above `1.0`. `[1.0-jre,1.0]` is therefore
+    /// genuinely inverted and correctly parses to `Empty`, matching real Maven semantics, not
+    /// a false positive from the new guard.
+    #[test]
+    fn test_unrecognized_qualifier_above_release_is_empty() {
+        for style in [BracketStyle::Standard, BracketStyle::AllowReversed] {
+            let range = parse_interval("[1.0-jre,1.0]", style).unwrap();
+            assert_eq!(range, VersionRange::Empty, "style={style:?}");
         }
     }
 

@@ -137,10 +137,10 @@ fn is_before(version: &str, edge: (&str, bool)) -> bool {
 /// fallback-candidate scan of `available` cannot tell "excluded by a gap" apart from
 /// "legitimately above the requirement's ceiling" without asking the matcher directly (#1571).
 ///
-/// M1 (review, tracked for a separate follow-up issue): `parse_interval` never validates
-/// `min <= max`, so a degenerate member (`(3.0,3.0)`, `[5.0,3.0]`) can reach here — this fails
-/// closed (a spurious `true` only ever makes an offerable fallback edit get rejected, never
-/// makes a bad one get approved), so it is left unguarded for this fix.
+/// A degenerate union member (`(3.0,3.0)`, `[5.0,3.0]`) parses to
+/// [`deps_core::interval::VersionRange::Empty`] (#1595), not a real `Bounded` shape, so
+/// [`upper_edge`]/[`lower_edge`]'s wildcard arm gives it no edge — it cannot contribute a
+/// fabricated gap the way an unvalidated degenerate range used to.
 pub(crate) fn explicitly_excludes(version: &str, ranges: &[VersionRange]) -> bool {
     if satisfies_ranges(version, ranges) {
         return false;
@@ -252,6 +252,30 @@ mod tests {
             assert!(satisfies(v, req), "{v} should be covered by the overlap");
             assert!(!excludes(v, req));
         }
+    }
+
+    /// #1595's exact repro: a degenerate union member (`(3.0,3.0)`, a zero-width open range)
+    /// must not fabricate a gap edge above the real ceiling of the valid `[1.0,2.0)` member —
+    /// `2.5` is simply above that ceiling, not explicitly excluded.
+    #[test]
+    fn test_explicitly_excludes_ignores_degenerate_member() {
+        let req = "[1.0,2.0),(3.0,3.0)";
+        assert!(!excludes("2.5", req));
+        assert!(!satisfies("2.5", req));
+        assert!(!excludes("3.0", req));
+    }
+
+    /// An `Empty` member contributing no edge must not swallow a real gap between two other,
+    /// well-formed members: with `(3.0,3.0)` sitting between `[1.0,2.0)` and `[4.0,5.0)`, both
+    /// `2.5` (past the first member's ceiling) and `3.5` (before the third member's floor)
+    /// still fall in the genuine gap between those two real members and stay excluded.
+    #[test]
+    fn test_explicitly_excludes_still_detects_real_gap_with_degenerate_member_present() {
+        let req = "[1.0,2.0),(3.0,3.0),[4.0,5.0)";
+        assert!(excludes("2.5", req));
+        assert!(excludes("3.5", req));
+        assert!(!satisfies("2.5", req));
+        assert!(!satisfies("3.5", req));
     }
 
     /// An exact-point member (`[1.0]`) has both edges at the same version, so it can be one
