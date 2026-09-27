@@ -408,6 +408,23 @@ fn classify_vulnerable_dependency(
         // reasons". Only a confirmed exclusion is a real gap; anything else falls back to the
         // legacy "assume already fixed" reading, preserving pre-#1566 behavior.
         Err(VulnFixSkip::NoOpRewrite) => {
+            // #1578 S1: an oversized requirement is a size-based fail-closed guard, never a
+            // confirmed exclusion — `compile_requirement` (the CWE-400 resource-exhaustion
+            // vector deps-core's own #1472 gate bounds, e.g. `requirement_status`,
+            // `best_candidate_for_requirement`) is never called for it, so it must not be
+            // folded into the same boolean/reason as an actually-confirmed `Some(false)`
+            // matcher verdict below; kept as its own branch reporting
+            // `UnfixableReason::OversizedRequirement` rather than
+            // `UnsupportedRequirementShape`, whose doc/message both assert confirmation.
+            if deps_core::lsp_helpers::requirement_is_oversized(version_req) {
+                return unfixable_item(
+                    dep,
+                    &current,
+                    UnfixableReason::OversizedRequirement,
+                    ignore_rule_overridden,
+                );
+            }
+
             let fix_concrete = deps_core::ConcreteVersion::new(version_native.as_str());
             let confirmed_excluded = formatter
                 .compile_requirement(version_req)
@@ -525,8 +542,8 @@ mod tests {
     use crate::config::IgnoreRule;
     use deps_core::licenses::LicensePolicy;
     use deps_core::lsp_helpers::{
-        DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-        RequirementMatcher, RequirementResolution, SourcePolicy,
+        DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming, PackageNaming,
+        PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
     };
     use deps_core::osv::{Advisory, Capped, OsvVersion, UpgradeStatus, VulnSeverity};
     use deps_core::parser::DependencySource;
@@ -757,6 +774,41 @@ mod tests {
     impl DiagnosticPolicy for IndeterminateFormatter {}
     impl SourcePolicy for IndeterminateFormatter {}
     impl OsvNaming for IndeterminateFormatter {}
+
+    /// Issue #1578: echoes `current` back unchanged (so `plan_verified_fix` reaches
+    /// `NoOpRewrite`) but panics if `compile_requirement` is ever called — proves the
+    /// oversized-requirement gate in `classify_vulnerable_dependency`'s `NoOpRewrite` arm
+    /// short-circuits before reaching it, rather than merely happening to also produce the
+    /// right outcome.
+    struct PanicsIfCompiledFormatter;
+    impl PackageNaming for PanicsIfCompiledFormatter {}
+    impl PackageRendering for PanicsIfCompiledFormatter {
+        fn format_version_for_text_edit(&self, v: &deps_core::ConcreteVersion) -> String {
+            v.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+        fn format_version_replacing(
+            &self,
+            _version: &deps_core::ConcreteVersion,
+            current: &str,
+        ) -> String {
+            current.to_string()
+        }
+    }
+    impl RequirementResolution for PanicsIfCompiledFormatter {
+        fn compile_requirement(
+            &self,
+            _requirement: &VersionReq,
+        ) -> Option<Box<dyn RequirementMatcher>> {
+            panic!("compile_requirement must not be called for an oversized requirement (#1578)");
+        }
+    }
+    impl DiagnosticMessages for PanicsIfCompiledFormatter {}
+    impl DiagnosticPolicy for PanicsIfCompiledFormatter {}
+    impl SourcePolicy for PanicsIfCompiledFormatter {}
+    impl OsvNaming for PanicsIfCompiledFormatter {}
 
     /// A formatter with no `compile_requirement` override (like GitHub Actions/GitLab CI) —
     /// `plan_vulnerability_fix`'s own textual no-op guard is the only available signal.
@@ -1500,5 +1552,108 @@ mod tests {
         // is a caret range (not a pin), so `resolve_in_use_version` returns `None` and this
         // falls back to the declared requirement text.
         assert_eq!(item.current, "0.9");
+    }
+
+    /// Issue #1578 gap 1: the mock-only `NoOpRewrite`/`UnsupportedRequirementShape` regression
+    /// (`test_classify_unsupported_requirement_shape_is_unfixable_not_requires_lockfile_update`)
+    /// proves the *decision logic*, but not that Cargo's real `semver`-backed matcher actually
+    /// returns `Some(false)` (not `None`/`Some(true)`) for this exact compound-requirement/fix
+    /// pair. This exercises the real `deps_engine::setup::CargoFormatter` (Cargo's own
+    /// `deps_cargo::CargoFormatter`, reached through deps-engine's ecosystem registry rather
+    /// than linking deps-cargo directly) end to end: its own
+    /// `format_version_replacing` echoes a compound requirement back unchanged (reaching
+    /// `NoOpRewrite`), and its `compile_requirement` (real `semver::VersionReq`) must confirm
+    /// `1.5.2` is excluded by `">=1.2, <1.5"`.
+    #[test]
+    fn test_classify_real_cargo_formatter_compound_requirement_confirms_exclusion() {
+        let dep = dep("foo", ">=1.2, <1.5");
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &deps_engine::setup::CargoFormatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape)
+            ),
+            "real Cargo semver matcher must confirm 1.5.2 is excluded by \">=1.2, <1.5\", got {:?}",
+            item.outcome
+        );
+    }
+
+    /// Issue #1578 gap 2: an oversized requirement must be rejected as `Unfixable` before ever
+    /// reaching `compile_requirement` — `PanicsIfCompiledFormatter` panics if that call is
+    /// made, so this fails loudly (not just with the wrong outcome) if the gate is removed or
+    /// reordered after the `compile_requirement` call.
+    #[test]
+    fn test_classify_oversized_requirement_never_reaches_compile_requirement() {
+        let oversized_req = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+        let dep = dep("foo", &oversized_req);
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &PanicsIfCompiledFormatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        // #1578 S1: `OversizedRequirement`, not `UnsupportedRequirementShape` — the matcher
+        // (which would have panicked) never ran, so this is a size-based fail-closed guard, not
+        // a confirmed exclusion.
+        assert!(
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::OversizedRequirement)
+            ),
+            "got {:?}",
+            item.outcome
+        );
+    }
+
+    /// #1578 M2: exactly at `MAX_REQUIREMENT_LEN` must NOT be treated as oversized
+    /// (`requirement_is_oversized` uses strict `>`) — falls through to the real matcher, which
+    /// confirms the compound requirement excludes the fix (`UnsupportedRequirementShape`, not
+    /// `OversizedRequirement`).
+    #[test]
+    fn test_classify_requirement_at_exact_cap_is_not_oversized() {
+        let head = ">=1.2,";
+        let tail = " <1.5";
+        let padding = " ".repeat(MAX_REQUIREMENT_LEN - head.len() - tail.len());
+        let requirement = format!("{head}{padding}{tail}");
+        assert_eq!(requirement.len(), MAX_REQUIREMENT_LEN);
+
+        let dep = dep("foo", &requirement);
+        let dv = verified_dv("1.5.2");
+        let analysis = test_analysis(cached_with("foo", "1.5.2"), HashSet::new());
+        let item = classify_vulnerable_dependency(
+            &dep,
+            &dv,
+            None,
+            "foo",
+            &analysis,
+            &deps_engine::setup::CargoFormatter,
+            EcosystemId::Cargo,
+            &IgnoreRules::empty(),
+        );
+        assert!(
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape)
+            ),
+            "expected the matcher to run at the exact cap and confirm exclusion, got {:?}",
+            item.outcome
+        );
     }
 }
