@@ -670,6 +670,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                     latest_vuln_keys.as_ref(),
                     &normalized_name,
                     item.version.as_str(),
+                    formatter,
                 )
             } else {
                 candidate_verdict(
@@ -678,6 +679,7 @@ pub async fn generate_code_actions<R: Registry + ?Sized>(
                     latest_vuln_keys.as_ref(),
                     &normalized_name,
                     item.version.as_str(),
+                    formatter,
                 )
             };
             if !matches!(

@@ -310,19 +310,24 @@ fn apply_osv_latest_verdict_to_completions(
     // left every *other* item ungated too, the same fail-open bug class #1524 itself fixes for
     // code actions.
     //
-    // Issue #1524: every item's own candidate version, extracted the same way the pre-#1524
-    // code already did for the "latest" item alone — `insert_text` when present (the actual
-    // text a client would insert), falling back to the label with any "(latest)" suffix
-    // stripped.
+    // Issue #1534: keyed on `label` (with any "(latest)" suffix stripped), never
+    // `insert_text`. `build_version_completion` (deps-core) sets `label` to the real
+    // registry version string unconditionally, but `complete_versions_generic_replacing`
+    // may afterwards rewrite `insert_text` through `PackageRendering::
+    // format_version_for_completion` to match the *typed* presentation style (e.g.
+    // Composer's `v`-prefix preservation, #1435 S3) — a value that no longer matches the
+    // bare registry version OSV's phase B actually keyed its check against, so every
+    // Composer item failed this lookup and rendered as unconditionally `Unverified`.
+    // `label` is never touched by that styling step (see that function's own doc), so it
+    // stays the correct key for every ecosystem, including the common case where
+    // `insert_text` already equals the bare version.
     let versions: Vec<String> = items
         .iter()
         .map(|item| {
-            item.insert_text.clone().unwrap_or_else(|| {
-                item.label
-                    .strip_suffix(" (latest)")
-                    .unwrap_or(&item.label)
-                    .to_string()
-            })
+            item.label
+                .strip_suffix(" (latest)")
+                .unwrap_or(&item.label)
+                .to_string()
         })
         .collect();
     let latest_idx = items
@@ -375,6 +380,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 Some(&vuln_keys),
                                 &normalized_name,
                                 version,
+                                formatter,
                             )
                         } else {
                             deps_core::lsp_helpers::candidate_verdict(
@@ -383,6 +389,7 @@ fn apply_osv_latest_verdict_to_completions(
                                 Some(&vuln_keys),
                                 &normalized_name,
                                 version,
+                                formatter,
                             )
                         }
                     })
@@ -1692,6 +1699,85 @@ mod tests {
             "the non-latest candidate must be demoted via candidate_verdict too: {:?}",
             items[1].tags
         );
+    }
+
+    /// Issue #1534: Composer's `PackageRendering::format_version_for_completion` (#1435 S3)
+    /// may rewrite `insert_text` to preserve a typed `v`-prefix style (e.g. `"v1.0.0"`), a
+    /// value that never equals the bare registry version (`"1.0.0"`) OSV's phase B actually
+    /// keyed `candidate_status` against. Before this fix, the verdict lookup was keyed on
+    /// `insert_text` first, so every Composer item failed to match and was demoted as
+    /// `Unverified` regardless of its real, independently-verified-clean status. `label` is
+    /// never touched by that styling step (`build_version_completion` sets it to the raw
+    /// registry version unconditionally), so keying on it instead must let this item match
+    /// and stay untouched.
+    #[cfg(feature = "composer")]
+    #[tokio::test]
+    async fn test_apply_osv_latest_verdict_to_completions_matches_composer_v_prefixed_insert_text()
+    {
+        use deps_core::osv::{CandidateStatusMap, UpgradeStatus};
+
+        let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+        let state = Arc::new(ServerState::new());
+        let url = deps_core::test_util::test_uri("/test/composer.json");
+        let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+
+        let content = r#"{"require": {"vendor/package": "^1.0.0"}}"#.to_string();
+        let ecosystem = state
+            .ecosystem_registry
+            .get(deps_core::EcosystemId::Composer)
+            .unwrap();
+        let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+        let dep = &parse_result.dependencies()[0];
+        let position: Position = dep.version_range().unwrap().end.into();
+        let mut doc = DocumentState::new_from_parse_result(
+            EcosystemId::Composer,
+            content.clone(),
+            parse_result,
+        );
+
+        // Phase B verified the bare "1.0.0" as clean — the actual key its check ran against,
+        // independent of whatever `insert_text` styling later does with it.
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            deps_core::test_util::vuln_key("vendor/package"),
+            std::iter::once((
+                "1.0.0".to_string(),
+                UpgradeStatus::CandidateClean {
+                    version: "1.0.0".to_string(),
+                },
+            ))
+            .collect(),
+        );
+        doc.update_candidate_status(candidate_status);
+        state.update_document(uri.clone(), doc);
+
+        // `insert_text` styled with Composer's `v`-prefix — never equal to the bare "1.0.0"
+        // the `candidate_status` map above (and OSV itself) was keyed against.
+        let mut items = vec![CompletionItem {
+            label: "1.0.0".to_string(),
+            insert_text: Some("v1.0.0".to_string()),
+            sort_text: Some("00000".to_string()),
+            preselect: Some(false),
+            ..Default::default()
+        }];
+
+        apply_osv_latest_verdict_to_completions(
+            &state,
+            &uri,
+            position,
+            true,
+            CompletionOrigin::Version,
+            &mut items,
+        );
+
+        assert!(
+            items[0].tags.is_none(),
+            "a v-prefixed insert_text must not prevent the label's bare version from matching \
+             a verified-clean candidate_status entry: {:?}",
+            items[0].tags
+        );
+        assert_eq!(items[0].sort_text.as_deref(), Some("00000"));
+        assert!(items[0].detail.is_none(), "got: {:?}", items[0].detail);
     }
 
     /// Impl-critic S5's second regression case: a default-dispatch ecosystem (Cargo, which

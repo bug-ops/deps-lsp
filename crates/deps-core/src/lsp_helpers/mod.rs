@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::error::DepsError;
 use crate::licenses::LicensePolicy;
 use crate::osv::{
-    CandidateStatusMap, LatestStatusMap, ScanOutcome, UpgradeStatus, VulnKey, VulnSeverity,
-    VulnerabilityMap,
+    CandidateStatusMap, LatestStatusMap, ScanOutcome, SkipReason, UpgradeStatus, VulnKey,
+    VulnSeverity, VulnerabilityMap,
 };
 use crate::position::{Position, Range};
 use crate::{
@@ -1559,10 +1559,11 @@ pub enum LatestVerdict {
 ///     name: PackageName::new("left-pad"),
 ///     name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
 /// };
+/// let formatter = deps_core::test_util::StubFormatter::new();
 ///
 /// // No map attached at all (OSV disabled/offline) — not applicable, today's behavior.
 /// assert_eq!(
-///     latest_verdict(None, &dep, None, "left-pad", "1.0.8"),
+///     latest_verdict(None, &dep, None, "left-pad", "1.0.8", &formatter),
 ///     LatestVerdict::NotApplicable
 /// );
 ///
@@ -1570,7 +1571,7 @@ pub enum LatestVerdict {
 /// // closed, never pass through as safe.
 /// let empty = LatestStatusMap::new();
 /// assert_eq!(
-///     latest_verdict(Some(&empty), &dep, None, "left-pad", "1.0.8"),
+///     latest_verdict(Some(&empty), &dep, None, "left-pad", "1.0.8", &formatter),
 ///     LatestVerdict::Unverified
 /// );
 /// ```
@@ -1581,6 +1582,7 @@ pub fn latest_verdict(
     keys: Option<&crate::osv::VulnKeys>,
     normalized_name: &str,
     displayed_latest: &str,
+    formatter: &dyn EcosystemFormatter,
 ) -> LatestVerdict {
     let Some(map) = latest_status else {
         return LatestVerdict::NotApplicable;
@@ -1588,22 +1590,40 @@ pub fn latest_verdict(
     upgrade_status_to_verdict(
         resolve_latest_status(map, dep, keys, normalized_name),
         displayed_latest,
+        dep,
+        formatter,
     )
 }
 
 /// Shared `UpgradeStatus -> LatestVerdict` mapping behind both [`latest_verdict`] and
 /// [`candidate_verdict`] (#1524) — factored out so the two never drift on what "clean" vs.
 /// "vulnerable" vs. "unverified"/"not applicable" means for a checked candidate.
-// TODO(critic): structural OSV verdict ignores version and survives a source change until
-// next phase B
+///
+/// A [`SkipReason::NonRegistrySource`] structural entry is cached under `dep`'s plain
+/// [`crate::osv::VulnKey`] (name, not source), so it survives untouched if `dep`'s source later
+/// changes from e.g. path/git to registry — until the next phase B run overwrites it. Since that
+/// window would otherwise read as the fail-open [`LatestVerdict::NotApplicable`] for a dependency
+/// that is now registry-resolvable and simply hasn't been checked yet, this re-checks `dep`'s
+/// *current* source before trusting a cached `NonRegistrySource` skip (issue #1531). The check
+/// goes through `formatter.source_is_public_registry_content` — the same predicate phase B itself
+/// uses to classify `NonRegistrySource` in the first place (`deps-engine`'s `classify::osv`) —
+/// rather than a bare `DependencySource::Registry` match, so an ecosystem that widens what counts
+/// as registry content (e.g. `deps-cargo`'s `AlternateRegistry { mirrors_crates_io: true }` for a
+/// configured crates.io mirror) is not itself misread as still-non-registry and wrongly kept
+/// stale. A mismatch means the entry is stale, so it fails closed to
+/// [`LatestVerdict::Unverified`] instead.
 fn upgrade_status_to_verdict(
     status: Option<&UpgradeStatus>,
     expected_version: &str,
+    dep: &dyn Dependency,
+    formatter: &dyn EcosystemFormatter,
 ) -> LatestVerdict {
     match status {
         None | Some(UpgradeStatus::NotChecked) => LatestVerdict::Unverified,
         Some(UpgradeStatus::CandidateUnverified { reason, .. }) => {
-            if reason.is_structural() {
+            let stale_non_registry_skip = *reason == SkipReason::NonRegistrySource
+                && formatter.source_is_public_registry_content(&dep.source());
+            if reason.is_structural() && !stale_non_registry_skip {
                 LatestVerdict::NotApplicable
             } else {
                 LatestVerdict::Unverified
@@ -1759,10 +1779,11 @@ pub fn resolve_candidate_status<'a>(
 ///     name: PackageName::new("left-pad"),
 ///     name_range: Range::new(Position::new(0, 0), Position::new(0, 8)).into(),
 /// };
+/// let formatter = deps_core::test_util::StubFormatter::new();
 ///
 /// // No map attached at all (OSV disabled/offline) — not applicable, mirrors `latest_verdict`.
 /// assert_eq!(
-///     candidate_verdict(None, &dep, None, "left-pad", "1.0.6"),
+///     candidate_verdict(None, &dep, None, "left-pad", "1.0.6", &formatter),
 ///     LatestVerdict::NotApplicable
 /// );
 ///
@@ -1771,7 +1792,7 @@ pub fn resolve_candidate_status<'a>(
 /// let mut candidate_status = CandidateStatusMap::new();
 /// candidate_status.insert(deps_core::test_util::vuln_key("left-pad"), std::collections::HashMap::new());
 /// assert_eq!(
-///     candidate_verdict(Some(&candidate_status), &dep, None, "left-pad", "1.0.6"),
+///     candidate_verdict(Some(&candidate_status), &dep, None, "left-pad", "1.0.6", &formatter),
 ///     LatestVerdict::Unverified
 /// );
 /// ```
@@ -1782,6 +1803,7 @@ pub fn candidate_verdict(
     keys: Option<&crate::osv::VulnKeys>,
     normalized_name: &str,
     version: &str,
+    formatter: &dyn EcosystemFormatter,
 ) -> LatestVerdict {
     let Some(map) = candidate_status else {
         return LatestVerdict::NotApplicable;
@@ -1790,7 +1812,7 @@ pub fn candidate_verdict(
         return LatestVerdict::Unverified;
     };
     let status = per_version.get(version).or_else(|| per_version.get(""));
-    upgrade_status_to_verdict(status, version)
+    upgrade_status_to_verdict(status, version, dep, formatter)
 }
 
 /// Converts byte offsets in source text to LSP `Position` values.
@@ -3387,7 +3409,7 @@ pub fn dependency_version_range_is_literal(
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
-    use crate::{PackageName, VersionReq};
+    use crate::{DependencySource, PackageName, VersionReq};
 
     // --- gossip_cooldown_for (issue #1456, spec 072 FR-008/FR-011, S2 tri-state) ---
 
@@ -5089,6 +5111,230 @@ mod tests {
         assert_eq!(
             formatter.package_url(&pkg("requests")),
             "https://pypi.org/project/requests"
+        );
+    }
+
+    // --- upgrade_status_to_verdict structural staleness (issue #1531) ---
+
+    /// A [`Dependency`] whose `source()` is configurable, for exercising the
+    /// `NonRegistrySource` structural-skip staleness gate — [`MockDep`] always reports
+    /// [`DependencySource::Registry`], which can't represent "started non-registry, source
+    /// changed to registry".
+    struct DepWithSource {
+        name: PackageName,
+        name_range: crate::position::Range,
+        source: DependencySource,
+    }
+
+    impl Dependency for DepWithSource {
+        fn name(&self) -> &PackageName {
+            &self.name
+        }
+        fn name_range(&self) -> crate::position::Range {
+            self.name_range
+        }
+        fn version_requirement(&self) -> Option<&VersionReq> {
+            None
+        }
+        fn version_range(&self) -> Option<crate::position::Range> {
+            None
+        }
+        fn source(&self) -> DependencySource {
+            self.source.clone()
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn structural_skip_entry() -> UpgradeStatus {
+        UpgradeStatus::CandidateUnverified {
+            version: "1.0.0".to_string(),
+            reason: SkipReason::NonRegistrySource,
+        }
+    }
+
+    /// Mirrors `deps-cargo`'s `CargoFormatter::source_is_public_registry_content` override
+    /// (impl-critic S1, #1531): a verified crates.io mirror (`AlternateRegistry {
+    /// mirrors_crates_io: true, .. }`, reached via a `[source.crates-io] replace-with` chain)
+    /// counts as public-registry content alongside plain `Registry`. A local double rather than
+    /// depending on `deps-cargo` from `deps-core` (wrong dependency direction).
+    struct MockMirrorFormatter;
+    impl PackageNaming for MockMirrorFormatter {}
+    impl PackageRendering for MockMirrorFormatter {
+        fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+            version.to_string()
+        }
+        fn package_url(&self, name: &PackageName) -> String {
+            name.as_str().to_string()
+        }
+    }
+    impl RequirementResolution for MockMirrorFormatter {}
+    impl DiagnosticMessages for MockMirrorFormatter {}
+    impl DiagnosticPolicy for MockMirrorFormatter {}
+    impl SourcePolicy for MockMirrorFormatter {
+        fn source_is_public_registry_content(&self, source: &DependencySource) -> bool {
+            matches!(
+                source,
+                DependencySource::Registry
+                    | DependencySource::AlternateRegistry {
+                        mirrors_crates_io: true,
+                        ..
+                    }
+            )
+        }
+    }
+    impl OsvNaming for MockMirrorFormatter {}
+
+    /// #1531 regression: a dependency whose source is *still* non-registry keeps the existing
+    /// structural-fallback behavior — the cached `NonRegistrySource` skip is not stale, so it
+    /// resolves to `NotApplicable` for both the "latest" and per-candidate verdicts.
+    #[test]
+    fn structural_skip_same_source_stays_not_applicable() {
+        let dep = DepWithSource {
+            name: pkg("vendored-lib"),
+            name_range: crate::position::Range::default(),
+            source: DependencySource::Path {
+                path: "../vendored-lib".to_string(),
+            },
+        };
+        let formatter = crate::test_util::StubFormatter::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("vendored-lib"),
+            structural_skip_entry(),
+        );
+        assert_eq!(
+            latest_verdict(
+                Some(&latest_status),
+                &dep,
+                None,
+                "vendored-lib",
+                "1.0.0",
+                &formatter
+            ),
+            LatestVerdict::NotApplicable
+        );
+
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            crate::test_util::vuln_key("vendored-lib"),
+            std::iter::once((String::new(), structural_skip_entry())).collect(),
+        );
+        assert_eq!(
+            candidate_verdict(
+                Some(&candidate_status),
+                &dep,
+                None,
+                "vendored-lib",
+                "1.0.0",
+                &formatter
+            ),
+            LatestVerdict::NotApplicable
+        );
+    }
+
+    /// #1531: a dependency that *started* with a non-registry source (git/path) picks up a
+    /// `CandidateUnverified{NonRegistrySource}` structural entry under its plain name key. If
+    /// the manifest is then edited so the same dependency now resolves to a registry source,
+    /// that cached entry is stale until the next phase B run overwrites it — the verdict must
+    /// fail closed to `Unverified` for the new registry version, never silently pass through
+    /// as `NotApplicable` ("safe to offer").
+    #[test]
+    fn structural_skip_source_changed_to_registry_is_not_stale_safe() {
+        let dep = DepWithSource {
+            name: pkg("vendored-lib"),
+            name_range: crate::position::Range::default(),
+            source: DependencySource::Registry,
+        };
+        let formatter = crate::test_util::StubFormatter::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("vendored-lib"),
+            structural_skip_entry(),
+        );
+        assert_eq!(
+            latest_verdict(
+                Some(&latest_status),
+                &dep,
+                None,
+                "vendored-lib",
+                "2.0.0",
+                &formatter
+            ),
+            LatestVerdict::Unverified
+        );
+
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            crate::test_util::vuln_key("vendored-lib"),
+            std::iter::once((String::new(), structural_skip_entry())).collect(),
+        );
+        assert_eq!(
+            candidate_verdict(
+                Some(&candidate_status),
+                &dep,
+                None,
+                "vendored-lib",
+                "2.0.0",
+                &formatter
+            ),
+            LatestVerdict::Unverified
+        );
+    }
+
+    /// #1531 impl-critic S1: phase B classifies `NonRegistrySource` via
+    /// `formatter.source_is_public_registry_content`, not a bare `DependencySource::Registry`
+    /// match — an ecosystem like `deps-cargo` widens that predicate to also accept a verified
+    /// crates.io mirror (`AlternateRegistry { mirrors_crates_io: true, .. }`). A path dependency
+    /// edited to such a mirrored registry dependency must be recognized as a source change too,
+    /// not stay wrongly `NotApplicable` just because it isn't the literal `Registry` variant.
+    #[test]
+    fn structural_skip_source_changed_to_mirrored_alternate_registry_is_not_stale_safe() {
+        let dep = DepWithSource {
+            name: pkg("vendored-lib"),
+            name_range: crate::position::Range::default(),
+            source: DependencySource::AlternateRegistry {
+                index: "https://crates-mirror.example.com/index".to_string(),
+                mirrors_crates_io: true,
+            },
+        };
+        let formatter = MockMirrorFormatter;
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("vendored-lib"),
+            structural_skip_entry(),
+        );
+        assert_eq!(
+            latest_verdict(
+                Some(&latest_status),
+                &dep,
+                None,
+                "vendored-lib",
+                "2.0.0",
+                &formatter
+            ),
+            LatestVerdict::Unverified
+        );
+
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            crate::test_util::vuln_key("vendored-lib"),
+            std::iter::once((String::new(), structural_skip_entry())).collect(),
+        );
+        assert_eq!(
+            candidate_verdict(
+                Some(&candidate_status),
+                &dep,
+                None,
+                "vendored-lib",
+                "2.0.0",
+                &formatter
+            ),
+            LatestVerdict::Unverified
         );
     }
 }

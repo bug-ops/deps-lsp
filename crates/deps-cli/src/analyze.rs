@@ -263,6 +263,7 @@ impl ManifestAnalysis {
                     Some(&vuln_keys),
                     &normalized_name,
                     latest.as_str(),
+                    formatter,
                 ),
                 LatestVerdict::Unverified
             )

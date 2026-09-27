@@ -760,6 +760,7 @@ pub fn collect_update_candidates(
             vuln_keys.as_ref(),
             &normalized_name,
             latest.as_str(),
+            formatter,
         ) {
             crate::lsp_helpers::LatestVerdict::Verified
             | crate::lsp_helpers::LatestVerdict::NotApplicable => {}
