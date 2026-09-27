@@ -246,6 +246,68 @@ jobs:
         # that leg's failures in the Actions UI.
         run: ${{ matrix.run }}
 
+  ecosystem-crate-test:
+    name: Ecosystem Crate Test (${{ matrix.name }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true' || needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Issue #1549: `feature-matrix-test`'s `ecosystems-*` legs above always run through
+        # `deps-lsp`, which requests `lsp-responses` on deps-core (and transitively on every
+        # enabled ecosystem crate) unconditionally in its own Cargo.toml — so no CI job ever
+        # nextest-runs an ecosystem crate directly, scoped to itself, with its own default
+        # (lsp-responses off) feature set. That's exactly the gap that let #1545 ship: a
+        # `#[cfg(feature = "lsp-responses")]`-gated override in `deps-composer` silently fell
+        # back to the wrong default, invisible because deps-composer was never tested outside
+        # deps-lsp's feature-forwarding. Each leg below runs `cargo hack nextest run -p
+        # deps-<ecosystem> --each-feature` directly against the crate (default features,
+        # lsp-responses, and any crate-local fuzzing/test-util feature each as their own
+        # slice), so the same bug class in any of the other 13 ecosystem crates fails CI.
+        # Split by crate, mirroring the `ecosystems-1/2/3` sharding above, so 3 parallel
+        # shards of 4-5 small independent crates finish in the time of the slowest single
+        # crate rather than the sum of all 14 — a future 15th ecosystem crate should be added
+        # to the shortest list below.
+        include:
+          - name: ecosystem-crates-1
+            run: |
+              cargo hack nextest run -p deps-bundler --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-cargo --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-composer --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-dart --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-deno --each-feature --keep-going --profile ci --no-fail-fast
+          - name: ecosystem-crates-2
+            run: |
+              cargo hack nextest run -p deps-github-actions --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-gitlab-ci --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-go --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-gradle --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-maven --each-feature --keep-going --profile ci --no-fail-fast
+          - name: ecosystem-crates-3
+            run: |
+              cargo hack nextest run -p deps-npm --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-nuget --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-pypi --each-feature --keep-going --profile ci --no-fail-fast
+              cargo hack nextest run -p deps-swift --each-feature --keep-going --profile ci --no-fail-fast
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: moonrepo/setup-rust@abb2d32350334249b178c401e5ec5836e0cd88d3  # v1
+        with:
+          cache-extra-identifier: ecosystem-crate-test-${{ matrix.name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install cargo-hack and cargo-nextest
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2.87.20
+        with:
+          tool: cargo-hack, cargo-nextest
+
+      - name: Run tests for this shard
+        run: ${{ matrix.run }}
+
   doc-and-hygiene:
     name: Doc + Hygiene
     needs: changes
@@ -1350,6 +1412,7 @@ jobs:
         fuzz-check,
         feature-matrix,
         feature-matrix-test,
+        ecosystem-crate-test,
         doc-and-hygiene,
         security,
         test,
@@ -1387,6 +1450,7 @@ jobs:
           check_job "${{ needs.fuzz-check.result }}" "fuzz-check" || failed=1
           check_job "${{ needs.feature-matrix.result }}" "feature-matrix" || failed=1
           check_job "${{ needs.feature-matrix-test.result }}" "feature-matrix-test" || failed=1
+          check_job "${{ needs.ecosystem-crate-test.result }}" "ecosystem-crate-test" || failed=1
           check_job "${{ needs.doc-and-hygiene.result }}" "doc-and-hygiene" || failed=1
           check_job "${{ needs.security.result }}" "security" || failed=1
           check_job "${{ needs.test.result }}" "test" || failed=1

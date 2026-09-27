@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **ci**: new `ecosystem-crate-test` job runs each of the 14 ecosystem crates' own test suite scoped to itself with default (non-`lsp-responses`) features, closing a CI blind spot that let a mis-gated trait override ship silently (resolves #1549) (#1552)
 - **deps-core**: new shared `secret::ApiToken`/`secret::token_from_env` and `rate_limit::DEFAULT_COOLDOWN_SECS`, replacing GitHub Actions' and GitLab CI's independently duplicated auth-token and rate-limit-cooldown code (part of #1480) (#1510)
 - **deps-core, deps-lsp**: new opt-in deps.dev GOSSIP signals (`gossip.enabled`, disabled by default) source hover's/diagnostics' outdated-cooldown callout from deps.dev's authoritative Dynamic Cooldown data (falling back to the existing local heuristic when unavailable), add a live hover low-usage/slopsquatting-risk callout for the pinned version, and give completion a new default-on local per-candidate cooldown badge, across the seven deps.dev-covered ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) (resolves #1456) (#1473)
 - **deps-core, deps-lsp**: new opt-in typosquat-similarity diagnostic (`typosquat.enabled`, disabled by default) flags a declared direct dependency whose name deps.dev's `GetSimilarlyNamedPackages`/`GetDependents` endpoints report as asymmetrically similar to a much more popular package, across the seven deps.dev-covered ecosystems (Cargo, npm, PyPI, Go, Bundler, Maven, NuGet) (resolves #1437) (#1451)
