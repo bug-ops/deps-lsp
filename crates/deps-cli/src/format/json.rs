@@ -148,8 +148,8 @@ pub struct UpdateItemDocument {
     /// The current (resolved in-use, or declared) version.
     pub current: String,
     /// The version this item's edit would move the dependency to, when applicable — empty
-    /// when the item has no concrete target ([`crate::update::PlannedUpdateItem::target`] is
-    /// `None`).
+    /// when the item has no concrete target ([`crate::update::PlannedUpdateItem::target`]
+    /// returns `None`).
     pub target: String,
     /// One of `applied` / `skipped` / `requires-lockfile-update` / `unfixable`.
     pub outcome: String,
@@ -208,7 +208,7 @@ pub fn update_to_document(
         .map(|item| UpdateItemDocument {
             name: crate::sanitize::sanitize_message_for_display(&item.name),
             current: crate::sanitize::sanitize_message_for_display(&item.current.render_text()),
-            target: item.target.as_ref().map_or_else(String::new, |v| {
+            target: item.target().map_or_else(String::new, |v| {
                 crate::sanitize::sanitize_message_for_display(v.as_str())
             }),
             outcome: item.outcome.wire_token().to_string(),
@@ -340,7 +340,6 @@ mod tests {
             current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
                 "1.0.0",
             )),
-            target: Some(deps_core::ConcreteVersion::from("1.2.0")),
             outcome,
             advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],
             ignore_rule_overridden: false,
@@ -356,13 +355,20 @@ mod tests {
         }
     }
 
+    fn applied_outcome() -> crate::update::Outcome {
+        crate::update::Outcome::Applied {
+            edit: applied_edit(),
+            target: deps_core::ConcreteVersion::from("1.2.0"),
+        }
+    }
+
     /// S5: `update_to_document` on a non-empty plan — every field (including the `dry_run`
     /// marker and advisory ids) must survive into the document, not just the empty-plan
     /// doctest's shape.
     #[test]
     fn test_update_to_document_non_empty_plan_maps_every_field() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
+            items: vec![update_item(applied_outcome())],
         };
         let document = update_to_document(&plan, DryRun::Yes);
         assert_eq!(document.schema_version, UPDATE_SCHEMA_VERSION);
@@ -379,7 +385,7 @@ mod tests {
     #[test]
     fn test_render_update_non_empty_plan_round_trips_through_serde_json() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
+            items: vec![update_item(applied_outcome())],
         };
         let rendered = render_update(&plan, DryRun::No).expect("render must succeed");
         let parsed: UpdateReportDocument =
@@ -391,10 +397,10 @@ mod tests {
     /// pre-#1605 `String`-with-`""`-sentinel convention — no `UPDATE_SCHEMA_VERSION` bump.
     #[test]
     fn test_update_to_document_none_target_renders_empty_string() {
-        let mut item = update_item(crate::update::Outcome::Skipped(
-            crate::update::SkipReason::NotRequested,
-        ));
-        item.target = None;
+        let item = update_item(crate::update::Outcome::Skipped {
+            reason: crate::update::SkipReason::NotRequested,
+            target: None,
+        });
         let plan = crate::update::UpdatePlan { items: vec![item] };
         let document = update_to_document(&plan, DryRun::No);
         assert_eq!(document.items[0].target, "");
@@ -404,17 +410,16 @@ mod tests {
     /// registry text (`ConcreteVersion` is deliberately unchecked) and must both be sanitized.
     #[test]
     fn test_update_to_document_strips_ansi_from_target_and_reason() {
-        let mut item = update_item(crate::update::Outcome::Skipped(
-            crate::update::SkipReason::NotSafelyEditable(
+        let mut item = update_item(crate::update::Outcome::Skipped {
+            reason: crate::update::SkipReason::NotSafelyEditable(
                 deps_core::edit::UnplannableReason::LatestFlaggedByOsv,
             ),
-        ));
-        item.target = Some(deps_core::ConcreteVersion::from("1.2.0\x1B[31m"));
+            target: Some(deps_core::ConcreteVersion::from("1.2.0\x1B[31m")),
+        });
         item.cooldown_fallback = Some(crate::update::CooldownFallbackNote::Blocked {
             version: deps_core::ConcreteVersion::from("1.1.0\x1B[31m"),
         });
-        let mut applied_instead_of_item =
-            update_item(crate::update::Outcome::Applied(applied_edit()));
+        let mut applied_instead_of_item = update_item(applied_outcome());
         applied_instead_of_item.cooldown_fallback =
             Some(crate::update::CooldownFallbackNote::AppliedInsteadOf(
                 deps_core::ConcreteVersion::from("1.3.0\x1B[31m"),

@@ -130,7 +130,7 @@ impl UpdatePlan {
         self.items
             .iter()
             .filter_map(|item| match &item.outcome {
-                Outcome::Applied(edit) => Some(edit.clone()),
+                Outcome::Applied { edit, .. } => Some(edit.clone()),
                 _ => None,
             })
             .collect()
@@ -146,15 +146,10 @@ pub struct PlannedUpdateItem {
     /// no concrete in-use version could be resolved, or [`CurrentVersion::Unknown`] when
     /// neither is available.
     pub current: CurrentVersion,
-    /// The version this item's edit (when [`Self::outcome`] is [`Outcome::Applied`]) would
-    /// move the dependency to — the target considered, even when no edit was written.
-    /// `None` when no concrete target exists (an unplannable latest, an ignore-rule skip of
-    /// an OSV-blocked fallback, or — under `--security-only` — an unfixable/not-requested
-    /// item, #1605).
-    pub target: Option<ConcreteVersion>,
-    /// This item's disposition — the edit that would apply [`Self::target`] lives inside
-    /// [`Outcome::Applied`] itself (#1349: folding it in here as a second, independently
-    /// settable field made `Applied` with no edit a representable-but-invalid state).
+    /// This item's disposition — the target version considered (even when no edit was
+    /// written) lives inside [`Self::outcome`]'s own variant (#1615: folding it into `Outcome`
+    /// makes a target only representable where the variant actually carries one, rather than
+    /// as a second, independently settable item-level field). Read it via [`Self::target`].
     pub outcome: Outcome,
     /// OSV advisory ids this item resolves. Populated in `--security-only` mode, and also in
     /// default mode for a cooldown-fallback decision that names a `Flagged` `latest`/fallback
@@ -163,7 +158,7 @@ pub struct PlannedUpdateItem {
     pub advisory_ids: Vec<String>,
     /// Whether a matching `[update].ignore` rule exists but was overridden (FR-008,
     /// `--security-only` mode only — the rule never applies in default mode, since a match
-    /// there is reported via <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code>
+    /// there is reported via [`Outcome::Skipped`] with reason [`SkipReason::IgnoreRule`]
     /// instead).
     pub ignore_rule_overridden: bool,
     /// A newer version excluded from this item's [`Self::target`] by an active GOSSIP cooldown
@@ -198,41 +193,58 @@ pub enum CooldownFallbackNote {
 
 /// A dependency's disposition within an [`UpdatePlan`].
 ///
-/// # The invalid state this makes unrepresentable (#1349)
+/// # The invalid state this makes unrepresentable (#1349, #1615)
 ///
 /// Before this type carried [`ManifestEdit`] directly, [`PlannedUpdateItem`] stored `outcome`
 /// and `edit: Option<ManifestEdit>` as two independent fields the caller had to keep in sync by
-/// convention. Nothing stopped `PlannedUpdateItem { outcome: Outcome::Applied, edit: None, .. }`
-/// — empirically, that combination made `apply_plan` report success (`Ok(())`) without writing
-/// anything. `edit` no longer exists as a separate field, so that state fails to compile:
+/// convention (#1349) — that combination made `apply_plan` report success (`Ok(())`) without
+/// writing anything. `edit` was folded into [`Self::Applied`] to close that gap, but the
+/// dependency's target version stayed a second, independently settable field on
+/// [`PlannedUpdateItem`] itself, which reopened the same class of bug: an `Applied` item with no
+/// target. #1615 folds the target into each variant that actually carries one instead, so
+/// [`Self::Applied`] with no target fails to compile:
 ///
 /// ```compile_fail
-/// use deps_cli::update::{CurrentVersion, Outcome, PlannedUpdateItem};
+/// use deps_cli::update::Outcome;
+/// use deps_core::edit::ManifestEdit;
+/// use deps_core::position::{Position, Range};
 ///
-/// let item = PlannedUpdateItem {
-///     name: "serde".to_string(),
-///     current: CurrentVersion::Unknown,
-///     target: None,
-///     outcome: Outcome::Applied,
-///     edit: None,
-///     advisory_ids: Vec::new(),
-///     ignore_rule_overridden: false,
+/// let outcome = Outcome::Applied {
+///     edit: ManifestEdit {
+///         range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+///         new_text: "1.2.0".to_string(),
+///     },
 /// };
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// A fix plan existed and its edit was written (or would be, under `--dry-run`).
-    /// Contributes to exit 0. Carries the edit itself — #1349: this makes "applied, but no
-    /// edit to write" unrepresentable, where a separate `PlannedUpdateItem::edit: Option<_>`
-    /// field previously let the two drift out of sync (`apply_plan` would report success
-    /// without writing anything).
-    Applied(ManifestEdit),
+    /// Contributes to exit 0. Carries the edit and its target version — #1349/#1615: this
+    /// makes "applied, but no edit/target to write" unrepresentable, where separate
+    /// `PlannedUpdateItem` fields previously let them drift out of sync (`apply_plan` would
+    /// report success without writing anything).
+    Applied {
+        /// The edit [`apply_plan`] writes.
+        edit: ManifestEdit,
+        /// The version this edit moves the dependency to.
+        target: ConcreteVersion,
+    },
     /// Excluded from this run, for [`SkipReason`].
-    Skipped(SkipReason),
+    Skipped {
+        /// Why this candidate was skipped.
+        reason: SkipReason,
+        /// The target version considered for this occurrence, when one was known — `None` when
+        /// no concrete target exists (an unplannable latest, an ignore-rule skip of an
+        /// OSV-blocked fallback, or — under `--security-only` — a not-requested item).
+        target: Option<ConcreteVersion>,
+    },
     /// (`--security-only` only) The dependency is `Vulnerable`, but its declared requirement
     /// already admits the fix target, so no requirement-level edit exists — needs #1116.
     /// Contributes to exit 1.
-    RequiresLockfileUpdate,
+    RequiresLockfileUpdate {
+        /// The already-admitted fix target.
+        target: ConcreteVersion,
+    },
     /// (`--security-only` only) No verified fix could be written, for [`UnfixableReason`].
     /// Contributes to exit 1.
     Unfixable(UnfixableReason),
@@ -272,7 +284,11 @@ pub enum SkipReason {
 }
 
 /// Why a `--security-only` candidate could not be fixed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The three variants that reject a specific, known fix target (#1614) carry it inline, so
+/// `--security-only` output can report the rejected version instead of nothing; the two that
+/// mean no fix target was ever established carry none.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnfixableReason {
     /// No independently-verified fix target exists: no advisory has a claimable fix, the fix
     /// target failed the safety gate, or `deps_core::edit`'s internal fix-target verification
@@ -283,7 +299,10 @@ pub enum UnfixableReason {
     FetchFailedOrAbsent,
     /// The fix target is present in the registry's yanked list with a status that
     /// [`deps_core::RemovalStatus::blocks_resolution`] (FR-012).
-    Yanked,
+    Yanked {
+        /// The yanked fix target that was rejected.
+        target: ConcreteVersion,
+    },
     /// The declared requirement has a shape the formatter has no single unambiguous rewrite
     /// for (e.g. a compound comma-separated Cargo requirement, #1566) *and* a requirement
     /// matcher exists that has already confirmed the declared requirement does not admit the
@@ -291,7 +310,10 @@ pub enum UnfixableReason {
     /// requirement already admits the fix and nothing needs rewriting at all. Conflating the
     /// two would tell the operator to regenerate the lock file for a dependency that is still
     /// vulnerable (#1566 S1).
-    UnsupportedRequirementShape,
+    UnsupportedRequirementShape {
+        /// The confirmed-excluded fix target.
+        target: ConcreteVersion,
+    },
     /// The declared requirement's raw text exceeds `deps_core::lsp_helpers::MAX_REQUIREMENT_LEN`
     /// (`deps_core::lsp_helpers::requirement_is_oversized`, #1472's CWE-400 defense-in-depth
     /// bound) — a size-based fail-closed guard applied *before* a requirement matcher is ever
@@ -302,7 +324,10 @@ pub enum UnfixableReason {
     /// admitted the fix is still reported here rather than as
     /// [`Outcome::RequiresLockfileUpdate`] — conflating the two would let a false "confirmed
     /// excluded" claim reach the operator for a case that was never actually checked.
-    OversizedRequirement,
+    OversizedRequirement {
+        /// The fix target the oversized requirement was never checked against.
+        target: ConcreteVersion,
+    },
 }
 
 impl Outcome {
@@ -313,10 +338,29 @@ impl Outcome {
     #[must_use]
     pub const fn wire_token(&self) -> &'static str {
         match self {
-            Self::Applied(_) => "applied",
-            Self::Skipped(_) => "skipped",
-            Self::RequiresLockfileUpdate => "requires-lockfile-update",
+            Self::Applied { .. } => "applied",
+            Self::Skipped { .. } => "skipped",
+            Self::RequiresLockfileUpdate { .. } => "requires-lockfile-update",
             Self::Unfixable(_) => "unfixable",
+        }
+    }
+
+    /// This outcome's target version, when its variant carries one — the sole read path for a
+    /// dependency's considered/applied target (#1615), used by [`PlannedUpdateItem::target`] and
+    /// every formatter.
+    #[must_use]
+    pub const fn target(&self) -> Option<&ConcreteVersion> {
+        match self {
+            Self::Applied { target, .. } | Self::RequiresLockfileUpdate { target } => Some(target),
+            Self::Skipped { target, .. } => target.as_ref(),
+            Self::Unfixable(
+                UnfixableReason::Yanked { target }
+                | UnfixableReason::UnsupportedRequirementShape { target }
+                | UnfixableReason::OversizedRequirement { target },
+            ) => Some(target),
+            Self::Unfixable(
+                UnfixableReason::NoVerifiedFix | UnfixableReason::FetchFailedOrAbsent,
+            ) => None,
         }
     }
 }
@@ -332,15 +376,9 @@ impl PlannedUpdateItem {
     /// `exit.rs`, this module's own tests, and the doctest above) — this constructor does not
     /// make the type `#[non_exhaustive]` or migrate every existing literal to it.
     #[must_use]
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "one parameter per struct field (mirrors FetchResult::new/CooldownFallback::new's \
-                  identical constructor-over-builder precedent elsewhere in the workspace)"
-    )]
     pub fn new(
         name: String,
         current: CurrentVersion,
-        target: Option<ConcreteVersion>,
         outcome: Outcome,
         advisory_ids: Vec<String>,
         ignore_rule_overridden: bool,
@@ -350,7 +388,6 @@ impl PlannedUpdateItem {
         Self {
             name,
             current,
-            target,
             outcome,
             advisory_ids,
             ignore_rule_overridden,
@@ -359,33 +396,58 @@ impl PlannedUpdateItem {
         }
     }
 
+    /// This item's considered/applied target version — delegates to [`Outcome::target`], the
+    /// sole read path since #1615 folded the target into [`Self::outcome`]'s own variant.
+    #[must_use]
+    pub const fn target(&self) -> Option<&ConcreteVersion> {
+        self.outcome.target()
+    }
+
     /// A one-line human-readable reason for [`Self::outcome`] (FR-021's `reason` field).
     #[must_use]
     pub fn reason(&self) -> String {
         let base = match &self.outcome {
-            Outcome::Applied(_) => "update applied",
-            Outcome::Skipped(SkipReason::IgnoreRule) => "matched an [update].ignore rule",
-            Outcome::Skipped(SkipReason::NotRequested) => "not named by --package",
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::UnsafeLatestVersion,
-            )) => "the registry-reported latest version failed a safety check",
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::NonLiteralSpan,
-            )) => {
+            Outcome::Applied { .. } => "update applied",
+            Outcome::Skipped {
+                reason: SkipReason::IgnoreRule,
+                ..
+            } => "matched an [update].ignore rule",
+            Outcome::Skipped {
+                reason: SkipReason::NotRequested,
+                ..
+            } => "not named by --package",
+            Outcome::Skipped {
+                reason:
+                    SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::UnsafeLatestVersion,
+                    ),
+                ..
+            } => "the registry-reported latest version failed a safety check",
+            Outcome::Skipped {
+                reason:
+                    SkipReason::NotSafelyEditable(deps_core::edit::UnplannableReason::NonLiteralSpan),
+                ..
+            } => {
                 "the declared version is not a plain literal (e.g. a property reference or variable) and cannot be safely rewritten"
             }
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::NoOpRewrite,
-            )) => "no single unambiguous rewrite exists for this dependency's requirement syntax",
+            Outcome::Skipped {
+                reason:
+                    SkipReason::NotSafelyEditable(deps_core::edit::UnplannableReason::NoOpRewrite),
+                ..
+            } => "no single unambiguous rewrite exists for this dependency's requirement syntax",
             // Fix-cycle item 6/M1 minor: `NotSafelyEditable(LatestFlaggedByOsv|LatestUnverified)`
             // is reused for a blocked FALLBACK candidate (row 10, FR-011) as well as a blocked
             // `latest` — `UpdateCandidate` carries no marker distinguishing which view produced
             // it, so the base text branches on `cooldown_fallback` instead of naming "latest"
             // unconditionally (which previously read as self-contradictory once the `Blocked`
             // attribution suffix below named the fallback candidate specifically).
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestFlaggedByOsv,
-            )) => {
+            Outcome::Skipped {
+                reason:
+                    SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv,
+                    ),
+                ..
+            } => {
                 if matches!(
                     self.cooldown_fallback,
                     Some(CooldownFallbackNote::Blocked { .. })
@@ -395,9 +457,11 @@ impl PlannedUpdateItem {
                     "the registry's latest version is flagged by OSV.dev — refusing to write it"
                 }
             }
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestUnverified,
-            )) => {
+            Outcome::Skipped {
+                reason:
+                    SkipReason::NotSafelyEditable(deps_core::edit::UnplannableReason::LatestUnverified),
+                ..
+            } => {
                 if matches!(
                     self.cooldown_fallback,
                     Some(CooldownFallbackNote::Blocked { .. })
@@ -407,13 +471,15 @@ impl PlannedUpdateItem {
                     "the registry's latest version could not be verified against OSV.dev — refusing to write it"
                 }
             }
-            Outcome::Skipped(SkipReason::OverlapsAnotherEdit) => {
-                "this edit's span overlapped another item's and was dropped"
-            }
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown) => {
-                "the selected update target was published within the freshness cooldown window"
-            }
-            Outcome::RequiresLockfileUpdate => {
+            Outcome::Skipped {
+                reason: SkipReason::OverlapsAnotherEdit,
+                ..
+            } => "this edit's span overlapped another item's and was dropped",
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            } => "the selected update target was published within the freshness cooldown window",
+            Outcome::RequiresLockfileUpdate { .. } => {
                 "declared requirement already admits the fix target; regenerate the lock file (see #1116)"
             }
             Outcome::Unfixable(UnfixableReason::NoVerifiedFix) => {
@@ -422,11 +488,11 @@ impl PlannedUpdateItem {
             Outcome::Unfixable(UnfixableReason::FetchFailedOrAbsent) => {
                 "registry fetch for this dependency failed or returned no data"
             }
-            Outcome::Unfixable(UnfixableReason::Yanked) => "the fix target is yanked",
-            Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape) => {
-                "the declared requirement's syntax has no safe single-value rewrite and does not already admit the fix version — manual edit required"
+            Outcome::Unfixable(UnfixableReason::Yanked { .. }) => "the fix target is yanked",
+            Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. }) => {
+                "the declared requirement's syntax has no safe single-value rewrite and does not already admit the fix target — manual edit required"
             }
-            Outcome::Unfixable(UnfixableReason::OversizedRequirement) => {
+            Outcome::Unfixable(UnfixableReason::OversizedRequirement { .. }) => {
                 "the declared requirement is too large to safely evaluate; treating as unfixable — manual edit required"
             }
         };
@@ -552,7 +618,7 @@ fn resolve_cooldown_fallback_view(
 /// An outdated dependency `collect_update_candidates` could not safely rewrite (a
 /// [`deps_core::edit::UpdateCandidate::Unplannable`] — an unsafe registry value, a
 /// non-literal span, or a formatter with no unambiguous rewrite) is still reported here as
-/// <code>[Outcome::Skipped]([SkipReason::NotSafelyEditable])</code> rather than silently
+/// [`Outcome::Skipped`] with reason [`SkipReason::NotSafelyEditable`] rather than silently
 /// vanishing from the plan (spec 068 S4) — a `--package <NAME>` run naming exactly that
 /// dependency must not exit 0 with no signal.
 ///
@@ -658,8 +724,8 @@ fn resolve_cooldown_fallback_view(
 /// );
 ///
 /// assert_eq!(plan.items.len(), 1);
-/// assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
-/// assert_eq!(plan.items[0].target, Some(ConcreteVersion::from("1.2.0")));
+/// assert!(matches!(plan.items[0].outcome, Outcome::Applied { .. }));
+/// assert_eq!(plan.items[0].target(), Some(&ConcreteVersion::from("1.2.0")));
 /// ```
 #[must_use]
 #[expect(
@@ -892,21 +958,30 @@ fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, Option
 fn resolve_from_latest(
     latest_candidate: UpdateCandidate,
     ignore_rules: &IgnoreRules,
-) -> (
-    CurrentVersion,
-    Option<ConcreteVersion>,
-    Outcome,
-    Vec<String>,
-) {
+) -> (CurrentVersion, Outcome, Vec<String>) {
     match latest_candidate {
         UpdateCandidate::Planned(p) => {
             let target = p.target.clone();
             let current = CurrentVersion::from(p.current);
             let kind = current.update_kind_to(&p.target);
             if let Some(reason) = ignore_rules.skip_reason(&p.normalized_name, kind) {
-                (current, Some(target), Outcome::Skipped(reason), Vec::new())
+                (
+                    current,
+                    Outcome::Skipped {
+                        reason,
+                        target: Some(target),
+                    },
+                    Vec::new(),
+                )
             } else {
-                (current, Some(target), Outcome::Applied(p.edit), Vec::new())
+                (
+                    current,
+                    Outcome::Applied {
+                        edit: p.edit,
+                        target,
+                    },
+                    Vec::new(),
+                )
             }
         }
         UpdateCandidate::Unplannable {
@@ -917,11 +992,17 @@ fn resolve_from_latest(
             let outcome = if let Some(rule_reason) =
                 ignore_rules.skip_reason(&normalized_name, UpdateKind::Unknown)
             {
-                Outcome::Skipped(rule_reason)
+                Outcome::Skipped {
+                    reason: rule_reason,
+                    target: None,
+                }
             } else {
-                Outcome::Skipped(SkipReason::NotSafelyEditable(reason))
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(reason),
+                    target: None,
+                }
             };
-            (CurrentVersion::Unknown, None, outcome, Vec::new())
+            (CurrentVersion::Unknown, outcome, Vec::new())
         }
     }
 }
@@ -993,14 +1074,12 @@ fn resolve_occurrence(
     let fallback_candidate = fallback_by_key.remove(&key);
 
     let build = |current: CurrentVersion,
-                 target: Option<ConcreteVersion>,
                  outcome: Outcome,
                  advisory_ids: Vec<String>,
                  cooldown_fallback: Option<CooldownFallbackNote>| {
         PlannedUpdateItem::new(
             name.clone(),
             current,
-            target,
             outcome,
             advisory_ids,
             false,
@@ -1013,8 +1092,10 @@ fn resolve_occurrence(
         let (current, target) = latest_current_target(&latest_candidate);
         return build(
             current,
-            target,
-            Outcome::Skipped(SkipReason::NotRequested),
+            Outcome::Skipped {
+                reason: SkipReason::NotRequested,
+                target,
+            },
             Vec::new(),
             None,
         );
@@ -1043,16 +1124,30 @@ fn resolve_occurrence(
     // Fix-cycle item 6 (DRY): "never demote a flagged/unverified latest" is the shared shape
     // behind rows 5/6/8/FR-003-reject — one closure instead of four hand-rolled copies.
     let never_demoted = |latest_candidate: UpdateCandidate| {
-        let (current, target, outcome, advisory_ids) =
-            resolve_from_latest(latest_candidate, ignore_rules);
-        build(current, target, outcome, advisory_ids, None)
+        let (current, outcome, advisory_ids) = resolve_from_latest(latest_candidate, ignore_rules);
+        build(current, outcome, advisory_ids, None)
+    };
+    // DRY (code review finding): the routine "cooldown pause, targeting whatever `latest`
+    // itself carries" shape recurs across rows 4/6/(fb.target-mismatch)/(requirement rejected)/11
+    // — one closure instead of five hand-rolled copies.
+    let cooldown_skip_from_latest = |latest_candidate: &UpdateCandidate| {
+        let (current, target) = latest_current_target(latest_candidate);
+        build(
+            current,
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                target,
+            },
+            Vec::new(),
+            None,
+        )
     };
 
     match disposition {
         CooldownDisposition::NotEvaluated | CooldownDisposition::Cleared => {
-            let (current, target, outcome, advisory_ids) =
+            let (current, outcome, advisory_ids) =
                 resolve_from_latest(latest_candidate, ignore_rules);
-            build(current, target, outcome, advisory_ids, None)
+            build(current, outcome, advisory_ids, None)
         }
         CooldownDisposition::Blocked { fallback: None, .. } => {
             if latest_is_osv_unplannable {
@@ -1060,14 +1155,7 @@ fn resolve_occurrence(
                 never_demoted(latest_candidate)
             } else {
                 // Row 4.
-                let (current, target) = latest_current_target(&latest_candidate);
-                build(
-                    current,
-                    target,
-                    Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
-                    Vec::new(),
-                    None,
-                )
+                cooldown_skip_from_latest(&latest_candidate)
             }
         }
         // `by` (GOSSIP vs. local) is deliberately unread here: the wording difference is
@@ -1090,14 +1178,7 @@ fn resolve_occurrence(
                     if latest_is_osv_unplannable {
                         never_demoted(latest_candidate)
                     } else {
-                        let (current, target) = latest_current_target(&latest_candidate);
-                        build(
-                            current,
-                            target,
-                            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
-                            Vec::new(),
-                            None,
-                        )
+                        cooldown_skip_from_latest(&latest_candidate)
                     }
                 }
                 Some(UpdateCandidate::Planned(fb)) => {
@@ -1112,14 +1193,7 @@ fn resolve_occurrence(
                         return if latest_is_osv_unplannable {
                             never_demoted(latest_candidate)
                         } else {
-                            let (current, target) = latest_current_target(&latest_candidate);
-                            build(
-                                current,
-                                target,
-                                Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
-                                Vec::new(),
-                                None,
-                            )
+                            cooldown_skip_from_latest(&latest_candidate)
                         };
                     }
                     // Spec 076 FR-022/FR-023/FR-025: one uniform, re-parse-based guard applied
@@ -1151,8 +1225,10 @@ fn resolve_occurrence(
                         if let Some(reason) = ignore_rules.skip_reason(&fb.normalized_name, kind) {
                             build(
                                 current,
-                                Some(fb.target.clone()),
-                                Outcome::Skipped(reason),
+                                Outcome::Skipped {
+                                    reason,
+                                    target: Some(fb.target.clone()),
+                                },
                                 Vec::new(),
                                 None,
                             )
@@ -1172,8 +1248,10 @@ fn resolve_occurrence(
                                 });
                             build(
                                 current,
-                                Some(fb.target.clone()),
-                                Outcome::Applied(fb.edit),
+                                Outcome::Applied {
+                                    edit: fb.edit,
+                                    target: fb.target,
+                                },
                                 advisory_ids,
                                 latest_version.map(CooldownFallbackNote::AppliedInsteadOf),
                             )
@@ -1181,8 +1259,10 @@ fn resolve_occurrence(
                             // Row 9: the ordinary cooldown-fallback substitution.
                             build(
                                 current,
-                                Some(fb.target.clone()),
-                                Outcome::Applied(fb.edit),
+                                Outcome::Applied {
+                                    edit: fb.edit,
+                                    target: fb.target,
+                                },
                                 Vec::new(),
                                 latest_version.map(CooldownFallbackNote::AppliedInsteadOf),
                             )
@@ -1194,14 +1274,7 @@ fn resolve_occurrence(
                         if latest_is_osv_unplannable {
                             never_demoted(latest_candidate)
                         } else {
-                            let (current, target) = latest_current_target(&latest_candidate);
-                            build(
-                                current,
-                                target,
-                                Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
-                                Vec::new(),
-                                None,
-                            )
+                            cooldown_skip_from_latest(&latest_candidate)
                         }
                     }
                 }
@@ -1224,8 +1297,10 @@ fn resolve_occurrence(
                         // `UpdateKind::Unknown` treatment applies).
                         build(
                             CurrentVersion::Unknown,
-                            None,
-                            Outcome::Skipped(rule_reason),
+                            Outcome::Skipped {
+                                reason: rule_reason,
+                                target: None,
+                            },
                             Vec::new(),
                             None,
                         )
@@ -1246,8 +1321,10 @@ fn resolve_occurrence(
                         let (current, _) = latest_current_target(&latest_candidate);
                         build(
                             current,
-                            Some(fallback.version.clone()),
-                            Outcome::Skipped(SkipReason::NotSafelyEditable(fb_reason)),
+                            Outcome::Skipped {
+                                reason: SkipReason::NotSafelyEditable(fb_reason),
+                                target: Some(fallback.version.clone()),
+                            },
                             advisory_ids,
                             Some(CooldownFallbackNote::Blocked {
                                 version: fallback.version.clone(),
@@ -1255,14 +1332,7 @@ fn resolve_occurrence(
                         )
                     } else {
                         // Row 11: fallback blocked by a non-OSV structural reason.
-                        let (current, target) = latest_current_target(&latest_candidate);
-                        build(
-                            current,
-                            target,
-                            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
-                            Vec::new(),
-                            None,
-                        )
+                        cooldown_skip_from_latest(&latest_candidate)
                     }
                 }
             }
@@ -1302,7 +1372,7 @@ pub enum ApplyError {
 
 /// Deduplicates `items`' [`Outcome::Applied`] edits by span in place, demoting any item whose
 /// edit was dropped as an overlap to
-/// <code>[Outcome::Skipped]([SkipReason::OverlapsAnotherEdit])</code>.
+/// [`Outcome::Skipped`] with reason [`SkipReason::OverlapsAnotherEdit`].
 ///
 /// Spec 075 FR-015: [`plan_updates`] now calls this itself, after per-occurrence view
 /// selection, over its own chosen `PlannedUpdate`s — the correct place for this pass to run
@@ -1333,7 +1403,7 @@ pub fn dedup_applied_items(items: &mut [PlannedUpdateItem]) {
         .iter()
         .enumerate()
         .filter_map(|(index, item)| match &item.outcome {
-            Outcome::Applied(edit) => Some(Indexed {
+            Outcome::Applied { edit, .. } => Some(Indexed {
                 index,
                 edit: edit.clone(),
             }),
@@ -1347,8 +1417,13 @@ pub fn dedup_applied_items(items: &mut [PlannedUpdateItem]) {
             .collect();
 
     for (index, item) in items.iter_mut().enumerate() {
-        if matches!(item.outcome, Outcome::Applied(_)) && !kept_indices.contains(&index) {
-            item.outcome = Outcome::Skipped(SkipReason::OverlapsAnotherEdit);
+        if !kept_indices.contains(&index)
+            && let Outcome::Applied { target, .. } = &item.outcome
+        {
+            item.outcome = Outcome::Skipped {
+                reason: SkipReason::OverlapsAnotherEdit,
+                target: Some(target.clone()),
+            };
         }
     }
 }
@@ -1622,10 +1697,13 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(
+        assert!(matches!(
             plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown)
-        );
+            Outcome::Skipped {
+                reason: SkipReason::WithinFreshnessCooldown,
+                ..
+            }
+        ));
         assert_eq!(
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_CLEAN,
@@ -1666,7 +1744,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
+        assert!(matches!(plan.items[0].outcome, Outcome::Applied { .. }));
     }
 
     /// Issue #1521 item 1: `update`'s output must attribute a GOSSIP-cooldown-excluded newer
@@ -1698,7 +1776,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
+        assert!(matches!(plan.items[0].outcome, Outcome::Applied { .. }));
         assert_eq!(
             plan.items[0].gossip_excluded_version,
             Some(deps_core::ConcreteVersion::new("2.0.0"))
@@ -1751,9 +1829,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "the local cooldown skip must win the outcome decision"
         );
         assert_eq!(
@@ -1812,7 +1895,7 @@ mod tests {
         let applied: Vec<&str> = plan
             .items
             .iter()
-            .filter(|i| matches!(i.outcome, Outcome::Applied(_)))
+            .filter(|i| matches!(i.outcome, Outcome::Applied { .. }))
             .map(|i| i.name.as_str())
             .collect();
         assert_eq!(
@@ -1868,11 +1951,16 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -1932,16 +2020,22 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
         assert_eq!(
-            plan.items[0].target, None,
+            plan.items[0].target(),
+            None,
             "an Unplannable candidate has no concrete target"
         );
         assert_eq!(
@@ -1995,11 +2089,16 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestUnverified
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestUnverified
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2050,9 +2149,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2093,11 +2197,16 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestUnverified
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestUnverified
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2142,11 +2251,14 @@ mod tests {
         );
 
         let serde_item = plan.items.iter().find(|i| i.name == "serde").unwrap();
-        assert!(matches!(serde_item.outcome, Outcome::Applied(_)));
+        assert!(matches!(serde_item.outcome, Outcome::Applied { .. }));
         let tokio_item = plan.items.iter().find(|i| i.name == "tokio").unwrap();
         assert!(matches!(
             tokio_item.outcome,
-            Outcome::Skipped(SkipReason::NotRequested)
+            Outcome::Skipped {
+                reason: SkipReason::NotRequested,
+                ..
+            }
         ));
     }
 
@@ -2177,7 +2289,10 @@ mod tests {
         assert_eq!(plan.items.len(), 1);
         assert!(matches!(
             plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::IgnoreRule)
+            Outcome::Skipped {
+                reason: SkipReason::IgnoreRule,
+                ..
+            }
         ));
     }
 
@@ -2214,7 +2329,10 @@ mod tests {
         assert!(
             matches!(
                 plan.items[0].outcome,
-                Outcome::Skipped(SkipReason::IgnoreRule)
+                Outcome::Skipped {
+                    reason: SkipReason::IgnoreRule,
+                    ..
+                }
             ),
             "got {:?}",
             plan.items[0].outcome
@@ -2248,9 +2366,12 @@ mod tests {
         assert_eq!(plan.items.len(), 1);
         assert!(matches!(
             plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::NonLiteralSpan
-            ))
+            Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(
+                    deps_core::edit::UnplannableReason::NonLiteralSpan
+                ),
+                ..
+            }
         ));
     }
 
@@ -2279,7 +2400,7 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1);
-        assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
+        assert!(matches!(plan.items[0].outcome, Outcome::Applied { .. }));
     }
 
     #[test]
@@ -2310,11 +2431,13 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: Some(ConcreteVersion::from("1.2.0")),
-                outcome: Outcome::Applied(ManifestEdit {
-                    range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-                    new_text: "1.2.0".to_string(),
-                }),
+                outcome: Outcome::Applied {
+                    edit: ManifestEdit {
+                        range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+                        new_text: "1.2.0".to_string(),
+                    },
+                    target: ConcreteVersion::from("1.2.0"),
+                },
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
@@ -2345,11 +2468,13 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: Some(ConcreteVersion::from("1.2.0")),
-                outcome: Outcome::Applied(ManifestEdit {
-                    range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-                    new_text: "1.2.0".to_string(),
-                }),
+                outcome: Outcome::Applied {
+                    edit: ManifestEdit {
+                        range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+                        new_text: "1.2.0".to_string(),
+                    },
+                    target: ConcreteVersion::from("1.2.0"),
+                },
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
@@ -2380,11 +2505,13 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: Some(ConcreteVersion::from("1.2.0")),
-                outcome: Outcome::Applied(ManifestEdit {
-                    range: Range::new(Position::new(0, 9), Position::new(0, 14)),
-                    new_text: "1.2.0".to_string(),
-                }),
+                outcome: Outcome::Applied {
+                    edit: ManifestEdit {
+                        range: Range::new(Position::new(0, 9), Position::new(0, 14)),
+                        new_text: "1.2.0".to_string(),
+                    },
+                    target: ConcreteVersion::from("1.2.0"),
+                },
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
@@ -2415,8 +2542,10 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: Some(ConcreteVersion::from("1.2.0")),
-                outcome: Outcome::Skipped(SkipReason::IgnoreRule),
+                outcome: Outcome::Skipped {
+                    reason: SkipReason::IgnoreRule,
+                    target: Some(ConcreteVersion::from("1.2.0")),
+                },
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
                 gossip_excluded_version: None,
@@ -2444,11 +2573,13 @@ mod tests {
         PlannedUpdateItem {
             name: name.to_string(),
             current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-            target: Some(ConcreteVersion::from("1.2.0")),
-            outcome: Outcome::Applied(ManifestEdit {
-                range,
-                new_text: "1.2.0".to_string(),
-            }),
+            outcome: Outcome::Applied {
+                edit: ManifestEdit {
+                    range,
+                    new_text: "1.2.0".to_string(),
+                },
+                target: ConcreteVersion::from("1.2.0"),
+            },
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
             gossip_excluded_version: None,
@@ -2472,7 +2603,7 @@ mod tests {
         assert!(
             items
                 .iter()
-                .all(|i| matches!(i.outcome, Outcome::Applied(_)))
+                .all(|i| matches!(i.outcome, Outcome::Applied { .. }))
         );
     }
 
@@ -2492,11 +2623,19 @@ mod tests {
             ),
         ];
         dedup_applied_items(&mut items);
-        assert!(matches!(items[0].outcome, Outcome::Applied(_)));
+        assert!(matches!(items[0].outcome, Outcome::Applied { .. }));
         assert!(matches!(
             items[1].outcome,
-            Outcome::Skipped(SkipReason::OverlapsAnotherEdit)
+            Outcome::Skipped {
+                reason: SkipReason::OverlapsAnotherEdit,
+                ..
+            }
         ));
+        assert_eq!(
+            items[1].target(),
+            Some(&ConcreteVersion::from("1.2.0")),
+            "a demoted item must keep its target, not silently drop it (#1615)"
+        );
     }
 
     // --- Spec 075 (`deps-cli update` cooldown fallback) ---
@@ -2827,9 +2966,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2889,9 +3033,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2930,9 +3079,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -2962,16 +3116,21 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "1.4.0 is a downgrade below the unlisted declared pin 1.5.0 and must never be \
              applied: {:?}",
             plan.items[0]
         );
         assert_eq!(
-            plan.items[0].target,
-            Some(ConcreteVersion::from("2.0.0")),
+            plan.items[0].target(),
+            Some(&ConcreteVersion::from("2.0.0")),
             "the rejected fallback must never leak into the reported target either"
         );
         assert!(plan.items[0].cooldown_fallback.is_none());
@@ -3030,11 +3189,14 @@ mod tests {
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
         assert!(
-            matches!(plan.items[0].outcome, Outcome::Applied(_)),
+            matches!(plan.items[0].outcome, Outcome::Applied { .. }),
             "got: {:?}",
             plan.items[0].outcome
         );
-        assert_eq!(plan.items[0].target, Some(ConcreteVersion::from("1.1.0")));
+        assert_eq!(
+            plan.items[0].target(),
+            Some(&ConcreteVersion::from("1.1.0"))
+        );
         assert!(
             !plan.items[0].advisory_ids.is_empty(),
             "the flagged-latest attribution must be retained: {:?}",
@@ -3079,11 +3241,16 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestUnverified
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestUnverified
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3120,17 +3287,22 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "a divergence between the fallback view's own planned target (1.9.0) and \
              `cooldown_disposition`'s independently computed pick (1.1.0) must never be \
              silently written: {:?}",
             plan.items[0]
         );
         assert_eq!(
-            plan.items[0].target,
-            Some(ConcreteVersion::from("2.0.0")),
+            plan.items[0].target(),
+            Some(&ConcreteVersion::from("2.0.0")),
             "must fall back to the real (unmodified) latest, never either divergent fallback \
              value"
         );
@@ -3168,17 +3340,22 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
         assert_eq!(
-            plan.items[0].target,
-            Some(ConcreteVersion::from("1.1.0")),
+            plan.items[0].target(),
+            Some(&ConcreteVersion::from("1.1.0")),
             "must name the blocked fallback version, not latest"
         );
         assert!(!plan.items[0].advisory_ids.is_empty());
@@ -3217,15 +3394,23 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestUnverified
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestUnverified
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
-        assert_eq!(plan.items[0].target, Some(ConcreteVersion::from("1.1.0")));
+        assert_eq!(
+            plan.items[0].target(),
+            Some(&ConcreteVersion::from("1.1.0"))
+        );
         assert_eq!(
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_POLICY_VIOLATION
@@ -3268,11 +3453,16 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::NotSafelyEditable(
-                deps_core::edit::UnplannableReason::LatestFlaggedByOsv
-            )),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::NotSafelyEditable(
+                        deps_core::edit::UnplannableReason::LatestFlaggedByOsv
+                    ),
+                    ..
+                }
+            ),
             "got: {:?}",
             plan.items[0].outcome
         );
@@ -3308,9 +3498,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "a fallback blocked by a non-OSV structural reason is a routine cooldown skip, not \
              an exit-1 safety refusal: {:?}",
             plan.items[0].outcome
@@ -3370,9 +3565,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::IgnoreRule),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::IgnoreRule,
+                    ..
+                }
+            ),
             "an ignored package's row-7 fallback must not be applied: {:?}",
             plan.items[0].outcome
         );
@@ -3411,9 +3611,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::IgnoreRule),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::IgnoreRule,
+                    ..
+                }
+            ),
             "an ignored package's row-9 fallback must not be applied: {:?}",
             plan.items[0].outcome
         );
@@ -3462,14 +3667,20 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::IgnoreRule),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::IgnoreRule,
+                    ..
+                }
+            ),
             "an ignored package's row-10 blocked fallback must exit clean, not policy-violation: {:?}",
             plan.items[0].outcome
         );
         assert_eq!(
-            plan.items[0].target, None,
+            plan.items[0].target(),
+            None,
             "the ignore-rule skip of an OSV-blocked fallback has no concrete target"
         );
         assert_eq!(
@@ -3532,9 +3743,14 @@ mod tests {
         );
 
         assert_eq!(plan.items.len(), 1, "{:?}", plan.items);
-        assert_eq!(
-            plan.items[0].outcome,
-            Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+        assert!(
+            matches!(
+                plan.items[0].outcome,
+                Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    ..
+                }
+            ),
             "the GOSSIP-Active cooldown for the raw name 'Django' must be detected even though \
              normalize_package_name lowercases it to 'django': {:?}",
             plan.items[0].outcome
@@ -3638,17 +3854,17 @@ mod tests {
             .find(|i| i.name == "beta")
             .expect("beta item present");
         assert_eq!(
-            alpha.target,
-            Some(ConcreteVersion::from("1.1.0")),
+            alpha.target(),
+            Some(&ConcreteVersion::from("1.1.0")),
             "alpha must get its own fallback, not beta's: {alpha:?}"
         );
         assert_eq!(
-            beta.target,
-            Some(ConcreteVersion::from("9.1.0")),
+            beta.target(),
+            Some(&ConcreteVersion::from("9.1.0")),
             "beta must get its own fallback, not alpha's: {beta:?}"
         );
-        assert!(matches!(alpha.outcome, Outcome::Applied(_)));
-        assert!(matches!(beta.outcome, Outcome::Applied(_)));
+        assert!(matches!(alpha.outcome, Outcome::Applied { .. }));
+        assert!(matches!(beta.outcome, Outcome::Applied { .. }));
     }
 
     /// Code review (severity upgrade over the earlier "attribution only, never a wrong write"
@@ -3707,15 +3923,20 @@ mod tests {
 
         assert_eq!(plan.items.len(), 2, "{:?}", plan.items);
         for item in &plan.items {
-            assert_eq!(
-                item.outcome,
-                Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+            assert!(
+                matches!(
+                    item.outcome,
+                    Outcome::Skipped {
+                        reason: SkipReason::WithinFreshnessCooldown,
+                        ..
+                    }
+                ),
                 "an unresolvable collision must fail closed, never approve a downgrade or a \
                  swapped write: {item:?}"
             );
             assert_eq!(
-                item.target,
-                Some(ConcreteVersion::from("1.2.0")),
+                item.target(),
+                Some(&ConcreteVersion::from("1.2.0")),
                 "target must stay the real (unmodified) latest, never a fallback picked via a \
                  collided lookup: {item:?}"
             );
@@ -3787,9 +4008,14 @@ mod tests {
 
         assert_eq!(plan.items.len(), 2, "{:?}", plan.items);
         for item in &plan.items {
-            assert_eq!(
-                item.outcome,
-                Outcome::Skipped(SkipReason::WithinFreshnessCooldown),
+            assert!(
+                matches!(
+                    item.outcome,
+                    Outcome::Skipped {
+                        reason: SkipReason::WithinFreshnessCooldown,
+                        ..
+                    }
+                ),
                 "a collision must fail closed uniformly for both occurrences, never `Applied` \
                  and never attributing one occurrence's structural defect to the other: {item:?}"
             );

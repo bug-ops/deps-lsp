@@ -645,7 +645,7 @@ async fn run_update(
         && plan
             .items
             .iter()
-            .any(|item| matches!(item.outcome, update::Outcome::Applied(_)))
+            .any(|item| matches!(item.outcome, update::Outcome::Applied { .. }))
     {
         let reason = if ctx.policy.network.offline {
             "network.offline is set"

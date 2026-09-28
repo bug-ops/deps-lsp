@@ -105,7 +105,7 @@ pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: DryRun) -> Strin
     for item in &plan.items {
         // Security-S3: `target`/`reason()` carry unvalidated `ConcreteVersion` text, sanitized
         // like `name`/`current` below; only `None` means "no target".
-        let target = item.target.as_ref().map_or_else(
+        let target = item.target().map_or_else(
             || "-".to_string(),
             |v| crate::sanitize::sanitize_message_for_display(v.as_str()),
         );
@@ -225,7 +225,6 @@ mod tests {
             current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
                 "1.0.0",
             )),
-            target: Some(deps_core::ConcreteVersion::from("1.2.0")),
             outcome,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
@@ -241,12 +240,19 @@ mod tests {
         }
     }
 
+    fn applied_outcome() -> crate::update::Outcome {
+        crate::update::Outcome::Applied {
+            edit: applied_edit(),
+            target: deps_core::ConcreteVersion::from("1.2.0"),
+        }
+    }
+
     /// S5: `render_update` on a non-empty plan — the empty-plan doctest alone never exercised
     /// the per-item line format or the `dry_run` leading note.
     #[test]
     fn test_render_update_non_empty_plan_includes_item_line() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
+            items: vec![update_item(applied_outcome())],
         };
         let table = render_update(&plan, DryRun::No);
         assert!(table.contains("serde"));
@@ -259,7 +265,7 @@ mod tests {
     #[test]
     fn test_render_update_dry_run_includes_leading_note() {
         let plan = crate::update::UpdatePlan {
-            items: vec![update_item(crate::update::Outcome::Applied(applied_edit()))],
+            items: vec![update_item(applied_outcome())],
         };
         let table = render_update(&plan, DryRun::Yes);
         assert!(table.starts_with("(dry run"));
@@ -279,10 +285,10 @@ mod tests {
     /// #1605: `None` is the sole "no target" sentinel now — it still renders as `-`.
     #[test]
     fn test_render_update_none_target_renders_dash() {
-        let mut item = update_item(crate::update::Outcome::Skipped(
-            crate::update::SkipReason::NotRequested,
-        ));
-        item.target = None;
+        let item = update_item(crate::update::Outcome::Skipped {
+            reason: crate::update::SkipReason::NotRequested,
+            target: None,
+        });
         let plan = crate::update::UpdatePlan { items: vec![item] };
         let table = render_update(&plan, DryRun::No);
         assert!(table.contains(" -> - "), "got: {table}");
@@ -293,17 +299,16 @@ mod tests {
     /// sanitized at this render sink.
     #[test]
     fn test_render_update_strips_ansi_from_target_and_reason() {
-        let mut item = update_item(crate::update::Outcome::Skipped(
-            crate::update::SkipReason::NotSafelyEditable(
+        let mut item = update_item(crate::update::Outcome::Skipped {
+            reason: crate::update::SkipReason::NotSafelyEditable(
                 deps_core::edit::UnplannableReason::LatestFlaggedByOsv,
             ),
-        ));
-        item.target = Some(deps_core::ConcreteVersion::from("1.2.0\x1B[31m"));
+            target: Some(deps_core::ConcreteVersion::from("1.2.0\x1B[31m")),
+        });
         item.cooldown_fallback = Some(crate::update::CooldownFallbackNote::Blocked {
             version: deps_core::ConcreteVersion::from("1.1.0\x1B[31m"),
         });
-        let mut applied_instead_of_item =
-            update_item(crate::update::Outcome::Applied(applied_edit()));
+        let mut applied_instead_of_item = update_item(applied_outcome());
         applied_instead_of_item.cooldown_fallback =
             Some(crate::update::CooldownFallbackNote::AppliedInsteadOf(
                 deps_core::ConcreteVersion::from("1.3.0\x1B[31m"),

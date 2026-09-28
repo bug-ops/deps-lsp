@@ -335,7 +335,9 @@ fn classify_vulnerable_dependency(
         return unfixable_item(
             dep,
             current,
-            UnfixableReason::Yanked,
+            UnfixableReason::Yanked {
+                target: deps_core::ConcreteVersion::new(version_native),
+            },
             ignore_rule_overridden,
         );
     }
@@ -357,8 +359,10 @@ fn classify_vulnerable_dependency(
         Ok(planned) => PlannedUpdateItem::new(
             dep.name().as_str().to_string(),
             current,
-            Some(deps_core::ConcreteVersion::new(version_native)),
-            Outcome::Applied(planned.edit),
+            Outcome::Applied {
+                edit: planned.edit,
+                target: deps_core::ConcreteVersion::new(version_native),
+            },
             fix.advisory_ids,
             ignore_rule_overridden,
             None,
@@ -414,7 +418,9 @@ fn classify_vulnerable_dependency(
                 return unfixable_item(
                     dep,
                     current,
-                    UnfixableReason::OversizedRequirement,
+                    UnfixableReason::OversizedRequirement {
+                        target: deps_core::ConcreteVersion::new(version_native.as_str()),
+                    },
                     ignore_rule_overridden,
                 );
             }
@@ -427,7 +433,9 @@ fn classify_vulnerable_dependency(
                 unfixable_item(
                     dep,
                     current,
-                    UnfixableReason::UnsupportedRequirementShape,
+                    UnfixableReason::UnsupportedRequirementShape {
+                        target: fix_concrete,
+                    },
                     ignore_rule_overridden,
                 )
             } else {
@@ -503,8 +511,10 @@ fn skipped_not_requested(
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
-        None,
-        Outcome::Skipped(crate::update::SkipReason::NotRequested),
+        Outcome::Skipped {
+            reason: crate::update::SkipReason::NotRequested,
+            target: None,
+        },
         Vec::new(),
         false,
         None,
@@ -521,7 +531,6 @@ fn unfixable_item(
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
-        None,
         Outcome::Unfixable(reason),
         Vec::new(),
         ignore_rule_overridden,
@@ -540,8 +549,7 @@ fn requires_lockfile_update_item(
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
-        Some(target),
-        Outcome::RequiresLockfileUpdate,
+        Outcome::RequiresLockfileUpdate { target },
         advisory_ids.to_vec(),
         ignore_rule_overridden,
         None,
@@ -903,8 +911,11 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::Applied(_)));
-        assert_eq!(item.target, Some(deps_core::ConcreteVersion::from("1.0.2")));
+        assert!(matches!(item.outcome, Outcome::Applied { .. }));
+        assert_eq!(
+            item.target(),
+            Some(&deps_core::ConcreteVersion::from("1.0.2"))
+        );
     }
 
     /// C1 (critical): a `Vulnerable` dependency with no declared `version_requirement()` at
@@ -932,7 +943,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::RequiresLockfileUpdate));
+        assert!(matches!(
+            item.outcome,
+            Outcome::RequiresLockfileUpdate { .. }
+        ));
     }
 
     #[test]
@@ -958,7 +972,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::RequiresLockfileUpdate));
+        assert!(matches!(
+            item.outcome,
+            Outcome::RequiresLockfileUpdate { .. }
+        ));
     }
 
     /// S1 (significant, US-003): a requirement the ecosystem's own comparator confirms
@@ -982,8 +999,14 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::RequiresLockfileUpdate));
-        assert_eq!(item.target, Some(deps_core::ConcreteVersion::from("1.0.2")));
+        assert!(matches!(
+            item.outcome,
+            Outcome::RequiresLockfileUpdate { .. }
+        ));
+        assert_eq!(
+            item.target(),
+            Some(&deps_core::ConcreteVersion::from("1.0.2"))
+        );
     }
 
     /// Fallback path (GitHub Actions/GitLab CI — no `compile_requirement`): the declared
@@ -1004,7 +1027,10 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::RequiresLockfileUpdate));
+        assert!(matches!(
+            item.outcome,
+            Outcome::RequiresLockfileUpdate { .. }
+        ));
     }
 
     /// #1566 S1 regression: a requirement shape (e.g. Cargo's compound `">=1.2, <1.5"`) whose
@@ -1030,14 +1056,15 @@ mod tests {
         assert!(
             matches!(
                 item.outcome,
-                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape)
+                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. })
             ),
             "expected Unfixable(UnsupportedRequirementShape), got {:?}",
             item.outcome
         );
         assert_eq!(
-            item.target, None,
-            "an Unfixable item has no concrete target"
+            item.target(),
+            Some(&deps_core::ConcreteVersion::from("1.5.2")),
+            "an Unfixable item with a rejected fix target must report it (#1614)"
         );
         assert!(
             !item.reason().contains("regenerate the lock file"),
@@ -1069,7 +1096,7 @@ mod tests {
             &IgnoreRules::empty(),
         );
         assert!(
-            matches!(item.outcome, Outcome::RequiresLockfileUpdate),
+            matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. }),
             "expected RequiresLockfileUpdate, got {:?}",
             item.outcome
         );
@@ -1095,7 +1122,7 @@ mod tests {
             &IgnoreRules::empty(),
         );
         assert!(
-            matches!(item.outcome, Outcome::RequiresLockfileUpdate),
+            matches!(item.outcome, Outcome::RequiresLockfileUpdate { .. }),
             "expected RequiresLockfileUpdate, got {:?}",
             item.outcome
         );
@@ -1149,21 +1176,24 @@ mod tests {
         );
 
         assert!(
-            matches!(rewrite_item.outcome, Outcome::Applied(_)),
+            matches!(rewrite_item.outcome, Outcome::Applied { .. }),
             "serde's requirement (\"0.9\") does not yet admit 1.0.2, so it must be rewritten"
         );
         assert_eq!(
-            rewrite_item.target,
-            Some(deps_core::ConcreteVersion::from("1.0.2"))
+            rewrite_item.target(),
+            Some(&deps_core::ConcreteVersion::from("1.0.2"))
         );
         assert!(
-            matches!(lockfile_item.outcome, Outcome::RequiresLockfileUpdate),
+            matches!(
+                lockfile_item.outcome,
+                Outcome::RequiresLockfileUpdate { .. }
+            ),
             "tokio's requirement (\"1\") already admits 1.0.2 per spec.md's US-003 fixture, so \
              it must be reported, not rewritten"
         );
         assert_eq!(
-            lockfile_item.target,
-            Some(deps_core::ConcreteVersion::from("1.0.2"))
+            lockfile_item.target(),
+            Some(&deps_core::ConcreteVersion::from("1.0.2"))
         );
     }
 
@@ -1402,8 +1432,13 @@ mod tests {
         );
         assert!(matches!(
             item.outcome,
-            Outcome::Unfixable(UnfixableReason::Yanked)
+            Outcome::Unfixable(UnfixableReason::Yanked { .. })
         ));
+        assert_eq!(
+            item.target(),
+            Some(&deps_core::ConcreteVersion::from("1.0.2")),
+            "a yanked-unfixable item must report the rejected fix target (#1614)"
+        );
     }
 
     /// #1344 C3: since the requirement-already-admits-fix gate moved inside
@@ -1442,7 +1477,7 @@ mod tests {
         );
         assert!(matches!(
             item.outcome,
-            Outcome::Unfixable(UnfixableReason::Yanked)
+            Outcome::Unfixable(UnfixableReason::Yanked { .. })
         ));
     }
 
@@ -1485,7 +1520,10 @@ mod tests {
             &IgnoreRules::empty(),
         );
         assert!(
-            matches!(item.outcome, Outcome::Unfixable(UnfixableReason::Yanked)),
+            matches!(
+                item.outcome,
+                Outcome::Unfixable(UnfixableReason::Yanked { .. })
+            ),
             "the yanked native-form entry (v1.0.2) must match the converted native-form fix \
              target, not the raw OSV wire form (1.0.2), which was never in the yanked list"
         );
@@ -1513,7 +1551,7 @@ mod tests {
             EcosystemId::Cargo,
             &IgnoreRules::empty(),
         );
-        assert!(matches!(item.outcome, Outcome::Applied(_)));
+        assert!(matches!(item.outcome, Outcome::Applied { .. }));
     }
 
     /// FR-008: a matching `[update].ignore` rule is reported as overridden, never suppressed.
@@ -1543,7 +1581,7 @@ mod tests {
             EcosystemId::Cargo,
             &ignore_rules,
         );
-        assert!(matches!(item.outcome, Outcome::Applied(_)));
+        assert!(matches!(item.outcome, Outcome::Applied { .. }));
         assert!(
             item.ignore_rule_overridden,
             "a matching rule must be reported as overridden, not silently applied"
@@ -1608,7 +1646,7 @@ mod tests {
         assert!(
             matches!(
                 item.outcome,
-                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape)
+                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. })
             ),
             "real Cargo semver matcher must confirm 1.5.2 is excluded by \">=1.2, <1.5\", got {:?}",
             item.outcome
@@ -1641,10 +1679,15 @@ mod tests {
         assert!(
             matches!(
                 item.outcome,
-                Outcome::Unfixable(UnfixableReason::OversizedRequirement)
+                Outcome::Unfixable(UnfixableReason::OversizedRequirement { .. })
             ),
             "got {:?}",
             item.outcome
+        );
+        assert_eq!(
+            item.target(),
+            Some(&deps_core::ConcreteVersion::from("1.5.2")),
+            "an oversized-requirement-unfixable item must report the rejected fix target (#1614)"
         );
     }
 
@@ -1676,7 +1719,7 @@ mod tests {
         assert!(
             matches!(
                 item.outcome,
-                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape)
+                Outcome::Unfixable(UnfixableReason::UnsupportedRequirementShape { .. })
             ),
             "expected the matcher to run at the exact cap and confirm exclusion, got {:?}",
             item.outcome
