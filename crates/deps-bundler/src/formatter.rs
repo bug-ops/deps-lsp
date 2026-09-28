@@ -945,7 +945,7 @@ mod tests {
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
-                version: "7.0.8".to_string(),
+                version: ConcreteVersion::new("7.0.8"),
             });
 
         let planned = plan_vulnerability_fix(
@@ -1007,7 +1007,7 @@ mod tests {
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
-                version: "6.1.0".to_string(),
+                version: ConcreteVersion::new("6.1.0"),
             });
 
         let planned =
@@ -1058,7 +1058,7 @@ mod tests {
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
-                version: "7.0.8".to_string(),
+                version: ConcreteVersion::new("7.0.8"),
             });
 
         let planned = plan_vulnerability_fix(
@@ -1129,7 +1129,7 @@ mod tests {
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
             .with_fix_target_status(UpgradeStatus::CandidateClean {
-                version: "3.0.0".to_string(),
+                version: ConcreteVersion::new("3.0.0"),
             });
 
         let planned = plan_vulnerability_fix(

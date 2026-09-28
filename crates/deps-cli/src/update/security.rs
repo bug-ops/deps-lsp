@@ -570,7 +570,8 @@ mod tests {
     use deps_core::parser::DependencySource;
     use deps_core::position::{Position, Range};
     use deps_core::{
-        Dependency, EcosystemId, PackageName, PackageVersions, RemovalStatus, VersionReq,
+        ConcreteVersion, Dependency, EcosystemId, PackageName, PackageVersions, RemovalStatus,
+        VersionReq,
     };
     use std::any::Any;
     use std::collections::{HashMap, HashSet};
@@ -854,7 +855,7 @@ mod tests {
             1,
         ))
         .with_fix_target_status(UpgradeStatus::CandidateClean {
-            version: fixed_version.to_string(),
+            version: ConcreteVersion::new(fixed_version),
         })
     }
 
@@ -1495,7 +1496,7 @@ mod tests {
             1,
         ))
         .with_fix_target_status(UpgradeStatus::CandidateClean {
-            version: "v1.0.2".to_string(),
+            version: ConcreteVersion::new("v1.0.2"),
         });
         let mut cached = HashMap::new();
         cached.insert(

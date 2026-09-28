@@ -544,7 +544,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -621,7 +621,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },

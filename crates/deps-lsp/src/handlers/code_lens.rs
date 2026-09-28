@@ -134,7 +134,7 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
-    use deps_core::EcosystemId;
+    use deps_core::{ConcreteVersion, EcosystemId};
     // Only `cargo_tests` and `cross_ecosystem_tests`' per-ecosystem cases consume this.
     #[cfg(any(
         feature = "cargo",
@@ -301,7 +301,7 @@ mod tests {
                     (
                         deps_core::test_util::vuln_key(name.as_str()),
                         deps_core::osv::UpgradeStatus::CandidateClean {
-                            version: versions.latest.to_string(),
+                            version: versions.latest.clone(),
                         },
                     )
                 })
@@ -1227,7 +1227,7 @@ let package = Package(
             latest_status.insert(
                 deps_core::test_util::vuln_key("actions/checkout"),
                 deps_core::osv::UpgradeStatus::CandidateClean {
-                    version: "v4".to_string(),
+                    version: ConcreteVersion::new("v4"),
                 },
             );
             doc_state.update_latest_status(latest_status);

@@ -7,8 +7,8 @@ use std::time::Duration;
 use crate::error::DepsError;
 use crate::licenses::LicensePolicy;
 use crate::osv::{
-    CandidateStatusMap, LatestStatusMap, ScanOutcome, SkipReason, UpgradeStatus, VulnKey,
-    VulnSeverity, VulnerabilityMap,
+    CandidateStatusMap, CandidateStatuses, LatestStatusMap, ScanOutcome, StructuralSkipReason,
+    UpgradeStatus, VulnKey, VulnSeverity, VulnerabilityMap,
 };
 use crate::position::{Position, Range};
 use crate::{
@@ -2184,7 +2184,7 @@ fn resolve_by_vuln_key<'a, V>(
 /// latest_status.insert(
 ///     deps_core::test_util::vuln_key("time"),
 ///     UpgradeStatus::CandidateClean {
-///         version: "1.0.0".to_string(),
+///         version: deps_core::ConcreteVersion::new("1.0.0"),
 ///     },
 /// );
 ///
@@ -2344,10 +2344,17 @@ fn upgrade_status_to_verdict(
 ) -> LatestVerdict {
     match status {
         None | Some(UpgradeStatus::NotChecked) => LatestVerdict::Unverified,
-        Some(UpgradeStatus::CandidateUnverified { reason, .. }) => {
-            let stale_non_registry_skip = *reason == SkipReason::NonRegistrySource
+        Some(UpgradeStatus::StructurallyUnchecked(reason)) => {
+            let stale_non_registry_skip = *reason == StructuralSkipReason::NonRegistrySource
                 && formatter.source_is_public_registry_content(&dep.source());
-            if reason.is_structural() && !stale_non_registry_skip {
+            if stale_non_registry_skip {
+                LatestVerdict::Unverified
+            } else {
+                LatestVerdict::NotApplicable
+            }
+        }
+        Some(UpgradeStatus::CandidateUnverified { reason, .. }) => {
+            if reason.is_structural() {
                 LatestVerdict::NotApplicable
             } else {
                 LatestVerdict::Unverified
@@ -2427,18 +2434,23 @@ fn upgrade_status_to_verdict(
 /// let mut candidate_status = CandidateStatusMap::new();
 /// candidate_status.insert(
 ///     deps_core::test_util::vuln_key("time"),
-///     std::iter::once((
-///         "0.1.43".to_string(),
-///         UpgradeStatus::CandidateClean {
-///             version: "0.1.43".to_string(),
-///         },
-///     ))
-///     .collect(),
+///     deps_core::osv::CandidateStatuses::PerVersion(
+///         std::iter::once((
+///             deps_core::ConcreteVersion::new("0.1.43"),
+///             UpgradeStatus::CandidateClean {
+///                 version: deps_core::ConcreteVersion::new("0.1.43"),
+///             },
+///         ))
+///         .collect(),
+///     ),
 /// );
 ///
-/// let per_version = resolve_candidate_status(&candidate_status, &dep, None, "time").unwrap();
+/// let statuses = resolve_candidate_status(&candidate_status, &dep, None, "time").unwrap();
+/// let deps_core::osv::CandidateStatuses::PerVersion(per_version) = statuses else {
+///     unreachable!()
+/// };
 /// assert!(matches!(
-///     per_version.get("0.1.43"),
+///     per_version.get(&deps_core::ConcreteVersion::new("0.1.43")),
 ///     Some(UpgradeStatus::CandidateClean { .. })
 /// ));
 /// ```
@@ -2448,7 +2460,7 @@ pub fn resolve_candidate_status<'a>(
     dep: &dyn Dependency,
     keys: Option<&crate::osv::VulnKeys>,
     normalized_name: &str,
-) -> Option<&'a HashMap<String, UpgradeStatus>> {
+) -> Option<&'a CandidateStatuses> {
     resolve_by_vuln_key(candidate_status, dep, keys, normalized_name)
 }
 
@@ -2460,9 +2472,9 @@ pub fn resolve_candidate_status<'a>(
 ///
 /// A dependency with no entry at all in `candidate_status` (phase B's candidate-check round
 /// never covered it) resolves to [`LatestVerdict::Unverified`], matching [`latest_verdict`]'s
-/// identical fail-closed default. A structural skip is recorded once per dependency under the
-/// empty-string sentinel key (see [`crate::osv::CandidateStatusMap`]'s doc) and is consulted
-/// only when `version` itself has no entry of its own.
+/// identical fail-closed default. A structural skip is recorded once per dependency as
+/// [`crate::osv::CandidateStatuses::Structural`] (see that type's doc) and applies uniformly to
+/// every candidate version, never mixed with real per-version data for the same dependency.
 ///
 /// # Examples
 ///
@@ -2514,7 +2526,10 @@ pub fn resolve_candidate_status<'a>(
 /// // A map with an entry for this dependency, but not for this exact version — fails closed
 /// // to `Unverified`, never silently treated as safe.
 /// let mut candidate_status = CandidateStatusMap::new();
-/// candidate_status.insert(deps_core::test_util::vuln_key("left-pad"), std::collections::HashMap::new());
+/// candidate_status.insert(
+///     deps_core::test_util::vuln_key("left-pad"),
+///     deps_core::osv::CandidateStatuses::PerVersion(std::collections::HashMap::new()),
+/// );
 /// assert_eq!(
 ///     candidate_verdict(Some(&candidate_status), &dep, None, "left-pad", "1.0.6", &formatter),
 ///     LatestVerdict::Unverified
@@ -2532,11 +2547,19 @@ pub fn candidate_verdict(
     let Some(map) = candidate_status else {
         return LatestVerdict::NotApplicable;
     };
-    let Some(per_version) = resolve_candidate_status(map, dep, keys, normalized_name) else {
-        return LatestVerdict::Unverified;
-    };
-    let status = per_version.get(version).or_else(|| per_version.get(""));
-    upgrade_status_to_verdict(status, version, dep, formatter)
+    match resolve_candidate_status(map, dep, keys, normalized_name) {
+        None => LatestVerdict::Unverified,
+        Some(CandidateStatuses::Structural(reason)) => upgrade_status_to_verdict(
+            Some(&UpgradeStatus::StructurallyUnchecked(*reason)),
+            version,
+            dep,
+            formatter,
+        ),
+        Some(CandidateStatuses::PerVersion(per_version)) => {
+            let status = per_version.get(&ConcreteVersion::from(version));
+            upgrade_status_to_verdict(status, version, dep, formatter)
+        }
+    }
 }
 
 /// Converts byte offsets in source text to LSP `Position` values.
@@ -4178,6 +4201,7 @@ pub fn dependency_version_range_is_literal(
 mod tests {
     use super::*;
     use crate::lsp_helpers::test_support::*;
+    use crate::osv::SkipReason;
     use crate::{DependencySource, PackageName, VersionReq};
 
     // --- gossip_cooldown_for (issue #1456, spec 072 FR-008/FR-011, S2 tri-state) ---
@@ -5979,10 +6003,7 @@ mod tests {
     }
 
     fn structural_skip_entry() -> UpgradeStatus {
-        UpgradeStatus::CandidateUnverified {
-            version: "1.0.0".to_string(),
-            reason: SkipReason::NonRegistrySource,
-        }
+        UpgradeStatus::StructurallyUnchecked(StructuralSkipReason::NonRegistrySource)
     }
 
     /// Mirrors `deps-cargo`'s `CargoFormatter::source_is_public_registry_content` override
@@ -6051,7 +6072,7 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             crate::test_util::vuln_key("vendored-lib"),
-            std::iter::once((String::new(), structural_skip_entry())).collect(),
+            CandidateStatuses::Structural(StructuralSkipReason::NonRegistrySource),
         );
         assert_eq!(
             candidate_verdict(
@@ -6101,7 +6122,7 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             crate::test_util::vuln_key("vendored-lib"),
-            std::iter::once((String::new(), structural_skip_entry())).collect(),
+            CandidateStatuses::Structural(StructuralSkipReason::NonRegistrySource),
         );
         assert_eq!(
             candidate_verdict(
@@ -6154,7 +6175,7 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             crate::test_util::vuln_key("vendored-lib"),
-            std::iter::once((String::new(), structural_skip_entry())).collect(),
+            CandidateStatuses::Structural(StructuralSkipReason::NonRegistrySource),
         );
         assert_eq!(
             candidate_verdict(
@@ -6166,6 +6187,59 @@ mod tests {
                 &formatter
             ),
             LatestVerdict::Unverified
+        );
+    }
+
+    /// #1624 critique M3: `UnmappableName` is structural but — unlike `NonRegistrySource` —
+    /// [`LatestStatusMap`] still records a real candidate version for it (see
+    /// `deps_engine::classify::osv::build_latest_check_targets`), so it stays a
+    /// `CandidateUnverified{version, reason}` entry there while [`CandidateStatusMap`] (which
+    /// has no single-version slot for the whole dependency) represents the identical skip as
+    /// `CandidateStatuses::Structural`. Both must resolve to `NotApplicable`.
+    #[test]
+    fn unmappable_name_resolves_to_not_applicable_for_latest_and_candidate() {
+        let dep = DepWithSource {
+            name: pkg("jsr-pinned"),
+            name_range: crate::position::Range::default(),
+            source: DependencySource::Registry,
+        };
+        let formatter = crate::test_util::StubFormatter::new();
+
+        let mut latest_status = LatestStatusMap::new();
+        latest_status.insert(
+            crate::test_util::vuln_key("jsr-pinned"),
+            UpgradeStatus::CandidateUnverified {
+                version: ConcreteVersion::new("1.0.0"),
+                reason: SkipReason::UnmappableName,
+            },
+        );
+        assert_eq!(
+            latest_verdict(
+                Some(&latest_status),
+                &dep,
+                None,
+                "jsr-pinned",
+                "1.0.0",
+                &formatter
+            ),
+            LatestVerdict::NotApplicable
+        );
+
+        let mut candidate_status = CandidateStatusMap::new();
+        candidate_status.insert(
+            crate::test_util::vuln_key("jsr-pinned"),
+            CandidateStatuses::Structural(StructuralSkipReason::UnmappableName),
+        );
+        assert_eq!(
+            candidate_verdict(
+                Some(&candidate_status),
+                &dep,
+                None,
+                "jsr-pinned",
+                "1.0.0",
+                &formatter
+            ),
+            LatestVerdict::NotApplicable
         );
     }
 
