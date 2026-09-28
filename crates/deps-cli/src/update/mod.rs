@@ -2643,7 +2643,7 @@ mod tests {
     const FALLBACK_FORMATTER: deps_core::test_util::StubFormatter =
         deps_core::test_util::StubFormatter::new().with_manifest_requirement_as_resolved_version();
 
-    /// A formatter with a REAL `compile_requirement` — `semver::VersionReq`-backed, via the
+    /// A formatter with a REAL `compile_bounded_requirement` — `semver::VersionReq`-backed, via the
     /// same `deps_core::lsp_helpers::compile_semver_requirement` deps-cargo/deps-swift use in
     /// production. Fix-cycle item 1/S1: the original test used a synthetic `AtLeastMajor3`
     /// matcher whose behavior happened to be self-consistent with the (wrong)
@@ -2662,10 +2662,11 @@ mod tests {
         }
     }
     impl deps_core::lsp_helpers::RequirementResolution for RealSemverFormatter {
-        fn compile_requirement(
+        fn compile_bounded_requirement(
             &self,
-            requirement: &deps_core::VersionReq,
+            requirement: deps_core::lsp_helpers::BoundedVersionReq<'_>,
         ) -> Option<Box<dyn deps_core::lsp_helpers::RequirementMatcher>> {
+            let requirement = requirement.get();
             deps_core::lsp_helpers::compile_semver_requirement(requirement)
         }
     }
@@ -2896,7 +2897,7 @@ mod tests {
 
     /// Like [`fallback_scenario_analysis`], but with a caller-controlled declared requirement
     /// and full `available` list — needed to exercise [`RealSemverFormatter`]'s real
-    /// `compile_requirement` guard (fix-cycle item 1/S1, tester Gap C) end to end through
+    /// `compile_bounded_requirement` guard (fix-cycle item 1/S1, tester Gap C) end to end through
     /// [`plan_updates`]/[`resolve_occurrence`], not just the isolated helper.
     fn real_semver_scenario(
         req: &str,
@@ -3171,7 +3172,7 @@ mod tests {
             },
         );
         analysis.fallback_status = Some(fallback_status);
-        // Spec 076: reaching `Applied` needs a real `compile_requirement` (the Go-bypass
+        // Spec 076: reaching `Applied` needs a real `compile_bounded_requirement` (the Go-bypass
         // `FALLBACK_FORMATTER` no longer short-circuits the guard, FR-022) and a working
         // re-parse (FR-024).
         let reparse = reparse_quoted_deps(vec![("pkg", Position::new(0, 7))]);

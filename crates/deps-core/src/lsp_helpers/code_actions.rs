@@ -230,7 +230,7 @@ fn build_unsatisfiable_fix_action(
     formatter: &dyn EcosystemFormatter,
 ) -> Option<UnsatisfiableFixAction> {
     // #1370: central placeholder gate — an unexpanded placeholder has no concrete version
-    // text a fix action could ever replace, independent of whether `compile_requirement`
+    // text a fix action could ever replace, independent of whether `compile_bounded_requirement`
     // happens to also return `None` for it.
     if requirement_is_placeholder_for(formatter, dep, version_req.as_str()) {
         return None;
@@ -3199,7 +3199,7 @@ mod tests {
         use super::*;
         use std::collections::HashMap;
 
-        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but
+        /// Same exact-match `compile_bounded_requirement` as [`ExactMatchFormatter`], but
         /// `format_version_replacing` always returns a fixed text that stays
         /// unsatisfiable against any `available` list not literally containing it —
         /// simulating a pypi/gradle-style override that preserves operator style
@@ -3227,9 +3227,9 @@ mod tests {
         }
 
         impl RequirementResolution for NonFixingFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }
@@ -3243,7 +3243,7 @@ mod tests {
 
         impl OsvNaming for NonFixingFormatter {}
 
-        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but
+        /// Same exact-match `compile_bounded_requirement` as [`ExactMatchFormatter`], but
         /// `format_version_replacing` always returns the same fixed text regardless of
         /// its input — mirroring PyPI's `truncate_release_to_match`, which can map
         /// distinct registry versions to byte-identical rewritten text (M7 / plan
@@ -3273,9 +3273,9 @@ mod tests {
         }
 
         impl RequirementResolution for CollidingTextFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }
@@ -3289,7 +3289,7 @@ mod tests {
 
         impl OsvNaming for CollidingTextFormatter {}
 
-        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`], but with a
+        /// Same exact-match `compile_bounded_requirement` as [`ExactMatchFormatter`], but with a
         /// non-identity `normalize_package_name`, for the M1 lookup-fallback test.
         struct NormalizingExactFormatter;
 
@@ -3310,9 +3310,9 @@ mod tests {
         }
 
         impl RequirementResolution for NormalizingExactFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }
@@ -3937,7 +3937,7 @@ mod tests {
             );
         }
 
-        /// Same exact-match `compile_requirement` as [`ExactMatchFormatter`] (so an
+        /// Same exact-match `compile_bounded_requirement` as [`ExactMatchFormatter`] (so an
         /// unsatisfiable-fix action would otherwise be offered, and the registry's versions
         /// would otherwise produce REFACTOR "Update to X" items), but
         /// `requirement_is_placeholder` unconditionally returns `true` — #1370 tester gap:
@@ -3958,9 +3958,9 @@ mod tests {
         }
 
         impl RequirementResolution for PlaceholderGatedFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
             }

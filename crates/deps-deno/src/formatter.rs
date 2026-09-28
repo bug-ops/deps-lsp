@@ -9,8 +9,8 @@
 
 use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, warn_rejected_value,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, warn_rejected_value,
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
@@ -110,7 +110,11 @@ impl RequirementResolution for DenoFormatter {
     /// `RequirementMatcher::strict_prerelease_exclusion` also carries over unchanged, so the
     /// unsatisfiable-requirement diagnostic's pre-release hint applies to both `npm:` and
     /// `jsr:` specifiers with no separate flag to declare on this formatter.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         deps_npm::compile_node_semver_range(requirement)
     }
 
@@ -201,6 +205,7 @@ impl OsvNaming for DenoFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementGate;
 
     use deps_core::test_util::capture_tracing_output;
 
@@ -214,7 +219,7 @@ mod tests {
     // capture_tracing_output-based warn-log tests below (different assertion surface), or
     // the non-literal test_validate_package_name_jsr_rejects_overlong_segment (`.repeat`
     // boundary), both of which stay hand-written. No `version_roundtrip` — this formatter
-    // has no `version_satisfies_requirement` override, only `compile_requirement`, whose
+    // has no `version_satisfies_requirement` override, only `compile_bounded_requirement`, whose
     // matcher is exercised directly by the hand-written tests below.
     deps_core::formatter_conformance! {
         mod deno_formatter_conformance;
@@ -311,7 +316,7 @@ mod tests {
         assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
-    /// #1639: `DenoFormatter::compile_requirement` delegates entirely to
+    /// #1639: `DenoFormatter::compile_bounded_requirement` delegates entirely to
     /// `deps_npm::parse_range_safe`, so it must inherit that fix's "any version" resolution
     /// for a wildcard-major tilde requirement, whether bare (`~*`/`~x`/`~X`) or with trailing
     /// components (`~>x.2.3`) — npm's own semantics, not an unresolved requirement (matches
@@ -364,7 +369,7 @@ mod tests {
     #[test]
     fn test_compile_requirement_dist_tag_returns_none() {
         // M6: dist-tags like `npm:react@latest` fail `node_semver::Range::parse`, so
-        // `compile_requirement` correctly returns `None` — matching how package.json
+        // `compile_bounded_requirement` correctly returns `None` — matching how package.json
         // already handles dist-tags, not an accident.
         let formatter = DenoFormatter;
         assert!(
@@ -494,7 +499,7 @@ mod tests {
         );
     }
 
-    /// #1601 impl-critic M4: Deno's `compile_requirement` delegates entirely to
+    /// #1601 impl-critic M4: Deno's `compile_bounded_requirement` delegates entirely to
     /// `deps_npm::compile_node_semver_range`, so it must inherit `NodeSemverMatcher`'s
     /// OR-alternation-gap detection unchanged — not previously covered by a direct test here,
     /// unlike npm's own `formatter.rs`/`ecosystem.rs` suites.

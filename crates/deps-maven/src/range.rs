@@ -54,7 +54,7 @@ pub fn is_range(requirement: &str) -> bool {
 /// range its author intended, so treating it as satisfied by the well-formed members alone
 /// would be misleading, not just a missing feature.
 ///
-/// Used by `MavenFormatter::compile_requirement` to parse the requirement once per
+/// Used by `MavenFormatter::compile_bounded_requirement` to parse the requirement once per
 /// dependency; the resulting `Vec<VersionRange>` is then tested against each candidate
 /// version via `satisfies_ranges` with no re-parsing.
 pub(crate) fn parse_range(requirement: &str) -> Option<Vec<VersionRange>> {
@@ -113,7 +113,7 @@ pub(crate) fn explicitly_excludes(version: &str, ranges: &[VersionRange]) -> boo
 ///
 /// Convenience wrapper around `parse_range` + `satisfies_ranges` for callers that don't
 /// need to test more than one candidate against the same requirement (unlike
-/// `MavenFormatter::compile_requirement`, which parses once via `parse_range` and reuses it).
+/// `MavenFormatter::compile_bounded_requirement`, which parses once via `parse_range` and reuses it).
 pub fn satisfies(version: &str, requirement: &str) -> bool {
     match parse_range(requirement) {
         Some(ranges) => satisfies_ranges(version, &ranges),

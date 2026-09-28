@@ -1,10 +1,10 @@
 //! Version formatting for the NuGet ecosystem.
 
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
     compile_requirement_unless, format_version_replacing_by_shape,
-    requirement_contains_template_placeholder, requirement_is_oversized,
+    requirement_contains_template_placeholder,
 };
 use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
 
@@ -25,11 +25,11 @@ fn is_valid_nuget_id(name: &str) -> bool {
 }
 
 /// NuGet interval/floating-pattern matcher, compiled once per dependency by
-/// [`NuGetFormatter::compile_requirement`] — the range or floating pattern is parsed once
+/// [`NuGetFormatter::compile_bounded_requirement`] — the range or floating pattern is parsed once
 /// here rather than being re-parsed for every candidate version scanned. Always decidable
 /// (`Some`) — matching a candidate against an already-parsed range/pattern has no separate
 /// "candidate failed to parse" signal, only "range/pattern failed to parse" (already ruled
-/// out by `compile_requirement` before this is constructed).
+/// out by `compile_bounded_requirement` before this is constructed).
 enum NuGetMatcher {
     Range(crate::version::VersionRange),
     Float(crate::version::FloatPattern),
@@ -111,7 +111,7 @@ impl PackageRendering for NuGetFormatter {
     /// Delegates to the shared [`format_version_replacing_by_shape`] with [`bare_meaning`] of
     /// [`EcosystemId::NuGet`] (#1602: [`BareMeaning::Floor`][bm]) — NuGet's bare
     /// `Version="1.0.0"` is a minimum-only floor (see
-    /// [`RequirementResolution::is_requirement_up_to_date`]'s own doc), not an auto-following
+    /// [`RequirementResolution::is_bounded_requirement_up_to_date`]'s own doc), not an auto-following
     /// range: collapsing a bounded interval (`[1.0,2.0)`), a floating pattern (`1.1.*`,
     /// `1.2.0-rc.*`), or a bracket-wrapped exact pin (`[1.0.0]`) to bare would silently drop
     /// its upper bound, widening what the requirement accepts instead of updating it.
@@ -141,7 +141,7 @@ impl RequirementResolution for NuGetFormatter {
     /// `0.0.0`-shaped floor matching almost any version — mirrors `MavenFormatter`'s identical
     /// "skip comparison" precedent for its own unresolved-property case, and is what
     /// `deps_core::lsp_helpers::in_use_version`'s `version_matches_requirement` (its
-    /// `compile_requirement`-`None` fallback) calls this method for.
+    /// `compile_bounded_requirement`-`None` fallback) calls this method for.
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         if self.requirement_is_unresolved(&VersionReq::new(requirement)) {
             return true;
@@ -170,20 +170,12 @@ impl RequirementResolution for NuGetFormatter {
     /// `0.0.0`-shaped floor that every `latest` compares `>=` against — the same
     /// false-"satisfied" coercion [`Self::version_satisfies_requirement`]'s guard above
     /// prevents, needed separately here since this floor branch never calls that method.
-    ///
-    /// #1627 S1: this override bypasses [`RequirementResolution::is_requirement_up_to_date`]'s
-    /// shared default entirely, so its own `requirement_is_oversized` gate never ran for
-    /// NuGet — an oversized requirement reached `compare_minimum_floor`/
-    /// `version_satisfies_requirement` uncapped. Gated here too, same `true` (suppress)
-    /// semantics as the shared default.
-    fn is_requirement_up_to_date(
+    fn is_bounded_requirement_up_to_date(
         &self,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> bool {
-        if requirement_is_oversized(requirement) {
-            return true;
-        }
+        let requirement = requirement.get();
         if self.requirement_is_unresolved(requirement) {
             return true;
         }
@@ -201,7 +193,7 @@ impl RequirementResolution for NuGetFormatter {
     /// `@(ItemList)`) inside a version string — most commonly `[$(MinVersion),$(MaxVersion))`.
     /// `crate::version::parse_range` rejects the bracketed `$(...)` form outright (#821:
     /// its parentheses trip the shared grammar's nested-bracket guard), which
-    /// `compile_requirement` alone would already treat as undecidable — but without this
+    /// `compile_bounded_requirement` alone would already treat as undecidable — but without this
     /// guard, `requirement_status` would classify it as a generic malformed requirement
     /// instead of the more specific `Unresolved` status, losing the "not yet expanded, skip
     /// the check" diagnostic distinction. A bare `$(X)`/`%(X)`/`@(X)` (unbracketed) has no
@@ -230,7 +222,7 @@ impl RequirementResolution for NuGetFormatter {
     }
 
     /// Uses [`compile_requirement_unless`] (see that function and
-    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate rejects a syntactically malformed range or floating pattern
     /// (parsing fails) — without this guard, a malformed requirement string would make
@@ -251,7 +243,11 @@ impl RequirementResolution for NuGetFormatter {
     // `compile_requirement_unless`'s contract only invokes the build closure when the
     // undecidable predicate returned `false`, i.e. parsing already succeeded.
     #[allow(clippy::expect_used)]
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
@@ -279,35 +275,27 @@ impl RequirementResolution for NuGetFormatter {
         }
     }
 
-    /// Overridden for the same reason as [`Self::is_requirement_up_to_date`]: a bare or
+    /// Overridden for the same reason as [`Self::is_bounded_requirement_up_to_date`]: a bare or
     /// explicit open-ended-minimum requirement (`1.0.0`, `[1.0.0,)`) is a floor NuGet resolves
     /// to its *lowest* admissible member, not an auto-following range — the base default
-    /// (`compile_requirement(..).matches(target)`, true for any version at or above the
+    /// (`compile_bounded_requirement(..).matches(target)`, true for any version at or above the
     /// floor) would wrongly say "no edit needed" for exactly the shape that needs one, since
     /// leaving the manifest unedited keeps restoring the vulnerable floor version (#1344 C1).
     /// Every other shape (exact pins, bounded/maximum ranges, floating patterns like `1.1.*`)
     /// already expresses a genuine forward-compatibility window, so those keep the base
-    /// default via `compile_requirement`.
-    ///
-    /// #1627 S1: this override bypasses [`RequirementResolution::requirement_already_resolves_to`]'s
-    /// shared default entirely, so its own `requirement_is_oversized` gate never ran for
-    /// NuGet — an oversized requirement reached `compare_minimum_floor`/`compile_requirement`
-    /// uncapped. Gated here too, same `false` (fail-closed) semantics as the shared default.
-    fn requirement_already_resolves_to(
+    /// default via `compile_bounded_requirement`.
+    fn bounded_requirement_already_resolves_to(
         &self,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         target: &ConcreteVersion,
     ) -> bool {
-        if requirement_is_oversized(requirement) {
-            return false;
-        }
         let requirement_str = requirement.as_str();
         let is_floor = !requirement_str.contains('*')
             && crate::version::compare_minimum_floor(requirement_str, target.as_str()).is_some();
         if is_floor {
             return false;
         }
-        self.compile_requirement(requirement)
+        self.compile_bounded_requirement(requirement)
             .is_some_and(|matcher| matcher.matches(target) == Some(true))
     }
 }
@@ -334,6 +322,7 @@ impl OsvNaming for NuGetFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementGate;
 
     #[test]
     fn test_format_version() {
@@ -424,7 +413,7 @@ mod tests {
     // test_validate_package_name_accepts_underscore_as_word_character/
     // test_validate_package_name_accepts_unresolved_msbuild_property/
     // test_validate_package_name_rejects_invalid_names. Does not cover
-    // `is_requirement_up_to_date` (a distinct method from `version_satisfies_requirement`) or
+    // `is_bounded_requirement_up_to_date` (a distinct method from `version_satisfies_requirement`) or
     // the non-literal `test_validate_package_name_rejects_too_long`, which stay hand-written.
     deps_core::formatter_conformance! {
         mod nuget_formatter_conformance;
@@ -534,7 +523,7 @@ mod tests {
         );
     }
 
-    /// Code-review finding 1: `is_requirement_up_to_date`'s `compare_minimum_floor` branch
+    /// Code-review finding 1: `is_bounded_requirement_up_to_date`'s `compare_minimum_floor` branch
     /// never calls `version_satisfies_requirement`, so it needs its own unresolved-requirement
     /// guard — without it, `$(Property)` would coerce to a `0.0.0` floor that every `latest`
     /// compares `>=` against, reporting "up to date" for the wrong reason (right answer,
@@ -549,7 +538,7 @@ mod tests {
     }
 
     /// Code-review finding 1: `version_satisfies_requirement` is `in_use_version.rs`'s
-    /// `version_matches_requirement` fallback whenever `compile_requirement` returns `None` —
+    /// `version_matches_requirement` fallback whenever `compile_bounded_requirement` returns `None` —
     /// now the case for every `$(...)` requirement — so it must not coerce the unparseable core
     /// to a `0.0.0` floor that matches almost any candidate.
     #[test]
@@ -652,7 +641,7 @@ mod tests {
     #[test]
     fn test_compile_requirement_bare_floor_satisfiable() {
         // A bare version is a minimum-floor requirement under `satisfies` (unlike
-        // `is_requirement_up_to_date`'s floor-pin override) — any version `>= floor` counts
+        // `is_bounded_requirement_up_to_date`'s floor-pin override) — any version `>= floor` counts
         // as a match for the unsatisfiable check.
         let f = NuGetFormatter;
         let matcher = f
@@ -662,7 +651,7 @@ mod tests {
         assert_eq!(matcher.matches(&ConcreteVersion::new("0.9.0")), Some(false));
     }
 
-    /// The malformed-requirement guard this formatter's `compile_requirement` adds — the
+    /// The malformed-requirement guard this formatter's `compile_bounded_requirement` adds — the
     /// same class of fix Maven/Gradle carry, but previously untested for NuGet.
     #[test]
     fn test_compile_requirement_malformed_range_returns_none() {
@@ -673,7 +662,7 @@ mod tests {
         );
     }
 
-    /// #821: `compile_requirement` must classify these as undecidable (no diagnostic), the
+    /// #821: `compile_bounded_requirement` must classify these as undecidable (no diagnostic), the
     /// same treatment Maven/Gradle already give them, instead of the previous behavior where
     /// `crate::version::parse_range`'s independent, less-hardened grammar silently accepted
     /// them and made every candidate compare as satisfied.
@@ -698,8 +687,8 @@ mod tests {
 
     /// A bare `$(SomeProperty)` reference previously parsed as an ordinary
     /// `VersionRange::Minimum` floor (no bracket for `parse_range`'s nested-bracket guard to
-    /// trip on), so `compile_requirement` would decisively (and wrongly) report every
-    /// candidate as satisfying it. See [`NuGetFormatter::compile_requirement`]'s doc for why
+    /// trip on), so `compile_bounded_requirement` would decisively (and wrongly) report every
+    /// candidate as satisfying it. See [`NuGetFormatter::compile_bounded_requirement`]'s doc for why
     /// this is defense-in-depth rather than a fix for a live code path: were this text ever to
     /// reach `deps-cli update --security-only`'s `requirement_already_admits_fix` gate, it
     /// would rely on exactly this wrong answer — but `version_requirement()` is already `None`
@@ -854,12 +843,12 @@ mod tests {
         );
     }
 
-    // --- requirement_already_resolves_to (#1344 C1) ---
+    // --- bounded_requirement_already_resolves_to (#1344 C1) ---
 
     #[test]
     fn test_requirement_already_resolves_to_bare_floor_is_false() {
         let f = NuGetFormatter;
-        // The base default (`compile_requirement(..).matches(..)`) would say `true` here —
+        // The base default (`compile_bounded_requirement(..).matches(..)`) would say `true` here —
         // any version at or above the floor is a matcher hit — which is exactly the bug: a
         // bare floor never auto-follows forward, so the override must refuse it.
         assert!(!f.requirement_already_resolves_to(
@@ -876,7 +865,7 @@ mod tests {
     fn test_requirement_already_resolves_to_open_ended_minimum_bracket_form_is_false() {
         let f = NuGetFormatter;
         // Same floor shape as a bare version, spelled with explicit interval brackets — must
-        // classify identically (mirrors `is_requirement_up_to_date`'s own bracket-form tests).
+        // classify identically (mirrors `is_bounded_requirement_up_to_date`'s own bracket-form tests).
         assert!(!f.requirement_already_resolves_to(
             &VersionReq::new("[1.0.0,)"),
             &ConcreteVersion::new("1.0.2")
@@ -886,7 +875,7 @@ mod tests {
     #[test]
     fn test_requirement_already_resolves_to_exact_pin_is_false() {
         let f = NuGetFormatter;
-        // An exact pin's `compile_requirement` matcher already rejects any other version, so
+        // An exact pin's `compile_bounded_requirement` matcher already rejects any other version, so
         // this stays `false` via the base default (`compare_minimum_floor` returns `None` for
         // an exact pin, falling through).
         assert!(!f.requirement_already_resolves_to(

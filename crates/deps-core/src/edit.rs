@@ -10,9 +10,9 @@
 //! and spec 063 applied to [`crate::Dependency`]/[`crate::lockfile::LockFileCache`].
 
 use crate::lsp_helpers::{
-    EcosystemFormatter, LineOffsetTable, RequirementStatus, RequirementStatusGate, VersionData,
-    is_safe_version_string, literal_span_matches, requirement_is_oversized, resolve_in_use_version,
-    slice_for_range, strip_whitespace, warn_rejected_value,
+    EcosystemFormatter, LineOffsetTable, RequirementGate, RequirementStatus, VersionData,
+    is_safe_version_string, literal_span_matches, resolve_in_use_version, slice_for_range,
+    strip_whitespace, warn_rejected_value,
 };
 use crate::{ConcreteVersion, Dependency, ParseResult, VersionReq};
 
@@ -1185,12 +1185,12 @@ pub fn resolve_verified_fix(
 /// does: Maven and Gradle have none, and a NuGet project's is opt-in. For those, suppression
 /// is instead because the requirement already structurally expresses the fix — e.g. a Maven
 /// dynamic range/`LATEST`/`SNAPSHOT` resolves it at build time — not because of any lock
-/// file). `requirement_already_resolves_to`'s default asks only "is the fix a member of the
+/// file). `bounded_requirement_already_resolves_to`'s default asks only "is the fix a member of the
 /// requirement's accepted set", correct for a requirement a resolver picks its *newest*
 /// admissible member from, but wrong for one a resolver instead pins to its *lowest*
 /// admissible member (NuGet's bare `Version="1.0.0"` floor, #1344) — ecosystems with that
 /// resolution shape override the method rather than relying on the default; see
-/// `deps-nuget`'s override. Ecosystems with no `compile_requirement` override (GitHub Actions,
+/// `deps-nuget`'s override. Ecosystems with no `compile_bounded_requirement` override (GitHub Actions,
 /// GitLab CI — SHA/tag pins, not version ranges) fall through to the textual no-op guard as
 /// the only available signal. Originally only checked by `deps-cli update --security-only`'s
 /// `classify_vulnerable_dependency` (#1329); moved here so `deps-lsp`'s vulnerability-fix code
@@ -1315,7 +1315,7 @@ pub fn plan_verified_fix(
     formatter: &dyn EcosystemFormatter,
 ) -> Result<PlannedUpdate, VulnFixSkip> {
     // #1370: central placeholder gate, checked first — an unexpanded placeholder has no
-    // concrete version text to replace, independent of whether `requirement_already_resolves_to`
+    // concrete version text to replace, independent of whether `bounded_requirement_already_resolves_to`
     // or the formatter's own rewrite logic would coincidentally treat it as safe. Checked
     // against `current` (the exact text a caller is about to consider rewriting), not
     // `dep.version_requirement()`, since a caller may reach this with `current` derived from
@@ -1325,14 +1325,9 @@ pub fn plan_verified_fix(
     }
 
     let fix_concrete = ConcreteVersion::new(version_native);
-    // #1472 defense-in-depth: an oversized requirement is treated as not already resolving to
-    // the fix (same `None -> false` collapse the default `requirement_already_resolves_to`
-    // already applies for an uncompilable requirement) — gated at this call site since NuGet's
-    // override bypasses the default entirely rather than delegating to it.
     let requirement_already_resolves_to_fix =
         dep.version_requirement().is_some_and(|version_req| {
-            !requirement_is_oversized(version_req)
-                && formatter.requirement_already_resolves_to(version_req, &fix_concrete)
+            formatter.requirement_already_resolves_to(version_req, &fix_concrete)
         });
     if requirement_already_resolves_to_fix {
         return Err(VulnFixSkip::RequirementAlreadyResolves);
@@ -1736,9 +1731,9 @@ mod tests {
                 }
             }
             impl crate::lsp_helpers::RequirementResolution for NoOpFormatter {
-                fn is_requirement_up_to_date(
+                fn is_bounded_requirement_up_to_date(
                     &self,
-                    _requirement: &crate::VersionReq,
+                    _requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
                     _latest: &ConcreteVersion,
                 ) -> bool {
                     false
@@ -1828,9 +1823,9 @@ mod tests {
                 }
             }
             impl crate::lsp_helpers::RequirementResolution for ShaPinResolvedFormatter {
-                fn is_requirement_up_to_date(
+                fn is_bounded_requirement_up_to_date(
                     &self,
-                    _requirement: &crate::VersionReq,
+                    _requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
                     _latest: &ConcreteVersion,
                 ) -> bool {
                     false
@@ -1974,7 +1969,7 @@ mod tests {
         }
 
         /// #1472 defense-in-depth: an oversized requirement must not trip
-        /// `RequirementAlreadyResolves`, even when `requirement_already_resolves_to` would
+        /// `RequirementAlreadyResolves`, even when `bounded_requirement_already_resolves_to` would
         /// otherwise report `true` — proven via `ExactMatchFormatter`'s exact string-equality
         /// matcher, so an oversized requirement identical to the fix target trivially "already
         /// resolves" without the gate. With the gate, planning proceeds past that check and
@@ -2021,7 +2016,7 @@ mod tests {
             assert_eq!(planned.target.as_str(), "1.0.2");
         }
 
-        /// An ecosystem with no `compile_requirement` override (e.g. GitHub Actions/GitLab CI)
+        /// An ecosystem with no `compile_bounded_requirement` override (e.g. GitHub Actions/GitLab CI)
         /// has no comparator to consult, so the gate is inert and the textual no-op guard is
         /// the only available signal — a genuinely different target must still be planned.
         #[test]
@@ -2051,7 +2046,7 @@ mod tests {
 
         /// A genuine textual no-op — the formatter's rewrite is byte-identical to the literal
         /// fallback `current` text — must be `VulnFixSkip::NoOpRewrite`, distinct from
-        /// `RequirementAlreadyResolves` above (no `compile_requirement` override here, so that
+        /// `RequirementAlreadyResolves` above (no `compile_bounded_requirement` override here, so that
         /// gate never fires; this is the plain textual guard alone).
         #[test]
         fn test_true_no_op_rewrite_is_rejected() {
@@ -2121,10 +2116,10 @@ mod tests {
 
         /// A synthetic formatter mimicking a resolver that pins a bare requirement to its
         /// *lowest* admissible member (NuGet's bare `Version="1.0.0"` floor, #1344 C1) rather
-        /// than following forward to the newest one. Its raw `compile_requirement` matcher is
+        /// than following forward to the newest one. Its raw `compile_bounded_requirement` matcher is
         /// deliberately permissive (matches any version at or above the floor, exactly like
         /// NuGet's `Minimum` shape) so this test proves `plan_vulnerability_fix` consults
-        /// `requirement_already_resolves_to`'s override — which correctly refuses to
+        /// `bounded_requirement_already_resolves_to`'s override — which correctly refuses to
         /// suppress — rather than the raw matcher alone.
         struct FloorFormatter;
 
@@ -2149,16 +2144,16 @@ mod tests {
             }
         }
         impl RequirementResolution for FloorFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &crate::VersionReq,
+                requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 Some(Box::new(FloorMatcher(requirement.as_str().to_string())))
             }
 
-            fn requirement_already_resolves_to(
+            fn bounded_requirement_already_resolves_to(
                 &self,
-                _requirement: &crate::VersionReq,
+                _requirement: crate::lsp_helpers::BoundedVersionReq<'_>,
                 _target: &ConcreteVersion,
             ) -> bool {
                 // A floor never auto-follows forward — leaving it unedited always keeps
@@ -2172,9 +2167,9 @@ mod tests {
         impl OsvNaming for FloorFormatter {}
 
         /// #1344 C1 regression: a floor-shaped requirement must NOT be suppressed just
-        /// because `compile_requirement`'s raw matcher admits the fix target — the resolver
+        /// because `compile_bounded_requirement`'s raw matcher admits the fix target — the resolver
         /// keeps pinning to the floor, so an edit is still the only way to actually apply the
-        /// fix. See `deps-nuget`'s real `requirement_already_resolves_to` override for the
+        /// fix. See `deps-nuget`'s real `bounded_requirement_already_resolves_to` override for the
         /// concrete regression this mirrors.
         #[test]
         fn test_floor_shaped_requirement_still_returns_planned_edit() {
@@ -2182,7 +2177,7 @@ mod tests {
             let dv = verified_dv("1.0.2");
 
             // Sanity: the raw matcher alone would wrongly admit the fix, if the gate used it
-            // directly instead of `requirement_already_resolves_to`.
+            // directly instead of `bounded_requirement_already_resolves_to`.
             assert_eq!(
                 FloorFormatter
                     .compile_requirement(&crate::VersionReq::new("1.0.0"))

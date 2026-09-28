@@ -330,7 +330,7 @@ mod tests {
     #[test]
     fn npm_dist_tag_parses_but_later_fails_to_compile_as_a_range() {
         // M6: `npm:react@latest` parses fine at the specifier-grammar level; it is
-        // `compile_requirement` (node_semver::Range::parse) that correctly rejects it —
+        // `compile_bounded_requirement` (node_semver::Range::parse) that correctly rejects it —
         // the same as a dist-tag in package.json.
         let parsed = parse_specifier("npm:react@latest").unwrap();
         assert_eq!(parsed.name, "npm:react");

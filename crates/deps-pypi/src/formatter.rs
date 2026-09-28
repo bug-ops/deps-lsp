@@ -2,16 +2,15 @@ use deps_core::ConcreteVersion;
 use deps_core::Dependency;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
-use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
 };
 use pep440_rs::{Operator, Version, VersionSpecifiers};
 use std::str::FromStr;
 
 /// Precise PEP 440 specifier-set matcher, compiled once per dependency by
-/// [`PypiFormatter::compile_requirement`].
+/// [`PypiFormatter::compile_bounded_requirement`].
 struct Pep440Matcher(VersionSpecifiers);
 
 impl RequirementMatcher for Pep440Matcher {
@@ -200,7 +199,11 @@ impl RequirementResolution for PypiFormatter {
     /// positive.
     ///
     /// [local version identifier]: https://peps.python.org/pep-0440/#local-version-identifiers
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
@@ -271,6 +274,8 @@ fn truncate_release_to_match(source_version: &str, latest: &str) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
+    use deps_core::lsp_helpers::RequirementGate;
 
     /// FR-009: `Registry` and `AlternateRegistry` both resolve; `CustomRegistry` and every
     /// non-registry source stay fail-closed via the default `is_version_resolvable()`.

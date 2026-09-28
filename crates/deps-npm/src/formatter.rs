@@ -1,6 +1,6 @@
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 use std::borrow::Cow;
@@ -393,8 +393,8 @@ fn node_semver_or_gap_excludes(branches: &[node_semver::Range], version: &str) -
 /// Compiles `requirement` as a `node_semver::Range`, the grammar npm's registry and JSR both
 /// use for matching.
 ///
-/// The single source of truth for `deps-npm`'s own [`NpmFormatter::compile_requirement`] and
-/// `deps-deno`'s `DenoFormatter::compile_requirement` (#1478).
+/// The single source of truth for `deps-npm`'s own [`NpmFormatter::compile_bounded_requirement`] and
+/// `deps-deno`'s `DenoFormatter::compile_bounded_requirement` (#1478).
 ///
 /// Guards against an unresolved placeholder itself (#1374/#1377): a requirement for which
 /// `deps_core::lsp_helpers::requirement_contains_template_placeholder` says `true` never
@@ -576,7 +576,11 @@ impl RequirementResolution for NpmFormatter {
     /// does not reuse (see that method's docs). The unresolved-placeholder guard
     /// (#1374/#1377) now lives inside `compile_node_semver_range` itself; see its doc for why
     /// that's safe without an extra `self.requirement_is_unresolved` check here.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         compile_node_semver_range(requirement)
     }
 
@@ -638,6 +642,7 @@ impl OsvNaming for NpmFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementGate;
 
     /// O2: npm never offers the #205 "Replace with X" rename action — its only
     /// successor signal is free text (`deprecated`'s message), and regex-extracting a
@@ -858,7 +863,7 @@ mod tests {
     /// #1639: `node_semver` 2.2.0 hits an internal `unreachable!()` (rather than returning
     /// `Err`) for a *bare* tilde requirement whose partial version has a wildcard major
     /// (`~*`/`~x`/`~X`, any trailing components) — reachable straight from `package.json` via
-    /// `compile_requirement`. Real npm resolves all of these to "any version" (live-verified),
+    /// `compile_bounded_requirement`. Real npm resolves all of these to "any version" (live-verified),
     /// so `parse_range_safe` now resolves them precisely instead of just catching the panic —
     /// asserted here by confirming the matcher admits an arbitrary version.
     #[test]

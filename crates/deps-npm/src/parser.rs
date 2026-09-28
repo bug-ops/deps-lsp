@@ -447,7 +447,7 @@ struct NpmAlias {
 /// silently truncated.
 ///
 /// A dist-tag alias (`"npm:react@beta"`, `"npm:foo@latest"`) is legal npm syntax but not a
-/// semver range `NpmFormatter::compile_requirement`'s `node_semver::Range` can parse, which
+/// semver range `NpmFormatter::compile_bounded_requirement`'s `node_semver::Range` can parse, which
 /// would otherwise silently match no version at all — treated the same as the
 /// missing-version case below.
 ///

@@ -4,7 +4,7 @@ use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
 use super::diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 use super::{
-    EcosystemFormatter, LatestVerdict, RequirementStatus, RequirementStatusGate, VersionData,
+    EcosystemFormatter, LatestVerdict, RequirementGate, RequirementStatus, VersionData,
     in_use_version, latest_verdict, sanitize_and_truncate_for_diagnostic,
 };
 

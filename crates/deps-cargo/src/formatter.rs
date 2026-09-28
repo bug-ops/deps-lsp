@@ -1,10 +1,10 @@
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
     compile_semver_requirement, format_version_replacing_by_shape,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName};
 
 /// Maximum crate name length this diagnostic accepts.
 ///
@@ -149,7 +149,11 @@ impl RequirementResolution for CargoFormatter {
     /// semantics (`^`, `~`, comparator lists), the same crate `deps-cargo`'s registry uses for
     /// matching, unlike the default `version_satisfies_requirement` heuristic this method
     /// deliberately does not reuse (see that method's docs). Shared with `deps-swift` (#1495).
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
@@ -200,6 +204,8 @@ impl OsvNaming for CargoFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
+    use deps_core::lsp_helpers::RequirementGate;
 
     // #758: exact-value `EcosystemFormatter` conformance, replacing several hand-written
     // tests. The remaining validate_package_name tests below stay hand-written: they assert
@@ -542,7 +548,7 @@ mod tests {
     /// §3.1 worked example: an ordinary comparator-list requirement, which
     /// `version_satisfies_requirement`'s loose heuristic (no `^`/`~` prefix, three dot
     /// segments so `is_partial_version` is false) incorrectly rejects. The precise
-    /// `compile_requirement` matcher must accept it.
+    /// `compile_bounded_requirement` matcher must accept it.
     #[test]
     fn test_compile_requirement_comparator_list_satisfiable() {
         let formatter = CargoFormatter;
