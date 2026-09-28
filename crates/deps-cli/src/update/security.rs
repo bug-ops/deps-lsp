@@ -304,7 +304,7 @@ fn classify_vulnerable_dependency(
         return requires_lockfile_update_item(
             dep,
             current,
-            &version_native,
+            deps_core::ConcreteVersion::new(version_native),
             &fix.advisory_ids,
             ignore_rule_overridden,
         );
@@ -314,7 +314,7 @@ fn classify_vulnerable_dependency(
         return requires_lockfile_update_item(
             dep,
             current,
-            &version_native,
+            deps_core::ConcreteVersion::new(version_native),
             &fix.advisory_ids,
             ignore_rule_overridden,
         );
@@ -357,7 +357,7 @@ fn classify_vulnerable_dependency(
         Ok(planned) => PlannedUpdateItem::new(
             dep.name().as_str().to_string(),
             current,
-            version_native,
+            Some(deps_core::ConcreteVersion::new(version_native)),
             Outcome::Applied(planned.edit),
             fix.advisory_ids,
             ignore_rule_overridden,
@@ -373,7 +373,7 @@ fn classify_vulnerable_dependency(
         Err(VulnFixSkip::RequirementAlreadyResolves) => requires_lockfile_update_item(
             dep,
             current,
-            &version_native,
+            deps_core::ConcreteVersion::new(version_native),
             &fix.advisory_ids,
             ignore_rule_overridden,
         ),
@@ -434,7 +434,7 @@ fn classify_vulnerable_dependency(
                 requires_lockfile_update_item(
                     dep,
                     current,
-                    &version_native,
+                    fix_concrete,
                     &fix.advisory_ids,
                     ignore_rule_overridden,
                 )
@@ -503,7 +503,7 @@ fn skipped_not_requested(
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
-        String::new(),
+        None,
         Outcome::Skipped(crate::update::SkipReason::NotRequested),
         Vec::new(),
         false,
@@ -521,7 +521,7 @@ fn unfixable_item(
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
-        String::new(),
+        None,
         Outcome::Unfixable(reason),
         Vec::new(),
         ignore_rule_overridden,
@@ -533,14 +533,14 @@ fn unfixable_item(
 fn requires_lockfile_update_item(
     dep: &dyn deps_core::Dependency,
     current: CurrentVersion,
-    target: &str,
+    target: deps_core::ConcreteVersion,
     advisory_ids: &[String],
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
-        target.to_string(),
+        Some(target),
         Outcome::RequiresLockfileUpdate,
         advisory_ids.to_vec(),
         ignore_rule_overridden,
@@ -904,7 +904,7 @@ mod tests {
             &IgnoreRules::empty(),
         );
         assert!(matches!(item.outcome, Outcome::Applied(_)));
-        assert_eq!(item.target, "1.0.2");
+        assert_eq!(item.target, Some(deps_core::ConcreteVersion::from("1.0.2")));
     }
 
     /// C1 (critical): a `Vulnerable` dependency with no declared `version_requirement()` at
@@ -983,7 +983,7 @@ mod tests {
             &IgnoreRules::empty(),
         );
         assert!(matches!(item.outcome, Outcome::RequiresLockfileUpdate));
-        assert_eq!(item.target, "1.0.2");
+        assert_eq!(item.target, Some(deps_core::ConcreteVersion::from("1.0.2")));
     }
 
     /// Fallback path (GitHub Actions/GitLab CI — no `compile_requirement`): the declared
@@ -1034,6 +1034,10 @@ mod tests {
             ),
             "expected Unfixable(UnsupportedRequirementShape), got {:?}",
             item.outcome
+        );
+        assert_eq!(
+            item.target, None,
+            "an Unfixable item has no concrete target"
         );
         assert!(
             !item.reason().contains("regenerate the lock file"),
@@ -1148,13 +1152,19 @@ mod tests {
             matches!(rewrite_item.outcome, Outcome::Applied(_)),
             "serde's requirement (\"0.9\") does not yet admit 1.0.2, so it must be rewritten"
         );
-        assert_eq!(rewrite_item.target, "1.0.2");
+        assert_eq!(
+            rewrite_item.target,
+            Some(deps_core::ConcreteVersion::from("1.0.2"))
+        );
         assert!(
             matches!(lockfile_item.outcome, Outcome::RequiresLockfileUpdate),
             "tokio's requirement (\"1\") already admits 1.0.2 per spec.md's US-003 fixture, so \
              it must be reported, not rewritten"
         );
-        assert_eq!(lockfile_item.target, "1.0.2");
+        assert_eq!(
+            lockfile_item.target,
+            Some(deps_core::ConcreteVersion::from("1.0.2"))
+        );
     }
 
     /// FR-011: registry fetch failure is `Unfixable`, not silently passed through.

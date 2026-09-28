@@ -247,7 +247,7 @@ mod tests {
             current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
                 "1.0.0",
             )),
-            target: "1.2.0".to_string(),
+            target: Some(deps_core::ConcreteVersion::from("1.2.0")),
             outcome,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
