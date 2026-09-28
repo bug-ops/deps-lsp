@@ -10,6 +10,7 @@ use deps_core::lsp_helpers::{
     match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
+use std::borrow::Cow;
 
 /// Whether `segment` matches Packagist's vendor/package name-segment charset: starts and ends
 /// with an ASCII alphanumeric character, with only `.`, `_`, `-` allowed in between (Composer's
@@ -86,31 +87,68 @@ impl RequirementMatcher for ComposerMatcher {
     }
 }
 
-/// Shared OR (`||`)/AND (whitespace)-splitting tree-walker for Composer's requirement
-/// grammar, including its `v`-prefix and `@stability`-flag stripping — the traversal
-/// [`ComposerFormatter::version_satisfies_requirement`] and [`composer_explicitly_excludes`]
-/// both need identically (PR #1589 had to fix the same `normalize_operator_spacing` spacing
-/// bug in both functions because they did not share this walker; #1591 extracted it).
+/// Strips a leading `v`/`V` and a trailing `@stability` flag from one OR-branch (or the
+/// whole requirement, before any `||` split), returning `None` for the wildcard sentinel
+/// (empty, or `*`) — shared by [`walk_requirement`] and the OR-gap bound derivation
+/// ([`composer_or_gap_excludes`]), which both need this per-branch normalization.
+fn strip_branch_affixes(branch: &str) -> Option<&str> {
+    let branch = branch.trim();
+    // Only strip when it leaves something behind — a bare "v"/"V" branch must fall through
+    // to the exact/partial match, not collapse to "" and hit the wildcard guard below.
+    let branch = match branch.strip_prefix(['v', 'V']) {
+        Some(rest) if !rest.is_empty() => rest,
+        _ => branch,
+    };
+    // Must run before the operator branches below see the text, or a `@flag` is parsed as
+    // part of the numeric core (#424).
+    let (branch, _stability_flag) = strip_stability_flag(branch);
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "*" {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
+/// Normalizes a top-level comma AND-separator to whitespace — Composer treats the two
+/// identically (`composer/semver`'s `VersionParser::parseConstraints`) — and runs the result
+/// through [`normalize_operator_spacing`]. Shared by [`walk_requirement`]'s AND-splitting and
+/// the OR-gap bound derivation ([`composer_or_gap_excludes`]) so both stay in sync, mirroring
+/// this project's #1596/#1598 admit/exclude-walker dedup precedent.
+fn normalize_and_separators(requirement: &str) -> Cow<'_, str> {
+    if !requirement.contains(',') {
+        return normalize_operator_spacing(requirement);
+    }
+    let comma_normalized = requirement.replace(',', " ");
+    Cow::Owned(normalize_operator_spacing(&comma_normalized).into_owned())
+}
+
+/// Shared OR (`||`)/AND (whitespace or comma)-splitting tree-walker for Composer's
+/// requirement grammar, including its `v`-prefix and `@stability`-flag stripping — the
+/// traversal [`ComposerFormatter::version_satisfies_requirement`] and
+/// [`composer_explicitly_excludes`] both need identically (PR #1589 had to fix the same
+/// `normalize_operator_spacing` spacing bug in both functions because they did not share this
+/// walker; #1591 extracted it). #1603: a comma is Composer's other AND separator
+/// (`">=1.0,<2.0"` == `">=1.0 <2.0"`) and must be split identically to whitespace, or a
+/// comma-joined compound requirement silently collapses to its first clause (`eval_leaf`
+/// strips the leading operator and treats everything after the first comma as part of a
+/// single version string).
+///
+/// Any multi-token result — whether split on comma or whitespace — is always AND-combined
+/// (impl-critic S3 follow-up to #1603): every legitimate single Composer clause (`^`/`~`,
+/// `>=`/`<=`/`>`/`<`/`=`/`!=`, `X.Y.*` wildcard, exact/partial match) is exactly one token
+/// once spacing is normalized, so there is no real single-clause shape with an internal
+/// space to protect against splitting — unlike an earlier version of this function, which
+/// only treated a multi-token run as AND when some token started with `>`/`<`, silently
+/// collapsing e.g. `"^1.0 !=1.2.0"` to just its first token.
 ///
 /// Only leaf evaluation and the AND-group's fold differ between the two callers — see
 /// [`RequirementLeaf`].
 fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &str) -> bool {
     let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
-    let requirement = requirement.trim();
-    // Only strip when it leaves something behind — a bare "v"/"V" requirement must fall
-    // through to the exact/partial match, not collapse to "" and hit the wildcard guard below.
-    let requirement = match requirement.strip_prefix(['v', 'V']) {
-        Some(rest) if !rest.is_empty() => rest,
-        _ => requirement,
-    };
-    // Must run before the operator branches below see `requirement`, or a `@flag` is parsed
-    // as part of the numeric core (#424).
-    let (requirement, _stability_flag) = strip_stability_flag(requirement);
-    let requirement = requirement.trim();
-
-    if requirement.is_empty() || requirement == "*" {
+    let Some(requirement) = strip_branch_affixes(requirement) else {
         return leaf.on_wildcard();
-    }
+    };
 
     if requirement.contains("||") {
         return requirement
@@ -118,19 +156,11 @@ fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &s
             .any(|part| walk_requirement(leaf, version, part.trim()));
     }
 
-    // Runs on every candidate version `ComposerMatcher::matches` checks; borrows unchanged
-    // when there is nothing to collapse, so the common no-spaced-operator case must not allocate.
-    let requirement = normalize_operator_spacing(requirement);
+    let requirement = normalize_and_separators(requirement);
     let requirement = &*requirement;
 
-    // Only treat as an AND-range if there are multiple space-separated tokens that look like
-    // constraints — a bare multi-word string (e.g. "1.0.0" alone) must not be split here.
     let parts: Vec<&str> = requirement.split_whitespace().collect();
-    if parts.len() > 1
-        && parts
-            .iter()
-            .any(|p| p.starts_with('>') || p.starts_with('<'))
-    {
+    if parts.len() > 1 {
         return leaf.combine_and(
             parts
                 .iter()
@@ -138,6 +168,7 @@ fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &s
         );
     }
 
+    let requirement = parts.first().copied().unwrap_or(requirement);
     leaf.eval_leaf(version, requirement)
 }
 
@@ -276,9 +307,276 @@ impl RequirementLeaf for ExcludeLeaf {
 }
 
 /// Thin [`walk_requirement`] wrapper for "does this explicitly ban `version`" — see
-/// [`ExcludeLeaf`].
+/// [`ExcludeLeaf`], combined with the `||`-alternation-gap check (#1601, see
+/// [`composer_or_gap_excludes`]): a `!=` clause and an OR-gap are two independently sufficient
+/// ways Composer can explicitly exclude a version with no single admitted-range ceiling to
+/// blame it on.
 fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
     walk_requirement(&ExcludeLeaf, version, requirement)
+        || composer_or_gap_excludes(version, requirement)
+}
+
+/// One `||`-branch's admitted extent, as far as [`clause_bound`] can characterize it — `None`
+/// on either side means open-ended (or unknown) on that side. See [`branch_bound`]'s doc for
+/// when a whole branch is instead entirely unknown.
+struct BranchBound {
+    lower: Option<(String, bool)>,
+    upper: Option<(String, bool)>,
+}
+
+impl BranchBound {
+    const fn unbounded() -> Self {
+        Self {
+            lower: None,
+            upper: None,
+        }
+    }
+
+    /// Whether this bound's own two edges make it impossible to satisfy (impl-critic M1):
+    /// `lower > upper`, or `lower == upper` with either edge exclusive — the same
+    /// inverted/zero-width-exclusive shape `deps_core::interval::VersionRange::Empty` guards
+    /// against for Maven (#1595). A branch this narrow contributes no valid edge either way
+    /// ([`branch_bound`] treats it the same as an unrecognized clause shape): without this
+    /// check it would otherwise report both "past its own upper edge" and "before its own
+    /// lower edge" simultaneously for every candidate, manufacturing a gap out of a branch
+    /// that never admitted anything in the first place.
+    fn is_unsatisfiable(&self) -> bool {
+        let (Some((lo, lo_incl)), Some((hi, hi_incl))) = (&self.lower, &self.upper) else {
+            return false;
+        };
+        match compare_versions(lo, hi) {
+            ord if ord > 0 => true,
+            0 => !(*lo_incl && *hi_incl),
+            _ => false,
+        }
+    }
+}
+
+/// Strips a leading `v`/`V` from a clause's bound text — the same normalization
+/// [`AdmitLeaf::eval_leaf`]'s own operator branches apply independently of
+/// [`strip_branch_affixes`]'s branch-level strip (a clause may carry its own `v` right after
+/// its operator, e.g. `">=v1.0.0"`).
+fn strip_bound_v(s: &str) -> &str {
+    s.strip_prefix(['v', 'V']).unwrap_or(s)
+}
+
+/// Increments `prefix`'s last dot-segment by one, forming the exclusive upper edge implied by
+/// a wildcard clause (`X.Y.*` -> lower `X.Y`, upper `X.(Y+1)`) — mirrors
+/// [`AdmitLeaf::eval_leaf`]'s wildcard branch exactly (a prefix-of-segments check), just
+/// expressed as a literal boundary value instead of a `starts_with` test.
+fn increment_last_segment(prefix: &str) -> String {
+    let mut parts: Vec<u64> = prefix.split('.').map(|p| p.parse().unwrap_or(0)).collect();
+    match parts.last_mut() {
+        Some(last) => *last = last.saturating_add(1),
+        None => parts.push(1),
+    }
+    parts
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// One AND-clause's contribution to its branch's overall admitted extent (#1601), or `None`
+/// when the clause's admitted set cannot be expressed as a value-based bound independent of a
+/// specific candidate's own segment count or of a known matcher quirk:
+///
+/// - A bare exact/partial-match clause (no operator prefix) has no such bound —
+///   [`AdmitLeaf::eval_leaf`]'s own partial-match branch admits or rejects based on how many
+///   dot-segments the *candidate itself* has relative to the clause, not on a fixed value
+///   range independent of that.
+/// - A caret (`^`) clause has no such bound either: [`satisfies_caret`] only ever compares a
+///   truncated *prefix* of segments (ignoring every segment below the first nonzero one, or
+///   below the minor segment when the major is `0`) and never checks the requirement's own
+///   lower-bound segments below that point — deriving a "textbook" caret bound here would
+///   disagree with what `AdmitLeaf` actually admits.
+/// - Tilde (`~`) is excluded too, for uniformity with caret, even though
+///   [`satisfies_tilde_composer`]'s own bound is well-defined — mixing a caret-adjacent
+///   operator into bound derivation piecemeal is more error-prone than consistently treating
+///   both as "unknown shape".
+///
+/// Excluding these shapes only means some real gaps go undetected — it is always safe, never
+/// incorrect, mirroring `deps-maven`'s own defensive "unknown shape contributes no edge"
+/// pattern in `upper_edge`/`lower_edge`.
+fn clause_bound(clause: &str) -> Option<BranchBound> {
+    if let Some(req) = clause.strip_prefix(">=") {
+        let v = strip_bound_v(req.trim()).to_string();
+        return Some(BranchBound {
+            lower: Some((v, true)),
+            upper: None,
+        });
+    }
+    if let Some(req) = clause.strip_prefix("<=") {
+        let v = strip_bound_v(req.trim()).to_string();
+        return Some(BranchBound {
+            lower: None,
+            upper: Some((v, true)),
+        });
+    }
+    if let Some(req) = clause.strip_prefix('>') {
+        let v = strip_bound_v(req.trim()).to_string();
+        return Some(BranchBound {
+            lower: Some((v, false)),
+            upper: None,
+        });
+    }
+    if let Some(req) = clause.strip_prefix('<') {
+        let v = strip_bound_v(req.trim()).to_string();
+        return Some(BranchBound {
+            lower: None,
+            upper: Some((v, false)),
+        });
+    }
+    if clause.strip_prefix("!=").is_some() {
+        // A `!=` clause punctures a single point rather than restricting the branch's
+        // extent — ExcludeLeaf's own AND-fold already catches this independently, so it must
+        // not narrow the bound derived here.
+        return Some(BranchBound::unbounded());
+    }
+    if let Some(req) = clause.strip_prefix('=') {
+        let v = strip_bound_v(req.trim()).to_string();
+        return Some(BranchBound {
+            lower: Some((v.clone(), true)),
+            upper: Some((v, true)),
+        });
+    }
+    if let Some(prefix) = clause.strip_suffix(".*") {
+        // Code-review finding: every segment must actually be numeric before deriving a
+        // bound — a malformed/typo'd clause like `"abc.*"` must fall through to `None`
+        // (unknown shape) the same as caret/tilde/bare-partial, not silently treat `"abc"`
+        // as version `0` via `increment_last_segment`'s own `parse().unwrap_or(0)` and
+        // fabricate a bound `[0,1)` for a clause that admits nothing at all.
+        if !prefix.is_empty() && prefix.split('.').all(|seg| seg.parse::<u64>().is_ok()) {
+            let lower = prefix.to_string();
+            let upper = increment_last_segment(prefix);
+            return Some(BranchBound {
+                lower: Some((lower, true)),
+                upper: Some((upper, false)),
+            });
+        }
+    }
+    None
+}
+
+/// Compares two optional lower edges and keeps the tighter (larger) one, matching a lower
+/// bound's own AND-intersection: at equal value, an exclusive edge is tighter than inclusive.
+fn tighter_lower(a: Option<(String, bool)>, b: Option<(String, bool)>) -> Option<(String, bool)> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some((av, ai)), Some((bv, bi))) => match compare_versions(&av, &bv) {
+            0 => Some((av, ai && bi)),
+            ord if ord > 0 => Some((av, ai)),
+            _ => Some((bv, bi)),
+        },
+    }
+}
+
+/// Compares two optional upper edges and keeps the tighter (smaller) one — mirrors
+/// [`tighter_lower`].
+fn tighter_upper(a: Option<(String, bool)>, b: Option<(String, bool)>) -> Option<(String, bool)> {
+    match (a, b) {
+        (None, x) | (x, None) => x,
+        (Some((av, ai)), Some((bv, bi))) => match compare_versions(&av, &bv) {
+            0 => Some((av, ai && bi)),
+            ord if ord < 0 => Some((av, ai)),
+            _ => Some((bv, bi)),
+        },
+    }
+}
+
+/// One `||`-branch's overall admitted extent, AND-intersecting its clauses (#1601). Returns
+/// `None` when any clause's shape is unknown to [`clause_bound`], or when the intersected
+/// bound turns out unsatisfiable (impl-critic M1, see [`BranchBound::is_unsatisfiable`]) — the
+/// whole branch is then excluded from OR-gap detection rather than guessing a partial bound
+/// or manufacturing a fake gap out of a branch that never admitted anything (safe: only means
+/// a real gap through this specific branch goes undetected).
+fn branch_bound(branch: &str) -> Option<BranchBound> {
+    let Some(branch) = strip_branch_affixes(branch) else {
+        return Some(BranchBound::unbounded());
+    };
+    let normalized = normalize_and_separators(branch);
+    let normalized = &*normalized;
+    let parts: Vec<&str> = normalized.split_whitespace().collect();
+    let parts: Vec<&str> = if parts.is_empty() {
+        vec![normalized]
+    } else {
+        parts
+    };
+    let mut bound = BranchBound::unbounded();
+    for part in parts {
+        let clause = clause_bound(part)?;
+        bound = BranchBound {
+            lower: tighter_lower(bound.lower, clause.lower),
+            upper: tighter_upper(bound.upper, clause.upper),
+        };
+    }
+    if bound.is_unsatisfiable() {
+        return None;
+    }
+    Some(bound)
+}
+
+/// Whether `version` is explicitly excluded by an OR-alternation gap (#1601, same class as
+/// Maven's #1590 disjoint-range gap): not admitted by any `||`-branch, yet sitting past one
+/// branch's upper edge and before another's lower edge — Composer's counterpart of
+/// `deps-maven`'s `range::explicitly_excludes`, generalized through
+/// [`deps_core::interval::union_gap_excludes`] (the same representation-agnostic predicate
+/// `deps-npm`'s own `||`-gap detection routes through).
+///
+/// Coverage is checked once, up front, via the real matcher
+/// (`ComposerFormatter::version_satisfies_requirement`) over the *whole* original requirement
+/// — not by re-deriving "covered" from the same [`BranchBound`]s used for edge detection
+/// (impl-critic S2): a branch whose bound [`branch_bound`] cannot characterize (caret/tilde/
+/// bare-partial — see [`clause_bound`]'s doc) is filtered out of the `branches` list entirely,
+/// so a bound-derived "covered" check could never see a candidate that only the *real* matcher
+/// knows is admitted by exactly such a branch — reporting both `matches == true` and
+/// `explicitly_excludes == true` for the same candidate simultaneously. Routing "covered"
+/// through the real matcher first, before any branch is filtered, rules that out: once this
+/// early return has passed, no member below can be covering `version` either, so the
+/// `union_gap_excludes` `covers` callback below is intentionally always `false`.
+///
+/// A version stripped here is *only* used against [`compare_versions`]-based edge comparisons
+/// (impl-critic S1) — the coverage check above passes the original, unstripped `version` to
+/// the real matcher instead, which already strips it internally
+/// ([`walk_requirement`]'s own leading strip); `compare_versions` has no such built-in
+/// stripping; a real Packagist tag left un-stripped here (e.g. `v1.5.0`, common for
+/// `symfony/*`) would silently defeat every gap comparison.
+fn composer_or_gap_excludes(version: &str, requirement: &str) -> bool {
+    if ComposerFormatter.version_satisfies_requirement(&ConcreteVersion::new(version), requirement)
+    {
+        return false;
+    }
+    let Some(stripped_requirement) = strip_branch_affixes(requirement) else {
+        return false;
+    };
+    if !stripped_requirement.contains("||") {
+        return false;
+    }
+    let branches: Vec<BranchBound> = stripped_requirement
+        .split("||")
+        .filter_map(|b| branch_bound(b.trim()))
+        .collect();
+    let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
+    let cmp = |a: &str, b: &String| compare_versions(a, b.as_str()).cmp(&0);
+    deps_core::interval::union_gap_excludes(
+        &branches,
+        // Coverage is already ruled out by the real-matcher check above.
+        |_: &BranchBound| false,
+        |b: &BranchBound| {
+            deps_core::interval::admits_at_or_above(
+                version,
+                b.upper.as_ref().map(|(v, i)| (v, *i)),
+                cmp,
+            )
+        },
+        |b: &BranchBound| {
+            deps_core::interval::admits_at_or_below(
+                version,
+                b.lower.as_ref().map(|(v, i)| (v, *i)),
+                cmp,
+            )
+        },
+    )
 }
 
 /// Composer-specific LSP formatting.
@@ -887,6 +1185,317 @@ mod tests {
         assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), ">= 1.0 < 2.0"));
     }
 
+    /// #1603: a comma is Composer's other AND separator, equivalent to whitespace — before
+    /// the fix, `">=1.0.0,<2.0.0"` silently collapsed to its first clause (`>=1.0.0` alone),
+    /// so a version above the upper bound was incorrectly admitted.
+    #[test]
+    fn test_comma_and_separator_equivalent_to_whitespace() {
+        let f = ComposerFormatter;
+        // Control: a plain caret requirement, unaffected by the comma fix.
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.0"));
+
+        // The comma-joined compound requirement must gate on BOTH bounds, not just the first.
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), ">=1.0.0,<2.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), ">=1.0.0,<2.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), ">=1.0.0,<2.0.0"));
+
+        // A lone `!=` clause, comma-adjacent syntax aside.
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "!=1.1.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "!=1.1.0"));
+
+        // Compound: all three comma-separated clauses must hold.
+        let compound = ">=1.0.0,<2.0.0,!=1.1.0";
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), compound));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), compound));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), compound));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), compound));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), compound));
+
+        // Control: a plain lower bound alone stays unaffected.
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("5.0.0"), ">=1.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), ">=1.0.0"));
+    }
+
+    /// #1603 impl-critic follow-up: the cooldown-fallback safety net
+    /// (`ComposerMatcher::explicitly_excludes`) shares `walk_requirement`'s comma split, so a
+    /// `!=` clause placed after a comma is now reachable by `ExcludeLeaf` too.
+    #[test]
+    fn test_composer_explicitly_excludes_reaches_comma_separated_exclusion() {
+        assert!(composer_explicitly_excludes(
+            "1.5.0",
+            ">=1.0.0,!=1.5.0,<2.0.0"
+        ));
+        assert!(!composer_explicitly_excludes(
+            "1.6.0",
+            ">=1.0.0,!=1.5.0,<2.0.0"
+        ));
+    }
+
+    /// #1601: a candidate sitting in the gap between two `||`-branches is explicitly excluded
+    /// by the union's shape, mirroring Maven's #1590 disjoint-range gap.
+    #[test]
+    fn test_composer_explicitly_excludes_detects_or_alternation_gap() {
+        assert!(composer_explicitly_excludes(
+            "1.5.0",
+            ">=1.0 <1.5 || >1.5 <2.0"
+        ));
+        assert!(!composer_explicitly_excludes(
+            "1.2.0",
+            ">=1.0 <1.5 || >1.5 <2.0"
+        ));
+        assert!(!composer_explicitly_excludes(
+            "1.8.0",
+            ">=1.0 <1.5 || >1.5 <2.0"
+        ));
+        assert!(!composer_explicitly_excludes(
+            "0.5.0",
+            ">=1.0 <1.5 || >1.5 <2.0"
+        ));
+        assert!(!composer_explicitly_excludes(
+            "2.5.0",
+            ">=1.0 <1.5 || >1.5 <2.0"
+        ));
+    }
+
+    /// #1601: the same gap, expressed with fully open-ended halves.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_open_ended_halves() {
+        assert!(composer_explicitly_excludes("1.5.0", "<1.5 || >1.5 <2.0"));
+        assert!(!composer_explicitly_excludes("1.2.0", "<1.5 || >1.5 <2.0"));
+        assert!(!composer_explicitly_excludes("1.8.0", "<1.5 || >1.5 <2.0"));
+    }
+
+    /// #1601 control: an existing `!=` exclusion inside a single (non-OR) requirement must
+    /// remain correct after the OR-gap check is added alongside it.
+    #[test]
+    fn test_composer_explicitly_excludes_control_ne_exclusion_still_correct() {
+        assert!(composer_explicitly_excludes("1.5.0", ">=1.0 !=1.5.0 <2.0"));
+        assert!(!composer_explicitly_excludes("1.6.0", ">=1.0 !=1.5.0 <2.0"));
+    }
+
+    /// A `||`-branch built from an unrecognized clause shape (caret) contributes no edge, so
+    /// a real gap between recognized branches is still detected, and a candidate that would
+    /// only be "excluded" via the unrecognized branch's own (unmodeled) shape is never
+    /// falsely flagged.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_ignores_unrecognized_branch() {
+        // `^3.0` contributes no edge; the gap between `>=1.0 <1.5` and `>1.5 <2.0` is still found.
+        assert!(composer_explicitly_excludes(
+            "1.5.0",
+            ">=1.0 <1.5 || >1.5 <2.0 || ^3.0"
+        ));
+        // A candidate admitted by the caret branch is covered, so never excluded.
+        assert!(!composer_explicitly_excludes(
+            "3.2.0",
+            ">=1.0 <1.5 || >1.5 <2.0 || ^3.0"
+        ));
+    }
+
+    /// A single `||`-branch alone has no "other side" to form a gap against.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_requires_at_least_two_branches() {
+        assert!(!composer_explicitly_excludes("5.0.0", ">=1.0 <2.0"));
+    }
+
+    /// Documents the deliberate scope limit from `clause_bound`'s doc: a union made
+    /// *entirely* of caret/tilde branches has no recognized bound anywhere, so
+    /// `composer_or_gap_excludes` has no branches left to compare and never fires — this is
+    /// always safe (no false exclusion), just a known gap in detection coverage, unlike npm's
+    /// `NodeSemverMatcher`, whose probe-based approach handles this same shape (see that
+    /// module's own `^1.0.0 || ^3.0.0` regression test).
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_all_caret_branches_undetected() {
+        assert!(!composer_explicitly_excludes("2.5.0", "^1.0.0 || ^3.0.0"));
+    }
+
+    /// impl-critic S1: a real Packagist tag is routinely `v`-prefixed (every `symfony/*`
+    /// release), and OR-gap detection must strip it before comparing, exactly like every
+    /// other comparison path in this module — without the strip, `v1.5.0` silently failed to
+    /// register as excluded while the unprefixed `1.5.0` correctly did.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_strips_v_prefix() {
+        let req = ">=1.0 <1.5 || >1.5 <2.0";
+        assert!(composer_explicitly_excludes("v1.5.0", req));
+        assert!(!composer_explicitly_excludes("v1.2.0", req));
+        assert!(!composer_explicitly_excludes("v1.8.0", req));
+    }
+
+    /// impl-critic S2: a candidate actually admitted by an unrecognized (caret) branch must
+    /// never simultaneously be reported as explicitly excluded by a gap between the OTHER,
+    /// recognized branches — `composer_or_gap_excludes`'s up-front real-matcher coverage check
+    /// must see every branch, not just the ones with a derivable bound.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_no_contradiction_with_opaque_branch() {
+        let f = ComposerFormatter;
+        let req = "<1.0 || ^1.5 || >=3.0";
+        for candidate in ["1.5.0", "1.5", "1.9.9"] {
+            let admitted = f.version_satisfies_requirement(&ConcreteVersion::new(candidate), req);
+            let excluded = composer_explicitly_excludes(candidate, req);
+            assert!(
+                !(admitted && excluded),
+                "{candidate}: admitted={admitted} excluded={excluded} must not both be true"
+            );
+            // `^1.5` genuinely admits all three, so this branch's coverage must win outright.
+            assert!(admitted, "{candidate} should be admitted by ^1.5");
+            assert!(!excluded, "{candidate} should not be reported excluded");
+        }
+    }
+
+    /// impl-critic M1: a branch whose own bound is internally unsatisfiable (`>=5.0,<3.0`,
+    /// inverted after AND-intersecting its clauses) must not manufacture a fake gap — it
+    /// contributes no edge, the same as an unrecognized clause shape.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_ignores_unsatisfiable_branch() {
+        assert!(!composer_explicitly_excludes("4.0.0", "^1.0 || >=5.0,<3.0"));
+    }
+
+    /// impl-critic M4: two branches touching exactly at a shared inclusive boundary leave no
+    /// real gap — the boundary version is genuinely covered by the second branch's inclusive
+    /// lower edge, not caught between the two.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_touching_inclusive_boundary_is_covered() {
+        assert!(!composer_explicitly_excludes(
+            "1.5.0",
+            ">=1.0 <1.5 || >=1.5 <2.0"
+        ));
+    }
+
+    /// Tester follow-up: `clause_bound`'s `<=` branch has no dedicated OR-gap regression test
+    /// — the gap sits strictly between an inclusive `<=` upper edge and an exclusive `>` lower
+    /// edge on the other branch, and the boundary versions on each side must resolve
+    /// correctly (covered vs. excluded).
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_le_bound_clause() {
+        let req = ">=1.0 <=1.5 || >1.6 <2.0";
+        assert!(composer_explicitly_excludes("1.5.5", req));
+        assert!(composer_explicitly_excludes("1.6.0", req));
+        assert!(!composer_explicitly_excludes("1.2.0", req));
+        assert!(!composer_explicitly_excludes("1.6.1", req));
+        // Covered by the first branch's inclusive `<=1.5` edge, not a gap.
+        assert!(!composer_explicitly_excludes("1.5.0", req));
+    }
+
+    /// Tester follow-up: `clause_bound`'s exact `=` branch (a single-point bound) has no
+    /// dedicated OR-gap regression test — every version strictly between two exact pins is a
+    /// genuine gap, and each pin itself must remain covered, not excluded.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_exact_equals_clause() {
+        let req = "=1.0 || =2.0";
+        assert!(composer_explicitly_excludes("1.5.0", req));
+        assert!(!composer_explicitly_excludes("1.0.0", req));
+        assert!(!composer_explicitly_excludes("2.0.0", req));
+        // Outside the union's overall span entirely — uncovered, not excluded.
+        assert!(!composer_explicitly_excludes("0.5.0", req));
+        assert!(!composer_explicitly_excludes("2.5.0", req));
+    }
+
+    /// Tester follow-up: `clause_bound`'s wildcard (`.* `) branch and
+    /// `increment_last_segment`'s exclusive-upper-edge derivation have no dedicated OR-gap
+    /// regression test.
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_wildcard_clause() {
+        let req = "1.0.* || 1.2.*";
+        assert!(composer_explicitly_excludes("1.1.5", req));
+        assert!(!composer_explicitly_excludes("1.0.99", req));
+        assert!(!composer_explicitly_excludes("1.2.5", req));
+        // Outside the union's overall span entirely — uncovered, not excluded.
+        assert!(!composer_explicitly_excludes("0.9.0", req));
+        assert!(!composer_explicitly_excludes("1.3.0", req));
+    }
+
+    /// Code-review finding: a malformed/typo'd wildcard clause whose prefix isn't actually
+    /// numeric (`"abc.*"`) must not fabricate a bound by treating `"abc"` as version `0` —
+    /// it must contribute no edge, the same as an unrecognized clause shape (caret/tilde/
+    /// bare-partial). Before this fix, `composer_explicitly_excludes` wrongly returned `true`
+    /// here even though the real matcher agrees `1.0.0` isn't admitted by either branch for
+    /// an unrelated reason (no real gap, just plain non-admission).
+    #[test]
+    fn test_composer_explicitly_excludes_or_gap_ignores_non_numeric_wildcard_prefix() {
+        let f = ComposerFormatter;
+        let req = "abc.* || >=2.0";
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), req));
+        assert!(!composer_explicitly_excludes("1.0.0", req));
+    }
+
+    /// Tester follow-up: whitespace surrounding the comma AND-separator (on either side, or
+    /// both) must normalize identically to the bare comma form.
+    #[test]
+    fn test_comma_with_surrounding_whitespace() {
+        let f = ComposerFormatter;
+        for req in [">=1.0,<2.0", ">=1.0, <2.0", ">=1.0 ,<2.0", ">=1.0 , <2.0"] {
+            assert!(
+                f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), req),
+                "{req}"
+            );
+            assert!(
+                !f.version_satisfies_requirement(&ConcreteVersion::new("2.5.0"), req),
+                "{req}"
+            );
+            assert!(
+                !f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), req),
+                "{req}"
+            );
+        }
+    }
+
+    /// impl-critic M4: an AND-group inside one `||`-branch, using the comma form, still
+    /// admits/excludes correctly (already passing before this round, now pinned by a test).
+    #[test]
+    fn test_and_inside_or_with_commas() {
+        let f = ComposerFormatter;
+        let req = "^0.9 || >=1.0,<2.0,!=1.5.0";
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), req));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), req));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), req));
+    }
+
+    /// impl-critic S3: a whitespace-AND clause list must combine every clause regardless of
+    /// operator kind, mirroring the comma form's already-correct behavior — before this fix,
+    /// only a group containing a `>`/`<`-prefixed token was split, so `"^1.0 !=1.2.0"`
+    /// silently collapsed to just `^1.0` and admitted `1.2.0` anyway.
+    #[test]
+    fn test_and_split_handles_non_range_operator_tokens() {
+        let f = ComposerFormatter;
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.0 !=1.2.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "^1.0 !=1.2.0"));
+        // Parity with the comma form, which already worked.
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.0,!=1.2.0"));
+
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.5"), "~1.0 !=1.0.5"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.6"), "~1.0 !=1.0.5"));
+    }
+
+    /// impl-critic M2 (corrected per team-lead: Composer's docs DO define a "Hyphenated
+    /// Version Range", `"1.0 - 2.0"` == `">=1.0.0 <2.1"` — this is valid `composer/semver`
+    /// grammar, not npm/node-semver-only syntax as an earlier version of this doc claimed).
+    /// This grammar is simply not implemented by `walk_requirement`/`clause_bound` yet
+    /// (tracked as a follow-up issue, not fixed here) — the bare `"-"` token is parsed as an
+    /// ordinary AND-clause that can never match any real version, so the whole AND-group fails
+    /// closed (matches nothing) rather than resolving the hyphenated range correctly. S3's
+    /// unconditional AND-split changed this specific unimplemented-input's behavior as a side
+    /// effect: it previously fell back to a silent partial-match on `"1.0"` alone; failing
+    /// closed is the safer of the two wrong answers until hyphen-range support is added.
+    #[test]
+    fn test_hyphen_range_syntax_is_unimplemented_and_fails_closed() {
+        let f = ComposerFormatter;
+        for v in ["1.0.0", "1.5.0", "2.0.0", "0.5.0"] {
+            assert!(!f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0"));
+        }
+    }
+
+    /// A trailing/bare comma with nothing meaningful on one side must not panic or leave
+    /// stray whitespace reaching `eval_leaf` — a dangling comma degrades to whatever real
+    /// clause remains (mirrors trimming a trailing separator), not a crash or a corrupted
+    /// comparison against a whitespace-padded string.
+    #[test]
+    fn test_comma_with_trailing_garbage_does_not_panic() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "1.0.0,"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "1.0.0,"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), ","));
+    }
+
     #[test]
     fn test_bare_v_requirement_does_not_match_everything() {
         let f = ComposerFormatter;
@@ -999,6 +1608,19 @@ mod tests {
 
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "=1.0.0"));
         assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "=1.0.0"));
+    }
+
+    /// impl-critic M5 regression: a spaced bare `=` (`"= 1.0.0"`) must still match exactly like
+    /// its unspaced form (`"=1.0.0"`, see `test_comparison_operators` above) — #1603's fix made
+    /// `walk_requirement`'s AND-split unconditional for any multi-token result, so without
+    /// `normalize_operator_spacing` also collapsing whitespace after a bare `=`, this silently
+    /// split into a no-op bare `=` clause AND-ed with a bare `"1.0.0"` clause, making the whole
+    /// requirement unsatisfiable for every version, including its own exact pin.
+    #[test]
+    fn test_spaced_bare_equals_operator() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "= 1.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.1"), "= 1.0.0"));
     }
 
     #[test]

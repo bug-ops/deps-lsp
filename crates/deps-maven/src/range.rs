@@ -13,8 +13,6 @@
 //!
 //! [spec]: https://maven.apache.org/pom.html#dependency-version-requirement-specification
 
-use std::cmp::Ordering;
-
 use crate::interval::{BracketStyle, VersionRange, contains, parse_interval};
 
 /// Splits `s` on commas that are not nested inside a `[`/`(` ... `]`/`)` pair, so a
@@ -102,30 +100,6 @@ fn lower_edge(range: &VersionRange) -> Option<(&str, bool)> {
     }
 }
 
-/// Whether `version` lies at or beyond `edge`, the mirror image of `contains`'s own
-/// upper-bound check (fails, i.e. "past", exactly where that check would not have matched).
-fn is_past(version: &str, edge: (&str, bool)) -> bool {
-    let (bound, inclusive) = edge;
-    let ord = crate::version::compare_versions_for_range(version, bound);
-    if inclusive {
-        ord == Ordering::Greater
-    } else {
-        ord != Ordering::Less
-    }
-}
-
-/// Whether `version` lies at or before `edge`, the mirror image of `contains`'s own
-/// lower-bound check.
-fn is_before(version: &str, edge: (&str, bool)) -> bool {
-    let (bound, inclusive) = edge;
-    let ord = crate::version::compare_versions_for_range(version, bound);
-    if inclusive {
-        ord == Ordering::Less
-    } else {
-        ord != Ordering::Greater
-    }
-}
-
 /// Whether `version` is explicitly excluded by the *shape* of a disjoint multi-range union
 /// (issue #1590): not covered by any member, yet sitting in the gap between two of them
 /// (past one member's upper edge and before another's lower edge) rather than merely outside
@@ -137,23 +111,21 @@ fn is_before(version: &str, edge: (&str, bool)) -> bool {
 /// fallback-candidate scan of `available` cannot tell "excluded by a gap" apart from
 /// "legitimately above the requirement's ceiling" without asking the matcher directly (#1571).
 ///
-/// A degenerate union member (`(3.0,3.0)`, `[5.0,3.0]`) parses to
+/// Delegates the gap-shape logic itself to [`deps_core::interval::union_gap_excludes`] (#1601)
+/// — the same representation-agnostic predicate `deps-npm`'s and `deps-composer`'s own
+/// `||`-alternation-gap detection route through, generalizing what used to be Maven-only
+/// logic. A degenerate union member (`(3.0,3.0)`, `[5.0,3.0]`) parses to
 /// [`deps_core::interval::VersionRange::Empty`] (#1595), not a real `Bounded` shape, so
 /// [`upper_edge`]/[`lower_edge`]'s wildcard arm gives it no edge — it cannot contribute a
 /// fabricated gap the way an unvalidated degenerate range used to.
 pub(crate) fn explicitly_excludes(version: &str, ranges: &[VersionRange]) -> bool {
-    if satisfies_ranges(version, ranges) {
-        return false;
-    }
-    let past_some_upper = ranges
-        .iter()
-        .filter_map(upper_edge)
-        .any(|e| is_past(version, e));
-    let before_some_lower = ranges
-        .iter()
-        .filter_map(lower_edge)
-        .any(|e| is_before(version, e));
-    past_some_upper && before_some_lower
+    let cmp = |a: &str, b: &str| crate::version::compare_versions_for_range(a, b);
+    deps_core::interval::union_gap_excludes(
+        ranges,
+        |range| contains(version, range),
+        |range| deps_core::interval::admits_at_or_above(version, upper_edge(range), cmp),
+        |range| deps_core::interval::admits_at_or_below(version, lower_edge(range), cmp),
+    )
 }
 
 /// Checks whether `version` satisfies a Maven range `requirement`.

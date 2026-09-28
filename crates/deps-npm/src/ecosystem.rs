@@ -394,6 +394,59 @@ mod tests {
         );
     }
 
+    /// #1601: `fallback` sits in the gap between two `||`-branches (`>=1.0.0 <1.5.0` and
+    /// `>1.5.0 <2.0.0`) — neither branch covers it, and `2.0.0` also fails both branches'
+    /// ceilings, so the extensional "something newer also matches" scan is vacuous. Only
+    /// `NodeSemverMatcher::explicitly_excludes`'s OR-gap probe catches this.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_or_alternation_gap_vacuous_case() {
+        let ecosystem = NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"dependencies": {"pkg": ">=1.0.0 <1.5.0 || >1.5.0 <2.0.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &NpmFormatter,
+            &uri,
+            &content,
+            "pkg",
+            "1.5.0",
+            &["2.0.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
+    /// #1601: the same gap shape with caret alternatives — `deps-composer` cannot model this
+    /// (a caret clause has no literal bound it can derive), but npm's probe-based approach
+    /// (via `Range::allows_any`) needs no literal bound and catches it regardless.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_or_alternation_gap_caret_branches() {
+        let ecosystem = NpmEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"dependencies": {"pkg": "^1.0.0 || ^3.0.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/package.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &NpmFormatter,
+            &uri,
+            &content,
+            "pkg",
+            "2.5.0",
+            &["2.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
     // #758: exact-value `Ecosystem` conformance, replacing several hand-written tests.
     deps_core::ecosystem_conformance! {
         mod npm_ecosystem_conformance;

@@ -5,15 +5,21 @@ use deps_core::lsp_helpers::{
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
 /// Precise npm semver range matcher, compiled once per dependency by
-/// [`compile_node_semver_range`].
-struct NodeSemverMatcher(node_semver::Range);
+/// [`compile_node_semver_range`]. `branches` is `range` split on its top-level `||` and
+/// individually re-parsed — needed only for [`explicitly_excludes`](Self::explicitly_excludes)'s
+/// OR-alternation-gap check (#1601), since `node_semver::Range`'s own internal bound sets are
+/// private and can't be walked from outside the crate.
+struct NodeSemverMatcher {
+    range: node_semver::Range,
+    branches: Vec<node_semver::Range>,
+}
 
 impl RequirementMatcher for NodeSemverMatcher {
     fn matches(&self, version: &ConcreteVersion) -> Option<bool> {
         let version = version.as_str();
         node_semver::Version::parse(version)
             .ok()
-            .map(|v| self.0.satisfies(&v))
+            .map(|v| self.range.satisfies(&v))
     }
 
     /// `node_semver::Range::satisfies` excludes pre-releases unless `requirement` itself pins
@@ -25,6 +31,57 @@ impl RequirementMatcher for NodeSemverMatcher {
     fn strict_prerelease_exclusion(&self) -> bool {
         true
     }
+
+    /// #1601 (same class as Maven's #1590 disjoint-range gap and Composer's `||`-gap): a
+    /// version not satisfied by any `||`-branch can still sit strictly between two of them,
+    /// with nothing admitted in the gap — the cooldown-fallback safety net
+    /// (`fallback_edit_excludes_newer`) has no other way to tell that apart from a fallback
+    /// that legitimately exceeds every branch's ceiling.
+    fn explicitly_excludes(&self, version: &ConcreteVersion) -> bool {
+        node_semver_or_gap_excludes(&self.branches, version.as_str())
+    }
+}
+
+/// Whether `version` is explicitly excluded by an OR-alternation gap in npm's `||`-joined
+/// range grammar (#1601). `node_semver::Range`'s own bound values are private, so each
+/// branch's admitted span is probed via its public `allows_any` rather than read as literal
+/// edges (`deps-maven`'s/`deps-composer`'s approach) —
+/// [`deps_core::interval::union_gap_excludes`] is the shared, representation-agnostic
+/// predicate all three route through.
+///
+/// A branch that admits nothing at all (an internally-contradictory comparator set, e.g.
+/// `">1.0.0 <1.0.0"`) is excluded from both the "past" and "before" sides rather than
+/// spuriously satisfying both simultaneously — mirroring `deps-maven`'s own
+/// [`deps_core::interval::VersionRange::Empty`] handling.
+///
+/// Each branch's satisfiability (`allows_any(&any)`) is computed once, up front, and paired
+/// with the branch itself — not recomputed inside both the `admits_at_or_above` and
+/// `admits_at_or_below` closures (code-review perf finding), since `union_gap_excludes` calls
+/// each closure once per branch on every invocation.
+fn node_semver_or_gap_excludes(branches: &[node_semver::Range], version: &str) -> bool {
+    if branches.len() < 2 {
+        return false;
+    }
+    let Ok(candidate) = node_semver::Version::parse(version) else {
+        return false;
+    };
+    let Ok(at_or_above) = node_semver::Range::parse(format!(">={candidate}")) else {
+        return false;
+    };
+    let Ok(at_or_below) = node_semver::Range::parse(format!("<={candidate}")) else {
+        return false;
+    };
+    let any = node_semver::Range::any();
+    let members: Vec<(&node_semver::Range, bool)> = branches
+        .iter()
+        .map(|branch| (branch, branch.allows_any(&any)))
+        .collect();
+    deps_core::interval::union_gap_excludes(
+        &members,
+        |(branch, _satisfiable)| branch.satisfies(&candidate),
+        |(branch, satisfiable)| !satisfiable || branch.allows_any(&at_or_above),
+        |(branch, satisfiable)| !satisfiable || branch.allows_any(&at_or_below),
+    )
 }
 
 /// Compiles `requirement` as a `node_semver::Range`, the grammar npm's registry and JSR both
@@ -64,9 +121,13 @@ pub fn compile_node_semver_range(requirement: &VersionReq) -> Option<Box<dyn Req
     if deps_core::lsp_helpers::requirement_contains_template_placeholder(requirement.as_str()) {
         return None;
     }
-    node_semver::Range::parse(requirement.as_str())
-        .ok()
-        .map(|req| Box::new(NodeSemverMatcher(req)) as Box<dyn RequirementMatcher>)
+    let range = node_semver::Range::parse(requirement.as_str()).ok()?;
+    let branches = requirement
+        .as_str()
+        .split("||")
+        .filter_map(|branch| node_semver::Range::parse(branch.trim()).ok())
+        .collect();
+    Some(Box::new(NodeSemverMatcher { range, branches }) as Box<dyn RequirementMatcher>)
 }
 
 /// Maximum name length npm's registry accepts.
@@ -551,5 +612,57 @@ mod tests {
                 "expected {requirement:?} to be rejected"
             );
         }
+    }
+
+    fn explicitly_excludes(requirement: &str, version: &str) -> bool {
+        let matcher = compile_node_semver_range(&VersionReq::new(requirement)).unwrap();
+        matcher.explicitly_excludes(&ConcreteVersion::new(version))
+    }
+
+    /// #1601: a version sitting in the gap between two `||`-branches is explicitly excluded,
+    /// mirroring Maven's #1590 disjoint-range gap and Composer's own `||`-gap detection.
+    #[test]
+    fn test_explicitly_excludes_detects_or_alternation_gap() {
+        let req = ">=1.0.0 <1.5.0 || >1.5.0 <2.0.0";
+        assert!(explicitly_excludes(req, "1.5.0"));
+        assert!(!explicitly_excludes(req, "1.2.0"));
+        assert!(!explicitly_excludes(req, "1.8.0"));
+        assert!(!explicitly_excludes(req, "0.5.0"));
+        assert!(!explicitly_excludes(req, "2.5.0"));
+    }
+
+    /// #1601: the same gap, expressed with fully open-ended halves.
+    #[test]
+    fn test_explicitly_excludes_or_gap_open_ended_halves() {
+        let req = "<1.5.0 || >1.5.0 <2.0.0";
+        assert!(explicitly_excludes(req, "1.5.0"));
+        assert!(!explicitly_excludes(req, "1.2.0"));
+        assert!(!explicitly_excludes(req, "1.8.0"));
+    }
+
+    /// #1601's issue repro: unlike `deps-composer` (which cannot model a caret-only branch's
+    /// bound, see that crate's own documented limitation), npm's probe-based approach handles
+    /// this shape because it never needs a literal bound value.
+    #[test]
+    fn test_explicitly_excludes_or_gap_caret_branches() {
+        let req = "^1.0.0 || ^3.0.0";
+        assert!(explicitly_excludes(req, "2.5.0"));
+        assert!(!explicitly_excludes(req, "1.5.0"));
+        assert!(!explicitly_excludes(req, "3.5.0"));
+    }
+
+    /// A single branch alone has no "other side" to form a gap against.
+    #[test]
+    fn test_explicitly_excludes_or_gap_requires_at_least_two_branches() {
+        assert!(!explicitly_excludes(">=1.0.0 <2.0.0", "5.0.0"));
+    }
+
+    /// A version covered by any branch is never excluded, regardless of how the other
+    /// branches are shaped.
+    #[test]
+    fn test_explicitly_excludes_or_gap_false_when_covered() {
+        let req = ">=1.0.0 <1.5.0 || >1.5.0 <2.0.0";
+        assert!(!explicitly_excludes(req, "1.2.0"));
+        assert!(!explicitly_excludes(req, "1.8.0"));
     }
 }
