@@ -621,6 +621,97 @@ pub fn format_version_replacing_by_shape(
     }
 }
 
+/// Parses up to the first 3 dot-separated `parts` as `u64`, padding any components beyond
+/// `parts.len()` with `0`. Returns `None` if any of the first 3 parts fails to parse as a
+/// non-negative integer.
+fn parse_caret_components(parts: &[&str]) -> Option<[u64; 3]> {
+    let mut out = [0u64; 3];
+    for (slot, part) in out.iter_mut().zip(parts.iter()) {
+        *slot = part.parse().ok()?;
+    }
+    Some(out)
+}
+
+/// The exclusive upper bound of a `^`-requirement whose lower bound is `lower`
+/// (`parse_caret_components`'s output) and whose requirement text had `req_parts` given
+/// components: increments the left-most non-zero component among those given, zeroing
+/// everything after it — or, if every given component is `0`, increments the last given
+/// component instead (`^0.0` -> `<0.1.0`, `^0.0.0` -> `<0.0.1`).
+///
+/// Returns `None` when that increment would overflow `u64` (an unrealistic version component,
+/// but not something a caller can rule out) — the caller then treats the caret requirement as
+/// having no upper bound at all, rather than panicking (debug) or silently wrapping to `0`
+/// (release), the same overflow class #1619 already fixed in `deps-composer`'s own
+/// `increment_last_segment`.
+fn caret_upper_bound(lower: [u64; 3], req_parts: &[&str]) -> Option<[u64; 3]> {
+    let given_len = req_parts.len().min(3);
+    let bump_index = lower
+        .iter()
+        .take(given_len)
+        .position(|&component| component != 0)
+        .unwrap_or_else(|| given_len.saturating_sub(1));
+
+    let [major, minor, patch] = lower;
+    Some(match bump_index {
+        0 => [major.checked_add(1)?, 0, 0],
+        1 => [major, minor.checked_add(1)?, 0],
+        _ => [major, minor, patch.checked_add(1)?],
+    })
+}
+
+/// Truncates `version` at its first `-` (prerelease) or `+` (build metadata) marker, so the
+/// numeric `major.minor.patch` core can still be split and parsed by
+/// [`parse_caret_components`] even when the candidate carries a suffix that component-wise
+/// `u64` parsing can't handle directly (#1622 S3: without this, a suffixed candidate like
+/// `1.4.9-beta` silently defeated the caret lower-bound floor by falling through to the
+/// pre-#1622, major-only fallback). Only ever applied to a *candidate* version, never to the
+/// requirement text itself — a non-numeric requirement component (`^1.5.x`) is a distinct,
+/// deliberately deferred gap (impl-critic M2).
+#[expect(
+    clippy::string_slice,
+    reason = "cut is either a `find(['-', '+'])` match index (both ASCII, so always a char \
+              boundary) or version.len() itself, so the slice bound is always a char boundary"
+)]
+fn strip_version_suffix(version: &str) -> &str {
+    let cut = version.find(['-', '+']).unwrap_or(version.len());
+    &version[..cut]
+}
+
+/// Whether `latest` is still within a `^`-requirement's exclusive *upper* bound (the
+/// auto-following range's ceiling) — ignoring the requirement's own minor/patch lower-bound
+/// floor #1622 added to [`RequirementResolution::version_satisfies_requirement`]'s `^` branch.
+///
+/// [`RequirementResolution::is_requirement_up_to_date`]'s default asks "is `latest` still
+/// within what this requirement would resolve to", not "does `latest` satisfy every clause of
+/// the requirement" — `latest` is the newest *available* version (already excluding
+/// yanked/prerelease/cooldown-held releases upstream), so it can legitimately sit below a
+/// caret's own lower-bound floor (every `>=1.5` release of a `^1.5` dependency yanked, `latest`
+/// still `1.4.9`) without the dependency being outdated in any actionable sense — a manifest
+/// edit here would plan a downgrade, not an upgrade. #1622's lower-bound enforcement must stay
+/// scoped to `version_satisfies_requirement`'s own general-purpose membership question (e.g.
+/// lock-file in-use-version checks), not leak into this one.
+///
+/// Returns `None` when `requirement` doesn't start with `^`, or any of its components fails to
+/// parse, so the caller falls back to its own general-purpose check for every other shape.
+fn caret_admits_up_to_date(latest: &str, requirement: &str) -> Option<bool> {
+    let req = requirement.strip_prefix('^')?;
+    let req_parts: Vec<&str> = req.split('.').collect();
+    let ver_parts: Vec<&str> = strip_version_suffix(latest).split('.').collect();
+
+    if req_parts.first() != ver_parts.first() {
+        return Some(false);
+    }
+
+    let (Some(lower), Some(candidate)) = (
+        parse_caret_components(&req_parts),
+        parse_caret_components(&ver_parts),
+    ) else {
+        return Some(true);
+    };
+
+    Some(caret_upper_bound(lower, &req_parts).is_none_or(|upper| candidate < upper))
+}
+
 /// Requirement parsing, matching, and up-to-date status.
 ///
 /// Implementors guarantee every method here is a pure function of its arguments — no network
@@ -644,31 +735,30 @@ pub trait RequirementResolution: Send + Sync {
     /// overrides that method, not this one.
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
-        // Caret allows changes that don't modify the left-most non-zero component:
-        // ^2.0 -> 2.x.x, ^0.2 -> 0.2.x, ^0.0.3 -> only 0.0.3
+        // Caret allows changes that don't modify the left-most non-zero component, but never
+        // below the requirement's own minor/patch floor: ^1.5 -> [1.5.0, 2.0.0), ^0.2 ->
+        // [0.2.0, 0.3.0), ^0.0.3 -> [0.0.3, 0.0.4) (#1622, mirroring #1619's fix for
+        // `deps-composer`'s own `satisfies_caret`).
         if let Some(req) = requirement.strip_prefix('^') {
             let req_parts: Vec<&str> = req.split('.').collect();
-            let ver_parts: Vec<&str> = version.split('.').collect();
+            let ver_parts: Vec<&str> = strip_version_suffix(version).split('.').collect();
 
             // Must have same major version
             if req_parts.first() != ver_parts.first() {
                 return false;
             }
 
-            // For ^X.Y where X > 0, any X.*.* is allowed
-            if req_parts.first().is_some_and(|m| *m != "0") {
+            let (Some(lower), Some(candidate)) = (
+                parse_caret_components(&req_parts),
+                parse_caret_components(&ver_parts),
+            ) else {
+                // A non-numeric component is unusual for a bare `^X.Y[.Z]` requirement — fall
+                // back to the major-only check already confirmed above.
                 return true;
-            }
+            };
 
-            #[expect(
-                clippy::indexing_slicing,
-                reason = "for ^0.Y, must have same minor (length checked on the same line)"
-            )]
-            if req_parts.len() >= 2 && ver_parts.len() >= 2 {
-                return req_parts[1] == ver_parts[1];
-            }
-
-            return true;
+            return candidate >= lower
+                && caret_upper_bound(lower, &req_parts).is_none_or(|upper| candidate < upper);
         }
 
         // Tilde allows patch-level changes: ~2.0 -> 2.0.x, ~2.0.1 -> 2.0.x where x >= 1
@@ -688,19 +778,25 @@ pub trait RequirementResolution: Send + Sync {
     /// Whether an unresolved dependency (no lock-file version) should be reported as
     /// up to date against `latest`, given its declared `requirement`.
     ///
-    /// Default: `latest` satisfies `requirement` — correct for range-based ecosystems
-    /// (Cargo's `^1.2`, npm's `~1.2`, ...) where the declared requirement already
-    /// expresses forward compatibility, so a `latest` it accepts is not "newer" in any
-    /// actionable sense. Ecosystems where a bare requirement is a minimum floor rather
-    /// than an auto-following range (NuGet's bare `Version="1.0.0"`) must override this,
-    /// since "does the floor accept `latest`" and "is the pin already `latest`" are
-    /// different questions there.
+    /// Default: for a `^`-requirement, whether `latest` sits below its exclusive upper bound
+    /// only — `caret_admits_up_to_date`, ignoring the requirement's own minor/patch
+    /// lower-bound floor (#1622 S2): `latest` is the newest *available* version, so it can
+    /// legitimately sit below that floor (every `>=1.5` release of a `^1.5` dependency yanked,
+    /// `latest` still `1.4.9`) without the dependency being outdated in any actionable sense —
+    /// treating it as outdated here would have a caller plan a downgrade, not an upgrade. Every
+    /// other requirement shape falls back to `latest` satisfies `requirement` — correct for
+    /// range-based ecosystems (Cargo's `^1.2`, npm's `~1.2`, ...) where the declared requirement
+    /// already expresses forward compatibility, so a `latest` it accepts is not "newer" in any
+    /// actionable sense. Ecosystems where a bare requirement is a minimum floor rather than an
+    /// auto-following range (NuGet's bare `Version="1.0.0"`) must override this, since "does the
+    /// floor accept `latest`" and "is the pin already `latest`" are different questions there.
     fn is_requirement_up_to_date(
         &self,
         requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> bool {
-        self.version_satisfies_requirement(latest, requirement.as_str())
+        caret_admits_up_to_date(latest.as_str(), requirement.as_str())
+            .unwrap_or_else(|| self.version_satisfies_requirement(latest, requirement.as_str()))
     }
 
     /// Whether `requirement` could not be resolved to a concrete version constraint (e.g. an
@@ -1506,6 +1602,111 @@ mod tests {
         assert_eq!(
             MOCK_FORMATTER.requirement_status(&requirement, &latest),
             RequirementStatus::UpToDate
+        );
+    }
+
+    /// #1622 impl-critic S1: incrementing an already-`u64::MAX` component must not panic
+    /// (debug) or silently wrap to `0` (release) — mirrors #1619's `checked_add` fix for
+    /// `deps-composer`'s `increment_last_segment`. An overflowing upper bound is `None`
+    /// ("unbounded"), not a wrapped, wrong value.
+    #[test]
+    fn test_caret_upper_bound_overflow_returns_none_instead_of_panicking() {
+        let max = u64::MAX.to_string();
+        assert_eq!(caret_upper_bound([u64::MAX, 0, 0], &[max.as_str()]), None);
+        assert_eq!(
+            caret_upper_bound([0, u64::MAX, 0], &["0", max.as_str()]),
+            None
+        );
+        assert_eq!(
+            caret_upper_bound([0, 0, u64::MAX], &["0", "0", max.as_str()]),
+            None
+        );
+    }
+
+    /// A caret requirement whose upper bound overflows is treated as unbounded above — the
+    /// lower bound is still enforced, and the candidate must not panic against a `u64::MAX`
+    /// component either.
+    #[test]
+    fn test_version_satisfies_requirement_caret_overflow_treated_as_unbounded_above() {
+        let max = u64::MAX.to_string();
+        let requirement = format!("^{max}");
+        assert!(MOCK_FORMATTER.version_satisfies_requirement(
+            &ConcreteVersion::new(format!("{max}.0.0")),
+            &requirement
+        ));
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), &requirement)
+        );
+    }
+
+    /// #1622 impl-critic S2: `is_requirement_up_to_date`'s default must not proxy through
+    /// `version_satisfies_requirement`'s lower-bound-enforcing `^` check. `latest` is the
+    /// newest *available* version (yanked/prerelease/cooldown-held releases already excluded
+    /// upstream), so it can legitimately sit below a caret's own minor/patch floor without the
+    /// dependency being outdated in any actionable sense — reporting `Outdated` here would have
+    /// a caller (e.g. `deps-cli update`) plan an actual downgrade (`^1.5` -> `^1.4.9`).
+    #[test]
+    fn test_requirement_status_caret_latest_below_lower_bound_floor_stays_up_to_date() {
+        let requirement = VersionReq::new("^1.5");
+        let latest = ConcreteVersion::new("1.4.9");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &latest),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    /// The major-version check is unaffected by the S2 carve-out above: `latest` still below a
+    /// caret's *major* component stays `Outdated`, same as before #1622.
+    #[test]
+    fn test_requirement_status_caret_latest_below_major_is_outdated() {
+        let requirement = VersionReq::new("^2.0");
+        let latest = ConcreteVersion::new("1.9.0");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &latest),
+            RequirementStatus::Outdated
+        );
+    }
+
+    /// #1622 impl-critic S3: a prerelease/build-metadata suffix on the *candidate* version must
+    /// not defeat the lower-bound floor by tripping `parse_caret_components`'s non-numeric
+    /// fallback — `strip_version_suffix` truncates it first. Reachable in production via
+    /// `in_use_version.rs`'s lock-file-resolved candidate filtering for Cargo/npm/Deno.
+    #[test]
+    fn test_version_satisfies_requirement_caret_candidate_suffix_still_enforces_lower_bound() {
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.4.9-beta"), "^1.5")
+        );
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.4.9+build"), "^1.5")
+        );
+        // The stripped core `1.5.0` meets the floor — accepted as the approximation this
+        // heuristic already makes elsewhere (no full semver prerelease-ordering).
+        assert!(
+            MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0-beta"), "^1.5")
+        );
+    }
+
+    /// Same S3 fix, exercised through `caret_admits_up_to_date`/`requirement_status` with a
+    /// suffixed `latest`. Unlike `version_satisfies_requirement` above, this path only checks
+    /// the caret's *upper* bound (S2), so a suffix below the lower-bound floor alone doesn't
+    /// flip the answer (that's the zero-major case below: `0.5.5-beta` sits at neither
+    /// boundary, `0.6.0-beta` sits exactly at the upper bound) — a non-zero-major requirement
+    /// like `^1.5` can't demonstrate this, since its ceiling is far enough away that the
+    /// pre-#1622 non-numeric fallback (`Some(true)`) already happened to agree.
+    #[test]
+    fn test_requirement_status_caret_suffixed_latest_at_upper_bound_is_outdated() {
+        let requirement = VersionReq::new("^0.5");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("0.5.5-beta")),
+            RequirementStatus::UpToDate
+        );
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("0.6.0-beta")),
+            RequirementStatus::Outdated
         );
     }
 
