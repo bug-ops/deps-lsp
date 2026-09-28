@@ -165,6 +165,58 @@ pub fn build_scan_targets(
 
     (targets, skipped)
 }
+/// Outcome of classifying one dependency for [`build_latest_check_targets`]/
+/// [`build_candidate_check_targets`]'s shared registry-source/cached-version/OSV-name gates
+/// (code-review finding: the two functions used to duplicate this exact branch sequence, which
+/// this PR's `StructuralSkipReason` retyping had to edit in lockstep in both copies).
+enum DepCheckClassification<'a> {
+    /// `formatter.source_is_public_registry_content` returned `false`.
+    NonRegistrySource,
+    /// No registry-cached version list yet for this dependency — absence, not a structural
+    /// skip: a later commit populating `cached_versions` can still turn this into a real
+    /// target (see both callers' own doc for why this must not be read as "not applicable").
+    NoCachedVersions,
+    /// A cached version list exists, but `formatter.osv_package_name` returned `None`.
+    UnmappableName {
+        /// This dependency's registry-cached version list, for a caller that still wants to
+        /// report a real (if unmappable) candidate version.
+        cached: &'a deps_core::lsp_helpers::PackageVersions,
+    },
+    /// A real, checkable target: the resolved OSV package name and this dependency's
+    /// registry-cached version list.
+    Target {
+        /// `formatter.osv_package_name(dep)`'s resolved value.
+        osv_name: String,
+        /// This dependency's registry-cached version list.
+        cached: &'a deps_core::lsp_helpers::PackageVersions,
+    },
+}
+
+/// The shared classification steps behind [`DepCheckClassification`]'s variants — see that
+/// type's doc.
+fn classify_dep_for_check_targets<'a>(
+    dep: &dyn deps_core::Dependency,
+    cached_versions: &'a HashMap<PackageName, deps_core::lsp_helpers::PackageVersions>,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+) -> DepCheckClassification<'a> {
+    if !formatter.source_is_public_registry_content(&dep.source()) {
+        return DepCheckClassification::NonRegistrySource;
+    }
+
+    let normalized_name = formatter.normalize_package_name(dep.name());
+    let Some(cached) = cached_versions
+        .get(normalized_name.as_str())
+        .or_else(|| cached_versions.get(dep.name()))
+    else {
+        return DepCheckClassification::NoCachedVersions;
+    };
+
+    match formatter.osv_package_name(dep) {
+        Some(osv_name) => DepCheckClassification::Target { osv_name, cached },
+        None => DepCheckClassification::UnmappableName { cached },
+    }
+}
+
 /// Builds phase B.1's latest-check targets for **every** dependency with a registry-cached
 /// latest (issue #1517).
 ///
@@ -254,51 +306,41 @@ pub fn build_latest_check_targets(
     Vec<deps_core::osv::ScanTarget>,
     deps_core::osv::LatestStatusMap,
 ) {
-    use deps_core::osv::{SkipReason, UpgradeStatus, vuln_key_for};
+    use deps_core::osv::{SkipReason, StructuralSkipReason, UpgradeStatus, vuln_key_for};
 
     let mut targets = Vec::new();
     let mut structural = deps_core::osv::LatestStatusMap::new();
 
     for dep in parse_result.dependencies() {
-        let normalized_name = formatter.normalize_package_name(dep.name());
         let key = vuln_key_for(dep, Some(vuln_keys), formatter);
 
-        if !formatter.source_is_public_registry_content(&dep.source()) {
-            structural.insert(
-                key,
-                UpgradeStatus::CandidateUnverified {
-                    version: String::new(),
-                    reason: SkipReason::NonRegistrySource,
-                },
-            );
-            continue;
-        }
-
-        let Some(latest) = cached_versions
-            .get(normalized_name.as_str())
-            .or_else(|| cached_versions.get(dep.name()))
-        else {
+        match classify_dep_for_check_targets(dep, cached_versions, formatter) {
+            DepCheckClassification::NonRegistrySource => {
+                structural.insert(
+                    key,
+                    UpgradeStatus::StructurallyUnchecked(StructuralSkipReason::NonRegistrySource),
+                );
+            }
             // No registry-cached latest yet — absence, not a structural skip (see doc above).
-            continue;
-        };
-
-        let Some(osv_name) = formatter.osv_package_name(dep) else {
-            structural.insert(
-                key,
-                UpgradeStatus::CandidateUnverified {
-                    version: latest.latest.to_string(),
-                    reason: SkipReason::UnmappableName,
-                },
-            );
-            continue;
-        };
-
-        targets.push(deps_core::osv::ScanTarget::from_native(
-            key,
-            osv_name,
-            latest.latest.clone(),
-            formatter,
-        ));
+            DepCheckClassification::NoCachedVersions => {}
+            DepCheckClassification::UnmappableName { cached } => {
+                structural.insert(
+                    key,
+                    UpgradeStatus::CandidateUnverified {
+                        version: cached.latest.clone(),
+                        reason: SkipReason::UnmappableName,
+                    },
+                );
+            }
+            DepCheckClassification::Target { osv_name, cached } => {
+                targets.push(deps_core::osv::ScanTarget::from_native(
+                    key,
+                    osv_name,
+                    cached.latest.clone(),
+                    formatter,
+                ));
+            }
+        }
     }
 
     (targets, structural)
@@ -322,10 +364,11 @@ const MAX_CANDIDATE_CHECK_VERSIONS: usize = 6;
 /// [`deps_core::osv::LatestStatusMap`]-shaped result into a
 /// [`deps_core::osv::CandidateStatusMap`] keyed by the version each round actually checked.
 ///
-/// Mirrors [`build_latest_check_targets`]'s exact structural-skip handling (non-public-registry
-/// source, unmappable OSV name) — recorded once per dependency in the returned `structural` map
-/// under the empty-string sentinel key (see [`deps_core::osv::CandidateStatusMap`]'s doc),
-/// never duplicated per round.
+/// Shares [`build_latest_check_targets`]'s structural-skip classification via
+/// `classify_dep_for_check_targets` (non-public-registry source, unmappable OSV name) — recorded
+/// once per dependency in the returned `structural` map as
+/// [`deps_core::osv::CandidateStatuses::Structural`] (see that type's doc), never duplicated per
+/// round.
 ///
 /// Selection is deliberately simpler than
 /// [`deps_core::completion::prepare_version_display_items`]'s exact display-item algorithm
@@ -346,46 +389,36 @@ pub fn build_candidate_check_targets(
     Vec<Vec<deps_core::osv::ScanTarget>>,
     deps_core::osv::CandidateStatusMap,
 ) {
-    use deps_core::osv::{SkipReason, UpgradeStatus, vuln_key_for};
+    use deps_core::osv::{CandidateStatuses, StructuralSkipReason, vuln_key_for};
 
     let mut rounds: Vec<Vec<deps_core::osv::ScanTarget>> =
         vec![Vec::new(); MAX_CANDIDATE_CHECK_VERSIONS];
     let mut structural = deps_core::osv::CandidateStatusMap::new();
 
     for dep in parse_result.dependencies() {
-        let normalized_name = formatter.normalize_package_name(dep.name());
         let key = vuln_key_for(dep, Some(vuln_keys), formatter);
 
-        if !formatter.source_is_public_registry_content(&dep.source()) {
-            structural.entry(key).or_default().insert(
-                String::new(),
-                UpgradeStatus::CandidateUnverified {
-                    version: String::new(),
-                    reason: SkipReason::NonRegistrySource,
-                },
-            );
-            continue;
-        }
-
-        let Some(package_versions) = cached_versions
-            .get(normalized_name.as_str())
-            .or_else(|| cached_versions.get(dep.name()))
-        else {
-            // No registry-cached version list yet — absence, not a structural skip (see doc
-            // above), matching `build_latest_check_targets`'s identical treatment.
-            continue;
-        };
-
-        let Some(osv_name) = formatter.osv_package_name(dep) else {
-            structural.entry(key).or_default().insert(
-                String::new(),
-                UpgradeStatus::CandidateUnverified {
-                    version: String::new(),
-                    reason: SkipReason::UnmappableName,
-                },
-            );
-            continue;
-        };
+        let (osv_name, package_versions) =
+            match classify_dep_for_check_targets(dep, cached_versions, formatter) {
+                DepCheckClassification::NonRegistrySource => {
+                    structural.insert(
+                        key,
+                        CandidateStatuses::Structural(StructuralSkipReason::NonRegistrySource),
+                    );
+                    continue;
+                }
+                // No registry-cached version list yet — absence, not a structural skip (see
+                // doc above), matching `build_latest_check_targets`'s identical treatment.
+                DepCheckClassification::NoCachedVersions => continue,
+                DepCheckClassification::UnmappableName { .. } => {
+                    structural.insert(
+                        key,
+                        CandidateStatuses::Structural(StructuralSkipReason::UnmappableName),
+                    );
+                    continue;
+                }
+                DepCheckClassification::Target { osv_name, cached } => (osv_name, cached),
+            };
 
         let yanked: std::collections::HashSet<&ConcreteVersion> = package_versions
             .yanked
@@ -572,7 +605,7 @@ fn resolve_fix_target(
 ///     .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
 /// );
 /// let latest_status = UpgradeStatus::CandidateClean {
-///     version: "1.2.0".to_string(),
+///     version: ConcreteVersion::new("1.2.0"),
 /// };
 /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
 ///
@@ -642,6 +675,7 @@ pub fn collect_fix_target_resolutions(
 ///     VulnerabilityMap,
 /// };
 /// use deps_core::test_util::vuln_key;
+/// use deps_core::ConcreteVersion;
 /// use deps_engine::classify::osv::apply_live_fix_target_statuses;
 /// use std::collections::HashMap;
 /// use std::sync::Arc;
@@ -663,7 +697,7 @@ pub fn collect_fix_target_resolutions(
 /// statuses.insert(
 ///     vuln_key("pkg"),
 ///     UpgradeStatus::CandidateClean {
-///         version: "1.2.0".to_string(),
+///         version: ConcreteVersion::new("1.2.0"),
 ///     },
 /// );
 ///
@@ -675,7 +709,7 @@ pub fn collect_fix_target_resolutions(
 /// assert_eq!(
 ///     dv.fix_target_status,
 ///     UpgradeStatus::CandidateClean {
-///         version: "1.2.0".to_string()
+///         version: ConcreteVersion::new("1.2.0")
 ///     }
 /// );
 /// ```
@@ -1537,6 +1571,246 @@ mod tests {
             );
         }
     }
+
+    /// #1624 tester gap 1: `build_latest_check_targets`/`build_candidate_check_targets`'s
+    /// structural-skip insert paths and `build_candidate_check_targets`'s per-rank
+    /// round-bucketing loop, previously entirely unexercised by any unit test (only the one
+    /// doctest above, which covers just the "real target" happy path).
+    mod build_check_targets_tests {
+        use super::*;
+        use deps_core::Dependency;
+        use deps_core::lsp_helpers::{
+            DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+            PackageVersions, RequirementResolution, SourcePolicy,
+        };
+        use deps_core::osv::{CandidateStatuses, StructuralSkipReason, UpgradeStatus};
+        use deps_core::parser::DependencySource;
+        use deps_core::position::{Position, Range};
+        use deps_core::test_util::StubFormatter;
+        use std::any::Any;
+        use std::sync::Arc;
+
+        struct MockDep {
+            name: PackageName,
+            source: DependencySource,
+        }
+
+        impl Dependency for MockDep {
+            fn name(&self) -> &PackageName {
+                &self.name
+            }
+            fn name_range(&self) -> Range {
+                let addr = std::ptr::from_ref(self) as u32;
+                Range::new(Position::new(0, addr), Position::new(0, addr + 1))
+            }
+            fn version_requirement(&self) -> Option<&VersionReq> {
+                None
+            }
+            fn version_range(&self) -> Option<Range> {
+                None
+            }
+            fn source(&self) -> DependencySource {
+                self.source.clone()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        struct MockParseResult {
+            deps: Vec<MockDep>,
+        }
+
+        impl deps_core::ParseResult for MockParseResult {
+            fn dependencies(&self) -> Vec<&dyn Dependency> {
+                self.deps.iter().map(|d| d as &dyn Dependency).collect()
+            }
+            fn workspace_root(&self) -> Option<&std::path::Path> {
+                None
+            }
+            fn uri(&self) -> &url::Url {
+                static URI: std::sync::OnceLock<url::Url> = std::sync::OnceLock::new();
+                URI.get_or_init(|| deps_core::test_util::test_uri("/test/Cargo.toml"))
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+        }
+
+        /// A formatter whose package name is never mappable to an OSV ecosystem name —
+        /// `StubFormatter`'s `OsvNaming` default (always `Some`) can't drive the
+        /// `UnmappableName` structural-skip branch.
+        struct UnmappableNameFormatter;
+        impl PackageNaming for UnmappableNameFormatter {}
+        impl PackageRendering for UnmappableNameFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for UnmappableNameFormatter {}
+        impl DiagnosticMessages for UnmappableNameFormatter {}
+        impl DiagnosticPolicy for UnmappableNameFormatter {}
+        impl SourcePolicy for UnmappableNameFormatter {}
+        impl OsvNaming for UnmappableNameFormatter {
+            fn osv_package_name(&self, _dep: &dyn Dependency) -> Option<String> {
+                None
+            }
+        }
+
+        fn vuln_keys_for(
+            parse_result: &dyn deps_core::ParseResult,
+            formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+        ) -> deps_core::osv::VulnKeys {
+            deps_core::osv::vulnerability_keys(
+                parse_result,
+                &HashMap::new(),
+                None,
+                formatter,
+                EcosystemId::Cargo,
+            )
+        }
+
+        #[test]
+        fn build_latest_check_targets_non_registry_source_is_structurally_unchecked() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("vendored"),
+                    source: DependencySource::Path {
+                        path: "../vendored".to_string(),
+                    },
+                }],
+            };
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+
+            let (targets, structural) = build_latest_check_targets(
+                &parse_result,
+                &HashMap::new(),
+                &vuln_keys,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert!(targets.is_empty());
+            assert_eq!(
+                structural.get(&deps_core::test_util::vuln_key("vendored")),
+                Some(&UpgradeStatus::StructurallyUnchecked(
+                    StructuralSkipReason::NonRegistrySource
+                ))
+            );
+        }
+
+        #[test]
+        fn build_candidate_check_targets_non_registry_source_is_structural() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("vendored"),
+                    source: DependencySource::Path {
+                        path: "../vendored".to_string(),
+                    },
+                }],
+            };
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+
+            let (rounds, structural) = build_candidate_check_targets(
+                &parse_result,
+                &HashMap::new(),
+                &vuln_keys,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert!(
+                rounds.iter().all(Vec::is_empty),
+                "no round may hold a non-registry dependency"
+            );
+            assert_eq!(
+                structural.get(&deps_core::test_util::vuln_key("vendored")),
+                Some(&CandidateStatuses::Structural(
+                    StructuralSkipReason::NonRegistrySource
+                ))
+            );
+        }
+
+        #[test]
+        fn build_candidate_check_targets_unmappable_name_is_structural() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("jsr-pinned"),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let vuln_keys = vuln_keys_for(&parse_result, &UnmappableNameFormatter);
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::new("jsr-pinned"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+
+            let (rounds, structural) = build_candidate_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &UnmappableNameFormatter,
+            );
+
+            assert!(
+                rounds.iter().all(Vec::is_empty),
+                "an unmappable name has no OSV-checkable round targets"
+            );
+            assert_eq!(
+                structural.get(&deps_core::test_util::vuln_key("jsr-pinned")),
+                Some(&CandidateStatuses::Structural(
+                    StructuralSkipReason::UnmappableName
+                ))
+            );
+        }
+
+        #[test]
+        fn build_candidate_check_targets_buckets_newest_first_by_round() {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("pkg"),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let vuln_keys = vuln_keys_for(&parse_result, &StubFormatter::DEFAULT);
+            let mut cached_versions = HashMap::new();
+            let available: Arc<[ConcreteVersion]> = Arc::from(vec![
+                ConcreteVersion::new("3.0.0"),
+                ConcreteVersion::new("2.0.0"),
+                ConcreteVersion::new("1.0.0"),
+            ]);
+            cached_versions.insert(
+                PackageName::new("pkg"),
+                PackageVersions::new(ConcreteVersion::new("3.0.0"), available),
+            );
+
+            let (rounds, structural) = build_candidate_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &StubFormatter::DEFAULT,
+            );
+
+            assert!(structural.is_empty());
+            assert_eq!(
+                rounds[0].len(),
+                1,
+                "round 0 must hold this dependency's newest candidate"
+            );
+            assert_eq!(rounds[0][0].display_version, "3.0.0");
+            assert_eq!(rounds[1].len(), 1);
+            assert_eq!(rounds[1][0].display_version, "2.0.0");
+            assert_eq!(rounds[2].len(), 1);
+            assert_eq!(rounds[2][0].display_version, "1.0.0");
+            assert!(
+                rounds[3..].iter().all(Vec::is_empty),
+                "only 3 candidate versions were available, so later rounds must stay empty"
+            );
+        }
+    }
+
     /// #462: `resolve_fix_target`'s pure per-dependency decision logic (reuse / provably
     /// clean / needs a live check / skip), and `apply_live_fix_target_statuses`'s handling of
     /// a live-check result map that may be missing keys (timeout/outage).
@@ -1598,7 +1872,7 @@ mod tests {
             // Case (c): F (1.2.0, the only advisory's fix) coincides with the already-checked
             // "latest" candidate — reuse its result, no live check queued.
             let latest_status = UpgradeStatus::CandidateClean {
-                version: "1.2.0".to_string(),
+                version: ConcreteVersion::new("1.2.0"),
             };
             let dv = dv(vec![advisory("A1", &["1.2.0"])]);
             let latest_status_map = latest_status_map(latest_status.clone());
@@ -1621,7 +1895,7 @@ mod tests {
             // queue a live check.
             let dv = dv(vec![advisory("A1", &["1.2.0"])]);
             let latest_status_map = latest_status_map(UpgradeStatus::CandidateClean {
-                version: "3.0.0".to_string(),
+                version: ConcreteVersion::new("3.0.0"),
             });
             let mut osv_name_by_key = HashMap::new();
             osv_name_by_key.insert(deps_core::test_util::vuln_key("pkg"), "pkg".to_string());
@@ -1652,7 +1926,7 @@ mod tests {
             // clean/vulnerable verdict, so this must still queue a live check.
             let dv = dv(vec![advisory("A1", &["1.2.0"])]);
             let latest_status_map = latest_status_map(UpgradeStatus::CandidateUnverified {
-                version: "1.2.0".to_string(),
+                version: ConcreteVersion::new("1.2.0"),
                 reason: deps_core::osv::SkipReason::QueryFailed,
             });
             let mut osv_name_by_key = HashMap::new();
@@ -1740,19 +2014,19 @@ mod tests {
             latest_status.insert(
                 deps_core::test_util::vuln_key("reused"),
                 UpgradeStatus::CandidateClean {
-                    version: "1.0.0".to_string(),
+                    version: ConcreteVersion::new("1.0.0"),
                 },
             );
             latest_status.insert(
                 deps_core::test_util::vuln_key("live-a"),
                 UpgradeStatus::CandidateClean {
-                    version: "9.0.0".to_string(),
+                    version: ConcreteVersion::new("9.0.0"),
                 },
             );
             latest_status.insert(
                 deps_core::test_util::vuln_key("live-b"),
                 UpgradeStatus::CandidateClean {
-                    version: "9.0.0".to_string(),
+                    version: ConcreteVersion::new("9.0.0"),
                 },
             );
             let mut osv_name_by_key = HashMap::new();
@@ -1809,7 +2083,7 @@ mod tests {
             statuses.insert(
                 deps_core::test_util::vuln_key("checked"),
                 UpgradeStatus::CandidateClean {
-                    version: "1.0.0".to_string(),
+                    version: ConcreteVersion::new("1.0.0"),
                 },
             );
             // "timed-out" deliberately has no entry in `statuses`.
@@ -1825,7 +2099,7 @@ mod tests {
             assert_eq!(
                 checked.fix_target_status,
                 UpgradeStatus::CandidateClean {
-                    version: "1.0.0".to_string()
+                    version: ConcreteVersion::new("1.0.0")
                 }
             );
 

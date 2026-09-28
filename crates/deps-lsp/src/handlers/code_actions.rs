@@ -229,6 +229,8 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    #[cfg(any(feature = "cargo", feature = "swift"))]
+    use deps_core::ConcreteVersion;
     #[cfg(any(feature = "cargo", feature = "npm", feature = "swift"))]
     use deps_core::EcosystemId;
     use tower_lsp_server::ls_types::{Position, Range, TextDocumentIdentifier};
@@ -572,7 +574,7 @@ serde = "0.9.0"
                         1,
                     ))
                     .with_fix_target_status(UpgradeStatus::CandidateClean {
-                        version: "1.0.5".to_string(),
+                        version: ConcreteVersion::new("1.0.5"),
                     }),
                 ),
             );
@@ -672,7 +674,7 @@ serde = "1.0.0"
                         1,
                     ))
                     .with_fix_target_status(UpgradeStatus::CandidateClean {
-                        version: "1.0.5".to_string(),
+                        version: ConcreteVersion::new("1.0.5"),
                     }),
                 ),
             );
@@ -775,7 +777,7 @@ serde = "0.9.0"
                 ScanOutcome::Vulnerable(
                     DependencyVulnerabilities::new(Capped::new(advisories, total))
                         .with_fix_target_status(UpgradeStatus::CandidateClean {
-                            version: "1.0.5".to_string(),
+                            version: ConcreteVersion::new("1.0.5"),
                         }),
                 ),
             );
@@ -894,7 +896,7 @@ serde = "0.9.0"
                 ScanOutcome::Vulnerable(
                     DependencyVulnerabilities::new(Capped::new(advisories, total))
                         .with_fix_target_status(UpgradeStatus::CandidateClean {
-                            version: "1.0.6".to_string(),
+                            version: ConcreteVersion::new("1.0.6"),
                         }),
                 ),
             );
@@ -1076,7 +1078,8 @@ serde = "0.9.0"
         #[tokio::test]
         async fn test_handle_code_actions_candidate_status_gates_non_latest_refactor_items() {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
-            use deps_core::osv::{CandidateStatusMap, UpgradeStatus};
+            use deps_core::ConcreteVersion;
+            use deps_core::osv::{CandidateStatusMap, CandidateStatuses, UpgradeStatus};
 
             let content = "[dependencies]\nserde = \"0.9.0\"\n".to_string();
 
@@ -1109,13 +1112,15 @@ serde = "0.9.0"
                     let mut candidate_status = CandidateStatusMap::new();
                     candidate_status.insert(
                         deps_core::test_util::vuln_key("serde"),
-                        std::iter::once((
-                            version.to_string(),
-                            UpgradeStatus::CandidateClean {
-                                version: version.to_string(),
-                            },
-                        ))
-                        .collect(),
+                        CandidateStatuses::PerVersion(
+                            std::iter::once((
+                                ConcreteVersion::new(version),
+                                UpgradeStatus::CandidateClean {
+                                    version: ConcreteVersion::new(version),
+                                },
+                            ))
+                            .collect(),
+                        ),
                     );
                     doc_state.signals.candidate_status = candidate_status;
                 }
@@ -1282,7 +1287,7 @@ serde = "0.9.0"
                         1,
                     ))
                     .with_fix_target_status(UpgradeStatus::CandidateClean {
-                        version: "4.50.1".to_string(),
+                        version: ConcreteVersion::new("4.50.1"),
                     }),
                 ),
             );

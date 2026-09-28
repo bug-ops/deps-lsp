@@ -1935,7 +1935,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.2.0".to_string(),
+                version: ConcreteVersion::new("1.2.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -1999,7 +1999,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.2.0".to_string(),
+                version: ConcreteVersion::new("1.2.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -3155,7 +3155,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "2.0.0".to_string(),
+                version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -3167,7 +3167,7 @@ mod tests {
         fallback_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateClean {
-                version: "1.1.0".to_string(),
+                version: ConcreteVersion::new("1.1.0"),
             },
         );
         analysis.fallback_status = Some(fallback_status);
@@ -3223,7 +3223,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateClean {
-                version: "1.2.0".to_string(),
+                version: ConcreteVersion::new("1.2.0"),
             },
         );
         analysis.latest_status = Some(latest_status);
@@ -3321,7 +3321,7 @@ mod tests {
         fallback_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.1.0".to_string(),
+                version: ConcreteVersion::new("1.1.0"),
                 advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -3431,7 +3431,7 @@ mod tests {
             status.insert(
                 deps_core::test_util::vuln_key("pkg"),
                 UpgradeStatus::CandidateVulnerable {
-                    version: version.to_string(),
+                    version: deps_core::ConcreteVersion::new(version),
                     advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
                     worst_severity: Some(VulnSeverity::High),
                 },
@@ -3538,7 +3538,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "2.0.0".to_string(),
+                version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -3641,7 +3641,7 @@ mod tests {
         fallback_status.insert(
             deps_core::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.1.0".to_string(),
+                version: ConcreteVersion::new("1.1.0"),
                 advisory_ids: Capped::new(vec!["GHSA-x".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },

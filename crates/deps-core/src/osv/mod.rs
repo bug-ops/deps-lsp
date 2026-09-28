@@ -26,10 +26,10 @@ use dashmap::DashMap;
 pub use severity::to_diagnostic_severity as diagnostic_severity_for;
 use types::worst_severity;
 pub use types::{
-    Advisory, CandidateStatusMap, Capped, DependencyVulnerabilities, FixRecommendation,
-    LatestStatusMap, OsvEcosystem, OsvVersion, ScanOutcome, ScanTarget, SkipReason, UpgradeStatus,
-    VulnKey, VulnKeys, VulnSeverity, VulnerabilityMap, is_valid_osv_id, validated_osv_url,
-    vuln_key_for, vulnerability_keys,
+    Advisory, CandidateStatusMap, CandidateStatuses, Capped, DependencyVulnerabilities,
+    FixRecommendation, LatestStatusMap, OsvEcosystem, OsvVersion, ScanOutcome, ScanTarget,
+    SkipReason, StructuralSkipReason, UpgradeStatus, VulnKey, VulnKeys, VulnSeverity,
+    VulnerabilityMap, is_valid_osv_id, validated_osv_url, vuln_key_for, vulnerability_keys,
 };
 use types::{
     OsvBatchRequest, OsvBatchResponse, OsvPackage, OsvQuery, OsvSingleQueryResponse, OsvVulnRecord,
@@ -344,23 +344,16 @@ impl OsvClient {
             return HashMap::new();
         }
 
-        // `display_version`, not `version`: the latter is OSV's wire spelling (e.g. Go's
-        // `v`-prefix stripped), but `UpgradeStatus` must surface the ecosystem-native one.
-        let versions: HashMap<&VulnKey, &str> = candidates
-            .iter()
-            .map(|c| (&c.key, c.display_version.as_str()))
-            .collect();
-
         let mut outcomes = self.resolve(ecosystem, candidates, timeout).await;
 
         candidates
             .iter()
             .map(|candidate| {
                 let key = candidate.key.clone();
-                let version = (*versions
-                    .get(&key)
-                    .unwrap_or(&candidate.display_version.as_str()))
-                .to_string();
+                // `display_version`, not `version`: the latter is OSV's wire spelling (e.g.
+                // Go's `v`-prefix stripped), but `UpgradeStatus` must surface the
+                // ecosystem-native one.
+                let version = candidate.display_version.clone();
                 let status = match outcomes.remove(&key) {
                     Some(ScanOutcome::Clean) => UpgradeStatus::CandidateClean { version },
                     Some(ScanOutcome::Vulnerable(dv)) => {

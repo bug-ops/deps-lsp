@@ -6355,7 +6355,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -6438,7 +6438,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "2.0.0".to_string(),
+                version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -6498,7 +6498,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -6555,7 +6555,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.5.0".to_string(),
+                version: ConcreteVersion::new("1.5.0"),
                 advisory_ids: Capped::new(vec!["GHSA-yyyy".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -6625,7 +6625,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["GHSA-xxxx".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -6717,7 +6717,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -6811,7 +6811,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -6885,7 +6885,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateUnverified {
-                version: "1.5.0".to_string(),
+                version: ConcreteVersion::new("1.5.0"),
                 reason: SkipReason::QueryFailed,
             },
         );
@@ -6946,7 +6946,7 @@ mod tests {
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateUnverified {
                 // Stale: describes a previous phase B run's `latest`, not the current one.
-                version: "1.5.0".to_string(),
+                version: ConcreteVersion::new("1.5.0"),
                 reason: SkipReason::QueryFailed,
             },
         );
@@ -6999,7 +6999,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateUnverified {
-                version: "1.5.0".to_string(),
+                version: ConcreteVersion::new("1.5.0"),
                 reason: SkipReason::QueryFailed,
             },
         );
@@ -7114,7 +7114,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateUnverified {
-                version: "1.5.0".to_string(),
+                version: ConcreteVersion::new("1.5.0"),
                 reason: SkipReason::UnmappableName,
             },
         );

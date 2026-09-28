@@ -617,6 +617,13 @@ mod tests {
     use super::*;
     use crate::document::DocumentState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    #[cfg(any(
+        feature = "cargo",
+        feature = "pypi",
+        feature = "maven",
+        feature = "composer"
+    ))]
+    use deps_core::ConcreteVersion;
     use tower_lsp_server::ls_types::{
         CompletionItemKind, Position, TextDocumentIdentifier, TextDocumentPositionParams,
     };
@@ -927,7 +934,8 @@ mod tests {
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_demotes_flagged_item() {
         use deps_core::osv::{
-            CandidateStatusMap, Capped, LatestStatusMap, UpgradeStatus, VulnSeverity,
+            CandidateStatusMap, CandidateStatuses, Capped, LatestStatusMap, UpgradeStatus,
+            VulnSeverity,
         };
 
         // Held per fs_probe::snapshot_guard's doc: parse_manifest touches fs_probe and this
@@ -950,7 +958,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.2.0".to_string(),
+                version: ConcreteVersion::new("1.2.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -963,13 +971,15 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             deps_core::test_util::vuln_key("serde"),
-            std::iter::once((
-                "1.0.0".to_string(),
-                UpgradeStatus::CandidateClean {
-                    version: "1.0.0".to_string(),
-                },
-            ))
-            .collect(),
+            CandidateStatuses::PerVersion(
+                std::iter::once((
+                    ConcreteVersion::new("1.0.0"),
+                    UpgradeStatus::CandidateClean {
+                        version: ConcreteVersion::new("1.0.0"),
+                    },
+                ))
+                .collect(),
+            ),
         );
         doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);
@@ -1128,7 +1138,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("serde"),
             UpgradeStatus::CandidateClean {
-                version: "1.1.0".to_string(),
+                version: ConcreteVersion::new("1.1.0"),
             },
         );
         doc.update_latest_status(latest_status);
@@ -1169,7 +1179,9 @@ mod tests {
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_gates_every_item_when_none_looks_like_latest()
      {
-        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+        use deps_core::osv::{
+            CandidateStatusMap, CandidateStatuses, Capped, UpgradeStatus, VulnSeverity,
+        };
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
@@ -1188,15 +1200,17 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             deps_core::test_util::vuln_key("serde"),
-            std::iter::once((
-                "1.2.0".to_string(),
-                UpgradeStatus::CandidateVulnerable {
-                    version: "1.2.0".to_string(),
-                    advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
-                    worst_severity: Some(VulnSeverity::Malicious),
-                },
-            ))
-            .collect(),
+            CandidateStatuses::PerVersion(
+                std::iter::once((
+                    ConcreteVersion::new("1.2.0"),
+                    UpgradeStatus::CandidateVulnerable {
+                        version: ConcreteVersion::new("1.2.0"),
+                        advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
+                        worst_severity: Some(VulnSeverity::Malicious),
+                    },
+                ))
+                .collect(),
+            ),
         );
         doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);
@@ -1367,7 +1381,8 @@ mod tests {
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_demotes_flagged_non_latest_item() {
         use deps_core::osv::{
-            CandidateStatusMap, Capped, LatestStatusMap, UpgradeStatus, VulnSeverity,
+            CandidateStatusMap, CandidateStatuses, Capped, LatestStatusMap, UpgradeStatus,
+            VulnSeverity,
         };
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
@@ -1388,7 +1403,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("feed-widget-helper"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.0.8".to_string(),
+                version: ConcreteVersion::new("1.0.8"),
                 advisory_ids: Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -1398,15 +1413,17 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             deps_core::test_util::vuln_key("feed-widget-helper"),
-            std::iter::once((
-                "1.0.6".to_string(),
-                UpgradeStatus::CandidateVulnerable {
-                    version: "1.0.6".to_string(),
-                    advisory_ids: Capped::new(vec!["MAL-2026-16331".to_string()], 1),
-                    worst_severity: Some(VulnSeverity::Malicious),
-                },
-            ))
-            .collect(),
+            CandidateStatuses::PerVersion(
+                std::iter::once((
+                    ConcreteVersion::new("1.0.6"),
+                    UpgradeStatus::CandidateVulnerable {
+                        version: ConcreteVersion::new("1.0.6"),
+                        advisory_ids: Capped::new(vec!["MAL-2026-16331".to_string()], 1),
+                        worst_severity: Some(VulnSeverity::Malicious),
+                    },
+                ))
+                .collect(),
+            ),
         );
         doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);
@@ -1484,7 +1501,9 @@ mod tests {
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_untouched_for_pypi_package_name_completion()
      {
-        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+        use deps_core::osv::{
+            CandidateStatusMap, CandidateStatuses, Capped, UpgradeStatus, VulnSeverity,
+        };
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
@@ -1506,15 +1525,17 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             deps_core::test_util::vuln_key("requests"),
-            std::iter::once((
-                "2.31.0".to_string(),
-                UpgradeStatus::CandidateVulnerable {
-                    version: "2.31.0".to_string(),
-                    advisory_ids: Capped::new(vec!["MAL-2026-00003".to_string()], 1),
-                    worst_severity: Some(VulnSeverity::Malicious),
-                },
-            ))
-            .collect(),
+            CandidateStatuses::PerVersion(
+                std::iter::once((
+                    ConcreteVersion::new("2.31.0"),
+                    UpgradeStatus::CandidateVulnerable {
+                        version: ConcreteVersion::new("2.31.0"),
+                        advisory_ids: Capped::new(vec!["MAL-2026-00003".to_string()], 1),
+                        worst_severity: Some(VulnSeverity::Malicious),
+                    },
+                ))
+                .collect(),
+            ),
         );
         doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);
@@ -1563,7 +1584,9 @@ mod tests {
     #[cfg(feature = "maven")]
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_gates_self_closing_maven_version_tag() {
-        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+        use deps_core::osv::{
+            CandidateStatusMap, CandidateStatuses, Capped, UpgradeStatus, VulnSeverity,
+        };
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
@@ -1593,7 +1616,7 @@ mod tests {
         latest_status.insert(
             deps_core::test_util::vuln_key("org.example:evil-lib"),
             UpgradeStatus::CandidateVulnerable {
-                version: "9.9.9".to_string(),
+                version: ConcreteVersion::new("9.9.9"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00004".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -1602,15 +1625,17 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             deps_core::test_util::vuln_key("org.example:evil-lib"),
-            std::iter::once((
-                "9.8.0".to_string(),
-                UpgradeStatus::CandidateVulnerable {
-                    version: "9.8.0".to_string(),
-                    advisory_ids: Capped::new(vec!["MAL-2026-00005".to_string()], 1),
-                    worst_severity: Some(VulnSeverity::Malicious),
-                },
-            ))
-            .collect(),
+            CandidateStatuses::PerVersion(
+                std::iter::once((
+                    ConcreteVersion::new("9.8.0"),
+                    UpgradeStatus::CandidateVulnerable {
+                        version: ConcreteVersion::new("9.8.0"),
+                        advisory_ids: Capped::new(vec!["MAL-2026-00005".to_string()], 1),
+                        worst_severity: Some(VulnSeverity::Malicious),
+                    },
+                ))
+                .collect(),
+            ),
         );
         doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);
@@ -1684,7 +1709,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_matches_composer_v_prefixed_insert_text()
     {
-        use deps_core::osv::{CandidateStatusMap, UpgradeStatus};
+        use deps_core::osv::{CandidateStatusMap, CandidateStatuses, UpgradeStatus};
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
         let state = Arc::new(ServerState::new());
@@ -1710,13 +1735,15 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             deps_core::test_util::vuln_key("vendor/package"),
-            std::iter::once((
-                "1.0.0".to_string(),
-                UpgradeStatus::CandidateClean {
-                    version: "1.0.0".to_string(),
-                },
-            ))
-            .collect(),
+            CandidateStatuses::PerVersion(
+                std::iter::once((
+                    ConcreteVersion::new("1.0.0"),
+                    UpgradeStatus::CandidateClean {
+                        version: ConcreteVersion::new("1.0.0"),
+                    },
+                ))
+                .collect(),
+            ),
         );
         doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);
@@ -1762,7 +1789,9 @@ mod tests {
     #[tokio::test]
     async fn test_apply_osv_latest_verdict_to_completions_gates_position_just_before_version_range()
     {
-        use deps_core::osv::{CandidateStatusMap, Capped, UpgradeStatus, VulnSeverity};
+        use deps_core::osv::{
+            CandidateStatusMap, CandidateStatuses, Capped, UpgradeStatus, VulnSeverity,
+        };
         use tower_lsp_server::ls_types::Range;
 
         let _guard = deps_core::fs_probe::snapshot_guard_async().await;
@@ -1787,15 +1816,17 @@ mod tests {
         let mut candidate_status = CandidateStatusMap::new();
         candidate_status.insert(
             deps_core::test_util::vuln_key("serde"),
-            std::iter::once((
-                "0.5.0".to_string(),
-                UpgradeStatus::CandidateVulnerable {
-                    version: "0.5.0".to_string(),
-                    advisory_ids: Capped::new(vec!["MAL-2026-00006".to_string()], 1),
-                    worst_severity: Some(VulnSeverity::Malicious),
-                },
-            ))
-            .collect(),
+            CandidateStatuses::PerVersion(
+                std::iter::once((
+                    ConcreteVersion::new("0.5.0"),
+                    UpgradeStatus::CandidateVulnerable {
+                        version: ConcreteVersion::new("0.5.0"),
+                        advisory_ids: Capped::new(vec!["MAL-2026-00006".to_string()], 1),
+                        worst_severity: Some(VulnSeverity::Malicious),
+                    },
+                ))
+                .collect(),
+            ),
         );
         doc.update_candidate_status(candidate_status);
         state.update_document(uri.clone(), doc);

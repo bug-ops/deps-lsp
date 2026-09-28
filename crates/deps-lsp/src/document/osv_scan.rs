@@ -545,23 +545,59 @@ pub(crate) async fn run_osv_phase_b_and_commit(
         .await;
     for checked in round_results {
         for (key, status) in checked {
-            let version = match &status {
+            let version: ConcreteVersion = match &status {
                 deps_core::osv::UpgradeStatus::CandidateClean { version }
                 | deps_core::osv::UpgradeStatus::CandidateVulnerable { version, .. }
                 | deps_core::osv::UpgradeStatus::CandidateUnverified { version, .. } => {
                     version.clone()
                 }
-                // `check_candidates` never returns `NotChecked` — a target it could not
-                // resolve at all becomes `CandidateUnverified` instead (see its own doc).
-                // `#[non_exhaustive]` requires this wildcard even though every real variant
-                // is already matched above (`NotChecked` included); a future new variant with
-                // no known version string here is nothing to record, not a bug.
+                // `check_candidates` never returns `NotChecked`/`StructurallyUnchecked` — a
+                // target it could not resolve at all becomes `CandidateUnverified` instead
+                // (see its own doc). `#[non_exhaustive]` requires this wildcard even though
+                // every real variant is already matched above; a future new variant with no
+                // known version string here is nothing to record, not a bug.
                 _ => continue,
             };
-            candidate_status
+            // Structural entries never reach this point: `build_candidate_check_targets`
+            // never adds a dependency it recorded as `CandidateStatuses::Structural` to any
+            // round, so a round result can only ever belong to a `PerVersion` entry. Checked by
+            // borrowing first (code-review finding: an unconditional `key.clone()` before the
+            // `entry()` move was dead weight on the hot, common `PerVersion` path, paid on every
+            // round-result entry just to log the rare/unreachable-in-practice mismatch) — only
+            // the mismatch arm below ever needs `key`, and it still owns it there since
+            // `entry(key)` was never reached. Exhaustive (not `if let`) because
+            // `CandidateStatuses` is deliberately not `#[non_exhaustive]` (#1624 critique S2) —
+            // a silently-dropped `Structural` case here would only ever be caught by this
+            // `debug_assert!`, since the invariant above is enforced by a comment in
+            // `deps-engine`, not by the type system.
+            if let Some(deps_core::osv::CandidateStatuses::Structural(reason)) =
+                candidate_status.get(&key)
+            {
+                debug_assert!(
+                    false,
+                    "candidate-check round result for a dependency recorded as \
+                     structurally skipped ({reason:?}) — build_candidate_check_targets \
+                     should never have queued a round target for this key"
+                );
+                tracing::warn!(
+                    key = %key,
+                    ?reason,
+                    "OSV #1624: dropping candidate-check round result for a structurally \
+                     skipped dependency"
+                );
+                continue;
+            }
+            match candidate_status
                 .entry(key)
-                .or_default()
-                .insert(version, status);
+                .or_insert_with(|| deps_core::osv::CandidateStatuses::PerVersion(HashMap::new()))
+            {
+                deps_core::osv::CandidateStatuses::PerVersion(per_version) => {
+                    per_version.insert(version, status);
+                }
+                deps_core::osv::CandidateStatuses::Structural(_) => unreachable!(
+                    "just checked above via candidate_status.get(&key) that this entry is not Structural"
+                ),
+            }
         }
     }
 
@@ -1280,7 +1316,7 @@ mod tests {
     mod phase_b_latest_status_tests {
         use super::super::super::state::DocumentState;
         use super::*;
-        use deps_core::osv::{OsvClient, UpgradeStatus};
+        use deps_core::osv::{CandidateStatuses, OsvClient, UpgradeStatus};
         use std::assert_matches;
 
         /// End to end: a registry-sourced Cargo dependency pinned at a clean version, with a
@@ -1294,14 +1330,16 @@ mod tests {
         async fn phase_b_populates_latest_status_for_a_phase_a_clean_dependency() {
             let _guard = deps_core::fs_probe::snapshot_guard_async().await;
             let mut server = mockito::Server::new_async().await;
-            // Both phase A's (pinned "1.0.0") and phase B's (latest "1.2.0") batch queries
-            // hit this same endpoint; mocked to report every queried version clean, so this
-            // one mock covers both calls (`.expect(2)`).
+            // Phase A's (pinned "1.0.0"), B.1's (latest "1.2.0"), and B.1b's round-0
+            // candidate-check (the sole cached version, "1.2.0", is also this dependency's
+            // only round-0 candidate — #1624 tester gap 2) batch queries all hit this same
+            // endpoint; mocked to report every queried version clean, so this one mock covers
+            // all three calls (`.expect(3)`).
             let _batch = server
                 .mock("POST", "/v1/querybatch")
                 .with_status(200)
                 .with_body(r#"{"results":[{}]}"#)
-                .expect(2)
+                .expect(3)
                 .create_async()
                 .await;
 
@@ -1365,6 +1403,25 @@ mod tests {
                 "phase B must populate latest_status for a phase-A-clean dependency too \
                  (issue #1517) — got: {:?}",
                 doc.signals.latest_status
+            );
+            // #1624 tester gap 2: the B.1b round-merge (rewritten for this issue) must land in
+            // `candidate_status` too, keyed by the exact `ConcreteVersion` the round checked —
+            // not silently dropped by the `entry().or_insert_with(..)` merge, and not left as a
+            // fresh empty `PerVersion` map.
+            let candidate_statuses = doc
+                .signals
+                .candidate_status
+                .get(&deps_core::test_util::vuln_key("serde"));
+            let Some(CandidateStatuses::PerVersion(per_version)) = candidate_statuses else {
+                panic!(
+                    "phase B's B.1b round-check must populate candidate_status with a \
+                     PerVersion entry for serde — got: {candidate_statuses:?}"
+                );
+            };
+            assert_matches!(
+                per_version.get(&deps_core::ConcreteVersion::new("1.2.0")),
+                Some(UpgradeStatus::CandidateClean { version }) if version == "1.2.0",
+                "round 0's sole candidate (\"1.2.0\") must resolve clean — got: {per_version:?}"
             );
         }
     }

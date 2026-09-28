@@ -681,12 +681,12 @@ pub enum UpgradeStatus {
     /// The candidate upgrade version is not itself affected by any known advisory.
     CandidateClean {
         /// The version that was checked.
-        version: String,
+        version: ConcreteVersion,
     },
     /// The candidate upgrade version is itself affected.
     CandidateVulnerable {
         /// The version that was checked.
-        version: String,
+        version: ConcreteVersion,
         /// Advisory IDs that still apply to the candidate version, capped at
         /// [`crate::osv::MAX_ADVISORY_RECORDS`] the same way
         /// [`DependencyVulnerabilities::advisories`] is (#462 critic M1) —
@@ -704,19 +704,31 @@ pub enum UpgradeStatus {
         /// treating [`Self::CandidateVulnerable`] as a hard block.
         worst_severity: Option<VulnSeverity>,
     },
-    /// The candidate upgrade version's OSV status could not be determined — either the check
-    /// was never run (transient: query failure, timeout, truncation) or structurally does not
-    /// apply (this dependency's source/ecosystem is never checked against OSV at all). See
-    /// [`SkipReason::is_structural`] for the distinction a caller (e.g.
-    /// `crate::lsp_helpers::latest_verdict`) uses to tell the two apart — a transient reason
-    /// must fail closed (never rendered as "verified safe"), while a structural one degrades to
-    /// "not applicable" instead (issue #1517).
+    /// The candidate upgrade version's OSV status could not be determined, but a version was
+    /// still attempted or is otherwise known: either the check itself failed (transient — query
+    /// failure, timeout, truncation) or the reason is structural but a real candidate version
+    /// was already on hand ([`SkipReason::UnmappableName`]/[`SkipReason::UnmappableEcosystem`]
+    /// — the registry's "latest" is known, only its OSV mapping is not). See
+    /// [`Self::StructurallyUnchecked`] for the case where no version is known at all. A caller
+    /// must fail closed (never render this as "verified safe") until a later phase B run
+    /// replaces it — [`SkipReason::is_structural`] tells a transient reason apart from a
+    /// structural-but-version-known one, which callers treat differently (issue #1517).
     CandidateUnverified {
-        /// The version that was attempted (or would have been attempted, for a structural skip).
-        version: String,
+        /// The version that was attempted.
+        version: ConcreteVersion,
         /// Why the check did not produce a definite clean/vulnerable verdict.
         reason: SkipReason,
     },
+    /// This dependency's source/ecosystem is never checked against OSV at all, and no candidate
+    /// version is known either, so there is nothing to report — unlike
+    /// [`Self::CandidateUnverified`], which always names a version even when its reason is also
+    /// structural. Only ever holds a [`StructuralSkipReason`] (issue #1624 S1): unlike a bare
+    /// [`SkipReason`], which also admits transient reasons like
+    /// [`SkipReason::QueryFailed`], this makes "this dependency is never checked, for a
+    /// permanent reason" the only state this variant can represent — a caller (e.g.
+    /// `crate::lsp_helpers::latest_verdict`) degrades it to "not applicable" rather than
+    /// "unverified" (issue #1517).
+    StructurallyUnchecked(StructuralSkipReason),
 }
 
 /// Vulnerability data for one dependency that OSV reported as non-clean.
@@ -977,7 +989,8 @@ impl DependencyVulnerabilities {
             Some(
                 UpgradeStatus::NotChecked
                 | UpgradeStatus::CandidateClean { .. }
-                | UpgradeStatus::CandidateUnverified { .. },
+                | UpgradeStatus::CandidateUnverified { .. }
+                | UpgradeStatus::StructurallyUnchecked(_),
             )
             | None => &[],
         };
@@ -1132,6 +1145,60 @@ impl SkipReason {
     }
 }
 
+/// The subset of [`SkipReason`] that is structural (see [`SkipReason::is_structural`]).
+///
+/// Permanent for as long as a dependency is declared the way it is, never resolved merely by a
+/// retry. The only reasons [`UpgradeStatus::StructurallyUnchecked`] and
+/// [`CandidateStatuses::Structural`] can hold, so a transient reason (e.g.
+/// [`SkipReason::QueryFailed`]) is structurally impossible to store as "this dependency is
+/// never checked against OSV" (issue #1624) — unlike a bare `SkipReason` payload, which would
+/// let a future producer bug (or test fixture) construct e.g. `StructurallyUnchecked(QueryFailed)`
+/// and have it silently resolve to `NotApplicable` (fail-open) instead of `Unverified`, since
+/// nothing but an unenforced runtime `is_structural()` check would catch it.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::{SkipReason, StructuralSkipReason};
+///
+/// assert_eq!(
+///     StructuralSkipReason::NonRegistrySource.as_skip_reason(),
+///     SkipReason::NonRegistrySource
+/// );
+/// assert_eq!(
+///     SkipReason::from(StructuralSkipReason::UnmappableName),
+///     SkipReason::UnmappableName
+/// );
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuralSkipReason {
+    /// See [`SkipReason::NonRegistrySource`].
+    NonRegistrySource,
+    /// See [`SkipReason::UnmappableName`].
+    UnmappableName,
+    /// See [`SkipReason::UnmappableEcosystem`].
+    UnmappableEcosystem,
+}
+
+impl StructuralSkipReason {
+    /// Widens to the full [`SkipReason`] enum, e.g. to reuse
+    /// [`SkipReason::unchecked_reason`]/`SkipReason::as_str` for rendering or logging.
+    #[must_use]
+    pub const fn as_skip_reason(self) -> SkipReason {
+        match self {
+            Self::NonRegistrySource => SkipReason::NonRegistrySource,
+            Self::UnmappableName => SkipReason::UnmappableName,
+            Self::UnmappableEcosystem => SkipReason::UnmappableEcosystem,
+        }
+    }
+}
+
+impl From<StructuralSkipReason> for SkipReason {
+    fn from(value: StructuralSkipReason) -> Self {
+        value.as_skip_reason()
+    }
+}
+
 #[cfg(test)]
 mod skip_reason_unchecked_reason_tests {
     use super::SkipReason;
@@ -1232,25 +1299,42 @@ pub type VulnerabilityMap = HashMap<VulnKey, ScanOutcome>;
 /// scan entirely — `crate::lsp_helpers::latest_verdict` treats the two differently.
 pub type LatestStatusMap = HashMap<VulnKey, UpgradeStatus>;
 
+/// A dependency's phase B candidate-check result set (#1524, issue #1624).
+///
+/// Replaces an earlier design that recorded a structural skip under an empty-string sentinel
+/// key inside the per-version map — a shape that let "structurally skipped" and "has real
+/// per-version data" coexist for the same dependency, which is meaningless. This enum makes
+/// that state unrepresentable: a dependency is either structurally unchecked as a whole, or has
+/// zero or more real per-version verdicts, never both.
+///
+/// Deliberately not `#[non_exhaustive]` (project rule, #1624 critique S2): every match site
+/// across the workspace is compiler-forced to handle a new variant, rather than one crate's
+/// `#[non_exhaustive]`-mandated wildcard silently swallowing it (as the old `if let PerVersion`
+/// in `deps-lsp`'s B.1b round-merge would have).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateStatuses {
+    /// This dependency's source/ecosystem is never checked against OSV at all — applies to
+    /// every candidate version alike, so no per-version map is kept. Only ever holds a
+    /// [`StructuralSkipReason`], not a bare [`SkipReason`], for the same reason
+    /// [`UpgradeStatus::StructurallyUnchecked`] does (issue #1624 S1).
+    Structural(StructuralSkipReason),
+    /// Per-candidate verdicts from phase B's candidate-check rounds, keyed by the exact
+    /// ecosystem-native version a candidate-offering surface (code actions' "update to X"
+    /// list, completion's version items) is about to display — one entry per version phase B's
+    /// candidate-check round actually covered for this dependency.
+    PerVersion(HashMap<ConcreteVersion, UpgradeStatus>),
+}
+
 /// Per-dependency, per-candidate-version OSV verdict (#1524).
 ///
 /// The sibling of [`LatestStatusMap`] for callers that need more than one candidate version's
-/// own status, not only the registry's single "latest" pick.
+/// own status, not only the registry's single "latest" pick. See [`CandidateStatuses`] for what
+/// a single entry can hold.
 ///
-/// The inner `HashMap<String, UpgradeStatus>` is keyed by the exact ecosystem-native version
-/// string a candidate-offering surface (code actions' "update to X" list, completion's version
-/// items) is about to display — one entry per version phase B's candidate-check round actually
-/// covered for this dependency. A structural skip (this dependency's source/ecosystem is never
-/// checked against OSV at all) is recorded once per dependency under the empty-string key
-/// (`""`), a version no ecosystem's `ScanTarget::display_version` can ever equal, rather than
-/// duplicated under every candidate version — [`crate::lsp_helpers::candidate_verdict`] falls
-/// back to it when the exact version being asked about has no entry of its own.
-///
-/// A dependency entirely absent from this map (not even the empty-string sentinel) means phase
-/// B's candidate-check round simply never covered it yet — [`crate::lsp_helpers::candidate_verdict`]
-/// treats that the same as an unchecked version: [`crate::lsp_helpers::LatestVerdict::Unverified`],
-/// never silently safe.
-pub type CandidateStatusMap = HashMap<VulnKey, HashMap<String, UpgradeStatus>>;
+/// A dependency entirely absent from this map means phase B's candidate-check round simply
+/// never covered it yet — [`crate::lsp_helpers::candidate_verdict`] treats that the same as an
+/// unchecked version: [`crate::lsp_helpers::LatestVerdict::Unverified`], never silently safe.
+pub type CandidateStatusMap = HashMap<VulnKey, CandidateStatuses>;
 
 /// A single occurrence's [`VulnerabilityMap`] lookup key, as computed by [`vulnerability_keys`]
 /// or [`vuln_key_for`].
@@ -2019,7 +2103,7 @@ mod recommended_fix_tests {
             advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
         ]);
         let latest = UpgradeStatus::CandidateVulnerable {
-            version: "1.2.0".to_string(),
+            version: ConcreteVersion::new("1.2.0"),
             advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
         };
@@ -2033,7 +2117,7 @@ mod recommended_fix_tests {
     fn candidate_vulnerable_subtracting_every_claimed_id_returns_none() {
         let vulns = dv(vec![advisory("A1", VulnSeverity::High, &["1.1.0"])]);
         let latest = UpgradeStatus::CandidateVulnerable {
-            version: "1.1.0".to_string(),
+            version: ConcreteVersion::new("1.1.0"),
             advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
         };
@@ -2044,7 +2128,7 @@ mod recommended_fix_tests {
     fn candidate_clean_subtracts_nothing() {
         let vulns = dv(vec![advisory("A1", VulnSeverity::High, &["1.1.0"])]);
         let latest = UpgradeStatus::CandidateClean {
-            version: "2.0.0".to_string(),
+            version: ConcreteVersion::new("2.0.0"),
         };
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
         assert_eq!(fix.advisory_ids, vec!["A1".to_string()]);
@@ -2056,7 +2140,7 @@ mod recommended_fix_tests {
         // mistaken for a confirmed-vulnerable candidate — `still_applying` stays empty.
         let vulns = dv(vec![advisory("A1", VulnSeverity::High, &["1.1.0"])]);
         let latest = UpgradeStatus::CandidateUnverified {
-            version: "2.0.0".to_string(),
+            version: ConcreteVersion::new("2.0.0"),
             reason: SkipReason::QueryFailed,
         };
         let fix = vulns.recommended_fix(Some(&latest)).unwrap();
@@ -2085,7 +2169,7 @@ mod recommended_fix_tests {
             advisory("A2", VulnSeverity::Medium, &["1.2.0"]),
         ]);
         let latest = UpgradeStatus::CandidateVulnerable {
-            version: "3.0.0".to_string(),
+            version: ConcreteVersion::new("3.0.0"),
             advisory_ids: Capped::new(vec!["A1".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
         };
