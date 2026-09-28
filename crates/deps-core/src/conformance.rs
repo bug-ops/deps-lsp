@@ -310,6 +310,50 @@ pub fn assert_version_satisfies_requirement(
     );
 }
 
+/// Asserts that rewriting each of `bounded_range_samples` never silently drops its upper bound
+/// (#1602).
+///
+/// `ecosystem` derives its [`BareMeaning`](crate::lsp_helpers::BareMeaning) from
+/// [`crate::lsp_helpers::bare_meaning`] — the single exhaustive per-ecosystem source of truth —
+/// rather than taking a `BareMeaning` literal directly, so a caller cannot accidentally pass a
+/// value that disagrees with what `ecosystem`'s own formatter is wired to use (#1602 impl-critic
+/// S1). `bounded_range_samples` is a requirement with an explicit upper bound (a range, a
+/// compound constraint, or a wildcard/dynamic-version shape). Under
+/// [`BareMeaning::Caret`](crate::lsp_helpers::BareMeaning::Caret) or
+/// [`BareMeaning::Floor`](crate::lsp_helpers::BareMeaning::Floor), a bare version means "this or
+/// newer" with no ceiling, so collapsing a bounded requirement to bare would WIDEN what it
+/// accepts — [`formatter.format_version_replacing`](crate::lsp_helpers::PackageRendering::format_version_replacing)
+/// must refuse the rewrite and return `sample` unchanged for every one of them. Under
+/// [`BareMeaning::ExactPin`](crate::lsp_helpers::BareMeaning::ExactPin), collapsing to bare
+/// always narrows or preserves what the requirement accepts, so this function asserts nothing
+/// for it — that ecosystem's own conformance/unit tests own that guarantee instead.
+///
+/// This is the shared, per-`BareMeaning` half of #1602's "every ecosystem either refuses or
+/// shape-preserves a bounded-range rewrite" invariant; ecosystems whose `format_version_replacing`
+/// does not go through [`format_version_replacing_by_shape`](crate::lsp_helpers::format_version_replacing_by_shape)
+/// at all (e.g. PyPI's/Composer's/npm's own exact-pin-preserving overrides) are `BareMeaning::ExactPin`
+/// ecosystems by construction and are therefore exempt here by the same rule.
+pub fn assert_bare_meaning_never_widens_bounded_range(
+    formatter: &dyn EcosystemFormatter,
+    ecosystem: crate::EcosystemId,
+    bounded_range_samples: &[&str],
+) {
+    let meaning = crate::lsp_helpers::bare_meaning(ecosystem);
+    if meaning == crate::lsp_helpers::BareMeaning::ExactPin {
+        return;
+    }
+    let new_version = ConcreteVersion::new("99.0.0");
+    for &sample in bounded_range_samples {
+        let rewritten = formatter.format_version_replacing(&new_version, sample);
+        assert_eq!(
+            rewritten, sample,
+            "{sample:?}: a bounded-range requirement must be refused (left unchanged), not \
+             collapsed to a bare version — collapsing would drop its upper bound and WIDEN what \
+             the requirement accepts under {ecosystem:?} ({meaning:?})"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------
 // Macro 3: `lockfile_conformance!` — `LockFileProvider` behavior, looped over a
 // (filename, content) list at runtime (an ecosystem may recognize more than one lock file).

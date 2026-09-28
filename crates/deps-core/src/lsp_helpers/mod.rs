@@ -76,7 +76,8 @@ pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     BareMeaning, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming,
     PackageNaming, PackageRendering, RequirementResolution, RequirementRewriteShape, SourcePolicy,
-    classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
+    bare_meaning, classify_requirement_rewrite_shape, format_version_replacing_by_shape,
+    requirement_is_compound,
 };
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, TagIndex, byte_span_to_range, is_full_sha,

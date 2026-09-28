@@ -2,11 +2,13 @@
 
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
 use deps_core::{
-    ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
+    ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq,
+    is_safe_maven_coordinate_segment,
 };
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Maven.
@@ -179,6 +181,22 @@ impl PackageRendering for MavenFormatter {
         version.to_string()
     }
 
+    /// Delegates to the shared [`format_version_replacing_by_shape`] with [`bare_meaning`] of
+    /// [`EcosystemId::Maven`] (#1602: `BareMeaning::Floor`) — Maven's bare version is a "soft"
+    /// recommended version that dependency mediation may override,
+    /// not an auto-following range: collapsing a bounded/union range (`[1.0,2.0)`) or a
+    /// bracket-wrapped hard pin (`[1.0.0]`) to bare would silently drop its upper bound (or,
+    /// for the hard pin, its exclusivity), widening what the requirement accepts instead of
+    /// updating it.
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        format_version_replacing_by_shape(
+            version,
+            current,
+            bare_meaning(EcosystemId::Maven),
+            || self.format_version_for_text_edit(version),
+        )
+    }
+
     fn package_url(&self, name: &PackageName) -> String {
         crate::registry::package_url(name.as_str())
     }
@@ -270,6 +288,39 @@ mod tests {
         assert_eq!(
             f.format_version_for_text_edit(&ConcreteVersion::new("1.0.0-SNAPSHOT")),
             "1.0.0-SNAPSHOT"
+        );
+    }
+
+    /// #1602 repro: `<version>[20.0,30.0)</version>` must never collapse to a bare
+    /// `33.7.1-jre` — that would drop the upper bound and turn a hard range into a soft
+    /// recommendation with no ceiling.
+    #[test]
+    fn test_format_version_replacing_bounded_range_refused() {
+        let f = MavenFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("33.7.1-jre"), "[20.0,30.0)"),
+            "[20.0,30.0)"
+        );
+    }
+
+    /// #1602: a bracket-wrapped hard pin keeps its bracket wrap on rewrite instead of
+    /// collapsing to an unbounded soft recommendation.
+    #[test]
+    fn test_format_version_replacing_bracket_exact_pin_preserved() {
+        let f = MavenFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("2.0.0"), "[1.0.0]"),
+            "[2.0.0]"
+        );
+    }
+
+    /// #1602: the shared conformance helper, deriving `BareMeaning` from `EcosystemId::Maven`.
+    #[test]
+    fn test_bare_meaning_never_widens_bounded_range() {
+        deps_core::conformance::assert_bare_meaning_never_widens_bounded_range(
+            &MavenFormatter,
+            deps_core::EcosystemId::Maven,
+            &["[20.0,30.0)", "(1.0,2.0]", "[1.0,1.5),(1.5,2.0)"],
         );
     }
 

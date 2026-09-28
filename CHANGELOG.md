@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: new `lsp_helpers::{FallbackEditVerdict, FallbackEditRejection, fallback_edit_excludes_newer}`, `edit::{ManifestReparse, EcosystemReparse}`, and `ecosystem::parse_manifest_now` — a two-phase, re-parse-based guard deciding whether a cooldown-fallback edit is safe to write, applied uniformly across all 14 ecosystems (part of #1544) (#1581)
 
 ### Security
+- **ci**: `auto-merge.yml`'s Dependabot gate now checks `github.event.pull_request.user.login` instead of the spoofable `github.actor`, and PR metadata is passed via `env:` instead of being template-expanded directly into the run script (resolves #1600)
 - **deps-core**: `fallback_edit_excludes_newer`'s two `compile_requirement` call sites now gate on `requirement_is_oversized` first, closing the same CWE-400 class #1472/#1579 closed elsewhere (resolves #1580) (#1585)
 - **deps-cli, deps-core**: `deps-cli update --security-only`'s `NoOpRewrite` classification now gates on `requirement_is_oversized` before calling `compile_requirement`, closing the same CWE-400 class #1472 closed elsewhere (resolves #1578) (#1579)
 - **deps-core**: closes two defense-in-depth SSRF/HTTPS gaps — a userinfo-spoofed loopback host (e.g. `http://localhost:80@evil.com/`) could bypass the test-util HTTPS carve-out, and `HostClass` misclassified the RFC 8215 NAT64 local-use prefix, `0.0.0.0/8`, `192.0.0.0/24`, `fec0::/10`, and the Alibaba Cloud metadata address as `Global`/unwrapped (resolves #1562) (#1567)
@@ -84,6 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-core, deps-nuget, deps-maven, deps-gradle**: `deps-cli update` no longer collapses a bounded version range to a bare version for NuGet, Maven, and Gradle, which silently dropped the requirement's upper bound; a new `BareMeaning::Floor` shape guard (already applied to Cargo/Dart by #1584) now refuses the rewrite instead (resolves #1602)
 - **deps-core, deps-maven, deps-gradle, deps-nuget**: fix bounded version-range parser accepting min>max / degenerate zero-width ranges as satisfiable requirements (resolves #1595) (#1599)
 - **deps-maven**: cooldown-fallback guard now rejects a fallback candidate excluded by a disjoint-range gap (e.g. `[1.0,1.5),(1.5,2.0)`), Maven's only way to express a `!=`-style exclusion (resolves #1590) (#1594)
 - **deps-core, deps-pypi, deps-composer, deps-bundler**: cooldown-fallback guard now rejects a fallback candidate the declared requirement excludes via a `!=` term or a `||` gap (resolves #1571) (#1589)
