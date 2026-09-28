@@ -4,8 +4,8 @@ use crate::{ConcreteVersion, EcosystemConfig, ParseResult};
 
 use super::diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 use super::{
-    EcosystemFormatter, LatestVerdict, RequirementStatus, VersionData, in_use_version,
-    latest_verdict, sanitize_and_truncate_for_diagnostic,
+    EcosystemFormatter, LatestVerdict, RequirementStatus, RequirementStatusGate, VersionData,
+    in_use_version, latest_verdict, sanitize_and_truncate_for_diagnostic,
 };
 
 /// Sanitizes and caps a version-shaped string (`latest` or `resolved_version`) for

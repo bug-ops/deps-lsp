@@ -52,12 +52,12 @@ pub use code_lenses::{
     generate_code_lenses,
 };
 pub use diagnostics::{
-    DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities, LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE,
-    MAX_DIAGNOSTIC_VALUE_CHARS, MAX_REQUIREMENT_LEN, TYPOSQUAT_DIAGNOSTIC_CODE,
-    TyposquatFetchOutcome, UNSATISFIABLE_DIAGNOSTIC_CODE, compile_requirement_unless,
-    fetch_gossip_findings_batch, fetch_typosquat_signals, force_refresh_gossip_findings,
-    generate_diagnostics_from_cache, redact_name_for_diagnostic, redact_requirement_for_diagnostic,
-    requirement_is_unsatisfiable, requirement_len_exceeds_cap,
+    BoundedVersionReq, DEPRECATED_DIAGNOSTIC_CODE, DiagnosticSeverities,
+    LICENSE_POLICY_VIOLATION_DIAGNOSTIC_CODE, MAX_DIAGNOSTIC_VALUE_CHARS, MAX_REQUIREMENT_LEN,
+    TYPOSQUAT_DIAGNOSTIC_CODE, TyposquatFetchOutcome, UNSATISFIABLE_DIAGNOSTIC_CODE,
+    compile_requirement_unless, fetch_gossip_findings_batch, fetch_typosquat_signals,
+    force_refresh_gossip_findings, generate_diagnostics_from_cache, redact_name_for_diagnostic,
+    redact_requirement_for_diagnostic, requirement_is_unsatisfiable, requirement_len_exceeds_cap,
     sanitize_advisory_text_for_diagnostic, sanitize_and_truncate_for_diagnostic,
     truncate_for_diagnostic,
 };
@@ -75,9 +75,9 @@ pub use diagnostics::requirement_is_oversized;
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     BareMeaning, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming,
-    PackageNaming, PackageRendering, RequirementResolution, RequirementRewriteShape, SourcePolicy,
-    bare_meaning, classify_requirement_rewrite_shape, format_version_replacing_by_shape,
-    requirement_is_compound,
+    PackageNaming, PackageRendering, RequirementResolution, RequirementRewriteShape,
+    RequirementStatusGate, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
+    format_version_replacing_by_shape, requirement_is_compound,
 };
 pub use git_ref::{
     CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, TagIndex, byte_span_to_range, is_full_sha,

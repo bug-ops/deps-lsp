@@ -2,9 +2,9 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementResolution, RequirementStatus, SourcePolicy, TagIndex, match_v_prefix_style,
-    requirement_contains_template_placeholder, requirement_is_oversized,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementResolution, RequirementStatus, SourcePolicy, TagIndex,
+    match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -329,18 +329,18 @@ impl RequirementResolution for GithubActionsFormatter {
     /// but the SHA itself is immutable — a stale comment can silently read as "up to
     /// date" against `latest` even though the pinned commit is actually behind newer
     /// releases still inside the same major/minor line. Falls back to
-    /// [`Self::requirement_status`] (trusting the comment) on any `TagIndex` miss — a
+    /// [`Self::classify_requirement_status`] (trusting the comment) on any `TagIndex` miss — a
     /// cold cache before the registry fetch populates it, or a commentless/tag/branch
     /// pin, for which the comment-trusting path is already correct or already
     /// `Unresolved`.
-    fn requirement_status_for(
+    fn classify_requirement_status_for(
         &self,
         dep: &dyn Dependency,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        self.sha_pin_status_from_tag_index(dep, requirement, latest)
-            .unwrap_or_else(|| self.requirement_status(requirement, latest))
+        self.sha_pin_status_from_tag_index(dep, latest)
+            .unwrap_or_else(|| self.classify_requirement_status(requirement, latest))
     }
 
     /// #1556: a SHA pin's registry-confirmed tag (`TagIndex.sha_to_tag`) is a real,
@@ -380,21 +380,20 @@ impl RequirementResolution for GithubActionsFormatter {
 
 impl GithubActionsFormatter {
     /// Ground-truth status for a comment-annotated SHA pin whose commit is indexed in
-    /// `tag_index` — see [`RequirementResolution::requirement_status_for`]. `None` when
-    /// `dep` isn't such a pin, or the SHA has no `TagIndex` entry yet.
+    /// `tag_index` — see [`RequirementResolution::classify_requirement_status_for`]. `None`
+    /// when `dep` isn't such a pin, or the SHA has no `TagIndex` entry yet.
     ///
-    /// #1644: gated on [`requirement_is_oversized`] first, the same `Unresolved` treatment
-    /// [`RequirementResolution::requirement_status`]'s shared gate already applies on the
-    /// comment-trusting fallback path — this method bypasses that shared gate entirely.
+    /// #1648: no longer gates on `requirement_is_oversized` itself — this method is only ever
+    /// reached through
+    /// [`RequirementStatusGate::requirement_status_for`](deps_core::lsp_helpers::RequirementStatusGate::requirement_status_for),
+    /// which already constructs a [`BoundedVersionReq`] before calling
+    /// [`Self::classify_requirement_status_for`], so an oversized requirement never reaches
+    /// here at all.
     fn sha_pin_status_from_tag_index(
         &self,
         dep: &dyn Dependency,
-        requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> Option<RequirementStatus> {
-        if requirement_is_oversized(requirement) {
-            return Some(RequirementStatus::Unresolved);
-        }
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
         // Restricted to comment-annotated SHA pins: a commentless pin has no human-written
         // text to distrust, so it stays on the ordinary path instead (#907 scope decision).
@@ -432,7 +431,7 @@ impl OsvNaming for GithubActionsFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::CommitSha;
+    use deps_core::lsp_helpers::{CommitSha, RequirementStatusGate};
     use deps_core::parser::DependencySource;
     use deps_core::{Position, Range};
 

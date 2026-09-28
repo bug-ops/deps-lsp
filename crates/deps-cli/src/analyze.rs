@@ -9,8 +9,8 @@
 
 use deps_core::licenses::LicensePolicy;
 use deps_core::lsp_helpers::{
-    CooldownDisposition, DependencyOutcomes, LatestVerdict, PackageVersions, cooldown_disposition,
-    latest_verdict,
+    CooldownDisposition, DependencyOutcomes, LatestVerdict, PackageVersions, RequirementStatusGate,
+    cooldown_disposition, latest_verdict,
 };
 use deps_core::osv::{LatestStatusMap, VulnerabilityMap};
 use deps_core::{

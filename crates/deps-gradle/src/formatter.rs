@@ -327,7 +327,7 @@ impl OsvNaming for GradleFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::RequirementStatus;
+    use deps_core::lsp_helpers::{RequirementStatus, RequirementStatusGate};
 
     /// A minimal [`deps_core::Dependency`] for probing
     /// [`deps_core::edit::replacement_text`] directly — its identity is irrelevant to the

@@ -10,9 +10,9 @@
 //! and spec 063 applied to [`crate::Dependency`]/[`crate::lockfile::LockFileCache`].
 
 use crate::lsp_helpers::{
-    EcosystemFormatter, LineOffsetTable, RequirementStatus, VersionData, is_safe_version_string,
-    literal_span_matches, requirement_is_oversized, resolve_in_use_version, slice_for_range,
-    strip_whitespace, warn_rejected_value,
+    EcosystemFormatter, LineOffsetTable, RequirementStatus, RequirementStatusGate, VersionData,
+    is_safe_version_string, literal_span_matches, requirement_is_oversized, resolve_in_use_version,
+    slice_for_range, strip_whitespace, warn_rejected_value,
 };
 use crate::{ConcreteVersion, Dependency, ParseResult, VersionReq};
 

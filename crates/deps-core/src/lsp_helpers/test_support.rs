@@ -37,9 +37,9 @@ impl PackageRendering for MockUnresolvedFormatter {
 }
 
 impl RequirementResolution for MockUnresolvedFormatter {
-    fn requirement_status(
+    fn classify_requirement_status(
         &self,
-        _requirement: &VersionReq,
+        _requirement: BoundedVersionReq<'_>,
         _latest: &ConcreteVersion,
     ) -> RequirementStatus {
         RequirementStatus::Unresolved

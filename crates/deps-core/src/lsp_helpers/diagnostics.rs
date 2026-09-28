@@ -20,8 +20,8 @@ use crate::{
 
 use super::{
     CooldownBlocker, CooldownDisposition, EcosystemFormatter, LatestVerdict, PackageVersions,
-    RequirementMatcher, RequirementStatus, VersionData, cooldown_disposition, resolve_scan_outcome,
-    version_range_is_synthetic_empty,
+    RequirementMatcher, RequirementStatus, RequirementStatusGate, VersionData,
+    cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -625,6 +625,68 @@ pub fn requirement_len_exceeds_cap(requirement: &str) -> bool {
 #[must_use]
 pub fn requirement_is_oversized(requirement: &VersionReq) -> bool {
     requirement_len_exceeds_cap(requirement.as_str())
+}
+
+/// A [`VersionReq`] proven not [`requirement_is_oversized`].
+///
+/// The only way to construct one is through [`Self::new`]'s length check, so a
+/// [`RequirementResolution::classify_requirement_status`](super::RequirementResolution::classify_requirement_status)/
+/// [`classify_requirement_status_for`](super::RequirementResolution::classify_requirement_status_for)
+/// override receives a value that has already passed the gate and has nothing oversized it
+/// could forget to reject.
+///
+/// #1648: replaces a manual `requirement_is_oversized` check repeated at every
+/// `classify_requirement_status[_for]` override (and easy to omit at a new one) with a
+/// structural guarantee — [`super::RequirementStatusGate`], the only production entry point,
+/// is the sole place that constructs this type, before any override ever runs.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundedVersionReq<'a>(&'a VersionReq);
+
+impl<'a> BoundedVersionReq<'a> {
+    /// Constructs a `BoundedVersionReq`, or `None` when `requirement` is
+    /// [`requirement_is_oversized`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionReq;
+    /// use deps_core::lsp_helpers::{BoundedVersionReq, MAX_REQUIREMENT_LEN};
+    ///
+    /// assert!(BoundedVersionReq::new(&VersionReq::new("^1.0.0")).is_some());
+    ///
+    /// let at_cap = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN));
+    /// assert!(BoundedVersionReq::new(&at_cap).is_some());
+    ///
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(BoundedVersionReq::new(&oversized).is_none());
+    /// ```
+    #[must_use]
+    pub fn new(requirement: &'a VersionReq) -> Option<Self> {
+        (!requirement_is_oversized(requirement)).then_some(Self(requirement))
+    }
+
+    /// Returns the wrapped requirement.
+    #[must_use]
+    pub const fn get(self) -> &'a VersionReq {
+        self.0
+    }
+
+    /// Returns the wrapped requirement's raw string.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::VersionReq;
+    /// use deps_core::lsp_helpers::BoundedVersionReq;
+    ///
+    /// let requirement = VersionReq::new("^1.0.0");
+    /// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+    /// assert_eq!(bounded.as_str(), "^1.0.0");
+    /// ```
+    #[must_use]
+    pub fn as_str(self) -> &'a str {
+        self.get().as_str()
+    }
 }
 
 /// Returns `true` when no published version satisfies `requirement`.

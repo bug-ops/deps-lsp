@@ -276,7 +276,7 @@ impl OsvNaming for MavenFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::RequirementStatus;
+    use deps_core::lsp_helpers::{RequirementStatus, RequirementStatusGate};
 
     #[test]
     fn test_format_version() {
