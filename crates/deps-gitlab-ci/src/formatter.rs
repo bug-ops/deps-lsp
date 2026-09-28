@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementResolution, RequirementStatus, SourcePolicy, TagIndex, match_v_prefix_style,
-    requirement_contains_template_placeholder, warn_rejected_value,
+    requirement_contains_template_placeholder, requirement_is_oversized, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -262,12 +262,19 @@ impl RequirementResolution for GitlabCiFormatter {
     /// text-reclassified a `project:` `ref: "1.2"` as `Partial` and silently suppressed
     /// itself, while the code action offered by `format_version_replacing_for`'s correct
     /// `Branch` classification still treated it as a normal, bumpable pin).
+    ///
+    /// #1631: this override bypasses [`RequirementResolution::requirement_status`]'s shared
+    /// default entirely, so its own `requirement_is_oversized` gate never ran here — gated
+    /// first, before the `PinStyle` lookup, same `Unresolved` semantics as the shared default.
     fn requirement_status_for(
         &self,
         dep: &dyn Dependency,
         requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
+        if requirement_is_oversized(requirement) {
+            return RequirementStatus::Unresolved;
+        }
         let Some(pin) = dep
             .as_any()
             .downcast_ref::<GitlabCiDependency>()
@@ -740,6 +747,53 @@ mod tests {
         assert_eq!(
             fmt.requirement_status_for(&d, &requirement, &ConcreteVersion::new("1.3.0")),
             RequirementStatus::Outdated
+        );
+    }
+
+    /// #1631 regression: `requirement_status_for` must gate on `requirement_is_oversized`
+    /// before consulting `dep.pin`, matching the shared default's semantics
+    /// (`deps_core::lsp_helpers::formatter::requirement_status`). A `Tag` pin whose
+    /// requirement text differs from `latest` would otherwise reach `status_for_pin`'s
+    /// `normalize_tag` comparison and report `Outdated` — the sanity assertion below proves
+    /// that is what `status_for_pin` (the un-gated helper `requirement_status_for` calls
+    /// into) still does on its own, so the gate is what changes the outcome.
+    #[test]
+    fn test_requirement_status_for_oversized_requirement_is_unresolved() {
+        let fmt = formatter();
+        let d = dep(Some(PinStyle::Tag), "org/proj", DependencySource::Registry);
+        let oversized = "1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN + 1);
+
+        assert_eq!(
+            status_for_pin(&PinStyle::Tag, &oversized, "2.0.0"),
+            RequirementStatus::Outdated,
+            "sanity: the un-gated pin comparison alone would call this Outdated"
+        );
+        assert_eq!(
+            fmt.requirement_status_for(
+                &d,
+                &VersionReq::new(&oversized),
+                &ConcreteVersion::new("2.0.0")
+            ),
+            RequirementStatus::Unresolved
+        );
+    }
+
+    /// The cap is exclusive: a requirement of exactly `MAX_REQUIREMENT_LEN` bytes must still
+    /// reach the normal `Tag` comparison, not the gate (mirrors the same boundary convention
+    /// used by `requirement_is_oversized`'s other callers, e.g. `deps_npm::catalog`).
+    #[test]
+    fn test_requirement_status_for_at_cap_requirement_not_gated() {
+        let fmt = formatter();
+        let d = dep(Some(PinStyle::Tag), "org/proj", DependencySource::Registry);
+        let at_cap = "1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN);
+
+        assert_eq!(
+            fmt.requirement_status_for(
+                &d,
+                &VersionReq::new(&at_cap),
+                &ConcreteVersion::new(&at_cap)
+            ),
+            RequirementStatus::UpToDate
         );
     }
 
