@@ -1094,6 +1094,29 @@ mod tests {
         );
     }
 
+    /// #1639: a bare wildcard-major catalog range (npm's own "any version" syntax) now
+    /// resolves through `parse_range_safe` instead of being misreported as
+    /// [`CatalogOutcome::NonSemverEntry`] — `resolve` routes every catalog range through the
+    /// same wrapper `deps-npm`'s other call sites use, so this call site inherited the fix
+    /// automatically; this test pins that it actually did.
+    #[test]
+    fn test_apply_catalog_wildcard_tilde_range_resolves() {
+        let _guard = deps_core::fs_probe::snapshot_guard();
+        let root = tempfile::tempdir().unwrap();
+        workspace(root.path(), "catalog:\n  left-pad: \"~*\"\n");
+        let cache = PnpmWorkspaceCache::new();
+        let config = load(Some(root.path()), &cache);
+
+        let mut deps = vec![dep("left-pad", "catalog:")];
+        apply(&mut deps, config.as_deref());
+
+        assert_eq!(deps[0].version_req, Some("~*".into()));
+        assert_matches!(
+            deps[0].catalog.as_ref().unwrap().outcome,
+            CatalogOutcome::Resolved(ref r) if r == "~*"
+        );
+    }
+
     /// #1483 (CWE-400): a catalog entry longer than `MAX_REQUIREMENT_LEN` must be rejected
     /// before it ever reaches `node_semver::Range::parse`, which allocates roughly 1.6 KB per
     /// `||` alternative and so is a resource-exhaustion vector on an unbounded string.

@@ -1586,15 +1586,16 @@ mod tests {
         );
     }
 
-    /// #1630: `~*` (and its `~x`/`~X` aliases) used to hit an internal `unreachable!()` in
-    /// `node_semver` 2.2.0 rather than returning `Err`, crashing this hot request-handling
-    /// path (hover/completion/diagnostics all resolve through `select_latest_matching`).
-    /// Asserts the panic is now caught and folds into the same `None` an ordinary
-    /// unparseable requirement already produces. `~1.x.3`/`~>1.x.3` are deliberately excluded
-    /// here since #1646 gave them a real, precise resolution instead — see
+    /// #1639: `~*` (and its `~x`/`~X`/`~>x.2.3` wildcard-major aliases) used to hit an
+    /// internal `unreachable!()` in `node_semver` 2.2.0 rather than returning `Err`, crashing
+    /// this hot request-handling path (hover/completion/diagnostics all resolve through
+    /// `select_latest_matching`); #1630/#1638 turned the crash into a safe `None`, but real
+    /// npm resolves all of these to "any version" — asserts they now correctly select the
+    /// only available candidate instead. `~1.x.3`/`~>1.x.3` are deliberately excluded here
+    /// since #1646 gave them a real, precise resolution instead — see
     /// `formatter::tests::test_compile_requirement_tilde_wildcard_patch_resolves_precisely`.
     #[test]
-    fn test_select_latest_matching_tilde_wildcard_does_not_panic() {
+    fn test_select_latest_matching_wildcard_major_resolves_to_any_version() {
         use deps_core::{Registry, VersionReq};
 
         let cache = Arc::new(HttpCache::new());
@@ -1612,8 +1613,8 @@ mod tests {
                     &req,
                     &deps_core::SelectionContext::none()
                 ),
-                None,
-                "requirement {requirement:?} must not panic and must resolve to None"
+                Some(0),
+                "requirement {requirement:?} must resolve to the only candidate"
             );
         }
     }
@@ -1683,13 +1684,14 @@ mod tests {
         mock.assert_async().await;
     }
 
-    /// #1630: a `~*`-shaped requirement used to panic `node_semver::Range::parse` instead
+    /// #1639: a `~*`-shaped requirement used to panic `node_semver::Range::parse` instead
     /// of returning `Err`, crashing the request handler on the main thread (DoS from an
-    /// untrusted `package.json`). Now caught and folded into the same `Err` path an
-    /// ordinary unparseable requirement already takes. `~1.x.3`/`~>1.x.3` are deliberately
-    /// excluded here since #1646 gave them a real, precise resolution instead.
+    /// untrusted `package.json`); #1630/#1638 turned that into a safe `Err`, but real npm
+    /// resolves all of these to "any version" — asserts they now correctly resolve the
+    /// registry's only version instead. `~1.x.3`/`~>1.x.3` are deliberately excluded here
+    /// since #1646 gave them a real, precise resolution instead.
     #[tokio::test]
-    async fn test_get_latest_matching_tilde_wildcard_does_not_panic() {
+    async fn test_get_latest_matching_wildcard_major_resolves_to_any_version() {
         let mut server = mockito::Server::new_async().await;
         let base = server.url();
         let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
@@ -1703,13 +1705,16 @@ mod tests {
             .await;
 
         for requirement in ["~*", "~x", "~X", "=*", "~>x.2.3"] {
-            let err = registry
+            let latest = registry
                 .get_latest_matching("left-pad", requirement)
                 .await
-                .expect_err("tilde-wildcard requirement must not panic and must be rejected");
-            assert!(
-                matches!(err, DepsError::InvalidVersionReq(_)),
-                "requirement {requirement:?} produced unexpected error: {err:?}"
+                .unwrap_or_else(|e| panic!("requirement {requirement:?} must not error: {e}"));
+            assert_eq!(
+                latest
+                    .unwrap_or_else(|| panic!("requirement {requirement:?} must resolve a version"))
+                    .version,
+                "1.3.0",
+                "requirement {requirement:?} must resolve to the only available version"
             );
         }
     }

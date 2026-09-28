@@ -311,24 +311,38 @@ mod tests {
         assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
-    /// #1630: `DenoFormatter::compile_requirement` delegates entirely to
-    /// `deps_npm::compile_node_semver_range`, so it must inherit that fix's panic safety for
-    /// a tilde-wildcard requirement (`~*`/`~x`/`~X`) that used to hit `node_semver`'s internal
-    /// `unreachable!()` instead of returning `Err`. `~>x.2.3` (wildcard major; not
-    /// `~1.x.3`/`~>1.x.3`, which `deps-npm` #1646 gave a real, precise resolution instead —
-    /// see `test_compile_requirement_tilde_wildcard_patch_resolves_precisely` below) covers
-    /// the same shape.
+    /// #1639: `DenoFormatter::compile_requirement` delegates entirely to
+    /// `deps_npm::parse_range_safe`, so it must inherit that fix's "any version" resolution
+    /// for a wildcard-major tilde requirement, whether bare (`~*`/`~x`/`~X`) or with trailing
+    /// components (`~>x.2.3`) — npm's own semantics, not an unresolved requirement (matches
+    /// `deps-npm`'s own coverage for this call site).
     #[test]
-    fn test_compile_requirement_tilde_wildcard_does_not_panic() {
+    fn test_compile_requirement_wildcard_major_resolves_to_any_version() {
         let formatter = DenoFormatter;
         for requirement in ["~*", "~x", "~X", "=*", "~>x.2.3"] {
-            assert!(
-                formatter
-                    .compile_requirement(&VersionReq::new(requirement))
-                    .is_none(),
-                "requirement {requirement:?} must not panic and must resolve to None"
+            let matcher = formatter
+                .compile_requirement(&VersionReq::new(requirement))
+                .unwrap_or_else(|| panic!("requirement {requirement:?} must resolve to a matcher"));
+            assert_eq!(
+                matcher.matches(&ConcreteVersion::new("999.999.999")),
+                Some(true),
+                "requirement {requirement:?} must match an arbitrary version"
             );
         }
+    }
+
+    /// #1639: unlike plain tilde, an equals range with a wildcard major followed by a concrete
+    /// component (`=x.2.3`) is a genuine npm parse error, not "any version" — must stay
+    /// unresolved via the same `deps_npm::parse_range_safe` delegation.
+    #[test]
+    fn test_compile_requirement_equals_wildcard_major_concrete_trailing_stays_unresolved() {
+        let formatter = DenoFormatter;
+        assert!(
+            formatter
+                .compile_requirement(&VersionReq::new("=x.2.3"))
+                .is_none(),
+            "requirement \"=x.2.3\" must stay unresolved, not resolve to \"any version\""
+        );
     }
 
     /// #1646 impl-critic M4: `deps-deno` inherits `deps-npm`'s precise `~1.x.3` resolution
