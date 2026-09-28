@@ -68,36 +68,20 @@ pub(crate) fn satisfies_ranges(version: &str, ranges: &[VersionRange]) -> bool {
     ranges.iter().any(|range| contains(version, range))
 }
 
-/// This member's upper edge, if any (`Minimum` has none — it is open-ended above).
-///
-/// `deps_core::interval::VersionRange` is `#[non_exhaustive]` outside its defining crate, so a
-/// wildcard arm is mandatory here even though the four variants above are exhaustive today; a
-/// future variant falls back to "no edge", the same as `Minimum`/`Maximum`'s genuinely open
-/// side — it simply cannot contribute a gap-detection signal until this match is updated.
+/// This member's upper edge, if any (`Minimum`/`Empty` have none — see
+/// [`deps_core::interval::VersionRange::upper_edge`], the shared accessor this delegates to
+/// (#1610) — `deps-composer`'s own OR-alternation-gap check routes through the same method).
 fn upper_edge(range: &VersionRange) -> Option<(&str, bool)> {
-    match range {
-        VersionRange::Exact(v) => Some((v.as_str(), true)),
-        VersionRange::Maximum { version, inclusive } => Some((version.as_str(), *inclusive)),
-        VersionRange::Bounded {
-            max, max_inclusive, ..
-        } => Some((max.as_str(), *max_inclusive)),
-        // `Minimum` (open-ended above) plus any future variant.
-        _ => None,
-    }
+    range
+        .upper_edge()
+        .map(|(v, inclusive)| (v.as_str(), inclusive))
 }
 
-/// This member's lower edge, if any (`Maximum` has none — it is open-ended below). See
-/// [`upper_edge`] for why a wildcard arm is required.
+/// This member's lower edge, if any (`Maximum`/`Empty` have none). See [`upper_edge`].
 fn lower_edge(range: &VersionRange) -> Option<(&str, bool)> {
-    match range {
-        VersionRange::Exact(v) => Some((v.as_str(), true)),
-        VersionRange::Minimum { version, inclusive } => Some((version.as_str(), *inclusive)),
-        VersionRange::Bounded {
-            min, min_inclusive, ..
-        } => Some((min.as_str(), *min_inclusive)),
-        // `Maximum` (open-ended below) plus any future variant.
-        _ => None,
-    }
+    range
+        .lower_edge()
+        .map(|(v, inclusive)| (v.as_str(), inclusive))
 }
 
 /// Whether `version` is explicitly excluded by the *shape* of a disjoint multi-range union
