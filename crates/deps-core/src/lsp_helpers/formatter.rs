@@ -621,6 +621,57 @@ pub fn format_version_replacing_by_shape(
     }
 }
 
+/// Splits `component` (a single dot-component, or a whole version string) at its first `-`/`+`
+/// marker, returning the core before it and whether that marker was `-` (a prerelease suffix,
+/// which sorts below the bare numeric value — unlike `+` build metadata, which doesn't affect
+/// ordering).
+fn split_patch_component(component: &str) -> (&str, bool) {
+    component
+        .char_indices()
+        .find(|&(_, c)| c == '-' || c == '+')
+        .map_or((component, false), |(idx, marker)| {
+            (component.split_at(idx).0, marker == '-')
+        })
+}
+
+/// Whether `version` satisfies a tilde requirement whose text (already stripped of its `~`
+/// prefix) is `req` — patch-level changes only: `~X.Y.Z` -> `[X.Y.Z, X.(Y+1).0)`, `~X.Y` ->
+/// `[X.Y.0, X.(Y+1).0)`, `~X` -> `[X.0.0, (X+1).0.0)`.
+///
+/// [`is_same_major_minor`] already enforces the major/minor upper bound (and the
+/// shorter-requirement floor defaults for `~X`/`~X.Y`); this adds the explicit patch floor a
+/// 3-component `~X.Y.Z` requirement needs on top of it, including a suffixed patch on either
+/// side and a missing candidate patch (treated as `0`). Falls back to permissive
+/// (`is_same_major_minor`'s own verdict) whenever either side's patch component isn't a plain,
+/// in-range `u64` once its suffix is stripped — a wildcard (`x`/`X`/`*`), other non-numeric text,
+/// or a component too large to fit `u64`.
+fn tilde_admits_version(req: &str, version: &str) -> bool {
+    if !is_same_major_minor(req, version) {
+        return false;
+    }
+
+    let Some(required_component) = req.split('.').nth(2) else {
+        return true;
+    };
+    let (required_core, required_is_prerelease) = split_patch_component(required_component);
+    let Ok(required_patch) = required_core.parse::<u64>() else {
+        return true;
+    };
+
+    let candidate_component = version.split('.').nth(2).unwrap_or("0");
+    let (candidate_core, candidate_is_prerelease) = split_patch_component(candidate_component);
+    let Ok(candidate_patch) = candidate_core.parse::<u64>() else {
+        return true;
+    };
+
+    match candidate_patch.cmp(&required_patch) {
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Greater => true,
+        // ~1.5.3-beta.1 admits any prerelease at that patch — short of full semver precedence
+        std::cmp::Ordering::Equal => !candidate_is_prerelease || required_is_prerelease,
+    }
+}
+
 /// Parses up to the first 3 dot-separated `parts` as `u64`, padding any components beyond
 /// `parts.len()` with `0`. Returns `None` if any of the first 3 parts fails to parse as a
 /// non-negative integer.
@@ -763,16 +814,16 @@ pub trait RequirementResolution: Send + Sync {
 
         // Tilde allows patch-level changes: ~2.0 -> 2.0.x, ~2.0.1 -> 2.0.x where x >= 1
         if let Some(req) = requirement.strip_prefix('~') {
-            return is_same_major_minor(req, version);
+            return tilde_admits_version(req, version);
         }
 
         // Plain version or partial version
         let req_parts: Vec<&str> = requirement.split('.').collect();
         let is_partial_version = req_parts.len() <= 2;
+        let version_core = split_patch_component(version).0;
 
         version == requirement
-            || (is_partial_version && is_same_major_minor(requirement, version))
-            || (is_partial_version && version.starts_with(requirement))
+            || (is_partial_version && is_same_major_minor(requirement, version_core))
     }
 
     /// Whether an unresolved dependency (no lock-file version) should be reported as
@@ -1641,6 +1692,180 @@ mod tests {
         let latest = ConcreteVersion::new("1.0.0");
         assert_eq!(
             MOCK_FORMATTER.requirement_status(&requirement, &latest),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    /// #1636: `~1.5.3`'s own patch floor must be enforced, not just major/minor equality —
+    /// `1.5.0` is same major.minor but below the requirement's explicit `.3` floor.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_enforces_patch_floor() {
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5.3")
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.3"), "~1.5.3")
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), "~1.5.3")
+        );
+    }
+
+    /// A tilde requirement without its own patch component (`~1.5`) keeps the pre-#1636
+    /// major/minor-only floor — every patch is admitted.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_without_patch_admits_any_patch() {
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5")
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), "~1.5")
+        );
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), "~1.5")
+        );
+    }
+
+    /// impl-critic round 1, S1: a suffixed patch component on either side must not bypass the
+    /// floor check via the non-numeric fallback — the suffix is stripped before parsing, not
+    /// treated as unparseable.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_suffixed_patch_still_enforces_floor() {
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0-beta.1"), "~1.5.3")
+        );
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5.3-beta.1")
+        );
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "~1.5.3+build")
+        );
+    }
+
+    /// impl-critic round 1, S1: a prerelease candidate at the requirement's exact numeric patch
+    /// still sorts below it in semver precedence (`1.5.3-beta < 1.5.3`), so it must be rejected
+    /// even though the numeric component matches.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_prerelease_at_exact_patch_is_rejected() {
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.5.3-beta"), "~1.5.3")
+        );
+    }
+
+    /// impl-critic round 2, S2: the S1 rejection above must not fire when the requirement
+    /// itself is a prerelease at that exact patch — `~1.5.3-beta.1` admitting its own exact
+    /// version, and admitting another prerelease at the same patch, are both correct; only a
+    /// non-prerelease requirement (the test above) should reject an equal-patch prerelease
+    /// candidate.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_prerelease_requirement_admits_same_patch_prerelease()
+     {
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(
+                &ConcreteVersion::new("1.5.3-beta.1"),
+                "~1.5.3-beta.1"
+            )
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(
+                &ConcreteVersion::new("1.5.3-rc.1"),
+                "~1.5.3-beta.1"
+            )
+        );
+    }
+
+    /// Same S1 fix, exercised through `requirement_status` (the real production entry point
+    /// Cargo/npm/Deno's outdated diagnostic goes through), for consistency with the other
+    /// `requirement_status`-level tests in this block.
+    #[test]
+    fn test_requirement_status_tilde_suffixed_candidate_is_outdated() {
+        let requirement = VersionReq::new("~1.5.3");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("1.5.0-beta.1")),
+            RequirementStatus::Outdated
+        );
+    }
+
+    /// Unlike a prerelease suffix, build metadata (`+build`) doesn't affect semver precedence —
+    /// an equal numeric patch with only a `+` suffix must still be admitted, not rejected the
+    /// way `1.5.3-beta` is.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_build_metadata_at_exact_patch_is_admitted() {
+        assert!(
+            MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.5.3+build"), "~1.5.3")
+        );
+    }
+
+    /// A wildcard (`x`/`X`/`*`) patch component in the requirement itself is documented as
+    /// falling back to the permissive major/minor-only check, not as a rejection — this is the
+    /// one case `tilde_admits_version`'s non-numeric fallback is still meant to cover after S1.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_wildcard_patch_is_permissive() {
+        for requirement in ["~1.5.x", "~1.5.X", "~1.5.*"] {
+            assert!(
+                MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), requirement)
+            );
+            assert!(
+                MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), requirement)
+            );
+        }
+    }
+
+    /// impl-critic round 1, M1: a candidate missing its patch component entirely is treated as
+    /// patch `0`, not as automatically satisfying a `~X.Y.Z` requirement's own patch floor.
+    #[test]
+    fn test_version_satisfies_requirement_tilde_missing_candidate_patch_treated_as_zero() {
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.5"), "~1.5.3")
+        );
+    }
+
+    /// A tilde requirement is enforced through the real production entry point too:
+    /// `requirement_status` (via the default `is_requirement_up_to_date`), the sole caller
+    /// `Cargo`/`npm`/`Deno`'s outdated diagnostic goes through since none of them override
+    /// `version_satisfies_requirement` or `is_requirement_up_to_date`.
+    #[test]
+    fn test_requirement_status_tilde_below_patch_floor_is_outdated() {
+        let requirement = VersionReq::new("~1.5.3");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("1.5.0")),
+            RequirementStatus::Outdated
+        );
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("1.5.3")),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    /// #1636: a bare partial requirement (`1.2`) must not admit a version merely because it
+    /// shares a numeric string prefix — `1.20.0` is a different minor (`20`), not `2.x`.
+    #[test]
+    fn test_version_satisfies_requirement_partial_version_rejects_string_prefix_match() {
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.20.0"), "1.2")
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.5"), "1.2")
+        );
+    }
+
+    /// Same #1636 fix, exercised through the real production entry point.
+    #[test]
+    fn test_requirement_status_partial_version_string_prefix_is_outdated() {
+        let requirement = VersionReq::new("1.2");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("1.20.0")),
+            RequirementStatus::Outdated
+        );
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("1.2.5")),
             RequirementStatus::UpToDate
         );
     }
