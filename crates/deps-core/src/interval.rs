@@ -20,6 +20,7 @@
 //! candidate against a bound. See each item's own doc for the exact signature.
 
 use std::cmp::Ordering;
+use std::ops::Bound;
 
 /// A single parsed bracket interval, e.g. `[1.0,2.0)` or `[1.0]`.
 ///
@@ -68,8 +69,8 @@ pub enum VersionRange<V> {
 }
 
 impl<V> VersionRange<V> {
-    /// This range's upper edge, if any — `(bound, inclusive)`. `Minimum` (open-ended above)
-    /// and `Empty` (admits nothing) have none.
+    /// This range's upper edge as a [`Bound`] — `Unbounded` for `Minimum` (open-ended above)
+    /// and `Empty` (admits nothing).
     ///
     /// Shared edge accessor for union-gap detection (`deps-maven`'s disjoint-range-union check,
     /// `deps-composer`'s OR-alternation check, #1610): both derive a member's edges through this
@@ -79,6 +80,7 @@ impl<V> VersionRange<V> {
     ///
     /// ```
     /// use deps_core::interval::VersionRange;
+    /// use std::ops::Bound;
     ///
     /// let bounded = VersionRange::Bounded {
     ///     min: "1.0".to_string(),
@@ -86,32 +88,33 @@ impl<V> VersionRange<V> {
     ///     max: "2.0".to_string(),
     ///     max_inclusive: false,
     /// };
-    /// assert_eq!(bounded.upper_edge(), Some((&"2.0".to_string(), false)));
+    /// assert_eq!(bounded.upper_edge(), Bound::Excluded(&"2.0".to_string()));
     ///
     /// let minimum = VersionRange::Minimum {
     ///     version: "1.5".to_string(),
     ///     inclusive: true,
     /// };
-    /// assert_eq!(minimum.upper_edge(), None);
+    /// assert_eq!(minimum.upper_edge(), Bound::Unbounded);
     /// ```
-    pub fn upper_edge(&self) -> Option<(&V, bool)> {
+    pub fn upper_edge(&self) -> Bound<&V> {
         match self {
-            Self::Exact(v) => Some((v, true)),
-            Self::Maximum { version, inclusive } => Some((version, *inclusive)),
+            Self::Exact(v) => Bound::Included(v),
+            Self::Maximum { version, inclusive } => inclusive_bound(version, *inclusive),
             Self::Bounded {
                 max, max_inclusive, ..
-            } => Some((max, *max_inclusive)),
-            Self::Minimum { .. } | Self::Empty => None,
+            } => inclusive_bound(max, *max_inclusive),
+            Self::Minimum { .. } | Self::Empty => Bound::Unbounded,
         }
     }
 
-    /// This range's lower edge, if any — `(bound, inclusive)`. `Maximum` (open-ended below)
-    /// and `Empty` (admits nothing) have none. See [`Self::upper_edge`].
+    /// This range's lower edge as a [`Bound`] — `Unbounded` for `Maximum` (open-ended below)
+    /// and `Empty` (admits nothing). See [`Self::upper_edge`].
     ///
     /// # Examples
     ///
     /// ```
     /// use deps_core::interval::VersionRange;
+    /// use std::ops::Bound;
     ///
     /// let bounded = VersionRange::Bounded {
     ///     min: "1.0".to_string(),
@@ -119,23 +122,34 @@ impl<V> VersionRange<V> {
     ///     max: "2.0".to_string(),
     ///     max_inclusive: false,
     /// };
-    /// assert_eq!(bounded.lower_edge(), Some((&"1.0".to_string(), true)));
+    /// assert_eq!(bounded.lower_edge(), Bound::Included(&"1.0".to_string()));
     ///
     /// let maximum = VersionRange::Maximum {
     ///     version: "2.0".to_string(),
     ///     inclusive: false,
     /// };
-    /// assert_eq!(maximum.lower_edge(), None);
+    /// assert_eq!(maximum.lower_edge(), Bound::Unbounded);
     /// ```
-    pub fn lower_edge(&self) -> Option<(&V, bool)> {
+    pub fn lower_edge(&self) -> Bound<&V> {
         match self {
-            Self::Exact(v) => Some((v, true)),
-            Self::Minimum { version, inclusive } => Some((version, *inclusive)),
+            Self::Exact(v) => Bound::Included(v),
+            Self::Minimum { version, inclusive } => inclusive_bound(version, *inclusive),
             Self::Bounded {
                 min, min_inclusive, ..
-            } => Some((min, *min_inclusive)),
-            Self::Maximum { .. } | Self::Empty => None,
+            } => inclusive_bound(min, *min_inclusive),
+            Self::Maximum { .. } | Self::Empty => Bound::Unbounded,
         }
+    }
+}
+
+/// Builds a [`Bound::Included`] or [`Bound::Excluded`] from a value and an inclusivity flag —
+/// the one place this crate still names the flag directly, shared by [`VersionRange::upper_edge`]
+/// and [`VersionRange::lower_edge`] so no other call site has to.
+fn inclusive_bound<V>(value: V, inclusive: bool) -> Bound<V> {
+    if inclusive {
+        Bound::Included(value)
+    } else {
+        Bound::Excluded(value)
     }
 }
 
@@ -180,9 +194,14 @@ fn bounded_or_empty<V>(
 ///
 /// ```
 /// use deps_core::interval::{VersionRange, range_from_edges};
+/// use std::ops::Bound;
 ///
 /// let cmp = |a: &String, b: &String| a.cmp(b);
-/// let range = range_from_edges(Some(("1.0".to_string(), true)), Some(("2.0".to_string(), false)), cmp);
+/// let range = range_from_edges(
+///     Bound::Included("1.0".to_string()),
+///     Bound::Excluded("2.0".to_string()),
+///     cmp,
+/// );
 /// assert_eq!(
 ///     range,
 ///     Some(VersionRange::Bounded {
@@ -194,24 +213,46 @@ fn bounded_or_empty<V>(
 /// );
 ///
 /// // Both edges absent has no `VersionRange` shape.
-/// assert_eq!(range_from_edges::<String>(None, None, cmp), None);
+/// assert_eq!(
+///     range_from_edges::<String>(Bound::Unbounded, Bound::Unbounded, cmp),
+///     None
+/// );
 /// ```
 pub fn range_from_edges<V>(
-    min: Option<(V, bool)>,
-    max: Option<(V, bool)>,
+    min: Bound<V>,
+    max: Bound<V>,
     cmp_bound: impl Fn(&V, &V) -> Ordering,
 ) -> Option<VersionRange<V>> {
     match (min, max) {
-        (Some((min, min_inclusive)), Some((max, max_inclusive))) => Some(bounded_or_empty(
-            min,
-            min_inclusive,
-            max,
-            max_inclusive,
-            cmp_bound,
-        )),
-        (Some((version, inclusive)), None) => Some(VersionRange::Minimum { version, inclusive }),
-        (None, Some((version, inclusive))) => Some(VersionRange::Maximum { version, inclusive }),
-        (None, None) => None,
+        (Bound::Included(min), Bound::Included(max)) => {
+            Some(bounded_or_empty(min, true, max, true, cmp_bound))
+        }
+        (Bound::Included(min), Bound::Excluded(max)) => {
+            Some(bounded_or_empty(min, true, max, false, cmp_bound))
+        }
+        (Bound::Excluded(min), Bound::Included(max)) => {
+            Some(bounded_or_empty(min, false, max, true, cmp_bound))
+        }
+        (Bound::Excluded(min), Bound::Excluded(max)) => {
+            Some(bounded_or_empty(min, false, max, false, cmp_bound))
+        }
+        (Bound::Included(version), Bound::Unbounded) => Some(VersionRange::Minimum {
+            version,
+            inclusive: true,
+        }),
+        (Bound::Excluded(version), Bound::Unbounded) => Some(VersionRange::Minimum {
+            version,
+            inclusive: false,
+        }),
+        (Bound::Unbounded, Bound::Included(version)) => Some(VersionRange::Maximum {
+            version,
+            inclusive: true,
+        }),
+        (Bound::Unbounded, Bound::Excluded(version)) => Some(VersionRange::Maximum {
+            version,
+            inclusive: false,
+        }),
+        (Bound::Unbounded, Bound::Unbounded) => None,
     }
 }
 
@@ -447,48 +488,150 @@ pub fn contains<Q: ?Sized, V>(
 
 /// Whether an upper-bounded member admits some value at or above `candidate`.
 ///
-/// `upper_edge` is `(bound, inclusive)`, or `None` for open-ended-above. `None` always
-/// answers `true`: "no known upper edge" means "assume unbounded", the safe default for a
-/// member whose shape [`union_gap_excludes`]'s caller could not characterize (mirrors
-/// `deps-maven`'s own `upper_edge`/`lower_edge` wildcard-arm convention of contributing no
-/// edge for an unrecognized/degenerate shape rather than guessing one).
+/// `upper_edge` is a [`Bound`], `Unbounded` for open-ended-above. `Unbounded` always answers
+/// `true`: "no known upper edge" means "assume unbounded", the safe default for a member whose
+/// shape [`union_gap_excludes`]'s caller could not characterize (mirrors `deps-maven`'s own
+/// `upper_edge`/`lower_edge` wildcard-arm convention of contributing no edge for an
+/// unrecognized/degenerate shape rather than guessing one).
 pub fn admits_at_or_above<Q: ?Sized, V: ?Sized>(
     candidate: &Q,
-    upper_edge: Option<(&V, bool)>,
+    upper_edge: Bound<&V>,
     cmp: impl Fn(&Q, &V) -> Ordering,
 ) -> bool {
     match upper_edge {
-        None => true,
-        Some((bound, inclusive)) => {
-            let ord = cmp(candidate, bound);
-            if inclusive {
-                ord != Ordering::Greater
-            } else {
-                ord == Ordering::Less
-            }
-        }
+        Bound::Unbounded => true,
+        Bound::Included(bound) => cmp(candidate, bound) != Ordering::Greater,
+        Bound::Excluded(bound) => cmp(candidate, bound) == Ordering::Less,
     }
 }
 
 /// Whether a lower-bounded member admits some value at or below `candidate`.
 ///
-/// `lower_edge` is `(bound, inclusive)`, or `None` for open-ended-below. See
-/// [`admits_at_or_above`]'s doc for why `None` always answers `true`.
+/// `lower_edge` is a [`Bound`], `Unbounded` for open-ended-below. See
+/// [`admits_at_or_above`]'s doc for why `Unbounded` always answers `true`.
 pub fn admits_at_or_below<Q: ?Sized, V: ?Sized>(
     candidate: &Q,
-    lower_edge: Option<(&V, bool)>,
+    lower_edge: Bound<&V>,
     cmp: impl Fn(&Q, &V) -> Ordering,
 ) -> bool {
     match lower_edge {
-        None => true,
-        Some((bound, inclusive)) => {
-            let ord = cmp(candidate, bound);
-            if inclusive {
-                ord != Ordering::Less
+        Bound::Unbounded => true,
+        Bound::Included(bound) => cmp(candidate, bound) != Ordering::Less,
+        Bound::Excluded(bound) => cmp(candidate, bound) == Ordering::Greater,
+    }
+}
+
+/// Keeps the tighter (larger) of two optional lower bounds under AND-intersection.
+///
+/// At equal value, an exclusive edge is tighter than an inclusive one (it excludes the
+/// boundary the inclusive edge would admit); `Unbounded` never wins over a real bound. Generic
+/// AND-intersection primitive for a caller building a bound up from independent AND-clauses
+/// (`deps-composer`'s own clause-by-clause fold, #1610/#1625) — kept here, next to
+/// [`range_from_edges`], so the next ecosystem that AND-folds clauses into a [`VersionRange`]
+/// does not have to re-derive this tie-breaking rule itself.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::interval::tighter_lower;
+/// use std::ops::Bound;
+///
+/// let cmp = |a: &u32, b: &u32| a.cmp(b);
+///
+/// // The larger lower bound is tighter.
+/// assert_eq!(
+///     tighter_lower(Bound::Included(1), Bound::Included(2), cmp),
+///     Bound::Included(2)
+/// );
+///
+/// // At equal value, exclusive is tighter than inclusive.
+/// assert_eq!(
+///     tighter_lower(Bound::Included(2), Bound::Excluded(2), cmp),
+///     Bound::Excluded(2)
+/// );
+///
+/// // `Unbounded` never wins over a real bound.
+/// assert_eq!(
+///     tighter_lower(Bound::Unbounded, Bound::Included(1), cmp),
+///     Bound::Included(1)
+/// );
+/// ```
+pub fn tighter_lower<V>(a: Bound<V>, b: Bound<V>, cmp: impl Fn(&V, &V) -> Ordering) -> Bound<V> {
+    match (a, b) {
+        (Bound::Unbounded, x) | (x, Bound::Unbounded) => x,
+        (Bound::Included(av), Bound::Included(bv)) => {
+            if cmp(&av, &bv) == Ordering::Less {
+                Bound::Included(bv)
             } else {
-                ord == Ordering::Greater
+                Bound::Included(av)
             }
         }
+        (Bound::Excluded(av), Bound::Excluded(bv)) => {
+            if cmp(&av, &bv) == Ordering::Less {
+                Bound::Excluded(bv)
+            } else {
+                Bound::Excluded(av)
+            }
+        }
+        (Bound::Included(av), Bound::Excluded(bv)) => match cmp(&av, &bv) {
+            Ordering::Less | Ordering::Equal => Bound::Excluded(bv),
+            Ordering::Greater => Bound::Included(av),
+        },
+        (Bound::Excluded(av), Bound::Included(bv)) => match cmp(&av, &bv) {
+            Ordering::Greater | Ordering::Equal => Bound::Excluded(av),
+            Ordering::Less => Bound::Included(bv),
+        },
+    }
+}
+
+/// Keeps the tighter (smaller) of two optional upper bounds under AND-intersection — mirrors
+/// [`tighter_lower`], with the tie-break and "smaller wins" direction inverted.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::interval::tighter_upper;
+/// use std::ops::Bound;
+///
+/// let cmp = |a: &u32, b: &u32| a.cmp(b);
+///
+/// // The smaller upper bound is tighter.
+/// assert_eq!(
+///     tighter_upper(Bound::Included(2), Bound::Included(1), cmp),
+///     Bound::Included(1)
+/// );
+///
+/// // At equal value, exclusive is tighter than inclusive.
+/// assert_eq!(
+///     tighter_upper(Bound::Included(2), Bound::Excluded(2), cmp),
+///     Bound::Excluded(2)
+/// );
+/// ```
+pub fn tighter_upper<V>(a: Bound<V>, b: Bound<V>, cmp: impl Fn(&V, &V) -> Ordering) -> Bound<V> {
+    match (a, b) {
+        (Bound::Unbounded, x) | (x, Bound::Unbounded) => x,
+        (Bound::Included(av), Bound::Included(bv)) => {
+            if cmp(&av, &bv) == Ordering::Greater {
+                Bound::Included(bv)
+            } else {
+                Bound::Included(av)
+            }
+        }
+        (Bound::Excluded(av), Bound::Excluded(bv)) => {
+            if cmp(&av, &bv) == Ordering::Greater {
+                Bound::Excluded(bv)
+            } else {
+                Bound::Excluded(av)
+            }
+        }
+        (Bound::Included(av), Bound::Excluded(bv)) => match cmp(&av, &bv) {
+            Ordering::Greater | Ordering::Equal => Bound::Excluded(bv),
+            Ordering::Less => Bound::Included(av),
+        },
+        (Bound::Excluded(av), Bound::Included(bv)) => match cmp(&av, &bv) {
+            Ordering::Less | Ordering::Equal => Bound::Excluded(av),
+            Ordering::Greater => Bound::Included(bv),
+        },
     }
 }
 
@@ -738,30 +881,76 @@ mod tests {
 
     #[test]
     fn test_admits_at_or_above_none_edge_is_always_true() {
-        assert!(admits_at_or_above("999", None::<(&str, bool)>, str_ord));
+        assert!(admits_at_or_above("999", Bound::Unbounded, str_ord));
     }
 
     #[test]
     fn test_admits_at_or_above_respects_inclusivity() {
         let bound = "5";
-        assert!(admits_at_or_above("5", Some((bound, true)), str_ord));
-        assert!(!admits_at_or_above("5", Some((bound, false)), str_ord));
-        assert!(admits_at_or_above("4", Some((bound, true)), str_ord));
-        assert!(!admits_at_or_above("6", Some((bound, true)), str_ord));
+        assert!(admits_at_or_above("5", Bound::Included(bound), str_ord));
+        assert!(!admits_at_or_above("5", Bound::Excluded(bound), str_ord));
+        assert!(admits_at_or_above("4", Bound::Included(bound), str_ord));
+        assert!(!admits_at_or_above("6", Bound::Included(bound), str_ord));
     }
 
     #[test]
     fn test_admits_at_or_below_none_edge_is_always_true() {
-        assert!(admits_at_or_below("0", None::<(&str, bool)>, str_ord));
+        assert!(admits_at_or_below("0", Bound::Unbounded, str_ord));
     }
 
     #[test]
     fn test_admits_at_or_below_respects_inclusivity() {
         let bound = "5";
-        assert!(admits_at_or_below("5", Some((bound, true)), str_ord));
-        assert!(!admits_at_or_below("5", Some((bound, false)), str_ord));
-        assert!(admits_at_or_below("6", Some((bound, true)), str_ord));
-        assert!(!admits_at_or_below("4", Some((bound, true)), str_ord));
+        assert!(admits_at_or_below("5", Bound::Included(bound), str_ord));
+        assert!(!admits_at_or_below("5", Bound::Excluded(bound), str_ord));
+        assert!(admits_at_or_below("6", Bound::Included(bound), str_ord));
+        assert!(!admits_at_or_below("4", Bound::Included(bound), str_ord));
+    }
+
+    #[test]
+    fn test_tighter_lower_prefers_larger_value_and_exclusive_on_tie() {
+        let cmp = |a: &u32, b: &u32| a.cmp(b);
+        assert_eq!(
+            tighter_lower(Bound::Included(1), Bound::Included(2), cmp),
+            Bound::Included(2)
+        );
+        assert_eq!(
+            tighter_lower(Bound::Included(2), Bound::Excluded(2), cmp),
+            Bound::Excluded(2)
+        );
+        assert_eq!(
+            tighter_lower(Bound::Excluded(2), Bound::Included(2), cmp),
+            Bound::Excluded(2)
+        );
+        assert_eq!(
+            tighter_lower(Bound::Unbounded, Bound::Included(1), cmp),
+            Bound::Included(1)
+        );
+        assert_eq!(
+            tighter_lower(Bound::Included(1), Bound::Unbounded, cmp),
+            Bound::Included(1)
+        );
+    }
+
+    #[test]
+    fn test_tighter_upper_prefers_smaller_value_and_exclusive_on_tie() {
+        let cmp = |a: &u32, b: &u32| a.cmp(b);
+        assert_eq!(
+            tighter_upper(Bound::Included(2), Bound::Included(1), cmp),
+            Bound::Included(1)
+        );
+        assert_eq!(
+            tighter_upper(Bound::Included(2), Bound::Excluded(2), cmp),
+            Bound::Excluded(2)
+        );
+        assert_eq!(
+            tighter_upper(Bound::Excluded(2), Bound::Included(2), cmp),
+            Bound::Excluded(2)
+        );
+        assert_eq!(
+            tighter_upper(Bound::Unbounded, Bound::Included(1), cmp),
+            Bound::Included(1)
+        );
     }
 
     /// Mirrors Maven's #1590 disjoint-range-union gap test, but through the
@@ -828,33 +1017,36 @@ mod tests {
     #[test]
     fn test_upper_edge_lower_edge_per_variant() {
         let bounded = parse_str("[1.0,2.0)", BracketStyle::Standard).unwrap();
-        assert_eq!(bounded.upper_edge(), Some((&"2.0".to_string(), false)));
-        assert_eq!(bounded.lower_edge(), Some((&"1.0".to_string(), true)));
+        assert_eq!(bounded.upper_edge(), Bound::Excluded(&"2.0".to_string()));
+        assert_eq!(bounded.lower_edge(), Bound::Included(&"1.0".to_string()));
 
         let min = parse_str("[1.5,)", BracketStyle::Standard).unwrap();
-        assert_eq!(min.upper_edge(), None);
-        assert_eq!(min.lower_edge(), Some((&"1.5".to_string(), true)));
+        assert_eq!(min.upper_edge(), Bound::Unbounded);
+        assert_eq!(min.lower_edge(), Bound::Included(&"1.5".to_string()));
 
         let max = parse_str("(,2.0]", BracketStyle::Standard).unwrap();
-        assert_eq!(max.upper_edge(), Some((&"2.0".to_string(), true)));
-        assert_eq!(max.lower_edge(), None);
+        assert_eq!(max.upper_edge(), Bound::Included(&"2.0".to_string()));
+        assert_eq!(max.lower_edge(), Bound::Unbounded);
 
         let exact = parse_str("[1.0]", BracketStyle::Standard).unwrap();
-        assert_eq!(exact.upper_edge(), Some((&"1.0".to_string(), true)));
-        assert_eq!(exact.lower_edge(), Some((&"1.0".to_string(), true)));
+        assert_eq!(exact.upper_edge(), Bound::Included(&"1.0".to_string()));
+        assert_eq!(exact.lower_edge(), Bound::Included(&"1.0".to_string()));
 
         let empty: VersionRange<String> = VersionRange::Empty;
-        assert_eq!(empty.upper_edge(), None);
-        assert_eq!(empty.lower_edge(), None);
+        assert_eq!(empty.upper_edge(), Bound::Unbounded);
+        assert_eq!(empty.lower_edge(), Bound::Unbounded);
     }
 
     #[test]
     fn test_range_from_edges_builds_expected_shapes() {
         let cmp = |a: &String, b: &String| a.cmp(b);
-        let v = |s: &str| (s.to_string(), true);
 
         assert_eq!(
-            range_from_edges(Some(v("1.0")), Some(("2.0".to_string(), false)), cmp),
+            range_from_edges(
+                Bound::Included("1.0".to_string()),
+                Bound::Excluded("2.0".to_string()),
+                cmp
+            ),
             Some(VersionRange::Bounded {
                 min: "1.0".to_string(),
                 min_inclusive: true,
@@ -863,20 +1055,23 @@ mod tests {
             })
         );
         assert_eq!(
-            range_from_edges(Some(v("1.5")), None, cmp),
+            range_from_edges(Bound::Included("1.5".to_string()), Bound::Unbounded, cmp),
             Some(VersionRange::Minimum {
                 version: "1.5".to_string(),
                 inclusive: true,
             })
         );
         assert_eq!(
-            range_from_edges(None, Some(v("2.0")), cmp),
+            range_from_edges(Bound::Unbounded, Bound::Included("2.0".to_string()), cmp),
             Some(VersionRange::Maximum {
                 version: "2.0".to_string(),
                 inclusive: true,
             })
         );
-        assert_eq!(range_from_edges::<String>(None, None, cmp), None);
+        assert_eq!(
+            range_from_edges::<String>(Bound::Unbounded, Bound::Unbounded, cmp),
+            None
+        );
     }
 
     /// #1595 parity: `range_from_edges` must apply the same unsatisfiable-shape detection
@@ -886,16 +1081,16 @@ mod tests {
         let cmp = |a: &String, b: &String| a.cmp(b);
         assert_eq!(
             range_from_edges(
-                Some(("5.0".to_string(), true)),
-                Some(("3.0".to_string(), true)),
+                Bound::Included("5.0".to_string()),
+                Bound::Included("3.0".to_string()),
                 cmp
             ),
             Some(VersionRange::Empty)
         );
         assert_eq!(
             range_from_edges(
-                Some(("3.0".to_string(), false)),
-                Some(("3.0".to_string(), true)),
+                Bound::Excluded("3.0".to_string()),
+                Bound::Included("3.0".to_string()),
                 cmp
             ),
             Some(VersionRange::Empty)

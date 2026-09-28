@@ -14,6 +14,7 @@
 //! [spec]: https://maven.apache.org/pom.html#dependency-version-requirement-specification
 
 use crate::interval::{BracketStyle, VersionRange, contains, parse_interval};
+use std::ops::Bound;
 
 /// Splits `s` on commas that are not nested inside a `[`/`(` ... `]`/`)` pair, so a
 /// union like `[1.0,2.0),[3.0,4.0)` yields two members while the inner min/max comma of
@@ -68,20 +69,16 @@ pub(crate) fn satisfies_ranges(version: &str, ranges: &[VersionRange]) -> bool {
     ranges.iter().any(|range| contains(version, range))
 }
 
-/// This member's upper edge, if any (`Minimum`/`Empty` have none — see
+/// This member's upper edge (`Unbounded` for `Minimum`/`Empty` — see
 /// [`deps_core::interval::VersionRange::upper_edge`], the shared accessor this delegates to
 /// (#1610) — `deps-composer`'s own OR-alternation-gap check routes through the same method).
-fn upper_edge(range: &VersionRange) -> Option<(&str, bool)> {
-    range
-        .upper_edge()
-        .map(|(v, inclusive)| (v.as_str(), inclusive))
+fn upper_edge(range: &VersionRange) -> Bound<&str> {
+    range.upper_edge().map(String::as_str)
 }
 
-/// This member's lower edge, if any (`Maximum`/`Empty` have none). See [`upper_edge`].
-fn lower_edge(range: &VersionRange) -> Option<(&str, bool)> {
-    range
-        .lower_edge()
-        .map(|(v, inclusive)| (v.as_str(), inclusive))
+/// This member's lower edge (`Unbounded` for `Maximum`/`Empty`). See [`upper_edge`].
+fn lower_edge(range: &VersionRange) -> Bound<&str> {
+    range.lower_edge().map(String::as_str)
 }
 
 /// Whether `version` is explicitly excluded by the *shape* of a disjoint multi-range union
