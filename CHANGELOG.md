@@ -283,6 +283,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core, deps-engine**: migrate `deps-core` and `deps-engine`'s remaining hand-rolled `Registry`/`Version` test doubles onto the shared `deps_core::test_util::MockVersion`/`MockRegistry` fixture; no behavior change (resolves #1582) (#1588)
 - **deps-composer**: `version_satisfies_requirement`/`composer_explicitly_excludes` now share one `walk_requirement`/`RequirementLeaf` tree-walker instead of independently duplicating the OR/AND-splitting traversal; no behavior change (resolves #1591)
 - **deps-bundler**: `version_matches_requirement`/`version_explicitly_excluded_by_requirement` now share one typed `Constraint` enum and parse function instead of two independently hand-rolled per-part operator parses; no behavior change (resolves #1597) (#1598)
+- **deps-cli**: typed the JSON output DTOs' closed token sets (ecosystem/category/severity/outcome), replacing stringly-typed fields with enums that reject an unrecognized token on deserialize instead of accepting an arbitrary string; wire output byte-identical for every existing token (resolves #1626)
 
 ### Documentation
 - mdBook overhaul: added basics sections to every ecosystem page, new `deps-engine` and GitHub Action pages, and a restructured table of contents separating everyday usage from architecture/internals (#1288)
