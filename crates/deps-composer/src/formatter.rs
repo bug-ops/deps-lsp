@@ -549,12 +549,11 @@ fn compare_versions_ord(a: &str, b: &str) -> std::cmp::Ordering {
 ///   [`AdmitLeaf::eval_leaf`]'s own partial-match branch admits or rejects based on how many
 ///   dot-segments the *candidate itself* has relative to the clause, not on a fixed value
 ///   range independent of that.
-/// - A caret (`^`) clause has no such bound either: [`satisfies_caret`] only ever compares a
-///   truncated *prefix* of segments (ignoring every segment below the first nonzero one, or
-///   below the minor segment when the major is `0`) and never checks the requirement's own
-///   lower-bound segments below that point — deriving a "textbook" caret bound here would
-///   disagree with what `AdmitLeaf` actually admits.
-/// - Tilde (`~`) is excluded too, for uniformity with caret, even though
+/// - A caret (`^`) clause is excluded too: [`satisfies_caret`]'s admitted range is well-defined
+///   (`>=major.minor.patch[-suffix] <upper-dev`), but reproducing it here would duplicate its
+///   zero-padding, first-nonzero-component lock, and synthetic `-dev`-suffix construction — not
+///   worth it until a shared bound-string helper exists, so it stays grouped with tilde below.
+/// - Tilde (`~`) is excluded too, for the same reason, even though
 ///   [`satisfies_tilde_composer`]'s own bound is well-defined — mixing a caret-adjacent
 ///   operator into bound derivation piecemeal is more error-prone than consistently treating
 ///   both as "unknown shape".
@@ -869,7 +868,8 @@ impl RequirementResolution for ComposerFormatter {
     /// Checks if a version satisfies a Composer version requirement.
     ///
     /// Handles Composer-specific operators:
-    /// - `^` — caret (same semantics as default)
+    /// - `^` — caret, npm-style: locked at the first non-zero component from the left (major,
+    ///   else minor, else patch), stricter than `deps-core`'s shared default caret check
     /// - `~X.Y.Z` — tilde with patch: `>=X.Y.Z <X.(Y+1).0`
     /// - `~X.Y` — tilde without patch: `>=X.Y.0 <(X+1).0.0` (Composer-specific!)
     /// - `X.Y.*` — wildcard patch
@@ -1008,24 +1008,76 @@ fn satisfies_tilde_composer(version: &str, req: &str) -> bool {
     }
 }
 
-/// Caret operator — same as default EcosystemFormatter but inlined for clarity.
+/// Caret operator — npm-style semantics (also Composer's own, per its docs and
+/// `VersionParser`): the range is bounded above at the first non-zero component from the left
+/// (major, else minor, else patch) and bounded below at the requirement itself, with missing
+/// trailing segments in `req` treated as zero. E.g. `^1.5` — `>=1.5.0 <2.0.0`; `^0.3.2` —
+/// `>=0.3.2 <0.4.0`; `^0.0.3` — `>=0.0.3 <0.0.4`.
+///
+/// Both edges carry a synthetic `-dev` suffix when `req` itself names none: `dev` is the lowest
+/// [`StabilityFloor`] rank, so appending it to the upper bound excludes every prerelease of the
+/// next boundary version too (not just its stable release), and appending it to the lower bound
+/// still admits a prerelease *of the requirement itself* (e.g. `^1.5` must admit `1.5.0-RC1`).
+///
+/// Splits `req` through [`split_composer_core_and_suffix`] up front — not just `req.split('.')`
+/// — so a requirement whose last segment fuses a stability suffix onto its digits with no
+/// separator (e.g. `^0.0.3alpha1`) doesn't get parsed as a garbled numeric component. The
+/// upper-bound arithmetic reuses [`increment_last_segment`] (already `checked_add`-guarded), so
+/// an overflowing requirement segment is rejected rather than panicking or silently wrapping,
+/// and a fully non-numeric requirement (`^abc`) is rejected up front for the same reason.
 fn satisfies_caret(version: &str, req: &str) -> bool {
-    let req_parts: Vec<&str> = req.split('.').collect();
-    let ver_parts: Vec<&str> = version.split('.').collect();
-
-    if req_parts.first() != ver_parts.first() {
+    let (core, req_suffix) = split_composer_core_and_suffix(req);
+    if core.is_empty() {
         return false;
     }
 
-    if req_parts.first().is_some_and(|m| *m != "0") {
-        return true;
+    let mut nums = Vec::new();
+    for segment in core.split('.') {
+        let Ok(n) = segment.parse::<u64>() else {
+            return false;
+        };
+        nums.push(n);
     }
+    let Some(&major) = nums.first() else {
+        return false;
+    };
+    let minor = nums.get(1).copied();
 
-    if let (Some(r), Some(v)) = (req_parts.get(1), ver_parts.get(1)) {
-        return r == v;
+    let lock_len = if major != 0 || nums.len() < 2 {
+        1
+    } else if minor.is_some_and(|m| m != 0) || nums.len() < 3 {
+        2
+    } else {
+        3
+    };
+
+    let Some(upper_prefix) = nums.get(..lock_len).and_then(|prefix| {
+        let joined = prefix
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(".");
+        increment_last_segment(&joined)
+    }) else {
+        return false;
+    };
+    let upper = format!("{upper_prefix}-dev");
+
+    let mut lower_nums = nums.clone();
+    while lower_nums.len() < 3 {
+        lower_nums.push(0);
     }
+    let lower_core = lower_nums
+        .iter()
+        .map(u64::to_string)
+        .collect::<Vec<_>>()
+        .join(".");
+    let lower = req_suffix.map_or_else(
+        || format!("{lower_core}-dev"),
+        |suffix| format!("{lower_core}-{suffix}"),
+    );
 
-    true
+    compare_versions(version, &lower) >= 0 && compare_versions(version, &upper) < 0
 }
 
 /// Lenient, version-*qualifier* stability classification (matching Composer's `VersionParser`
@@ -1086,11 +1138,13 @@ pub(crate) fn composer_version_stability(version: &str) -> StabilityFloor {
 /// The flag is a syntax element of the *constraint* grammar
 /// (`composer/semver`'s `VersionParser::parseStabilityFlag`), not part of the version-range
 /// text itself, so it must be stripped before `satisfies_caret`/`satisfies_tilde_composer`/
-/// `compare_versions` ever see the constraint. Left in place, it is parsed as part of the
-/// numeric core instead (e.g. `^1.0@beta`'s minor segment becomes `"0@beta"`), which only
-/// happens to still match today because `satisfies_caret`'s nonzero-major fast path returns
-/// before it would ever look at that garbled segment — every other operator (tilde,
-/// `>=`/`<=`, exact/partial) has no such fast path and silently never matches (#424).
+/// `compare_versions` ever see the constraint. Left in place, every operator except caret
+/// parses it as part of the numeric core instead (e.g. `~1.0@beta`'s minor segment becomes
+/// `"0@beta"`) and silently never matches (#424); `satisfies_caret` itself now tolerates a
+/// leftover flag by construction — it splits `req`'s own stability suffix off before parsing
+/// digits, so `@beta` lands in the suffix text (where it degrades to the same `Stable`,
+/// no-numeric qualifier as no suffix at all) rather than a garbled digit segment — but that is
+/// an incidental side effect, not a substitute for stripping the flag up front.
 ///
 /// `pub(crate)`: also used by `registry.rs`'s [`effective_minimum_stability`] to read
 /// the flag as a per-dependency stability opt-in, overriding both the concrete-requirement
@@ -1302,6 +1356,106 @@ mod tests {
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.0"));
         assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.2"));
         assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.3.0"), "^1.0"));
+    }
+
+    /// #1617: `satisfies_caret` enforced only the major-version upper cutoff, silently
+    /// admitting any minor/patch below the stated lower bound (e.g. `^1.5` wrongly admitted
+    /// `1.1.0`/`1.2.0`/`1.4.0`).
+    #[test]
+    fn test_caret_enforces_minor_lower_bound() {
+        let f = ComposerFormatter;
+        // ^1.5 == >=1.5.0 <2.0.0
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.5"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.9"), "^1.5"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.9.0"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.4.0"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "^1.5"));
+    }
+
+    /// 0.x caret locks tighter (Composer follows npm semantics here): `^0.3.2` ==
+    /// `>=0.3.2 <0.4.0`, so a lower patch within the same minor must still be rejected.
+    #[test]
+    fn test_caret_zero_major_locks_to_first_nonzero_component() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.2"), "^0.3.2"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.9"), "^0.3.2"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.3.1"), "^0.3.2"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.4.0"), "^0.3.2"));
+
+        // ^0.0.3 == >=0.0.3 <0.0.4 — locks all the way to patch.
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0.3"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.2"), "^0.0.3"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.4"), "^0.0.3"));
+    }
+
+    /// impl-critic S1: the upper bound must exclude every prerelease of the next boundary
+    /// version too, not just its stable release — a plain `<2.0.0` cutoff wrongly admits
+    /// `2.0.0-beta1` because a prerelease sorts below its own stable release.
+    #[test]
+    fn test_caret_upper_bound_excludes_prerelease_of_next_boundary() {
+        let f = ComposerFormatter;
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0-beta1"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0-dev"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.4.0-RC1"), "^0.3.2"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.4-alpha"), "^0.0.3"));
+    }
+
+    /// impl-critic M1: the lower bound must still admit a prerelease *of the requirement
+    /// itself* when the requirement names no explicit stability (Composer/npm both allow this).
+    #[test]
+    fn test_caret_lower_bound_admits_prerelease_of_requirement_itself() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0-RC1"), "^1.5"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.4.9-RC1"), "^1.5"));
+    }
+
+    /// impl-critic M2 / tester gap: a stability suffix on the requirement's own last segment
+    /// must be preserved and attached to the *numeric core*, not appended after zero-padding
+    /// (`^1.0-beta`'s lower bound is `1.0.0-beta`, not `1.0-beta.0`) — this must hold whether
+    /// the requirement stops at the locked (minor) segment or goes deeper into a `0.0.x` core.
+    #[test]
+    fn test_caret_requirement_suffix_attaches_to_zero_padded_core() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0-beta"), "^1.0-beta"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.0-beta"), "^0.3-beta"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("0.3.5"), "^0.3-beta"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.4.0"), "^0.3-beta"));
+
+        // Referenced in `satisfies_caret`'s own doc comment: `^1.0.0-a1` must admit itself.
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0-a1"), "^1.0.0-a1"));
+
+        // Tester gap: a fused, separator-optional suffix directly after the locking digit
+        // (real Composer syntax, see `test_is_prerelease_marker_separatorless_suffix`) must
+        // not corrupt the upper-bound's numeric parse and produce an inverted/unsatisfiable
+        // range — `^0.0.3-alpha1` must admit its own exact version.
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("0.0.3-alpha1"), "^0.0.3-alpha1")
+        );
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.0.4"), "^0.0.3-alpha1"));
+    }
+
+    /// impl-critic M3: a fully non-numeric requirement (typo/malformed) must be rejected, not
+    /// silently treated as `0` and admit everything with a matching major.
+    #[test]
+    fn test_caret_malformed_requirement_rejected() {
+        let f = ComposerFormatter;
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), "^abc"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^abc"));
+    }
+
+    /// impl-critic S2: an overflowing requirement segment must not panic (debug) or silently
+    /// wrap to a bogus bound (release) — `increment_last_segment`'s `checked_add` guard makes
+    /// this simply unsatisfiable.
+    #[test]
+    fn test_caret_overflowing_major_does_not_panic() {
+        let f = ComposerFormatter;
+        assert!(!f.version_satisfies_requirement(
+            &ConcreteVersion::new("18446744073709551615.0.0"),
+            "^18446744073709551615"
+        ));
     }
 
     #[test]
