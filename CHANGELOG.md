@@ -187,6 +187,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `deps-cli update --update-types` now classifies a GitHub Actions/GitLab CI SHA pin resolved via the tag index as Major/Minor/Patch instead of always Unknown (part of #1556) (#1572)
 
 ### Breaking
+- **deps-core**: `interval::VersionRange::upper_edge`/`lower_edge`/`range_from_edges`/`admits_at_or_above`/`admits_at_or_below` now use `std::ops::Bound<V>` instead of `Option<(V, bool)>`; new generic `interval::tighter_lower`/`tighter_upper` AND-intersection helpers; **deps-composer**'s `compare_versions` now returns `std::cmp::Ordering` instead of `i32` (`compare_versions_ord` is removed) and its edge-folding internals (`hyphen_bounds_from_edges`, `HyphenRangeMatch`, `intersect_clause_bounds`) are retyped onto `Bound<String>` to match (resolves #1625) (#XXXX)
 - **deps-core**: `Ecosystem::fetch_license` now takes `&PackageName`/`&ConcreteVersion` instead of `&str`/`&str` (resolves #1593) (#1604)
 - **deps-engine**: `classify::license::tier3_license_targets`/`fetch_tier3_licenses` now use `(PackageName, ConcreteVersion)` targets instead of `(PackageName, String)` (part of #1593) (#1604)
 - **deps-core, deps-cli**: `edit::PlannedUpdate.current`/`cli::update::PlannedUpdateItem.current` are now `Option<ConcreteVersion>`/the new exhaustive `deps_cli::update::CurrentVersion` enum instead of `String`, removing the historical `""`-means-unresolved convention (resolves #1593) (#1604)
