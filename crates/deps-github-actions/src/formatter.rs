@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementResolution, RequirementStatus, SourcePolicy, TagIndex, match_v_prefix_style,
-    requirement_contains_template_placeholder,
+    requirement_contains_template_placeholder, requirement_is_oversized,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -339,7 +339,7 @@ impl RequirementResolution for GithubActionsFormatter {
         requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        self.sha_pin_status_from_tag_index(dep, latest)
+        self.sha_pin_status_from_tag_index(dep, requirement, latest)
             .unwrap_or_else(|| self.requirement_status(requirement, latest))
     }
 
@@ -382,11 +382,19 @@ impl GithubActionsFormatter {
     /// Ground-truth status for a comment-annotated SHA pin whose commit is indexed in
     /// `tag_index` — see [`RequirementResolution::requirement_status_for`]. `None` when
     /// `dep` isn't such a pin, or the SHA has no `TagIndex` entry yet.
+    ///
+    /// #1644: gated on [`requirement_is_oversized`] first, the same `Unresolved` treatment
+    /// [`RequirementResolution::requirement_status`]'s shared gate already applies on the
+    /// comment-trusting fallback path — this method bypasses that shared gate entirely.
     fn sha_pin_status_from_tag_index(
         &self,
         dep: &dyn Dependency,
+        requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> Option<RequirementStatus> {
+        if requirement_is_oversized(requirement) {
+            return Some(RequirementStatus::Unresolved);
+        }
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
         // Restricted to comment-annotated SHA pins: a commentless pin has no human-written
         // text to distrust, so it stays on the ordinary path instead (#907 scope decision).
@@ -950,6 +958,41 @@ mod tests {
             fmt.requirement_status_for(&d, &VersionReq::new("v4"), &ConcreteVersion::new("v4.3.1")),
             RequirementStatus::Outdated,
             "ground-truth tag v4.0.0 is behind latest v4.3.1; must not trust the stale v4 comment"
+        );
+    }
+
+    /// #1644: an oversized `requirement` must short-circuit to `Unresolved` before ever
+    /// consulting the `TagIndex`, even when the SHA has a real, resolvable ground-truth tag
+    /// there — mirrors the divergence test above (same ground-truth tag `v4.0.0`, `latest`
+    /// `v4.3.1`) but with a `requirement` past `MAX_REQUIREMENT_LEN`, proving the oversized
+    /// gate wins over the ground-truth lookup rather than being silently bypassed by it.
+    #[test]
+    fn test_requirement_status_for_sha_pin_oversized_requirement_is_unresolved() {
+        use deps_core::lsp_helpers::MAX_REQUIREMENT_LEN;
+
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index
+            .sha_to_tag
+            .insert(CommitSha::parse(&sha).unwrap(), "v4.0.0".to_string());
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4".to_string()),
+            }),
+            "actions/checkout",
+            Some(format!("{sha} # v4").as_str()),
+        );
+
+        let oversized = VersionReq::new("1".repeat(MAX_REQUIREMENT_LEN + 1));
+        assert_eq!(
+            fmt.requirement_status_for(&d, &oversized, &ConcreteVersion::new("v4.3.1")),
+            RequirementStatus::Unresolved,
+            "oversized requirement must be reported Unresolved, not resolved via the \
+             TagIndex ground truth"
         );
     }
 
