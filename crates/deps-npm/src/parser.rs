@@ -516,7 +516,7 @@ fn parse_npm_alias(value: &str) -> Option<NpmAlias> {
             "npm: alias version requirement exceeds max length, keeping literal value"
         );
         version_req
-    } else if node_semver::Range::parse(version_req).is_err() {
+    } else if crate::formatter::parse_range_safe(version_req).is_err() {
         "*"
     } else {
         version_req
