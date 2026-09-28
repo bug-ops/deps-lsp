@@ -1771,8 +1771,8 @@ pub trait OsvNaming: Send + Sync {
     /// every ecosystem this project supports except PyPI, and for Cargo, npm,
     /// Go, Maven, Gradle, Dart, Bundler, NuGet, and PyPI the manifest's raw
     /// name already matches OSV's canonical spelling.
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
-        Some(dep.name().as_str().to_string())
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<crate::osv::OsvPackageName> {
+        Some(crate::osv::OsvPackageName::new(dep.name().as_str()))
     }
 
     /// Converts a version string as it appears in an OSV advisory record

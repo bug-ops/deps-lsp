@@ -11,6 +11,7 @@ use deps_core::lsp_helpers::{
     match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
+use deps_core::osv::OsvPackageName;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::Bound;
@@ -660,25 +661,14 @@ fn increment_last_segment(prefix: &str) -> Option<String> {
 /// incorrect, mirroring `deps-maven`'s own defensive "unknown shape contributes no edge"
 /// pattern in its `upper_edge`/`lower_edge`.
 fn clause_bound(clause: &str) -> Option<VersionRange<String>> {
+    let compare_owned = |a: &String, b: &String| compare_versions(a, b);
     if let Some(cmp) = parse_comparator(clause) {
         let v = cmp.version.to_string();
         return match cmp.op {
-            CmpOp::Ge => Some(VersionRange::Minimum {
-                version: v,
-                inclusive: true,
-            }),
-            CmpOp::Le => Some(VersionRange::Maximum {
-                version: v,
-                inclusive: true,
-            }),
-            CmpOp::Gt => Some(VersionRange::Minimum {
-                version: v,
-                inclusive: false,
-            }),
-            CmpOp::Lt => Some(VersionRange::Maximum {
-                version: v,
-                inclusive: false,
-            }),
+            CmpOp::Ge => range_from_edges(Bound::Included(v), Bound::Unbounded, compare_owned),
+            CmpOp::Le => range_from_edges(Bound::Unbounded, Bound::Included(v), compare_owned),
+            CmpOp::Gt => range_from_edges(Bound::Excluded(v), Bound::Unbounded, compare_owned),
+            CmpOp::Lt => range_from_edges(Bound::Unbounded, Bound::Excluded(v), compare_owned),
             CmpOp::Eq => Some(VersionRange::Exact(v)),
             // Handled by the caller before `clause_bound` is ever reached for it (it punctures
             // a single point rather than restricting the branch's extent) — see this
@@ -692,12 +682,11 @@ fn clause_bound(clause: &str) -> Option<VersionRange<String>> {
         // (unknown shape) the same as caret/tilde/bare-partial, not silently treat `"abc"` as
         // version `0` and fabricate a bound `[0,1)` for a clause that admits nothing at all).
         if let Some(upper) = increment_last_segment(prefix) {
-            return Some(VersionRange::Bounded {
-                min: prefix.to_string(),
-                min_inclusive: true,
-                max: upper,
-                max_inclusive: false,
-            });
+            return range_from_edges(
+                Bound::Included(prefix.to_string()),
+                Bound::Excluded(upper),
+                compare_owned,
+            );
         }
     }
     None
@@ -752,18 +741,20 @@ fn intersect_clause_bounds<'a>(
     mut upper: Bound<String>,
     parts: impl IntoIterator<Item = &'a str>,
 ) -> Option<VersionRange<String>> {
+    let compare_owned = |a: &String, b: &String| compare_versions(a, b);
     for part in parts {
         if parse_comparator(part).is_some_and(|cmp| cmp.op == CmpOp::Ne) {
             continue;
         }
         let clause = clause_bound(part)?;
-        let cmp = |a: &String, b: &String| compare_versions(a, b);
-        lower = tighter_lower(lower, clause.lower_edge().map(String::clone), cmp);
-        upper = tighter_upper(upper, clause.upper_edge().map(String::clone), cmp);
+        // Keeps an `Empty` clause from widening the branch through its `Unbounded` edges.
+        if clause == VersionRange::Empty {
+            return Some(VersionRange::Empty);
+        }
+        lower = tighter_lower(lower, clause.lower_edge().map(String::clone), compare_owned);
+        upper = tighter_upper(upper, clause.upper_edge().map(String::clone), compare_owned);
     }
-    range_from_edges(lower, upper, |a: &String, b: &String| {
-        compare_versions(a, b)
-    })
+    range_from_edges(lower, upper, compare_owned)
 }
 
 /// Whether `version` is explicitly excluded by an OR-alternation gap (#1601, same class as
@@ -1042,8 +1033,8 @@ impl OsvNaming for ComposerFormatter {
     /// every ecosystem except PyPI).
     ///
     /// Must stay ungated: this is plain OSV-classification logic reachable from `deps-cli`, not LSP-response code (#1545).
-    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<String> {
-        Some(self.normalize_package_name(dep.name()))
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<OsvPackageName> {
+        Some(OsvPackageName::new(self.normalize_package_name(dep.name())))
     }
 }
 
@@ -2244,24 +2235,10 @@ mod tests {
                 "{clause} vs {version}"
             );
             let bound = clause_bound(clause).unwrap_or_else(|| panic!("{clause} should bound"));
-            let contains = match &bound {
-                VersionRange::Minimum {
-                    version: b,
-                    inclusive,
-                } => {
-                    let ord = compare_versions(version, b);
-                    if *inclusive { ord.is_ge() } else { ord.is_gt() }
-                }
-                VersionRange::Maximum {
-                    version: b,
-                    inclusive,
-                } => {
-                    let ord = compare_versions(version, b);
-                    if *inclusive { ord.is_le() } else { ord.is_lt() }
-                }
-                VersionRange::Exact(b) => compare_versions(version, b).is_eq(),
-                other => panic!("unexpected bound shape for {clause}: {other:?}"),
-            };
+            let contains =
+                deps_core::interval::contains(*version, &bound, |a: &str, b: &String| {
+                    compare_versions(a, b)
+                });
             assert_eq!(
                 contains, *admitted,
                 "clause_bound vs eval_leaf for {clause}"
@@ -2269,6 +2246,25 @@ mod tests {
         }
         // `!=` has no clause_bound (handled by the caller, see that function's doc).
         assert!(clause_bound("!=1.0.0").is_none());
+    }
+
+    #[test]
+    fn test_clause_bound_edges_per_operator() {
+        let ge = clause_bound(">=1.0").unwrap();
+        assert_eq!(ge.lower_edge(), Bound::Included(&"1.0".to_string()));
+        assert_eq!(ge.upper_edge(), Bound::Unbounded);
+        let lt = clause_bound("<2.0").unwrap();
+        assert_eq!(lt.lower_edge(), Bound::Unbounded);
+        assert_eq!(lt.upper_edge(), Bound::Excluded(&"2.0".to_string()));
+    }
+
+    #[test]
+    fn test_intersect_clause_bounds_contradictory_clauses_are_empty() {
+        let lower = Bound::Included("1.0".to_string());
+        assert_eq!(
+            intersect_clause_bounds(lower, Bound::Unbounded, [">=1.0", "<1.0"]),
+            Some(VersionRange::Empty)
+        );
     }
 
     #[test]
@@ -2563,14 +2559,16 @@ mod tests {
 
         assert_eq!(
             f.osv_package_name(&dep),
-            Some("symfony/http-kernel".to_string())
+            Some(OsvPackageName::new("symfony/http-kernel"))
         );
         // Regression guard: a future "tidy-up" that routes osv_package_name
         // through normalize_package_name directly instead of calling it
         // explicitly would still be correct for Composer, but this pins the
         // observable behavior so any drift is caught.
         assert_eq!(
-            f.osv_package_name(&dep).as_deref(),
+            f.osv_package_name(&dep)
+                .as_ref()
+                .map(OsvPackageName::as_str),
             Some(f.normalize_package_name(&dep.name).as_str())
         );
     }
