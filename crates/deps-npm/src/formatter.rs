@@ -129,11 +129,13 @@ enum TokenShape {
 /// Classifies a single, already-merged (see [`merge_bare_operator_tokens`]) comparator token
 /// against the `node_semver` 2.2.0 `unreachable!()` panic shapes reachable from user input
 /// (#1630, confirmed by reading `node_semver`'s own tilde/equals match arms in `range.rs`):
-/// a tilde or equals token whose partial version has a wildcard major (`~*`, `=*`, `~x.2.3`,
-/// ...), or a tilde token (plain or `~>` — npm treats them as synonyms) whose minor is a
-/// wildcard while its patch is concrete (`~1.x.3`, `~>1.x.3`) — neither operator's match arms
-/// cover these, and both are confirmed to panic (live-tested for #1646, not just read off the
-/// source).
+/// a tilde token (plain or `~>` — npm treats them as synonyms) whose partial version has a
+/// wildcard major, regardless of trailing components (`~*`, `~x.2.3`, ...) — npm resolves all
+/// of these to "any version" (live-verified, #1639); a tilde token whose minor is a wildcard
+/// while its patch is concrete (`~1.x.3`, `~>1.x.3`, #1646); or an equals token whose *every*
+/// present component is a wildcard (`~x`, `=x.x.x`, `=X.x`, #1639 — unlike tilde, an equals
+/// token with a wildcard major but any concrete trailing component, e.g. `=x.2.3`, is a genuine
+/// npm parse error, not "any version": live-verified against npm's own `semver` package).
 ///
 /// Returns `None` for anything this can't classify, so [`parse_range_safe`] falls back to
 /// `catch_unwind` instead of guessing. Mirrors the `deps-pypi`/`pep508_rs` precedent's shape: a
@@ -141,16 +143,19 @@ enum TokenShape {
 /// grammar re-implementation — caret (`^`) ranges are not checked here since `node_semver`'s
 /// caret match arms have no equivalent gap. Must never return `Some` for a token `node_semver`
 /// can actually parse as-is (a false positive would silently rewrite valid input), and for
-/// `Unresolvable` specifically — reachable from a combined-comparator context where it gets
-/// rewritten to `*` rather than rejecting the whole requirement, see [`parse_range_safe`] —
-/// must never return `Some(Unresolvable)` for a shape that actually has a narrower real bound
-/// (that would silently produce a wrong, overly permissive answer instead of a safe `Err`).
+/// `Unresolvable` specifically — rewritten to `*` and re-parsed rather than rejecting the whole
+/// requirement outright, see [`parse_range_safe`] — must never return `Some(Unresolvable)` for
+/// a shape that actually has a narrower real bound (that would silently produce a wrong,
+/// overly permissive answer instead of a safe `Err`).
 fn classify_token_shape(token: &str) -> Option<TokenShape> {
     if let Some(rest) = token.strip_prefix("~>").or_else(|| token.strip_prefix('~')) {
-        let comps = partial_version_components(rest)?;
-        if comps.first() == Some(&VersionComponentKind::Wildcard) {
+        let unprefixed = rest.strip_prefix('v').unwrap_or(rest);
+        if let Some(comps) = partial_version_components(unprefixed)
+            && comps.first() == Some(&VersionComponentKind::Wildcard)
+        {
             return Some(TokenShape::Unresolvable);
         }
+        let comps = partial_version_components(rest)?;
         if matches!(
             comps.as_slice(),
             [
@@ -166,8 +171,12 @@ fn classify_token_shape(token: &str) -> Option<TokenShape> {
         return None;
     }
     if let Some(rest) = token.strip_prefix('=') {
-        let comps = partial_version_components(rest)?;
-        if comps.first() == Some(&VersionComponentKind::Wildcard) {
+        let unprefixed = rest.strip_prefix('v').unwrap_or(rest);
+        let comps = partial_version_components(unprefixed)?;
+        if comps
+            .iter()
+            .all(|comp| *comp == VersionComponentKind::Wildcard)
+        {
             return Some(TokenShape::Unresolvable);
         }
     }
@@ -190,25 +199,14 @@ fn classify_token_shape(token: &str) -> Option<TokenShape> {
 /// `RUST_BACKTRACE=1`, on every re-diagnose of a manifest containing one) — mirrors why the
 /// `deps-pypi`/`pep508_rs` precedent pre-validates before its own `catch_unwind` backstop.
 ///
-/// A single, bare wildcard-major comparator (`~*`, `=x.x.x-beta`, ...) has no other
-/// comparator in the requirement to narrow it down to a precise value, so it keeps the
-/// established `Panicked` fallback (#1630/#1639). Combined with at least one other
-/// *token* via `||` or whitespace, it's instead rewritten to a bare `*` (npm's own
-/// wildcard-as-identity semantics: `*` doesn't narrow an AND'd comparator's bound, and
-/// unions to "any version" across `||` — live-verified for #1646) and re-parsed for a
-/// precise result, e.g. `"^1.0.0 ~*"` resolves to `^1.0.0`'s own bound rather than failing.
-/// `~1.x.3`/`~>1.x.3` (#1646) are unconditionally rewritten to their real bound-equivalent
-/// `~1.x` — see `TokenShape::TildeWildcardPatch`.
-///
-/// The single-vs-combined boundary is a raw token count, not a semantic "is this actually
-/// combined with something else" check — so two *identical* wildcard-major tokens
-/// (`"~* ~*"`, an unusual but not impossible degenerate shape) already count as "combined"
-/// and resolve to `Ok` rather than the bare single-token `Err` (#1646 impl-critic M1). This
-/// is intentional, not accidental: npm's own AND-of-wildcards semantics genuinely resolves
-/// such a requirement (to "any version"), so returning a precise `Ok` for it is no less
-/// correct than the single-token case's `Err` — the two just sit on opposite sides of the
-/// "has this been asked to be more precise than we've researched" line #1639 drew, since a
-/// second wildcard token doesn't add any new information over the first alone.
+/// A bare wildcard-major comparator (`~*`, `=x.x.x`, ...) has no narrower real value to
+/// substitute, so it's rewritten to a bare `*` (`node_semver`'s own always-parseable "any
+/// version" token) and re-parsed — whether it's the whole requirement on its own (#1639) or
+/// combined with another comparator via `||`/whitespace (`*` doesn't narrow an AND'd
+/// comparator's bound, and unions to "any version" across `||` — live-verified for #1646),
+/// e.g. `"^1.0.0 ~*"` resolves to `^1.0.0`'s own bound rather than failing. `~1.x.3`/`~>1.x.3`
+/// (#1646) are unconditionally rewritten to their real bound-equivalent `~1.x` instead — see
+/// `TokenShape::TildeWildcardPatch`.
 ///
 /// # Errors
 ///
@@ -224,8 +222,13 @@ fn classify_token_shape(token: &str) -> Option<TokenShape> {
 ///
 /// assert!(parse_range_safe("^1.0.0").is_ok());
 /// assert!(parse_range_safe("not a range").is_err());
-/// // Previously panicked (#1630); now a graceful `Err(RangeParseError::Panicked)`.
-/// assert!(parse_range_safe("~*").is_err());
+/// // Previously panicked (#1630), then a safe-but-wrong `Err` (npm actually resolves this to
+/// // "any version"); now correctly `Ok` (#1639).
+/// assert!(parse_range_safe("~*").is_ok());
+/// // #1639: unlike tilde, an equals wildcard-major with any concrete trailing component is a
+/// // genuine npm parse error, not "any version" (live-verified against npm's own `semver`).
+/// assert!(parse_range_safe("=x.2.3").is_err());
+/// assert!(parse_range_safe("=x.x.x").is_ok());
 /// // #1646: combined with another comparator, the wildcard half no longer blocks the whole
 /// // requirement from resolving.
 /// assert!(parse_range_safe("^1.0.0 ~*").is_ok());
@@ -249,35 +252,47 @@ pub fn parse_range_safe(requirement: &str) -> Result<node_semver::Range, RangePa
                 .collect()
         })
         .collect();
-    let total_tokens: usize = branches.iter().map(Vec::len).sum();
-    let has_unresolvable = branches
-        .iter()
-        .flatten()
-        .any(|(_, shape)| matches!(shape, Some(TokenShape::Unresolvable)));
 
-    if has_unresolvable && total_tokens <= 1 {
-        tracing::warn!(
-            requirement,
-            "node_semver would panic parsing this range shape, rejecting before parsing (#1630)"
-        );
-        return Err(RangeParseError::Panicked);
-    }
+    let rewrite_branch = |branch: &[(Cow<'_, str>, Option<TokenShape>)]| -> String {
+        branch
+            .iter()
+            .map(|(token, shape)| match shape {
+                Some(TokenShape::Unresolvable) => "*".to_string(),
+                Some(TokenShape::TildeWildcardPatch { major }) => format!("~{major}.x"),
+                None => token.as_ref().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     let needs_rewrite = branches.iter().flatten().any(|(_, shape)| shape.is_some());
+
+    // npm requires every `||`-branch to be independently valid — a wildcard branch
+    // (rewritten to `*`) doesn't get a free pass for its siblings. `node_semver`'s own
+    // combined-string parse doesn't always enforce this (observed to silently tolerate a
+    // malformed branch once an already-matches-everything `*` branch is present), so each
+    // rewritten branch is validated on its own before trusting the combined result.
+    if needs_rewrite && branches.len() > 1 {
+        for branch in &branches {
+            let branch_str = rewrite_branch(branch);
+            match std::panic::catch_unwind(|| node_semver::Range::parse(&branch_str)) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(RangeParseError::from(e)),
+                Err(_) => {
+                    tracing::warn!(
+                        requirement,
+                        "node_semver panicked parsing a range branch, treating it as unparseable (#1630)"
+                    );
+                    return Err(RangeParseError::Panicked);
+                }
+            }
+        }
+    }
+
     let rewritten = needs_rewrite.then(|| {
         branches
             .iter()
-            .map(|branch| {
-                branch
-                    .iter()
-                    .map(|(token, shape)| match shape {
-                        Some(TokenShape::Unresolvable) => "*".to_string(),
-                        Some(TokenShape::TildeWildcardPatch { major }) => format!("~{major}.x"),
-                        None => token.as_ref().to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
+            .map(|branch| rewrite_branch(branch))
             .collect::<Vec<_>>()
             .join(" || ")
     });
@@ -840,44 +855,65 @@ mod tests {
         );
     }
 
-    /// #1630: `node_semver` 2.2.0 hits an internal `unreachable!()` (rather than returning
-    /// `Err`) for a *bare* tilde/equals requirement whose partial version is itself a
-    /// wildcard (`~*`/`~x`/`~X`) — reachable straight from `package.json` via
-    /// `compile_requirement`. Asserts the panic is caught and folded into the same graceful
-    /// `None` an ordinary unparseable requirement already produces. `~>x.2.3` (a wildcard
-    /// *major*, unlike `~>1.x.3` which #1646 impl-critic S1 moved to a precise resolution —
-    /// see `test_compile_requirement_tilde_wildcard_patch_resolves_precisely` below) stays in
-    /// this bucket.
+    /// #1639: `node_semver` 2.2.0 hits an internal `unreachable!()` (rather than returning
+    /// `Err`) for a *bare* tilde requirement whose partial version has a wildcard major
+    /// (`~*`/`~x`/`~X`, any trailing components) — reachable straight from `package.json` via
+    /// `compile_requirement`. Real npm resolves all of these to "any version" (live-verified),
+    /// so `parse_range_safe` now resolves them precisely instead of just catching the panic —
+    /// asserted here by confirming the matcher admits an arbitrary version.
     #[test]
-    fn test_compile_requirement_tilde_wildcard_does_not_panic() {
+    fn test_compile_requirement_wildcard_major_resolves_to_any_version() {
         let formatter = NpmFormatter;
-        for requirement in ["~*", "~x", "~X", "=*", "=x", "=X", "~>*", "~>x.2.3"] {
-            assert!(
-                formatter
-                    .compile_requirement(&VersionReq::new(requirement))
-                    .is_none(),
-                "requirement {requirement:?} must not panic and must resolve to None"
+        for requirement in ["~*", "~x", "~X", "~>*", "~>x.2.3", "=*", "=x", "=X"] {
+            let matcher = formatter
+                .compile_requirement(&VersionReq::new(requirement))
+                .unwrap_or_else(|| panic!("{requirement:?} must resolve to a real range"));
+            assert_eq!(
+                matcher.matches(&ConcreteVersion::new("999.999.999")),
+                Some(true),
+                "requirement {requirement:?} must match an arbitrary version"
             );
         }
     }
 
-    /// #1630 at the wrapper level: `parse_range_safe` must catch (or, via
-    /// `classify_token_shape`, pre-empt) the panic and report it as
-    /// [`RangeParseError::Panicked`], distinguishable from an ordinary
-    /// [`RangeParseError::Malformed`] parse rejection. Covers both `node_semver`
-    /// `unreachable!()` sites: `range.rs:982` (wildcard-major tilde) and `range.rs:782`
-    /// (wildcard-major equals). `~>x.2.3` (wildcard major) is included since it panics too and
-    /// has no narrower value to substitute — unlike `~>1.x.3`, moved to a precise resolution
-    /// by #1646 impl-critic S1.
+    /// #1639 at the wrapper level: a bare wildcard-major tilde/equals comparator now resolves
+    /// to `Ok(Range::any())` instead of `Err(RangeParseError::Panicked)`, whether or not it's
+    /// combined with another comparator. Unlike tilde, an equals comparator with a wildcard
+    /// major but any *concrete* trailing component (`=x.2.3`) is a genuine npm parse error, not
+    /// "any version" — live-verified against npm's own `semver` package — and must stay
+    /// `Panicked` (`node_semver`'s equals `unreachable!()` site, `range.rs:782`, fires
+    /// regardless of the trailing components, same as the tilde site at `range.rs:982`).
+    /// npm requires every `||`-branch to be independently valid — a wildcard-resolving branch
+    /// (`~*`) doesn't give its sibling branch a free pass, unlike `node_semver`'s own combined
+    /// parse (observed to silently tolerate `"* || not-a-version"`, treating the whole range as
+    /// `Ok`, when parsed as one joined string — the reason [`parse_range_safe`] validates each
+    /// rewritten branch on its own instead of trusting the joined re-parse alone).
     #[test]
-    fn test_parse_range_safe_catches_tilde_wildcard_panic() {
-        for requirement in ["~*", "~x", "~X", "=*", "=x", "=X", "~>*", "~>x.2.3"] {
+    fn test_parse_range_safe_or_branch_must_independently_parse() {
+        assert!(parse_range_safe("~* || not-a-version").is_err());
+        assert!(parse_range_safe("~* || ^1.0.0").is_ok());
+        // #1646/#1650's `~1.x.3` precise rewrite composes with #1639's wildcard-major rule:
+        // a branch that resolves precisely (not "any version") still lets its `~x` sibling
+        // widen the whole OR to "any version".
+        assert!(parse_range_safe("~1.x.3 || ~x").is_ok());
+    }
+
+    #[test]
+    fn test_parse_range_safe_wildcard_major_resolves_to_any_version() {
+        for requirement in ["~*", "~x", "~X", "~>*", "~>x.2.3", "=*", "=x", "=X"] {
+            assert!(
+                parse_range_safe(requirement).is_ok(),
+                "requirement {requirement:?} must resolve to Ok"
+            );
+        }
+        for requirement in ["=x.2.3", "=x.2", "=X.x.2"] {
             assert!(
                 matches!(
                     parse_range_safe(requirement),
                     Err(RangeParseError::Panicked)
                 ),
-                "requirement {requirement:?} must resolve to RangeParseError::Panicked"
+                "requirement {requirement:?} (wildcard major, concrete trailing) must stay \
+                 RangeParseError::Panicked for equals, unlike tilde"
             );
         }
         assert!(matches!(
@@ -890,6 +926,28 @@ mod tests {
         assert!(parse_range_safe("=1.x.3").is_ok());
         // Plain tilde's gap requires patch to be concrete; a wildcard patch is fine.
         assert!(parse_range_safe("~1.x").is_ok());
+    }
+
+    /// #1639 impl-critic S1': `node_semver` and real npm both accept only a *lowercase* `v`
+    /// prefix (`~v*`, `=v*`, `=vx` resolve to any version, live-verified) — an uppercase `V`
+    /// is genuinely invalid in both, and must stay `Panicked`, not be silently accepted as an
+    /// equivalent prefix (a v-prefix-case regression caught before merge, see #1639's PR
+    /// history).
+    #[test]
+    fn test_parse_range_safe_lowercase_v_prefix_resolves_uppercase_stays_err() {
+        for requirement in ["~v*", "=v*", "=vx"] {
+            assert!(
+                parse_range_safe(requirement).is_ok(),
+                "requirement {requirement:?} (lowercase v) must resolve to Ok"
+            );
+        }
+        for requirement in ["~V*", "=V*", "~Vx.2"] {
+            assert!(
+                parse_range_safe(requirement).is_err(),
+                "requirement {requirement:?} (uppercase V) must stay Err, not be silently \
+                 accepted as an equivalent to the lowercase-v shape"
+            );
+        }
     }
 
     /// #1646 shape 3: `~1.x.3` (plain tilde, concrete-wildcard-concrete) is rewritten to its
@@ -949,11 +1007,8 @@ mod tests {
     fn test_parse_range_safe_merges_whitespace_after_bare_operator() {
         for requirement in ["~ *", "= *", "~  *", "=  *"] {
             assert!(
-                matches!(
-                    parse_range_safe(requirement),
-                    Err(RangeParseError::Panicked)
-                ),
-                "requirement {requirement:?} must resolve to RangeParseError::Panicked, matching bare \"~*\"/\"=*\""
+                parse_range_safe(requirement).is_ok(),
+                "requirement {requirement:?} must resolve to Ok, matching bare \"~*\"/\"=*\" (#1639)"
             );
         }
         // Combined with a real comparator, the merged wildcard half no longer blocks
@@ -1009,24 +1064,20 @@ mod tests {
 
     /// #1646 shape 4: a fully-wildcard component set with a `-prerelease` suffix on the last
     /// component still resolves to "any version" in real npm (`=x.x.x-beta` -> `<any>`,
-    /// live-verified), matching the already-established bare-wildcard `None` fallback.
+    /// live-verified), matching the plain bare-wildcard resolution (#1639).
     #[test]
-    fn test_compile_requirement_prerelease_suffixed_wildcard_does_not_panic() {
+    fn test_compile_requirement_prerelease_suffixed_wildcard_resolves_to_any_version() {
         let formatter = NpmFormatter;
         for requirement in ["=x.x.x-beta", "~x.x.x-beta", "~*.*.*-beta", "=X.X.X-beta.1"] {
-            assert!(
-                formatter
-                    .compile_requirement(&VersionReq::new(requirement))
-                    .is_none(),
-                "requirement {requirement:?} must not panic and must resolve to None"
+            let matcher = formatter
+                .compile_requirement(&VersionReq::new(requirement))
+                .unwrap_or_else(|| panic!("{requirement:?} must resolve to a real range"));
+            assert_eq!(
+                matcher.matches(&ConcreteVersion::new("999.999.999")),
+                Some(true),
+                "requirement {requirement:?} must match an arbitrary version"
             );
-            assert!(
-                matches!(
-                    parse_range_safe(requirement),
-                    Err(RangeParseError::Panicked)
-                ),
-                "requirement {requirement:?} must resolve to RangeParseError::Panicked"
-            );
+            assert!(parse_range_safe(requirement).is_ok());
         }
     }
 

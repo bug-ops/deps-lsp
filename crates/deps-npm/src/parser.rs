@@ -1323,6 +1323,25 @@ mod tests {
         assert_eq!(dep.version_req, Some("*".into()));
     }
 
+    /// #1639: a bare wildcard-major alias version (`"npm:pkg@~*"`) now resolves through
+    /// `parse_range_safe` instead of being reported as unparseable, so it's kept verbatim
+    /// (not normalized to the existence-wildcard `"*"` the dist-tag/no-version fallback uses,
+    /// since it's already a real, resolvable npm range) — this call site inherited the fix
+    /// automatically since it routes through the shared wrapper; this test pins that it did.
+    #[test]
+    fn test_parse_npm_alias_wildcard_tilde_kept_verbatim() {
+        let json = r#"{
+  "dependencies": {
+    "my-react": "npm:react@~*"
+  }
+}"#;
+
+        let result = parse_package_json(json, &test_uri()).unwrap();
+        let dep = &result.dependencies[0];
+        assert_eq!(dep.package, Some("react".into()));
+        assert_eq!(dep.version_req, Some("~*".into()));
+    }
+
     /// #1490 (CWE-400): an alias version requirement longer than `MAX_REQUIREMENT_LEN` must
     /// skip `node_semver::Range::parse` entirely (that parser allocates roughly 1.6 KB per
     /// `||` alternative, so an unbounded string is a resource-exhaustion vector) and be kept

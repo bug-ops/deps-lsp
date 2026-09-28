@@ -11,7 +11,9 @@ use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use crate::types::{DenoMetadata, JsrPackage, JsrVersion};
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Metadata, PackageName, Registry, Result, Version,
-    VersionReq, lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or,
+    VersionReq,
+    lsp_helpers::{MAX_REQUIREMENT_LEN, requirement_len_exceeds_cap, warn_rejected_value},
+    not_found_or as core_not_found_or,
 };
 use deps_npm::NpmRegistry;
 use serde::Deserialize;
@@ -609,6 +611,14 @@ impl Registry for DenoRegistry {
             match split_scheme(name.as_str()) {
                 Some((Scheme::Jsr, rest)) => {
                     let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
+                    // Reject before `parse_range_safe` (see `requirement_len_exceeds_cap`'s
+                    // docs), mirroring every `deps-npm` call site (#1640) — an oversized
+                    // requirement never reaches the parser at all.
+                    if requirement_len_exceeds_cap(req.as_str()) {
+                        return Err(DepsError::InvalidVersionReq(format!(
+                            "version requirement exceeds {MAX_REQUIREMENT_LEN} bytes"
+                        )));
+                    }
                     // Pre-check before any network call: a malformed requirement must stay
                     // `Err` (R5c's diagnostic), not silently become `Ok(None)` (R5e, no diagnostic).
                     deps_npm::parse_range_safe(req.as_str())
@@ -1227,30 +1237,120 @@ mod tests {
         assert_matches!(err, DepsError::InvalidVersionReq(_));
     }
 
-    /// #1630: a `~*`-shaped requirement used to panic `node_semver::Range::parse` (called
-    /// directly in this module's JSR pre-check, not via `deps-npm`'s `compile_requirement`)
-    /// instead of returning `Err`. Mirrors `deps-npm`'s own coverage for this call site.
-    /// `~>x.2.3` (wildcard major; not `~1.x.3`/`~>1.x.3`, which `deps-npm` #1646 gave a real,
-    /// precise resolution instead) covers the same shape.
+    /// #1639: unlike plain tilde, an equals range with a wildcard major followed by a
+    /// concrete component (`=x.2.3`) is a genuine npm parse error, not "any version" — the
+    /// JSR pre-check (called directly, not via `deps-npm`'s `compile_requirement`) must stay
+    /// `Err` for it, mirroring `deps-npm`'s own coverage for this call site.
     #[tokio::test]
-    async fn test_deno_registry_get_latest_matching_jsr_tilde_wildcard_does_not_panic() {
+    async fn test_deno_registry_get_latest_matching_jsr_equals_wildcard_major_concrete_trailing_stays_err()
+     {
         let registry = DenoRegistry {
             jsr: unreachable_jsr(Arc::new(HttpCache::new())),
             npm: NpmRegistry::new(Arc::new(HttpCache::new())),
         };
 
-        for requirement in ["~*", "~x", "~X", "=*", "~>x.2.3"] {
-            let Err(err) = Registry::get_latest_matching(
+        let Err(err) = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("jsr:@std/fs"),
+            &VersionReq::new("=x.2.3"),
+            &deps_core::SelectionContext::none(),
+        )
+        .await
+        else {
+            panic!("expected an error for \"=x.2.3\"");
+        };
+        assert_matches!(err, DepsError::InvalidVersionReq(_));
+    }
+
+    /// #1640: unlike every other `parse_range_safe` call site in `deps-npm`, the JSR branch
+    /// had no `requirement_len_exceeds_cap` pre-check ahead of it — an oversized requirement
+    /// reached the parser directly instead of short-circuiting first. Proves the cap now
+    /// applies here too, and before any network call (`unreachable_jsr`).
+    ///
+    /// (impl-critic M5): the fixture must be a *parseable* 257-byte (`MAX_REQUIREMENT_LEN + 1`)
+    /// range (28 `"1.0.0 || "` alternatives plus a trailing `"1.0.0"`, mirroring `deps-npm`'s
+    /// own `oversized_parseable_range` fixture), not an arbitrary unparseable string — an
+    /// unparseable oversized string would already be rejected via `parse_range_safe`'s own
+    /// error path, so that wouldn't distinguish "rejected by the length gate before the
+    /// parser" from "rejected by the parser itself". A genuinely parseable-but-oversized input
+    /// only rejects here if the length gate fires; `unreachable_jsr` additionally proves it
+    /// fires before any network call, since the code path would otherwise have reached the
+    /// (bogus) JSR host and failed with a different, non-`InvalidVersionReq` error.
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_jsr_oversized_req_rejected_before_parse() {
+        let registry = DenoRegistry {
+            jsr: unreachable_jsr(Arc::new(HttpCache::new())),
+            npm: NpmRegistry::new(Arc::new(HttpCache::new())),
+        };
+        let oversized = format!("{}1.0.0", "1.0.0 || ".repeat(28));
+        assert_eq!(oversized.len(), MAX_REQUIREMENT_LEN + 1);
+        assert!(
+            node_semver::Range::parse(&oversized).is_ok(),
+            "fixture must be parseable so only the length gate explains a rejection"
+        );
+
+        let Err(err) = Registry::get_latest_matching(
+            &registry,
+            &PackageName::new("jsr:@std/fs"),
+            &VersionReq::new(&oversized),
+            &deps_core::SelectionContext::none(),
+        )
+        .await
+        else {
+            panic!("expected an error for an oversized jsr: version requirement");
+        };
+        assert_matches!(err, DepsError::InvalidVersionReq(_));
+        let message = err.to_string();
+        assert!(message.contains("256"), "message: {message}");
+        assert!(
+            !message.contains(&oversized),
+            "message must not embed the raw oversized value: {message}"
+        );
+    }
+
+    /// #1639: npm resolves a bare wildcard-major tilde/equals requirement
+    /// (`~*`/`~x`/`~X`/`~>x.2.3`/`=*`/`=x`/`=X`) to "any version" — the JSR pre-check must let
+    /// it reach the registry and resolve the newest version, not report
+    /// `Err(DepsError::InvalidVersionReq)` like a malformed range.
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_jsr_bare_wildcard_matches_any_version() {
+        let mut server = mockito::Server::new_async().await;
+        let cache = Arc::new(HttpCache::new());
+        let jsr = JsrRegistry::with_bases(Arc::clone(&cache), server.url(), server.url());
+        let registry = DenoRegistry {
+            jsr,
+            npm: NpmRegistry::new(cache),
+        };
+
+        server
+            .mock("GET", "/@std/fs/meta.json")
+            .with_status(200)
+            .with_body(
+                r#"{"versions": {
+                    "1.0.0": {"createdAt": "2024-01-01T00:00:00Z"},
+                    "2.0.0": {"createdAt": "2025-01-01T00:00:00Z"}
+                }}"#,
+            )
+            .create_async()
+            .await;
+
+        for requirement in ["~*", "~x", "~X", "~>x.2.3", "=*", "=x", "=X"] {
+            let latest = Registry::get_latest_matching(
                 &registry,
                 &PackageName::new("jsr:@std/fs"),
                 &VersionReq::new(requirement),
                 &deps_core::SelectionContext::none(),
             )
             .await
-            else {
-                panic!("expected an error for a tilde-wildcard jsr: version requirement");
-            };
-            assert_matches!(err, DepsError::InvalidVersionReq(_));
+            .unwrap_or_else(|e| panic!("requirement {requirement:?} must not error: {e}"));
+
+            assert_eq!(
+                latest
+                    .unwrap_or_else(|| panic!("requirement {requirement:?} must resolve a version"))
+                    .version_string(),
+                "2.0.0",
+                "requirement {requirement:?} must resolve to the newest version"
+            );
         }
     }
 
