@@ -314,16 +314,35 @@ mod tests {
     /// #1630: `DenoFormatter::compile_requirement` delegates entirely to
     /// `deps_npm::compile_node_semver_range`, so it must inherit that fix's panic safety for
     /// a tilde-wildcard requirement (`~*`/`~x`/`~X`) that used to hit `node_semver`'s internal
-    /// `unreachable!()` instead of returning `Err`.
+    /// `unreachable!()` instead of returning `Err`. `~>x.2.3` (wildcard major; not
+    /// `~1.x.3`/`~>1.x.3`, which `deps-npm` #1646 gave a real, precise resolution instead —
+    /// see `test_compile_requirement_tilde_wildcard_patch_resolves_precisely` below) covers
+    /// the same shape.
     #[test]
     fn test_compile_requirement_tilde_wildcard_does_not_panic() {
         let formatter = DenoFormatter;
-        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+        for requirement in ["~*", "~x", "~X", "=*", "~>x.2.3"] {
             assert!(
                 formatter
                     .compile_requirement(&VersionReq::new(requirement))
                     .is_none(),
                 "requirement {requirement:?} must not panic and must resolve to None"
+            );
+        }
+    }
+
+    /// #1646 impl-critic M4: `deps-deno` inherits `deps-npm`'s precise `~1.x.3` resolution
+    /// entirely through `compile_node_semver_range`, but had no test asserting it positively
+    /// resolves here (only that the *unresolvable* shapes don't panic, above).
+    #[test]
+    fn test_compile_requirement_tilde_wildcard_patch_resolves_precisely() {
+        let formatter = DenoFormatter;
+        for requirement in ["~1.x.3", "~>1.x.3"] {
+            assert!(
+                formatter
+                    .compile_requirement(&VersionReq::new(requirement))
+                    .is_some(),
+                "requirement {requirement:?} must resolve to a real range"
             );
         }
     }

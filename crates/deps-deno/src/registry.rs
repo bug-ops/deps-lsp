@@ -1230,6 +1230,8 @@ mod tests {
     /// #1630: a `~*`-shaped requirement used to panic `node_semver::Range::parse` (called
     /// directly in this module's JSR pre-check, not via `deps-npm`'s `compile_requirement`)
     /// instead of returning `Err`. Mirrors `deps-npm`'s own coverage for this call site.
+    /// `~>x.2.3` (wildcard major; not `~1.x.3`/`~>1.x.3`, which `deps-npm` #1646 gave a real,
+    /// precise resolution instead) covers the same shape.
     #[tokio::test]
     async fn test_deno_registry_get_latest_matching_jsr_tilde_wildcard_does_not_panic() {
         let registry = DenoRegistry {
@@ -1237,7 +1239,7 @@ mod tests {
             npm: NpmRegistry::new(Arc::new(HttpCache::new())),
         };
 
-        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+        for requirement in ["~*", "~x", "~X", "=*", "~>x.2.3"] {
             let Err(err) = Registry::get_latest_matching(
                 &registry,
                 &PackageName::new("jsr:@std/fs"),
