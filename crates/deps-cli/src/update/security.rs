@@ -4,7 +4,6 @@
 
 use std::time::Duration;
 
-use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::edit::{VulnFixSkip, plan_verified_fix, resolve_verified_fix};
 use deps_core::lsp_helpers::{resolve_in_use_version, resolve_scan_outcome};
@@ -12,7 +11,9 @@ use deps_core::osv::{OsvClient, ScanOutcome};
 
 use crate::analyze::ManifestAnalysis;
 use crate::update::ignore::IgnoreRules;
-use crate::update::{Outcome, PlannedUpdateItem, UnfixableReason, UpdatePlan, is_requested};
+use crate::update::{
+    CurrentVersion, Outcome, PlannedUpdateItem, UnfixableReason, UpdatePlan, is_requested,
+};
 
 /// Ceiling on the phase-B `check_candidates` timeout, mirroring `analyze.rs`'s own OSV scan
 /// timeout ceiling — the shared `reqwest` client already imposes its own client-wide 30s
@@ -238,28 +239,19 @@ fn classify_vulnerable_dependency(
     // show which version is actually vulnerable ("serde 1.0.1 -> 1.0.2"), not the declared
     // range ("serde 1 -> 1.0.2"), which hides that information.
     //
-    // Code review finding 4: the fallback chain below is *not* the same as default mode's.
-    // Default mode's `collect_update_candidates` (`deps-core::edit`) falls straight from an
-    // unresolved `resolve_in_use_version` to an empty string — the honest "we don't know"
-    // value `classify_update` maps to `UpdateKind::Unknown`. This function instead falls back
-    // to the declared requirement text before empty, deliberately: an empty `current` in a
+    // Code review finding 4: `security_current`'s fallback chain is *not* the same as default
+    // mode's. Default mode's `collect_update_candidates` (`deps-core::edit`) falls straight
+    // from an unresolved `resolve_in_use_version` to `CurrentVersion::Unknown` (rendered as
+    // `""`), the honest "we don't know" value `CurrentVersion::update_kind_to` maps to
+    // `UpdateKind::Unknown`. This function instead falls back to the declared requirement text
+    // (`CurrentVersion::Declared`) before `Unknown`, deliberately: an empty `current` in a
     // vulnerability report ("serde  -> 1.0.2") reads as a rendering bug, and a
     // `--security-only` report's whole purpose is communicating exposure, so showing the
     // declared range ("serde 1 -> 1.0.2") when the exact in-use version can't be resolved is
     // strictly more useful here than it would be worth changing default mode's shared,
     // LSP-facing `current` semantics to match (which FR-001's byte-identical-`deps-lsp`
     // constraint rules out doing casually anyway).
-    let current = resolve_in_use_version(
-        dep,
-        normalized_name,
-        &analysis.resolved_versions,
-        Some(&analysis.resolved_version_candidates),
-        formatter,
-        ecosystem_id,
-    )
-    .map(ConcreteVersion::into_string)
-    .or_else(|| dep.version_requirement().map(|r| r.as_str().to_string()))
-    .unwrap_or_default();
+    let current = security_current(dep, normalized_name, analysis, formatter, ecosystem_id);
     let ignore_rule_overridden = ignore_override(ignore_rules, normalized_name);
 
     // FR-011: the two-signal, load-bearing `Unfixable` rule — `fetch_and_classify_package`
@@ -278,7 +270,7 @@ fn classify_vulnerable_dependency(
     if analysis.fetch_failed.contains(dep.name()) || cached.is_none() {
         return unfixable_item(
             dep,
-            &current,
+            current,
             UnfixableReason::FetchFailedOrAbsent,
             ignore_rule_overridden,
         );
@@ -296,7 +288,7 @@ fn classify_vulnerable_dependency(
         Err(_) => {
             return unfixable_item(
                 dep,
-                &current,
+                current,
                 UnfixableReason::NoVerifiedFix,
                 ignore_rule_overridden,
             );
@@ -311,7 +303,7 @@ fn classify_vulnerable_dependency(
     let Some(version_req) = dep.version_requirement() else {
         return requires_lockfile_update_item(
             dep,
-            &current,
+            current,
             &version_native,
             &fix.advisory_ids,
             ignore_rule_overridden,
@@ -321,7 +313,7 @@ fn classify_vulnerable_dependency(
     let Some(version_range) = dep.version_range() else {
         return requires_lockfile_update_item(
             dep,
-            &current,
+            current,
             &version_native,
             &fix.advisory_ids,
             ignore_rule_overridden,
@@ -342,7 +334,7 @@ fn classify_vulnerable_dependency(
     if yanked {
         return unfixable_item(
             dep,
-            &current,
+            current,
             UnfixableReason::Yanked,
             ignore_rule_overridden,
         );
@@ -380,7 +372,7 @@ fn classify_vulnerable_dependency(
         // was already reported `Unfixable(Yanked)` and never reaches this match.
         Err(VulnFixSkip::RequirementAlreadyResolves) => requires_lockfile_update_item(
             dep,
-            &current,
+            current,
             &version_native,
             &fix.advisory_ids,
             ignore_rule_overridden,
@@ -421,7 +413,7 @@ fn classify_vulnerable_dependency(
             if deps_core::lsp_helpers::requirement_is_oversized(version_req) {
                 return unfixable_item(
                     dep,
-                    &current,
+                    current,
                     UnfixableReason::OversizedRequirement,
                     ignore_rule_overridden,
                 );
@@ -434,14 +426,14 @@ fn classify_vulnerable_dependency(
             if confirmed_excluded {
                 unfixable_item(
                     dep,
-                    &current,
+                    current,
                     UnfixableReason::UnsupportedRequirementShape,
                     ignore_rule_overridden,
                 )
             } else {
                 requires_lockfile_update_item(
                     dep,
-                    &current,
+                    current,
                     &version_native,
                     &fix.advisory_ids,
                     ignore_rule_overridden,
@@ -459,11 +451,39 @@ fn classify_vulnerable_dependency(
             | VulnFixSkip::UnresolvedPlaceholder,
         ) => unfixable_item(
             dep,
-            &current,
+            current,
             UnfixableReason::NoVerifiedFix,
             ignore_rule_overridden,
         ),
     }
+}
+
+/// `--security-only`'s `current` resolution (M8/code-review finding 4): the resolved in-use
+/// version when one exists, else the declared requirement text, else [`CurrentVersion::Unknown`]
+/// — see [`classify_vulnerable_dependency`]'s doc for why this differs from default mode's
+/// [`deps_core::edit::collect_update_candidates`], which never falls back to the declared text.
+fn security_current(
+    dep: &dyn deps_core::Dependency,
+    normalized_name: &str,
+    analysis: &ManifestAnalysis,
+    formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
+    ecosystem_id: deps_core::EcosystemId,
+) -> CurrentVersion {
+    resolve_in_use_version(
+        dep,
+        normalized_name,
+        &analysis.resolved_versions,
+        Some(&analysis.resolved_version_candidates),
+        formatter,
+        ecosystem_id,
+    )
+    .map(CurrentVersion::Resolved)
+    .or_else(|| {
+        dep.version_requirement()
+            .cloned()
+            .map(CurrentVersion::Declared)
+    })
+    .unwrap_or(CurrentVersion::Unknown)
 }
 
 /// Whether a `[update].ignore` rule matches this dependency, purely for the FR-008 override
@@ -479,17 +499,7 @@ fn skipped_not_requested(
     analysis: &ManifestAnalysis,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
 ) -> PlannedUpdateItem {
-    let current = resolve_in_use_version(
-        dep,
-        normalized_name,
-        &analysis.resolved_versions,
-        Some(&analysis.resolved_version_candidates),
-        formatter,
-        ecosystem_id,
-    )
-    .map(ConcreteVersion::into_string)
-    .or_else(|| dep.version_requirement().map(|r| r.as_str().to_string()))
-    .unwrap_or_default();
+    let current = security_current(dep, normalized_name, analysis, formatter, ecosystem_id);
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
         current,
@@ -504,13 +514,13 @@ fn skipped_not_requested(
 
 fn unfixable_item(
     dep: &dyn deps_core::Dependency,
-    current: &str,
+    current: CurrentVersion,
     reason: UnfixableReason,
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
-        current.to_string(),
+        current,
         String::new(),
         Outcome::Unfixable(reason),
         Vec::new(),
@@ -522,14 +532,14 @@ fn unfixable_item(
 
 fn requires_lockfile_update_item(
     dep: &dyn deps_core::Dependency,
-    current: &str,
+    current: CurrentVersion,
     target: &str,
     advisory_ids: &[String],
     ignore_rule_overridden: bool,
 ) -> PlannedUpdateItem {
     PlannedUpdateItem::new(
         dep.name().as_str().to_string(),
-        current.to_string(),
+        current,
         target.to_string(),
         Outcome::RequiresLockfileUpdate,
         advisory_ids.to_vec(),
@@ -1554,7 +1564,10 @@ mod tests {
         // No lockfile-resolved version in `analysis.resolved_versions` and Cargo's bare "0.9"
         // is a caret range (not a pin), so `resolve_in_use_version` returns `None` and this
         // falls back to the declared requirement text.
-        assert_eq!(item.current, "0.9");
+        assert_eq!(
+            item.current,
+            CurrentVersion::Declared(VersionReq::new("0.9"))
+        );
     }
 
     /// Issue #1578 gap 1: the mock-only `NoOpRewrite`/`UnsupportedRequirementShape` regression

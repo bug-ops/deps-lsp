@@ -205,7 +205,7 @@ pub fn update_to_document(
         .iter()
         .map(|item| UpdateItemDocument {
             name: crate::sanitize::sanitize_message_for_display(&item.name),
-            current: crate::sanitize::sanitize_message_for_display(&item.current),
+            current: crate::sanitize::sanitize_message_for_display(&item.current.render_text()),
             target: item.target.clone(),
             outcome: item.outcome.wire_token().to_string(),
             reason: item.reason(),
@@ -333,7 +333,9 @@ mod tests {
     fn update_item(outcome: crate::update::Outcome) -> crate::update::PlannedUpdateItem {
         crate::update::PlannedUpdateItem {
             name: "serde".to_string(),
-            current: "1.0.0".to_string(),
+            current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
+                "1.0.0",
+            )),
             target: "1.2.0".to_string(),
             outcome,
             advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],

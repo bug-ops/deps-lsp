@@ -222,7 +222,9 @@ fn applied_plan(range: Range, new_text: &str) -> UpdatePlan {
     UpdatePlan {
         items: vec![PlannedUpdateItem {
             name: "serde".to_string(),
-            current: "1.0.0".to_string(),
+            current: deps_cli::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
+                "1.0.0",
+            )),
             target: new_text.to_string(),
             outcome: Outcome::Applied(ManifestEdit {
                 range,

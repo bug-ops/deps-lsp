@@ -217,9 +217,13 @@ pub struct PlannedUpdate {
     /// The dependency name's span in the manifest source.
     pub name_range: crate::position::Range,
     /// The version this dependency is currently pinned to, when it could be resolved (see
-    /// [`collect_update_edits`]'s doc for exactly how) — empty when it could not be, which
-    /// [`crate::edit::classify_update`] always classifies [`UpdateKind::Unknown`].
-    pub current: String,
+    /// [`collect_update_edits`]'s doc for exactly how). `None` covers two distinct cases: a
+    /// genuinely unresolvable in-use version (`collect_update_candidates`) — a caller that
+    /// classifies it via [`classify_update`] gets [`UpdateKind::Unknown`] for this case, the
+    /// same as for any other string [`classify_update`] can't parse as a leading dotted-numeric
+    /// version — and [`plan_verified_fix`], which never attempts to resolve this field at all
+    /// and always leaves it `None` regardless of whether the in-use version is knowable.
+    pub current: Option<ConcreteVersion>,
     /// The version this edit would move the dependency to.
     pub target: ConcreteVersion,
     /// The edit itself.
@@ -883,23 +887,20 @@ pub fn collect_update_candidates(
         }
 
         // FR-003: per occurrence, never the collapsed per-name map — a renamed/aliased
-        // dependency (spec 050) must classify against its own resolved pin. `unwrap_or_default`
-        // (empty string) is the honest "unresolvable" value: `classify_update` always maps it
-        // to `UpdateKind::Unknown`.
-        let current = versions
-            .ecosystem
-            .and_then(|ecosystem| {
-                resolve_in_use_version(
-                    dep,
-                    &normalized_name,
-                    versions.resolved,
-                    versions.resolved_version_candidates,
-                    formatter,
-                    ecosystem,
-                )
-            })
-            .map(ConcreteVersion::into_string)
-            .unwrap_or_default();
+        // dependency (spec 050) must classify against its own resolved pin. `None` here means
+        // genuinely unresolvable (not, as for `plan_verified_fix`, simply never attempted) — a
+        // caller that classifies this field via `classify_update` gets `UpdateKind::Unknown`
+        // for it, since there is no version string to pass in.
+        let current = versions.ecosystem.and_then(|ecosystem| {
+            resolve_in_use_version(
+                dep,
+                &normalized_name,
+                versions.resolved,
+                versions.resolved_version_candidates,
+                formatter,
+                ecosystem,
+            )
+        });
 
         candidates.push(UpdateCandidate::Planned(PlannedUpdate {
             name,
@@ -1349,7 +1350,10 @@ pub fn plan_verified_fix(
         name: dep.name().as_str().to_string(),
         normalized_name,
         name_range: dep.name_range(),
-        current: current.to_string(),
+        // `current` here is the requirement text passed in for placeholder/no-op checks
+        // above, not a resolved pinned version — `PlannedUpdate::current` documents only the
+        // latter, so this caller has none to report.
+        current: None,
         target: ConcreteVersion::new(version_native),
         edit: ManifestEdit {
             range: version_range,
@@ -1612,8 +1616,8 @@ mod tests {
             planned.sort_by_key(|p| p.edit.range.start.line);
 
             assert_eq!(planned.len(), 2);
-            assert_eq!(planned[0].current, "0.9.15");
-            assert_eq!(planned[1].current, "1.0.219");
+            assert_eq!(planned[0].current, Some(ConcreteVersion::from("0.9.15")));
+            assert_eq!(planned[1].current, Some(ConcreteVersion::from("1.0.219")));
         }
 
         #[test]
@@ -1863,9 +1867,12 @@ mod tests {
             let UpdateCandidate::Planned(planned) = &candidates[0] else {
                 panic!("expected a planned update, got {:?}", candidates[0]);
             };
-            assert_eq!(planned.current, "v1.3.0");
+            assert_eq!(planned.current, Some(ConcreteVersion::from("v1.3.0")));
             assert_eq!(
-                classify_update(&planned.current, planned.target.as_str()),
+                classify_update(
+                    planned.current.as_ref().unwrap().as_str(),
+                    planned.target.as_str()
+                ),
                 UpdateKind::Minor
             );
         }

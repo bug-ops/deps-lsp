@@ -244,7 +244,9 @@ mod tests {
     fn update_item(outcome: Outcome) -> PlannedUpdateItem {
         PlannedUpdateItem {
             name: "serde".to_string(),
-            current: "1.0.0".to_string(),
+            current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
+                "1.0.0",
+            )),
             target: "1.2.0".to_string(),
             outcome,
             advisory_ids: Vec::new(),

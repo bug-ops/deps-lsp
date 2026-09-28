@@ -20,6 +20,7 @@
 //! still construct one; see `deps-core`'s own `test_util` module for the identical pattern
 //! this one was copied from.
 
+use deps_core::ConcreteVersion;
 use deps_core::Ecosystem;
 use deps_core::EcosystemId;
 use deps_core::LicenseSource;
@@ -132,14 +133,14 @@ impl ParseResult for StubParseResult {
 /// # Examples
 ///
 /// ```
-/// use deps_core::PackageName;
+/// use deps_core::{ConcreteVersion, PackageName};
 /// use deps_engine::classify::license::fetch_tier3_licenses;
 /// use deps_engine::test_util::TestTier3Ecosystem;
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
-///     let targets = vec![(PackageName::new("pkg"), "1.0.0".to_string())];
+///     let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("1.0.0"))];
 ///
 ///     let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
 ///
@@ -241,8 +242,8 @@ impl Ecosystem for TestTier3Ecosystem {
 
     fn fetch_license<'a>(
         &'a self,
-        _name: &'a str,
-        _version: &'a str,
+        _name: &'a PackageName,
+        _version: &'a ConcreteVersion,
     ) -> BoxFuture<'a, Vec<String>> {
         match &self.fetch_license_result {
             FetchLicenseBehavior::Returns(license) => {

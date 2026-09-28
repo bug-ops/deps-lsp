@@ -175,7 +175,10 @@ impl TierThreeLicenseFetch {
 ///     EcosystemId::Dart,
 /// );
 ///
-/// assert_eq!(targets, vec![(PackageName::new("dep-0"), "1.0.0".to_string())]);
+/// assert_eq!(
+///     targets,
+///     vec![(PackageName::new("dep-0"), ConcreteVersion::from("1.0.0"))]
+/// );
 /// ```
 pub fn tier3_license_targets(
     parse_result: &dyn deps_core::ParseResult,
@@ -183,7 +186,7 @@ pub fn tier3_license_targets(
     resolved_version_candidates: &HashMap<PackageName, Vec<ConcreteVersion>>,
     formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
     ecosystem_id: EcosystemId,
-) -> Vec<(PackageName, String)> {
+) -> Vec<(PackageName, ConcreteVersion)> {
     let mut seen = std::collections::HashSet::new();
     parse_result
         .dependencies()
@@ -199,7 +202,7 @@ pub fn tier3_license_targets(
                 formatter,
                 ecosystem_id,
             )?;
-            Some((d.name().clone(), version.into_string()))
+            Some((d.name().clone(), version))
         })
         .filter(|target| seen.insert(target.clone()))
         .collect()
@@ -318,14 +321,14 @@ pub async fn prefetch_tier3_licenses(
 /// # Examples
 ///
 /// ```
-/// use deps_core::PackageName;
+/// use deps_core::{ConcreteVersion, PackageName};
 /// use deps_engine::classify::license::fetch_tier3_licenses;
 /// use deps_engine::test_util::TestTier3Ecosystem;
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let ecosystem = TestTier3Ecosystem::returning(vec!["MIT".to_string()]);
-///     let targets = vec![(PackageName::new("pkg"), "1.0.0".to_string())];
+///     let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("1.0.0"))];
 ///
 ///     let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
 ///
@@ -337,7 +340,7 @@ pub async fn prefetch_tier3_licenses(
 /// ```
 pub async fn fetch_tier3_licenses(
     ecosystem: &dyn Ecosystem,
-    targets: Vec<(PackageName, String)>,
+    targets: Vec<(PackageName, ConcreteVersion)>,
     fetch_timeout_secs: u64,
     concurrency: usize,
 ) -> TierThreeLicenseFetch {
@@ -361,7 +364,7 @@ pub async fn fetch_tier3_licenses(
             let mut timed_out = false;
             let found = tokio::time::timeout(
                 timeout_duration,
-                ecosystem.fetch_license(name.as_str(), &version),
+                ecosystem.fetch_license(&name, &version),
             )
             .await
             .unwrap_or_else(|_| {
@@ -479,7 +482,10 @@ mod tests {
 
         assert_eq!(
             targets,
-            vec![(PackageName::new("collection"), "1.18.0".to_string())]
+            vec![(
+                PackageName::new("collection"),
+                ConcreteVersion::from("1.18.0")
+            )]
         );
     }
 
@@ -574,7 +580,7 @@ mod tests {
 
         assert_eq!(
             targets,
-            vec![(PackageName::new("okhttp"), "4.12.0".to_string())]
+            vec![(PackageName::new("okhttp"), ConcreteVersion::from("4.12.0"))]
         );
     }
 
@@ -601,8 +607,8 @@ mod tests {
         assert_eq!(
             targets,
             vec![
-                (PackageName::new("okhttp"), "4.12.0".to_string()),
-                (PackageName::new("okhttp"), "4.11.0".to_string()),
+                (PackageName::new("okhttp"), ConcreteVersion::from("4.12.0")),
+                (PackageName::new("okhttp"), ConcreteVersion::from("4.11.0")),
             ]
         );
     }
@@ -737,7 +743,10 @@ mod tests {
     #[tokio::test]
     async fn fetch_tier3_licenses_filters_out_empty_results() {
         let ecosystem = TestTier3Ecosystem::returning(vec![]);
-        let targets = vec![(PackageName::new("no-license-found"), "1.0.0".to_string())];
+        let targets = vec![(
+            PackageName::new("no-license-found"),
+            ConcreteVersion::from("1.0.0"),
+        )];
 
         let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
 
@@ -752,7 +761,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_tier3_licenses_dispatches_and_keeps_non_empty_results() {
         let ecosystem = TestTier3Ecosystem::returning(vec!["Apache-2.0".to_string()]);
-        let targets = vec![(PackageName::new("pkg"), "2.0.0".to_string())];
+        let targets = vec![(PackageName::new("pkg"), ConcreteVersion::from("2.0.0"))];
 
         let result = fetch_tier3_licenses(&ecosystem, targets, 10, 4).await;
 
@@ -775,7 +784,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn fetch_tier3_licenses_timeout_is_clamped_to_floor_and_counted() {
         let ecosystem = TestTier3Ecosystem::pending();
-        let targets = vec![(PackageName::new("unreachable-pkg"), "1.0.0".to_string())];
+        let targets = vec![(
+            PackageName::new("unreachable-pkg"),
+            ConcreteVersion::from("1.0.0"),
+        )];
 
         let mut fut = Box::pin(fetch_tier3_licenses(&ecosystem, targets, 1, 4));
 
@@ -848,8 +860,8 @@ mod tests {
             }
             fn fetch_license<'a>(
                 &'a self,
-                _name: &'a str,
-                _version: &'a str,
+                _name: &'a PackageName,
+                _version: &'a ConcreteVersion,
             ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
                 let current = Arc::clone(&self.current);
                 let max_seen = Arc::clone(&self.max_seen);
@@ -876,7 +888,12 @@ mod tests {
             max_seen: Arc::clone(&max_seen),
         };
         let targets: Vec<_> = (0..10)
-            .map(|i| (PackageName::new(format!("pkg-{i}")), "1.0.0".to_string()))
+            .map(|i| {
+                (
+                    PackageName::new(format!("pkg-{i}")),
+                    ConcreteVersion::from("1.0.0"),
+                )
+            })
             .collect();
 
         fetch_tier3_licenses(&ecosystem, targets, 10, 3).await;

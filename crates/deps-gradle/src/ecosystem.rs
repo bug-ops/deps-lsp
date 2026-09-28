@@ -307,13 +307,13 @@ impl Ecosystem for GradleEcosystem {
     /// #660/#688/#692). See `crate::license::fetch_license`.
     fn fetch_license<'a>(
         &'a self,
-        name: &'a str,
-        version: &'a str,
+        name: &'a deps_core::PackageName,
+        version: &'a deps_core::ConcreteVersion,
     ) -> deps_core::ecosystem::BoxFuture<'a, Vec<String>> {
         Box::pin(crate::license::fetch_license(
             &self.http_cache,
-            name,
-            version,
+            name.as_str(),
+            version.as_str(),
         ))
     }
 
