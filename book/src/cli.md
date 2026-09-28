@@ -111,7 +111,9 @@ subcommands. Paths default to the current directory when none are given to `chec
   ```
 
   `schema_version` is bumped, and the bump documented as `Breaking` in `CHANGELOG.md`,
-  whenever a field is renamed or removed (adding a new optional field is not itself a bump).
+  whenever a field is renamed, removed, or its wire type/nullability changes (e.g. a
+  sentinel value like `""` becoming `null`); adding a new optional field is not itself
+  a bump.
   Note that the JSON schema does **not** carry a finding's OSV advisory id or its
   `https://osv.dev/vulnerability/{id}` link — only `sarif` output does (see below). If your
   tooling needs the advisory id/URL for a vulnerability finding, parse `sarif` output instead
