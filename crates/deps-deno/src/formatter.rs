@@ -311,6 +311,23 @@ mod tests {
         assert_eq!(matcher.matches(&ConcreteVersion::new("2.0.0")), Some(false));
     }
 
+    /// #1630: `DenoFormatter::compile_requirement` delegates entirely to
+    /// `deps_npm::compile_node_semver_range`, so it must inherit that fix's panic safety for
+    /// a tilde-wildcard requirement (`~*`/`~x`/`~X`) that used to hit `node_semver`'s internal
+    /// `unreachable!()` instead of returning `Err`.
+    #[test]
+    fn test_compile_requirement_tilde_wildcard_does_not_panic() {
+        let formatter = DenoFormatter;
+        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+            assert!(
+                formatter
+                    .compile_requirement(&VersionReq::new(requirement))
+                    .is_none(),
+                "requirement {requirement:?} must not panic and must resolve to None"
+            );
+        }
+    }
+
     #[test]
     fn test_compile_requirement_dist_tag_returns_none() {
         // M6: dist-tags like `npm:react@latest` fail `node_semver::Range::parse`, so

@@ -573,7 +573,7 @@ impl NpmRegistry {
         }
 
         // Parse npm semver requirement
-        let req = node_semver::Range::parse(req_str)
+        let req = crate::formatter::parse_range_safe(req_str)
             .map_err(|e| DepsError::InvalidVersionReq(e.to_string()))?;
 
         Ok(versions.into_iter().find(|v| {
@@ -915,7 +915,7 @@ impl deps_core::Registry for NpmRegistry {
         if deps_core::lsp_helpers::requirement_len_exceeds_cap(req_str) {
             return None;
         }
-        let parsed_req = node_semver::Range::parse(req_str).ok()?;
+        let parsed_req = crate::formatter::parse_range_safe(req_str).ok()?;
         versions.iter().position(|v| {
             node_semver::Version::parse(v.version_string()).is_ok_and(|ver| {
                 parsed_req.satisfies(&ver) && !v.removal_status().blocks_resolution()
@@ -1586,6 +1586,36 @@ mod tests {
         );
     }
 
+    /// #1630: `~*` (and its `~x`/`~X` aliases) used to hit an internal `unreachable!()` in
+    /// `node_semver` 2.2.0 rather than returning `Err`, crashing this hot request-handling
+    /// path (hover/completion/diagnostics all resolve through `select_latest_matching`).
+    /// Asserts the panic is now caught and folds into the same `None` an ordinary
+    /// unparseable requirement already produces.
+    #[test]
+    fn test_select_latest_matching_tilde_wildcard_does_not_panic() {
+        use deps_core::{Registry, VersionReq};
+
+        let cache = Arc::new(HttpCache::new());
+        let registry = NpmRegistry::new(cache);
+        let versions: Vec<Box<dyn deps_core::Version>> = vec![Box::new(NpmVersion {
+            version: "1.0.0".into(),
+            deprecation: NpmDeprecation::Active,
+            published_at: None,
+        })];
+        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+            let req = VersionReq::new(requirement);
+            assert_eq!(
+                registry.select_latest_matching(
+                    &versions,
+                    &req,
+                    &deps_core::SelectionContext::none()
+                ),
+                None,
+                "requirement {requirement:?} must not panic and must resolve to None"
+            );
+        }
+    }
+
     /// B2: `get_latest_matching`'s wildcard branch must agree with
     /// `select_latest_matching`'s on the same prerelease-at-front shape.
     #[tokio::test]
@@ -1649,6 +1679,36 @@ mod tests {
             "message must not embed the raw oversized value: {message}"
         );
         mock.assert_async().await;
+    }
+
+    /// #1630: a `~*`-shaped requirement used to panic `node_semver::Range::parse` instead
+    /// of returning `Err`, crashing the request handler on the main thread (DoS from an
+    /// untrusted `package.json`). Now caught and folded into the same `Err` path an
+    /// ordinary unparseable requirement already takes.
+    #[tokio::test]
+    async fn test_get_latest_matching_tilde_wildcard_does_not_panic() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
+
+        server
+            .mock("GET", "/left-pad")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(r#"{"versions": {"1.3.0": {}}}"#)
+            .create_async()
+            .await;
+
+        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+            let err = registry
+                .get_latest_matching("left-pad", requirement)
+                .await
+                .expect_err("tilde-wildcard requirement must not panic and must be rejected");
+            assert!(
+                matches!(err, DepsError::InvalidVersionReq(_)),
+                "requirement {requirement:?} produced unexpected error: {err:?}"
+            );
+        }
     }
 
     /// The cap is exclusive: a requirement of exactly `MAX_REQUIREMENT_LEN` bytes must still
