@@ -617,6 +617,12 @@ mod tests {
     use super::*;
     use crate::document::DocumentState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    #[cfg(any(
+        feature = "cargo",
+        feature = "pypi",
+        feature = "maven",
+        feature = "composer"
+    ))]
     use deps_core::ConcreteVersion;
     use tower_lsp_server::ls_types::{
         CompletionItemKind, Position, TextDocumentIdentifier, TextDocumentPositionParams,

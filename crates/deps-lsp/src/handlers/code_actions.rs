@@ -229,6 +229,7 @@ mod tests {
     use super::*;
     use crate::document::ServerState;
     use crate::test_utils::test_helpers::create_test_client_and_config;
+    #[cfg(any(feature = "cargo", feature = "swift"))]
     use deps_core::ConcreteVersion;
     #[cfg(any(feature = "cargo", feature = "npm", feature = "swift"))]
     use deps_core::EcosystemId;
