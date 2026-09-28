@@ -54,6 +54,12 @@ const GITLAB_CI_UNRESOLVED_HOST_CODE: &str = "unresolved-gitlab-host";
 /// per spec 062 `tasks.md` T020, rather than silently dropping findings this crate cannot
 /// classify.
 ///
+/// `Serialize`/`Deserialize` (#1626, manual impls below [`Self::as_str`]) produce/accept the
+/// exact same tokens as [`Self::as_str`] — used directly as
+/// `crate::format::json::FindingDocument::category` and as the
+/// `crate::format::json::ReportDocument::summary` map key, so the JSON wire format never
+/// stringly-types this closed set.
+///
 /// # Examples
 ///
 /// ```
@@ -146,6 +152,50 @@ impl Category {
 impl std::fmt::Display for Category {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+// Manual `Serialize`/`Deserialize` (#1626), not `#[derive(Serialize)]` +
+// `#[serde(rename_all = ...)]`: the derived unit-variant `Serialize` impl
+// (`serialize_unit_variant`) was empirically reproduced to make
+// `insta::assert_json_snapshot!` panic ("cannot serialize maps without string keys to JSON")
+// when this type was used as a raw `BTreeMap` key. `ReportDocument::summary` now serializes
+// through its own `serialize_with` (`serialize_summary_lexicographically`) instead of relying
+// on this impl for its keys, but this `serialize_str` impl is kept so `Category` still reads
+// as a plain string in every other context (the `FindingDocument::category` field, and
+// `summary`'s `Deserialize` side).
+impl serde::Serialize for Category {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Category {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let token = String::deserialize(deserializer)?;
+        match token.as_str() {
+            "outdated" => Ok(Self::Outdated),
+            "yanked" => Ok(Self::Yanked),
+            "vulnerable" => Ok(Self::Vulnerable),
+            "unsatisfiable" => Ok(Self::Unsatisfiable),
+            "mutable-ref" => Ok(Self::MutableRefPin),
+            "license" => Ok(Self::License),
+            "deprecated" => Ok(Self::Deprecated),
+            "other" => Ok(Self::Other),
+            other => Err(serde::de::Error::unknown_variant(
+                other,
+                &[
+                    "outdated",
+                    "yanked",
+                    "vulnerable",
+                    "unsatisfiable",
+                    "mutable-ref",
+                    "license",
+                    "deprecated",
+                    "other",
+                ],
+            )),
+        }
     }
 }
 
@@ -701,6 +751,36 @@ mod tests {
         assert_eq!(Category::License.as_str(), "license");
         assert_eq!(Category::Deprecated.as_str(), "deprecated");
         assert_eq!(Category::Other.as_str(), "other");
+    }
+
+    /// #1626: `Serialize` must emit the same tokens as [`Category::as_str`], byte-identical
+    /// (quoted JSON strings), for every variant — including `MutableRefPin`'s explicit rename.
+    #[test]
+    fn test_category_serialize_matches_as_str_tokens() {
+        for category in [
+            Category::Outdated,
+            Category::Yanked,
+            Category::Vulnerable,
+            Category::Unsatisfiable,
+            Category::MutableRefPin,
+            Category::License,
+            Category::Deprecated,
+            Category::Other,
+        ] {
+            let json = serde_json::to_string(&category).expect("Category must serialize");
+            assert_eq!(json, format!("\"{}\"", category.as_str()));
+            let parsed: Category = serde_json::from_str(&json).expect("must round-trip");
+            assert_eq!(parsed, category);
+        }
+    }
+
+    /// #1626 tester gap 1: an unrecognized `category` token must be a hard deserialize error
+    /// (the `unknown_variant` arm of `Category`'s manual `Deserialize` impl above), not
+    /// silently accepted or defaulted to [`Category::Other`].
+    #[test]
+    fn test_category_deserialize_rejects_unknown_token() {
+        let result: Result<Category, _> = serde_json::from_str("\"not-a-real-category\"");
+        assert!(result.is_err());
     }
 
     #[test]
