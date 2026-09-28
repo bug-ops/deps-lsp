@@ -37,7 +37,7 @@ pub struct PinNoun {
 /// - it declares a non-empty version requirement that [`crate::edit::requirement_is_placeholder_for`]
 ///   does not consider an unexpanded placeholder (#1370 central gate);
 /// - the formatter's
-///   [`requirement_status_for`](crate::lsp_helpers::RequirementResolution::requirement_status_for)
+///   [`requirement_status_for`](crate::lsp_helpers::RequirementStatusGate::requirement_status_for)
 ///   reports the declared requirement as [`Outdated`](crate::lsp_helpers::RequirementStatus::Outdated)
 ///   — the same predicate the diagnostics pipeline's outdated rule calls, though that rule
 ///   also gates on `formatter.can_resolve_source`, which this planner does not check, so the

@@ -2,9 +2,9 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementResolution, RequirementStatus, SourcePolicy, TagIndex, match_v_prefix_style,
-    requirement_contains_template_placeholder, requirement_is_oversized, warn_rejected_value,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementResolution, RequirementStatus, SourcePolicy, TagIndex,
+    match_v_prefix_style, requirement_contains_template_placeholder, warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -205,7 +205,7 @@ impl RequirementResolution for GitlabCiFormatter {
     ///
     /// Text-only, so ambiguous for a shape shared between grammars (#466 review M-c) — a
     /// caller that already has the dependency in hand should call
-    /// [`Self::requirement_status_for`] instead, which consults its authoritative
+    /// [`Self::classify_requirement_status_for`] instead, which consults its authoritative
     /// [`crate::types::PinStyle`] rather than re-guessing from text.
     fn requirement_is_unresolved(&self, requirement: &VersionReq) -> bool {
         matches!(
@@ -236,8 +236,8 @@ impl RequirementResolution for GitlabCiFormatter {
     /// does not consult that first, e.g. the "Update N outdated" code lens).
     ///
     /// Text-only, so ambiguous for a shape shared between grammars — see
-    /// [`Self::requirement_status_for`]'s doc for the dependency-aware alternative a caller
-    /// holding the dependency should prefer.
+    /// [`Self::classify_requirement_status_for`]'s doc for the dependency-aware alternative a
+    /// caller holding the dependency should prefer.
     fn is_requirement_up_to_date(
         &self,
         requirement: &VersionReq,
@@ -263,24 +263,23 @@ impl RequirementResolution for GitlabCiFormatter {
     /// itself, while the code action offered by `format_version_replacing_for`'s correct
     /// `Branch` classification still treated it as a normal, bumpable pin).
     ///
-    /// #1631: this override bypasses [`RequirementResolution::requirement_status`]'s shared
-    /// default entirely, so its own `requirement_is_oversized` gate never ran here — gated
-    /// first, before the `PinStyle` lookup, same `Unresolved` semantics as the shared default.
-    fn requirement_status_for(
+    /// #1648: this override bypasses [`RequirementResolution::classify_requirement_status`]'s
+    /// shared default entirely, but no longer needs its own `requirement_is_oversized` gate —
+    /// [`RequirementStatusGate::requirement_status_for`](deps_core::lsp_helpers::RequirementStatusGate::requirement_status_for),
+    /// the only production entry point, already rejects an oversized requirement via
+    /// [`BoundedVersionReq`] before this override is ever called.
+    fn classify_requirement_status_for(
         &self,
         dep: &dyn Dependency,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        if requirement_is_oversized(requirement) {
-            return RequirementStatus::Unresolved;
-        }
         let Some(pin) = dep
             .as_any()
             .downcast_ref::<GitlabCiDependency>()
             .and_then(|gl_dep| gl_dep.pin.as_ref())
         else {
-            return self.requirement_status(requirement, latest);
+            return self.classify_requirement_status(requirement, latest);
         };
         status_for_pin(pin, requirement.as_str(), latest.as_str())
     }
@@ -437,6 +436,7 @@ impl OsvNaming for GitlabCiFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementStatusGate;
     use deps_core::position::{Position, Range};
 
     fn formatter() -> GitlabCiFormatter {
@@ -750,13 +750,15 @@ mod tests {
         );
     }
 
-    /// #1631 regression: `requirement_status_for` must gate on `requirement_is_oversized`
-    /// before consulting `dep.pin`, matching the shared default's semantics
-    /// (`deps_core::lsp_helpers::formatter::requirement_status`). A `Tag` pin whose
-    /// requirement text differs from `latest` would otherwise reach `status_for_pin`'s
-    /// `normalize_tag` comparison and report `Outdated` — the sanity assertion below proves
-    /// that is what `status_for_pin` (the un-gated helper `requirement_status_for` calls
-    /// into) still does on its own, so the gate is what changes the outcome.
+    /// #1631/#1648 regression: `requirement_status_for` must report `Unresolved` for an
+    /// oversized requirement before ever consulting `dep.pin` — this override no longer needs
+    /// its own gate for that (see [`GitlabCiFormatter::classify_requirement_status_for`]'s doc):
+    /// [`RequirementStatusGate::requirement_status_for`] rejects it structurally via
+    /// [`BoundedVersionReq`] first. A `Tag` pin whose requirement text differs from `latest`
+    /// would otherwise reach `status_for_pin`'s `normalize_tag` comparison and report
+    /// `Outdated` — the sanity assertion below proves that is what `status_for_pin` (the
+    /// un-gated helper `classify_requirement_status_for` calls into) still does on its own, so
+    /// the gate is what changes the outcome.
     #[test]
     fn test_requirement_status_for_oversized_requirement_is_unresolved() {
         let fmt = formatter();
