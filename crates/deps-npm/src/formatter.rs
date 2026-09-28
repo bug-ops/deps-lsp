@@ -253,21 +253,46 @@ pub fn parse_range_safe(requirement: &str) -> Result<node_semver::Range, RangePa
         })
         .collect();
 
+    let rewrite_branch = |branch: &[(Cow<'_, str>, Option<TokenShape>)]| -> String {
+        branch
+            .iter()
+            .map(|(token, shape)| match shape {
+                Some(TokenShape::Unresolvable) => "*".to_string(),
+                Some(TokenShape::TildeWildcardPatch { major }) => format!("~{major}.x"),
+                None => token.as_ref().to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+
     let needs_rewrite = branches.iter().flatten().any(|(_, shape)| shape.is_some());
+
+    // npm requires every `||`-branch to be independently valid — a wildcard branch
+    // (rewritten to `*`) doesn't get a free pass for its siblings. `node_semver`'s own
+    // combined-string parse doesn't always enforce this (observed to silently tolerate a
+    // malformed branch once an already-matches-everything `*` branch is present), so each
+    // rewritten branch is validated on its own before trusting the combined result.
+    if needs_rewrite && branches.len() > 1 {
+        for branch in &branches {
+            let branch_str = rewrite_branch(branch);
+            match std::panic::catch_unwind(|| node_semver::Range::parse(&branch_str)) {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => return Err(RangeParseError::from(e)),
+                Err(_) => {
+                    tracing::warn!(
+                        requirement,
+                        "node_semver panicked parsing a range branch, treating it as unparseable (#1630)"
+                    );
+                    return Err(RangeParseError::Panicked);
+                }
+            }
+        }
+    }
+
     let rewritten = needs_rewrite.then(|| {
         branches
             .iter()
-            .map(|branch| {
-                branch
-                    .iter()
-                    .map(|(token, shape)| match shape {
-                        Some(TokenShape::Unresolvable) => "*".to_string(),
-                        Some(TokenShape::TildeWildcardPatch { major }) => format!("~{major}.x"),
-                        None => token.as_ref().to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
+            .map(|branch| rewrite_branch(branch))
             .collect::<Vec<_>>()
             .join(" || ")
     });
@@ -858,6 +883,21 @@ mod tests {
     /// "any version" — live-verified against npm's own `semver` package — and must stay
     /// `Panicked` (`node_semver`'s equals `unreachable!()` site, `range.rs:782`, fires
     /// regardless of the trailing components, same as the tilde site at `range.rs:982`).
+    /// npm requires every `||`-branch to be independently valid — a wildcard-resolving branch
+    /// (`~*`) doesn't give its sibling branch a free pass, unlike `node_semver`'s own combined
+    /// parse (observed to silently tolerate `"* || not-a-version"`, treating the whole range as
+    /// `Ok`, when parsed as one joined string — the reason [`parse_range_safe`] validates each
+    /// rewritten branch on its own instead of trusting the joined re-parse alone).
+    #[test]
+    fn test_parse_range_safe_or_branch_must_independently_parse() {
+        assert!(parse_range_safe("~* || not-a-version").is_err());
+        assert!(parse_range_safe("~* || ^1.0.0").is_ok());
+        // #1646/#1650's `~1.x.3` precise rewrite composes with #1639's wildcard-major rule:
+        // a branch that resolves precisely (not "any version") still lets its `~x` sibling
+        // widen the whole OR to "any version".
+        assert!(parse_range_safe("~1.x.3 || ~x").is_ok());
+    }
+
     #[test]
     fn test_parse_range_safe_wildcard_major_resolves_to_any_version() {
         for requirement in ["~*", "~x", "~X", "~>*", "~>x.2.3", "=*", "=x", "=X"] {
