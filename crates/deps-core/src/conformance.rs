@@ -924,7 +924,7 @@ pub async fn assert_unresolved_requirements_never_rewritten(
             );
             let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
                 .with_fix_target_status(UpgradeStatus::CandidateClean {
-                    version: native.to_string(),
+                    version: native.clone(),
                 });
 
             let planned = crate::edit::plan_vulnerability_fix(

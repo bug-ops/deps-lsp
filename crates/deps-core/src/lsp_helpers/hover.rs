@@ -1229,7 +1229,7 @@ fn push_vulnerability_hover_section(
                 && candidate_vulnerable_line_should_render(advisory_ids, dv.advisories.items())
             {
                 markdown.push_static("\n\u{26a0}\u{fe0f} Latest version ");
-                markdown.push_code(version, FieldKind::Version);
+                markdown.push_code(version.as_str(), FieldKind::Version);
                 markdown.push_static(" is also affected.\n");
             }
 
@@ -5296,7 +5296,7 @@ mod tests {
 
         let dv = DependencyVulnerabilities::new(Capped::new(vec![Arc::new(advisory)], 1));
         let latest = UpgradeStatus::CandidateVulnerable {
-            version: "V".repeat(500),
+            version: ConcreteVersion::new("V".repeat(500)),
             advisory_ids: Capped::new(vec!["RUSTSEC-2020-0071".to_string()], 1),
             worst_severity: Some(VulnSeverity::High),
         };
@@ -5535,7 +5535,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("yaml-rust"),
             UpgradeStatus::CandidateVulnerable {
-                version: "0.5.0".to_string(),
+                version: ConcreteVersion::new("0.5.0"),
                 advisory_ids: Capped::new(vec!["RUSTSEC-2024-0320".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Informational),
             },
@@ -5598,7 +5598,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("mixed-pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "2.0.0".to_string(),
+                version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(
                     vec![
                         "RUSTSEC-2024-0320".to_string(),

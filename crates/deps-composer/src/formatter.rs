@@ -3042,7 +3042,7 @@ mod tests {
         );
         DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
             UpgradeStatus::CandidateClean {
-                version: fixed_version.to_string(),
+                version: ConcreteVersion::new(fixed_version),
             },
         )
     }

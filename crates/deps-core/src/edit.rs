@@ -1073,7 +1073,9 @@ pub(crate) fn fix_target_is_verified(
                 .iter()
                 .all(|id| known_ids.contains(id.as_str()) && !fix.advisory_ids.contains(id))
         }
-        UpgradeStatus::NotChecked | UpgradeStatus::CandidateUnverified { .. } => false,
+        UpgradeStatus::NotChecked
+        | UpgradeStatus::CandidateUnverified { .. }
+        | UpgradeStatus::StructurallyUnchecked(_) => false,
     }
 }
 
@@ -1146,7 +1148,7 @@ pub(crate) fn fix_target_is_verified(
 /// );
 ///
 /// let verified = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
-///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: "1.2.0".to_string() });
+///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: ConcreteVersion::new("1.2.0") });
 /// assert!(resolve_verified_fix(&verified, None, &MockFormatter).is_ok());
 /// ```
 pub fn resolve_verified_fix(
@@ -1266,7 +1268,7 @@ pub fn resolve_verified_fix(
 ///     .with_fixed_versions(vec![OsvVersion::new("1.2.0")]),
 /// );
 /// let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1))
-///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: "1.2.0".to_string() });
+///     .with_fix_target_status(UpgradeStatus::CandidateClean { version: ConcreteVersion::new("1.2.0") });
 ///
 /// let planned =
 ///     plan_vulnerability_fix(&dep, dep.version_range, "1.0.0", &dv, None, &MockFormatter);
@@ -1667,7 +1669,7 @@ mod tests {
             latest_status.insert(
                 crate::test_util::vuln_key("feed-widget-helper"),
                 crate::osv::UpgradeStatus::CandidateVulnerable {
-                    version: "1.0.8".to_string(),
+                    version: ConcreteVersion::new("1.0.8"),
                     advisory_ids: crate::osv::Capped::new(vec!["MAL-2026-16332".to_string()], 1),
                     worst_severity: Some(crate::osv::VulnSeverity::Malicious),
                 },
@@ -1917,7 +1919,7 @@ mod tests {
             );
             DependencyVulnerabilities::new(Capped::new(vec![advisory], 1)).with_fix_target_status(
                 UpgradeStatus::CandidateClean {
-                    version: fixed_version.to_string(),
+                    version: ConcreteVersion::new(fixed_version),
                 },
             )
         }
@@ -2106,7 +2108,7 @@ mod tests {
             let total = advisories.len();
             let dv = DependencyVulnerabilities::new(Capped::new(advisories, total))
                 .with_fix_target_status(UpgradeStatus::CandidateClean {
-                    version: "2.0.0".to_string(),
+                    version: ConcreteVersion::new("2.0.0"),
                 });
 
             let d = dep("serde", "0.9", range(0, 8, 0, 11));

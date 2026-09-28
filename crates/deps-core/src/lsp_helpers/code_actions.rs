@@ -742,7 +742,7 @@ mod tests {
     use crate::lsp_helpers::test_support_lsp::*;
     use crate::lsp_helpers::*;
     use crate::position::{Position, Range};
-    use crate::{Dependency, PackageName, VersionReq};
+    use crate::{ConcreteVersion, Dependency, PackageName, VersionReq};
     use std::any::Any;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -788,7 +788,7 @@ mod tests {
                     2,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                 },
             }),
         );
@@ -884,7 +884,7 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(advisories, total),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "2.0.0".to_string(),
+                    version: ConcreteVersion::new("2.0.0"),
                 },
             }),
         );
@@ -971,7 +971,7 @@ mod tests {
             ScanOutcome::Vulnerable(DependencyVulnerabilities {
                 advisories: Capped::new(advisories, total),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "2.0.0".to_string(),
+                    version: ConcreteVersion::new("2.0.0"),
                 },
             }),
         );
@@ -1054,7 +1054,7 @@ mod tests {
                     2,
                 ),
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                     advisory_ids: Capped::new(vec!["A1".to_string()], 1),
                     worst_severity: Some(VulnSeverity::High),
                 },
@@ -1064,7 +1064,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "3.0.0".to_string(),
+                version: ConcreteVersion::new("3.0.0"),
                 advisory_ids: Capped::new(vec!["A1".to_string()], 1),
                 worst_severity: Some(VulnSeverity::High),
             },
@@ -1136,7 +1136,7 @@ mod tests {
                     2,
                 ),
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                     advisory_ids: Capped::new(vec!["A1".to_string()], 1),
                     worst_severity: Some(VulnSeverity::High),
                 },
@@ -1199,7 +1199,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                     advisory_ids: Capped::new(vec!["A2".to_string()], 1),
                     worst_severity: Some(VulnSeverity::High),
                 },
@@ -1266,7 +1266,7 @@ mod tests {
                 // excludes it), yet the live check of F=1.2.0 reports A1 itself still
                 // applies — a claim the verification actually contradicts.
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                     advisory_ids: Capped::new(vec!["A1".to_string()], 1),
                     worst_severity: Some(VulnSeverity::High),
                 },
@@ -1344,7 +1344,7 @@ mod tests {
                 // affecting F; the second one was truncated out of `advisory_ids` and could be
                 // anything, including the still-applying A1 itself.
                 fix_target_status: UpgradeStatus::CandidateVulnerable {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                     advisory_ids: Capped::new(vec!["A2".to_string()], 2),
                     worst_severity: Some(VulnSeverity::High),
                 },
@@ -1459,7 +1459,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "2.0.0".to_string(),
+                    version: ConcreteVersion::new("2.0.0"),
                 },
             }),
         );
@@ -1850,7 +1850,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "2.17.1".to_string(),
+                    version: ConcreteVersion::new("2.17.1"),
                 },
             }),
         );
@@ -1930,7 +1930,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "1.2.5".to_string(),
+                    version: ConcreteVersion::new("1.2.5"),
                 },
             }),
         );
@@ -2055,7 +2055,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "1.0.2".to_string(),
+                    version: ConcreteVersion::new("1.0.2"),
                 },
             }),
         );
@@ -2117,7 +2117,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                 },
             }),
         );
@@ -2182,7 +2182,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                 },
             }),
         );
@@ -2249,7 +2249,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "1.2.0".to_string(),
+                    version: ConcreteVersion::new("1.2.0"),
                 },
             }),
         );
@@ -2376,7 +2376,7 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateVulnerable {
-                version: "2.0.0".to_string(),
+                version: ConcreteVersion::new("2.0.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00001".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
@@ -2424,7 +2424,8 @@ mod tests {
     #[tokio::test]
     async fn test_generate_code_actions_omits_flagged_intermediate_candidate_refactor() {
         use crate::osv::{
-            CandidateStatusMap, Capped, LatestStatusMap, UpgradeStatus, VulnSeverity,
+            CandidateStatusMap, CandidateStatuses, Capped, LatestStatusMap, UpgradeStatus,
+            VulnSeverity,
         };
 
         let (dep, version_range, content) = vulnerable_dep("1.0.0");
@@ -2439,20 +2440,23 @@ mod tests {
         latest_status.insert(
             crate::test_util::vuln_key("pkg"),
             UpgradeStatus::CandidateClean {
-                version: "2.0.0".to_string(),
+                version: ConcreteVersion::new("2.0.0"),
             },
         );
         let mut candidate_status = CandidateStatusMap::new();
         let mut per_version = HashMap::new();
         per_version.insert(
-            "1.5.0".to_string(),
+            ConcreteVersion::new("1.5.0"),
             UpgradeStatus::CandidateVulnerable {
-                version: "1.5.0".to_string(),
+                version: ConcreteVersion::new("1.5.0"),
                 advisory_ids: Capped::new(vec!["MAL-2026-00002".to_string()], 1),
                 worst_severity: Some(VulnSeverity::Malicious),
             },
         );
-        candidate_status.insert(crate::test_util::vuln_key("pkg"), per_version);
+        candidate_status.insert(
+            crate::test_util::vuln_key("pkg"),
+            CandidateStatuses::PerVersion(per_version),
+        );
 
         let versions = VersionData::new(&cached, &resolved)
             .with_latest_status(&latest_status)
@@ -2742,7 +2746,7 @@ mod tests {
                     1,
                 ),
                 fix_target_status: UpgradeStatus::CandidateClean {
-                    version: "1.0.2".to_string(),
+                    version: ConcreteVersion::new("1.0.2"),
                 },
             }),
         );
@@ -3716,7 +3720,7 @@ mod tests {
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {
-                        version: "5.5.5".to_string(),
+                        version: ConcreteVersion::new("5.5.5"),
                     },
                 }),
             );
@@ -3799,7 +3803,7 @@ mod tests {
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {
-                        version: "9.9.9".to_string(),
+                        version: ConcreteVersion::new("9.9.9"),
                     },
                 }),
             );
@@ -3862,7 +3866,7 @@ mod tests {
                         1,
                     ),
                     fix_target_status: UpgradeStatus::CandidateClean {
-                        version: "9.9.5".to_string(),
+                        version: ConcreteVersion::new("9.9.5"),
                     },
                 }),
             );
