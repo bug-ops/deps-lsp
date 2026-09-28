@@ -21,9 +21,11 @@ entry is resolved against **Packagist**'s metadata API
 license, and (if the maintainer flagged the package) an "abandoned" notice. Completion queries
 Packagist's `packagist.org/search.json` endpoint. Version constraints use Composer's own
 syntax — caret (`^7.0`, compatible up to the next major), tilde (`~3.5`, compatible up to the
-next minor), exact pins, and wildcards — compared with the stability-aware ordering described
-below. When a `composer.lock` exists alongside the manifest, it is read to resolve each
-dependency's actual in-use (installed) version, shown alongside the declared constraint.
+next minor), exact pins, wildcards, hyphenated ranges (`1.0 - 2.0`, equivalent to
+`>=1.0.0 <2.1.0`), and OR-separated alternatives (`1.0 || 2.0`, or the equivalent single-pipe
+`1.0 | 2.0`) — compared with the stability-aware ordering described below. When a
+`composer.lock` exists alongside the manifest, it is read to resolve each dependency's actual
+in-use (installed) version, shown alongside the declared constraint.
 
 ## Version Comparison
 
