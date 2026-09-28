@@ -225,11 +225,13 @@ fn applied_plan(range: Range, new_text: &str) -> UpdatePlan {
             current: deps_cli::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
                 "1.0.0",
             )),
-            target: Some(deps_core::ConcreteVersion::from(new_text)),
-            outcome: Outcome::Applied(ManifestEdit {
-                range,
-                new_text: new_text.to_string(),
-            }),
+            outcome: Outcome::Applied {
+                edit: ManifestEdit {
+                    range,
+                    new_text: new_text.to_string(),
+                },
+                target: deps_core::ConcreteVersion::from(new_text),
+            },
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
             gossip_excluded_version: None,

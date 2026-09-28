@@ -83,21 +83,21 @@ pub fn exit_code(
 ///
 /// `0` if every item is [`Outcome::Applied`], the plan was empty (nothing eligible), or every
 /// non-`Applied` item is a deliberate exclusion
-/// (<code>[Outcome::Skipped]([SkipReason::NotRequested])</code> — a `--package` narrowing —
-/// <code>[Outcome::Skipped]([SkipReason::IgnoreRule])</code> — a `[update].ignore` match —
-/// <code>[Outcome::Skipped]([SkipReason::WithinFreshnessCooldown])</code>, issue #1525's
+/// ([`Outcome::Skipped`] with reason [`SkipReason::NotRequested`] — a `--package` narrowing —
+/// [`Outcome::Skipped`] with reason [`SkipReason::IgnoreRule`] — a `[update].ignore` match —
+/// [`Outcome::Skipped`] with reason [`SkipReason::WithinFreshnessCooldown`], issue #1525's
 /// automatic, policy-driven pause rather than a failed fix attempt — **not guaranteed to
 /// self-resolve**: it clears only once a release survives long enough to age past the cooldown
 /// window without a newer release replacing it, so a package publishing at least once per
 /// window can stay skipped indefinitely (see [`SkipReason::WithinFreshnessCooldown`]'s own doc)
-/// — or <code>[Outcome::Skipped]([SkipReason::OverlapsAnotherEdit])</code>: a genuinely
+/// — or [`Outcome::Skipped`] with reason [`SkipReason::OverlapsAnotherEdit`]: a genuinely
 /// overlapping edit dropped by [`crate::update::dedup_applied_items`], not a failed fix attempt
 /// — the surviving edit at the same span already achieves the write (spec 075 fix-cycle
 /// finding: [`crate::update::plan_updates`] now calls `dedup_applied_items` on itself, per
 /// FR-015, making this variant reachable from default-mode `update` for the first time; leaving
 /// it out of this exemption list regressed a scenario that exited clean before that change).
 /// `1` if at least one item is
-/// <code>[Outcome::Skipped]([SkipReason::NotSafelyEditable])</code>,
+/// [`Outcome::Skipped`] with reason [`SkipReason::NotSafelyEditable`],
 /// [`Outcome::RequiresLockfileUpdate`], or [`Outcome::Unfixable`] — these represent something
 /// the run *wanted* to fix but could not, unlike an operator-requested exclusion. `2`
 /// (execution error — parse/write/TOCTOU/symlink/offline-gate failures) is set by the caller
@@ -125,13 +125,14 @@ pub fn update_exit_code(plan: &UpdatePlan) -> i32 {
     let has_unresolved_item = plan.items.iter().any(|item| {
         !matches!(
             item.outcome,
-            Outcome::Applied(_)
-                | Outcome::Skipped(
-                    SkipReason::NotRequested
+            Outcome::Applied { .. }
+                | Outcome::Skipped {
+                    reason: SkipReason::NotRequested
                         | SkipReason::IgnoreRule
                         | SkipReason::WithinFreshnessCooldown
-                        | SkipReason::OverlapsAnotherEdit
-                )
+                        | SkipReason::OverlapsAnotherEdit,
+                    ..
+                }
         )
     });
     if has_unresolved_item {
@@ -247,7 +248,6 @@ mod tests {
             current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
                 "1.0.0",
             )),
-            target: Some(deps_core::ConcreteVersion::from("1.2.0")),
             outcome,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
@@ -257,10 +257,13 @@ mod tests {
     }
 
     fn applied() -> Outcome {
-        Outcome::Applied(ManifestEdit {
-            range: Range::default(),
-            new_text: "1.2.0".to_string(),
-        })
+        Outcome::Applied {
+            edit: ManifestEdit {
+                range: Range::default(),
+                new_text: "1.2.0".to_string(),
+            },
+            target: deps_core::ConcreteVersion::from("1.2.0"),
+        }
     }
 
     #[test]
@@ -282,7 +285,10 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![
                 update_item(applied()),
-                update_item(Outcome::Skipped(SkipReason::IgnoreRule)),
+                update_item(Outcome::Skipped {
+                    reason: SkipReason::IgnoreRule,
+                    target: None,
+                }),
             ],
         };
         assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
@@ -294,7 +300,10 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![
                 update_item(applied()),
-                update_item(Outcome::Skipped(SkipReason::NotRequested)),
+                update_item(Outcome::Skipped {
+                    reason: SkipReason::NotRequested,
+                    target: None,
+                }),
             ],
         };
         assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
@@ -303,9 +312,10 @@ mod tests {
     #[test]
     fn test_update_exit_code_not_safely_editable_skip_is_policy_violation() {
         let plan = UpdatePlan {
-            items: vec![update_item(Outcome::Skipped(
-                SkipReason::NotSafelyEditable(UnplannableReason::NonLiteralSpan),
-            ))],
+            items: vec![update_item(Outcome::Skipped {
+                reason: SkipReason::NotSafelyEditable(UnplannableReason::NonLiteralSpan),
+                target: None,
+            })],
         };
         assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
     }
@@ -313,7 +323,9 @@ mod tests {
     #[test]
     fn test_update_exit_code_requires_lockfile_update_is_policy_violation() {
         let plan = UpdatePlan {
-            items: vec![update_item(Outcome::RequiresLockfileUpdate)],
+            items: vec![update_item(Outcome::RequiresLockfileUpdate {
+                target: deps_core::ConcreteVersion::from("1.2.0"),
+            })],
         };
         assert_eq!(update_exit_code(&plan), EXIT_POLICY_VIOLATION);
     }
@@ -335,7 +347,10 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![
                 update_item(applied()),
-                update_item(Outcome::Skipped(SkipReason::WithinFreshnessCooldown)),
+                update_item(Outcome::Skipped {
+                    reason: SkipReason::WithinFreshnessCooldown,
+                    target: None,
+                }),
             ],
         };
         assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
@@ -352,7 +367,10 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![
                 update_item(applied()),
-                update_item(Outcome::Skipped(SkipReason::OverlapsAnotherEdit)),
+                update_item(Outcome::Skipped {
+                    reason: SkipReason::OverlapsAnotherEdit,
+                    target: None,
+                }),
             ],
         };
         assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
@@ -363,8 +381,14 @@ mod tests {
         let plan = UpdatePlan {
             items: vec![
                 update_item(applied()),
-                update_item(Outcome::Skipped(SkipReason::NotRequested)),
-                update_item(Outcome::Skipped(SkipReason::IgnoreRule)),
+                update_item(Outcome::Skipped {
+                    reason: SkipReason::NotRequested,
+                    target: None,
+                }),
+                update_item(Outcome::Skipped {
+                    reason: SkipReason::IgnoreRule,
+                    target: None,
+                }),
             ],
         };
         assert_eq!(update_exit_code(&plan), EXIT_CLEAN);
