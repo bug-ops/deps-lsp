@@ -683,6 +683,57 @@ fn parse_caret_components(parts: &[&str]) -> Option<[u64; 3]> {
     Some(out)
 }
 
+/// Whether `part` is npm's wildcard-range component token (`x`, `X`, or `*`) — used in both
+/// partial-version requirements (`1.x`, `1.2.x`, `1.2.*`) and caret requirements (`^1.5.x`,
+/// `^1.5.*`) to mean "matches any value in this position", npm's own interpretation of the
+/// syntax (#1641, #1637).
+fn is_wildcard_component(part: &str) -> bool {
+    matches!(part, "x" | "X" | "*")
+}
+
+/// The requirement components to use for matching, truncated at the first wildcard token
+/// (`x`/`X`/`*`) and everything after it — npm's own semantics treat a wildcard component as
+/// "not specified", which also silently wildcards every component after it (node-semver's
+/// `replaceXRange` sets `xp = xm || isX(p)`): `1.x.5` behaves identically to `1.x`, and
+/// `^1.5.x` behaves identically to `^1.5`. Shared by both the plain/partial-version wildcard
+/// check ([`matches_wildcard_components`], #1641) and caret bounding
+/// ([`RequirementResolution::version_satisfies_requirement`]'s `^` branch and
+/// [`caret_admits_up_to_date`], #1637), so neither has to understand wildcards itself — both
+/// just consume a possibly-shorter, wildcard-free `req_parts` slice.
+///
+/// Callers must check for an empty result themselves: an empty slice means the *first*
+/// component was already a wildcard (`^x`, `*`), which is "matches any value" — treating it as
+/// zero given components (`^` with nothing after it, i.e. `[0, 0, 0]`) would wrongly bound the
+/// match to major version `0` only, contradicting the "any value" meaning.
+fn truncate_at_wildcard<'a>(req_parts: &'a [&'a str]) -> &'a [&'a str] {
+    let Some(idx) = req_parts
+        .iter()
+        .position(|part| is_wildcard_component(part))
+    else {
+        return req_parts;
+    };
+    req_parts.get(..idx).unwrap_or(req_parts)
+}
+
+/// Whether every component of `req_parts` up to its first wildcard token (`x`/`X`/`*`) equals
+/// the same-position component of `version_parts` — a wildcard component and everything after it
+/// match any value (see [`truncate_at_wildcard`]). Requires `req_parts` to actually contain a
+/// wildcard — otherwise this is not the right check, since plain-equality/partial-prefix matching
+/// already covers a non-wildcard requirement — and `version_parts` to have at least as many
+/// components as the truncated prefix, since a wildcard requirement is still a partial/floor
+/// match rather than an exact-length one (#1641).
+fn matches_wildcard_components(req_parts: &[&str], version_parts: &[&str]) -> bool {
+    if !req_parts.iter().any(|part| is_wildcard_component(part)) {
+        return false;
+    }
+    let effective = truncate_at_wildcard(req_parts);
+    version_parts.len() >= effective.len()
+        && effective
+            .iter()
+            .zip(version_parts.iter())
+            .all(|(req, ver)| req == ver)
+}
+
 /// The exclusive upper bound of a `^`-requirement whose lower bound is `lower`
 /// (`parse_caret_components`'s output) and whose requirement text had `req_parts` given
 /// components: increments the left-most non-zero component among those given, zeroing
@@ -715,9 +766,11 @@ fn caret_upper_bound(lower: [u64; 3], req_parts: &[&str]) -> Option<[u64; 3]> {
 /// [`parse_caret_components`] even when the candidate carries a suffix that component-wise
 /// `u64` parsing can't handle directly (#1622 S3: without this, a suffixed candidate like
 /// `1.4.9-beta` silently defeated the caret lower-bound floor by falling through to the
-/// pre-#1622, major-only fallback). Only ever applied to a *candidate* version, never to the
-/// requirement text itself — a non-numeric requirement component (`^1.5.x`) is a distinct,
-/// deliberately deferred gap (impl-critic M2).
+/// pre-#1622, major-only fallback). Also applied to the *requirement* text's own floor component
+/// since #1637, to collapse a prerelease/build-suffixed requirement (`^1.5.0-beta.1`) down to
+/// its numeric floor `1.5.0` — a deliberate simplification that drops semver prerelease
+/// precedence, not full prerelease-range semantics. Wildcard requirement components (`x`/`X`/
+/// `*`) are a separate concern handled by [`truncate_at_wildcard`], not by this function.
 #[expect(
     clippy::string_slice,
     reason = "cut is either a `find(['-', '+'])` match index (both ASCII, so always a char \
@@ -746,21 +799,30 @@ fn strip_version_suffix(version: &str) -> &str {
 /// parse, so the caller falls back to its own general-purpose check for every other shape.
 fn caret_admits_up_to_date(latest: &str, requirement: &str) -> Option<bool> {
     let req = requirement.strip_prefix('^')?;
+    let req = strip_version_suffix(req);
     let req_parts: Vec<&str> = req.split('.').collect();
     let ver_parts: Vec<&str> = strip_version_suffix(latest).split('.').collect();
 
-    if req_parts.first() != ver_parts.first() {
-        return Some(false);
+    match (req_parts.first(), ver_parts.first()) {
+        (Some(r), Some(v)) if is_wildcard_component(r) || r == v => {}
+        _ => return Some(false),
     }
 
+    let effective_req_parts = truncate_at_wildcard(&req_parts);
+    if effective_req_parts.is_empty() {
+        // The requirement's first component was itself a wildcard (`^x`, `^*`) — npm treats
+        // this as "any version", not as a caret with zero given components (which would
+        // wrongly bound the match to major version `0` only, per `truncate_at_wildcard`'s doc).
+        return Some(true);
+    }
     let (Some(lower), Some(candidate)) = (
-        parse_caret_components(&req_parts),
+        parse_caret_components(effective_req_parts),
         parse_caret_components(&ver_parts),
     ) else {
         return Some(true);
     };
 
-    Some(caret_upper_bound(lower, &req_parts).is_none_or(|upper| candidate < upper))
+    Some(caret_upper_bound(lower, effective_req_parts).is_none_or(|upper| candidate < upper))
 }
 
 /// Requirement parsing, matching, and up-to-date status.
@@ -791,25 +853,41 @@ pub trait RequirementResolution: Send + Sync {
         // [0.2.0, 0.3.0), ^0.0.3 -> [0.0.3, 0.0.4) (#1622, mirroring #1619's fix for
         // `deps-composer`'s own `satisfies_caret`).
         if let Some(req) = requirement.strip_prefix('^') {
+            // Collapses a prerelease/build-suffixed requirement floor (`^1.5.0-beta.1`) to its
+            // numeric core, same simplification `strip_version_suffix` already applies to
+            // candidates (#1637).
+            let req = strip_version_suffix(req);
             let req_parts: Vec<&str> = req.split('.').collect();
             let ver_parts: Vec<&str> = strip_version_suffix(version).split('.').collect();
 
-            // Must have same major version
-            if req_parts.first() != ver_parts.first() {
-                return false;
+            // Must have same major version — an `x`/`X`/`*` major component (e.g. `^x.5.0`,
+            // vanishingly rare in practice) matches any candidate major.
+            match (req_parts.first(), ver_parts.first()) {
+                (Some(r), Some(v)) if is_wildcard_component(r) || r == v => {}
+                _ => return false,
             }
 
+            // A wildcard component (`^1.5.x`, `^1.5.*`) is treated as "not specified", the same
+            // as a shorter `^1.5` requirement (#1637) — see `truncate_at_wildcard`.
+            let effective_req_parts = truncate_at_wildcard(&req_parts);
+            if effective_req_parts.is_empty() {
+                // The requirement's first component was itself a wildcard (`^x`, `^*`,
+                // `^x.5.0`) — npm treats this as "any version", not as a caret with zero given
+                // components (which would wrongly bound the match to major version `0` only).
+                return true;
+            }
             let (Some(lower), Some(candidate)) = (
-                parse_caret_components(&req_parts),
+                parse_caret_components(effective_req_parts),
                 parse_caret_components(&ver_parts),
             ) else {
-                // A non-numeric component is unusual for a bare `^X.Y[.Z]` requirement — fall
-                // back to the major-only check already confirmed above.
+                // A non-numeric, non-wildcard component is unusual for a bare `^X.Y[.Z]`
+                // requirement — fall back to the major-only check already confirmed above.
                 return true;
             };
 
             return candidate >= lower
-                && caret_upper_bound(lower, &req_parts).is_none_or(|upper| candidate < upper);
+                && caret_upper_bound(lower, effective_req_parts)
+                    .is_none_or(|upper| candidate < upper);
         }
 
         // Tilde allows patch-level changes: ~2.0 -> 2.0.x, ~2.0.1 -> 2.0.x where x >= 1
@@ -817,13 +895,21 @@ pub trait RequirementResolution: Send + Sync {
             return tilde_admits_version(req, version);
         }
 
-        // Plain version or partial version
+        // Plain version, partial version, or npm's `x`/`X`/`*` wildcard-range requirement
+        // (`1.x`, `1.2.x`, `1.2.*`) — the wildcard form can have up to 3 components, so it is
+        // checked independently of `is_partial_version` rather than folded into it (#1641). The
+        // raw `version.starts_with(requirement)` string check #1636 removed here wrongly
+        // admitted e.g. `1.20.0` for a `1.2` requirement; `is_same_major_minor` against the
+        // suffix-stripped `version_core` is the correct component-wise replacement, shared with
+        // the wildcard check below.
         let req_parts: Vec<&str> = requirement.split('.').collect();
         let is_partial_version = req_parts.len() <= 2;
         let version_core = split_patch_component(version).0;
+        let ver_parts: Vec<&str> = version_core.split('.').collect();
 
         version == requirement
             || (is_partial_version && is_same_major_minor(requirement, version_core))
+            || matches_wildcard_components(&req_parts, &ver_parts)
     }
 
     /// Whether an unresolved dependency (no lock-file version) should be reported as
@@ -1973,6 +2059,215 @@ mod tests {
             MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("0.6.0-beta")),
             RequirementStatus::Outdated
         );
+    }
+
+    /// #1641: npm's `x`/`X`/`*` wildcard-range syntax (`1.x`, `1.2.x`, `1.2.*`) must match a
+    /// candidate whose non-wildcard components agree, regardless of the requirement's component
+    /// count — the pre-fix code only ever matched a 3-component requirement via exact string
+    /// equality, so `1.2.x`/`1.2.*` always rejected every candidate.
+    #[test]
+    fn test_version_satisfies_requirement_wildcard_matches() {
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "1.x")
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "1.2.x")
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.5"), "1.2.*")
+        );
+    }
+
+    /// #1641: a wildcard requirement component must still reject a candidate that disagrees on a
+    /// non-wildcard component — the fix must not turn wildcard matching into blanket admission.
+    #[test]
+    fn test_version_satisfies_requirement_wildcard_rejects_mismatched_component() {
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.x")
+        );
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.0"), "1.2.x")
+        );
+    }
+
+    /// #1637: `^1.5.x` and `^1.5.*` must bound like `^1.5` (`[1.5.0, 2.0.0)`), not fail open and
+    /// admit every candidate past the major-version check — the pre-fix code returned `true`
+    /// unconditionally once `parse_caret_components` failed to parse the wildcard component.
+    #[test]
+    fn test_version_satisfies_requirement_caret_wildcard_bounds_correctly() {
+        for requirement in ["^1.5.x", "^1.5.*"] {
+            assert!(
+                !MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("1.4.9"), requirement),
+                "{requirement} must reject a candidate below the effective lower bound"
+            );
+            assert!(
+                MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), requirement),
+                "{requirement} must accept a candidate at the lower bound"
+            );
+            assert!(
+                MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), requirement),
+                "{requirement} must accept a candidate within range"
+            );
+            assert!(
+                !MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), requirement),
+                "{requirement} must reject a candidate at/above the upper bound"
+            );
+            assert!(
+                !MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), requirement),
+                "{requirement} must reject a candidate with a lower major version"
+            );
+        }
+    }
+
+    /// #1637: a prerelease/build-suffixed requirement floor (`^1.5.0-beta.1`) is collapsed to
+    /// its numeric core `1.5.0` and bounded the same as `^1.5.0`, rather than fail-opening on the
+    /// non-numeric `0-beta` component — a deliberate simplification that drops semver prerelease
+    /// precedence (see `strip_version_suffix`'s doc).
+    #[test]
+    fn test_version_satisfies_requirement_caret_requirement_suffix_still_bounds() {
+        let requirement = "^1.5.0-beta.1";
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.4.9"), requirement)
+        );
+        assert!(
+            MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), requirement)
+        );
+        assert!(
+            !MOCK_FORMATTER
+                .version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), requirement)
+        );
+    }
+
+    /// #1637 impl-critic S1: a wildcard *major* component (`^x`, `^*`, `^x.5.0`) means "any
+    /// version" per npm — `truncate_at_wildcard` returning an empty slice for these must not be
+    /// treated as "zero given components" (which would wrongly bound the match to major version
+    /// `0` only, contradicting the "any value" meaning of a leading wildcard).
+    #[test]
+    fn test_version_satisfies_requirement_caret_wildcard_major_matches_any_version() {
+        for requirement in ["^x", "^*", "^x.5.0"] {
+            assert!(
+                MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("2.3.4"), requirement),
+                "{requirement} must admit a high-major candidate"
+            );
+            assert!(
+                MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), requirement),
+                "{requirement} must admit a zero-major candidate too"
+            );
+        }
+    }
+
+    /// Same S1 fix, exercised through `caret_admits_up_to_date`/`requirement_status` — the sole
+    /// production caller of `caret_admits_up_to_date` (#1637).
+    #[test]
+    fn test_requirement_status_caret_wildcard_major_matches_any_version() {
+        let requirement = VersionReq::new("^*");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &ConcreteVersion::new("3.0.0")),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    /// #1637 impl-critic M2: `caret_admits_up_to_date`'s wildcard fix, exercised via its only
+    /// production entry point (`is_requirement_up_to_date`), not just `version_satisfies_requirement`
+    /// directly. A `latest` past the effective upper bound must now report outdated instead of
+    /// fail-open admitting it; a `latest` below the caret's own lower-bound floor must stay up to
+    /// date, confirming the #1622 S2 floor-ignoring contract is unaffected by this fix (no
+    /// `candidate >= lower` check was added to `caret_admits_up_to_date`).
+    #[test]
+    fn test_is_requirement_up_to_date_caret_wildcard_no_fail_open() {
+        let requirement = VersionReq::new("^1.5.x");
+        assert!(
+            !MOCK_FORMATTER.is_requirement_up_to_date(&requirement, &ConcreteVersion::new("2.0.0")),
+            "latest past the effective upper bound must be reported outdated, not fail-open admitted"
+        );
+        assert!(
+            MOCK_FORMATTER.is_requirement_up_to_date(&requirement, &ConcreteVersion::new("1.4.9")),
+            "latest below the caret's own lower-bound floor stays up to date (#1622 S2)"
+        );
+    }
+
+    /// Same M2 fix, exercised through the `requirement_status` wrapper end to end, mirroring
+    /// `test_requirement_status_caret_latest_below_major_is_outdated`'s existing pattern.
+    #[test]
+    fn test_requirement_status_caret_wildcard_latest_past_upper_bound_is_outdated() {
+        let requirement = VersionReq::new("^1.5.x");
+        let latest = ConcreteVersion::new("3.0.0");
+        assert_eq!(
+            MOCK_FORMATTER.requirement_status(&requirement, &latest),
+            RequirementStatus::Outdated
+        );
+    }
+
+    /// #1637 impl-critic M1: a wildcard component makes every component after it a wildcard too
+    /// (node-semver's `replaceXRange` semantics: `xp = xm || isX(p)`) — `1.x.5` behaves
+    /// identically to `1.x`, not "match any minor but require patch `5`".
+    #[test]
+    fn test_version_satisfies_requirement_wildcard_mid_position_truncates_trailing_components() {
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.4"), "1.x.5"),
+            "the trailing `.5` after a wildcard must not be enforced"
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.3.5"), "1.x.5")
+        );
+    }
+
+    /// #1637/#1641 impl-critic M3: the uppercase `X` wildcard token, in both the plain/partial
+    /// branch and the caret branch — `is_wildcard_component`'s `"X"` arm was previously
+    /// unexercised.
+    #[test]
+    fn test_version_satisfies_requirement_wildcard_uppercase_x() {
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "1.2.X")
+        );
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.6.0"), "^1.5.X")
+        );
+    }
+
+    /// #1637 impl-critic M3: a zero-major caret requirement routes through the same truncated
+    /// `effective_req_parts` path — `caret_upper_bound`'s existing zero-major bump logic (#1622)
+    /// must still produce the correct boundary once the wildcard component is dropped (`^0.x` ->
+    /// `<1.0.0`, `^0.0.x` -> `<0.1.0`, matching npm).
+    #[test]
+    fn test_version_satisfies_requirement_caret_zero_major_wildcard_bounds() {
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), "^0.x")
+        );
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^0.x")
+        );
+
+        assert!(
+            MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("0.0.5"), "^0.0.x")
+        );
+        assert!(
+            !MOCK_FORMATTER.version_satisfies_requirement(&ConcreteVersion::new("0.1.0"), "^0.0.x")
+        );
+    }
+
+    /// #1641 impl-critic M4: a bare `*`/`x`/`X` requirement (no dot at all) now matches every
+    /// candidate — a real, npm-correct behavior change from before this fix (previously always
+    /// `false`, since a single-token wildcard requirement fell through every pre-existing
+    /// plain/partial arm without matching).
+    #[test]
+    fn test_version_satisfies_requirement_bare_wildcard_matches_any_version() {
+        for requirement in ["*", "x", "X"] {
+            assert!(
+                MOCK_FORMATTER
+                    .version_satisfies_requirement(&ConcreteVersion::new("9.9.9"), requirement),
+                "{requirement} must match any candidate"
+            );
+        }
     }
 
     #[test]
