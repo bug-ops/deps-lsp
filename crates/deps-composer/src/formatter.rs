@@ -4,6 +4,7 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::StabilityFloor;
 use deps_core::VersionReq;
+use deps_core::interval::{VersionRange, range_from_edges};
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
@@ -123,7 +124,131 @@ fn normalize_and_separators(requirement: &str) -> Cow<'_, str> {
     Cow::Owned(normalize_operator_spacing(&comma_normalized).into_owned())
 }
 
-/// Shared OR (`||`)/AND (whitespace or comma)-splitting tree-walker for Composer's
+/// Splits `s` on Composer's OR separator (#1609): `composer/semver`'s own
+/// `VersionParser::parseConstraints` splits on `preg_split('{\s*\|\|?\s*}', ...)`, so a lone
+/// `|` is accepted exactly like the documented `||`. Implemented as a manual scan collapsing
+/// each maximal run of one-or-more `|` characters into a single split point (generalizing
+/// "one or two pipes" to any run, so a stray `|||` degrades the same way rather than leaving a
+/// spurious empty segment behind) — avoids a regex dependency for this.
+///
+/// Unlike naively splitting on every individual `|` character and filtering out empty strings,
+/// this leaves a genuinely blank segment visible to the caller instead of silently discarding
+/// it (impl-critic M1): two separator runs with only whitespace between them (`"A || || B"`),
+/// or a trailing run (`"A ||"`), each produce an empty/whitespace-only element here. The
+/// caller — [`walk_requirement`] and [`composer_or_gap_excludes`] — treats any such
+/// blank-after-trim branch as a malformed OR expression (`composer/semver` itself rejects these
+/// shapes) and fails closed, rather than the two callers silently disagreeing on how to handle
+/// it depending on how the blanks happened to be produced.
+///
+/// Shared by [`walk_requirement`]'s OR-splitting and [`composer_or_gap_excludes`]'s `||`/`|`-
+/// branch enumeration, mirroring this project's #1596/#1598 admit/exclude-walker dedup
+/// precedent.
+// `start`/`i` come from `char_indices()`, and every split point sits immediately before/after
+// a single-byte ASCII `|`, always a char boundary.
+#[allow(clippy::string_slice)]
+pub(crate) fn split_or_branches(s: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_run = false;
+    for (i, c) in s.char_indices() {
+        if c == '|' {
+            if !in_run {
+                parts.push(&s[start..i]);
+                in_run = true;
+            }
+        } else if in_run {
+            start = i;
+            in_run = false;
+        }
+    }
+    parts.push(&s[if in_run { s.len() } else { start }..]);
+    parts
+}
+
+/// Whether every one of `branches` is non-blank once trimmed — the shared malformed-OR guard
+/// [`split_or_branches`]'s doc describes (impl-critic M1): a blank segment only ever comes from
+/// a degenerate separator shape (`"A || || B"`, a trailing `"A ||"`), which `composer/semver`
+/// itself rejects rather than treating as an implicit wildcard branch.
+fn has_blank_or_branch(branches: &[&str]) -> bool {
+    branches.iter().any(|b| b.trim().is_empty())
+}
+
+/// Whether `s`'s Composer numeric-dot core (before any qualifier suffix, and after a leading
+/// `v`/`V` strip) is non-empty and entirely numeric.
+///
+/// [`increment_last_segment`] already applies this same discipline internally, but only to a
+/// hyphen range's upper bound; this is the same check made reusable so the lower bound gets it
+/// too (impl-critic S1) — without it, `compare_versions`' own `unwrap_or(0)` silently turns a
+/// malformed bound like `"^1.0"` or `"abc"` into version `0`, which would make e.g.
+/// `"^1.0 - 2.0"` or `"abc - 2.0"` admit everything below `hi` instead of falling closed —
+/// exactly the fabricated-bound bug class #1610 already guards against for the upper edge.
+fn has_valid_version_core(s: &str) -> bool {
+    let (core, _suffix) = split_composer_core_and_suffix(strip_bound_v(s));
+    !core.is_empty() && core.split('.').all(|seg| seg.parse::<u64>().is_ok())
+}
+
+/// Splits `branch` on composer/semver's Hyphenated Version Range separator (`X +- +Y`, #1608):
+/// exactly three whitespace-separated tokens with the middle token literally `-`.
+/// `split_whitespace` collapses any run of spaces around the hyphen for free (matching
+/// composer/semver's own ` +- +` grammar — one or more spaces each side, impl-critic M2), and
+/// never splits a hyphen embedded in a qualifier suffix with no surrounding whitespace
+/// (`1.0.0-alpha`, kept together as one token).
+///
+/// A hyphen range AND-combined with another clause (`"1.0 - 2.0 !=1.4.0"`, also valid
+/// composer/semver grammar) is not yet supported — its 4+ tokens fall through to `None` here
+/// (tracked as a follow-up, impl-critic M2/D2); the caller's prior fail-closed handling for an
+/// unrecognized shape applies unchanged.
+fn split_hyphen_range(branch: &str) -> Option<(&str, &str)> {
+    match branch.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [lo, "-", hi] => Some((*lo, *hi)),
+        _ => None,
+    }
+}
+
+/// Resolves a Composer Hyphenated Version Range (`X - Y`, #1608) to a single `(lower, upper)`
+/// edge pair — shared by [`walk_requirement`] (evaluates the edges directly via
+/// [`RequirementLeaf::eval_edge`], no `format!`/re-parse round trip) and [`branch_bound`] (feeds
+/// them straight into [`range_from_edges`]), so the two admit/OR-gap paths cannot independently
+/// drift out of sync (impl-critic S3 — the same #1591-class risk this project's other
+/// admit/exclude walkers already guard against).
+///
+/// `composer/semver`'s `VersionParser::parseConstraints` resolves the upper edge two different
+/// ways depending on `hi`'s precision (impl-critic S2, verified against Composer's own docs:
+/// `"1.0.0 - 2.1.0"` == `">=1.0.0 <=2.1.0"`):
+/// - A "full" `hi` — 3 or more numeric segments, or one already carrying its own stability
+///   suffix — is admitted up to and including itself (`<=hi`).
+/// - A "partial" `hi` (1-2 numeric segments, no suffix) widens to `<(last-segment+1)-dev`
+///   instead of a plain `<(last-segment+1)`: `-dev` is Composer's own lowest stability rank
+///   (below `alpha`), so it excludes every version — prerelease or stable — at that boundary
+///   core, the way Composer's real `-dev`-suffixed exclusive bound does; a plain
+///   `<(last-segment+1)` would let a same-core prerelease (e.g. `2.1.0-beta` under
+///   `"1.0 - 2.0"`) slip under it, since a prerelease sorts below its own stable release under
+///   [`compare_versions`]' qualifier precedence.
+///
+/// Returns `None` when `branch` isn't hyphen-range shaped ([`split_hyphen_range`]), or either
+/// edge's numeric core isn't itself valid ([`has_valid_version_core`], impl-critic S1) — a
+/// malformed bound like `"^1.0 - 2.0"` must not silently become version `0` and admit
+/// everything below `hi`.
+fn hyphen_range_edges(branch: &str) -> Option<((String, bool), (String, bool))> {
+    let (lo, hi) = split_hyphen_range(branch)?;
+    if !has_valid_version_core(lo) || !has_valid_version_core(hi) {
+        return None;
+    }
+    let lo = strip_bound_v(lo).to_string();
+
+    let hi_stripped = strip_bound_v(hi);
+    let (hi_core, hi_suffix) = split_composer_core_and_suffix(hi_stripped);
+    let full = hi_suffix.is_some() || hi_core.split('.').count() >= 3;
+    let upper = if full {
+        (hi_stripped.to_string(), true)
+    } else {
+        let incremented = increment_last_segment(hi_core)?;
+        (format!("{incremented}-dev"), false)
+    };
+    Some(((lo, true), upper))
+}
+
+/// Shared OR (`||`/`|`)/AND (whitespace or comma)-splitting tree-walker for Composer's
 /// requirement grammar, including its `v`-prefix and `@stability`-flag stripping — the
 /// traversal [`ComposerFormatter::version_satisfies_requirement`] and
 /// [`composer_explicitly_excludes`] both need identically (PR #1589 had to fix the same
@@ -142,6 +267,21 @@ fn normalize_and_separators(requirement: &str) -> Cow<'_, str> {
 /// only treated a multi-token run as AND when some token started with `>`/`<`, silently
 /// collapsing e.g. `"^1.0 !=1.2.0"` to just its first token.
 ///
+/// A hyphenated range (`"1.0 - 2.0"`, #1608) is checked next, on the whole branch before any
+/// AND-splitting: it is composer/semver's own `X +- +Y` grammar form, but its own internal
+/// space would otherwise be mis-split into bogus AND-clauses (`"1.0"`, `"-"`, `"2.0"`) by the
+/// generic whitespace split below. [`hyphen_range_edges`] resolves it to a `(lower, upper)`
+/// edge pair evaluated directly via [`RequirementLeaf::eval_edge`] — no `format!`/re-parse
+/// round trip (impl-critic S3). A shape it cannot characterize (non-numeric bound, no
+/// space-hyphen-space at all) falls through to that same generic split, preserving this
+/// function's prior fail-closed behavior for it.
+///
+/// A blank branch produced by [`split_or_branches`] (impl-critic M1: a degenerate separator
+/// shape like `"A || || B"` or a trailing `"A ||"`) fails the whole requirement closed
+/// (`false`) rather than treating it as an implicit wildcard branch — `composer/semver` itself
+/// rejects these shapes, and `false` is the correct answer for both the "admits" and
+/// "explicitly excludes" questions on malformed input.
+///
 /// Only leaf evaluation and the AND-group's fold differ between the two callers — see
 /// [`RequirementLeaf`].
 fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &str) -> bool {
@@ -150,10 +290,24 @@ fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &s
         return leaf.on_wildcard();
     };
 
-    if requirement.contains("||") {
-        return requirement
-            .split("||")
+    if requirement.contains('|') {
+        let branches = split_or_branches(requirement);
+        if has_blank_or_branch(&branches) {
+            return false;
+        }
+        return branches
+            .into_iter()
             .any(|part| walk_requirement(leaf, version, part.trim()));
+    }
+
+    if let Some((lower, upper)) = hyphen_range_edges(requirement) {
+        return leaf.combine_and(
+            [
+                leaf.eval_edge(version, &lower.0, lower.1, true),
+                leaf.eval_edge(version, &upper.0, upper.1, false),
+            ]
+            .into_iter(),
+        );
     }
 
     let requirement = normalize_and_separators(requirement);
@@ -193,6 +347,18 @@ trait RequirementLeaf {
 
     /// Folds an AND-separated clause group's per-clause results.
     fn combine_and(&self, results: impl Iterator<Item = bool>) -> bool;
+
+    /// Evaluates a single bound edge (`(bound, inclusive)`, from either side of a hyphen range,
+    /// #1608, via [`hyphen_range_edges`]) directly, without building and re-parsing an
+    /// operator-prefixed clause string (impl-critic S3). `lower` is `true` for the range's
+    /// lower edge (an implicit `>=`/`>`), `false` for its upper edge (`<=`/`<`).
+    ///
+    /// For [`AdmitLeaf`] this is a plain version-vs-bound comparison, equivalent to what
+    /// [`AdmitLeaf::eval_leaf`]'s own `>=`/`<=`/`>`/`<` branches compute. For [`ExcludeLeaf`] a
+    /// bound edge never itself excludes a version — only a literal `!=` clause does (see
+    /// [`ExcludeLeaf::eval_leaf`]) — so this always answers `false`, mirroring how
+    /// `ExcludeLeaf::eval_leaf` itself answers `false` for a `>=`/`<=`/`>`/`<` clause.
+    fn eval_edge(&self, version: &str, bound: &str, inclusive: bool, lower: bool) -> bool;
 }
 
 /// [`RequirementLeaf`] for "does this admit `version`" — Composer's full requirement grammar
@@ -206,6 +372,17 @@ impl RequirementLeaf for AdmitLeaf {
 
     fn combine_and(&self, mut results: impl Iterator<Item = bool>) -> bool {
         results.all(|r| r)
+    }
+
+    fn eval_edge(&self, version: &str, bound: &str, inclusive: bool, lower: bool) -> bool {
+        let ord = compare_versions(version, bound);
+        if lower {
+            if inclusive { ord >= 0 } else { ord > 0 }
+        } else if inclusive {
+            ord <= 0
+        } else {
+            ord < 0
+        }
     }
 
     // `version.starts_with(prefix)` short-circuits before `prefix.len()` is used as a slice
@@ -296,6 +473,10 @@ impl RequirementLeaf for ExcludeLeaf {
         results.any(|r| r)
     }
 
+    fn eval_edge(&self, _version: &str, _bound: &str, _inclusive: bool, _lower: bool) -> bool {
+        false
+    }
+
     fn eval_leaf(&self, version: &str, requirement: &str) -> bool {
         let Some(req) = requirement.strip_prefix("!=") else {
             return false;
@@ -316,42 +497,6 @@ fn composer_explicitly_excludes(version: &str, requirement: &str) -> bool {
         || composer_or_gap_excludes(version, requirement)
 }
 
-/// One `||`-branch's admitted extent, as far as [`clause_bound`] can characterize it — `None`
-/// on either side means open-ended (or unknown) on that side. See [`branch_bound`]'s doc for
-/// when a whole branch is instead entirely unknown.
-struct BranchBound {
-    lower: Option<(String, bool)>,
-    upper: Option<(String, bool)>,
-}
-
-impl BranchBound {
-    const fn unbounded() -> Self {
-        Self {
-            lower: None,
-            upper: None,
-        }
-    }
-
-    /// Whether this bound's own two edges make it impossible to satisfy (impl-critic M1):
-    /// `lower > upper`, or `lower == upper` with either edge exclusive — the same
-    /// inverted/zero-width-exclusive shape `deps_core::interval::VersionRange::Empty` guards
-    /// against for Maven (#1595). A branch this narrow contributes no valid edge either way
-    /// ([`branch_bound`] treats it the same as an unrecognized clause shape): without this
-    /// check it would otherwise report both "past its own upper edge" and "before its own
-    /// lower edge" simultaneously for every candidate, manufacturing a gap out of a branch
-    /// that never admitted anything in the first place.
-    fn is_unsatisfiable(&self) -> bool {
-        let (Some((lo, lo_incl)), Some((hi, hi_incl))) = (&self.lower, &self.upper) else {
-            return false;
-        };
-        match compare_versions(lo, hi) {
-            ord if ord > 0 => true,
-            0 => !(*lo_incl && *hi_incl),
-            _ => false,
-        }
-    }
-}
-
 /// Strips a leading `v`/`V` from a clause's bound text — the same normalization
 /// [`AdmitLeaf::eval_leaf`]'s own operator branches apply independently of
 /// [`strip_branch_affixes`]'s branch-level strip (a clause may carry its own `v` right after
@@ -361,25 +506,44 @@ fn strip_bound_v(s: &str) -> &str {
 }
 
 /// Increments `prefix`'s last dot-segment by one, forming the exclusive upper edge implied by
-/// a wildcard clause (`X.Y.*` -> lower `X.Y`, upper `X.(Y+1)`) — mirrors
-/// [`AdmitLeaf::eval_leaf`]'s wildcard branch exactly (a prefix-of-segments check), just
-/// expressed as a literal boundary value instead of a `starts_with` test.
-fn increment_last_segment(prefix: &str) -> String {
-    let mut parts: Vec<u64> = prefix.split('.').map(|p| p.parse().unwrap_or(0)).collect();
-    match parts.last_mut() {
-        Some(last) => *last = last.saturating_add(1),
-        None => parts.push(1),
+/// a wildcard clause (`X.Y.*` -> lower `X.Y`, upper `X.(Y+1)`) or a hyphen range's upper bound
+/// (`X - Y` -> `>=X <Y+1`, #1608) — mirrors [`AdmitLeaf::eval_leaf`]'s wildcard branch exactly
+/// (a prefix-of-segments check), just expressed as a literal boundary value instead of a
+/// `starts_with` test.
+///
+/// Returns `None` — rather than silently fabricating a `0` segment (#1610's root-cause bug
+/// class) — when any dot-segment is non-numeric (a malformed/typo'd bound like `"abc"`), or
+/// when the last segment is already `u64::MAX` and cannot be incremented further; both cases
+/// make the caller treat the clause/branch as an unrecognized shape, which only means detection
+/// through it is skipped, never a false positive.
+fn increment_last_segment(prefix: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    for segment in prefix.split('.') {
+        parts.push(segment.parse::<u64>().ok()?);
     }
-    parts
-        .iter()
-        .map(u64::to_string)
-        .collect::<Vec<_>>()
-        .join(".")
+    let last = parts.last_mut()?;
+    *last = last.checked_add(1)?;
+    Some(
+        parts
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+    )
 }
 
-/// One AND-clause's contribution to its branch's overall admitted extent (#1601), or `None`
-/// when the clause's admitted set cannot be expressed as a value-based bound independent of a
-/// specific candidate's own segment count or of a known matcher quirk:
+/// Composer's `compare_versions`, wrapped as an [`Ordering`](std::cmp::Ordering)-returning
+/// comparator for [`deps_core::interval`]'s generic bound-comparison closures.
+fn compare_versions_ord(a: &str, b: &str) -> std::cmp::Ordering {
+    compare_versions(a, b).cmp(&0)
+}
+
+/// One AND-clause's contribution to its branch's overall admitted extent (#1601), expressed as
+/// a [`deps_core::interval::VersionRange`] (#1610: reusing the same validated interval
+/// representation `deps-maven`'s own OR/disjoint-range exclusion check builds on, rather than a
+/// Composer-specific bound type). Returns `None` when the clause's admitted set cannot be
+/// expressed as a value-based bound independent of a specific candidate's own segment count or
+/// of a known matcher quirk:
 ///
 /// - A bare exact/partial-match clause (no operator prefix) has no such bound —
 ///   [`AdmitLeaf::eval_leaf`]'s own partial-match branch admits or rejects based on how many
@@ -394,64 +558,59 @@ fn increment_last_segment(prefix: &str) -> String {
 ///   [`satisfies_tilde_composer`]'s own bound is well-defined — mixing a caret-adjacent
 ///   operator into bound derivation piecemeal is more error-prone than consistently treating
 ///   both as "unknown shape".
+/// - A `!=` clause is handled by [`branch_bound`] itself, before this function is ever called
+///   for it (it punctures a single point rather than restricting the branch's extent —
+///   `ExcludeLeaf`'s own AND-fold already catches this independently, so it must not narrow the
+///   bound derived here).
 ///
 /// Excluding these shapes only means some real gaps go undetected — it is always safe, never
 /// incorrect, mirroring `deps-maven`'s own defensive "unknown shape contributes no edge"
-/// pattern in `upper_edge`/`lower_edge`.
-fn clause_bound(clause: &str) -> Option<BranchBound> {
+/// pattern in its `upper_edge`/`lower_edge`.
+// TODO(critic): share comparator-prefix parsing with eval_leaf (follow-up to #1610).
+fn clause_bound(clause: &str) -> Option<VersionRange<String>> {
     if let Some(req) = clause.strip_prefix(">=") {
         let v = strip_bound_v(req.trim()).to_string();
-        return Some(BranchBound {
-            lower: Some((v, true)),
-            upper: None,
+        return Some(VersionRange::Minimum {
+            version: v,
+            inclusive: true,
         });
     }
     if let Some(req) = clause.strip_prefix("<=") {
         let v = strip_bound_v(req.trim()).to_string();
-        return Some(BranchBound {
-            lower: None,
-            upper: Some((v, true)),
+        return Some(VersionRange::Maximum {
+            version: v,
+            inclusive: true,
         });
     }
     if let Some(req) = clause.strip_prefix('>') {
         let v = strip_bound_v(req.trim()).to_string();
-        return Some(BranchBound {
-            lower: Some((v, false)),
-            upper: None,
+        return Some(VersionRange::Minimum {
+            version: v,
+            inclusive: false,
         });
     }
     if let Some(req) = clause.strip_prefix('<') {
         let v = strip_bound_v(req.trim()).to_string();
-        return Some(BranchBound {
-            lower: None,
-            upper: Some((v, false)),
+        return Some(VersionRange::Maximum {
+            version: v,
+            inclusive: false,
         });
-    }
-    if clause.strip_prefix("!=").is_some() {
-        // A `!=` clause punctures a single point rather than restricting the branch's
-        // extent — ExcludeLeaf's own AND-fold already catches this independently, so it must
-        // not narrow the bound derived here.
-        return Some(BranchBound::unbounded());
     }
     if let Some(req) = clause.strip_prefix('=') {
         let v = strip_bound_v(req.trim()).to_string();
-        return Some(BranchBound {
-            lower: Some((v.clone(), true)),
-            upper: Some((v, true)),
-        });
+        return Some(VersionRange::Exact(v));
     }
     if let Some(prefix) = clause.strip_suffix(".*") {
-        // Code-review finding: every segment must actually be numeric before deriving a
-        // bound — a malformed/typo'd clause like `"abc.*"` must fall through to `None`
-        // (unknown shape) the same as caret/tilde/bare-partial, not silently treat `"abc"`
-        // as version `0` via `increment_last_segment`'s own `parse().unwrap_or(0)` and
-        // fabricate a bound `[0,1)` for a clause that admits nothing at all.
-        if !prefix.is_empty() && prefix.split('.').all(|seg| seg.parse::<u64>().is_ok()) {
-            let lower = prefix.to_string();
-            let upper = increment_last_segment(prefix);
-            return Some(BranchBound {
-                lower: Some((lower, true)),
-                upper: Some((upper, false)),
+        // `increment_last_segment` itself rejects a non-numeric/empty prefix (code-review
+        // finding: a malformed/typo'd clause like `"abc.*"` must fall through to `None`
+        // (unknown shape) the same as caret/tilde/bare-partial, not silently treat `"abc"` as
+        // version `0` and fabricate a bound `[0,1)` for a clause that admits nothing at all).
+        if let Some(upper) = increment_last_segment(prefix) {
+            return Some(VersionRange::Bounded {
+                min: prefix.to_string(),
+                min_inclusive: true,
+                max: upper,
+                max_inclusive: false,
             });
         }
     }
@@ -484,16 +643,30 @@ fn tighter_upper(a: Option<(String, bool)>, b: Option<(String, bool)>) -> Option
     }
 }
 
-/// One `||`-branch's overall admitted extent, AND-intersecting its clauses (#1601). Returns
-/// `None` when any clause's shape is unknown to [`clause_bound`], or when the intersected
-/// bound turns out unsatisfiable (impl-critic M1, see [`BranchBound::is_unsatisfiable`]) — the
-/// whole branch is then excluded from OR-gap detection rather than guessing a partial bound
-/// or manufacturing a fake gap out of a branch that never admitted anything (safe: only means
-/// a real gap through this specific branch goes undetected).
-fn branch_bound(branch: &str) -> Option<BranchBound> {
-    let Some(branch) = strip_branch_affixes(branch) else {
-        return Some(BranchBound::unbounded());
-    };
+/// One `||`/`|`-branch's overall admitted extent, expressed as a
+/// [`deps_core::interval::VersionRange`] built from [`range_from_edges`] (#1610). A hyphenated
+/// range (#1608) is recognized on the whole branch first, mirroring [`walk_requirement`]'s own
+/// interception (see that function's doc); otherwise each clause is AND-intersected via
+/// [`clause_bound`], skipping a `!=` clause (non-narrowing, see that function's doc) and
+/// bailing out entirely (`?`) on any other unrecognized clause shape.
+///
+/// Returns `None` when no clause contributed a bound (an all-`!=`/wildcard/unrecognized-clause
+/// branch — functionally inert either way for [`composer_or_gap_excludes`]'s gap detection, so
+/// omitting it from the `branches` list is equivalent to the alternative of keeping it with no
+/// edges) or, via [`range_from_edges`], `Some(VersionRange::Empty)` when the intersected bound
+/// turns out unsatisfiable (impl-critic M1: `lower > upper`, or equal with either edge
+/// exclusive) — [`VersionRange::upper_edge`]/[`VersionRange::lower_edge`] give `Empty` no edge
+/// either, so it contributes nothing to gap detection rather than manufacturing a fake gap out
+/// of a branch that never admitted anything.
+fn branch_bound(branch: &str) -> Option<VersionRange<String>> {
+    let branch = strip_branch_affixes(branch)?;
+
+    if let Some((lower, upper)) = hyphen_range_edges(branch) {
+        return range_from_edges(Some(lower), Some(upper), |a: &String, b: &String| {
+            compare_versions_ord(a, b)
+        });
+    }
+
     let normalized = normalize_and_separators(branch);
     let normalized = &*normalized;
     let parts: Vec<&str> = normalized.split_whitespace().collect();
@@ -502,22 +675,24 @@ fn branch_bound(branch: &str) -> Option<BranchBound> {
     } else {
         parts
     };
-    let mut bound = BranchBound::unbounded();
+
+    let mut lower: Option<(String, bool)> = None;
+    let mut upper: Option<(String, bool)> = None;
     for part in parts {
+        if part.starts_with("!=") {
+            continue;
+        }
         let clause = clause_bound(part)?;
-        bound = BranchBound {
-            lower: tighter_lower(bound.lower, clause.lower),
-            upper: tighter_upper(bound.upper, clause.upper),
-        };
+        lower = tighter_lower(lower, clause.lower_edge().map(|(v, i)| (v.clone(), i)));
+        upper = tighter_upper(upper, clause.upper_edge().map(|(v, i)| (v.clone(), i)));
     }
-    if bound.is_unsatisfiable() {
-        return None;
-    }
-    Some(bound)
+    range_from_edges(lower, upper, |a: &String, b: &String| {
+        compare_versions_ord(a, b)
+    })
 }
 
 /// Whether `version` is explicitly excluded by an OR-alternation gap (#1601, same class as
-/// Maven's #1590 disjoint-range gap): not admitted by any `||`-branch, yet sitting past one
+/// Maven's #1590 disjoint-range gap): not admitted by any `||`/`|`-branch, yet sitting past one
 /// branch's upper edge and before another's lower edge — Composer's counterpart of
 /// `deps-maven`'s `range::explicitly_excludes`, generalized through
 /// [`deps_core::interval::union_gap_excludes`] (the same representation-agnostic predicate
@@ -525,7 +700,7 @@ fn branch_bound(branch: &str) -> Option<BranchBound> {
 ///
 /// Coverage is checked once, up front, via the real matcher
 /// (`ComposerFormatter::version_satisfies_requirement`) over the *whole* original requirement
-/// — not by re-deriving "covered" from the same [`BranchBound`]s used for edge detection
+/// — not by re-deriving "covered" from the same [`VersionRange`]s used for edge detection
 /// (impl-critic S2): a branch whose bound [`branch_bound`] cannot characterize (caret/tilde/
 /// bare-partial — see [`clause_bound`]'s doc) is filtered out of the `branches` list entirely,
 /// so a bound-derived "covered" check could never see a candidate that only the *real* matcher
@@ -549,32 +724,28 @@ fn composer_or_gap_excludes(version: &str, requirement: &str) -> bool {
     let Some(stripped_requirement) = strip_branch_affixes(requirement) else {
         return false;
     };
-    if !stripped_requirement.contains("||") {
+    if !stripped_requirement.contains('|') {
         return false;
     }
-    let branches: Vec<BranchBound> = stripped_requirement
-        .split("||")
+    let raw_branches = split_or_branches(stripped_requirement);
+    if has_blank_or_branch(&raw_branches) {
+        return false;
+    }
+    let branches: Vec<VersionRange<String>> = raw_branches
+        .into_iter()
         .filter_map(|b| branch_bound(b.trim()))
         .collect();
     let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
-    let cmp = |a: &str, b: &String| compare_versions(a, b.as_str()).cmp(&0);
+    let cmp = |a: &str, b: &String| compare_versions_ord(a, b);
     deps_core::interval::union_gap_excludes(
         &branches,
         // Coverage is already ruled out by the real-matcher check above.
-        |_: &BranchBound| false,
-        |b: &BranchBound| {
-            deps_core::interval::admits_at_or_above(
-                version,
-                b.upper.as_ref().map(|(v, i)| (v, *i)),
-                cmp,
-            )
+        |_: &VersionRange<String>| false,
+        |b: &VersionRange<String>| {
+            deps_core::interval::admits_at_or_above(version, b.upper_edge(), cmp)
         },
-        |b: &BranchBound| {
-            deps_core::interval::admits_at_or_below(
-                version,
-                b.lower.as_ref().map(|(v, i)| (v, *i)),
-                cmp,
-            )
+        |b: &VersionRange<String>| {
+            deps_core::interval::admits_at_or_below(version, b.lower_edge(), cmp)
         },
     )
 }
@@ -1466,22 +1637,242 @@ mod tests {
         assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.6"), "~1.0 !=1.0.5"));
     }
 
-    /// impl-critic M2 (corrected per team-lead: Composer's docs DO define a "Hyphenated
-    /// Version Range", `"1.0 - 2.0"` == `">=1.0.0 <2.1"` — this is valid `composer/semver`
-    /// grammar, not npm/node-semver-only syntax as an earlier version of this doc claimed).
-    /// This grammar is simply not implemented by `walk_requirement`/`clause_bound` yet
-    /// (tracked as a follow-up issue, not fixed here) — the bare `"-"` token is parsed as an
-    /// ordinary AND-clause that can never match any real version, so the whole AND-group fails
-    /// closed (matches nothing) rather than resolving the hyphenated range correctly. S3's
-    /// unconditional AND-split changed this specific unimplemented-input's behavior as a side
-    /// effect: it previously fell back to a silent partial-match on `"1.0"` alone; failing
-    /// closed is the safer of the two wrong answers until hyphen-range support is added.
+    /// #1608: composer/semver's Hyphenated Version Range grammar, `"1.0 - 2.0"` ==
+    /// `">=1.0.0 <2.1"` (verified against `composer/semver`'s own
+    /// `VersionParser::parseConstraints` hyphen-range regex), is now resolved by
+    /// `walk_requirement`/`clause_bound` instead of failing closed.
     #[test]
-    fn test_hyphen_range_syntax_is_unimplemented_and_fails_closed() {
+    fn test_hyphen_range_syntax_is_admitted() {
         let f = ComposerFormatter;
-        for v in ["1.0.0", "1.5.0", "2.0.0", "0.5.0"] {
-            assert!(!f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0"));
+        for v in ["1.0.0", "1.5.0", "2.0.0", "2.0.9"] {
+            assert!(
+                f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0"),
+                "{v} should be admitted by \"1.0 - 2.0\""
+            );
         }
+        // Below the lower bound, or at/above the exclusive upper bound (`2.1`, not `2.0`).
+        for v in ["0.5.0", "2.1.0", "3.0.0"] {
+            assert!(
+                !f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0"),
+                "{v} should not be admitted by \"1.0 - 2.0\""
+            );
+        }
+    }
+
+    /// #1608: a hyphen embedded in a qualifier suffix directly adjacent to the version text
+    /// (`1.0.0-alpha`, no surrounding whitespace) must not be mistaken for the hyphen-range
+    /// separator — only a space-hyphen-space (`" - "`) counts.
+    #[test]
+    fn test_hyphen_range_lower_bound_carries_qualifier_suffix() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(
+            &ConcreteVersion::new("1.0.0-alpha"),
+            "1.0.0-alpha - 2.0.0"
+        ));
+        assert!(
+            !f.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "1.0.0-alpha - 2.0.0")
+        );
+    }
+
+    /// #1608: a plain (non-OR, non-`!=`) hyphen range never itself explicitly excludes a
+    /// version — same as any other ordinary range clause.
+    #[test]
+    fn test_hyphen_range_never_explicitly_excludes_alone() {
+        assert!(!composer_explicitly_excludes("1.5.0", "1.0 - 2.0"));
+        assert!(!composer_explicitly_excludes("5.0.0", "1.0 - 2.0"));
+    }
+
+    /// #1608: two hyphen-range `||`-branches with a real gap between them are detected by the
+    /// same OR-alternation-gap check the other clause shapes already exercise.
+    #[test]
+    fn test_hyphen_range_or_gap_detected() {
+        let req = "1.0 - 1.4 || 1.6 - 2.0";
+        assert!(composer_explicitly_excludes("1.5.0", req));
+        assert!(!composer_explicitly_excludes("1.2.0", req));
+        assert!(!composer_explicitly_excludes("1.8.0", req));
+        assert!(!composer_explicitly_excludes("0.5.0", req));
+        assert!(!composer_explicitly_excludes("2.5.0", req));
+    }
+
+    /// #1608: a malformed hyphen-adjacent shape (a second ` - ` landing inside what would be
+    /// the upper bound) is not mistaken for a valid range — it falls through to the prior
+    /// fail-closed AND-split behavior, same as any other unrecognized shape.
+    #[test]
+    fn test_hyphen_range_malformed_shape_fails_closed() {
+        let f = ComposerFormatter;
+        for v in ["1.0.0", "1.5.0", "2.0.0", "3.0.0"] {
+            assert!(!f.version_satisfies_requirement(&ConcreteVersion::new(v), "1.0 - 2.0 - 3.0"));
+        }
+    }
+
+    /// #1609: composer/semver's `VersionParser::parseConstraints` splits OR-branches on
+    /// `preg_split('{\s*\|\|?\s*}', ...)`, which accepts a lone `|` exactly like the documented
+    /// `||` — `walk_requirement` must treat both identically.
+    #[test]
+    fn test_single_pipe_or_separator_equivalent_to_double() {
+        let f = ComposerFormatter;
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "1.0.0 | 2.0.0"));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "1.0.0 | 2.0.0"));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("3.0.0"), "1.0.0 | 2.0.0"));
+    }
+
+    /// #1609: the OR-alternation-gap check must reach a single-pipe-separated union exactly
+    /// like a `||`-separated one.
+    #[test]
+    fn test_single_pipe_or_gap_detected() {
+        let req = ">=1.0 <1.5 | >1.5 <2.0";
+        assert!(composer_explicitly_excludes("1.5.0", req));
+        assert!(!composer_explicitly_excludes("1.2.0", req));
+        assert!(!composer_explicitly_excludes("1.8.0", req));
+    }
+
+    #[test]
+    fn test_split_or_branches_single_and_double_pipe() {
+        assert_eq!(split_or_branches("A || B"), ["A ", " B"]);
+        assert_eq!(split_or_branches("A | B"), ["A ", " B"]);
+        assert_eq!(split_or_branches("A || B || C"), ["A ", " B ", " C"]);
+        // A run of 3+ pipes collapses to a single separator, not multiple empty branches.
+        assert_eq!(split_or_branches("A ||| B"), ["A ", " B"]);
+        assert_eq!(split_or_branches("A |||| B"), ["A ", " B"]);
+    }
+
+    /// impl-critic M1: a degenerate separator shape (two runs with only whitespace between
+    /// them, or a trailing run) must produce a genuinely blank segment instead of silently
+    /// dropping it — [`has_blank_or_branch`] is what the caller uses to detect and reject it.
+    #[test]
+    fn test_split_or_branches_blank_segment_from_degenerate_separators() {
+        assert!(has_blank_or_branch(&split_or_branches("A || || B")));
+        assert!(has_blank_or_branch(&split_or_branches("A ||")));
+        assert!(has_blank_or_branch(&split_or_branches("|| A")));
+        // A single run (however long) never produces a blank segment on its own.
+        assert!(!has_blank_or_branch(&split_or_branches("A |||| B")));
+        assert!(!has_blank_or_branch(&split_or_branches("A || B")));
+    }
+
+    /// impl-critic M1: the blank-OR-branch shapes above must fail the whole requirement closed
+    /// (both admit and explicitly-excludes) rather than being treated as an implicit wildcard
+    /// branch.
+    #[test]
+    fn test_blank_or_branch_fails_requirement_closed() {
+        let f = ComposerFormatter;
+        for req in ["^1.0 ||", "^1.0 || || ^2.0", "|| ^1.0"] {
+            assert!(
+                !f.version_satisfies_requirement(&ConcreteVersion::new("9.9.9"), req),
+                "{req}"
+            );
+            assert!(!composer_explicitly_excludes("9.9.9", req), "{req}");
+        }
+        // A single run of 3+ pipes is not itself a blank-branch shape — still a normal OR.
+        assert!(
+            f.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "1.0.0 |||| 2.0.0")
+        );
+    }
+
+    #[test]
+    fn test_split_hyphen_range_accepts_and_rejects() {
+        assert_eq!(split_hyphen_range("1.0 - 2.0"), Some(("1.0", "2.0")));
+        assert_eq!(
+            split_hyphen_range("1.0.0-alpha - 2.0.0"),
+            Some(("1.0.0-alpha", "2.0.0"))
+        );
+        // impl-critic M2: multiple spaces on either side of the hyphen are still recognized
+        // (composer/semver's own grammar is ` +- +`, one or more spaces each side).
+        assert_eq!(split_hyphen_range("1.0  -  2.0"), Some(("1.0", "2.0")));
+        assert_eq!(split_hyphen_range("1.0 -   2.0"), Some(("1.0", "2.0")));
+        // No spaces around the hyphen: a qualifier suffix, not a range.
+        assert_eq!(split_hyphen_range("1.0.0-alpha"), None);
+        // A third token (whether another `-`-joined segment or an AND-combined clause) is not
+        // yet supported — exactly 3 whitespace-separated tokens required (impl-critic M2/D2).
+        assert_eq!(split_hyphen_range("1.0 - 2.0 - 3.0"), None);
+        assert_eq!(split_hyphen_range("1.0 - 2.0 !=1.4.0"), None);
+        assert_eq!(split_hyphen_range("1.0"), None);
+        assert_eq!(split_hyphen_range(" - 2.0"), None);
+        assert_eq!(split_hyphen_range("1.0 - "), None);
+    }
+
+    #[test]
+    fn test_has_valid_version_core() {
+        assert!(has_valid_version_core("1.0"));
+        assert!(has_valid_version_core("1.0.0"));
+        assert!(has_valid_version_core("v1.0"));
+        assert!(has_valid_version_core("1.0.0-alpha"));
+        // impl-critic S1: an operator-prefixed or non-numeric bound must not pass.
+        assert!(!has_valid_version_core("^1.0"));
+        assert!(!has_valid_version_core(">=1.0"));
+        assert!(!has_valid_version_core("abc"));
+        assert!(!has_valid_version_core(""));
+    }
+
+    /// impl-critic S1: a hyphen range whose `lo` isn't a valid bare version must not silently
+    /// become version `0` via `compare_versions`' own `unwrap_or(0)` fallback — the whole
+    /// requirement must fail closed instead of admitting everything below `hi`.
+    #[test]
+    fn test_hyphen_range_invalid_lower_bound_fails_closed() {
+        let f = ComposerFormatter;
+        for req in ["^1.0 - 2.0", ">=1.0 - 2.0", "abc - 2.0"] {
+            assert!(
+                !f.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), req),
+                "{req}"
+            );
+            assert!(
+                !f.version_satisfies_requirement(&ConcreteVersion::new("1.9.0"), req),
+                "{req}"
+            );
+        }
+    }
+
+    /// impl-critic S2: composer/semver's own docs, `"1.0.0 - 2.1.0"` == `">=1.0.0 <=2.1.0"` —
+    /// a "full" (3-segment) `hi` is admitted up to and including itself, unlike the partial
+    /// (2-segment) `hi` case, which excludes even a same-core prerelease (see the next test).
+    #[test]
+    fn test_hyphen_range_full_upper_bound_is_inclusive() {
+        let f = ComposerFormatter;
+        let req = "1.0.0 - 2.1.0";
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0"), req));
+        // A prerelease/finer-grained version at the same numeric core sorts above a bare
+        // `<=2.1.0` boundary under `compare_versions`' own qualifier precedence, so it is
+        // correctly excluded (this was the exact bug impl-critic S2 found: the old
+        // always-exclusive `<2.2` implementation incorrectly admitted both of these).
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.1-RC1"), req));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0.1"), req));
+    }
+
+    /// impl-critic S2: a "partial" (fewer than 3 numeric segments, no suffix) `hi` widens to a
+    /// `-dev`-floored exclusive upper bound, so a same-core prerelease is correctly excluded —
+    /// unlike a plain `<incremented` bound, which a prerelease sorts below and would slip
+    /// through.
+    #[test]
+    fn test_hyphen_range_partial_upper_bound_excludes_same_core_prerelease() {
+        let f = ComposerFormatter;
+        let req = "1.0 - 2.0";
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.9"), req));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0-beta"), req));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.1.0"), req));
+    }
+
+    /// impl-critic S2: a `hi` that already carries its own stability suffix is treated as
+    /// "full" (inclusive) regardless of its numeric segment count.
+    #[test]
+    fn test_hyphen_range_qualified_upper_bound_is_inclusive() {
+        let f = ComposerFormatter;
+        let req = "1.0.0 - 2.0.0-beta";
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0-beta"), req));
+        assert!(f.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), req));
+        // A stable release at the same core outranks the `-beta` boundary, so it's excluded.
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), req));
+        assert!(!f.version_satisfies_requirement(&ConcreteVersion::new("2.0.1"), req));
+    }
+
+    #[test]
+    fn test_increment_last_segment() {
+        assert_eq!(increment_last_segment("1.0"), Some("1.1".to_string()));
+        assert_eq!(increment_last_segment("2"), Some("3".to_string()));
+        // Non-numeric segments must not fabricate a `0` bound (#1610).
+        assert_eq!(increment_last_segment("abc"), None);
+        assert_eq!(increment_last_segment(""), None);
+        assert_eq!(increment_last_segment("1.abc"), None);
+        // An already-maximal last segment must not saturate to a wrong, collapsed value.
+        assert_eq!(increment_last_segment(&format!("1.{}", u64::MAX)), None);
     }
 
     /// A trailing/bare comma with nothing meaningful on one side must not panic or leave

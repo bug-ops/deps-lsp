@@ -67,6 +67,154 @@ pub enum VersionRange<V> {
     Empty,
 }
 
+impl<V> VersionRange<V> {
+    /// This range's upper edge, if any — `(bound, inclusive)`. `Minimum` (open-ended above)
+    /// and `Empty` (admits nothing) have none.
+    ///
+    /// Shared edge accessor for union-gap detection (`deps-maven`'s disjoint-range-union check,
+    /// `deps-composer`'s OR-alternation check, #1610): both derive a member's edges through this
+    /// method instead of independently re-matching `VersionRange`'s variants.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::interval::VersionRange;
+    ///
+    /// let bounded = VersionRange::Bounded {
+    ///     min: "1.0".to_string(),
+    ///     min_inclusive: true,
+    ///     max: "2.0".to_string(),
+    ///     max_inclusive: false,
+    /// };
+    /// assert_eq!(bounded.upper_edge(), Some((&"2.0".to_string(), false)));
+    ///
+    /// let minimum = VersionRange::Minimum {
+    ///     version: "1.5".to_string(),
+    ///     inclusive: true,
+    /// };
+    /// assert_eq!(minimum.upper_edge(), None);
+    /// ```
+    pub fn upper_edge(&self) -> Option<(&V, bool)> {
+        match self {
+            Self::Exact(v) => Some((v, true)),
+            Self::Maximum { version, inclusive } => Some((version, *inclusive)),
+            Self::Bounded {
+                max, max_inclusive, ..
+            } => Some((max, *max_inclusive)),
+            Self::Minimum { .. } | Self::Empty => None,
+        }
+    }
+
+    /// This range's lower edge, if any — `(bound, inclusive)`. `Maximum` (open-ended below)
+    /// and `Empty` (admits nothing) have none. See [`Self::upper_edge`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::interval::VersionRange;
+    ///
+    /// let bounded = VersionRange::Bounded {
+    ///     min: "1.0".to_string(),
+    ///     min_inclusive: true,
+    ///     max: "2.0".to_string(),
+    ///     max_inclusive: false,
+    /// };
+    /// assert_eq!(bounded.lower_edge(), Some((&"1.0".to_string(), true)));
+    ///
+    /// let maximum = VersionRange::Maximum {
+    ///     version: "2.0".to_string(),
+    ///     inclusive: false,
+    /// };
+    /// assert_eq!(maximum.lower_edge(), None);
+    /// ```
+    pub fn lower_edge(&self) -> Option<(&V, bool)> {
+        match self {
+            Self::Exact(v) => Some((v, true)),
+            Self::Minimum { version, inclusive } => Some((version, *inclusive)),
+            Self::Bounded {
+                min, min_inclusive, ..
+            } => Some((min, *min_inclusive)),
+            Self::Maximum { .. } | Self::Empty => None,
+        }
+    }
+}
+
+/// Builds the [`VersionRange::Bounded`]/[`VersionRange::Empty`] shape from a min/max edge pair,
+/// applying the same unsatisfiable-shape detection [`parse_interval`] uses for a syntactic
+/// bracket interval (#1595: `min > max`, or `min == max` with either edge exclusive, collapses
+/// to [`VersionRange::Empty`] rather than a literal `Bounded` shape that admits nothing).
+fn bounded_or_empty<V>(
+    min: V,
+    min_inclusive: bool,
+    max: V,
+    max_inclusive: bool,
+    cmp_bound: impl Fn(&V, &V) -> Ordering,
+) -> VersionRange<V> {
+    let ord = cmp_bound(&min, &max);
+    let unsatisfiable =
+        ord == Ordering::Greater || (ord == Ordering::Equal && !(min_inclusive && max_inclusive));
+    if unsatisfiable {
+        VersionRange::Empty
+    } else {
+        VersionRange::Bounded {
+            min,
+            min_inclusive,
+            max,
+            max_inclusive,
+        }
+    }
+}
+
+/// Builds a [`VersionRange`] from a min/max edge pair derived independently of bracket syntax.
+///
+/// Intended for a caller like Composer's per-`||`-branch bound, AND-intersected clause by
+/// clause (#1610) — reuses [`parse_interval`]'s own unsatisfiable-shape detection (via the same
+/// internal helper) rather than re-deriving it.
+///
+/// Returns `None` only when both edges are absent: "no constraint at all" (open on both sides)
+/// has no `VersionRange` shape to express it as — bracket syntax has no such form either (see
+/// [`parse_interval`]'s `(ParsedBound::Open, ParsedBound::Open) => None` case) — so the caller
+/// decides what an edge-less bound means for its own use case.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::interval::{VersionRange, range_from_edges};
+///
+/// let cmp = |a: &String, b: &String| a.cmp(b);
+/// let range = range_from_edges(Some(("1.0".to_string(), true)), Some(("2.0".to_string(), false)), cmp);
+/// assert_eq!(
+///     range,
+///     Some(VersionRange::Bounded {
+///         min: "1.0".to_string(),
+///         min_inclusive: true,
+///         max: "2.0".to_string(),
+///         max_inclusive: false,
+///     })
+/// );
+///
+/// // Both edges absent has no `VersionRange` shape.
+/// assert_eq!(range_from_edges::<String>(None, None, cmp), None);
+/// ```
+pub fn range_from_edges<V>(
+    min: Option<(V, bool)>,
+    max: Option<(V, bool)>,
+    cmp_bound: impl Fn(&V, &V) -> Ordering,
+) -> Option<VersionRange<V>> {
+    match (min, max) {
+        (Some((min, min_inclusive)), Some((max, max_inclusive))) => Some(bounded_or_empty(
+            min,
+            min_inclusive,
+            max,
+            max_inclusive,
+            cmp_bound,
+        )),
+        (Some((version, inclusive)), None) => Some(VersionRange::Minimum { version, inclusive }),
+        (None, Some((version, inclusive))) => Some(VersionRange::Maximum { version, inclusive }),
+        (None, None) => None,
+    }
+}
+
 /// Selects the delimiter grammar [`parse_interval`] accepts.
 ///
 /// `Standard` is Maven's/NuGet's grammar: `[`/`]` are inclusive, `(`/`)` are exclusive, and no
@@ -203,21 +351,13 @@ pub fn parse_interval<V>(
         let max = parse_bound_side(hi.trim(), &parse_bound);
         match (min, max) {
             (ParsedBound::Invalid, _) | (_, ParsedBound::Invalid) => None,
-            (ParsedBound::Value(min), ParsedBound::Value(max)) => {
-                let ord = cmp_bound(&min, &max);
-                let unsatisfiable = ord == Ordering::Greater
-                    || (ord == Ordering::Equal && !(min_inclusive && max_inclusive));
-                if unsatisfiable {
-                    Some(VersionRange::Empty)
-                } else {
-                    Some(VersionRange::Bounded {
-                        min,
-                        min_inclusive,
-                        max,
-                        max_inclusive,
-                    })
-                }
-            }
+            (ParsedBound::Value(min), ParsedBound::Value(max)) => Some(bounded_or_empty(
+                min,
+                min_inclusive,
+                max,
+                max_inclusive,
+                cmp_bound,
+            )),
             (ParsedBound::Value(version), ParsedBound::Open) => Some(VersionRange::Minimum {
                 version,
                 inclusive: min_inclusive,
@@ -683,6 +823,83 @@ mod tests {
             Member::Unknown => true,
         };
         assert!(union_gap_excludes(&members, covers, above, below));
+    }
+
+    #[test]
+    fn test_upper_edge_lower_edge_per_variant() {
+        let bounded = parse_str("[1.0,2.0)", BracketStyle::Standard).unwrap();
+        assert_eq!(bounded.upper_edge(), Some((&"2.0".to_string(), false)));
+        assert_eq!(bounded.lower_edge(), Some((&"1.0".to_string(), true)));
+
+        let min = parse_str("[1.5,)", BracketStyle::Standard).unwrap();
+        assert_eq!(min.upper_edge(), None);
+        assert_eq!(min.lower_edge(), Some((&"1.5".to_string(), true)));
+
+        let max = parse_str("(,2.0]", BracketStyle::Standard).unwrap();
+        assert_eq!(max.upper_edge(), Some((&"2.0".to_string(), true)));
+        assert_eq!(max.lower_edge(), None);
+
+        let exact = parse_str("[1.0]", BracketStyle::Standard).unwrap();
+        assert_eq!(exact.upper_edge(), Some((&"1.0".to_string(), true)));
+        assert_eq!(exact.lower_edge(), Some((&"1.0".to_string(), true)));
+
+        let empty: VersionRange<String> = VersionRange::Empty;
+        assert_eq!(empty.upper_edge(), None);
+        assert_eq!(empty.lower_edge(), None);
+    }
+
+    #[test]
+    fn test_range_from_edges_builds_expected_shapes() {
+        let cmp = |a: &String, b: &String| a.cmp(b);
+        let v = |s: &str| (s.to_string(), true);
+
+        assert_eq!(
+            range_from_edges(Some(v("1.0")), Some(("2.0".to_string(), false)), cmp),
+            Some(VersionRange::Bounded {
+                min: "1.0".to_string(),
+                min_inclusive: true,
+                max: "2.0".to_string(),
+                max_inclusive: false,
+            })
+        );
+        assert_eq!(
+            range_from_edges(Some(v("1.5")), None, cmp),
+            Some(VersionRange::Minimum {
+                version: "1.5".to_string(),
+                inclusive: true,
+            })
+        );
+        assert_eq!(
+            range_from_edges(None, Some(v("2.0")), cmp),
+            Some(VersionRange::Maximum {
+                version: "2.0".to_string(),
+                inclusive: true,
+            })
+        );
+        assert_eq!(range_from_edges::<String>(None, None, cmp), None);
+    }
+
+    /// #1595 parity: `range_from_edges` must apply the same unsatisfiable-shape detection
+    /// `parse_interval` does for a syntactic bracket interval.
+    #[test]
+    fn test_range_from_edges_unsatisfiable_shapes_are_empty() {
+        let cmp = |a: &String, b: &String| a.cmp(b);
+        assert_eq!(
+            range_from_edges(
+                Some(("5.0".to_string(), true)),
+                Some(("3.0".to_string(), true)),
+                cmp
+            ),
+            Some(VersionRange::Empty)
+        );
+        assert_eq!(
+            range_from_edges(
+                Some(("3.0".to_string(), false)),
+                Some(("3.0".to_string(), true)),
+                cmp
+            ),
+            Some(VersionRange::Empty)
+        );
     }
 
     /// A candidate covered by any member is never excluded, regardless of how many other

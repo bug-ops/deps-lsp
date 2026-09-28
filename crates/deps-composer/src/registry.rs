@@ -144,20 +144,21 @@ fn select_latest_for_existence_composer<T>(
 ///
 /// [`crate::formatter::strip_stability_flag`] applies `rfind('@')` to the *whole* string,
 /// which only works for a single unadorned constraint like `^1.0@beta`. A compound
-/// requirement splits into multiple constraint tokens — `||` (OR) and, within a
+/// requirement splits into multiple constraint tokens — `||`/`|` (OR, #1609) and, within a
 /// space-separated range, individual tokens like `>=1.0@dev` — and each token may carry its
 /// own flag. `version_satisfies_requirement` already recurses per token to evaluate the
-/// version range correctly; this mirrors that same split (flattened, since only "is there a
-/// flag" is needed here, not per-branch matching) so `^1.0@beta || ^2.0` and
-/// `>=1.0@dev <2.0` are not silently treated as flag-less.
+/// version range correctly; this mirrors that same split (via the shared
+/// [`crate::formatter::split_or_branches`], flattened, since only "is there a flag" is needed
+/// here, not per-branch matching) so `^1.0@beta || ^2.0` and `>=1.0@dev <2.0` are not silently
+/// treated as flag-less.
 ///
 /// Returns the *loosest* floor among every token's flag (if more than one token carries one):
 /// this never wrongly excludes a version some branch's flag would admit — the final
 /// `version_satisfies_requirement` call still narrows down to which branch, if any, actually
 /// matches.
 fn compound_stability_flag(req_str: &str) -> Option<StabilityFloor> {
-    req_str
-        .split("||")
+    crate::formatter::split_or_branches(req_str)
+        .into_iter()
         .flat_map(str::split_whitespace)
         .filter_map(|token| {
             let (_, flag) = crate::formatter::strip_stability_flag(token.trim());
@@ -2007,6 +2008,16 @@ mod tests {
             "the loosest flag among branches must win"
         );
         assert_eq!(compound_stability_flag("^1.0 || ^2.0"), None);
+    }
+
+    /// #1609: a single `|` splits identically to `||` (composer/semver's own
+    /// `VersionParser::parseConstraints` accepts both).
+    #[test]
+    fn test_compound_stability_flag_single_pipe_separator() {
+        assert_eq!(
+            compound_stability_flag("^1.0@beta | ^2.0"),
+            Some(StabilityFloor::Beta)
+        );
     }
 
     // --- #424 critique S2: separator-less short-alias (a/b) and dev, end-to-end ---
