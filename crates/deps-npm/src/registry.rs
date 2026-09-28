@@ -1590,7 +1590,9 @@ mod tests {
     /// `node_semver` 2.2.0 rather than returning `Err`, crashing this hot request-handling
     /// path (hover/completion/diagnostics all resolve through `select_latest_matching`).
     /// Asserts the panic is now caught and folds into the same `None` an ordinary
-    /// unparseable requirement already produces.
+    /// unparseable requirement already produces. `~1.x.3`/`~>1.x.3` are deliberately excluded
+    /// here since #1646 gave them a real, precise resolution instead — see
+    /// `formatter::tests::test_compile_requirement_tilde_wildcard_patch_resolves_precisely`.
     #[test]
     fn test_select_latest_matching_tilde_wildcard_does_not_panic() {
         use deps_core::{Registry, VersionReq};
@@ -1602,7 +1604,7 @@ mod tests {
             deprecation: NpmDeprecation::Active,
             published_at: None,
         })];
-        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+        for requirement in ["~*", "~x", "~X", "=*", "~>x.2.3"] {
             let req = VersionReq::new(requirement);
             assert_eq!(
                 registry.select_latest_matching(
@@ -1684,7 +1686,8 @@ mod tests {
     /// #1630: a `~*`-shaped requirement used to panic `node_semver::Range::parse` instead
     /// of returning `Err`, crashing the request handler on the main thread (DoS from an
     /// untrusted `package.json`). Now caught and folded into the same `Err` path an
-    /// ordinary unparseable requirement already takes.
+    /// ordinary unparseable requirement already takes. `~1.x.3`/`~>1.x.3` are deliberately
+    /// excluded here since #1646 gave them a real, precise resolution instead.
     #[tokio::test]
     async fn test_get_latest_matching_tilde_wildcard_does_not_panic() {
         let mut server = mockito::Server::new_async().await;
@@ -1699,7 +1702,7 @@ mod tests {
             .create_async()
             .await;
 
-        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+        for requirement in ["~*", "~x", "~X", "=*", "~>x.2.3"] {
             let err = registry
                 .get_latest_matching("left-pad", requirement)
                 .await
