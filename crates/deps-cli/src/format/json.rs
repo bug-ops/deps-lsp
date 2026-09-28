@@ -3,7 +3,8 @@
 //! Schema mirrors `specs/062-cli-check-mode/plan.md` §4 exactly. `schema_version` lets
 //! downstream tooling detect a future breaking change to this shape (constitution
 //! principle 8) — bump it, and document the bump in `CHANGELOG.md` as `Breaking`, whenever
-//! a field is renamed or removed (adding a new optional field is not itself a bump).
+//! a field is renamed, removed, or its wire type/nullability changes (e.g. a sentinel value
+//! like `""` becoming `null`); adding a new optional field is not itself a bump.
 
 use super::{DryRun, severity_str};
 use crate::report::CheckReport;
@@ -125,7 +126,7 @@ pub fn render(report: &CheckReport) -> Result<String, serde_json::Error> {
 }
 
 /// The current `schema_version` [`update_to_document`] emits.
-pub const UPDATE_SCHEMA_VERSION: u32 = 1;
+pub const UPDATE_SCHEMA_VERSION: u32 = 2;
 
 /// Top-level JSON document shape for an `update` run (FR-021).
 #[derive(Debug, Serialize, serde::Deserialize, PartialEq)]
@@ -147,10 +148,10 @@ pub struct UpdateItemDocument {
     pub name: String,
     /// The current (resolved in-use, or declared) version.
     pub current: String,
-    /// The version this item's edit would move the dependency to, when applicable — empty
+    /// The version this item's edit would move the dependency to, when applicable — `null`
     /// when the item has no concrete target ([`crate::update::PlannedUpdateItem::target`]
     /// returns `None`).
-    pub target: String,
+    pub target: Option<String>,
     /// One of `applied` / `skipped` / `requires-lockfile-update` / `unfixable`.
     pub outcome: String,
     /// A one-line human-readable reason for `outcome`.
@@ -208,9 +209,9 @@ pub fn update_to_document(
         .map(|item| UpdateItemDocument {
             name: crate::sanitize::sanitize_message_for_display(&item.name),
             current: crate::sanitize::sanitize_message_for_display(&item.current.render_text()),
-            target: item.target().map_or_else(String::new, |v| {
-                crate::sanitize::sanitize_message_for_display(v.as_str())
-            }),
+            target: item
+                .target()
+                .map(|v| crate::sanitize::sanitize_message_for_display(v.as_str())),
             outcome: item.outcome.wire_token().to_string(),
             reason: crate::sanitize::sanitize_message_for_display(&item.reason()),
             advisory_ids: item.advisory_ids.clone(),
@@ -377,7 +378,7 @@ mod tests {
         let item = &document.items[0];
         assert_eq!(item.name, "serde");
         assert_eq!(item.current, "1.0.0");
-        assert_eq!(item.target, "1.2.0");
+        assert_eq!(item.target.as_deref(), Some("1.2.0"));
         assert_eq!(item.outcome, "applied");
         assert_eq!(item.advisory_ids, vec!["RUSTSEC-2024-0001".to_string()]);
     }
@@ -393,17 +394,31 @@ mod tests {
         assert_eq!(parsed, update_to_document(&plan, DryRun::No));
     }
 
-    /// #1605: `None` (empty/no target) maps to `""` on the wire, byte-identical to the
-    /// pre-#1605 `String`-with-`""`-sentinel convention — no `UPDATE_SCHEMA_VERSION` bump.
+    /// #1629: `None` (empty/no target) maps to `null` on the wire (`UPDATE_SCHEMA_VERSION`
+    /// bumped to 2), replacing the pre-#1629 `""`-sentinel convention. Asserts the rendered
+    /// JSON text itself, not just the struct-level `Option`, so a future accidental
+    /// `skip_serializing_if` regression (key *absent* instead of present-and-`null`) is caught.
     #[test]
-    fn test_update_to_document_none_target_renders_empty_string() {
+    fn test_update_to_document_none_target_renders_null() {
         let item = update_item(crate::update::Outcome::Skipped {
             reason: crate::update::SkipReason::NotRequested,
             target: None,
         });
         let plan = crate::update::UpdatePlan { items: vec![item] };
         let document = update_to_document(&plan, DryRun::No);
-        assert_eq!(document.items[0].target, "");
+        assert_eq!(document.items[0].target, None);
+
+        let rendered = render_update(&plan, DryRun::No).expect("render must succeed");
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("must parse");
+        let target = value["items"][0]
+            .as_object()
+            .expect("item must be an object")
+            .get("target")
+            .expect("target key must be present, not omitted");
+        assert!(
+            target.is_null(),
+            "target must render as null, got: {target:?}"
+        );
     }
 
     /// #1605 critic S1: `target` and `reason`/`cooldown_fallback` both carry unvalidated
@@ -429,8 +444,9 @@ mod tests {
         };
         let document = update_to_document(&plan, DryRun::No);
         let doc_item = &document.items[0];
-        assert!(!doc_item.target.contains('\x1B'));
-        assert!(doc_item.target.contains("1.2.0"));
+        let target = doc_item.target.as_deref().expect("target must be Some");
+        assert!(!target.contains('\x1B'));
+        assert!(target.contains("1.2.0"));
         assert!(!doc_item.reason.contains('\x1B'));
         match &doc_item.cooldown_fallback {
             Some(CooldownFallbackDocument::Blocked { version }) => {

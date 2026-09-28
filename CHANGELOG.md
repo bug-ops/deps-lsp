@@ -186,6 +186,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-core**: `deps-cli update --update-types` now classifies a GitHub Actions/GitLab CI SHA pin resolved via the tag index as Major/Minor/Patch instead of always Unknown (part of #1556) (#1572)
 
 ### Breaking
+- **deps-cli**: `format::json::UpdateItemDocument.target` is now `Option<String>` (serialized as `null`) instead of `String` with `""` for "no target"; `UPDATE_SCHEMA_VERSION` bumped to 2 (resolves #1629)
 - **deps-core**: `Ecosystem::fetch_license` now takes `&PackageName`/`&ConcreteVersion` instead of `&str`/`&str` (resolves #1593) (#1604)
 - **deps-engine**: `classify::license::tier3_license_targets`/`fetch_tier3_licenses` now use `(PackageName, ConcreteVersion)` targets instead of `(PackageName, String)` (part of #1593) (#1604)
 - **deps-core, deps-cli**: `edit::PlannedUpdate.current`/`cli::update::PlannedUpdateItem.current` are now `Option<ConcreteVersion>`/the new exhaustive `deps_cli::update::CurrentVersion` enum instead of `String`, removing the historical `""`-means-unresolved convention (resolves #1593) (#1604)
