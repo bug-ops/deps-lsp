@@ -2,11 +2,13 @@
 
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
 use deps_core::{
-    ConcreteVersion, InvalidPackageName, PackageName, VersionReq, is_safe_maven_coordinate_segment,
+    ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq,
+    is_safe_maven_coordinate_segment,
 };
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Gradle.
@@ -193,9 +195,14 @@ impl PackageRendering for GradleFormatter {
     /// a strict constraint to a normal one.
     ///
     /// Only the degenerate suffix form (`1.2.3!!`, no `preferredVersion`) is
-    /// rewritten — to `{version}!!` — since the strict pin itself is what "update
-    /// version" means to bump there, and there is nothing else in the requirement to
-    /// preserve. The full infix form (`[1.7,1.8[!!1.7.25`) is left unchanged rather
+    /// rewritten, since the strict pin itself is what "update version" means to bump
+    /// there and there is nothing else in the requirement to preserve — but the
+    /// `strictlyVersion` half itself is rewritten through the same shape-based
+    /// [`format_version_replacing_by_shape`]/[`bare_meaning`] logic as the no-marker
+    /// case below (#1602 follow-up: `[1.0,2.0)!!` was previously rewritten to
+    /// `{version}!!` unconditionally, dropping the strict range's own upper bound —
+    /// the exact widening bug class this whole method exists to prevent, just on
+    /// this sibling branch of the same `match`). The full infix form (`[1.7,1.8[!!1.7.25`) is left unchanged rather
     /// than rewriting the `preferredVersion` half: since Gradle's strict constraint
     /// always wins conflict resolution, bumping the preference to a version outside
     /// the hand-written strict range (a likely outcome for "update to latest") would
@@ -212,13 +219,33 @@ impl PackageRendering for GradleFormatter {
     /// [`deps_core::edit::replacement_text`] (the sole production caller), gated on
     /// [`RequirementResolution::requirement_is_placeholder`] — this method itself no longer
     /// needs to guard against `current` being unresolved.
+    ///
+    /// Once the strict-marker cases above are ruled out, delegates to the shared
+    /// [`format_version_replacing_by_shape`] with [`bare_meaning`] of [`EcosystemId::Gradle`]
+    /// (#1602: `BareMeaning::Floor`) — Gradle's bare version is a `require` constraint that
+    /// conflict resolution may still upgrade, not an auto-following range: collapsing a
+    /// bounded/bracket-interval range (`[1.0,2.0)`), a dynamic-version marker (`1.0.+`), or a
+    /// bracket-wrapped exact pin (`[1.0.0]`) to bare would silently drop its upper bound,
+    /// widening what the requirement accepts instead of updating it.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
         let trimmed = current.trim();
-        let version = version.as_str();
         match trimmed.split_once("!!") {
-            Some((_, "")) => format!("{version}!!"),
+            Some((strict, "")) => format!(
+                "{}!!",
+                format_version_replacing_by_shape(
+                    version,
+                    strict,
+                    bare_meaning(EcosystemId::Gradle),
+                    || self.format_version_for_text_edit(version),
+                )
+            ),
             Some(_) => trimmed.to_string(),
-            None => self.format_version_for_text_edit(&ConcreteVersion::new(version)),
+            None => format_version_replacing_by_shape(
+                version,
+                current,
+                bare_meaning(EcosystemId::Gradle),
+                || self.format_version_for_text_edit(version),
+            ),
         }
     }
 
@@ -340,6 +367,41 @@ mod tests {
         );
     }
 
+    /// #1602 (lead code-review): the degenerate suffix form's strict half must go through the
+    /// same shape-based refusal as the no-marker case — `[1.0,2.0)!!` was previously rewritten
+    /// unconditionally to `{version}!!`, silently dropping the strict range's own upper bound
+    /// (a valid requirement shape, already covered elsewhere by `test_compile_requirement_strict_range`).
+    #[test]
+    fn test_format_version_replacing_strict_bounded_range_refused() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("3.0.0"), "[1.0,2.0)!!"),
+            "[1.0,2.0)!!"
+        );
+    }
+
+    /// #1602: the strict half's own dynamic-version marker must be refused too, not just its
+    /// bracket-interval ranges.
+    #[test]
+    fn test_format_version_replacing_strict_dynamic_plus_refused() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("2.22.3"), "2.9.+!!"),
+            "2.9.+!!"
+        );
+    }
+
+    /// #1602: a bare strict pin still rewrites through to the new version, keeping the `!!`
+    /// marker — the positive control for the two refusal tests above.
+    #[test]
+    fn test_format_version_replacing_strict_bare_still_collapses() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.4"), "[1.0.0]!!"),
+            "[1.2.4]!!"
+        );
+    }
+
     #[test]
     fn test_format_version_replacing_no_marker_stays_plain() {
         let f = GradleFormatter;
@@ -384,6 +446,73 @@ mod tests {
         assert_eq!(
             f.format_version_replacing(&ConcreteVersion::new("9.9.9"), "[1.7,1.8[!!1.7.25 "),
             "[1.7,1.8[!!1.7.25"
+        );
+    }
+
+    /// #1602 repro: a bracket-interval range with an explicit upper bound must never collapse
+    /// to a bare version — that would silently drop the upper bound.
+    #[test]
+    fn test_format_version_replacing_bracket_range_refused() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("33.7.1-jre"), "[20.0,30.0)"),
+            "[20.0,30.0)"
+        );
+    }
+
+    /// #1602 repro: a dynamic-version marker (`2.9.+`) must never collapse to a bare version
+    /// either — same widening hazard as a bracket range.
+    #[test]
+    fn test_format_version_replacing_dynamic_plus_refused() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("2.22.3"), "2.9.+"),
+            "2.9.+"
+        );
+    }
+
+    /// #1602: unlike a bounded range or `+` dynamic prefix, `latest.release`/`latest.integration`
+    /// carry no upper bound to begin with (they already resolve to "whatever is newest"), so
+    /// collapsing them to a bare floor version does not widen anything — this locks in that
+    /// `format_version_replacing` still pins them to a concrete version instead of refusing.
+    #[test]
+    fn test_format_version_replacing_dynamic_latest_marker_collapses() {
+        let f = GradleFormatter;
+        for requirement in ["latest.release", "latest.integration"] {
+            assert_eq!(
+                f.format_version_replacing(&ConcreteVersion::new("2.22.3"), requirement),
+                "2.22.3",
+                "expected {requirement:?} to collapse to a bare version"
+            );
+        }
+    }
+
+    /// #1602: a bracket-wrapped exact pin keeps its bracket wrap on rewrite instead of
+    /// collapsing to an unbounded bare floor.
+    #[test]
+    fn test_format_version_replacing_bracket_exact_pin_preserved() {
+        let f = GradleFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("2.0.0"), "[1.0.0]"),
+            "[2.0.0]"
+        );
+    }
+
+    /// #1602: the shared conformance helper, deriving `BareMeaning` from `EcosystemId::Gradle`.
+    #[test]
+    fn test_bare_meaning_never_widens_bounded_range() {
+        deps_core::conformance::assert_bare_meaning_never_widens_bounded_range(
+            &GradleFormatter,
+            deps_core::EcosystemId::Gradle,
+            &[
+                "[20.0,30.0)",
+                "2.9.+",
+                "[1.7,1.8]",
+                // Lead code-review: the strict-marker suffix form's own bounded shape must be
+                // refused too, not just the no-marker case.
+                "[1.0,2.0)!!",
+                "2.9.+!!",
+            ],
         );
     }
 

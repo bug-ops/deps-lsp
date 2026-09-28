@@ -1444,4 +1444,40 @@ mod tests {
 
         assert_eq!(result, Some(ConcreteVersion::from("1.0.0")));
     }
+
+    /// #1602: `bare_requirement_policy` (in-use-version resolution) and `bare_meaning`
+    /// (rewrite safety, `lsp_helpers::formatter`) answer different questions and are allowed to
+    /// diverge for most ecosystems (see `bare_meaning`'s own doc for why Maven/Gradle are
+    /// exactly such a divergence) — but the one thing they must never disagree on is
+    /// "does a bare version auto-follow future releases at all": an ecosystem is
+    /// `BareRequirementPolicy::AlwaysRange` here if and only if it is `BareMeaning::Caret`
+    /// there. A future ecosystem wired to one of these functions but not the other, or wired
+    /// inconsistently, fails this loop instead of silently shipping a mismatched pair.
+    #[test]
+    fn bare_meaning_agrees_with_bare_requirement_policy_on_always_range() {
+        use crate::lsp_helpers::{BareMeaning, bare_meaning};
+
+        for &eco in EcosystemId::ALL {
+            let policy = bare_requirement_policy(eco);
+            let meaning = bare_meaning(eco);
+            match policy {
+                BareRequirementPolicy::AlwaysRange => assert_eq!(
+                    meaning,
+                    BareMeaning::Caret,
+                    "{eco:?}: AlwaysRange (bare is an auto-following range for in-use-version \
+                     resolution) must also be BareMeaning::Caret for rewrite-safety purposes"
+                ),
+                BareRequirementPolicy::ConcreteIfFullVersion | BareRequirementPolicy::Concrete => {
+                    assert_ne!(
+                        meaning,
+                        BareMeaning::Caret,
+                        "{eco:?}: a bare version usable as an in-use-version pin ({policy:?}) \
+                         cannot also carry BareMeaning::Caret rewrite semantics — an ecosystem \
+                         whose bare form doesn't auto-follow future releases cannot widen when a \
+                         bounded range collapses to bare either"
+                    );
+                }
+            }
+        }
+    }
 }

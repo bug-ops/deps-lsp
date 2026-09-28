@@ -1,10 +1,10 @@
 use deps_core::lsp_helpers::{
-    BareMeaning, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_semver_requirement,
-    format_version_replacing_by_shape,
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    compile_semver_requirement, format_version_replacing_by_shape,
 };
 use deps_core::parser::DependencySource;
-use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
 
 /// Maximum crate name length this diagnostic accepts.
 ///
@@ -90,9 +90,10 @@ impl PackageRendering for CargoFormatter {
     /// rewrite, and for `~1.2.3` silently widens a patch-level-only-compatible requirement into
     /// a minor-level-compatible one.
     ///
-    /// Delegates to the shared [`format_version_replacing_by_shape`] with
-    /// [`BareMeaning::Caret`] (#1577) — Cargo reads a bare version as an implicit caret range,
-    /// so under that `BareMeaning` the shared policy also refuses to rewrite two further shapes
+    /// Delegates to the shared [`format_version_replacing_by_shape`] with [`bare_meaning`] of
+    /// [`EcosystemId::Cargo`] (#1577: `BareMeaning::Caret`) — Cargo reads a bare version as an
+    /// implicit caret range, so under that `BareMeaning` the shared policy also refuses to
+    /// rewrite two further shapes
     /// with no safe single-value replacement:
     ///
     /// - A compound (comma-separated) requirement like `">=1.2, <1.5"` — collapsing it to a
@@ -119,9 +120,12 @@ impl PackageRendering for CargoFormatter {
     /// then classifies the dependency as [`deps_core::edit::UnplannableReason::NoOpRewrite`]
     /// instead of silently writing a rewrite that changes what the requirement admits.
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        format_version_replacing_by_shape(version, current, BareMeaning::Caret, || {
-            self.format_version_for_text_edit(version)
-        })
+        format_version_replacing_by_shape(
+            version,
+            current,
+            bare_meaning(EcosystemId::Cargo),
+            || self.format_version_for_text_edit(version),
+        )
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -410,6 +414,18 @@ mod tests {
         assert_eq!(
             formatter.format_version_replacing(&ConcreteVersion::new("2.0.0"), "*"),
             "2.0.0"
+        );
+    }
+
+    /// #1602: the shared conformance helper, deriving `BareMeaning` from `EcosystemId::Cargo` —
+    /// a regression guard that this workspace's bounded-range refusal invariant still holds for
+    /// the ecosystem #1577/#1584 originally fixed it for.
+    #[test]
+    fn test_bare_meaning_never_widens_bounded_range() {
+        deps_core::conformance::assert_bare_meaning_never_widens_bounded_range(
+            &CargoFormatter,
+            deps_core::EcosystemId::Cargo,
+            &[">=1.0.100, <1.0.150", "1.2.*", "<1.5"],
         );
     }
 
