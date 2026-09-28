@@ -1298,6 +1298,14 @@ jobs:
           - toml_lockfiles
           - json_lockfiles
           - deps_cli_config
+        # `requirement_matcher` is deliberately excluded from this execution matrix (mirroring
+        # `pypi_requirement`'s exclusion above): it found a real, unprotected `node_semver`
+        # panic (npm range parsing, unrelated to #1627's Composer/length-cap scope), tracked as
+        # #1630 (P0/security). Re-add once #1630 is fixed or its call sites are wrapped in
+        # `catch_unwind`, so this job's scheduled weekly sweep does not permanently fail on a
+        # known, already-tracked issue. Still covered by `fuzz-check`'s `cargo check
+        # --workspace` (compiles every run) and can be run locally/manually:
+        # `cargo +nightly fuzz run requirement_matcher`.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
