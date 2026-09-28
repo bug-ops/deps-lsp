@@ -333,6 +333,13 @@ fn version_matches_requirement(
     version: &ConcreteVersion,
     requirement: &crate::VersionReq,
 ) -> bool {
+    // #1627 defense-in-depth: `best_candidate_for_requirement` already bails out before ever
+    // calling this per candidate (its own `requirement_is_oversized` gate above), but this
+    // repeats the check here too so this function stays safe on its own if a future caller is
+    // added without that outer gate.
+    if super::requirement_is_oversized(requirement) {
+        return false;
+    }
     if let Some(matcher) = formatter.compile_requirement(requirement) {
         matcher.matches(version) == Some(true)
     } else {

@@ -790,11 +790,36 @@ pub trait RequirementResolution: Send + Sync {
     /// actionable sense. Ecosystems where a bare requirement is a minimum floor rather than an
     /// auto-following range (NuGet's bare `Version="1.0.0"`) must override this, since "does the
     /// floor accept `latest`" and "is the pin already `latest`" are different questions there.
+    ///
+    /// #1627 defense-in-depth: every in-crate caller of this default already gates on
+    /// [`crate::lsp_helpers::requirement_is_oversized`] first ([`Self::requirement_status`]'s
+    /// own gate, and the fallback-edit verdict in `lsp_helpers::mod`), so this repeats the
+    /// same check here — before either `caret_admits_up_to_date` or
+    /// [`Self::version_satisfies_requirement`] see the requirement text — so the default itself
+    /// stays safe for a caller — in this crate or outside it — that does not. An oversized
+    /// `requirement` never reaches either function this way — it is reported `true` (not
+    /// outdated), the same "unmodellable, suppressed" semantics those existing gates use.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementResolution};
+    /// use deps_core::{ConcreteVersion, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(DefaultFormatter.is_requirement_up_to_date(&oversized, &ConcreteVersion::new("1.0.0")));
+    /// ```
     fn is_requirement_up_to_date(
         &self,
         requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> bool {
+        if super::requirement_is_oversized(requirement) {
+            return true;
+        }
         caret_admits_up_to_date(latest.as_str(), requirement.as_str())
             .unwrap_or_else(|| self.version_satisfies_requirement(latest, requirement.as_str()))
     }
@@ -1032,10 +1057,16 @@ pub trait RequirementResolution: Send + Sync {
     /// accepted set. Override only when some requirement shape in this ecosystem instead
     /// resolves to something other than that newest member.
     ///
+    /// #1627 defense-in-depth: an oversized `requirement` never reaches
+    /// [`Self::compile_requirement`] — it collapses to `false`, the same fail-closed
+    /// "not already resolved, an edit may still be needed" result production call sites
+    /// (`plan_verified_fix`, the fallback-edit verdict) already apply by gating with
+    /// [`crate::lsp_helpers::requirement_is_oversized`] before calling this method.
+    ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementResolution};
     /// use deps_core::{ConcreteVersion, VersionReq};
     ///
     /// struct DefaultFormatter;
@@ -1047,12 +1078,21 @@ pub trait RequirementResolution: Send + Sync {
     ///     &VersionReq::new("^1.2"),
     ///     &ConcreteVersion::new("1.5.0")
     /// ));
+    ///
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(!DefaultFormatter.requirement_already_resolves_to(
+    ///     &oversized,
+    ///     &ConcreteVersion::new("1.5.0")
+    /// ));
     /// ```
     fn requirement_already_resolves_to(
         &self,
         requirement: &VersionReq,
         target: &ConcreteVersion,
     ) -> bool {
+        if super::requirement_is_oversized(requirement) {
+            return false;
+        }
         self.compile_requirement(requirement)
             .is_some_and(|matcher| matcher.matches(target) == Some(true))
     }

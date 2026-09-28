@@ -265,3 +265,10 @@ path = "fuzz_targets/deps_cli_config.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "requirement_matcher"
+path = "fuzz_targets/requirement_matcher.rs"
+test = false
+doc = false
+bench = false

@@ -4,7 +4,7 @@ use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
     compile_requirement_unless, format_version_replacing_by_shape,
-    requirement_contains_template_placeholder,
+    requirement_contains_template_placeholder, requirement_is_oversized,
 };
 use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
 
@@ -170,11 +170,20 @@ impl RequirementResolution for NuGetFormatter {
     /// `0.0.0`-shaped floor that every `latest` compares `>=` against — the same
     /// false-"satisfied" coercion [`Self::version_satisfies_requirement`]'s guard above
     /// prevents, needed separately here since this floor branch never calls that method.
+    ///
+    /// #1627 S1: this override bypasses [`RequirementResolution::is_requirement_up_to_date`]'s
+    /// shared default entirely, so its own `requirement_is_oversized` gate never ran for
+    /// NuGet — an oversized requirement reached `compare_minimum_floor`/
+    /// `version_satisfies_requirement` uncapped. Gated here too, same `true` (suppress)
+    /// semantics as the shared default.
     fn is_requirement_up_to_date(
         &self,
         requirement: &VersionReq,
         latest: &ConcreteVersion,
     ) -> bool {
+        if requirement_is_oversized(requirement) {
+            return true;
+        }
         if self.requirement_is_unresolved(requirement) {
             return true;
         }
@@ -279,11 +288,19 @@ impl RequirementResolution for NuGetFormatter {
     /// Every other shape (exact pins, bounded/maximum ranges, floating patterns like `1.1.*`)
     /// already expresses a genuine forward-compatibility window, so those keep the base
     /// default via `compile_requirement`.
+    ///
+    /// #1627 S1: this override bypasses [`RequirementResolution::requirement_already_resolves_to`]'s
+    /// shared default entirely, so its own `requirement_is_oversized` gate never ran for
+    /// NuGet — an oversized requirement reached `compare_minimum_floor`/`compile_requirement`
+    /// uncapped. Gated here too, same `false` (fail-closed) semantics as the shared default.
     fn requirement_already_resolves_to(
         &self,
         requirement: &VersionReq,
         target: &ConcreteVersion,
     ) -> bool {
+        if requirement_is_oversized(requirement) {
+            return false;
+        }
         let requirement_str = requirement.as_str();
         let is_floor = !requirement_str.contains('*')
             && crate::version::compare_minimum_floor(requirement_str, target.as_str()).is_some();
