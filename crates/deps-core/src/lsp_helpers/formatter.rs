@@ -11,7 +11,9 @@
 use crate::position::Position;
 
 use super::{RequirementMatcher, RequirementStatus, is_same_major_minor, position_in_range};
-use crate::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
+use crate::{
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
+};
 
 /// Ecosystem-specific package name normalization and validation.
 ///
@@ -224,6 +226,63 @@ pub enum BareMeaning {
     /// constraint grammar, RubyGems) — so replacing any bounded requirement with a bare
     /// version NARROWS (or leaves identical) what it accepts, and is always safe.
     ExactPin,
+    /// A bare version is a minimum-only floor with no upper bound (NuGet's `Version="1.0.0"`,
+    /// Maven's "soft" recommended version, Gradle's `require` constraint) — so, like
+    /// [`Caret`](Self::Caret), replacing a bounded requirement with a bare version WIDENS what
+    /// it accepts (the upper bound is dropped) and must be refused. #1602: distinct from
+    /// `Caret` because these ecosystems have no auto-following range semantics at all (no `^`),
+    /// only a floor — but the rewrite-safety consequence for a bounded range is identical, so
+    /// [`format_version_replacing_by_shape`] treats both the same way for
+    /// [`RequirementRewriteShape::Compound`], [`RequirementRewriteShape::PartialWildcard`], and
+    /// [`RequirementRewriteShape::SingleBound`].
+    Floor,
+}
+
+/// The [`BareMeaning`] a bare (no-operator) version requirement carries under `ecosystem`.
+///
+/// The single, exhaustive source [`format_version_replacing_by_shape`] callers should derive
+/// their `bare_meaning` argument from.
+///
+/// This answers a *different* question from `lsp_helpers::in_use_version`'s private
+/// `bare_requirement_policy`: that function asks "can a bare requirement's text alone be
+/// treated as a single concrete version for in-use-version/OSV-target resolution", this asks
+/// "does rewriting a bounded range to bare change what the requirement accepts" — the #1602 bug
+/// class was exactly these two being conflated for Maven and Gradle, which
+/// `bare_requirement_policy` groups under its `Concrete` variant (a bare version is a usable
+/// resolution pin) even though their bare meaning for *rewrite* purposes is
+/// [`BareMeaning::Floor`], not [`BareMeaning::ExactPin`]. `in_use_version`'s own test module
+/// cross-checks the two functions stay logically consistent for the one invariant they do
+/// share: an ecosystem is [`BareMeaning::Caret`] here if and only if it is
+/// `BareRequirementPolicy::AlwaysRange` there.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::EcosystemId;
+/// use deps_core::lsp_helpers::{BareMeaning, bare_meaning};
+///
+/// assert_eq!(bare_meaning(EcosystemId::Cargo), BareMeaning::Caret);
+/// assert_eq!(bare_meaning(EcosystemId::Dart), BareMeaning::ExactPin);
+/// assert_eq!(bare_meaning(EcosystemId::NuGet), BareMeaning::Floor);
+/// assert_eq!(bare_meaning(EcosystemId::Maven), BareMeaning::Floor);
+/// assert_eq!(bare_meaning(EcosystemId::Gradle), BareMeaning::Floor);
+/// ```
+#[must_use]
+pub const fn bare_meaning(ecosystem: EcosystemId) -> BareMeaning {
+    match ecosystem {
+        EcosystemId::Cargo => BareMeaning::Caret,
+        EcosystemId::Maven | EcosystemId::Gradle | EcosystemId::NuGet => BareMeaning::Floor,
+        EcosystemId::Npm
+        | EcosystemId::Pypi
+        | EcosystemId::Go
+        | EcosystemId::Bundler
+        | EcosystemId::Dart
+        | EcosystemId::Composer
+        | EcosystemId::Swift
+        | EcosystemId::Deno
+        | EcosystemId::GithubActions
+        | EcosystemId::GitlabCi => BareMeaning::ExactPin,
+    }
 }
 
 /// Structural shape of a version-requirement string, classified for
@@ -250,6 +309,14 @@ pub enum RequirementRewriteShape {
     ExplicitCaret,
     /// A leading `=` exact-pin operator — the rewrite must keep the `=` prefix.
     ExactPin,
+    /// A bracket-wrapped exact pin with no internal comma (NuGet/Maven/Gradle's `[1.0.0]`) —
+    /// the bracket-interval grammars' spelling of "exactly this version, nothing else". Always
+    /// preserved with its bracket wrap, regardless of [`BareMeaning`]: unlike
+    /// [`ExplicitCaret`](Self::ExplicitCaret), no ecosystem using this bracket syntax also uses
+    /// [`BareMeaning::Caret`], so there is no meaning under which collapsing it to bare would be
+    /// safe. A bracket-interval *range* (`[1.0,2.0)`) always has an internal comma and is
+    /// therefore already [`Compound`](Self::Compound) before this variant is ever considered.
+    BracketExactPin,
     /// A leading tilde-family operator (Cargo's `~`, RubyGems' `~>`) — the rewrite must keep
     /// the tilde spelling.
     Tilde,
@@ -329,16 +396,56 @@ fn requirement_is_any_version_wildcard(requirement: &str) -> bool {
 }
 
 /// Whether `requirement` — assumed already checked via [`requirement_is_any_version_wildcard`]
-/// and found not a bare wildcard — has a `*`/`x`/`X` wildcard segment in its version core (see
+/// and found not a bare wildcard — has a `*` wildcard anywhere (including in a prerelease
+/// float like NuGet's `1.2.0-rc.*`), an `x`/`X` wildcard segment in its version core, or
+/// Gradle's trailing `+` dynamic-version marker (e.g. `1.0.+`, `2.5.+`) (see
 /// [`RequirementRewriteShape::PartialWildcard`]).
 ///
-/// Checks only the segments before the first `-`/`+` (the version core, before any
-/// prerelease/build-metadata part) so a prerelease identifier that happens to be a single
-/// letter `x` (e.g. `1.0.0-alpha.x`) is not mistaken for a wildcard segment.
+/// #1602 impl-critic S2: `*` is checked against the *whole* string, not just the version core
+/// — unlike `x`/`X`, a literal `*` is never a legitimate prerelease identifier in any
+/// supported ecosystem's grammar, so there is no equivalent false-positive risk to guard
+/// against by restricting it to the core (a `1.2.0-rc.*` float pinned to the `1.2.0` line
+/// must not fall through to [`RequirementRewriteShape::Bare`], which would silently turn it
+/// into an unbounded floor/caret range on rewrite). The `x`/`X` check stays restricted to the
+/// segments before the first `-`/`+` (the version core, before any prerelease/build-metadata
+/// part) so a prerelease identifier that happens to be a single letter `x` (e.g.
+/// `1.0.0-alpha.x`) is not mistaken for a wildcard segment. The trailing-`+` check runs first
+/// and independently of that split: Gradle's dynamic marker is the version core's own trailing
+/// character, not a build-metadata separator, so `1.0.+` must not be routed through the
+/// `split(['-', '+'])` core-isolation logic at all (`"1.0.+".split('+').next()` would silently
+/// discard the marker as if it were spurious build metadata).
+///
+/// Deliberately not scoped to Gradle alone: this classifier is shared across every ecosystem
+/// that calls [`format_version_replacing_by_shape`] (Cargo, Dart, NuGet, Maven, Gradle), and no
+/// other ecosystem's requirement grammar produces a bare, unmarked trailing `+` today — a real
+/// semver build-metadata suffix always has content after the `+` (`1.0.0+build`), so it never
+/// reaches this check with an empty tail. Threading an `EcosystemId`/bool parameter through
+/// this shared classifier to narrow the check to Gradle alone was considered and rejected as
+/// unwarranted complexity for a check with no current false-positive case; revisit if a future
+/// ecosystem's grammar ever legitimately produces a bare trailing `+`.
 fn requirement_is_partial_wildcard_shape(requirement: &str) -> bool {
+    if requirement.len() > 1 && requirement.ends_with('+') {
+        return true;
+    }
+    if requirement.contains('*') {
+        return true;
+    }
     let core = requirement.split(['-', '+']).next().unwrap_or(requirement);
-    core.split('.')
-        .any(|segment| matches!(segment, "*" | "x" | "X"))
+    core.split('.').any(|segment| matches!(segment, "x" | "X"))
+}
+
+/// Whether `requirement` is a bracket-wrapped exact pin — `[` ... `]` with no internal comma
+/// (NuGet/Maven/Gradle's `[1.0.0]`) — as opposed to a bracket-interval *range* (`[1.0,2.0)`),
+/// which always contains a comma and is therefore classified [`RequirementRewriteShape::Compound`]
+/// by [`requirement_is_compound`] before this function is ever consulted. Only square brackets
+/// are recognized: an unpaired `(`/`)` alone (without a comma) is not valid interval syntax in
+/// any of these ecosystems' grammars, so treating it as an exact pin here would be a guess this
+/// function is not meant to make.
+fn requirement_is_bracket_exact_pin(requirement: &str) -> bool {
+    requirement.len() > 2
+        && requirement.starts_with('[')
+        && requirement.ends_with(']')
+        && !requirement.contains(',')
 }
 
 /// Classifies `requirement`'s structural shape for
@@ -374,6 +481,21 @@ fn requirement_is_partial_wildcard_shape(requirement: &str) -> bool {
 ///     classify_requirement_rewrite_shape(">=1.2, <1.5"),
 ///     RequirementRewriteShape::Compound
 /// );
+/// assert_eq!(
+///     classify_requirement_rewrite_shape("[1.0.0]"),
+///     RequirementRewriteShape::BracketExactPin
+/// );
+/// // A bracket-interval range always has an internal comma, so it classifies as Compound,
+/// // not BracketExactPin.
+/// assert_eq!(
+///     classify_requirement_rewrite_shape("[1.0,2.0)"),
+///     RequirementRewriteShape::Compound
+/// );
+/// // Gradle's dynamic-version marker has no single-version rewrite either.
+/// assert_eq!(
+///     classify_requirement_rewrite_shape("1.0.+"),
+///     RequirementRewriteShape::PartialWildcard
+/// );
 /// ```
 #[must_use]
 pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewriteShape {
@@ -383,6 +505,9 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
     }
     if trimmed.starts_with('=') {
         return RequirementRewriteShape::ExactPin;
+    }
+    if requirement_is_bracket_exact_pin(trimmed) {
+        return RequirementRewriteShape::BracketExactPin;
     }
     if trimmed.starts_with("~>") || trimmed.starts_with('~') {
         return RequirementRewriteShape::Tilde;
@@ -408,7 +533,8 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
 /// Default requirement-rewrite policy driven by [`classify_requirement_rewrite_shape`] and
 /// `bare_meaning`.
 ///
-/// Always preserves an [`ExactPin`](RequirementRewriteShape::ExactPin) or
+/// Always preserves an [`ExactPin`](RequirementRewriteShape::ExactPin),
+/// [`BracketExactPin`](RequirementRewriteShape::BracketExactPin), or
 /// [`Tilde`](RequirementRewriteShape::Tilde) operator, and always calls `bare` for
 /// [`AnyVersion`](RequirementRewriteShape::AnyVersion) or
 /// [`Bare`](RequirementRewriteShape::Bare) (collapsing either is always safe, regardless of
@@ -417,9 +543,9 @@ pub fn classify_requirement_rewrite_shape(requirement: &str) -> RequirementRewri
 /// [`PartialWildcard`](RequirementRewriteShape::PartialWildcard),
 /// [`SingleBound`](RequirementRewriteShape::SingleBound), and
 /// [`Compound`](RequirementRewriteShape::Compound), the answer depends on `bare_meaning`: under
-/// [`BareMeaning::Caret`] the requirement is echoed back unchanged (no safe single-value
-/// rewrite — `ExplicitCaret` is the one exception, which collapses via `bare` instead, since
-/// under this `bare_meaning` a bare version already means caret); under
+/// [`BareMeaning::Caret`] or [`BareMeaning::Floor`] the requirement is echoed back unchanged (no
+/// safe single-value rewrite — `ExplicitCaret` collapses via `bare` instead only under `Caret`,
+/// since under that `bare_meaning` alone a bare version already means caret); under
 /// [`BareMeaning::ExactPin`] every one of them collapses safely (`ExplicitCaret` keeping its
 /// `^` prefix, since bare would narrow it to something other than a range).
 ///
@@ -466,15 +592,21 @@ pub fn format_version_replacing_by_shape(
         RequirementRewriteShape::Compound
         | RequirementRewriteShape::PartialWildcard
         | RequirementRewriteShape::SingleBound => match bare_meaning {
-            BareMeaning::Caret => current.to_string(),
+            BareMeaning::Caret | BareMeaning::Floor => current.to_string(),
             BareMeaning::ExactPin => bare(),
         },
+        // No ecosystem with `BareMeaning::Floor` has an explicit `^` caret operator in its
+        // grammar, so this arm is unreachable in practice — echoed back unchanged, mirroring
+        // `Caret`'s own refusal on every other unsafe shape above, since there is no known-safe
+        // rewrite to fall back on.
         RequirementRewriteShape::ExplicitCaret => match bare_meaning {
             BareMeaning::Caret => bare(),
+            BareMeaning::Floor => current.to_string(),
             BareMeaning::ExactPin => format!("^{}", version.as_str()),
         },
         RequirementRewriteShape::AnyVersion | RequirementRewriteShape::Bare => bare(),
         RequirementRewriteShape::ExactPin => format!("={}", version.as_str()),
+        RequirementRewriteShape::BracketExactPin => format!("[{}]", version.as_str()),
         RequirementRewriteShape::Tilde => {
             // Reconstructs whichever tilde spelling `current` actually used, rather than
             // hardcoding `~` — `~>` is RubyGems' spelling (Bundler doesn't call this function
@@ -1464,6 +1596,18 @@ mod tests {
         );
     }
 
+    /// #1602 impl-critic S2 (CONFIRMED): unlike `x`/`X`, a literal `*` is never a legitimate
+    /// prerelease identifier — NuGet's prerelease-label float `1.2.0-rc.*` must classify as
+    /// `PartialWildcard`, not fall through to `Bare` (which would silently widen it into an
+    /// unbounded floor/caret range on rewrite, the same bug class the fix otherwise refuses).
+    #[test]
+    fn test_classify_requirement_rewrite_shape_wildcard_in_prerelease_part() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("1.2.0-rc.*"),
+            RequirementRewriteShape::PartialWildcard
+        );
+    }
+
     /// Same root cause as the prerelease case above, for build metadata instead: a `+build.x`
     /// segment must not be mistaken for a wildcard component either — `split(['-', '+'])`
     /// isolates the version core before either separator.
@@ -1481,7 +1625,11 @@ mod tests {
     #[test]
     fn test_format_version_replacing_by_shape_empty_requirement_always_collapses() {
         let new_version = ConcreteVersion::new("2.0.0");
-        for bare_meaning in [BareMeaning::Caret, BareMeaning::ExactPin] {
+        for bare_meaning in [
+            BareMeaning::Caret,
+            BareMeaning::ExactPin,
+            BareMeaning::Floor,
+        ] {
             assert_eq!(
                 format_version_replacing_by_shape(&new_version, "", bare_meaning, || {
                     new_version.to_string()
@@ -1627,7 +1775,11 @@ mod tests {
     #[test]
     fn test_format_version_replacing_by_shape_any_version_always_collapses() {
         let new_version = ConcreteVersion::new("2.0.0");
-        for bare_meaning in [BareMeaning::Caret, BareMeaning::ExactPin] {
+        for bare_meaning in [
+            BareMeaning::Caret,
+            BareMeaning::ExactPin,
+            BareMeaning::Floor,
+        ] {
             assert_eq!(
                 format_version_replacing_by_shape(&new_version, "*", bare_meaning, || {
                     new_version.to_string()
@@ -1676,5 +1828,114 @@ mod tests {
             ),
             "^2.0.0"
         );
+    }
+
+    /// #1602: a bracket-wrapped exact pin always keeps its bracket wrap, regardless of
+    /// `BareMeaning` — this shape has no ecosystem whose bare form would make collapsing it safe.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_bracket_exact_pin() {
+        assert_eq!(
+            classify_requirement_rewrite_shape("[1.0.0]"),
+            RequirementRewriteShape::BracketExactPin
+        );
+    }
+
+    /// #1602: a bracket-interval *range* always has an internal comma, so it must classify as
+    /// Compound rather than BracketExactPin, even with an open-ended side (`[1.0,)`).
+    #[test]
+    fn test_classify_requirement_rewrite_shape_bracket_range_is_compound_not_exact_pin() {
+        for requirement in ["[1.0,2.0)", "(1.0,2.0]", "[1.0,)", "(,1.0]"] {
+            assert_eq!(
+                classify_requirement_rewrite_shape(requirement),
+                RequirementRewriteShape::Compound,
+                "expected {requirement:?} to classify as Compound"
+            );
+        }
+    }
+
+    /// #1602: Gradle's trailing `+` dynamic-version marker (`1.0.+`, `2.5.+`) has no
+    /// single-version rewrite that preserves "any matching patch/minor" semantics, exactly like
+    /// a `*`/`x`/`X` partial wildcard.
+    #[test]
+    fn test_classify_requirement_rewrite_shape_gradle_dynamic_plus_suffix() {
+        for requirement in ["1.0.+", "2.+", "1.2.3.+"] {
+            assert_eq!(
+                classify_requirement_rewrite_shape(requirement),
+                RequirementRewriteShape::PartialWildcard,
+                "expected {requirement:?} to classify as PartialWildcard"
+            );
+        }
+    }
+
+    /// #1602: under `BareMeaning::Floor`, a bounded/compound/wildcard requirement WIDENS if
+    /// collapsed to bare (the upper bound is dropped), so it must be refused, mirroring
+    /// `BareMeaning::Caret`'s own refusal.
+    #[test]
+    fn test_format_version_replacing_by_shape_floor_meaning_refuses_unsafe_shapes() {
+        let new_version = ConcreteVersion::new("13.0.4");
+        for requirement in ["[12.0.1,13.0.0)", "1.0.+", ">=1.0.0"] {
+            assert_eq!(
+                format_version_replacing_by_shape(
+                    &new_version,
+                    requirement,
+                    BareMeaning::Floor,
+                    || new_version.to_string()
+                ),
+                requirement,
+                "expected {requirement:?} to be echoed back unchanged under BareMeaning::Floor"
+            );
+        }
+    }
+
+    /// #1602: a bracket-wrapped exact pin is preserved under `BareMeaning::Floor` too — the
+    /// rewrite keeps the bracket wrap rather than collapsing to an unbounded floor.
+    #[test]
+    fn test_format_version_replacing_by_shape_floor_meaning_preserves_bracket_exact_pin() {
+        let new_version = ConcreteVersion::new("13.0.4");
+        assert_eq!(
+            format_version_replacing_by_shape(&new_version, "[12.0.1]", BareMeaning::Floor, || {
+                new_version.to_string()
+            }),
+            "[13.0.4]"
+        );
+    }
+
+    /// #1602: a bare (no-marker) requirement still collapses under `BareMeaning::Floor` — only
+    /// a *bounded* shape must be refused, not every non-exact one.
+    #[test]
+    fn test_format_version_replacing_by_shape_floor_meaning_bare_still_collapses() {
+        let new_version = ConcreteVersion::new("13.0.4");
+        assert_eq!(
+            format_version_replacing_by_shape(&new_version, "12.0.1", BareMeaning::Floor, || {
+                new_version.to_string()
+            }),
+            "13.0.4"
+        );
+    }
+
+    /// #1602: no ecosystem with `BareMeaning::Floor` has an explicit `^` caret operator, so
+    /// this arm is unreachable from any real ecosystem call site today — this test only proves
+    /// the exhaustive match's own documented fallback (echo back unchanged, like every other
+    /// unsafe shape under `Floor`) holds, in case a future `Floor` ecosystem ever gains one.
+    #[test]
+    fn test_format_version_replacing_by_shape_floor_meaning_refuses_explicit_caret() {
+        let new_version = ConcreteVersion::new("13.0.4");
+        assert_eq!(
+            format_version_replacing_by_shape(&new_version, "^1.2.3", BareMeaning::Floor, || {
+                new_version.to_string()
+            }),
+            "^1.2.3"
+        );
+    }
+
+    /// #1602: `bare_meaning` is an exhaustive, per-ecosystem source of truth — every
+    /// `EcosystemId::ALL` variant must resolve to some value without panicking (the match itself
+    /// enforces exhaustiveness at compile time; this proves the const fn is actually callable
+    /// for every variant at once).
+    #[test]
+    fn test_bare_meaning_covers_every_ecosystem() {
+        for &eco in EcosystemId::ALL {
+            let _ = bare_meaning(eco);
+        }
     }
 }

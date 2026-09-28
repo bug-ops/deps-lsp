@@ -11,7 +11,7 @@ jobs:
   auto-merge:
     name: Auto Merge
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     permissions:
       contents: write
       pull-requests: write
@@ -51,8 +51,10 @@ jobs:
           - Run tests locally if needed
           - Update code to handle breaking changes
 
-          Dependency: \`${{ steps.metadata.outputs.dependency-names }}\`
-          Update type: \`${{ steps.metadata.outputs.update-type }}\`"
+          Dependency: \`$DEPENDENCY_NAMES\`
+          Update type: \`$UPDATE_TYPE\`"
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEPENDENCY_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}

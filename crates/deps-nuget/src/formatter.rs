@@ -2,10 +2,11 @@
 
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
-use deps_core::{ConcreteVersion, InvalidPackageName, PackageName, VersionReq};
+use deps_core::{ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq};
 
 /// Maximum package ID length NuGet's client-side `PackageIdValidator` accepts.
 const MAX_PACKAGE_ID_LENGTH: usize = 100;
@@ -105,6 +106,24 @@ impl PackageRendering for NuGetFormatter {
         let version = version.as_str();
         // NuGet manifests store plain version text; no prefix/wrapping on insert.
         version.to_string()
+    }
+
+    /// Delegates to the shared [`format_version_replacing_by_shape`] with [`bare_meaning`] of
+    /// [`EcosystemId::NuGet`] (#1602: [`BareMeaning::Floor`][bm]) — NuGet's bare
+    /// `Version="1.0.0"` is a minimum-only floor (see
+    /// [`RequirementResolution::is_requirement_up_to_date`]'s own doc), not an auto-following
+    /// range: collapsing a bounded interval (`[1.0,2.0)`), a floating pattern (`1.1.*`,
+    /// `1.2.0-rc.*`), or a bracket-wrapped exact pin (`[1.0.0]`) to bare would silently drop
+    /// its upper bound, widening what the requirement accepts instead of updating it.
+    ///
+    /// [bm]: deps_core::lsp_helpers::BareMeaning::Floor
+    fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
+        format_version_replacing_by_shape(
+            version,
+            current,
+            bare_meaning(EcosystemId::NuGet),
+            || self.format_version_for_text_edit(version),
+        )
     }
 
     fn package_url(&self, name: &PackageName) -> String {
@@ -305,6 +324,79 @@ mod tests {
         assert_eq!(
             f.format_version_for_text_edit(&ConcreteVersion::new("13.0.3")),
             "13.0.3"
+        );
+    }
+
+    /// #1602 repro: `Version="[12.0.1,13.0.0)"` must never collapse to a bare `13.0.4` — that
+    /// would drop the upper bound and turn a bounded range into an unbounded floor.
+    #[test]
+    fn test_format_version_replacing_bounded_range_refused() {
+        let f = NuGetFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("13.0.4"), "[12.0.1,13.0.0)"),
+            "[12.0.1,13.0.0)"
+        );
+    }
+
+    /// #1602: a floating pattern (`1.1.*`) must never collapse to a bare version either — same
+    /// widening hazard as a bounded range.
+    #[test]
+    fn test_format_version_replacing_floating_pattern_refused() {
+        let f = NuGetFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("1.2.0"), "1.1.*"),
+            "1.1.*"
+        );
+    }
+
+    /// #1602 impl-critic S2: a prerelease-label float (`1.2.0-rc.*`,
+    /// `crate::version::FloatPattern::PrereleaseLabelPrefix`) has its wildcard in the
+    /// prerelease part, not the version core — must still refuse, not fall through to `Bare`
+    /// and silently widen a float pinned to the `1.2.0` line into an unbounded floor.
+    #[test]
+    fn test_format_version_replacing_prerelease_label_float_refused() {
+        let f = NuGetFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("13.0.4"), "1.2.0-rc.*"),
+            "1.2.0-rc.*"
+        );
+    }
+
+    /// #1602: a bracket-wrapped exact pin keeps its bracket wrap on rewrite instead of
+    /// collapsing to an unbounded bare floor.
+    #[test]
+    fn test_format_version_replacing_bracket_exact_pin_preserved() {
+        let f = NuGetFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("2.0.0"), "[1.0.0]"),
+            "[2.0.0]"
+        );
+    }
+
+    /// #1602: a bare requirement still collapses under `BareMeaning::Floor` — only a bounded
+    /// shape must be refused.
+    #[test]
+    fn test_format_version_replacing_bare_still_collapses() {
+        let f = NuGetFormatter;
+        assert_eq!(
+            f.format_version_replacing(&ConcreteVersion::new("13.0.4"), "12.0.1"),
+            "13.0.4"
+        );
+    }
+
+    /// #1602: the shared conformance helper, deriving `BareMeaning` from `EcosystemId::NuGet`.
+    #[test]
+    fn test_bare_meaning_never_widens_bounded_range() {
+        deps_core::conformance::assert_bare_meaning_never_widens_bounded_range(
+            &NuGetFormatter,
+            deps_core::EcosystemId::NuGet,
+            &[
+                "[12.0.1,13.0.0)",
+                "1.1.*",
+                "(1.0,2.0]",
+                // #1602 impl-critic S2: the wildcard lives in the prerelease part, not the core.
+                "1.2.0-rc.*",
+            ],
         );
     }
 

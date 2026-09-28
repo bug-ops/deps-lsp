@@ -2,12 +2,14 @@
 
 use crate::version::{version_matches_constraint, version_matches_normalized_constraint};
 use deps_core::ConcreteVersion;
+use deps_core::EcosystemId;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    BareMeaning, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, format_version_replacing_by_shape,
+    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
+    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    format_version_replacing_by_shape,
 };
 use deps_core::normalize_operator_spacing;
 
@@ -73,8 +75,9 @@ impl PackageRendering for DartFormatter {
         format!("^{version}")
     }
 
-    /// Delegates to [`format_version_replacing_by_shape`] with [`BareMeaning::ExactPin`] — a
-    /// bare pubspec constraint (no operator) means an *exact* version match, not an implicit
+    /// Delegates to [`format_version_replacing_by_shape`] with [`bare_meaning`] of
+    /// [`EcosystemId::Dart`] (`BareMeaning::ExactPin`) — a bare pubspec constraint (no
+    /// operator) means an *exact* version match, not an implicit
     /// caret range (confirmed by this crate's own `match_single_constraint`, `version.rs`,
     /// whose final fallback is `compare_versions(version, constraint) == Ordering::Equal`). So
     /// collapsing a bounded/compound constraint (a space-separated AND range like
@@ -93,7 +96,7 @@ impl PackageRendering for DartFormatter {
     ///
     /// [`RequirementRewriteShape::ExplicitCaret`]: deps_core::lsp_helpers::RequirementRewriteShape::ExplicitCaret
     fn format_version_replacing(&self, version: &ConcreteVersion, current: &str) -> String {
-        format_version_replacing_by_shape(version, current, BareMeaning::ExactPin, || {
+        format_version_replacing_by_shape(version, current, bare_meaning(EcosystemId::Dart), || {
             version.as_str().to_string()
         })
     }
