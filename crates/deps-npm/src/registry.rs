@@ -552,19 +552,8 @@ impl NpmRegistry {
         name: &str,
         req_str: &str,
     ) -> Result<Option<NpmVersion>> {
-        // Reject before the network fetch below and before `Range::parse` (see
-        // `requirement_len_exceeds_cap`'s docs). Checked first so an oversized requirement
-        // never pays for a full packument fetch it can't use (impl-critic M2).
-        if deps_core::lsp_helpers::requirement_len_exceeds_cap(req_str) {
-            return Err(DepsError::InvalidVersionReq(format!(
-                "version requirement exceeds {} bytes",
-                deps_core::lsp_helpers::MAX_REQUIREMENT_LEN
-            )));
-        }
-
-        let versions = self.get_versions(name).await?;
-
         if deps_core::is_existence_wildcard_str(req_str) {
+            let versions = self.get_versions(name).await?;
             // Not the generic `is_stable()` (also accepts `AdvisoryDeprecated`): #338 NFR-002
             // wants non-deprecated preferred over deprecated as a ranking, not resolvability.
             let idx =
@@ -572,9 +561,11 @@ impl NpmRegistry {
             return Ok(idx.and_then(|idx| versions.into_iter().nth(idx)));
         }
 
-        // Parse npm semver requirement
+        // Parsed before the fetch so an oversized or malformed requirement never pays for a
+        // full packument fetch it can't use (#1653, impl-critic M2).
         let req = crate::formatter::parse_range_safe(req_str)
             .map_err(|e| DepsError::InvalidVersionReq(e.to_string()))?;
+        let versions = self.get_versions(name).await?;
 
         Ok(versions.into_iter().find(|v| {
             let version = node_semver::Version::parse(&v.version).ok();
@@ -912,9 +903,6 @@ impl deps_core::Registry for NpmRegistry {
             return deps_core::select_latest_for_existence(versions, |v| v.as_ref());
         }
         let req_str = req.as_str();
-        if deps_core::lsp_helpers::requirement_len_exceeds_cap(req_str) {
-            return None;
-        }
         let parsed_req = crate::formatter::parse_range_safe(req_str).ok()?;
         versions.iter().position(|v| {
             node_semver::Version::parse(v.version_string()).is_ok_and(|ver| {
@@ -1681,6 +1669,29 @@ mod tests {
             !message.contains(&oversized),
             "message must not embed the raw oversized value: {message}"
         );
+        mock.assert_async().await;
+    }
+
+    /// #1653: a malformed requirement is rejected before the packument fetch too.
+    #[tokio::test]
+    async fn test_get_latest_matching_malformed_req_makes_no_request() {
+        let mut server = mockito::Server::new_async().await;
+        let base = server.url();
+        let registry = NpmRegistry::with_public_base_for_test(Arc::new(HttpCache::new()), base);
+
+        let mock = server
+            .mock("GET", "/react")
+            .match_header("accept", ABBREVIATED_ACCEPT)
+            .with_status(200)
+            .with_body(r#"{"versions": {"19.1.0": {}}}"#)
+            .expect(0)
+            .create_async()
+            .await;
+
+        registry
+            .get_latest_matching("react", "not a range")
+            .await
+            .expect_err("malformed requirement must be rejected");
         mock.assert_async().await;
     }
 

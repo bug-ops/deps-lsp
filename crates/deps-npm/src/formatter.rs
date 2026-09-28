@@ -1,6 +1,7 @@
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy,
+    DiagnosticMessages, DiagnosticPolicy, MAX_REQUIREMENT_LEN, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    requirement_len_exceeds_cap, up_to_date_via_compiled_matcher,
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 use std::borrow::Cow;
@@ -17,6 +18,13 @@ pub enum RangeParseError {
     /// `node_semver` 2.2.0's range-parsing state machine).
     #[error("node_semver panicked while parsing a range")]
     Panicked,
+    /// The requirement exceeds [`MAX_REQUIREMENT_LEN`] bytes and was rejected before
+    /// reaching `node_semver` (#1483, #1653).
+    #[error("version requirement exceeds {max} bytes")]
+    TooLong {
+        /// The byte cap that was exceeded.
+        max: usize,
+    },
 }
 
 /// Whether a version component (as split on `.`) is a wildcard token (`x`/`X`/`*`) or a
@@ -210,7 +218,9 @@ fn classify_token_shape(token: &str) -> Option<TokenShape> {
 ///
 /// # Errors
 ///
-/// Returns [`RangeParseError::Malformed`] for an ordinary unparseable range, and
+/// Returns [`RangeParseError::TooLong`] when `requirement` exceeds
+/// [`MAX_REQUIREMENT_LEN`] bytes (checked before any parsing, #1483),
+/// [`RangeParseError::Malformed`] for an ordinary unparseable range, and
 /// [`RangeParseError::Panicked`] when `node_semver` panics (or would panic, per the
 /// pre-check above) instead — both are `Err`, so a caller that already treats a malformed
 /// range as "unresolved"/"no match" needs no separate panic branch of its own.
@@ -238,8 +248,20 @@ fn classify_token_shape(token: &str) -> Option<TokenShape> {
 /// // precise treatment — critically, `~>1.x.3 || ^3.0.0` must NOT resolve to "any version".
 /// assert!(parse_range_safe("~>1.x.3").is_ok());
 /// assert!(parse_range_safe("~>1.x.3 || ^3.0.0").is_ok());
+/// // #1653: an oversized requirement is rejected before parsing.
+/// use deps_core::lsp_helpers::MAX_REQUIREMENT_LEN;
+/// use deps_npm::RangeParseError;
+/// assert!(matches!(
+///     parse_range_safe(&"1".repeat(MAX_REQUIREMENT_LEN + 1)),
+///     Err(RangeParseError::TooLong { max: MAX_REQUIREMENT_LEN })
+/// ));
 /// ```
 pub fn parse_range_safe(requirement: &str) -> Result<node_semver::Range, RangeParseError> {
+    if requirement_len_exceeds_cap(requirement) {
+        return Err(RangeParseError::TooLong {
+            max: MAX_REQUIREMENT_LEN,
+        });
+    }
     let branches: Vec<Vec<(Cow<'_, str>, Option<TokenShape>)>> = requirement
         .split("||")
         .map(|branch| {
@@ -578,6 +600,16 @@ impl RequirementResolution for NpmFormatter {
     /// that's safe without an extra `self.requirement_is_unresolved` check here.
     fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
         compile_node_semver_range(requirement)
+    }
+
+    /// Answers through the compiled npm matcher (#1656): the shared default's heuristic
+    /// misreads comparators, `||`, hyphen ranges, and wildcard tilde/equals as outdated.
+    fn is_requirement_up_to_date(
+        &self,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> bool {
+        up_to_date_via_compiled_matcher(self, requirement, latest)
     }
 
     // #1370/#1374/#1379/#1391: npm's requirement grammar has no placeholder syntax of its
@@ -1235,5 +1267,149 @@ mod tests {
         let req = ">=1.0.0 <1.5.0 || >1.5.0 <2.0.0";
         assert!(!explicitly_excludes(req, "1.2.0"));
         assert!(!explicitly_excludes(req, "1.8.0"));
+    }
+
+    fn npm_up_to_date(requirement: &str, latest: &str) -> bool {
+        NpmFormatter
+            .is_requirement_up_to_date(&VersionReq::new(requirement), &ConcreteVersion::new(latest))
+    }
+
+    /// #1656: shapes the shared default heuristic misread as outdated.
+    #[test]
+    fn test_is_requirement_up_to_date_admitting_shapes() {
+        for requirement in [
+            "=4.18.1",
+            "<5",
+            ">=1",
+            ">=0.0.0",
+            ">=4.18.1",
+            ">=4.0.0 <4.20.0",
+            "^4 || ^5",
+            "^3 || ^4",
+            "4.18.1 - 5",
+            "~*",
+            "=*",
+            "~x",
+            "=x",
+            "~ *",
+            "~4.x",
+            "=4.x",
+            "*",
+            "x",
+            "^4.0.0",
+            "4.18.1",
+            "4.x",
+            "~4",
+            "~4.18",
+            "~X",
+            "=X",
+        ] {
+            assert!(
+                npm_up_to_date(requirement, "4.18.1"),
+                "{requirement:?} must be up to date against 4.18.1"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_excluding_shapes() {
+        for requirement in [
+            ">=5",
+            "<4",
+            "^5 || ^6",
+            "^4.5 <4.7",
+            "=4.18.0",
+            "1 - 3",
+            "<=4",
+        ] {
+            assert!(
+                !npm_up_to_date(requirement, "4.18.1"),
+                "{requirement:?} must be outdated against 4.18.1"
+            );
+        }
+    }
+
+    /// #1622 S2 must survive the override: a caret's lower-bound floor is ignored.
+    #[test]
+    fn test_is_requirement_up_to_date_caret_floor_ignored() {
+        assert!(npm_up_to_date("^1.5", "1.4.9"));
+        assert!(!npm_up_to_date("^1.5", "2.0.0"));
+    }
+
+    #[test]
+    fn test_requirement_status_compound_is_up_to_date() {
+        use deps_core::lsp_helpers::{RequirementStatus, RequirementStatusGate};
+        assert_eq!(
+            NpmFormatter.requirement_status(
+                &VersionReq::new("^3 || ^4"),
+                &ConcreteVersion::new("4.18.1")
+            ),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_oversized_is_true() {
+        let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
+        assert!(npm_up_to_date(&oversized, "4.18.1"));
+    }
+
+    #[test]
+    fn test_parse_range_safe_length_cap_boundary() {
+        let at_cap = format!("{}1.0.0", " ".repeat(MAX_REQUIREMENT_LEN - 5));
+        assert_eq!(at_cap.len(), MAX_REQUIREMENT_LEN);
+        assert!(!matches!(
+            parse_range_safe(&at_cap),
+            Err(RangeParseError::TooLong { .. })
+        ));
+        let over = format!("{at_cap} ");
+        assert!(matches!(
+            parse_range_safe(&over),
+            Err(RangeParseError::TooLong { max }) if max == MAX_REQUIREMENT_LEN
+        ));
+    }
+
+    #[test]
+    fn test_range_parse_error_too_long_display() {
+        assert_eq!(
+            RangeParseError::TooLong { max: 256 }.to_string(),
+            "version requirement exceeds 256 bytes"
+        );
+    }
+
+    /// S1: a prerelease `latest` is judged by its numeric core (npm matchers exclude
+    /// prereleases), so wildcard shapes keep their pre-#1656 answer.
+    #[test]
+    fn test_is_requirement_up_to_date_prerelease_latest() {
+        for requirement in ["*", "x", "1.x", "~1.0", "^1.0.0"] {
+            assert!(
+                npm_up_to_date(requirement, "1.0.0-beta.3"),
+                "{requirement:?}"
+            );
+        }
+        for requirement in ["*", "x", "^4 || ^5", ">=4"] {
+            assert!(
+                npm_up_to_date(requirement, "5.0.0-beta.1"),
+                "{requirement:?}"
+            );
+        }
+        assert!(!npm_up_to_date(">=4 <5", "5.0.0-beta.1"));
+    }
+
+    /// S2 for compound requirements: a caret floor above `latest` never suggests a downgrade.
+    #[test]
+    fn test_is_requirement_up_to_date_compound_caret_floor_above_latest() {
+        for requirement in ["^1.5 <1.9", "^1.5 || ^2", "^1.5 || ^2.0"] {
+            assert!(npm_up_to_date(requirement, "1.4.9"), "{requirement:?}");
+        }
+        assert!(!npm_up_to_date("^1.5 <1.9", "1.9.5"));
+        assert!(!npm_up_to_date("^1.5 || ^2", "3.0.0"));
+    }
+
+    #[test]
+    fn test_is_requirement_up_to_date_degenerate_inputs_do_not_panic() {
+        let _ = npm_up_to_date("", "4.18.1");
+        let _ = npm_up_to_date("^4", "");
+        let _ = npm_up_to_date("", "");
     }
 }
