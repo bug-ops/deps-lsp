@@ -4,6 +4,141 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
 
+/// Failure from [`parse_range_safe`]: either `node_semver`'s own parse rejection, or the
+/// parser panicking instead of returning one.
+#[derive(Debug, thiserror::Error)]
+pub enum RangeParseError {
+    /// `node_semver::Range::parse` returned `Err` normally.
+    #[error(transparent)]
+    Malformed(#[from] node_semver::SemverError),
+    /// `node_semver::Range::parse` panicked instead of returning `Err` (#1630: certain
+    /// short, well-formed-looking inputs, e.g. `"~*"`, hit an internal `unreachable!()` in
+    /// `node_semver` 2.2.0's range-parsing state machine).
+    #[error("node_semver panicked while parsing a range")]
+    Panicked,
+}
+
+/// Whether a version component (as split on `.`) is a wildcard token (`x`/`X`/`*`) or starts
+/// with a concrete digit. `None` covers anything else (e.g. empty, or otherwise malformed) —
+/// [`has_known_panicking_shape`] treats that as "can't tell" rather than guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VersionComponentKind {
+    Wildcard,
+    Concrete,
+}
+
+/// Classifies up to the first 3 dot-separated components of a partial-version-shaped
+/// substring (e.g. `"1.x.3-beta"` from `"~1.x.3-beta"`, taken after stripping the `~`/`=`
+/// operator). Returns `None` for any component that is neither a wildcard token nor starts
+/// with an ASCII digit, so [`has_known_panicking_shape`] can fall back to `catch_unwind`
+/// instead of guessing.
+fn partial_version_components(version: &str) -> Option<Vec<VersionComponentKind>> {
+    version
+        .splitn(3, '.')
+        .map(|part| {
+            if matches!(part, "x" | "X" | "*") {
+                Some(VersionComponentKind::Wildcard)
+            } else if part.starts_with(|c: char| c.is_ascii_digit()) {
+                Some(VersionComponentKind::Concrete)
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Cheap pre-check for the two `node_semver` 2.2.0 `unreachable!()` panic shapes reachable
+/// from user input (#1630, confirmed by reading `node_semver`'s own tilde/equals match arms
+/// in `range.rs`): a tilde or equals range whose partial version has a wildcard major
+/// (`~*`, `=*`, `~x.2.3`, ...), or a *plain* tilde range (no `~>`) whose minor is a wildcard
+/// while its patch is concrete (`~1.x.3`) — neither operator's match arms cover these.
+///
+/// Mirrors the `deps-pypi`/`pep508_rs` precedent's shape: a cheap pre-check that keeps the
+/// common cases off the panic-unwind-log path, not a full grammar re-implementation. A false
+/// negative here is harmless — [`parse_range_safe`]'s `catch_unwind` remains the correctness
+/// backstop for any shape this heuristic misses (including `^`-caret ranges, which are not
+/// checked here since `node_semver`'s caret match arms have no equivalent gap). It must never
+/// have a false positive (rejecting a range `node_semver` can actually parse), so it only
+/// flags shapes read directly off `node_semver`'s source, nothing broader.
+fn has_known_panicking_shape(requirement: &str) -> bool {
+    requirement
+        .split("||")
+        .flat_map(str::split_whitespace)
+        .any(|token| {
+            if let Some(rest) = token.strip_prefix("~>").or_else(|| token.strip_prefix('~')) {
+                partial_version_components(rest).is_some_and(|comps| {
+                    comps.first() == Some(&VersionComponentKind::Wildcard)
+                        || matches!(
+                            comps.as_slice(),
+                            [
+                                VersionComponentKind::Concrete,
+                                VersionComponentKind::Wildcard,
+                                VersionComponentKind::Concrete
+                            ]
+                        )
+                })
+            } else if let Some(rest) = token.strip_prefix('=') {
+                partial_version_components(rest)
+                    .is_some_and(|comps| comps.first() == Some(&VersionComponentKind::Wildcard))
+            } else {
+                false
+            }
+        })
+}
+
+/// Panic-safe wrapper around [`node_semver::Range::parse`].
+///
+/// `node_semver` 2.2.0 has a reachable `unreachable!()` panic (#1630) for certain short
+/// npm range strings instead of returning `Err`, which would otherwise crash the LSP
+/// request handling this feeds (hover/completion/diagnostics/inlay hints all resolve
+/// dependency requirements through it). Every `node_semver::Range::parse` call in
+/// `deps-npm` and `deps-deno` (which delegates its own `npm:`/`jsr:` range parsing here)
+/// must route through this wrapper instead of calling `node_semver::Range::parse`
+/// directly.
+///
+/// `has_known_panicking_shape` rejects the known panic shapes upfront so the panic path
+/// stays a rare backstop rather than the common path for these inputs (avoids a
+/// `thread ... panicked at ...` block on stderr, plus a full backtrace under
+/// `RUST_BACKTRACE=1`, on every re-diagnose of a manifest containing one) — mirrors why the
+/// `deps-pypi`/`pep508_rs` precedent pre-validates before its own `catch_unwind` backstop.
+///
+/// # Errors
+///
+/// Returns [`RangeParseError::Malformed`] for an ordinary unparseable range, and
+/// [`RangeParseError::Panicked`] when `node_semver` panics (or would panic, per the
+/// pre-check above) instead — both are `Err`, so a caller that already treats a malformed
+/// range as "unresolved"/"no match" needs no separate panic branch of its own.
+///
+/// # Examples
+///
+/// ```
+/// use deps_npm::parse_range_safe;
+///
+/// assert!(parse_range_safe("^1.0.0").is_ok());
+/// assert!(parse_range_safe("not a range").is_err());
+/// // Previously panicked (#1630); now a graceful `Err(RangeParseError::Panicked)`.
+/// assert!(parse_range_safe("~*").is_err());
+/// ```
+pub fn parse_range_safe(requirement: &str) -> Result<node_semver::Range, RangeParseError> {
+    if has_known_panicking_shape(requirement) {
+        tracing::warn!(
+            requirement,
+            "node_semver would panic parsing this range shape, rejecting before parsing (#1630)"
+        );
+        return Err(RangeParseError::Panicked);
+    }
+    match std::panic::catch_unwind(|| node_semver::Range::parse(requirement)) {
+        Ok(result) => result.map_err(RangeParseError::from),
+        Err(_) => {
+            tracing::warn!(
+                requirement,
+                "node_semver panicked parsing a range, treating it as unparseable (#1630)"
+            );
+            Err(RangeParseError::Panicked)
+        }
+    }
+}
+
 /// Precise npm semver range matcher, compiled once per dependency by
 /// [`compile_node_semver_range`]. `branches` is `range` split on its top-level `||` and
 /// individually re-parsed — needed only for [`explicitly_excludes`](Self::explicitly_excludes)'s
@@ -65,10 +200,10 @@ fn node_semver_or_gap_excludes(branches: &[node_semver::Range], version: &str) -
     let Ok(candidate) = node_semver::Version::parse(version) else {
         return false;
     };
-    let Ok(at_or_above) = node_semver::Range::parse(format!(">={candidate}")) else {
+    let Ok(at_or_above) = parse_range_safe(&format!(">={candidate}")) else {
         return false;
     };
-    let Ok(at_or_below) = node_semver::Range::parse(format!("<={candidate}")) else {
+    let Ok(at_or_below) = parse_range_safe(&format!("<={candidate}")) else {
         return false;
     };
     let any = node_semver::Range::any();
@@ -121,11 +256,11 @@ pub fn compile_node_semver_range(requirement: &VersionReq) -> Option<Box<dyn Req
     if deps_core::lsp_helpers::requirement_contains_template_placeholder(requirement.as_str()) {
         return None;
     }
-    let range = node_semver::Range::parse(requirement.as_str()).ok()?;
+    let range = parse_range_safe(requirement.as_str()).ok()?;
     let branches = requirement
         .as_str()
         .split("||")
-        .filter_map(|branch| node_semver::Range::parse(branch.trim()).ok())
+        .filter_map(|branch| parse_range_safe(branch.trim()).ok())
         .collect();
     Some(Box::new(NodeSemverMatcher { range, branches }) as Box<dyn RequirementMatcher>)
 }
@@ -547,6 +682,75 @@ mod tests {
                 .compile_requirement(&VersionReq::new("not a range"))
                 .is_none()
         );
+    }
+
+    /// #1630: `node_semver` 2.2.0 hits an internal `unreachable!()` (rather than returning
+    /// `Err`) for a tilde requirement whose partial version is itself a wildcard
+    /// (`~*`/`~x`/`~X`) — reachable straight from `package.json` via `compile_requirement`.
+    /// Asserts the panic is caught and folded into the same graceful `None` an ordinary
+    /// unparseable requirement already produces.
+    #[test]
+    fn test_compile_requirement_tilde_wildcard_does_not_panic() {
+        let formatter = NpmFormatter;
+        for requirement in [
+            "~*",
+            "~x",
+            "~X",
+            "=*",
+            "=x",
+            "=X",
+            "~1.x.3",
+            "~>*",
+            "~* || ^1.0.0",
+            "^1.0.0 ~*",
+        ] {
+            assert!(
+                formatter
+                    .compile_requirement(&VersionReq::new(requirement))
+                    .is_none(),
+                "requirement {requirement:?} must not panic and must resolve to None"
+            );
+        }
+    }
+
+    /// #1630 at the wrapper level: `parse_range_safe` must catch (or, via
+    /// `has_known_panicking_shape`, pre-empt) the panic and report it as
+    /// [`RangeParseError::Panicked`], distinguishable from an ordinary
+    /// [`RangeParseError::Malformed`] parse rejection. Covers both `node_semver`
+    /// `unreachable!()` sites: `range.rs:982` (wildcard-major tilde) and `range.rs:782`
+    /// (wildcard-major equals), plus the plain-tilde wildcard-minor-then-patch gap.
+    #[test]
+    fn test_parse_range_safe_catches_tilde_wildcard_panic() {
+        for requirement in [
+            "~*",
+            "~x",
+            "~X",
+            "=*",
+            "=x",
+            "=X",
+            "~1.x.3",
+            "~>*",
+            "~* || ^1.0.0",
+            "^1.0.0 ~*",
+        ] {
+            assert!(
+                matches!(
+                    parse_range_safe(requirement),
+                    Err(RangeParseError::Panicked)
+                ),
+                "requirement {requirement:?} must resolve to RangeParseError::Panicked"
+            );
+        }
+        assert!(matches!(
+            parse_range_safe("not a range"),
+            Err(RangeParseError::Malformed(_))
+        ));
+        assert!(parse_range_safe("^1.0.0").is_ok());
+        // `=` (Exact) tolerates a wildcard minor as long as the major is concrete — only a
+        // wildcard *major* panics for this operator (unlike plain tilde's extra gap).
+        assert!(parse_range_safe("=1.x.3").is_ok());
+        // Plain tilde's gap requires patch to be concrete; a wildcard patch is fine.
+        assert!(parse_range_safe("~1.x").is_ok());
     }
 
     #[test]

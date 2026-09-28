@@ -596,7 +596,7 @@ fn resolve(
             if deps_core::lsp_helpers::requirement_len_exceeds_cap(range) {
                 return CatalogOutcome::RequirementTooLong;
             }
-            match node_semver::Range::parse(range) {
+            match crate::formatter::parse_range_safe(range) {
                 Ok(_) => CatalogOutcome::Resolved(range.clone()),
                 Err(_) => CatalogOutcome::NonSemverEntry {
                     value: range.clone(),

@@ -611,7 +611,7 @@ impl Registry for DenoRegistry {
                     let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
                     // Pre-check before any network call: a malformed requirement must stay
                     // `Err` (R5c's diagnostic), not silently become `Ok(None)` (R5e, no diagnostic).
-                    node_semver::Range::parse(req.as_str())
+                    deps_npm::parse_range_safe(req.as_str())
                         .map_err(|e| DepsError::InvalidVersionReq(e.to_string()))?;
                     let versions: Vec<Box<dyn Version>> = self
                         .jsr
@@ -1225,6 +1225,31 @@ mod tests {
             panic!("expected an error for a malformed jsr: version requirement");
         };
         assert_matches!(err, DepsError::InvalidVersionReq(_));
+    }
+
+    /// #1630: a `~*`-shaped requirement used to panic `node_semver::Range::parse` (called
+    /// directly in this module's JSR pre-check, not via `deps-npm`'s `compile_requirement`)
+    /// instead of returning `Err`. Mirrors `deps-npm`'s own coverage for this call site.
+    #[tokio::test]
+    async fn test_deno_registry_get_latest_matching_jsr_tilde_wildcard_does_not_panic() {
+        let registry = DenoRegistry {
+            jsr: unreachable_jsr(Arc::new(HttpCache::new())),
+            npm: NpmRegistry::new(Arc::new(HttpCache::new())),
+        };
+
+        for requirement in ["~*", "~x", "~X", "=*", "~1.x.3"] {
+            let Err(err) = Registry::get_latest_matching(
+                &registry,
+                &PackageName::new("jsr:@std/fs"),
+                &VersionReq::new(requirement),
+                &deps_core::SelectionContext::none(),
+            )
+            .await
+            else {
+                panic!("expected an error for a tilde-wildcard jsr: version requirement");
+            };
+            assert_matches!(err, DepsError::InvalidVersionReq(_));
+        }
     }
 
     // --- S-L1: dot-prefixed JSR segment must be rejected before building the URL ---
