@@ -931,25 +931,45 @@ mod tests {
         // ^0.0.3 should only allow 0.0.3 (left-most non-zero is patch)
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0.3"));
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.3"), "^0.0"));
+        // ^0.0.3 should NOT allow 0.0.2 (below the floor) or 0.0.4 (past the ceiling).
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.2"), "^0.0.3"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.4"), "^0.0.3"));
 
         // ^0 should only allow 0.x.y (major is 0)
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.0.0"), "^0"));
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("0.5.0"), "^0"));
         assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^0"));
+
+        // ^0.0 should NOT allow 0.1.0 (past the ceiling).
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.1.0"), "^0.0"));
     }
 
     #[test]
     fn test_caret_version_non_zero_major() {
         let formatter = MOCK_FORMATTER;
 
-        // ^1.2 allows any 1.x.x
-        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^1.2"));
+        // ^1.2 allows [1.2.0, 2.0.0) — same major, but never below the requirement's own
+        // minor floor (#1622).
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.2.0"), "^1.2"));
         assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.9.9"), "^1.2"));
 
-        // ^1.2 should NOT allow 2.x.x
+        // ^1.2 should NOT allow 2.x.x, nor a same-major version below the minor floor.
         assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.2"));
         assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("0.9.0"), "^1.2"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.0.0"), "^1.2"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.9"), "^1.2"));
+    }
+
+    /// #1622 regression: `^X.Y` must enforce its own minor/patch lower bound, not just the
+    /// major component — mirroring #1619's fix for `deps-composer`'s `satisfies_caret`.
+    #[test]
+    fn test_caret_requirement_enforces_minor_lower_bound() {
+        let formatter = MOCK_FORMATTER;
+
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("1.1.0"), "^1.5"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.5.0"), "^1.5"));
+        assert!(formatter.version_satisfies_requirement(&ConcreteVersion::new("1.9.0"), "^1.5"));
+        assert!(!formatter.version_satisfies_requirement(&ConcreteVersion::new("2.0.0"), "^1.5"));
     }
 
     #[test]

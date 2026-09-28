@@ -4,7 +4,7 @@ use deps_core::InvalidPackageName;
 use deps_core::PackageName;
 use deps_core::StabilityFloor;
 use deps_core::VersionReq;
-use deps_core::interval::{VersionRange, range_from_edges};
+use deps_core::interval::{VersionRange, range_from_edges, tighter_lower, tighter_upper};
 use deps_core::lsp_helpers::{
     DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
     RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
@@ -12,6 +12,8 @@ use deps_core::lsp_helpers::{
 };
 use deps_core::normalize_operator_spacing;
 use std::borrow::Cow;
+use std::cmp::Ordering;
+use std::ops::Bound;
 
 /// Whether `segment` matches Packagist's vendor/package name-segment charset: starts and ends
 /// with an ASCII alphanumeric character, with only `.`, `_`, `-` allowed in between (Composer's
@@ -211,7 +213,7 @@ fn has_valid_version_core(s: &str) -> bool {
 /// Returns `None` when either edge's numeric core isn't itself valid ([`has_valid_version_core`],
 /// impl-critic S1) — a malformed bound like `"^1.0 - 2.0"` must not silently become version `0`
 /// and admit everything below `hi`.
-fn hyphen_bounds_from_edges(lo: &str, hi: &str) -> Option<((String, bool), (String, bool))> {
+fn hyphen_bounds_from_edges(lo: &str, hi: &str) -> Option<(Bound<String>, Bound<String>)> {
     if !has_valid_version_core(lo) || !has_valid_version_core(hi) {
         return None;
     }
@@ -221,12 +223,12 @@ fn hyphen_bounds_from_edges(lo: &str, hi: &str) -> Option<((String, bool), (Stri
     let (hi_core, hi_suffix) = split_composer_core_and_suffix(hi_stripped);
     let full = hi_suffix.is_some() || hi_core.split('.').count() >= 3;
     let upper = if full {
-        (hi_stripped.to_string(), true)
+        Bound::Included(hi_stripped.to_string())
     } else {
         let incremented = increment_last_segment(hi_core)?;
-        (format!("{incremented}-dev"), false)
+        Bound::Excluded(format!("{incremented}-dev"))
     };
-    Some(((lo, true), upper))
+    Some((Bound::Included(lo), upper))
 }
 
 /// A hyphen range's resolved `(lower, upper)` edge pair, plus any further AND-clauses trailing
@@ -236,8 +238,8 @@ fn hyphen_bounds_from_edges(lo: &str, hi: &str) -> Option<((String, bool), (Stri
 /// [`walk_requirement`]/[`branch_bound`] separately normalizing again for their own fallback
 /// path, avoids a redundant re-scan for every ordinary, non-hyphen clause).
 struct HyphenRangeMatch<'a> {
-    lower: (String, bool),
-    upper: (String, bool),
+    lower: Bound<String>,
+    upper: Bound<String>,
     extra: Vec<&'a str>,
 }
 
@@ -351,8 +353,8 @@ fn walk_requirement<L: RequirementLeaf>(leaf: &L, version: &str, requirement: &s
 
     if let Some(hyphen) = hyphen_range_edges(requirement) {
         let edge_results = [
-            leaf.eval_edge(version, &hyphen.lower.0, hyphen.lower.1, true),
-            leaf.eval_edge(version, &hyphen.upper.0, hyphen.upper.1, false),
+            leaf.eval_edge(version, hyphen.lower.as_ref().map(String::as_str), true),
+            leaf.eval_edge(version, hyphen.upper.as_ref().map(String::as_str), false),
         ];
         return leaf.combine_and(
             edge_results.into_iter().chain(
@@ -399,17 +401,20 @@ trait RequirementLeaf {
     /// Folds an AND-separated clause group's per-clause results.
     fn combine_and(&self, results: impl Iterator<Item = bool>) -> bool;
 
-    /// Evaluates a single bound edge (`(bound, inclusive)`, from either side of a hyphen range,
-    /// #1608, via [`hyphen_range_edges`]) directly, without building and re-parsing an
+    /// Evaluates a single bound edge (a [`Bound`], from either side of a hyphen range, #1608,
+    /// via [`hyphen_range_edges`]) directly, without building and re-parsing an
     /// operator-prefixed clause string (impl-critic S3). `lower` is `true` for the range's
-    /// lower edge (an implicit `>=`/`>`), `false` for its upper edge (`<=`/`<`).
+    /// lower edge (an implicit `>=`/`>`), `false` for its upper edge (`<=`/`<`). `edge` is
+    /// always `Included`/`Excluded` in practice (a hyphen range's edges are always concrete),
+    /// but [`Bound::Unbounded`] is handled too — answering "admits everything" — so this stays
+    /// total over its own parameter type rather than assuming a caller-specific invariant.
     ///
     /// For [`AdmitLeaf`] this is a plain version-vs-bound comparison, equivalent to what
     /// [`AdmitLeaf::eval_leaf`]'s own `>=`/`<=`/`>`/`<` branches compute. For [`ExcludeLeaf`] a
     /// bound edge never itself excludes a version — only a literal `!=` clause does (see
     /// [`ExcludeLeaf::eval_leaf`]) — so this always answers `false`, mirroring how
     /// `ExcludeLeaf::eval_leaf` itself answers `false` for a `>=`/`<=`/`>`/`<` clause.
-    fn eval_edge(&self, version: &str, bound: &str, inclusive: bool, lower: bool) -> bool;
+    fn eval_edge(&self, version: &str, edge: Bound<&str>, lower: bool) -> bool;
 }
 
 /// [`RequirementLeaf`] for "does this admit `version`" — Composer's full requirement grammar
@@ -425,14 +430,20 @@ impl RequirementLeaf for AdmitLeaf {
         results.all(|r| r)
     }
 
-    fn eval_edge(&self, version: &str, bound: &str, inclusive: bool, lower: bool) -> bool {
+    fn eval_edge(&self, version: &str, edge: Bound<&str>, lower: bool) -> bool {
+        let (bound, inclusive) = match edge {
+            Bound::Included(b) => (b, true),
+            Bound::Excluded(b) => (b, false),
+            // No constraint from this side at all.
+            Bound::Unbounded => return true,
+        };
         let ord = compare_versions(version, bound);
         if lower {
-            if inclusive { ord >= 0 } else { ord > 0 }
+            if inclusive { ord.is_ge() } else { ord.is_gt() }
         } else if inclusive {
-            ord <= 0
+            ord.is_le()
         } else {
-            ord < 0
+            ord.is_lt()
         }
     }
 
@@ -456,12 +467,12 @@ impl RequirementLeaf for AdmitLeaf {
         if let Some(cmp) = parse_comparator(requirement) {
             let ord = compare_versions(version, cmp.version);
             return match cmp.op {
-                CmpOp::Ge => ord >= 0,
-                CmpOp::Le => ord <= 0,
-                CmpOp::Gt => ord > 0,
-                CmpOp::Lt => ord < 0,
-                CmpOp::Eq => ord == 0,
-                CmpOp::Ne => ord != 0,
+                CmpOp::Ge => ord.is_ge(),
+                CmpOp::Le => ord.is_le(),
+                CmpOp::Gt => ord.is_gt(),
+                CmpOp::Lt => ord.is_lt(),
+                CmpOp::Eq => ord.is_eq(),
+                CmpOp::Ne => ord.is_ne(),
             };
         }
 
@@ -505,7 +516,7 @@ impl RequirementLeaf for ExcludeLeaf {
         results.any(|r| r)
     }
 
-    fn eval_edge(&self, _version: &str, _bound: &str, _inclusive: bool, _lower: bool) -> bool {
+    fn eval_edge(&self, _version: &str, _edge: Bound<&str>, _lower: bool) -> bool {
         false
     }
 
@@ -513,7 +524,7 @@ impl RequirementLeaf for ExcludeLeaf {
         let Some(cmp) = parse_comparator(requirement) else {
             return false;
         };
-        cmp.op == CmpOp::Ne && compare_versions(version, cmp.version) == 0
+        cmp.op == CmpOp::Ne && compare_versions(version, cmp.version).is_eq()
     }
 }
 
@@ -621,12 +632,6 @@ fn increment_last_segment(prefix: &str) -> Option<String> {
     )
 }
 
-/// Composer's `compare_versions`, wrapped as an [`Ordering`](std::cmp::Ordering)-returning
-/// comparator for [`deps_core::interval`]'s generic bound-comparison closures.
-fn compare_versions_ord(a: &str, b: &str) -> std::cmp::Ordering {
-    compare_versions(a, b).cmp(&0)
-}
-
 /// One AND-clause's contribution to its branch's overall admitted extent (#1601), expressed as
 /// a [`deps_core::interval::VersionRange`] (#1610: reusing the same validated interval
 /// representation `deps-maven`'s own OR/disjoint-range exclusion check builds on, rather than a
@@ -698,32 +703,6 @@ fn clause_bound(clause: &str) -> Option<VersionRange<String>> {
     None
 }
 
-/// Compares two optional lower edges and keeps the tighter (larger) one, matching a lower
-/// bound's own AND-intersection: at equal value, an exclusive edge is tighter than inclusive.
-fn tighter_lower(a: Option<(String, bool)>, b: Option<(String, bool)>) -> Option<(String, bool)> {
-    match (a, b) {
-        (None, x) | (x, None) => x,
-        (Some((av, ai)), Some((bv, bi))) => match compare_versions(&av, &bv) {
-            0 => Some((av, ai && bi)),
-            ord if ord > 0 => Some((av, ai)),
-            _ => Some((bv, bi)),
-        },
-    }
-}
-
-/// Compares two optional upper edges and keeps the tighter (smaller) one — mirrors
-/// [`tighter_lower`].
-fn tighter_upper(a: Option<(String, bool)>, b: Option<(String, bool)>) -> Option<(String, bool)> {
-    match (a, b) {
-        (None, x) | (x, None) => x,
-        (Some((av, ai)), Some((bv, bi))) => match compare_versions(&av, &bv) {
-            0 => Some((av, ai && bi)),
-            ord if ord < 0 => Some((av, ai)),
-            _ => Some((bv, bi)),
-        },
-    }
-}
-
 /// One `||`/`|`-branch's overall admitted extent, expressed as a
 /// [`deps_core::interval::VersionRange`] built from [`range_from_edges`] (#1610). `branch` is
 /// normalized once, up front (code-review follow-up, mirroring [`walk_requirement`]'s own
@@ -748,7 +727,7 @@ fn branch_bound(branch: &str) -> Option<VersionRange<String>> {
     let normalized = &*normalized;
 
     if let Some(hyphen) = hyphen_range_edges(normalized) {
-        return intersect_clause_bounds(Some(hyphen.lower), Some(hyphen.upper), hyphen.extra);
+        return intersect_clause_bounds(hyphen.lower, hyphen.upper, hyphen.extra);
     }
 
     let parts: Vec<&str> = normalized.split_whitespace().collect();
@@ -757,7 +736,7 @@ fn branch_bound(branch: &str) -> Option<VersionRange<String>> {
     } else {
         parts
     };
-    intersect_clause_bounds(None, None, parts)
+    intersect_clause_bounds(Bound::Unbounded, Bound::Unbounded, parts)
 }
 
 /// AND-intersects each of `parts`' [`clause_bound`]s into a `(lower, upper)` pair, seeded
@@ -769,8 +748,8 @@ fn branch_bound(branch: &str) -> Option<VersionRange<String>> {
 /// silently drift from it — and any other clause [`clause_bound`] cannot characterize bails the
 /// whole branch out (`?`) as an unrecognized shape, same as before this extraction.
 fn intersect_clause_bounds<'a>(
-    mut lower: Option<(String, bool)>,
-    mut upper: Option<(String, bool)>,
+    mut lower: Bound<String>,
+    mut upper: Bound<String>,
     parts: impl IntoIterator<Item = &'a str>,
 ) -> Option<VersionRange<String>> {
     for part in parts {
@@ -778,11 +757,12 @@ fn intersect_clause_bounds<'a>(
             continue;
         }
         let clause = clause_bound(part)?;
-        lower = tighter_lower(lower, clause.lower_edge().map(|(v, i)| (v.clone(), i)));
-        upper = tighter_upper(upper, clause.upper_edge().map(|(v, i)| (v.clone(), i)));
+        let cmp = |a: &String, b: &String| compare_versions(a, b);
+        lower = tighter_lower(lower, clause.lower_edge().map(String::clone), cmp);
+        upper = tighter_upper(upper, clause.upper_edge().map(String::clone), cmp);
     }
     range_from_edges(lower, upper, |a: &String, b: &String| {
-        compare_versions_ord(a, b)
+        compare_versions(a, b)
     })
 }
 
@@ -831,7 +811,7 @@ fn composer_or_gap_excludes(version: &str, requirement: &str) -> bool {
         .filter_map(|b| branch_bound(b.trim()))
         .collect();
     let version = version.strip_prefix(['v', 'V']).unwrap_or(version);
-    let cmp = |a: &str, b: &String| compare_versions_ord(a, b);
+    let cmp = |a: &str, b: &String| compare_versions(a, b);
     deps_core::interval::union_gap_excludes(
         &branches,
         // Coverage is already ruled out by the real-matcher check above.
@@ -1173,7 +1153,7 @@ fn satisfies_caret(version: &str, req: &str) -> bool {
         |suffix| format!("{lower_core}-{suffix}"),
     );
 
-    compare_versions(version, &lower) >= 0 && compare_versions(version, &upper) < 0
+    compare_versions(version, &lower).is_ge() && compare_versions(version, &upper).is_lt()
 }
 
 /// Lenient, version-*qualifier* stability classification (matching Composer's `VersionParser`
@@ -1306,14 +1286,14 @@ fn split_composer_core_and_suffix(version: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Simple semantic version comparison returning -1, 0, or 1.
+/// Simple semantic version comparison.
 ///
 /// Compares the numeric-dot core segment by segment, then applies Composer's stability
 /// precedence to any qualifier suffix (`dev < alpha < beta < RC < stable`, see
 /// [`qualifier_stability`]) — a qualified version always sorts below its unqualified
 /// counterpart, and two qualifiers of the same stability compare by their numeric suffix
 /// (e.g. `beta2` < `beta10`).
-fn compare_versions(a: &str, b: &str) -> i32 {
+fn compare_versions(a: &str, b: &str) -> Ordering {
     let (a_core, a_suffix) = split_composer_core_and_suffix(a);
     let (b_core, b_suffix) = split_composer_core_and_suffix(b);
 
@@ -1324,11 +1304,9 @@ fn compare_versions(a: &str, b: &str) -> i32 {
     for i in 0..len {
         let av = a_parts.get(i).copied().unwrap_or(0);
         let bv = b_parts.get(i).copied().unwrap_or(0);
-        if av < bv {
-            return -1;
-        }
-        if av > bv {
-            return 1;
+        match av.cmp(&bv) {
+            Ordering::Equal => {}
+            ord => return ord,
         }
     }
 
@@ -1348,12 +1326,9 @@ fn compare_versions(a: &str, b: &str) -> i32 {
     );
 
     if a_q.rank != b_q.rank {
-        return if a_q.rank < b_q.rank { -1 } else { 1 };
+        return a_q.rank.cmp(&b_q.rank);
     }
-    if a_q.numeric != b_q.numeric {
-        return if a_q.numeric < b_q.numeric { -1 } else { 1 };
-    }
-    0
+    a_q.numeric.cmp(&b_q.numeric)
 }
 
 #[cfg(test)]
@@ -2152,12 +2127,12 @@ mod tests {
     #[test]
     fn test_hyphen_range_edges_shape_detection() {
         let hyphen = hyphen_range_edges("1.0 - 2.0").expect("exact 3-token shape");
-        assert_eq!(hyphen.lower, ("1.0".to_string(), true));
+        assert_eq!(hyphen.lower, Bound::Included("1.0".to_string()));
         assert!(hyphen.extra.is_empty());
 
         let hyphen =
             hyphen_range_edges("1.0.0-alpha - 2.0.0").expect("qualifier-suffixed lower bound");
-        assert_eq!(hyphen.lower, ("1.0.0-alpha".to_string(), true));
+        assert_eq!(hyphen.lower, Bound::Included("1.0.0-alpha".to_string()));
 
         // impl-critic M2: multiple spaces on either side of the hyphen are still recognized
         // (composer/semver's own grammar is ` +- +`, one or more spaces each side).
@@ -2184,14 +2159,14 @@ mod tests {
     #[test]
     fn test_hyphen_range_edges_recognizes_prefix_with_extra_tokens() {
         let hyphen = hyphen_range_edges("1.0 - 2.0").expect("exact 3-token shape");
-        assert_eq!(hyphen.lower, ("1.0".to_string(), true));
-        assert_eq!(hyphen.upper, ("2.1-dev".to_string(), false));
+        assert_eq!(hyphen.lower, Bound::Included("1.0".to_string()));
+        assert_eq!(hyphen.upper, Bound::Excluded("2.1-dev".to_string()));
         assert!(hyphen.extra.is_empty());
 
         let hyphen =
             hyphen_range_edges("1.0 - 2.0 !=1.4.0").expect("hyphen-range prefix with 1 extra");
-        assert_eq!(hyphen.lower, ("1.0".to_string(), true));
-        assert_eq!(hyphen.upper, ("2.1-dev".to_string(), false));
+        assert_eq!(hyphen.lower, Bound::Included("1.0".to_string()));
+        assert_eq!(hyphen.upper, Bound::Excluded("2.1-dev".to_string()));
         assert_eq!(hyphen.extra, vec!["!=1.4.0"]);
 
         let hyphen = hyphen_range_edges("1.0 - 2.0 !=1.4.0 !=1.6.0")
@@ -2275,16 +2250,16 @@ mod tests {
                     inclusive,
                 } => {
                     let ord = compare_versions(version, b);
-                    if *inclusive { ord >= 0 } else { ord > 0 }
+                    if *inclusive { ord.is_ge() } else { ord.is_gt() }
                 }
                 VersionRange::Maximum {
                     version: b,
                     inclusive,
                 } => {
                     let ord = compare_versions(version, b);
-                    if *inclusive { ord <= 0 } else { ord < 0 }
+                    if *inclusive { ord.is_le() } else { ord.is_lt() }
                 }
-                VersionRange::Exact(b) => compare_versions(version, b) == 0,
+                VersionRange::Exact(b) => compare_versions(version, b).is_eq(),
                 other => panic!("unexpected bound shape for {clause}: {other:?}"),
             };
             assert_eq!(
@@ -2404,29 +2379,47 @@ mod tests {
     /// truncated and tie with its stable counterpart.
     #[test]
     fn test_compare_versions_prerelease_vs_stable() {
-        assert_eq!(compare_versions("2.0.0", "2.0.0-beta1"), 1);
-        assert_eq!(compare_versions("2.0.0-beta1", "2.0.0"), -1);
-        assert_ne!(compare_versions("2.0.0", "2.0.0-beta1"), 0);
+        assert_eq!(compare_versions("2.0.0", "2.0.0-beta1"), Ordering::Greater);
+        assert_eq!(compare_versions("2.0.0-beta1", "2.0.0"), Ordering::Less);
+        assert_ne!(compare_versions("2.0.0", "2.0.0-beta1"), Ordering::Equal);
     }
 
     #[test]
     fn test_compare_versions_qualifier_ordering() {
         // dev < alpha < beta < RC < stable.
-        assert_eq!(compare_versions("1.0.0-dev", "1.0.0-alpha1"), -1);
-        assert_eq!(compare_versions("1.0.0-alpha1", "1.0.0-beta1"), -1);
-        assert_eq!(compare_versions("1.0.0-beta1", "1.0.0-RC1"), -1);
-        assert_eq!(compare_versions("1.0.0-RC1", "1.0.0"), -1);
+        assert_eq!(
+            compare_versions("1.0.0-dev", "1.0.0-alpha1"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0-alpha1", "1.0.0-beta1"),
+            Ordering::Less
+        );
+        assert_eq!(compare_versions("1.0.0-beta1", "1.0.0-RC1"), Ordering::Less);
+        assert_eq!(compare_versions("1.0.0-RC1", "1.0.0"), Ordering::Less);
         // Keyword aliases (a/b) and case-insensitivity.
-        assert_eq!(compare_versions("1.0.0-a1", "1.0.0-alpha1"), 0);
-        assert_eq!(compare_versions("1.0.0-b1", "1.0.0-beta1"), 0);
-        assert_eq!(compare_versions("1.0.0-rc1", "1.0.0-RC1"), 0);
+        assert_eq!(
+            compare_versions("1.0.0-a1", "1.0.0-alpha1"),
+            Ordering::Equal
+        );
+        assert_eq!(compare_versions("1.0.0-b1", "1.0.0-beta1"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0-rc1", "1.0.0-RC1"), Ordering::Equal);
     }
 
     #[test]
     fn test_compare_versions_qualifier_numeric_suffix() {
-        assert_eq!(compare_versions("1.0.0-beta2", "1.0.0-beta10"), -1);
-        assert_eq!(compare_versions("1.0.0-beta10", "1.0.0-beta2"), 1);
-        assert_eq!(compare_versions("1.0.0-beta.1", "1.0.0-beta.2"), -1);
+        assert_eq!(
+            compare_versions("1.0.0-beta2", "1.0.0-beta10"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("1.0.0-beta10", "1.0.0-beta2"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0-beta.1", "1.0.0-beta.2"),
+            Ordering::Less
+        );
     }
 
     /// Regression test for impl-critic M2: Composer's modifier regex allows any number of
@@ -2434,18 +2427,27 @@ mod tests {
     /// compared, not just the first — otherwise "alpha1.5" and "alpha1.2" silently tie.
     #[test]
     fn test_compare_versions_qualifier_multiple_numeric_groups() {
-        assert_eq!(compare_versions("1.0.0-alpha1.5", "1.0.0-alpha1.2"), 1);
-        assert_eq!(compare_versions("1.0.0-alpha1.2", "1.0.0-alpha1.5"), -1);
-        assert_ne!(compare_versions("1.0.0-alpha1.5", "1.0.0-alpha1.2"), 0);
+        assert_eq!(
+            compare_versions("1.0.0-alpha1.5", "1.0.0-alpha1.2"),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_versions("1.0.0-alpha1.2", "1.0.0-alpha1.5"),
+            Ordering::Less
+        );
+        assert_ne!(
+            compare_versions("1.0.0-alpha1.5", "1.0.0-alpha1.2"),
+            Ordering::Equal
+        );
     }
 
     #[test]
     fn test_compare_versions_numeric_segments_still_correct() {
-        assert_eq!(compare_versions("1.0.0", "1.0.0"), 0);
-        assert_eq!(compare_versions("1.0.1", "1.0.0"), 1);
-        assert_eq!(compare_versions("1.0.0", "1.0.1"), -1);
-        assert_eq!(compare_versions("2.0.0", "1.9.9"), 1);
-        assert_eq!(compare_versions("10.0.0", "9.0.0"), 1);
+        assert_eq!(compare_versions("1.0.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.1", "1.0.0"), Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "1.0.1"), Ordering::Less);
+        assert_eq!(compare_versions("2.0.0", "1.9.9"), Ordering::Greater);
+        assert_eq!(compare_versions("10.0.0", "9.0.0"), Ordering::Greater);
     }
 
     /// A qualified alpha/beta/RC version must not tie with its stable release under this
@@ -2458,7 +2460,7 @@ mod tests {
     #[test]
     fn test_compare_versions_sorts_prerelease_below_stable() {
         let mut versions = vec!["2.0.0-beta1", "2.0.0", "2.0.0-alpha1", "2.0.0-RC1"];
-        versions.sort_by(|a, b| compare_versions(a, b).cmp(&0));
+        versions.sort_by(|a, b| compare_versions(a, b));
         assert_eq!(
             versions,
             vec!["2.0.0-alpha1", "2.0.0-beta1", "2.0.0-RC1", "2.0.0"]
@@ -2467,7 +2469,10 @@ mod tests {
 
     #[test]
     fn test_compare_versions_build_metadata_ignored() {
-        assert_eq!(compare_versions("1.0.0+build1", "1.0.0+build2"), 0);
+        assert_eq!(
+            compare_versions("1.0.0+build1", "1.0.0+build2"),
+            Ordering::Equal
+        );
     }
 
     /// Build metadata must be stripped before the qualifier is parsed, not after — otherwise
@@ -2476,10 +2481,16 @@ mod tests {
     fn test_compare_versions_qualifier_with_build_metadata() {
         assert_eq!(
             compare_versions("2.0.0-beta1+build1", "2.0.0-beta1+build2"),
-            0
+            Ordering::Equal
         );
-        assert_eq!(compare_versions("2.0.0-beta1+build1", "2.0.0+build2"), -1);
-        assert_eq!(compare_versions("2.0.0+build1", "2.0.0-beta1+build2"), 1);
+        assert_eq!(
+            compare_versions("2.0.0-beta1+build1", "2.0.0+build2"),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_versions("2.0.0+build1", "2.0.0-beta1+build2"),
+            Ordering::Greater
+        );
     }
 
     /// Regression guard for a core with fewer dot segments than its counterpart (e.g. a
@@ -2487,10 +2498,10 @@ mod tests {
     /// cause a spurious mismatch.
     #[test]
     fn test_compare_versions_partial_core_length_mismatch() {
-        assert_eq!(compare_versions("1.0", "1.0.0"), 0);
-        assert_eq!(compare_versions("1.0.0", "1.0"), 0);
-        assert_eq!(compare_versions("1.1", "1.0.5"), 1);
-        assert_eq!(compare_versions("1", "1.0.0-beta1"), 1);
+        assert_eq!(compare_versions("1.0", "1.0.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.0.0", "1.0"), Ordering::Equal);
+        assert_eq!(compare_versions("1.1", "1.0.5"), Ordering::Greater);
+        assert_eq!(compare_versions("1", "1.0.0-beta1"), Ordering::Greater);
     }
 
     #[test]
