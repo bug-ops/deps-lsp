@@ -102,7 +102,7 @@ pub struct ReportDocument {
     ///
     /// Kept as `BTreeMap<Category, usize>` in memory ([`Category`]'s `Ord` is declaration
     /// order, used elsewhere for `--fail-on`/table/SARIF ordering), but serialized through
-    /// [`serialize_summary_lexicographically`] (#1626 critic S1) so the JSON key order stays
+    /// `serialize_summary_lexicographically` (#1626 critic S1) so the JSON key order stays
     /// the pre-#1626 `BTreeMap<String, usize>`'s lexicographic order rather than drifting to
     /// `Category`'s declaration order.
     #[serde(serialize_with = "serialize_summary_lexicographically")]
