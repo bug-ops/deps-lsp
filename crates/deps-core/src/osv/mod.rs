@@ -17,7 +17,7 @@
 mod severity;
 mod types;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -344,7 +344,7 @@ impl OsvClient {
             return HashMap::new();
         }
 
-        let mut outcomes = self.resolve(ecosystem, candidates, timeout).await;
+        let outcomes = self.resolve(ecosystem, candidates, timeout).await;
 
         candidates
             .iter()
@@ -354,7 +354,7 @@ impl OsvClient {
                 // Go's `v`-prefix stripped), but `UpgradeStatus` must surface the
                 // ecosystem-native one.
                 let version = candidate.display_version.clone();
-                let status = match outcomes.remove(&key) {
+                let status = match outcomes.get(&key) {
                     Some(ScanOutcome::Clean) => UpgradeStatus::CandidateClean { version },
                     Some(ScanOutcome::Vulnerable(dv)) => {
                         // Issue #1517 critique S2: `dv.advisories.items()` only holds the
@@ -382,9 +382,10 @@ impl OsvClient {
                             worst_severity,
                         }
                     }
-                    Some(ScanOutcome::Skipped(reason)) => {
-                        UpgradeStatus::CandidateUnverified { version, reason }
-                    }
+                    Some(ScanOutcome::Skipped(reason)) => UpgradeStatus::CandidateUnverified {
+                        version,
+                        reason: *reason,
+                    },
                     // `resolve` is documented to always produce one outcome per target, but a
                     // caller must still fail closed here rather than assume it, per this
                     // method's own contract above (issue #1517 AC4).
@@ -427,7 +428,12 @@ impl OsvClient {
         };
 
         let mut to_query: Vec<ScanTarget> = Vec::new();
+        let mut seen: HashSet<&VulnKey> = HashSet::with_capacity(targets.len());
         for t in targets {
+            // Duplicate keys share one result; querying them twice would only waste requests.
+            if !seen.insert(&t.key) {
+                continue;
+            }
             let cache_key = (osv_eco, t.osv_name.clone(), t.version.clone());
             let cached_ids = self.query_cache.get(&cache_key).and_then(|entry| {
                 (entry.fetched_at.elapsed() < QUERY_CACHE_TTL).then(|| entry.vuln_ids.clone())
@@ -1780,6 +1786,216 @@ mod tests {
                 if version == "2.0.0"
                     && advisory_ids.items() == ["ADV-1".to_string()]
                     && advisory_ids.total() == 1
+        );
+    }
+
+    /// Issue #1655: candidates sharing a `VulnKey` (one dependency declared in several
+    /// sections) must all reflect the one real OSV outcome, not a spurious `QueryFailed`.
+    #[tokio::test]
+    async fn check_candidates_duplicate_keys_share_the_real_outcome() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let candidates = vec![target("dup", "2.0.0"), target("dup", "2.0.0")];
+        let statuses = client
+            .check_candidates(EcosystemId::Npm, &candidates, TEST_TIMEOUT)
+            .await;
+
+        batch.assert_async().await;
+        assert_eq!(statuses.len(), 1);
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("dup")),
+            Some(UpgradeStatus::CandidateClean { version }) if version == "2.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_candidates_three_duplicates_share_one_query_and_outcome() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let candidates = vec![
+            target("dup", "2.0.0"),
+            target("dup", "2.0.0"),
+            target("dup", "2.0.0"),
+        ];
+        let statuses = client
+            .check_candidates(EcosystemId::Npm, &candidates, TEST_TIMEOUT)
+            .await;
+
+        batch.assert_async().await;
+        assert_eq!(statuses.len(), 1);
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("dup")),
+            Some(UpgradeStatus::CandidateClean { .. })
+        );
+    }
+
+    #[tokio::test]
+    async fn check_candidates_mixed_duplicate_and_unique_keys_keep_their_own_outcomes() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{},{"vulns":[{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/ADV-1")
+            .with_status(200)
+            .with_body(r#"{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let candidates = vec![
+            target("dup", "2.0.0"),
+            target("other", "3.0.0"),
+            target("dup", "2.0.0"),
+        ];
+        let statuses = client
+            .check_candidates(EcosystemId::Npm, &candidates, TEST_TIMEOUT)
+            .await;
+
+        assert_eq!(statuses.len(), 2);
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("dup")),
+            Some(UpgradeStatus::CandidateClean { version }) if version == "2.0.0"
+        );
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("other")),
+            Some(UpgradeStatus::CandidateVulnerable { version, advisory_ids, .. })
+                if version == "3.0.0" && advisory_ids.items() == ["ADV-1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn check_candidates_vulnerable_duplicates_carry_advisories() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{"vulns":[{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/ADV-1")
+            .with_status(200)
+            .with_body(r#"{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let candidates = vec![target("dup", "2.0.0"), target("dup", "2.0.0")];
+        let statuses = client
+            .check_candidates(EcosystemId::Npm, &candidates, TEST_TIMEOUT)
+            .await;
+
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("dup")),
+            Some(UpgradeStatus::CandidateVulnerable { advisory_ids, .. })
+                if advisory_ids.items() == ["ADV-1".to_string()] && advisory_ids.total() == 1
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_duplicate_keys_are_queried_once_and_keep_their_own_outcomes() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(
+                r#"{"results":[{},{"vulns":[{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}]}]}"#,
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let _record = server
+            .mock("GET", "/v1/vulns/ADV-1")
+            .with_status(200)
+            .with_body(r#"{"id":"ADV-1","modified":"2023-01-01T00:00:00Z"}"#)
+            .create_async()
+            .await;
+
+        let targets = vec![
+            target("dup", "2.0.0"),
+            target("other", "3.0.0"),
+            target("dup", "2.0.0"),
+        ];
+        let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
+
+        batch.assert_async().await;
+        assert_eq!(outcomes.len(), 2);
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("dup")),
+            Some(ScanOutcome::Clean)
+        );
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("other")),
+            Some(ScanOutcome::Vulnerable(_))
+        );
+    }
+
+    /// Same key with a different version is unreachable from the builders (the key encodes the
+    /// in-use signature); `resolve` pins first-wins should it ever happen.
+    #[tokio::test]
+    async fn resolve_same_key_different_version_queries_only_the_first() {
+        let (mut server, client) = mock_client().await;
+        let batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(200)
+            .with_body(r#"{"results":[{}]}"#)
+            .expect(1)
+            .create_async()
+            .await;
+
+        let targets = vec![target("dup", "1.0.0"), target("dup", "2.0.0")];
+        let outcomes = client.scan(EcosystemId::Npm, &targets, TEST_TIMEOUT).await;
+
+        batch.assert_async().await;
+        assert_eq!(outcomes.len(), 1);
+        assert_matches!(
+            outcomes.get(&crate::test_util::vuln_key("dup")),
+            Some(ScanOutcome::Clean)
+        );
+    }
+
+    #[tokio::test]
+    async fn check_candidates_duplicate_keys_all_unverified_when_query_fails() {
+        let (mut server, client) = mock_client().await;
+        let _batch = server
+            .mock("POST", "/v1/querybatch")
+            .with_status(500)
+            .create_async()
+            .await;
+
+        let candidates = vec![target("dup", "2.0.0"), target("dup", "2.0.0")];
+        let statuses = client
+            .check_candidates(EcosystemId::Npm, &candidates, TEST_TIMEOUT)
+            .await;
+
+        assert_matches!(
+            statuses.get(&crate::test_util::vuln_key("dup")),
+            Some(UpgradeStatus::CandidateUnverified {
+                reason: SkipReason::QueryFailed,
+                ..
+            })
         );
     }
 
