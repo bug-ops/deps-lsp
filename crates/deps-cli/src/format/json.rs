@@ -147,7 +147,9 @@ pub struct UpdateItemDocument {
     pub name: String,
     /// The current (resolved in-use, or declared) version.
     pub current: String,
-    /// The version this item's edit would move the dependency to, when applicable.
+    /// The version this item's edit would move the dependency to, when applicable — empty
+    /// when the item has no concrete target ([`crate::update::PlannedUpdateItem::target`] is
+    /// `None`).
     pub target: String,
     /// One of `applied` / `skipped` / `requires-lockfile-update` / `unfixable`.
     pub outcome: String,
@@ -198,27 +200,29 @@ pub fn update_to_document(
     plan: &crate::update::UpdatePlan,
     dry_run: DryRun,
 ) -> UpdateReportDocument {
-    // Security-S3: same sanitizer `format::table::render_update` routes `name`/`current`
-    // through — a JSON consumer that prints these fields verbatim gets the same protection.
+    // Security-S3: `target`/`reason`/`cooldown_fallback` carry unvalidated `ConcreteVersion`
+    // text, sanitized here like `name`/`current` and `format::table::render_update`.
     let items = plan
         .items
         .iter()
         .map(|item| UpdateItemDocument {
             name: crate::sanitize::sanitize_message_for_display(&item.name),
             current: crate::sanitize::sanitize_message_for_display(&item.current.render_text()),
-            target: item.target.clone(),
+            target: item.target.as_ref().map_or_else(String::new, |v| {
+                crate::sanitize::sanitize_message_for_display(v.as_str())
+            }),
             outcome: item.outcome.wire_token().to_string(),
-            reason: item.reason(),
+            reason: crate::sanitize::sanitize_message_for_display(&item.reason()),
             advisory_ids: item.advisory_ids.clone(),
             cooldown_fallback: item.cooldown_fallback.as_ref().map(|note| match note {
                 crate::update::CooldownFallbackNote::AppliedInsteadOf(latest) => {
                     CooldownFallbackDocument::AppliedInsteadOf {
-                        latest: latest.to_string(),
+                        latest: crate::sanitize::sanitize_message_for_display(latest.as_str()),
                     }
                 }
                 crate::update::CooldownFallbackNote::Blocked { version } => {
                     CooldownFallbackDocument::Blocked {
-                        version: version.to_string(),
+                        version: crate::sanitize::sanitize_message_for_display(version.as_str()),
                     }
                 }
             }),
@@ -336,7 +340,7 @@ mod tests {
             current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
                 "1.0.0",
             )),
-            target: "1.2.0".to_string(),
+            target: Some(deps_core::ConcreteVersion::from("1.2.0")),
             outcome,
             advisory_ids: vec!["RUSTSEC-2024-0001".to_string()],
             ignore_rule_overridden: false,
@@ -381,5 +385,61 @@ mod tests {
         let parsed: UpdateReportDocument =
             serde_json::from_str(&rendered).expect("must round-trip");
         assert_eq!(parsed, update_to_document(&plan, DryRun::No));
+    }
+
+    /// #1605: `None` (empty/no target) maps to `""` on the wire, byte-identical to the
+    /// pre-#1605 `String`-with-`""`-sentinel convention — no `UPDATE_SCHEMA_VERSION` bump.
+    #[test]
+    fn test_update_to_document_none_target_renders_empty_string() {
+        let mut item = update_item(crate::update::Outcome::Skipped(
+            crate::update::SkipReason::NotRequested,
+        ));
+        item.target = None;
+        let plan = crate::update::UpdatePlan { items: vec![item] };
+        let document = update_to_document(&plan, DryRun::No);
+        assert_eq!(document.items[0].target, "");
+    }
+
+    /// #1605 critic S1: `target` and `reason`/`cooldown_fallback` both carry unvalidated
+    /// registry text (`ConcreteVersion` is deliberately unchecked) and must both be sanitized.
+    #[test]
+    fn test_update_to_document_strips_ansi_from_target_and_reason() {
+        let mut item = update_item(crate::update::Outcome::Skipped(
+            crate::update::SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestFlaggedByOsv,
+            ),
+        ));
+        item.target = Some(deps_core::ConcreteVersion::from("1.2.0\x1B[31m"));
+        item.cooldown_fallback = Some(crate::update::CooldownFallbackNote::Blocked {
+            version: deps_core::ConcreteVersion::from("1.1.0\x1B[31m"),
+        });
+        let mut applied_instead_of_item =
+            update_item(crate::update::Outcome::Applied(applied_edit()));
+        applied_instead_of_item.cooldown_fallback =
+            Some(crate::update::CooldownFallbackNote::AppliedInsteadOf(
+                deps_core::ConcreteVersion::from("1.3.0\x1B[31m"),
+            ));
+        let plan = crate::update::UpdatePlan {
+            items: vec![item, applied_instead_of_item],
+        };
+        let document = update_to_document(&plan, DryRun::No);
+        let doc_item = &document.items[0];
+        assert!(!doc_item.target.contains('\x1B'));
+        assert!(doc_item.target.contains("1.2.0"));
+        assert!(!doc_item.reason.contains('\x1B'));
+        match &doc_item.cooldown_fallback {
+            Some(CooldownFallbackDocument::Blocked { version }) => {
+                assert!(!version.contains('\x1B'));
+                assert!(version.contains("1.1.0"));
+            }
+            other => panic!("expected Blocked, got: {other:?}"),
+        }
+        match &document.items[1].cooldown_fallback {
+            Some(CooldownFallbackDocument::AppliedInsteadOf { latest }) => {
+                assert!(!latest.contains('\x1B'));
+                assert!(latest.contains("1.3.0"));
+            }
+            other => panic!("expected AppliedInsteadOf, got: {other:?}"),
+        }
     }
 }

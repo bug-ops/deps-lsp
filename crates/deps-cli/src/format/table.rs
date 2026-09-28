@@ -103,15 +103,12 @@ pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: DryRun) -> Strin
     }
 
     for item in &plan.items {
-        let target = if item.target.is_empty() {
-            "-"
-        } else {
-            item.target.as_str()
-        };
-        // Security-S3: `name`/`current` can embed manifest-controlled text (a package name,
-        // or — in `--security-only` mode — the declared requirement/resolved version
-        // verbatim); routed through the same sanitizer every other untrusted-text sink in
-        // this crate uses, closing a consistency gap even though no live exploit reached it.
+        // Security-S3: `target`/`reason()` carry unvalidated `ConcreteVersion` text, sanitized
+        // like `name`/`current` below; only `None` means "no target".
+        let target = item.target.as_ref().map_or_else(
+            || "-".to_string(),
+            |v| crate::sanitize::sanitize_message_for_display(v.as_str()),
+        );
         let _ = writeln!(
             out,
             "[{}] {} {} -> {} — {}",
@@ -119,7 +116,7 @@ pub fn render_update(plan: &crate::update::UpdatePlan, dry_run: DryRun) -> Strin
             crate::sanitize::sanitize_message_for_display(&item.name),
             crate::sanitize::sanitize_message_for_display(&item.current.render_text()),
             target,
-            item.reason(),
+            crate::sanitize::sanitize_message_for_display(&item.reason()),
         );
     }
     out
@@ -228,7 +225,7 @@ mod tests {
             current: crate::update::CurrentVersion::Resolved(deps_core::ConcreteVersion::from(
                 "1.0.0",
             )),
-            target: "1.2.0".to_string(),
+            target: Some(deps_core::ConcreteVersion::from("1.2.0")),
             outcome,
             advisory_ids: Vec::new(),
             ignore_rule_overridden: false,
@@ -277,5 +274,47 @@ mod tests {
         let table = render_update(&crate::update::UpdatePlan::default(), DryRun::Yes);
         assert!(table.starts_with("(dry run"));
         assert!(table.contains("No eligible updates."));
+    }
+
+    /// #1605: `None` is the sole "no target" sentinel now — it still renders as `-`.
+    #[test]
+    fn test_render_update_none_target_renders_dash() {
+        let mut item = update_item(crate::update::Outcome::Skipped(
+            crate::update::SkipReason::NotRequested,
+        ));
+        item.target = None;
+        let plan = crate::update::UpdatePlan { items: vec![item] };
+        let table = render_update(&plan, DryRun::No);
+        assert!(table.contains(" -> - "), "got: {table}");
+    }
+
+    /// #1605 critic S1: `target` and `reason()`'s cooldown-fallback attribution both carry
+    /// unvalidated registry text (`ConcreteVersion` is deliberately unchecked) and must both be
+    /// sanitized at this render sink.
+    #[test]
+    fn test_render_update_strips_ansi_from_target_and_reason() {
+        let mut item = update_item(crate::update::Outcome::Skipped(
+            crate::update::SkipReason::NotSafelyEditable(
+                deps_core::edit::UnplannableReason::LatestFlaggedByOsv,
+            ),
+        ));
+        item.target = Some(deps_core::ConcreteVersion::from("1.2.0\x1B[31m"));
+        item.cooldown_fallback = Some(crate::update::CooldownFallbackNote::Blocked {
+            version: deps_core::ConcreteVersion::from("1.1.0\x1B[31m"),
+        });
+        let mut applied_instead_of_item =
+            update_item(crate::update::Outcome::Applied(applied_edit()));
+        applied_instead_of_item.cooldown_fallback =
+            Some(crate::update::CooldownFallbackNote::AppliedInsteadOf(
+                deps_core::ConcreteVersion::from("1.3.0\x1B[31m"),
+            ));
+        let plan = crate::update::UpdatePlan {
+            items: vec![item, applied_instead_of_item],
+        };
+        let table = render_update(&plan, DryRun::No);
+        assert!(!table.contains('\x1B'), "got: {table}");
+        assert!(table.contains("1.2.0"), "got: {table}");
+        assert!(table.contains("1.1.0"), "got: {table}");
+        assert!(table.contains("1.3.0"), "got: {table}");
     }
 }

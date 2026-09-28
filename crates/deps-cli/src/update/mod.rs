@@ -148,8 +148,10 @@ pub struct PlannedUpdateItem {
     pub current: CurrentVersion,
     /// The version this item's edit (when [`Self::outcome`] is [`Outcome::Applied`]) would
     /// move the dependency to — the target considered, even when no edit was written.
-    // TODO(critic): retype target's "" sentinel (#1605)
-    pub target: String,
+    /// `None` when no concrete target exists (an unplannable latest, an ignore-rule skip of
+    /// an OSV-blocked fallback, or — under `--security-only` — an unfixable/not-requested
+    /// item, #1605).
+    pub target: Option<ConcreteVersion>,
     /// This item's disposition — the edit that would apply [`Self::target`] lives inside
     /// [`Outcome::Applied`] itself (#1349: folding it in here as a second, independently
     /// settable field made `Applied` with no edit a representable-but-invalid state).
@@ -210,7 +212,7 @@ pub enum CooldownFallbackNote {
 /// let item = PlannedUpdateItem {
 ///     name: "serde".to_string(),
 ///     current: CurrentVersion::Unknown,
-///     target: "1.2.0".to_string(),
+///     target: None,
 ///     outcome: Outcome::Applied,
 ///     edit: None,
 ///     advisory_ids: Vec::new(),
@@ -338,7 +340,7 @@ impl PlannedUpdateItem {
     pub fn new(
         name: String,
         current: CurrentVersion,
-        target: String,
+        target: Option<ConcreteVersion>,
         outcome: Outcome,
         advisory_ids: Vec<String>,
         ignore_rule_overridden: bool,
@@ -657,7 +659,7 @@ fn resolve_cooldown_fallback_view(
 ///
 /// assert_eq!(plan.items.len(), 1);
 /// assert!(matches!(plan.items[0].outcome, Outcome::Applied(_)));
-/// assert_eq!(plan.items[0].target, "1.2.0");
+/// assert_eq!(plan.items[0].target, Some(ConcreteVersion::from("1.2.0")));
 /// ```
 #[must_use]
 #[expect(
@@ -871,13 +873,13 @@ fn candidate_identity(candidate: &UpdateCandidate) -> (String, deps_core::positi
 /// `(current, target)` for a `WithinFreshnessCooldown`/`NotRequested` item built directly from
 /// the latest view — a `Planned` candidate carries both; an `Unplannable` one carries neither
 /// (matches this planner's pre-#1543 convention for an item with no concrete write target).
-fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, String) {
+fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, Option<ConcreteVersion>) {
     match candidate {
         UpdateCandidate::Planned(p) => (
             CurrentVersion::from(p.current.clone()),
-            p.target.to_string(),
+            Some(p.target.clone()),
         ),
-        UpdateCandidate::Unplannable { .. } => (CurrentVersion::Unknown, String::new()),
+        UpdateCandidate::Unplannable { .. } => (CurrentVersion::Unknown, None),
     }
 }
 
@@ -890,16 +892,21 @@ fn latest_current_target(candidate: &UpdateCandidate) -> (CurrentVersion, String
 fn resolve_from_latest(
     latest_candidate: UpdateCandidate,
     ignore_rules: &IgnoreRules,
-) -> (CurrentVersion, String, Outcome, Vec<String>) {
+) -> (
+    CurrentVersion,
+    Option<ConcreteVersion>,
+    Outcome,
+    Vec<String>,
+) {
     match latest_candidate {
         UpdateCandidate::Planned(p) => {
-            let target = p.target.to_string();
+            let target = p.target.clone();
             let current = CurrentVersion::from(p.current);
             let kind = current.update_kind_to(&p.target);
             if let Some(reason) = ignore_rules.skip_reason(&p.normalized_name, kind) {
-                (current, target, Outcome::Skipped(reason), Vec::new())
+                (current, Some(target), Outcome::Skipped(reason), Vec::new())
             } else {
-                (current, target, Outcome::Applied(p.edit), Vec::new())
+                (current, Some(target), Outcome::Applied(p.edit), Vec::new())
             }
         }
         UpdateCandidate::Unplannable {
@@ -914,7 +921,7 @@ fn resolve_from_latest(
             } else {
                 Outcome::Skipped(SkipReason::NotSafelyEditable(reason))
             };
-            (CurrentVersion::Unknown, String::new(), outcome, Vec::new())
+            (CurrentVersion::Unknown, None, outcome, Vec::new())
         }
     }
 }
@@ -986,7 +993,7 @@ fn resolve_occurrence(
     let fallback_candidate = fallback_by_key.remove(&key);
 
     let build = |current: CurrentVersion,
-                 target: String,
+                 target: Option<ConcreteVersion>,
                  outcome: Outcome,
                  advisory_ids: Vec<String>,
                  cooldown_fallback: Option<CooldownFallbackNote>| {
@@ -1144,7 +1151,7 @@ fn resolve_occurrence(
                         if let Some(reason) = ignore_rules.skip_reason(&fb.normalized_name, kind) {
                             build(
                                 current,
-                                fb.target.to_string(),
+                                Some(fb.target.clone()),
                                 Outcome::Skipped(reason),
                                 Vec::new(),
                                 None,
@@ -1165,7 +1172,7 @@ fn resolve_occurrence(
                                 });
                             build(
                                 current,
-                                fb.target.to_string(),
+                                Some(fb.target.clone()),
                                 Outcome::Applied(fb.edit),
                                 advisory_ids,
                                 latest_version.map(CooldownFallbackNote::AppliedInsteadOf),
@@ -1174,7 +1181,7 @@ fn resolve_occurrence(
                             // Row 9: the ordinary cooldown-fallback substitution.
                             build(
                                 current,
-                                fb.target.to_string(),
+                                Some(fb.target.clone()),
                                 Outcome::Applied(fb.edit),
                                 Vec::new(),
                                 latest_version.map(CooldownFallbackNote::AppliedInsteadOf),
@@ -1217,7 +1224,7 @@ fn resolve_occurrence(
                         // `UpdateKind::Unknown` treatment applies).
                         build(
                             CurrentVersion::Unknown,
-                            String::new(),
+                            None,
                             Outcome::Skipped(rule_reason),
                             Vec::new(),
                             None,
@@ -1239,7 +1246,7 @@ fn resolve_occurrence(
                         let (current, _) = latest_current_target(&latest_candidate);
                         build(
                             current,
-                            fallback.version.to_string(),
+                            Some(fallback.version.clone()),
                             Outcome::Skipped(SkipReason::NotSafelyEditable(fb_reason)),
                             advisory_ids,
                             Some(CooldownFallbackNote::Blocked {
@@ -1934,6 +1941,10 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
+            plan.items[0].target, None,
+            "an Unplannable candidate has no concrete target"
+        );
+        assert_eq!(
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_POLICY_VIOLATION,
             "a flagged latest must never exit clean, even when also within cooldown"
@@ -2299,7 +2310,7 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: "1.2.0".to_string(),
+                target: Some(ConcreteVersion::from("1.2.0")),
                 outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
                     new_text: "1.2.0".to_string(),
@@ -2334,7 +2345,7 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: "1.2.0".to_string(),
+                target: Some(ConcreteVersion::from("1.2.0")),
                 outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
                     new_text: "1.2.0".to_string(),
@@ -2369,7 +2380,7 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: "1.2.0".to_string(),
+                target: Some(ConcreteVersion::from("1.2.0")),
                 outcome: Outcome::Applied(ManifestEdit {
                     range: Range::new(Position::new(0, 9), Position::new(0, 14)),
                     new_text: "1.2.0".to_string(),
@@ -2404,7 +2415,7 @@ mod tests {
             items: vec![PlannedUpdateItem {
                 name: "serde".to_string(),
                 current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-                target: "1.2.0".to_string(),
+                target: Some(ConcreteVersion::from("1.2.0")),
                 outcome: Outcome::Skipped(SkipReason::IgnoreRule),
                 advisory_ids: Vec::new(),
                 ignore_rule_overridden: false,
@@ -2433,7 +2444,7 @@ mod tests {
         PlannedUpdateItem {
             name: name.to_string(),
             current: CurrentVersion::Resolved(ConcreteVersion::from("1.0.0")),
-            target: "1.2.0".to_string(),
+            target: Some(ConcreteVersion::from("1.2.0")),
             outcome: Outcome::Applied(ManifestEdit {
                 range,
                 new_text: "1.2.0".to_string(),
@@ -2959,7 +2970,8 @@ mod tests {
             plan.items[0]
         );
         assert_eq!(
-            plan.items[0].target, "2.0.0",
+            plan.items[0].target,
+            Some(ConcreteVersion::from("2.0.0")),
             "the rejected fallback must never leak into the reported target either"
         );
         assert!(plan.items[0].cooldown_fallback.is_none());
@@ -3022,7 +3034,7 @@ mod tests {
             "got: {:?}",
             plan.items[0].outcome
         );
-        assert_eq!(plan.items[0].target, "1.1.0");
+        assert_eq!(plan.items[0].target, Some(ConcreteVersion::from("1.1.0")));
         assert!(
             !plan.items[0].advisory_ids.is_empty(),
             "the flagged-latest attribution must be retained: {:?}",
@@ -3117,7 +3129,8 @@ mod tests {
             plan.items[0]
         );
         assert_eq!(
-            plan.items[0].target, "2.0.0",
+            plan.items[0].target,
+            Some(ConcreteVersion::from("2.0.0")),
             "must fall back to the real (unmodified) latest, never either divergent fallback \
              value"
         );
@@ -3164,7 +3177,8 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
-            plan.items[0].target, "1.1.0",
+            plan.items[0].target,
+            Some(ConcreteVersion::from("1.1.0")),
             "must name the blocked fallback version, not latest"
         );
         assert!(!plan.items[0].advisory_ids.is_empty());
@@ -3211,7 +3225,7 @@ mod tests {
             "got: {:?}",
             plan.items[0].outcome
         );
-        assert_eq!(plan.items[0].target, "1.1.0");
+        assert_eq!(plan.items[0].target, Some(ConcreteVersion::from("1.1.0")));
         assert_eq!(
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_POLICY_VIOLATION
@@ -3455,6 +3469,10 @@ mod tests {
             plan.items[0].outcome
         );
         assert_eq!(
+            plan.items[0].target, None,
+            "the ignore-rule skip of an OSV-blocked fallback has no concrete target"
+        );
+        assert_eq!(
             crate::exit::update_exit_code(&plan),
             crate::exit::EXIT_CLEAN
         );
@@ -3620,11 +3638,13 @@ mod tests {
             .find(|i| i.name == "beta")
             .expect("beta item present");
         assert_eq!(
-            alpha.target, "1.1.0",
+            alpha.target,
+            Some(ConcreteVersion::from("1.1.0")),
             "alpha must get its own fallback, not beta's: {alpha:?}"
         );
         assert_eq!(
-            beta.target, "9.1.0",
+            beta.target,
+            Some(ConcreteVersion::from("9.1.0")),
             "beta must get its own fallback, not alpha's: {beta:?}"
         );
         assert!(matches!(alpha.outcome, Outcome::Applied(_)));
@@ -3694,7 +3714,8 @@ mod tests {
                  swapped write: {item:?}"
             );
             assert_eq!(
-                item.target, "1.2.0",
+                item.target,
+                Some(ConcreteVersion::from("1.2.0")),
                 "target must stay the real (unmodified) latest, never a fallback picked via a \
                  collided lookup: {item:?}"
             );
