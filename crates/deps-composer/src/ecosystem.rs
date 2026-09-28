@@ -354,6 +354,34 @@ mod tests {
         );
     }
 
+    /// #1601: no `!=` clause anywhere in R0, but `fallback` sits exactly in the gap between
+    /// the two `||`-branches (`>=1.0 <1.5` and `>1.5 <2.0`) — neither branch covers it, and
+    /// `2.0.0` also fails both branches' ceilings, so the extensional "something newer also
+    /// matches" scan is vacuous too. Only `composer_or_gap_excludes` (routed through
+    /// `ComposerMatcher::explicitly_excludes`) catches this.
+    #[tokio::test]
+    async fn test_fallback_edit_excludes_newer_rejects_or_alternation_gap_vacuous_case() {
+        let ecosystem = ComposerEcosystem::new(Arc::new(deps_core::HttpCache::new()));
+        let content = r#"{"require": {"acme/pkg": ">=1.0 <1.5 || >1.5 <2.0"}}"#.to_string();
+        let uri = deps_core::test_util::test_uri("/test/composer.json");
+        let verdict = deps_core::test_util::fallback_edit_outcome(
+            &ecosystem,
+            &ComposerFormatter,
+            &uri,
+            &content,
+            "acme/pkg",
+            "1.5.0",
+            &["2.0.0", "1.5.0", "1.0.0"],
+        )
+        .await;
+        assert_eq!(
+            verdict,
+            deps_core::lsp_helpers::FallbackEditVerdict::Rejected(
+                deps_core::lsp_helpers::FallbackEditRejection::OriginalExcludesFallback
+            )
+        );
+    }
+
     /// Impl-critic fix-cycle M2: `^0.9` (the first `||` branch) simply doesn't cover 1.5.0 at
     /// all, while `>=1.0 !=1.5.0 <2.0` (the second branch) explicitly bans it — an `all`-branches
     /// reading of "explicitly excluded" would miss this (the first branch never explicitly

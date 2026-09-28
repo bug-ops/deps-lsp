@@ -196,6 +196,7 @@ pub fn extract_pypi_min_version(version_req: &str) -> Option<String> {
 /// assert_eq!(normalize_operator_spacing(">= 1.0 < 2.0"), ">=1.0 <2.0");
 /// assert_eq!(normalize_operator_spacing(">=1.0 <2.0"), ">=1.0 <2.0");
 /// assert_eq!(normalize_operator_spacing(">=1.0 != 1.5.0 <2.0"), ">=1.0 !=1.5.0 <2.0");
+/// assert_eq!(normalize_operator_spacing("= 1.0.0"), "=1.0.0");
 /// ```
 pub fn normalize_operator_spacing(requirement: &str) -> Cow<'_, str> {
     if !has_spaced_operator(requirement) {
@@ -220,12 +221,22 @@ pub fn normalize_operator_spacing(requirement: &str) -> Cow<'_, str> {
             while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
                 chars.next();
             }
+        } else if c == '=' {
+            // A bare `=` (Composer's exact-pin operator) has no second character of its own
+            // to consume, unlike `!=`/`>=`/`<=` above, but still needs its trailing whitespace
+            // collapsed — or a caller that AND-splits on whitespace (`deps-composer`'s
+            // `walk_requirement`, #1603/impl-critic M5) misreads a spaced `"= 1.0.0"` as two
+            // separate clauses: a bare `=` clause (matching nothing) AND-ed with a bare
+            // `"1.0.0"` clause, silently making the requirement unsatisfiable.
+            while chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+                chars.next();
+            }
         }
     }
     Cow::Owned(result)
 }
 
-/// Reports whether `requirement` contains a `>`/`<`/`>=`/`<=`/`!=` operator immediately
+/// Reports whether `requirement` contains a `>`/`<`/`>=`/`<=`/`!=`/`=` operator immediately
 /// followed by whitespace, i.e. whether [`normalize_operator_spacing`] would need to allocate.
 /// Pure scan, no allocation, so the common no-op case stays cheap.
 fn has_spaced_operator(requirement: &str) -> bool {
@@ -243,6 +254,8 @@ fn has_spaced_operator(requirement: &str) -> bool {
             if chars.peek().is_some_and(|ws| ws.is_whitespace()) {
                 return true;
             }
+        } else if c == '=' && chars.peek().is_some_and(|ws| ws.is_whitespace()) {
+            return true;
         }
     }
     false
@@ -397,6 +410,19 @@ mod tests {
             ">=1.0 !=1.5.0 <2.0"
         );
         assert_eq!(normalize_operator_spacing("!= 1.5.0"), "!=1.5.0");
+    }
+
+    /// impl-critic M5: an unnormalized spaced bare `=` used to tokenize into a no-op bare `=`
+    /// and a bare version PIN when a caller AND-splits on whitespace (`deps-composer`'s
+    /// `walk_requirement`, since #1603's fix made that split unconditional for any multi-token
+    /// result) — silently making the whole requirement unsatisfiable rather than an exact pin.
+    #[test]
+    fn test_normalize_operator_spacing_collapses_spaced_equals() {
+        assert_eq!(normalize_operator_spacing("= 1.0.0"), "=1.0.0");
+        assert_eq!(
+            normalize_operator_spacing(">=1.0 = 1.5.0 <2.0"),
+            ">=1.0 =1.5.0 <2.0"
+        );
     }
 
     #[test]

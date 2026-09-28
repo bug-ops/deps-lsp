@@ -443,4 +443,19 @@ mod tests {
             "4.17.0"
         );
     }
+
+    /// #1601 impl-critic M4: Deno's `compile_requirement` delegates entirely to
+    /// `deps_npm::compile_node_semver_range`, so it must inherit `NodeSemverMatcher`'s
+    /// OR-alternation-gap detection unchanged — not previously covered by a direct test here,
+    /// unlike npm's own `formatter.rs`/`ecosystem.rs` suites.
+    #[test]
+    fn test_compile_requirement_explicitly_excludes_or_alternation_gap() {
+        let formatter = DenoFormatter;
+        let matcher = formatter
+            .compile_requirement(&VersionReq::new(">=1.0.0 <1.5.0 || >1.5.0 <2.0.0"))
+            .unwrap();
+        assert!(matcher.explicitly_excludes(&ConcreteVersion::new("1.5.0")));
+        assert!(!matcher.explicitly_excludes(&ConcreteVersion::new("1.2.0")));
+        assert!(!matcher.explicitly_excludes(&ConcreteVersion::new("1.8.0")));
+    }
 }

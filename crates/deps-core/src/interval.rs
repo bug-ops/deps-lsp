@@ -305,6 +305,108 @@ pub fn contains<Q: ?Sized, V>(
     }
 }
 
+/// Whether an upper-bounded member admits some value at or above `candidate`.
+///
+/// `upper_edge` is `(bound, inclusive)`, or `None` for open-ended-above. `None` always
+/// answers `true`: "no known upper edge" means "assume unbounded", the safe default for a
+/// member whose shape [`union_gap_excludes`]'s caller could not characterize (mirrors
+/// `deps-maven`'s own `upper_edge`/`lower_edge` wildcard-arm convention of contributing no
+/// edge for an unrecognized/degenerate shape rather than guessing one).
+pub fn admits_at_or_above<Q: ?Sized, V: ?Sized>(
+    candidate: &Q,
+    upper_edge: Option<(&V, bool)>,
+    cmp: impl Fn(&Q, &V) -> Ordering,
+) -> bool {
+    match upper_edge {
+        None => true,
+        Some((bound, inclusive)) => {
+            let ord = cmp(candidate, bound);
+            if inclusive {
+                ord != Ordering::Greater
+            } else {
+                ord == Ordering::Less
+            }
+        }
+    }
+}
+
+/// Whether a lower-bounded member admits some value at or below `candidate`.
+///
+/// `lower_edge` is `(bound, inclusive)`, or `None` for open-ended-below. See
+/// [`admits_at_or_above`]'s doc for why `None` always answers `true`.
+pub fn admits_at_or_below<Q: ?Sized, V: ?Sized>(
+    candidate: &Q,
+    lower_edge: Option<(&V, bool)>,
+    cmp: impl Fn(&Q, &V) -> Ordering,
+) -> bool {
+    match lower_edge {
+        None => true,
+        Some((bound, inclusive)) => {
+            let ord = cmp(candidate, bound);
+            if inclusive {
+                ord != Ordering::Less
+            } else {
+                ord == Ordering::Greater
+            }
+        }
+    }
+}
+
+/// Whether a candidate not covered by any union member is explicitly excluded by the shape.
+///
+/// "The shape" means: sitting past one member's admitted span and before another's, with
+/// nothing in between (#1601, generalizing Maven's disjoint-range-union gap detection from
+/// #1590/#1594 to any union representation).
+///
+/// This is deliberately representation-agnostic — `M` may be a bracket interval
+/// (`deps-maven`/`deps-composer`, whose members expose literal string edges via
+/// [`admits_at_or_above`]/[`admits_at_or_below`]) or an opaque range object with no exposed
+/// bound values (`deps-npm`'s `node_semver::Range`, whose members answer the same two
+/// questions by probing `Range::allows_any` instead). Only the answers to three yes/no
+/// questions per member are needed: does it cover `candidate` already, does it admit
+/// something at or above `candidate`, and does it admit something at or below `candidate`.
+///
+/// A member that cannot answer these precisely for some clause shape should just answer
+/// `true` for the two `admits_at_or_*` questions (see [`admits_at_or_above`]'s doc) — that
+/// only means a real gap through that member goes undetected, never that a covered candidate
+/// is misreported as excluded.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::interval::union_gap_excludes;
+///
+/// // Two disjoint half-lines with a punctured point at 5, mirroring a Maven
+/// // `(,5),(5,)`-style union or a Composer/npm `||`-alternation with the same shape.
+/// let members = [(0, 5), (5, 10)]; // (lower, upper), both bounds exclusive
+/// let excludes = |candidate: i32| {
+///     union_gap_excludes(
+///         &members,
+///         |&(lo, hi)| candidate > lo && candidate < hi,
+///         |&(_, hi)| candidate < hi,
+///         |&(lo, _)| candidate > lo,
+///     )
+/// };
+/// assert!(excludes(5));
+/// assert!(!excludes(3));
+/// assert!(!excludes(7));
+/// assert!(!excludes(-1));
+/// assert!(!excludes(11));
+/// ```
+pub fn union_gap_excludes<M>(
+    members: &[M],
+    covers: impl Fn(&M) -> bool,
+    admits_at_or_above: impl Fn(&M) -> bool,
+    admits_at_or_below: impl Fn(&M) -> bool,
+) -> bool {
+    if members.iter().any(&covers) {
+        return false;
+    }
+    let past_some_upper = members.iter().any(|m| !admits_at_or_above(m));
+    let before_some_lower = members.iter().any(|m| !admits_at_or_below(m));
+    past_some_upper && before_some_lower
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +590,111 @@ mod tests {
         let cmp = |a: &u32, b: &String| a.cmp(&b.parse::<u32>().unwrap());
         assert!(contains(&5u32, &range, cmp));
         assert!(!contains(&10u32, &range, cmp));
+    }
+
+    fn str_ord(a: &str, b: &str) -> Ordering {
+        a.cmp(b)
+    }
+
+    #[test]
+    fn test_admits_at_or_above_none_edge_is_always_true() {
+        assert!(admits_at_or_above("999", None::<(&str, bool)>, str_ord));
+    }
+
+    #[test]
+    fn test_admits_at_or_above_respects_inclusivity() {
+        let bound = "5";
+        assert!(admits_at_or_above("5", Some((bound, true)), str_ord));
+        assert!(!admits_at_or_above("5", Some((bound, false)), str_ord));
+        assert!(admits_at_or_above("4", Some((bound, true)), str_ord));
+        assert!(!admits_at_or_above("6", Some((bound, true)), str_ord));
+    }
+
+    #[test]
+    fn test_admits_at_or_below_none_edge_is_always_true() {
+        assert!(admits_at_or_below("0", None::<(&str, bool)>, str_ord));
+    }
+
+    #[test]
+    fn test_admits_at_or_below_respects_inclusivity() {
+        let bound = "5";
+        assert!(admits_at_or_below("5", Some((bound, true)), str_ord));
+        assert!(!admits_at_or_below("5", Some((bound, false)), str_ord));
+        assert!(admits_at_or_below("6", Some((bound, true)), str_ord));
+        assert!(!admits_at_or_below("4", Some((bound, true)), str_ord));
+    }
+
+    /// Mirrors Maven's #1590 disjoint-range-union gap test, but through the
+    /// representation-agnostic union primitive instead of `deps-maven`'s own edge extraction.
+    #[test]
+    fn test_union_gap_excludes_disjoint_members() {
+        let members: Vec<(i32, i32)> = vec![(0, 5), (5, 10)]; // exclusive both ends
+        let excludes = |candidate: i32| {
+            union_gap_excludes(
+                &members,
+                |&(lo, hi)| candidate > lo && candidate < hi,
+                |&(_, hi)| candidate < hi,
+                |&(lo, _)| candidate > lo,
+            )
+        };
+        assert!(excludes(5));
+        assert!(!excludes(3));
+        assert!(!excludes(7));
+        assert!(!excludes(-1));
+        assert!(!excludes(11));
+    }
+
+    /// A single member alone has no "other side" to sandwich a candidate against, so it can
+    /// never trigger a gap exclusion by itself, even if it is entirely below or above the
+    /// candidate.
+    #[test]
+    fn test_union_gap_excludes_single_member_never_excludes() {
+        let members: Vec<(i32, i32)> = vec![(0, 5)];
+        assert!(!union_gap_excludes(
+            &members,
+            |&(lo, hi)| 7 > lo && 7 < hi,
+            |&(_, hi)| 7 < hi,
+            |&(lo, _)| 7 > lo,
+        ));
+    }
+
+    /// A member reporting "unknown" (always answering `true` for both admits-questions, per
+    /// [`admits_at_or_above`]'s doc) never itself contributes a false gap, even sitting
+    /// between two other real members.
+    #[test]
+    fn test_union_gap_excludes_unknown_member_contributes_nothing() {
+        #[derive(Clone, Copy)]
+        enum Member {
+            Bounded(i32, i32),
+            Unknown,
+        }
+        let members = [
+            Member::Bounded(0, 5),
+            Member::Unknown,
+            Member::Bounded(5, 10),
+        ];
+        let covers = |m: &Member| matches!(m, Member::Bounded(lo, hi) if 5 > *lo && 5 < *hi);
+        let above = |m: &Member| match m {
+            Member::Bounded(_, hi) => 5 < *hi,
+            Member::Unknown => true,
+        };
+        let below = |m: &Member| match m {
+            Member::Bounded(lo, _) => 5 > *lo,
+            Member::Unknown => true,
+        };
+        assert!(union_gap_excludes(&members, covers, above, below));
+    }
+
+    /// A candidate covered by any member is never excluded, regardless of how many other
+    /// members would otherwise box it in.
+    #[test]
+    fn test_union_gap_excludes_false_when_covered() {
+        let members: Vec<(i32, i32)> = vec![(0, 5), (4, 10)];
+        assert!(!union_gap_excludes(
+            &members,
+            |&(lo, hi)| 4 >= lo && 4 <= hi,
+            |&(_, hi)| 4 < hi,
+            |&(lo, _)| 4 > lo,
+        ));
     }
 }
