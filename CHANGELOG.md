@@ -88,6 +88,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-swift**: `Package.swift` `.package(...)` calls with a trailing comma after the last argument are no longer skipped; all URL/path regexes now share one builder (resolves #1673) (#1681)
+- **deps-swift**: labelled `exact:`, `branch:`, `revision:` requirements and the legacy `name:` label before `url:`/`path:` are now parsed; branch/revision stay non-version-pinned Git deps (resolves #1672) (#1681)
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-engine**: a SHA pin resolving to a most-specific two-component release tag (`v2.9`) is now scanned by OSV, and a resolved-but-partial tag is no longer reported as "no resolved or exact version" (resolves #1668) (#1677)
 - **deps-swift**: labelled `.package(url:, exact: "1.2.3")` dependencies are now parsed instead of skipped (#1671)
 - **deps-core**: a bare or `=` pin is no longer reported outdated when `latest` differs only by semver build metadata (#1671)
