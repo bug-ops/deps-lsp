@@ -350,7 +350,7 @@ impl Ecosystem for GithubActionsEcosystem {
                 .formatter
                 .tag_index
                 .get(dep.name())
-                .and_then(|index| index.sha_to_tag.get(sha).cloned())
+                .and_then(|index| index.tag_for_sha(sha).map(str::to_string))
             else {
                 return Some(hover);
             };
@@ -1857,9 +1857,11 @@ mod tests {
             let eco = GithubActionsEcosystem::new(cache);
             let sha = "a".repeat(40);
             let mut index = TagIndex::default();
-            index.sha_to_tag.insert(
+            index.insert_sha_pin(
                 deps_core::lsp_helpers::CommitSha::parse(&sha).unwrap(),
-                "v4.0.0".to_string(),
+                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                    "v4.0.0",
+                )),
             );
             // Needed so `format_version_replacing_for` produces a real replacement for `latest`,
             // or a `tag_to_sha` miss falls back to the unchanged literal and drops the edit.

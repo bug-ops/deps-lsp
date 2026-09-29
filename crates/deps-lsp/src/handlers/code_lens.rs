@@ -1011,7 +1011,12 @@ let package = Package(
             let commit_sha = deps_core::lsp_helpers::CommitSha::parse(sha)
                 .expect("test fixture must pass a valid 40-hex SHA");
             index.tag_to_sha.insert(tag.to_string(), commit_sha.clone());
-            index.sha_to_tag.insert(commit_sha, tag.to_string());
+            index.insert_sha_pin(
+                commit_sha,
+                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                    tag,
+                )),
+            );
             gha_registry.tag_index().insert(
                 deps_core::PackageName::new(name),
                 std::sync::Arc::new(index),

@@ -3,8 +3,8 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementResolution, RequirementStatus, SourcePolicy, TagIndex,
-    match_v_prefix_style, requirement_contains_template_placeholder,
+    PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin, SourcePolicy,
+    TagIndex, match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -357,7 +357,7 @@ impl RequirementResolution for GithubActionsFormatter {
     /// its own `version_req`) is just as eligible. `None` on any `TagIndex` miss (cold
     /// cache, or a SHA no currently-fetched tag points at) — the honest "unknown", not a
     /// fabricated version.
-    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ConcreteVersion> {
+    fn resolved_pin_version(&self, dep: &dyn Dependency) -> Option<ResolvedPin> {
         let gha_dep = dep.as_any().downcast_ref::<GithubActionsDependency>()?;
         if !matches!(gha_dep.pin, Some(PinStyle::Sha { .. })) {
             return None;
@@ -366,8 +366,7 @@ impl RequirementResolution for GithubActionsFormatter {
         if !is_full_sha(sha) {
             return None;
         }
-        let tag = self.tag_index.get(dep.name())?.sha_to_tag.get(sha)?.clone();
-        Some(ConcreteVersion::new(tag))
+        self.tag_index.get(dep.name())?.resolved_pin(sha)
     }
 
     /// `tag_index` is populated as a side effect of [`GithubActionsRegistry`]'s own tags
@@ -410,8 +409,7 @@ impl GithubActionsFormatter {
         if !is_full_sha(sha) {
             return None;
         }
-        let real_tag = self.tag_index.get(dep.name())?.sha_to_tag.get(sha)?.clone();
-        let real_tag = VersionReq::new(real_tag);
+        let real_tag = VersionReq::new(self.tag_index.get(dep.name())?.tag_for_sha(sha)?);
         // An oversized registry tag is unmodellable, not a reason to trust the comment (#907).
         Some(
             BoundedVersionReq::new(&real_tag).map_or(RequirementStatus::Unresolved, |real_tag| {
@@ -937,9 +935,12 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "v4.0.0".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "v4.0.0",
+            )),
+        );
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -977,9 +978,12 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "v4.0.0".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "v4.0.0",
+            )),
+        );
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -1025,9 +1029,11 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index.sha_to_tag.insert(
+        index.insert_sha_pin(
             CommitSha::parse(&sha).unwrap(),
-            format!("v{}", "1".repeat(MAX_REQUIREMENT_LEN)),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                format!("v{}", "1".repeat(MAX_REQUIREMENT_LEN)),
+            )),
         );
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
@@ -1058,9 +1064,12 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "v4.0.0".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "v4.0.0",
+            )),
+        );
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -1117,9 +1126,12 @@ mod tests {
         let sha = "a".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "v1".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "v1",
+            )),
+        );
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -1133,7 +1145,7 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ConcreteVersion::new("v1"))
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v1")))
         );
     }
 
@@ -1146,9 +1158,12 @@ mod tests {
         let sha = "b".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "cargo-deny".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "cargo-deny",
+            )),
+        );
         fmt.tag_index
             .insert(PackageName::new("taiki-e/install-action"), Arc::new(index));
 
@@ -1161,7 +1176,9 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ConcreteVersion::new("cargo-deny"))
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new(
+                "cargo-deny"
+            )))
         );
     }
 
@@ -1172,9 +1189,12 @@ mod tests {
         let sha = "c".repeat(40);
         let fmt = formatter();
         let mut index = TagIndex::default();
-        index
-            .sha_to_tag
-            .insert(CommitSha::parse(&sha).unwrap(), "v4.2.0".to_string());
+        index.insert_sha_pin(
+            CommitSha::parse(&sha).unwrap(),
+            deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                "v4.2.0",
+            )),
+        );
         fmt.tag_index
             .insert(PackageName::new("actions/checkout"), Arc::new(index));
 
@@ -1187,7 +1207,48 @@ mod tests {
 
         assert_eq!(
             fmt.resolved_pin_version(&d),
-            Some(ConcreteVersion::new("v4.2.0"))
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v4.2.0")))
+        );
+    }
+
+    fn resolved_pin_for_tags(tags: &[&str]) -> Option<ResolvedPin> {
+        let sha = "a".repeat(40);
+        let commit = CommitSha::parse(&sha).unwrap();
+        let fmt = formatter();
+        fmt.tag_index.insert(
+            PackageName::new("actions/checkout"),
+            Arc::new(TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))),
+        );
+        let mut d = dep(
+            Some(PinStyle::Sha { comment_tag: None }),
+            "actions/checkout",
+            None,
+        );
+        d.version_req = Some(sha.into());
+        fmt.resolved_pin_version(&d)
+    }
+
+    /// #1668: the most specific tag on the commit wins and is classified by whether another
+    /// tag extends it.
+    #[test]
+    fn test_resolved_pin_version_classifies_two_component_release_and_alias() {
+        let most_specific = |tag: &str| Some(ResolvedPin::MostSpecific(ConcreteVersion::new(tag)));
+        assert_eq!(
+            resolved_pin_for_tags(&["v2", "v2.9"]),
+            most_specific("v2.9")
+        );
+        assert_eq!(
+            resolved_pin_for_tags(&["v2.9", "v2"]),
+            most_specific("v2.9")
+        );
+        assert_eq!(resolved_pin_for_tags(&["v2"]), most_specific("v2"));
+        assert_eq!(
+            resolved_pin_for_tags(&["v2", "v2.9.1"]),
+            most_specific("v2.9.1")
+        );
+        assert_eq!(
+            resolved_pin_for_tags(&["v2.9", "v2.9.1.4"]),
+            Some(ResolvedPin::Alias(ConcreteVersion::new("v2.9")))
         );
     }
 
