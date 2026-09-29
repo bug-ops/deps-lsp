@@ -91,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **deps-gradle, deps-nuget, deps-swift, deps-bundler, deps-github-actions**: `requirement_is_placeholder` now also composes the shared `requirement_contains_template_placeholder` detector (previously native-syntax-only), so `{{ VAR }}`/`@VAR@`/`%VAR%`/`${VAR}`/`<%= VAR %>` external-templating placeholders are no longer destructively rewritten to a literal version by `deps-cli update` or vulnerability-fix code actions in these five ecosystems (resolves #1390) (#1393)
 
 ### Fixed
+- **deps-core**: open-ended OSV ranges are now capped by `database_specific.last_known_affected_version_range`, so fixed and latest `github/codeql-action` versions are no longer flagged by GHSA-vqf5-2xx6-9wfm (resolves #1707) (#1712)
 - **deps-core**: equally specific release tags on one commit now resolve to the numerically lowest SemVer instead of the textually smallest name (`v4.9.0` over `v4.10.0`) when picking the tag matched against OSV advisories (resolves #1703) (#1708)
 - **deps-lsp**: the post-fetch OSV tag-index rescan is now skipped when vulnerabilities are disabled or the server is offline, like the phase A launch (resolves #1704) (#1708)
 - **deps-lsp**: OSV rescan after a registry fetch runs only when the per-key scan plan changed, so floating-tag, bare-major and branch pins no longer re-scan on every fetch (resolves #1705) (#1715)

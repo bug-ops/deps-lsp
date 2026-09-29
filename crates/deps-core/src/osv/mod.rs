@@ -1662,6 +1662,54 @@ mod tests {
         assert_matches!(scan_gha("4.1.3").await, ScanOutcome::Clean);
     }
 
+    const CODEQL_STUBS_BODY: &str = r#"{"results":[{"vulns":[{"id":"GHSA-vqf5-2xx6-9wfm","modified":"2025-02-03T00:00:00Z"}]}]}"#;
+    const CODEQL_RECORD_BODY: &str = r#"{"id":"GHSA-vqf5-2xx6-9wfm","modified":"2025-02-03T00:00:00Z",
+        "affected":[
+        {"package":{"name":"github/codeql-action","ecosystem":"GitHub Actions"},
+         "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"3.26.11"},{"fixed":"3.28.3"}]}],
+         "database_specific":{"last_known_affected_version_range":"<= 3.28.2"}},
+        {"package":{"name":"github/codeql-action","ecosystem":"GitHub Actions"},
+         "ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"2.26.11"}]}],
+         "database_specific":{"last_known_affected_version_range":"< 3.0.0"}}]}"#;
+
+    /// #1707: the open-ended `introduced: 2.26.11` entry is capped by its
+    /// `last_known_affected_version_range`, so neither the fix nor v4 is flagged.
+    #[tokio::test]
+    async fn gha_open_ended_range_honors_last_known_affected_version_range() {
+        for (version, vulnerable) in [
+            ("3.28.2", true),
+            ("2.30.0", true),
+            ("3.28.3", false),
+            ("4.38.2", false),
+        ] {
+            let (mut server, client) = mock_client().await;
+            let _batch = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(CODEQL_STUBS_BODY)
+                .create_async()
+                .await;
+            let _record = server
+                .mock("GET", "/v1/vulns/GHSA-vqf5-2xx6-9wfm")
+                .with_status(200)
+                .with_body(CODEQL_RECORD_BODY)
+                .create_async()
+                .await;
+            let targets = vec![target("github/codeql-action", version)];
+            let mut outcomes = client
+                .scan(EcosystemId::GithubActions, &targets, TEST_TIMEOUT)
+                .await;
+            let outcome = outcomes
+                .remove(&crate::test_util::vuln_key("github/codeql-action"))
+                .expect("one outcome per target");
+            if vulnerable {
+                assert_matches!(outcome, ScanOutcome::Vulnerable(_), "{version}");
+            } else {
+                assert_matches!(outcome, ScanOutcome::Clean, "{version}");
+            }
+        }
+    }
+
     fn provisional_target(name: &str, version: &str) -> ScanTarget {
         ScanTarget {
             osv_name: OsvQueryName::Provisional(OsvPackageName::new(name).unwrap()),
