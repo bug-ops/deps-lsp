@@ -75,9 +75,9 @@ pub use diagnostics::requirement_is_oversized;
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     BareMeaning, BuildMetadataPolicy, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter,
-    OsvNaming, PackageNaming, PackageRendering, RequirementGate, RequirementResolution,
-    RequirementRewriteShape, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
-    format_version_replacing_by_shape, requirement_is_compound,
+    OsvNameAvailability, OsvNaming, PackageNaming, PackageRendering, RequirementGate,
+    RequirementResolution, RequirementRewriteShape, SourcePolicy, bare_meaning,
+    classify_requirement_rewrite_shape, format_version_replacing_by_shape, requirement_is_compound,
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_ref::{

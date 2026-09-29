@@ -11,7 +11,9 @@
 use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
 use deps_core::PackageName;
-use deps_core::lsp_helpers::{has_unqueryable_resolved_pin, resolve_in_use_version};
+use deps_core::lsp_helpers::{
+    OsvNameAvailability, has_unqueryable_resolved_pin, resolve_in_use_version,
+};
 use std::collections::HashMap;
 
 /// Builds the OSV scan targets for one manifest's dependencies, applying the
@@ -158,6 +160,14 @@ pub fn build_scan_targets(
             continue;
         };
 
+        if formatter.osv_name_availability(dep) == OsvNameAvailability::AwaitingRegistryData {
+            skipped.insert(
+                key,
+                ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed),
+            );
+            continue;
+        }
+
         let Some(osv_name) = formatter.osv_package_name(dep) else {
             skipped.insert(key, ScanOutcome::Skipped(SkipReason::UnmappableName));
             continue;
@@ -181,6 +191,12 @@ enum DepCheckClassification<'a> {
     /// skip: a later commit populating `cached_versions` can still turn this into a real
     /// target (see both callers' own doc for why this must not be read as "not applicable").
     NoCachedVersions,
+    /// A cached version list exists, but the OSV name still depends on registry data that has
+    /// not landed (`OsvNameAvailability::AwaitingRegistryData`) — transient, never structural.
+    AwaitingOsvName {
+        /// This dependency's registry-cached version list.
+        cached: &'a deps_core::lsp_helpers::PackageVersions,
+    },
     /// A cached version list exists, but `formatter.osv_package_name` returned `None`.
     UnmappableName {
         /// This dependency's registry-cached version list, for a caller that still wants to
@@ -215,6 +231,10 @@ fn classify_dep_for_check_targets<'a>(
     else {
         return DepCheckClassification::NoCachedVersions;
     };
+
+    if formatter.osv_name_availability(dep) == OsvNameAvailability::AwaitingRegistryData {
+        return DepCheckClassification::AwaitingOsvName { cached };
+    }
 
     match formatter.osv_package_name(dep) {
         Some(osv_name) => DepCheckClassification::Target { osv_name, cached },
@@ -329,6 +349,15 @@ pub fn build_latest_check_targets(
             }
             // No registry-cached latest yet — absence, not a structural skip (see doc above).
             DepCheckClassification::NoCachedVersions => {}
+            DepCheckClassification::AwaitingOsvName { cached } => {
+                structural.insert(
+                    key,
+                    UpgradeStatus::CandidateUnverified {
+                        version: cached.latest.clone(),
+                        reason: SkipReason::CanonicalNameUnconfirmed,
+                    },
+                );
+            }
             DepCheckClassification::UnmappableName { cached } => {
                 structural.insert(
                     key,
@@ -421,6 +450,8 @@ pub fn build_candidate_check_targets(
                 // No registry-cached version list yet — absence, not a structural skip (see
                 // doc above), matching `build_latest_check_targets`'s identical treatment.
                 DepCheckClassification::NoCachedVersions => continue,
+                // Transient, like an absent cache: never recorded as structural.
+                DepCheckClassification::AwaitingOsvName { .. } => continue,
                 DepCheckClassification::UnmappableName { .. } => {
                     structural.insert(
                         key,
@@ -1227,7 +1258,14 @@ mod tests {
                 let tag_index = registry.tag_index();
                 tag_index.insert(
                     PackageName::new("actions/checkout"),
-                    Arc::new(TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))),
+                    Arc::new(
+                        TagIndex::from_tags(tags.iter().map(|t| (*t, &commit)))
+                            .with_canonical_repo_name(
+                                deps_core::github::CanonicalRepoName::from_commit_url(
+                                    "https://api.github.com/repos/actions/checkout/commits/abc",
+                                ),
+                            ),
+                    ),
                 );
                 let formatter = GithubActionsFormatter::new(tag_index);
 
@@ -1286,6 +1324,11 @@ mod tests {
                 deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
                     "v1.3.0",
                 )),
+            );
+            let index = index.with_canonical_repo_name(
+                deps_core::github::CanonicalRepoName::from_commit_url(
+                    "https://api.github.com/repos/actions/checkout/commits/abc",
+                ),
             );
             tag_index.insert(PackageName::new("actions/checkout"), Arc::new(index));
             let formatter = GithubActionsFormatter::new(tag_index);
@@ -1773,6 +1816,135 @@ mod tests {
                 _dep: &dyn Dependency,
             ) -> Option<deps_core::osv::OsvPackageName> {
                 None
+            }
+        }
+
+        /// A formatter whose OSV name is derived from registry data that has not landed yet.
+        struct AwaitingNameFormatter;
+        impl PackageNaming for AwaitingNameFormatter {}
+        impl PackageRendering for AwaitingNameFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for AwaitingNameFormatter {}
+        impl DiagnosticMessages for AwaitingNameFormatter {}
+        impl DiagnosticPolicy for AwaitingNameFormatter {}
+        impl SourcePolicy for AwaitingNameFormatter {}
+        impl OsvNaming for AwaitingNameFormatter {
+            fn osv_name_availability(
+                &self,
+                _dep: &dyn Dependency,
+            ) -> deps_core::lsp_helpers::OsvNameAvailability {
+                deps_core::lsp_helpers::OsvNameAvailability::AwaitingRegistryData
+            }
+        }
+
+        fn awaiting_name_fixture() -> (
+            MockParseResult,
+            deps_core::osv::VulnKeys,
+            HashMap<PackageName, PackageVersions>,
+        ) {
+            let parse_result = MockParseResult {
+                deps: vec![MockDep {
+                    name: PackageName::new("gha-action"),
+                    source: DependencySource::Registry,
+                }],
+            };
+            let vuln_keys = vuln_keys_for(&parse_result, &AwaitingNameFormatter);
+            let mut cached_versions = HashMap::new();
+            cached_versions.insert(
+                PackageName::new("gha-action"),
+                PackageVersions::latest_only("1.0.0"),
+            );
+            (parse_result, vuln_keys, cached_versions)
+        }
+
+        #[test]
+        fn build_latest_check_targets_awaiting_osv_name_is_unverified_not_structural() {
+            let (parse_result, vuln_keys, cached_versions) = awaiting_name_fixture();
+
+            let (targets, statuses) = build_latest_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &AwaitingNameFormatter,
+            );
+
+            assert!(targets.is_empty());
+            assert_eq!(
+                statuses.get(&deps_core::test_util::vuln_key("gha-action")),
+                Some(&UpgradeStatus::CandidateUnverified {
+                    version: ConcreteVersion::new("1.0.0"),
+                    reason: deps_core::osv::SkipReason::CanonicalNameUnconfirmed,
+                })
+            );
+        }
+
+        #[test]
+        fn build_candidate_check_targets_awaiting_osv_name_records_no_entry() {
+            let (parse_result, vuln_keys, cached_versions) = awaiting_name_fixture();
+
+            let (rounds, statuses) = build_candidate_check_targets(
+                &parse_result,
+                &cached_versions,
+                &vuln_keys,
+                &AwaitingNameFormatter,
+            );
+
+            assert!(rounds.iter().all(Vec::is_empty));
+            assert!(
+                statuses.is_empty(),
+                "a transient name gap must never be stored as structural: {statuses:?}"
+            );
+        }
+
+        /// #1683: a tag-pinned action whose repository casing is not yet confirmed is a
+        /// transient skip, never `UnmappableName`.
+        #[cfg(feature = "github-actions")]
+        #[test]
+        fn build_scan_targets_github_actions_without_canonical_name_is_unconfirmed() {
+            use deps_core::lsp_helpers::TagIndex;
+            use deps_core::osv::{ScanOutcome, SkipReason};
+            use deps_github_actions::{GithubActionsFormatter, GithubActionsRegistry};
+            use std::sync::Arc;
+
+            let uri = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let parse_result = deps_github_actions::parse_workflow_yaml(
+                "steps:\n  - uses: actions/checkout@v4.1.2\n",
+                &uri,
+            )
+            .expect("valid yaml");
+            let registry = GithubActionsRegistry::new(Arc::new(deps_core::HttpCache::new()));
+
+            for warm_without_canonical in [false, true] {
+                let tag_index = registry.tag_index();
+                tag_index.clear();
+                if warm_without_canonical {
+                    tag_index.insert(
+                        PackageName::new("actions/checkout"),
+                        Arc::new(TagIndex::default()),
+                    );
+                }
+                let formatter = GithubActionsFormatter::new(tag_index);
+
+                let (targets, skipped) = build_scan_targets(
+                    &parse_result,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &formatter,
+                    EcosystemId::GithubActions,
+                );
+
+                assert!(targets.is_empty());
+                assert_matches!(
+                    skipped.get(&deps_core::test_util::vuln_key("actions/checkout")),
+                    Some(ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed)),
+                    "warm_without_canonical={warm_without_canonical}: {skipped:?}"
+                );
             }
         }
 

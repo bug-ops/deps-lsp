@@ -2,9 +2,9 @@
 
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
-    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin, SourcePolicy,
-    TagIndex, match_v_prefix_style, requirement_contains_template_placeholder,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability, OsvNaming,
+    PackageNaming, PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin,
+    SourcePolicy, TagIndex, match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{
@@ -429,7 +429,31 @@ impl DiagnosticPolicy for GithubActionsFormatter {}
 
 impl SourcePolicy for GithubActionsFormatter {}
 
-impl OsvNaming for GithubActionsFormatter {}
+impl OsvNaming for GithubActionsFormatter {
+    /// Awaiting until the repository's tags response confirmed its canonical casing.
+    fn osv_name_availability(&self, dep: &dyn Dependency) -> OsvNameAvailability {
+        if self.osv_package_name(dep).is_some() {
+            OsvNameAvailability::Ready
+        } else {
+            OsvNameAvailability::AwaitingRegistryData
+        }
+    }
+
+    /// OSV's `GitHub Actions` names are exact-case, so only the canonical casing confirmed by
+    /// the repository's tags response is queried; `None` (never a guessed casing, which would
+    /// report a false clean) while it is unconfirmed.
+    fn osv_package_name(&self, dep: &dyn Dependency) -> Option<deps_core::osv::OsvPackageName> {
+        let index = self.tag_index.get(dep.name())?;
+        let canonical = index.canonical_repo_name()?.as_str();
+        if !canonical.eq_ignore_ascii_case(dep.name().as_str()) {
+            tracing::debug!(
+                written = %deps_core::net_policy::redact_declaration_key(dep.name().as_str()),
+                "canonical repository name differs from the written one beyond casing (renamed or transferred)"
+            );
+        }
+        deps_core::osv::OsvPackageName::new_or_skip(canonical)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1806,5 +1830,105 @@ mod tests {
             "the real GithubActionsFormatter must suppress the fix for #1390's unexpanded ERB \
              template placeholder, got {planned:?}"
         );
+    }
+
+    /// #1683: OSV names are exact-case, so a lowercase `uses:` maps to the canonical casing
+    /// GitHub reported, and to `None` (never the written casing) while it is unconfirmed.
+    #[test]
+    fn test_osv_package_name_uses_canonical_casing_from_tag_index() {
+        use deps_core::ParseResult;
+        use deps_core::lsp_helpers::OsvNaming;
+
+        let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: azure/setup-kubectl@v3\n";
+        let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
+        let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
+        let deps = result.dependencies();
+        let dep = *deps.first().expect("one dependency");
+        let name = PackageName::new("azure/setup-kubectl");
+        let formatter = formatter();
+
+        assert_eq!(formatter.osv_package_name(dep), None, "cold index");
+        assert_eq!(
+            formatter.osv_name_availability(dep),
+            OsvNameAvailability::AwaitingRegistryData
+        );
+
+        formatter
+            .tag_index
+            .insert(name.clone(), Arc::new(TagIndex::default()));
+        assert_eq!(formatter.osv_package_name(dep), None, "unconfirmed casing");
+
+        let canonical = deps_core::github::CanonicalRepoName::from_commit_url(
+            "https://api.github.com/repos/Azure/setup-kubectl/commits/abc",
+        );
+        formatter.tag_index.insert(
+            name,
+            Arc::new(TagIndex::default().with_canonical_repo_name(canonical)),
+        );
+        assert_eq!(
+            formatter
+                .osv_package_name(dep)
+                .as_ref()
+                .map(deps_core::osv::OsvPackageName::as_str),
+            Some("Azure/setup-kubectl")
+        );
+        assert_eq!(
+            formatter.osv_name_availability(dep),
+            OsvNameAvailability::Ready
+        );
+    }
+
+    /// #1683: the same action written in two casings is keyed separately in the tag index;
+    /// each occurrence is `Ready` only once its own key holds a confirmed canonical name.
+    #[test]
+    fn test_osv_package_name_same_action_in_two_casings() {
+        use deps_core::ParseResult;
+        use deps_core::lsp_helpers::OsvNaming;
+
+        let yaml = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: Azure/setup-kubectl@v3\n      - uses: azure/setup-kubectl@v3\n";
+        let uri = deps_core::test_util::test_uri("/test/.github/workflows/ci.yml");
+        let result = crate::parser::parse_workflow_yaml(yaml, &uri).expect("valid yaml");
+        let deps = result.dependencies();
+        assert_eq!(deps.len(), 2);
+        let canonical = || {
+            Arc::new(TagIndex::default().with_canonical_repo_name(
+                deps_core::github::CanonicalRepoName::from_commit_url(
+                    "https://api.github.com/repos/Azure/setup-kubectl/commits/abc",
+                ),
+            ))
+        };
+
+        for populated in [
+            &[][..],
+            &["Azure/setup-kubectl"],
+            &["Azure/setup-kubectl", "azure/setup-kubectl"],
+        ] {
+            let formatter = formatter();
+            for key in populated {
+                formatter
+                    .tag_index
+                    .insert(PackageName::new(*key), canonical());
+            }
+            for dep in &deps {
+                let expected = if populated.contains(&dep.name().as_str()) {
+                    Some("Azure/setup-kubectl")
+                } else {
+                    None
+                };
+                assert_eq!(
+                    formatter
+                        .osv_package_name(*dep)
+                        .as_ref()
+                        .map(deps_core::osv::OsvPackageName::as_str),
+                    expected,
+                    "populated={populated:?} dep={}",
+                    dep.name().as_str()
+                );
+                assert_eq!(
+                    formatter.osv_name_availability(*dep) == OsvNameAvailability::Ready,
+                    expected.is_some()
+                );
+            }
+        }
     }
 }

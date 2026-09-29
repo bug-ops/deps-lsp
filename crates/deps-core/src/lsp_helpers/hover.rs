@@ -6254,6 +6254,38 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_generate_hover_skip_reason_footer_shown_for_canonical_name_unconfirmed() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+
+        let parse_result = freshness_test_parse_result("serde");
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("serde"),
+            ScanOutcome::Skipped(SkipReason::CanonicalNameUnconfirmed),
+        );
+
+        let hover = generate_hover(
+            &parse_result,
+            Position::new(0, 2).into(),
+            VersionData::new(&HashMap::new(), &HashMap::new()).with_vulnerabilities(&vulns),
+            &MockRegistry,
+            &MOCK_FORMATTER,
+            crate::freshness::FreshnessSettings::default(),
+            PublishTime::now(),
+        )
+        .await
+        .expect("hover should be generated");
+
+        let content = hover.markdown();
+        assert!(
+            content
+                .contains("Vulnerability data not checked: the repository's canonical name has not been confirmed")
+                && !content.contains("no resolved or exact version"),
+            "got: {content}"
+        );
+    }
+
     /// Issue #1392: the reason-specific footer must not double up with the existing #483
     /// offline footer — while offline, only the broader "Offline: version and
     /// vulnerability data not checked" wording should render.
