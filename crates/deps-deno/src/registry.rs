@@ -11,9 +11,7 @@ use crate::specifier::{Scheme, is_dot_prefixed, split_scheme, split_scoped};
 use crate::types::{DenoMetadata, JsrPackage, JsrVersion};
 use deps_core::{
     DepsError, FreshnessSettings, HttpCache, Metadata, PackageName, Registry, Result, Version,
-    VersionReq,
-    lsp_helpers::{MAX_REQUIREMENT_LEN, requirement_len_exceeds_cap, warn_rejected_value},
-    not_found_or as core_not_found_or,
+    VersionReq, lsp_helpers::warn_rejected_value, not_found_or as core_not_found_or,
 };
 use deps_npm::NpmRegistry;
 use serde::Deserialize;
@@ -611,14 +609,6 @@ impl Registry for DenoRegistry {
             match split_scheme(name.as_str()) {
                 Some((Scheme::Jsr, rest)) => {
                     let (scope, pkg) = split_scoped(rest).ok_or_else(|| unroutable(name))?;
-                    // Reject before `parse_range_safe` (see `requirement_len_exceeds_cap`'s
-                    // docs), mirroring every `deps-npm` call site (#1640) — an oversized
-                    // requirement never reaches the parser at all.
-                    if requirement_len_exceeds_cap(req.as_str()) {
-                        return Err(DepsError::InvalidVersionReq(format!(
-                            "version requirement exceeds {MAX_REQUIREMENT_LEN} bytes"
-                        )));
-                    }
                     // Pre-check before any network call: a malformed requirement must stay
                     // `Err` (R5c's diagnostic), not silently become `Ok(None)` (R5e, no diagnostic).
                     deps_npm::parse_range_safe(req.as_str())
@@ -733,6 +723,7 @@ impl Registry for DenoRegistry {
 mod tests {
     use super::*;
 
+    use deps_core::lsp_helpers::MAX_REQUIREMENT_LEN;
     use deps_core::test_util::capture_tracing_output_async;
     use std::assert_matches;
 

@@ -590,19 +590,15 @@ fn resolve(
     match catalog.get(dependency_name) {
         None => CatalogOutcome::MissingEntry,
         Some(CatalogValue::Malformed) => CatalogOutcome::MalformedEntry,
-        Some(CatalogValue::Range(range)) => {
-            // #1483: reject before `Range::parse` ever sees it (see
-            // `requirement_len_exceeds_cap`'s docs).
-            if deps_core::lsp_helpers::requirement_len_exceeds_cap(range) {
-                return CatalogOutcome::RequirementTooLong;
-            }
-            match crate::formatter::parse_range_safe(range) {
-                Ok(_) => CatalogOutcome::Resolved(range.clone()),
-                Err(_) => CatalogOutcome::NonSemverEntry {
+        Some(CatalogValue::Range(range)) => match crate::formatter::parse_range_safe(range) {
+            Ok(_) => CatalogOutcome::Resolved(range.clone()),
+            Err(crate::RangeParseError::TooLong { .. }) => CatalogOutcome::RequirementTooLong,
+            Err(crate::RangeParseError::Malformed(_) | crate::RangeParseError::Panicked) => {
+                CatalogOutcome::NonSemverEntry {
                     value: range.clone(),
-                },
+                }
             }
-        }
+        },
     }
 }
 
