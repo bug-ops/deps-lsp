@@ -674,6 +674,22 @@ let package = Package(
     }
 
     #[test]
+    fn test_parse_exact_labelled() {
+        let content = r#".package(url: "https://github.com/apple/swift-crypto", exact: "3.0.0")"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("=3.0.0")
+        );
+        let range = dep.version_range().unwrap();
+        let start = content.find("3.0.0").unwrap();
+        assert_eq!(range.start.character as usize, start);
+        assert_eq!(range.end.character as usize, start + "3.0.0".len());
+    }
+
+    #[test]
     fn test_parse_range_half_open() {
         let content = r#".package(url: "https://github.com/foo/bar", "1.0.0"..<"2.0.0")"#;
         let result = parse_package_swift(content, &test_uri()).unwrap();
@@ -1075,6 +1091,51 @@ let package = Package(
                 .map(deps_core::VersionReq::as_str),
             Some("=3.0.0")
         );
+    }
+
+    #[test]
+    fn test_multiline_exact_labelled() {
+        let content = "\n.package(\n    url: \"https://github.com/apple/swift-crypto\",\n    exact : \"3.0.0\"\n)\n";
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 1);
+        let dep = &result.dependencies[0];
+        assert_eq!(
+            dep.version_requirement().map(deps_core::VersionReq::as_str),
+            Some("=3.0.0")
+        );
+        let range = dep.version_range().unwrap();
+        assert_eq!(range.start.line, 3);
+        assert_eq!(range.start.character, 13);
+        assert_eq!(range.end.character, 18);
+    }
+
+    #[test]
+    fn test_mixed_exact_forms_each_get_own_requirement() {
+        let content = r#"dependencies: [
+    .package(url: "https://github.com/apple/swift-crypto", .exact("3.0.0")),
+    .package(url: "https://github.com/apple/swift-nio", exact: "2.1.0"),
+    .package(url: "https://github.com/apple/swift-log", exact: "1.5.4"),
+]"#;
+        let result = parse_package_swift(content, &test_uri()).unwrap();
+        assert_eq!(result.dependencies.len(), 3);
+        for (dep, (line, ver)) in
+            result
+                .dependencies
+                .iter()
+                .zip([(1, "3.0.0"), (2, "2.1.0"), (3, "1.5.4")])
+        {
+            assert_eq!(
+                dep.version_requirement().map(deps_core::VersionReq::as_str),
+                Some(format!("={ver}").as_str())
+            );
+            let range = dep.version_range().unwrap();
+            assert_eq!(range.start.line, line);
+            let text = content.lines().nth(line as usize).unwrap();
+            assert_eq!(
+                text.get(range.start.character as usize..range.end.character as usize),
+                Some(ver)
+            );
+        }
     }
 
     // --- version range position tracking ---

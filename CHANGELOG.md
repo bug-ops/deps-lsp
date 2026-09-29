@@ -90,6 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 - **deps-swift**: `Package.swift` `.package(...)` calls with a trailing comma after the last argument are no longer skipped; all URL/path regexes now share one builder (resolves #1673) (#1681)
 - **deps-swift**: labelled `exact:`, `branch:`, `revision:` requirements and the legacy `name:` label before `url:`/`path:` are now parsed; branch/revision stay non-version-pinned Git deps (resolves #1672) (#1681)
+- **deps-swift**: labelled `.package(url:, exact: "1.2.3")` dependencies are now parsed instead of skipped (#1671)
+- **deps-core**: a bare or `=` pin is no longer reported outdated when `latest` differs only by semver build metadata (#1671)
 - **deps-core, deps-cargo**: Cargo comparator requirements (`=1.2.3`, `<2`, `>=1.2, <2`) are no longer reported outdated when `latest` satisfies them; bare pins keep the pin heuristic (resolves #1660) (#1667)
 - **deps-github-actions, deps-gitlab-ci**: `is_requirement_up_to_date` no longer reports an oversized requirement as outdated; it is treated as up to date, consistent with `Unresolved` (#1664)
 - **deps-npm, deps-deno, deps-core, deps-composer**: comparator, `||`, hyphen, and wildcard tilde/equals npm requirements are no longer reported outdated when `latest` satisfies them, and compound `^` requirements no longer hit the single-caret shortcut (#1656) (#1659)
