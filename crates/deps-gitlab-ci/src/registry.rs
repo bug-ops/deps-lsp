@@ -882,8 +882,8 @@ mod tests {
             .expect("expected a TagIndex entry");
         let expected_sha = CommitSha::parse(&sha).unwrap();
         assert_eq!(
-            index.sha_to_tag.get(&expected_sha),
-            Some(&"v1.0.0".to_string()),
+            index.tag_for_sha(expected_sha.as_str()),
+            Some("v1.0.0"),
             "sha_to_tag must prefer the semver-parseable tag over the bare moving one"
         );
         // tag_to_sha has no such ambiguity (keyed by the workflow's own literal ref text) —

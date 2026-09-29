@@ -1349,6 +1349,7 @@ fn offline_notice(
 const fn should_notify_in_diagnostics(reason: SkipReason) -> bool {
     match reason {
         SkipReason::NoConcreteVersion
+        | SkipReason::ResolvedTagNotFullVersion
         | SkipReason::QueryFailed
         | SkipReason::Truncated
         | SkipReason::UnevaluableAdvisoryRange => true,
@@ -5551,6 +5552,57 @@ mod tests {
             related.iter().any(|r| r.message().contains("pkg-a"))
                 && related.iter().any(|r| r.message().contains("pkg-b")),
             "both dependency names must survive via related_information; got: {related:?}"
+        );
+    }
+
+    /// #1668: a resolved-but-partial tag is worded as such, never as "no resolved ... version".
+    #[test]
+    fn test_generate_diagnostics_from_cache_skip_reason_notice_resolved_tag_not_full_version() {
+        use crate::osv::{ScanOutcome, SkipReason, VulnerabilityMap};
+        use crate::position::{Position, Range};
+
+        let formatter = MOCK_FORMATTER;
+        let parse_result = MockParseResult {
+            deps: vec![MockDep {
+                name: "pkg-a".into(),
+                version_req: "^1.0.0".into(),
+                version_range: Range::new(Position::new(0, 10), Position::new(0, 20)),
+                name_range: Range::new(Position::new(0, 0), Position::new(0, 5)),
+            }],
+            uri: crate::test_util::test_uri("/test/Cargo.toml"),
+        };
+        let cached_versions = HashMap::new();
+        let resolved_versions = HashMap::new();
+        let mut vulns: VulnerabilityMap = VulnerabilityMap::new();
+        vulns.insert(
+            crate::test_util::vuln_key("pkg-a"),
+            ScanOutcome::Skipped(SkipReason::ResolvedTagNotFullVersion),
+        );
+
+        let diagnostics = generate_diagnostics_from_cache(
+            &parse_result,
+            VersionData::new(&cached_versions, &resolved_versions).with_vulnerabilities(&vulns),
+            &formatter,
+            parse_result.uri(),
+            crate::freshness::FreshnessSettings::default(),
+            DiagnosticSeverities::default(),
+            PublishTime::now(),
+        );
+
+        let notice = diagnostics
+            .iter()
+            .find(|d| {
+                d.message()
+                    .contains("vulnerability data was not checked for")
+            })
+            .unwrap_or_else(|| panic!("expected the notice; got: {diagnostics:?}"));
+        assert!(
+            notice
+                .message()
+                .contains("the resolved tag is not a full version")
+                && !notice.message().contains("no resolved or exact version"),
+            "got: {}",
+            notice.message()
         );
     }
 

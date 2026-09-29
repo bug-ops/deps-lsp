@@ -204,7 +204,7 @@ pub(crate) async fn rescan_osv_if_tag_index_now_warm(
         doc.signals.vulnerabilities.values().any(|outcome| {
             matches!(
                 outcome,
-                deps_core::osv::ScanOutcome::Skipped(deps_core::osv::SkipReason::NoConcreteVersion)
+                deps_core::osv::ScanOutcome::Skipped(reason) if reason.depends_on_tag_index()
             )
         })
     });
@@ -1727,9 +1727,12 @@ mod tests {
                 .downcast_ref::<GithubActionsRegistry>()
                 .expect("GithubActionsEcosystem::registry() must return a GithubActionsRegistry");
             let mut index = TagIndex::default();
-            index
-                .sha_to_tag
-                .insert(CommitSha::parse(&sha).unwrap(), "v1.3.0".to_string());
+            index.insert_sha_pin(
+                CommitSha::parse(&sha).unwrap(),
+                deps_core::lsp_helpers::ResolvedPin::MostSpecific(deps_core::ConcreteVersion::new(
+                    "v1.3.0",
+                )),
+            );
             gha_registry
                 .tag_index()
                 .insert(PackageName::new("actions/checkout"), Arc::new(index));
@@ -1750,6 +1753,104 @@ mod tests {
                 "the rescan's full-replace commit must leave no leftover stale entry \
                  behind: {:?}",
                 doc.signals.vulnerabilities
+            );
+        }
+
+        /// #1668: a skip because the resolved tag was only a moving alias (`v2`) is just as
+        /// `TagIndex`-dependent as a cold-cache skip — once a refreshed index knows a more
+        /// specific tag for the SHA, the rescan must replace it with a real result.
+        #[tokio::test]
+        async fn rescan_replaces_resolved_tag_not_full_version_skip_after_index_refresh() {
+            let _guard = deps_core::fs_probe::snapshot_guard_async().await;
+            let mut server = mockito::Server::new_async().await;
+            let _mock = server
+                .mock("POST", "/v1/querybatch")
+                .with_status(200)
+                .with_body(r#"{"results":[{}]}"#)
+                .expect(1)
+                .create_async()
+                .await;
+
+            let mut state = ServerState::new();
+            state.osv = Arc::new(OsvClient::for_test(
+                Arc::new(deps_core::HttpCache::new()),
+                server.url(),
+            ));
+            let state = Arc::new(state);
+            let (client, _config) =
+                crate::test_utils::test_helpers::create_test_client_and_config();
+
+            let sha = "e".repeat(40);
+            let commit = CommitSha::parse(&sha).unwrap();
+            let url = deps_core::test_util::test_uri("/repo/.github/workflows/ci.yml");
+            let uri = crate::lsp_types_interop::to_lsp_uri(&url);
+            let content = format!("steps:\n  - uses: actions/checkout@{sha} # v2\n");
+
+            let ecosystem: Arc<dyn Ecosystem> = Arc::new(GithubActionsEcosystem::new(Arc::new(
+                deps_core::HttpCache::new(),
+            )));
+            let parse_result = ecosystem.parse_manifest(&content, &url).await.unwrap();
+            state.update_document(
+                uri.clone(),
+                DocumentState::new_from_parse_result(
+                    EcosystemId::GithubActions,
+                    content,
+                    parse_result,
+                ),
+            );
+
+            let registry = ecosystem.registry();
+            let tag_index = registry
+                .as_any()
+                .downcast_ref::<GithubActionsRegistry>()
+                .expect("GithubActionsEcosystem::registry() must return a GithubActionsRegistry")
+                .tag_index();
+            tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(TagIndex::from_tags([("v2", &commit)])),
+            );
+
+            let phase_a =
+                run_osv_scan_phase_a(uri.clone(), Arc::clone(&state), Arc::clone(&ecosystem), 5)
+                    .await
+                    .expect("a SHA-pinned step must still produce a phase-A result");
+            run_osv_phase_b_and_commit(
+                &uri,
+                &state,
+                ecosystem.ecosystem_id(),
+                ecosystem.formatter(),
+                5,
+                phase_a,
+            )
+            .await;
+
+            let key = deps_core::test_util::vuln_key("actions/checkout");
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Skipped(
+                    deps_core::osv::SkipReason::ResolvedTagNotFullVersion
+                ))
+            );
+
+            tag_index.insert(
+                PackageName::new("actions/checkout"),
+                Arc::new(TagIndex::from_tags([("v2", &commit), ("v2.9.1", &commit)])),
+            );
+            rescan_osv_if_tag_index_now_warm(&uri, &state, &client, &ecosystem, 5).await;
+
+            assert_matches!(
+                state
+                    .get_document(&uri)
+                    .unwrap()
+                    .signals
+                    .vulnerabilities
+                    .get(&key),
+                Some(deps_core::osv::ScanOutcome::Clean)
             );
         }
 
