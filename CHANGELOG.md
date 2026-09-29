@@ -89,6 +89,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **deps-core, deps-github-actions, deps-gitlab-ci, deps-engine**: a SHA pin resolving to a most-specific two-component release tag (`v2.9`) is now scanned by OSV, and a resolved-but-partial tag is no longer reported as "no resolved or exact version" (resolves #1668) (#1677)
+- **deps-swift**: labelled `.package(url:, exact: "1.2.3")` dependencies are now parsed instead of skipped (#1671)
+- **deps-core**: a bare or `=` pin is no longer reported outdated when `latest` differs only by semver build metadata (#1671)
 - **deps-core, deps-cargo**: Cargo comparator requirements (`=1.2.3`, `<2`, `>=1.2, <2`) are no longer reported outdated when `latest` satisfies them; bare pins keep the pin heuristic (resolves #1660) (#1667)
 - **deps-github-actions, deps-gitlab-ci**: `is_requirement_up_to_date` no longer reports an oversized requirement as outdated; it is treated as up to date, consistent with `Unresolved` (#1664)
 - **deps-npm, deps-deno, deps-core, deps-composer**: comparator, `||`, hyphen, and wildcard tilde/equals npm requirements are no longer reported outdated when `latest` satisfies them, and compound `^` requirements no longer hit the single-caret shortcut (#1656) (#1659)
