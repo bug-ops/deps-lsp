@@ -2145,7 +2145,7 @@ mod tests {
     ///
     /// Network-free: the added dependency uses Gradle's `4.+` dynamic-version syntax,
     /// which `resolve_in_use_version`'s `concrete_pin_version` fallback rejects (it
-    /// contains `+`, see `deps_core::lsp_helpers::in_use_version::looks_like_a_single_version`),
+    /// contains `+`, which is dynamic for Gradle),
     /// so `tier3_license_targets` produces zero targets and `run_license_prefetch`
     /// returns before any network call — this test only needs the generation bump that
     /// precedes that call, not the fetch itself.
