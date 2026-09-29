@@ -4,7 +4,7 @@ use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability,
     OsvNaming, PackageNaming, PackageRendering, RequirementResolution, RequirementStatus,
-    ResolvedPin, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
+    ResolvedPin, ShaPinLookup, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
     is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::parser::DependencySource;
@@ -444,73 +444,16 @@ impl GithubActionsFormatter {
             return None;
         };
         let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
-        match self.lookup_sha_pin(dep.name(), sha, latest)? {
-            ShaPinLookup::LatestCommit => Some(RequirementStatus::UpToDate),
-            ShaPinLookup::Indexed { tag } => {
-                // An oversized registry tag is unmodellable, not a reason to trust the comment (#907).
-                let real_tag = VersionReq::new(tag);
-                Some(BoundedVersionReq::new(&real_tag).map_or(
-                    RequirementStatus::Unresolved,
-                    |real_tag| {
-                        if is_tag_shaped(real_tag.as_str())
-                            && self.is_bounded_requirement_up_to_date(real_tag, latest)
-                        {
-                            RequirementStatus::UpToDate
-                        } else {
-                            RequirementStatus::Outdated
-                        }
-                    },
-                ))
-            }
-            ShaPinLookup::NotIndexed => match comment_tag {
-                None => Some(RequirementStatus::Outdated),
-                Some(_) => None,
-            },
-            ShaPinLookup::IndexUnavailable => None,
-        }
-    }
-
-    /// `None` when `sha` is not a full SHA. The lookup key is lowercased: the registry
-    /// reports lowercase hex, while a pin may be written in uppercase.
-    fn lookup_sha_pin(
-        &self,
-        name: &PackageName,
-        sha: &str,
-        latest: &ConcreteVersion,
-    ) -> Option<ShaPinLookup> {
-        if !is_full_sha(sha) {
-            return None;
-        }
-        let sha = sha.to_ascii_lowercase();
-        let Some(index) = self.tag_index.get(name).filter(|index| !index.is_empty()) else {
-            return Some(ShaPinLookup::IndexUnavailable);
+        let index = self.tag_index.get(dep.name());
+        let not_indexed = match comment_tag {
+            None => Some(RequirementStatus::Outdated),
+            Some(_) => None,
         };
-        if index
-            .tag_to_sha
-            .get(latest.as_str())
-            .is_some_and(|commit| commit.as_str() == sha)
-        {
-            return Some(ShaPinLookup::LatestCommit);
-        }
-        Some(match index.tag_for_sha(&sha) {
-            Some(tag) => ShaPinLookup::Indexed {
-                tag: tag.to_string(),
-            },
-            None => ShaPinLookup::NotIndexed,
-        })
+        ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), sha, latest)?
+            .into_status(not_indexed, |tag| {
+                self.is_bounded_requirement_up_to_date(tag, latest)
+            })
     }
-}
-
-/// Outcome of looking a full-SHA pin up in the repository's `TagIndex` (#1720).
-enum ShaPinLookup {
-    /// The SHA is the commit of `latest`, whatever other tags name it.
-    LatestCommit,
-    /// A tag other than `latest` names the SHA.
-    Indexed { tag: String },
-    /// The repository's index is populated and no tag points at the SHA.
-    NotIndexed,
-    /// No populated index for the repository yet (cold cache).
-    IndexUnavailable,
 }
 
 impl DiagnosticMessages for GithubActionsFormatter {}

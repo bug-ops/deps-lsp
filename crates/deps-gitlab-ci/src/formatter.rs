@@ -3,8 +3,9 @@
 use dashmap::DashMap;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
-    PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin, SourcePolicy,
-    TagIndex, match_v_prefix_style, requirement_contains_template_placeholder, warn_rejected_value,
+    PackageRendering, RequirementResolution, RequirementStatus, ResolvedPin, ShaPinLookup,
+    SourcePolicy, TagIndex, match_v_prefix_style, requirement_contains_template_placeholder,
+    warn_rejected_value,
 };
 use deps_core::parser::DependencySource;
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName, VersionReq};
@@ -111,6 +112,33 @@ impl GitlabCiFormatter {
             .and_then(|index| index.tag_to_sha.get(tag).cloned())
             .map(|sha| sha.to_string())
     }
+
+    /// #1723: ground-truth status of a full-SHA pin against the route's [`TagIndex`], keyed
+    /// `(endpoint, name)` like `Self::resolved_pin_version`. `None` (the caller keeps
+    /// `Unresolved`) on a cold or empty index, so an unfetched route never reads as outdated.
+    ///
+    /// A SHA absent from a populated index is `Outdated`: `latest` comes from the same fetch,
+    /// so the pin is provably not `latest`'s commit. An indexed SHA is up to date when it is
+    /// `latest`'s commit, or its tag is a version tag that is itself up to date; a non-version
+    /// tag never counts as up to date by text.
+    fn sha_pin_status_from_tag_index(
+        &self,
+        gl_dep: &GitlabCiDependency,
+        requirement: BoundedVersionReq<'_>,
+        latest: &ConcreteVersion,
+    ) -> Option<RequirementStatus> {
+        let index = self
+            .tag_index
+            .get(&(gl_dep.kind.endpoint(), gl_dep.name.clone()));
+        ShaPinLookup::resolve(
+            index.as_deref().map(AsRef::as_ref),
+            requirement.as_str(),
+            latest,
+        )?
+        .into_status(Some(RequirementStatus::Outdated), |tag| {
+            self.is_bounded_requirement_up_to_date(tag, latest)
+        })
+    }
 }
 
 impl PackageNaming for GitlabCiFormatter {
@@ -159,6 +187,9 @@ impl PackageRendering for GitlabCiFormatter {
         };
         match &gl_dep.pin {
             Some(PinStyle::Partial | PinStyle::Latest) => current.to_string(),
+            Some(PinStyle::Sha) => self
+                .sha_pin_replacement_for(gl_dep.kind.endpoint(), &gl_dep.name, version.as_str())
+                .unwrap_or_else(|| current.to_string()),
             _ => match_v_prefix_style(current, version.as_str()),
         }
     }
@@ -274,13 +305,17 @@ impl RequirementResolution for GitlabCiFormatter {
         requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> RequirementStatus {
-        let Some(pin) = dep
-            .as_any()
-            .downcast_ref::<GitlabCiDependency>()
-            .and_then(|gl_dep| gl_dep.pin.as_ref())
-        else {
+        let Some(gl_dep) = dep.as_any().downcast_ref::<GitlabCiDependency>() else {
             return self.classify_requirement_status(requirement, latest);
         };
+        let Some(pin) = gl_dep.pin.as_ref() else {
+            return self.classify_requirement_status(requirement, latest);
+        };
+        if *pin == PinStyle::Sha
+            && let Some(status) = self.sha_pin_status_from_tag_index(gl_dep, requirement, latest)
+        {
+            return status;
+        }
         status_for_pin(pin, requirement.as_str(), latest.as_str())
     }
 
@@ -364,6 +399,9 @@ fn contains_unresolved_gitlab_variable(text: &str) -> bool {
 /// ([`crate::component::classify_component_pin_style`]) or the dependency's own
 /// authoritative parse-time field (`GitlabCiDependency::pin`) — the single place this
 /// mapping is defined, so the two call paths cannot drift apart (#466 review M-c).
+///
+/// Text-only: a `Sha` pin stays `Unresolved` here; the tag-index refinement (#1723) lives in
+/// `GitlabCiFormatter::classify_requirement_status_for`, which has the dependency's route.
 ///
 /// #1370: an unresolved `$VAR`/`${VAR}`/`%VAR%` reference is checked first, ahead of the
 /// `pin`-based match — `PinStyle::Sha`/`Branch` already resolve to `Unresolved` below, but a
@@ -995,6 +1033,197 @@ mod tests {
         assert_eq!(
             fmt.requirement_status_for(&OtherDep, &requirement, &ConcreteVersion::new("1.5.0")),
             fmt.requirement_status(&requirement, &ConcreteVersion::new("1.5.0"))
+        );
+    }
+
+    // --- #1723: SHA pins classified through the tag index ---
+
+    const LATEST_SHA_1723: &str = "3333333333333333333333333333333333333333";
+    const OLD_SHA_1723: &str = "4444444444444444444444444444444444444444";
+    const MISSING_SHA_1723: &str = "5555555555555555555555555555555555555555";
+    const HEX_SHA_1723: &str = "abcdefabcdefabcdefabcdefabcdefabcdefabcd";
+
+    fn fmt_with_index_1723(endpoint: EndpointKind, extra: &[(&str, &str)]) -> GitlabCiFormatter {
+        use deps_core::lsp_helpers::CommitSha;
+
+        let fmt = formatter();
+        let mut tags = vec![("v1.1.0", LATEST_SHA_1723), ("v1.0.0", OLD_SHA_1723)];
+        tags.extend_from_slice(extra);
+        let commits: Vec<(&str, CommitSha)> = tags
+            .iter()
+            .map(|(tag, sha)| (*tag, CommitSha::parse(sha).unwrap()))
+            .collect();
+        fmt.tag_index.insert(
+            (endpoint, PackageName::new("gitlab.com/org/proj")),
+            Arc::new(TagIndex::from_tags(commits.iter().map(|(t, s)| (*t, s)))),
+        );
+        fmt
+    }
+
+    fn sha_dep_1723(sha: &str) -> GitlabCiDependency {
+        let mut d = dep(
+            Some(PinStyle::Sha),
+            "gitlab.com/org/proj",
+            DependencySource::AlternateRegistry {
+                index: "gitlab:abc".into(),
+                mirrors_crates_io: false,
+            },
+        );
+        d.version_req = Some(sha.into());
+        d
+    }
+
+    fn status_1723(fmt: &GitlabCiFormatter, d: &GitlabCiDependency) -> RequirementStatus {
+        fmt.requirement_status_for(
+            d,
+            d.version_req.as_ref().unwrap(),
+            &ConcreteVersion::new("v1.1.0"),
+        )
+    }
+
+    #[test]
+    fn test_sha_pin_on_latest_commit_is_up_to_date() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let d = sha_dep_1723(LATEST_SHA_1723);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::UpToDate);
+    }
+
+    #[test]
+    fn test_sha_pin_at_older_tag_is_outdated() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let d = sha_dep_1723(OLD_SHA_1723);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    #[test]
+    fn test_sha_pin_absent_from_populated_index_is_outdated() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let d = sha_dep_1723(MISSING_SHA_1723);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    #[test]
+    fn test_sha_pin_cold_or_empty_index_is_unresolved() {
+        let d = sha_dep_1723(MISSING_SHA_1723);
+        assert_eq!(status_1723(&formatter(), &d), RequirementStatus::Unresolved);
+
+        let fmt = formatter();
+        fmt.tag_index.insert(
+            (EndpointKind::Tags, PackageName::new("gitlab.com/org/proj")),
+            Arc::new(TagIndex::default()),
+        );
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Unresolved);
+    }
+
+    #[test]
+    fn test_sha_pin_uppercase_hex_matches_lowercase_index() {
+        let upper = HEX_SHA_1723.to_ascii_uppercase();
+        let old = fmt_with_index_1723(EndpointKind::Tags, &[("v1.0.1", HEX_SHA_1723)]);
+        assert_eq!(
+            status_1723(&old, &sha_dep_1723(&upper)),
+            RequirementStatus::Outdated
+        );
+
+        let latest = fmt_with_index_1723(EndpointKind::Tags, &[("v1.1.0", HEX_SHA_1723)]);
+        assert_eq!(
+            status_1723(&latest, &sha_dep_1723(&upper)),
+            RequirementStatus::UpToDate
+        );
+    }
+
+    #[test]
+    fn test_sha_pin_on_latest_commit_with_extra_tag_is_up_to_date() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("v1.1", LATEST_SHA_1723)]);
+        let d = sha_dep_1723(LATEST_SHA_1723);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::UpToDate);
+    }
+
+    #[test]
+    fn test_sha_pin_with_oversized_indexed_tag_is_unresolved() {
+        let oversized = "v".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN + 1);
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[(&oversized, MISSING_SHA_1723)]);
+        let d = sha_dep_1723(MISSING_SHA_1723);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Unresolved);
+    }
+
+    /// A SHA whose only tag is a partial `v1.1` on a non-latest commit reads by that tag's own
+    /// range, so it counts as up to date against `v1.1.0` (moving-tag trade-off, as in GitHub
+    /// Actions).
+    #[test]
+    fn test_sha_pin_with_partial_tag_on_older_commit_reads_by_tag_range() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("v1.1", MISSING_SHA_1723)]);
+        let d = sha_dep_1723(MISSING_SHA_1723);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::UpToDate);
+    }
+
+    #[test]
+    fn test_uppercase_sha_resolves_tag_for_hover_and_resolved_pin() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("v1.0.1", HEX_SHA_1723)]);
+        let upper = HEX_SHA_1723.to_ascii_uppercase();
+        assert_eq!(
+            fmt.resolved_pin_version(&sha_dep_1723(&upper)),
+            Some(ResolvedPin::MostSpecific(ConcreteVersion::new("v1.0.1")))
+        );
+    }
+
+    #[test]
+    fn test_sha_pin_with_non_version_tag_is_outdated() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[("nightly", MISSING_SHA_1723)]);
+        let d = sha_dep_1723(MISSING_SHA_1723);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    /// Keyed by `(endpoint, name)`: a `component:` (Releases) index never classifies a
+    /// `project:` (Tags) pin, which stays on the honest cold-index `Unresolved`.
+    #[test]
+    fn test_sha_pin_status_does_not_cross_endpoint_kinds() {
+        let fmt = fmt_with_index_1723(EndpointKind::Releases, &[]);
+        let d = sha_dep_1723(OLD_SHA_1723);
+        assert_eq!(d.kind.endpoint(), EndpointKind::Tags);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Unresolved);
+    }
+
+    #[test]
+    fn test_sha_pin_status_releases_endpoint_classifies_component_pin() {
+        let fmt = fmt_with_index_1723(EndpointKind::Releases, &[]);
+        let mut d = sha_dep_1723(OLD_SHA_1723);
+        d.kind = crate::types::IncludeKind::Component;
+        assert_eq!(d.kind.endpoint(), EndpointKind::Releases);
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Outdated);
+    }
+
+    #[test]
+    fn test_sha_pin_with_placeholder_stays_unresolved() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let mut d = sha_dep_1723(OLD_SHA_1723);
+        d.version_req = Some("$DEPLOY_SHA".into());
+        assert_eq!(status_1723(&fmt, &d), RequirementStatus::Unresolved);
+    }
+
+    /// The rewrite of a SHA pin is the latest tag's full SHA, never the bare tag text.
+    #[test]
+    fn test_format_version_replacing_for_sha_yields_latest_sha_not_tag() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let d = sha_dep_1723(OLD_SHA_1723);
+        assert_eq!(
+            deps_core::edit::replacement_text(
+                &fmt,
+                &d,
+                &ConcreteVersion::new("v1.1.0"),
+                OLD_SHA_1723
+            )
+            .as_deref(),
+            Some(LATEST_SHA_1723)
+        );
+    }
+
+    #[test]
+    fn test_format_version_replacing_for_sha_without_tag_is_no_op() {
+        let fmt = fmt_with_index_1723(EndpointKind::Tags, &[]);
+        let d = sha_dep_1723(OLD_SHA_1723);
+        assert_eq!(
+            fmt.format_version_replacing_for(&d, &ConcreteVersion::new("v9.9.9"), OLD_SHA_1723),
+            OLD_SHA_1723
         );
     }
 

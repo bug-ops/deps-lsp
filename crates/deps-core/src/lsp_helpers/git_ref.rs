@@ -4,7 +4,7 @@
 //! plumbing instead of forking it. `deps-github-actions` now imports these instead of
 //! defining them locally.
 
-use super::LineOffsetTable;
+use super::{BoundedVersionReq, LineOffsetTable, RequirementStatus};
 use crate::position::Range;
 use yaml_rust2::parser::Tag;
 use yaml_rust2::scanner::{Marker, TScalarStyle};
@@ -290,19 +290,153 @@ impl TagIndex {
     /// `None` when no tag points at `sha`.
     #[must_use]
     pub fn resolved_pin(&self, sha: &str) -> Option<ResolvedPin> {
-        self.sha_to_tag.get(sha).cloned()
+        self.pin_for_sha(sha).cloned()
     }
 
     /// The tag text published at `sha`, without its alias classification.
     #[must_use]
     pub fn tag_for_sha(&self, sha: &str) -> Option<&str> {
-        self.sha_to_tag.get(sha).map(|pin| pin.version().as_str())
+        self.tag_version_for_sha(sha)
+            .map(crate::ConcreteVersion::as_str)
+    }
+
+    fn pin_for_sha(&self, sha: &str) -> Option<&ResolvedPin> {
+        self.sha_to_tag
+            .get(sha)
+            .or_else(|| self.sha_to_tag.get(sha.to_ascii_lowercase().as_str()))
+    }
+
+    fn tag_version_for_sha(&self, sha: &str) -> Option<&crate::ConcreteVersion> {
+        self.pin_for_sha(sha).map(ResolvedPin::version)
     }
 
     /// Whether the index holds no tag in either direction.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tag_to_sha.is_empty() && self.sha_to_tag.is_empty()
+    }
+}
+
+/// Outcome of looking a full-SHA pin up in a repository's [`TagIndex`] against the newest
+/// release, shared by every tags-datasource ecosystem (GitHub Actions, GitLab CI).
+///
+/// Callers map each variant to their own status policy; the variants are exhaustive so a
+/// new outcome forces every consumer to decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShaPinLookup {
+    /// The SHA is the commit of `latest`, whatever other tags name it.
+    LatestCommit,
+    /// A tag other than `latest` names the SHA.
+    Indexed {
+        /// The tag published at the SHA, verbatim.
+        tag: crate::ConcreteVersion,
+    },
+    /// The repository's index is populated and no tag points at the SHA.
+    NotIndexed,
+    /// No populated index for the repository yet (cold cache).
+    IndexUnavailable,
+}
+
+impl ShaPinLookup {
+    /// Looks `sha` up in `index` relative to `latest`; `None` when `sha` is not a full SHA.
+    ///
+    /// The lookup key is lowercased: registries report lowercase hex, while a pin may be
+    /// written in uppercase. A missing or empty `index` yields
+    /// [`Self::IndexUnavailable`], never [`Self::NotIndexed`], so a cold cache is not
+    /// mistaken for proof that the pin is stale.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::ConcreteVersion;
+    /// use deps_core::lsp_helpers::{CommitSha, ShaPinLookup, TagIndex};
+    ///
+    /// let sha = CommitSha::parse(&"a".repeat(40)).unwrap();
+    /// let index = TagIndex::from_tags([("v1.0.0", &sha)]);
+    /// let latest = ConcreteVersion::new("v1.0.0");
+    /// assert_eq!(
+    ///     ShaPinLookup::resolve(Some(&index), &"A".repeat(40), &latest),
+    ///     Some(ShaPinLookup::LatestCommit)
+    /// );
+    /// assert_eq!(
+    ///     ShaPinLookup::resolve(None, sha.as_str(), &latest),
+    ///     Some(ShaPinLookup::IndexUnavailable)
+    /// );
+    /// ```
+    #[must_use]
+    pub fn resolve(
+        index: Option<&TagIndex>,
+        sha: &str,
+        latest: &crate::ConcreteVersion,
+    ) -> Option<Self> {
+        if !is_full_sha(sha) {
+            return None;
+        }
+        let sha = sha.to_ascii_lowercase();
+        let Some(index) = index.filter(|index| !index.is_empty()) else {
+            return Some(Self::IndexUnavailable);
+        };
+        if index
+            .tag_to_sha
+            .get(latest.as_str())
+            .is_some_and(|commit| commit.as_str() == sha)
+        {
+            return Some(Self::LatestCommit);
+        }
+        Some(match index.tag_version_for_sha(&sha) {
+            Some(tag) => Self::Indexed { tag: tag.clone() },
+            None => Self::NotIndexed,
+        })
+    }
+
+    /// Maps the lookup to a [`RequirementStatus`], or `None` when the caller should fall back
+    /// to its own text-based classification.
+    ///
+    /// [`Self::LatestCommit`] is up to date. [`Self::Indexed`] is up to date only when its tag
+    /// is [`is_tag_shaped`] and `tag_is_up_to_date` accepts it, so a non-version tag
+    /// (`cargo-deny`) never reads as current by text; an oversized tag is `Unresolved`.
+    /// [`Self::NotIndexed`] yields `not_indexed`, the one ecosystem-specific policy (GitHub
+    /// Actions trusts a `# tag` comment, GitLab CI has none). [`Self::IndexUnavailable`] yields
+    /// `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{RequirementStatus, ShaPinLookup};
+    ///
+    /// assert_eq!(
+    ///     ShaPinLookup::LatestCommit.into_status(None, |_| false),
+    ///     Some(RequirementStatus::UpToDate)
+    /// );
+    /// assert_eq!(
+    ///     ShaPinLookup::NotIndexed.into_status(Some(RequirementStatus::Outdated), |_| true),
+    ///     Some(RequirementStatus::Outdated)
+    /// );
+    /// assert_eq!(ShaPinLookup::IndexUnavailable.into_status(None, |_| true), None);
+    /// ```
+    #[must_use]
+    pub fn into_status(
+        self,
+        not_indexed: Option<RequirementStatus>,
+        tag_is_up_to_date: impl FnOnce(BoundedVersionReq<'_>) -> bool,
+    ) -> Option<RequirementStatus> {
+        match self {
+            Self::LatestCommit => Some(RequirementStatus::UpToDate),
+            Self::Indexed { tag } => {
+                let tag = crate::VersionReq::new(tag.as_str());
+                Some(
+                    BoundedVersionReq::new(&tag).map_or(RequirementStatus::Unresolved, |tag| {
+                        if is_tag_shaped(tag.as_str()) && tag_is_up_to_date(tag) {
+                            RequirementStatus::UpToDate
+                        } else {
+                            RequirementStatus::Outdated
+                        }
+                    }),
+                )
+            }
+            Self::NotIndexed => not_indexed,
+            Self::IndexUnavailable => None,
+        }
     }
 }
 
@@ -1214,6 +1348,95 @@ mod tests {
         assert_eq!(index.tag_for_sha(sha.as_str()), Some("v0.1.15"));
         assert_eq!(index.tag_to_sha.get("v1"), Some(&sha));
         assert_eq!(index.tag_to_sha.get("v0.1.15"), Some(&sha));
+    }
+
+    fn sha_of(c: char) -> CommitSha {
+        CommitSha::parse(&c.to_string().repeat(40)).unwrap()
+    }
+
+    fn lookup(index: Option<&TagIndex>, sha: &str, latest: &str) -> Option<ShaPinLookup> {
+        ShaPinLookup::resolve(index, sha, &crate::ConcreteVersion::new(latest))
+    }
+
+    #[test]
+    fn test_sha_pin_lookup_rejects_non_full_sha() {
+        let index = TagIndex::from_tags([("v1.0.0", &sha_of('a'))]);
+        for bad in [
+            "a".repeat(39),
+            "a".repeat(41),
+            "g".repeat(40),
+            "v1.0.0".to_string(),
+        ] {
+            assert_eq!(lookup(Some(&index), &bad, "v1.0.0"), None, "{bad}");
+        }
+        assert_eq!(
+            lookup(Some(&index), &"A".repeat(40), "v1.0.0"),
+            Some(ShaPinLookup::LatestCommit)
+        );
+    }
+
+    #[test]
+    fn test_sha_pin_lookup_variants() {
+        let index = TagIndex::from_tags([
+            ("v1.0.0", &sha_of('a')),
+            ("v1.1.0", &sha_of('b')),
+            ("v1.1", &sha_of('b')),
+        ]);
+        assert_eq!(
+            lookup(Some(&index), &"a".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::Indexed {
+                tag: crate::ConcreteVersion::new("v1.0.0")
+            })
+        );
+        assert_eq!(
+            lookup(Some(&index), &"c".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::NotIndexed)
+        );
+        assert_eq!(
+            lookup(Some(&TagIndex::default()), &"a".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::IndexUnavailable)
+        );
+        assert_eq!(
+            lookup(None, &"a".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::IndexUnavailable)
+        );
+        assert_eq!(
+            lookup(Some(&index), &"b".repeat(40), "v1.1.0"),
+            Some(ShaPinLookup::LatestCommit)
+        );
+    }
+
+    #[test]
+    fn test_tag_index_lookups_are_case_insensitive_on_sha() {
+        let index = TagIndex::from_tags([("v1.0.0", &sha_of('a'))]);
+        let upper = "A".repeat(40);
+        assert_eq!(index.tag_for_sha(&upper), Some("v1.0.0"));
+        assert!(index.resolved_pin(&upper).is_some());
+    }
+
+    #[test]
+    fn test_sha_pin_lookup_into_status_indexed_branches() {
+        let indexed = |tag: &str| ShaPinLookup::Indexed {
+            tag: crate::ConcreteVersion::new(tag),
+        };
+        assert_eq!(
+            indexed("v1.0.0").into_status(None, |_| true),
+            Some(RequirementStatus::UpToDate)
+        );
+        assert_eq!(
+            indexed("v1.0.0").into_status(None, |_| false),
+            Some(RequirementStatus::Outdated)
+        );
+        assert_eq!(
+            indexed("cargo-deny").into_status(None, |_| true),
+            Some(RequirementStatus::Outdated)
+        );
+        let oversized = "v".repeat(super::super::MAX_REQUIREMENT_LEN + 1);
+        assert_eq!(
+            indexed(&oversized).into_status(None, |_| true),
+            Some(RequirementStatus::Unresolved)
+        );
+        assert_eq!(ShaPinLookup::NotIndexed.into_status(None, |_| true), None);
     }
 
     fn resolved_pin_for(tags: &[&str]) -> Option<ResolvedPin> {
