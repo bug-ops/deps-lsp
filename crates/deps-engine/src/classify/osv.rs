@@ -1175,6 +1175,34 @@ mod tests {
             );
         }
 
+        /// #1689: a Dart `+N` build-number pin with no lock file is a concrete OSV query target.
+        #[cfg(feature = "dart")]
+        #[test]
+        fn build_scan_targets_dart_plus_build_number_pin_without_lockfile_is_queried() {
+            let dep = |name: &str, req: &str| MockDep {
+                name: PackageName::new(name),
+                version_req: Some(VersionReq::new(req)),
+                source: DependencySource::Registry,
+            };
+            let parse_result = MockParseResult {
+                deps: vec![
+                    dep("image_picker_android", "0.8.13+1"),
+                    dep("caret_pkg", "^0.8.13+1"),
+                ],
+            };
+
+            let (targets, skipped) = build_scan_targets(
+                &parse_result,
+                &HashMap::new(),
+                &HashMap::new(),
+                &deps_dart::DartFormatter,
+                EcosystemId::Dart,
+            );
+
+            assert_eq!(targets.len(), 1, "{skipped:?}");
+            assert_eq!(targets[0].display_version, "0.8.13+1");
+        }
+
         /// #1556 impl-critic S1: a GitHub Actions SHA pin whose `TagIndex`-resolved tag is
         /// itself a moving-major/partial name (here, `v1`, from a `# v1` comment) is NOT a
         /// queryable OSV version — `TagIndex.sha_to_tag` is first-wins over every tag
