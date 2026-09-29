@@ -216,6 +216,7 @@ mod tests {
 
     /// #1687 e2e: a `pubspec.lock`-resolved `0.8.13+1` against pub.dev latest `0.8.13+23`
     /// must render as outdated, not up to date.
+    #[cfg(feature = "lsp-responses")]
     #[tokio::test]
     async fn test_inlay_hint_lock_resolved_older_build_revision_is_outdated() {
         use deps_core::lsp_helpers::VersionData;
