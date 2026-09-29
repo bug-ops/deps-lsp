@@ -37,7 +37,7 @@ pub struct PinNoun {
 /// - it declares a non-empty version requirement that [`crate::edit::requirement_is_placeholder_for`]
 ///   does not consider an unexpanded placeholder (#1370 central gate);
 /// - the formatter's
-///   [`requirement_status_for`](crate::lsp_helpers::RequirementStatusGate::requirement_status_for)
+///   [`requirement_status_for`](crate::lsp_helpers::RequirementGate::requirement_status_for)
 ///   reports the declared requirement as [`Outdated`](crate::lsp_helpers::RequirementStatus::Outdated)
 ///   — the same predicate the diagnostics pipeline's outdated rule calls, though that rule
 ///   also gates on `formatter.can_resolve_source`, which this planner does not check, so the
@@ -399,7 +399,7 @@ mod tests {
             }
         }
 
-        /// A formatter whose `is_requirement_up_to_date` ignores range semantics and
+        /// A formatter whose `is_bounded_requirement_up_to_date` ignores range semantics and
         /// always reports "not up to date" — mirrors NuGet's bare-requirement-is-a-floor
         /// override (`crates/deps-nuget/src/formatter.rs`), used to prove the override
         /// point is actually consulted rather than the trait default. Appends `-forced`
@@ -423,9 +423,9 @@ mod tests {
         }
 
         impl RequirementResolution for FloorFormatter {
-            fn is_requirement_up_to_date(
+            fn is_bounded_requirement_up_to_date(
                 &self,
-                _requirement: &VersionReq,
+                _requirement: BoundedVersionReq<'_>,
                 _latest: &ConcreteVersion,
             ) -> bool {
                 false
@@ -650,7 +650,7 @@ mod tests {
 
         #[test]
         fn test_requirement_already_accepts_latest_is_not_counted() {
-            // "^1.0" already accepts "1.2.0" per the default `is_requirement_up_to_date`,
+            // "^1.0" already accepts "1.2.0" per the default `is_bounded_requirement_up_to_date`,
             // so no edit is produced even though `latest` differs from the source text.
             let content = "serde = \"^1.0\"\n";
             let pr = parse_result(vec![dep("serde", Some("^1.0"), Some(range(0, 9, 0, 13)))]);
@@ -715,9 +715,9 @@ mod tests {
             }
 
             impl RequirementResolution for NoOpFormatter {
-                fn is_requirement_up_to_date(
+                fn is_bounded_requirement_up_to_date(
                     &self,
-                    _requirement: &VersionReq,
+                    _requirement: BoundedVersionReq<'_>,
                     _latest: &ConcreteVersion,
                 ) -> bool {
                     false

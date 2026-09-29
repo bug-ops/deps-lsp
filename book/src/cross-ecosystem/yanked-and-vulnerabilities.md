@@ -76,7 +76,7 @@ This version has been yanked
 This only fires when at least one matching version exists and all matching versions are
 yanked — the same scan `Unsatisfiable Version Requirement` (see
 [Version Diagnostics](version-diagnostics.md)) uses (via
-`EcosystemFormatter::compile_requirement`), cross-referenced against the registry's yanked
+`EcosystemFormatter::compile_bounded_requirement`), cross-referenced against the registry's yanked
 flags. It is mutually exclusive with both the unsatisfiable WARNING (a yanked-only match is
 a satisfied match, not zero matches) and the outdated/up-to-date check. If a non-yanked
 version also satisfies the requirement (e.g. `^1.0` matching both a yanked `1.0.0` and a

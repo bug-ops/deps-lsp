@@ -1230,7 +1230,7 @@ mod tests {
 
     /// #1639: unlike plain tilde, an equals range with a wildcard major followed by a
     /// concrete component (`=x.2.3`) is a genuine npm parse error, not "any version" — the
-    /// JSR pre-check (called directly, not via `deps-npm`'s `compile_requirement`) must stay
+    /// JSR pre-check (called directly, not via `deps-npm`'s `compile_bounded_requirement`) must stay
     /// `Err` for it, mirroring `deps-npm`'s own coverage for this call site.
     #[tokio::test]
     async fn test_deno_registry_get_latest_matching_jsr_equals_wildcard_major_concrete_trailing_stays_err()

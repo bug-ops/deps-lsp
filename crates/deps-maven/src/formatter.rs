@@ -1,14 +1,13 @@
 //! Version formatting for Maven ecosystem.
 
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
     compile_requirement_unless, format_version_replacing_by_shape,
     requirement_contains_template_placeholder,
 };
 use deps_core::{
-    ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, VersionReq,
-    is_safe_maven_coordinate_segment,
+    ConcreteVersion, EcosystemId, InvalidPackageName, PackageName, is_safe_maven_coordinate_segment,
 };
 
 /// [`EcosystemFormatter`](deps_core::lsp_helpers::EcosystemFormatter) implementation for Maven.
@@ -75,7 +74,7 @@ fn is_timestamped_snapshot(requirement: &str) -> bool {
 }
 
 /// Precise Maven version/range matcher, compiled once per dependency by
-/// [`MavenFormatter::compile_requirement`] — the range union (if any) is parsed once into
+/// [`MavenFormatter::compile_bounded_requirement`] — the range union (if any) is parsed once into
 /// [`crate::interval::VersionRange`]s here rather than being re-parsed for every candidate
 /// version scanned. Deliberately more precise than the loose `version_satisfies_requirement`
 /// in two ways it does not need for its own "treat as up to date" question: it recognizes the
@@ -140,7 +139,7 @@ impl PackageNaming for MavenFormatter {
     /// never produces those) is valid Maven, not a malformed coordinate — checked first and
     /// always accepted, the same undecidable treatment `is_unresolved` already gets in
     /// [`version_satisfies_requirement`](Self::version_satisfies_requirement) and
-    /// [`compile_requirement`](Self::compile_requirement).
+    /// [`compile_bounded_requirement`](Self::compile_bounded_requirement).
     ///
     /// The missing-`:` branch is defensive: `crate::parser` always builds a
     /// dependency's name as `format!("{group_id}:{artifact_id}")`, so a real coordinate
@@ -204,9 +203,9 @@ impl PackageRendering for MavenFormatter {
 
 impl RequirementResolution for MavenFormatter {
     // #249 review (M4): this branch order (unresolved → range → exact) is a separate copy
-    // from `compile_requirement`'s below — kept apart deliberately (see `MavenMatcher`'s
+    // from `compile_bounded_requirement`'s below — kept apart deliberately (see `MavenMatcher`'s
     // docs for the two precision differences), but any reordering here must be checked
-    // against `compile_requirement`'s malformed-range guard placement too, since S1/S2
+    // against `compile_bounded_requirement`'s malformed-range guard placement too, since S1/S2
     // happened in `deps-gradle` from exactly this kind of drift between two copies.
     fn version_satisfies_requirement(&self, version: &ConcreteVersion, requirement: &str) -> bool {
         let version = version.as_str();
@@ -229,7 +228,7 @@ impl RequirementResolution for MavenFormatter {
     // `<%= %>`) defensively, with no override needed here.
 
     /// Uses [`compile_requirement_unless`] (see that function and
-    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate rejects a malformed range (`is_range` true but
     /// `crate::range::parse_range` fails) — checked unconditionally, first, before any other
@@ -241,7 +240,10 @@ impl RequirementResolution for MavenFormatter {
     ///
     /// #249 review (M4): this is a separate branch-order copy from `version_satisfies_requirement`
     /// above — see the note on that method before reordering either one.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
         compile_requirement_unless(
             requirement.as_str(),
             |r| crate::range::is_range(r) && crate::range::parse_range(r).is_none(),
@@ -276,7 +278,8 @@ impl OsvNaming for MavenFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::{RequirementStatus, RequirementStatusGate};
+    use deps_core::VersionReq;
+    use deps_core::lsp_helpers::{RequirementGate, RequirementStatus};
 
     #[test]
     fn test_format_version() {
@@ -484,7 +487,7 @@ mod tests {
     /// destructive rewrite is [`deps_core::edit::replacement_text`]'s central placeholder gate
     /// (backed by `RequirementResolution::requirement_is_placeholder`, which composes the
     /// shared generic-template detector for Maven's `${property}` form) — this
-    /// `AlwaysSatisfied` classification now only feeds `requirement_already_resolves_to`'s
+    /// `AlwaysSatisfied` classification now only feeds `bounded_requirement_already_resolves_to`'s
     /// secondary no-op check, not the sole line of defense `deps-cli`'s
     /// `requirement_already_admits_fix` originally relied on.
     #[test]
@@ -662,9 +665,9 @@ mod tests {
     /// must leave an unresolved `${property}` unrewritten rather than substituting the
     /// fix/latest version — mirrors `deps-nuget`'s `$(...)`-property equivalent
     /// (#1347/#1352). This is what actually closes the gap the default
-    /// `requirement_already_resolves_to`/`compile_requirement` pairing misses for a
+    /// `bounded_requirement_already_resolves_to`/`compile_bounded_requirement` pairing misses for a
     /// requirement that is *both* unresolved and an undecidable malformed range (see the
-    /// malformed-range test below) — `compile_requirement` returns `None` for that shape,
+    /// malformed-range test below) — `compile_bounded_requirement` returns `None` for that shape,
     /// not `MavenMatcher::AlwaysSatisfied`, making the pairing inert.
     #[test]
     fn test_replacement_text_unresolved_property_is_none() {
@@ -702,8 +705,8 @@ mod tests {
     /// #1353 S1: `[1.0,${hi}` is classified unresolved (`is_unresolved` delegates to
     /// `requirement_contains_template_placeholder`, which detects the embedded `${hi}`), but
     /// it is *also* a malformed range — `is_range` is true and `crate::range::parse_range`
-    /// fails on it, so `compile_requirement`'s malformed-range guard returns `None` (not
-    /// `MavenMatcher::AlwaysSatisfied`), making the default `requirement_already_resolves_to`
+    /// fails on it, so `compile_bounded_requirement`'s malformed-range guard returns `None` (not
+    /// `MavenMatcher::AlwaysSatisfied`), making the default `bounded_requirement_already_resolves_to`
     /// inert. `RequirementResolution::requirement_is_placeholder`'s direct `is_unresolved`
     /// check — consulted by `deps_core::edit::replacement_text` before ever calling into the
     /// formatter's rewrite logic — is what actually closes this gap.

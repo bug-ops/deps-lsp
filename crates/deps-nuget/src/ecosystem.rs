@@ -539,7 +539,7 @@ mod tests {
     async fn test_fallback_edit_excludes_newer_pins_m2_located_floor_loosening_writable() {
         // Spec 076 M2: a floor resolves ONLY to its own lowest member, never forward — spec
         // 075's `matches`-based guard rejected this (the floor admits 1.2.0); this guard
-        // writes it, since `requirement_already_resolves_to` correctly says a floor never
+        // writes it, since `bounded_requirement_already_resolves_to` correctly says a floor never
         // resolves past its own value. The floor's own value ("1.0.0") must be listed for the
         // fix-cycle floor-comparison scan to find it — realistic for production `available`
         // (every published version, unfiltered), since the floor is the user's own
@@ -650,7 +650,7 @@ mod tests {
 
     /// Diagnostics counterpart of the inlay-hint regressions above: `generate_diagnostics`
     /// (default impl, delegates to `lsp_helpers::generate_diagnostics_from_cache`) shares
-    /// the same `EcosystemFormatter::is_requirement_up_to_date` call site, so it was
+    /// the same `EcosystemFormatter::is_bounded_requirement_up_to_date` call site, so it was
     /// affected by the same bug and must be verified separately (no inlay-hint test
     /// exercises this path).
     async fn diagnostic_messages(
@@ -1381,7 +1381,7 @@ mod tests {
 
         /// End-to-end regression for issue #163: a `.csproj`/`Directory.Packages.props`
         /// bare-floor `Version` pinned behind the latest registry release must render `❌
-        /// {latest}`, not `✅` — see `NuGetFormatter::is_requirement_up_to_date`.
+        /// {latest}`, not `✅` — see `NuGetFormatter::is_bounded_requirement_up_to_date`.
         async fn inlay_hint_labels(
             eco: &NuGetEcosystem,
             content: &str,

@@ -6,9 +6,9 @@ use deps_core::StabilityFloor;
 use deps_core::VersionReq;
 use deps_core::interval::{VersionRange, range_from_edges, tighter_lower, tighter_upper};
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
-    match_v_prefix_style, requirement_contains_template_placeholder,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    compile_requirement_unless, match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::normalize_operator_spacing;
 use deps_core::osv::OsvPackageName;
@@ -71,7 +71,7 @@ fn requirement_is_composer_unresolved(requirement: &str) -> bool {
 }
 
 /// Composer requirement matcher, compiled once per dependency by
-/// [`ComposerFormatter::compile_requirement`]. Shares `version_satisfies_requirement`'s
+/// [`ComposerFormatter::compile_bounded_requirement`]. Shares `version_satisfies_requirement`'s
 /// hand-rolled comparator, which has no external parser to fail on, so this always
 /// decides (`Some`).
 struct ComposerMatcher(String);
@@ -953,7 +953,7 @@ impl RequirementResolution for ComposerFormatter {
     /// Compiles `requirement` into a `ComposerMatcher` using the same
     /// `version_satisfies_requirement` comparator — Composer requirements have no separate
     /// "loose" vs. "precise" form to distinguish. Uses [`compile_requirement_unless`] (see
-    /// that function and [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared
+    /// that function and [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared
     /// "undecidable" contract).
     ///
     /// The undecidable predicate rejects a `dev-*`/`*-dev` branch requirement (e.g.
@@ -963,7 +963,10 @@ impl RequirementResolution for ComposerFormatter {
     /// shape `@dev` normalizes to — out of every result, so `available` — unlike every other
     /// ecosystem's, which is the plan's "unfiltered `get_versions` output" invariant — can
     /// never contain one, even when the branch itself is real and installable.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
         compile_requirement_unless(
             requirement.as_str().trim(),
             |r| {
@@ -980,7 +983,7 @@ impl RequirementResolution for ComposerFormatter {
     /// must never be reported as an unsatisfiable requirement — both are resolved entirely
     /// by Composer's own installer, not by any version published on Packagist, so
     /// `deps_core::lsp_helpers::requirement_is_unsatisfiable` (which checks this before
-    /// calling `compile_requirement`) must treat them as unresolved instead of "no
+    /// calling `compile_bounded_requirement`) must treat them as unresolved instead of "no
     /// published version satisfies this".
     ///
     /// #1370/#1380: all three forms `requirement_is_composer_unresolved` covers
@@ -1326,6 +1329,7 @@ fn compare_versions(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
     use crate::types::{ComposerDependency, ComposerSection};
+    use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position as DomainPosition, Range};
     #[cfg(feature = "lsp-responses")]
     use std::collections::HashMap;
@@ -3149,7 +3153,7 @@ mod tests {
 
     /// Positive control: a resolved, well-formed requirement on the same dependency shape
     /// must still be rewritten. Uses an exact pin (not a `^`/`~` range) so the fix target
-    /// does not already satisfy `current` — otherwise `requirement_already_resolves_to`
+    /// does not already satisfy `current` — otherwise `bounded_requirement_already_resolves_to`
     /// would itself skip the edit as unnecessary, for an unrelated reason.
     #[test]
     fn test_plan_vulnerability_fix_resolved_requirement_still_returns_planned_edit() {

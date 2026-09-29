@@ -1,9 +1,9 @@
-//! Fuzzes every ecosystem's [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`]/
+//! Fuzzes every ecosystem's [`deps_core::lsp_helpers::RequirementGate::compile_requirement`]/
 //! [`deps_core::lsp_helpers::RequirementMatcher::matches`]/
 //! [`deps_core::lsp_helpers::RequirementMatcher::explicitly_excludes`]/
 //! [`deps_core::lsp_helpers::RequirementResolution::version_satisfies_requirement`]/
-//! [`deps_core::lsp_helpers::RequirementResolution::is_requirement_up_to_date`]/
-//! [`deps_core::lsp_helpers::RequirementResolution::requirement_already_resolves_to`] from
+//! [`deps_core::lsp_helpers::RequirementGate::is_requirement_up_to_date`]/
+//! [`deps_core::lsp_helpers::RequirementGate::requirement_already_resolves_to`] from
 //! arbitrary `(version, requirement)` string pairs (#1627).
 //!
 //! Property under test: no call panics for any input, capped or not. For a requirement within
@@ -21,7 +21,7 @@
 #[path = "../shared/panic_guard.rs"]
 mod panic_guard;
 
-use deps_core::lsp_helpers::requirement_is_oversized;
+use deps_core::lsp_helpers::{RequirementGate, requirement_is_oversized};
 use deps_core::{ConcreteVersion, Ecosystem, EcosystemId, VersionReq};
 use libfuzzer_sys::fuzz_target;
 use std::sync::{Arc, LazyLock};

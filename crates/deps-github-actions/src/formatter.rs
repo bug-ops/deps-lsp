@@ -263,12 +263,13 @@ impl RequirementResolution for GithubActionsFormatter {
     /// (a bare SHA or branch name — neither is dot-separated all-digit) returns `true`,
     /// never a false "outdated": [`Self::requirement_is_unresolved`] is what actually
     /// gates those out of the diagnostic/inlay-hint path; this is only the fallback for a
-    /// caller (the "Update N outdated" code lens) that does not consult that hook first.
-    fn is_requirement_up_to_date(
+    /// caller that does not consult that hook first.
+    fn is_bounded_requirement_up_to_date(
         &self,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> bool {
+        let requirement = requirement.get();
         let req = requirement
             .as_str()
             .strip_prefix(['v', 'V'])
@@ -385,7 +386,7 @@ impl GithubActionsFormatter {
     ///
     /// #1648: no longer gates on `requirement_is_oversized` itself — this method is only ever
     /// reached through
-    /// [`RequirementStatusGate::requirement_status_for`](deps_core::lsp_helpers::RequirementStatusGate::requirement_status_for),
+    /// [`RequirementGate::requirement_status_for`](deps_core::lsp_helpers::RequirementGate::requirement_status_for),
     /// which already constructs a [`BoundedVersionReq`] before calling
     /// [`Self::classify_requirement_status_for`], so an oversized requirement never reaches
     /// here at all.
@@ -410,12 +411,16 @@ impl GithubActionsFormatter {
             return None;
         }
         let real_tag = self.tag_index.get(dep.name())?.sha_to_tag.get(sha)?.clone();
+        let real_tag = VersionReq::new(real_tag);
+        // An oversized registry tag is unmodellable, not a reason to trust the comment (#907).
         Some(
-            if self.is_requirement_up_to_date(&VersionReq::new(real_tag), latest) {
-                RequirementStatus::UpToDate
-            } else {
-                RequirementStatus::Outdated
-            },
+            BoundedVersionReq::new(&real_tag).map_or(RequirementStatus::Unresolved, |real_tag| {
+                if self.is_bounded_requirement_up_to_date(real_tag, latest) {
+                    RequirementStatus::UpToDate
+                } else {
+                    RequirementStatus::Outdated
+                }
+            }),
         )
     }
 }
@@ -431,7 +436,7 @@ impl OsvNaming for GithubActionsFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::{CommitSha, RequirementStatusGate};
+    use deps_core::lsp_helpers::{CommitSha, RequirementGate};
     use deps_core::parser::DependencySource;
     use deps_core::{Position, Range};
 
@@ -992,6 +997,52 @@ mod tests {
             RequirementStatus::Unresolved,
             "oversized requirement must be reported Unresolved, not resolved via the \
              TagIndex ground truth"
+        );
+    }
+
+    /// #1652: the gated boolean entry point treats an oversized requirement as up to date
+    /// (unmodellable, consistent with `Unresolved` from `requirement_status`), not outdated.
+    #[test]
+    fn test_is_requirement_up_to_date_oversized_requirement_is_up_to_date() {
+        use deps_core::lsp_helpers::MAX_REQUIREMENT_LEN;
+
+        let oversized = VersionReq::new("1".repeat(MAX_REQUIREMENT_LEN + 1));
+
+        assert!(formatter().is_requirement_up_to_date(&oversized, &ConcreteVersion::new("2.0.0")));
+
+        // At-cap control: exactly `MAX_REQUIREMENT_LEN` still reaches the hook, which reports
+        // an all-digit requirement with extra leading components outdated.
+        let at_cap = VersionReq::new("1".repeat(MAX_REQUIREMENT_LEN));
+        assert!(!formatter().is_requirement_up_to_date(&at_cap, &ConcreteVersion::new("2.0.0")));
+    }
+
+    /// #1652 critic M2: an oversized `TagIndex` ground-truth tag is unmodellable, so the status
+    /// is `Unresolved` — it must not fall back to trusting the (possibly stale) comment (#907).
+    #[test]
+    fn test_requirement_status_for_sha_pin_oversized_ground_truth_tag_is_unresolved() {
+        use deps_core::lsp_helpers::MAX_REQUIREMENT_LEN;
+
+        let sha = "a".repeat(40);
+        let fmt = formatter();
+        let mut index = TagIndex::default();
+        index.sha_to_tag.insert(
+            CommitSha::parse(&sha).unwrap(),
+            format!("v{}", "1".repeat(MAX_REQUIREMENT_LEN)),
+        );
+        fmt.tag_index
+            .insert(PackageName::new("actions/checkout"), Arc::new(index));
+
+        let d = dep(
+            Some(PinStyle::Sha {
+                comment_tag: Some("v4".to_string()),
+            }),
+            "actions/checkout",
+            Some(format!("{sha} # v4").as_str()),
+        );
+
+        assert_eq!(
+            fmt.requirement_status_for(&d, &VersionReq::new("v4"), &ConcreteVersion::new("v4.3.1")),
+            RequirementStatus::Unresolved
         );
     }
 

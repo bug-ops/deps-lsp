@@ -7,9 +7,9 @@ use deps_core::PackageName;
 use deps_core::VersionReq;
 use deps_core::is_dot_segment;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_semver_requirement,
-    requirement_contains_template_placeholder, warn_rejected_value,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    compile_semver_requirement, requirement_contains_template_placeholder, warn_rejected_value,
 };
 use deps_core::osv::OsvPackageName;
 
@@ -18,7 +18,7 @@ use crate::types::SwiftDependency;
 /// Whether `requirement` contains an unresolved Swift string-interpolation placeholder
 /// (`\(...)`), e.g. `.package(url: ..., from: "\(v)")`. `deps-swift`'s parser does not degrade
 /// this shape to `version_requirement: None`, so it reaches [`RequirementResolution`] and
-/// [`PackageRendering`] directly — issue #1354 security audit: `compile_requirement` returns
+/// [`PackageRendering`] directly — issue #1354 security audit: `compile_bounded_requirement` returns
 /// `None` for it already (the interpolated text fails `semver::VersionReq::parse`), but
 /// nothing previously stopped `format_version_replacing` from planning a destructive
 /// `"9.9.9"`-literal rewrite over the interpolation. Mirrors `NuGetFormatter`'s `$(Property)`
@@ -160,8 +160,8 @@ impl RequirementResolution for SwiftFormatter {
 
     /// Delegates to [`compile_semver_requirement`] — the same `semver::VersionReq` crate
     /// `version_satisfies_requirement` uses, shared with `deps-cargo` (#1495). `None` on parse
-    /// failure is the fallible-parse shape of `compile_requirement`'s "undecidable" contract
-    /// (see [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`]) — Swift's
+    /// failure is the fallible-parse shape of `compile_bounded_requirement`'s "undecidable" contract
+    /// (see [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`]) — Swift's
     /// registry client follows GitHub tags pagination to build `available`, so a `None` here is
     /// purely "this requirement string doesn't parse as semver," not a gap in what pagination
     /// could return.
@@ -170,7 +170,11 @@ impl RequirementResolution for SwiftFormatter {
     /// checked explicitly first rather than relying on `semver::VersionReq::parse` to keep
     /// failing on it — defense-in-depth against a future interpolation spelling that happens
     /// to parse as valid semver syntax.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
@@ -229,6 +233,7 @@ impl OsvNaming for SwiftFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementGate;
 
     use deps_core::test_util::capture_tracing_output;
 
@@ -687,7 +692,7 @@ mod tests {
     /// `deps-nuget`'s `test_plan_vulnerability_fix_with_real_formatter_and_parsed_dependency`
     /// (#1352) and `deps-bundler`'s equivalent (#1354).
     ///
-    /// `compile_requirement` already returns `None` here (the interpolated text fails
+    /// `compile_bounded_requirement` already returns `None` here (the interpolated text fails
     /// `semver::VersionReq::parse`), but nothing previously stopped
     /// `format_version_replacing` from planning a destructive rewrite once
     /// `plan_vulnerability_fix`'s no-op guard compared the synthesized literal against it.

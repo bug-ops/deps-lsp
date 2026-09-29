@@ -349,9 +349,9 @@ impl<D: Dependency + 'static> ParseResult for SingleDepParseResult<D> {
     }
 }
 
-/// Formatter whose `compile_requirement` does exact-string matching, so
+/// Formatter whose `compile_bounded_requirement` does exact-string matching, so
 /// `requirement_is_unsatisfiable` can actually return `true` in a test
-/// (unlike the default `MOCK_FORMATTER`, whose `compile_requirement`
+/// (unlike the default `MOCK_FORMATTER`, whose `compile_bounded_requirement`
 /// default always returns `None`).
 pub(crate) struct ExactMatchFormatter;
 
@@ -379,7 +379,10 @@ impl PackageRendering for ExactMatchFormatter {
 }
 
 impl RequirementResolution for ExactMatchFormatter {
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
         Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
     }
 }
@@ -410,7 +413,11 @@ impl PackageRendering for StrictSemverFormatter {
 }
 
 impl RequirementResolution for StrictSemverFormatter {
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         compile_semver_requirement(requirement)
     }
 }
