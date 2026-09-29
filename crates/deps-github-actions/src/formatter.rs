@@ -1,17 +1,19 @@
 //! GitHub Actions ecosystem formatter.
 
 use dashmap::DashMap;
+#[cfg(any(test, feature = "lsp-responses"))]
+use deps_core::VersionReq;
 use deps_core::github::normalize_tag;
 use deps_core::lsp_helpers::{
     BoundedVersionReq, CommitSha, DiagnosticMessages, DiagnosticPolicy, OsvNameAvailability,
     OsvNaming, PackageNaming, PackageRendering, RequirementResolution, RequirementStatus,
-    ResolvedPin, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
+    ResolvedPin, ShaPinLookup, SourcePolicy, TagIndex, concrete_pin_version, extends_tag,
     is_partial_semver_shaped, match_v_prefix_style, requirement_contains_template_placeholder,
 };
 use deps_core::pagination::ListCoverage;
 use deps_core::parser::DependencySource;
 use deps_core::{
-    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName, VersionReq,
+    ConcreteVersion, Dependency, EcosystemId, InvalidPackageName, PackageName,
     lsp_helpers::warn_rejected_value,
 };
 use std::sync::Arc;
@@ -451,58 +453,9 @@ impl GithubActionsFormatter {
             return None;
         };
         let sha = crate::types::sha_pin_raw_sha(gha_dep)?;
-        match self.lookup_sha_pin(dep.name(), sha, latest)? {
-            ShaPinLookup::LatestCommit => Some(RequirementStatus::UpToDate),
-            ShaPinLookup::Indexed { tag } => {
-                // An oversized registry tag is unmodellable, not a reason to trust the comment (#907).
-                let real_tag = VersionReq::new(tag);
-                Some(BoundedVersionReq::new(&real_tag).map_or(
-                    RequirementStatus::Unresolved,
-                    |real_tag| {
-                        if is_tag_shaped(real_tag.as_str())
-                            && self.is_bounded_requirement_up_to_date(real_tag, latest)
-                        {
-                            RequirementStatus::UpToDate
-                        } else {
-                            RequirementStatus::Outdated
-                        }
-                    },
-                ))
-            }
-            ShaPinLookup::NotIndexed => Some(RequirementStatus::Outdated),
-            ShaPinLookup::Unverifiable => None,
-        }
-    }
-
-    /// `None` when `sha` is not a full SHA. The lookup key is lowercased: the registry
-    /// reports lowercase hex, while a pin may be written in uppercase.
-    fn lookup_sha_pin(
-        &self,
-        name: &PackageName,
-        sha: &str,
-        latest: &ConcreteVersion,
-    ) -> Option<ShaPinLookup> {
-        if !is_full_sha(sha) {
-            return None;
-        }
-        let sha = sha.to_ascii_lowercase();
-        let Some(index) = self.tag_index.get(name).filter(|index| !index.is_empty()) else {
-            return Some(ShaPinLookup::Unverifiable);
-        };
-        if index
-            .tag_to_sha
-            .get(latest.as_str())
-            .is_some_and(|commit| commit.as_str() == sha)
-        {
-            return Some(ShaPinLookup::LatestCommit);
-        }
-        Some(match (index.tag_for_sha(&sha), index.coverage()) {
-            (Some(tag), _) => ShaPinLookup::Indexed {
-                tag: tag.to_string(),
-            },
-            (None, ListCoverage::Complete) => ShaPinLookup::NotIndexed,
-            (None, ListCoverage::Truncated) => ShaPinLookup::Unverifiable,
-        })
+        let index = self.tag_index.get(dep.name());
+        ShaPinLookup::resolve(index.as_deref().map(AsRef::as_ref), sha, latest)?
+            .into_status(|tag| self.is_bounded_requirement_up_to_date(tag, latest))
     }
 
     /// Whether a SHA pin's trailing `# tag` comment agrees with the repository's `TagIndex`
@@ -585,18 +538,6 @@ pub(crate) enum CommentMismatch {
         /// The tag that does point at the SHA.
         actual: ConcreteVersion,
     },
-}
-
-/// Outcome of looking a full-SHA pin up in the repository's `TagIndex` (#1720).
-enum ShaPinLookup {
-    /// The SHA is the commit of `latest`, whatever other tags name it.
-    LatestCommit,
-    /// A tag other than `latest` names the SHA.
-    Indexed { tag: String },
-    /// The repository's index is populated, `Complete`, and no tag points at the SHA.
-    NotIndexed,
-    /// No populated index yet (cold cache), or the SHA is absent from a `Truncated` index.
-    Unverifiable,
 }
 
 impl DiagnosticMessages for GithubActionsFormatter {}

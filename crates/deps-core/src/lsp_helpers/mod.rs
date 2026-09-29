@@ -81,9 +81,10 @@ pub use formatter::{
     up_to_date_for_comparators_via_compiled_matcher, up_to_date_via_compiled_matcher,
 };
 pub use git_ref::{
-    CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, ResolvedPin, TagIndex, byte_span_to_range,
-    extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped, is_plain_null, is_tag_shaped,
-    locate_value_span, marker_byte_offset, match_v_prefix_style, short_sha,
+    CommitSha, MAX_FALLBACK_SCAN_BYTES, MarkedScalar, ResolvedPin, ShaPinLookup, TagIndex,
+    byte_span_to_range, extends_tag, is_full_sha, is_null_tag, is_partial_semver_shaped,
+    is_plain_null, is_tag_shaped, locate_value_span, marker_byte_offset, match_v_prefix_style,
+    short_sha,
 };
 #[cfg(feature = "lsp-responses")]
 pub use git_ref::{

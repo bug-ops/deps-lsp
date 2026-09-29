@@ -88,6 +88,13 @@ distinguish two cases that render identically) > `~latest` (highest published
 non-prerelease release) > partial semver (`1.2`, `1`, via `semver::VersionReq` range
 matching — `~1.2` matches `>=1.2.0, <1.3.0`).
 
+**SHA pins.** A full 40-character SHA pin is classified against the route's tag index once
+its tags (or releases) are loaded, the same way as in GitHub Actions: a SHA on the latest
+release's commit is up to date; a SHA at an older tag, or that no tag points at, is reported
+outdated and update-all re-pins it to the latest release's full SHA (never to a bare tag).
+Before the index is populated the pin stays unresolved. This includes a pin on a non-release
+commit newer than the latest release, which is reported outdated (effectively a downgrade).
+
 **Self-hosted instances.** `include: - project:` carries **no host segment in GitLab's
 own syntax at all** — the instance is always implicit. Set
 `registries.gitlab_instance_host` to the host such an include (and a
