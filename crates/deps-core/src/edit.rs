@@ -2118,7 +2118,7 @@ mod tests {
         /// *lowest* admissible member (NuGet's bare `Version="1.0.0"` floor, #1344 C1) rather
         /// than following forward to the newest one. Its raw `compile_bounded_requirement` matcher is
         /// deliberately permissive (matches any version at or above the floor, exactly like
-        /// NuGet's `Minimum` shape) so this test proves `plan_vulnerability_fix` consults
+        /// NuGet's lower-bound-only shape) so this test proves `plan_vulnerability_fix` consults
         /// `bounded_requirement_already_resolves_to`'s override — which correctly refuses to
         /// suppress — rather than the raw matcher alone.
         struct FloorFormatter;

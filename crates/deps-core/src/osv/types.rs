@@ -209,6 +209,115 @@ impl PartialEq<&str> for OsvVersion {
     }
 }
 
+/// OSV's canonical package name for one dependency — the spelling sent on the wire and matched
+/// against `affected[].package.name` in a returned record.
+///
+/// Distinct from the project-internal lookup key (`VulnKey`) and the ecosystem-native name
+/// (`PackageName`): the transform between them is not round-trippable (Swift `owner/repo` ->
+/// `github.com/owner/repo`; Composer lowercased), so a bare `String` would let a native name be
+/// passed where the wire name is required. Deliberately has no `From<String>`/`From<&str>`:
+/// construction goes through [`OsvPackageName::new`] only, so every wrap is greppable.
+///
+/// # Examples
+///
+/// ```
+/// use deps_core::osv::OsvPackageName;
+///
+/// let name = OsvPackageName::new("github.com/apple/swift-nio");
+/// assert_eq!(name.as_str(), "github.com/apple/swift-nio");
+/// assert_eq!(name, "github.com/apple/swift-nio");
+/// ```
+///
+/// `PartialOrd`/`Ord` are derived (raw byte-string order) only because
+/// [`crate::osv::OsvClient`]'s `query_cache` key tuple includes an `OsvPackageName` and its
+/// `Ord`-bounded eviction heap needs *some* total order to break ties.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OsvPackageName(String);
+
+impl OsvPackageName {
+    /// Wraps `value` as an `OsvPackageName`, unchanged.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvPackageName;
+    ///
+    /// let name = OsvPackageName::new(String::from("serde"));
+    /// assert_eq!(name.as_str(), "serde");
+    /// ```
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    /// Returns the OSV wire package name as a string slice.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvPackageName;
+    ///
+    /// assert_eq!(OsvPackageName::new("tokio").as_str(), "tokio");
+    /// ```
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consumes the `OsvPackageName`, returning the wrapped `String`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::osv::OsvPackageName;
+    ///
+    /// let owned: String = OsvPackageName::new("tokio").into_string();
+    /// assert_eq!(owned, "tokio");
+    /// ```
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for OsvPackageName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for OsvPackageName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl PartialEq<str> for OsvPackageName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for OsvPackageName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+#[cfg(test)]
+mod osv_package_name_tests {
+    use super::OsvPackageName;
+
+    #[test]
+    fn test_display_as_ref_and_str_equality() {
+        let name = OsvPackageName::new("github.com/apple/swift-nio");
+        assert_eq!(name.to_string(), "github.com/apple/swift-nio");
+        assert_eq!(AsRef::<str>::as_ref(&name), "github.com/apple/swift-nio");
+        assert_eq!(name, *"github.com/apple/swift-nio");
+        assert_eq!(name, "github.com/apple/swift-nio");
+        assert!(name != "other");
+    }
+}
+
 /// One dependency to query against OSV.
 ///
 /// Four distinct strings, deliberately: `key` is this project's internal
@@ -231,16 +340,16 @@ impl PartialEq<&str> for OsvVersion {
 ///
 /// ```
 /// use deps_core::ConcreteVersion;
-/// use deps_core::osv::{OsvVersion, ScanTarget};
+/// use deps_core::osv::{OsvPackageName, OsvVersion, ScanTarget};
 /// use deps_core::test_util::vuln_key;
 ///
 /// let target = ScanTarget::new(
 ///     vuln_key("time"),
-///     "time".to_string(),
+///     OsvPackageName::new("time"),
 ///     OsvVersion::new("0.1.43"),
 ///     ConcreteVersion::new("0.1.43"),
 /// );
-/// assert_eq!(target.key.as_str(), target.osv_name);
+/// assert!(target.osv_name == target.key.as_str());
 /// ```
 #[non_exhaustive]
 #[derive(Clone, PartialEq, Eq, crate::redact_debug::RedactingDebug)]
@@ -250,7 +359,7 @@ pub struct ScanTarget {
     pub key: VulnKey,
     /// OSV's canonical package name for this ecosystem — sent on the wire.
     #[redact(key)]
-    pub osv_name: String,
+    pub osv_name: OsvPackageName,
     /// Concrete version to query, resolved per the version-selection policy
     /// and rewritten to OSV's wire spelling via
     /// `EcosystemFormatter::osv_version`. Never surface this to the user —
@@ -287,7 +396,7 @@ impl ScanTarget {
     #[must_use]
     pub fn new(
         key: VulnKey,
-        osv_name: String,
+        osv_name: OsvPackageName,
         version: OsvVersion,
         display_version: ConcreteVersion,
     ) -> Self {
@@ -308,7 +417,7 @@ impl ScanTarget {
     /// ```
     /// use deps_core::ConcreteVersion;
     /// use deps_core::lsp_helpers::OsvNaming;
-    /// use deps_core::osv::ScanTarget;
+    /// use deps_core::osv::{OsvPackageName, ScanTarget};
     /// use deps_core::test_util::vuln_key;
     ///
     /// struct DefaultFormatter;
@@ -316,7 +425,7 @@ impl ScanTarget {
     ///
     /// let target = ScanTarget::from_native(
     ///     vuln_key("time"),
-    ///     "time".to_string(),
+    ///     OsvPackageName::new("time"),
     ///     ConcreteVersion::new("0.1.43"),
     ///     &DefaultFormatter,
     /// );
@@ -326,7 +435,7 @@ impl ScanTarget {
     #[must_use]
     pub fn from_native(
         key: VulnKey,
-        osv_name: String,
+        osv_name: OsvPackageName,
         native: ConcreteVersion,
         naming: &dyn crate::lsp_helpers::OsvNaming,
     ) -> Self {
@@ -337,7 +446,7 @@ impl ScanTarget {
 
 #[cfg(test)]
 mod scan_target_debug_redaction_tests {
-    use super::{OsvVersion, ScanTarget, VulnKey};
+    use super::{OsvPackageName, OsvVersion, ScanTarget, VulnKey};
     use crate::ConcreteVersion;
 
     crate::debug_redaction_conformance!(
@@ -345,7 +454,7 @@ mod scan_target_debug_redaction_tests {
         2,
         ScanTarget {
             key: VulnKey(crate::conformance::CREDENTIAL_PROBE_KEY.into()),
-            osv_name: crate::conformance::CREDENTIAL_PROBE_KEY.to_string(),
+            osv_name: OsvPackageName::new(crate::conformance::CREDENTIAL_PROBE_KEY),
             version: OsvVersion::new("1.0.0"),
             display_version: ConcreteVersion::new("1.0.0"),
         },
@@ -1742,6 +1851,18 @@ pub(super) struct OsvQuery {
     pub(super) version: String,
 }
 
+impl OsvQuery {
+    pub(super) fn new(target: &ScanTarget, osv_eco: OsvEcosystem) -> Self {
+        Self {
+            package: OsvPackage {
+                name: target.osv_name.clone().into_string(),
+                ecosystem: osv_eco.as_str().to_owned(),
+            },
+            version: target.version.clone().into_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct OsvPackage {
     pub(super) name: String,
@@ -1939,7 +2060,11 @@ impl OsvVulnRecord {
     /// matches (or omits) before `fixed_versions`/severity are extracted —
     /// otherwise a stranger package's fix version or severity could leak
     /// into this one's rendering.
-    pub(super) fn into_advisory(self, osv_name: &str, osv_eco: OsvEcosystem) -> Option<Advisory> {
+    pub(super) fn into_advisory(
+        self,
+        osv_name: &OsvPackageName,
+        osv_eco: OsvEcosystem,
+    ) -> Option<Advisory> {
         if !is_valid_osv_id(&self.id) {
             tracing::warn!(id = ?self.id, "OSV record has a malformed id, dropping");
             return None;
@@ -1951,7 +2076,7 @@ impl OsvVulnRecord {
             .filter(|a| {
                 a.package
                     .as_ref()
-                    .is_none_or(|p| p.name == osv_name && p.ecosystem == osv_eco.as_str())
+                    .is_none_or(|p| osv_name == p.name.as_str() && p.ecosystem == osv_eco.as_str())
             })
             .collect();
         // Every `affected[]` entry named a different package: OSV returned
@@ -1961,7 +2086,7 @@ impl OsvVulnRecord {
         let used_fallback_all = relevant.is_empty() && !self.affected.is_empty();
         let relevant: Vec<&OsvAffected> = if used_fallback_all {
             tracing::warn!(
-                id = %self.id, osv_name, osv_eco = osv_eco.as_str(),
+                id = %self.id, %osv_name, osv_eco = osv_eco.as_str(),
                 "no affected[] entry matched the queried package; using all entries"
             );
             self.affected.iter().collect()
@@ -2422,7 +2547,7 @@ mod osv_version_validation_tests {
         };
         assert!(
             record
-                .into_advisory("pkg", OsvEcosystem::CratesIo)
+                .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
                 .is_none()
         );
     }
@@ -2448,7 +2573,7 @@ mod osv_version_validation_tests {
         let log = crate::test_util::capture_tracing_output(|| {
             assert!(
                 record
-                    .into_advisory("pkg", OsvEcosystem::CratesIo)
+                    .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
                     .is_none()
             );
         });
@@ -2473,7 +2598,7 @@ mod osv_version_validation_tests {
         // verbatim into a `TextEdit`.
         let record = record_with_fixed(&["1.0.0", "1.0.0\", git = \"https://evil/x"]);
         let advisory = record
-            .into_advisory("pkg", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
             .expect("valid id, should still resolve");
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
@@ -2483,7 +2608,9 @@ mod osv_version_validation_tests {
     fn fixed_version_over_length_cap_is_dropped() {
         let long_version = format!("1.0.0-{}", "a".repeat(64));
         let record = record_with_fixed(&["1.0.0", &long_version]);
-        let advisory = record.into_advisory("pkg", OsvEcosystem::CratesIo).unwrap();
+        let advisory = record
+            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
+            .unwrap();
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("1.0.0")]);
     }
@@ -2523,7 +2650,7 @@ mod osv_version_validation_tests {
         };
 
         let advisory = record
-            .into_advisory("requests", OsvEcosystem::PyPI)
+            .into_advisory(&OsvPackageName::new("requests"), OsvEcosystem::PyPI)
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.fixed_versions, vec![OsvVersion::new("2.31.0")]);
@@ -2564,7 +2691,7 @@ mod osv_version_validation_tests {
         };
         let advisory = Arc::new(
             record
-                .into_advisory("requests", OsvEcosystem::PyPI)
+                .into_advisory(&OsvPackageName::new("requests"), OsvEcosystem::PyPI)
                 .expect("valid id, should resolve"),
         );
         let dv = DependencyVulnerabilities::new(Capped::new(vec![advisory], 1));
@@ -2599,7 +2726,7 @@ mod osv_version_validation_tests {
             }],
         };
         let advisory = record
-            .into_advisory("pkg", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
         assert!(
             advisory.fixed_versions.is_empty(),
@@ -2638,7 +2765,7 @@ mod osv_version_validation_tests {
         };
 
         let advisory = record
-            .into_advisory("pkg", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert!(advisory.fixed_versions.is_empty());
@@ -2670,7 +2797,7 @@ mod osv_version_validation_tests {
     fn every_fixed_version_malformed_yields_empty_fixed_versions_not_a_dropped_advisory() {
         let record = record_with_fixed(&["1.0.0\nEvil"]);
         let advisory = record
-            .into_advisory("pkg", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("pkg"), OsvEcosystem::CratesIo)
             .expect("the advisory itself is still valid, just with no usable fix");
 
         assert!(advisory.fixed_versions.is_empty());
@@ -2740,7 +2867,7 @@ mod informational_record_tests {
     fn live_yaml_rust_unmaintained_record_classifies_as_informational() {
         let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
         let advisory = record
-            .into_advisory("yaml-rust", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("yaml-rust"), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.severity, VulnSeverity::Informational);
@@ -2765,7 +2892,10 @@ mod informational_record_tests {
     fn into_advisory_rejects_informational_from_fallback_all_entries() {
         let record: OsvVulnRecord = serde_json::from_str(YAML_RUST_RUSTSEC_2024_0320).unwrap();
         let advisory = record
-            .into_advisory("some-other-crate", OsvEcosystem::CratesIo)
+            .into_advisory(
+                &OsvPackageName::new("some-other-crate"),
+                OsvEcosystem::CratesIo,
+            )
             .expect("valid id, should resolve");
 
         assert_ne!(advisory.severity, VulnSeverity::Informational);
@@ -2787,7 +2917,7 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory("yaml-rust", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("yaml-rust"), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_ne!(advisory.severity, VulnSeverity::Informational);
@@ -2811,7 +2941,7 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory("atty", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("atty"), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_ne!(
@@ -2843,7 +2973,7 @@ mod informational_record_tests {
         }"#;
         let record: OsvVulnRecord = serde_json::from_str(json).unwrap();
         let advisory = record
-            .into_advisory("yaml-rust", OsvEcosystem::CratesIo)
+            .into_advisory(&OsvPackageName::new("yaml-rust"), OsvEcosystem::CratesIo)
             .expect("valid id, should resolve");
 
         assert_eq!(advisory.severity, VulnSeverity::Unknown);

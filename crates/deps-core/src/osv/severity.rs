@@ -6,7 +6,7 @@
 
 use crate::diagnostic::Severity;
 
-use super::types::{OsvAffected, OsvEcosystem, VulnSeverity};
+use super::types::{OsvAffected, OsvEcosystem, OsvPackageName, VulnSeverity};
 
 /// Parses an OSV severity label (`database_specific.severity` or
 /// `ecosystem_specific.severity`) case-insensitively.
@@ -106,7 +106,7 @@ pub(super) fn classify(
     aliases: &[String],
     database_specific: Option<&serde_json::Value>,
     relevant_affected: &[&OsvAffected],
-    osv_name: &str,
+    osv_name: &OsvPackageName,
     osv_eco: OsvEcosystem,
 ) -> VulnSeverity {
     if id.starts_with("MAL-") || aliases.iter().any(|alias| alias.starts_with("MAL-")) {
@@ -131,7 +131,7 @@ pub(super) fn classify(
         let genuinely_this_package = affected
             .package
             .as_ref()
-            .is_some_and(|p| p.name == osv_name && p.ecosystem == osv_eco.as_str());
+            .is_some_and(|p| osv_name == p.name.as_str() && p.ecosystem == osv_eco.as_str());
         if genuinely_this_package
             && affected
                 .database_specific
@@ -198,6 +198,10 @@ mod tests {
     use crate::osv::types::{OsvAffected, OsvPackage};
 
     const PKG_NAME: &str = "yaml-rust";
+
+    fn pkg_name() -> OsvPackageName {
+        OsvPackageName::new(PKG_NAME)
+    }
     const PKG_ECO: &str = "crates.io";
     const PKG_OSV_ECO: OsvEcosystem = OsvEcosystem::CratesIo;
 
@@ -210,7 +214,7 @@ mod tests {
                 &[],
                 Some(&json),
                 &[],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Critical
@@ -226,7 +230,7 @@ mod tests {
                 &[],
                 Some(&json),
                 &[],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Medium
@@ -247,7 +251,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Low
@@ -257,7 +261,14 @@ mod tests {
     #[test]
     fn cvss_vector_only_record_is_unknown() {
         assert_eq!(
-            classify("RUSTSEC-2020-0071", &[], None, &[], PKG_NAME, PKG_OSV_ECO),
+            classify(
+                "RUSTSEC-2020-0071",
+                &[],
+                None,
+                &[],
+                &pkg_name(),
+                PKG_OSV_ECO
+            ),
             VulnSeverity::Unknown
         );
     }
@@ -265,7 +276,14 @@ mod tests {
     #[test]
     fn no_severity_at_all_is_unknown() {
         assert_eq!(
-            classify("RUSTSEC-2020-0071", &[], None, &[], PKG_NAME, PKG_OSV_ECO),
+            classify(
+                "RUSTSEC-2020-0071",
+                &[],
+                None,
+                &[],
+                &pkg_name(),
+                PKG_OSV_ECO
+            ),
             VulnSeverity::Unknown
         );
     }
@@ -282,7 +300,7 @@ mod tests {
                 &aliases,
                 None,
                 &[],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
@@ -294,7 +312,7 @@ mod tests {
         // Live-verified shape: OSV's MAL-2025-47141 record for npm
         // `@ctrl/tinycolor` has no severity field anywhere.
         assert_eq!(
-            classify("MAL-2025-47141", &[], None, &[], PKG_NAME, PKG_OSV_ECO),
+            classify("MAL-2025-47141", &[], None, &[], &pkg_name(), PKG_OSV_ECO),
             VulnSeverity::Malicious
         );
     }
@@ -311,7 +329,7 @@ mod tests {
                 &[],
                 Some(&json),
                 &[],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
@@ -334,7 +352,7 @@ mod tests {
                 &aliases,
                 Some(&json),
                 &[],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
@@ -360,13 +378,20 @@ mod tests {
                 &ghsa_aliases,
                 Some(&ghsa_severity),
                 &[],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
         );
         assert_eq!(
-            classify("MAL-2022-1", &mal_aliases, None, &[], PKG_NAME, PKG_OSV_ECO),
+            classify(
+                "MAL-2022-1",
+                &mal_aliases,
+                None,
+                &[],
+                &pkg_name(),
+                PKG_OSV_ECO
+            ),
             VulnSeverity::Malicious
         );
         assert_eq!(
@@ -375,7 +400,7 @@ mod tests {
                 &rustsec_aliases,
                 None,
                 &[],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
@@ -408,7 +433,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Informational
@@ -428,7 +453,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
@@ -447,7 +472,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
@@ -466,7 +491,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
@@ -482,7 +507,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
@@ -509,7 +534,7 @@ mod tests {
                 &[],
                 None,
                 &[&informational, &graded],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::High,
@@ -521,7 +546,7 @@ mod tests {
                 &[],
                 None,
                 &[&graded, &informational],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::High
@@ -537,7 +562,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Malicious
@@ -564,7 +589,7 @@ mod tests {
                 &[],
                 None,
                 &[&stranger],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
@@ -589,7 +614,7 @@ mod tests {
                 &[],
                 None,
                 &[&affected],
-                PKG_NAME,
+                &pkg_name(),
                 PKG_OSV_ECO
             ),
             VulnSeverity::Unknown
@@ -619,7 +644,7 @@ mod tests {
                     &[],
                     None,
                     &[&affected],
-                    PKG_NAME,
+                    &pkg_name(),
                     PKG_OSV_ECO
                 ),
                 VulnSeverity::Unknown,

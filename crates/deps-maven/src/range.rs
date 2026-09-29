@@ -69,14 +69,15 @@ pub(crate) fn satisfies_ranges(version: &str, ranges: &[VersionRange]) -> bool {
     ranges.iter().any(|range| contains(version, range))
 }
 
-/// This member's upper edge (`Unbounded` for `Minimum`/`Empty` — see
+/// This member's upper edge (`Unbounded` for an open-ended-above interval or `Empty` — see
 /// [`deps_core::interval::VersionRange::upper_edge`], the shared accessor this delegates to
 /// (#1610) — `deps-composer`'s own OR-alternation-gap check routes through the same method).
 fn upper_edge(range: &VersionRange) -> Bound<&str> {
     range.upper_edge().map(String::as_str)
 }
 
-/// This member's lower edge (`Unbounded` for `Maximum`/`Empty`). See [`upper_edge`].
+/// This member's lower edge (`Unbounded` for an open-ended-below interval or `Empty`). See
+/// [`upper_edge`].
 fn lower_edge(range: &VersionRange) -> Bound<&str> {
     range.lower_edge().map(String::as_str)
 }
@@ -96,8 +97,8 @@ fn lower_edge(range: &VersionRange) -> Bound<&str> {
 /// — the same representation-agnostic predicate `deps-npm`'s and `deps-composer`'s own
 /// `||`-alternation-gap detection route through, generalizing what used to be Maven-only
 /// logic. A degenerate union member (`(3.0,3.0)`, `[5.0,3.0]`) parses to
-/// [`deps_core::interval::VersionRange::Empty`] (#1595), not a real `Bounded` shape, so
-/// [`upper_edge`]/[`lower_edge`]'s wildcard arm gives it no edge — it cannot contribute a
+/// [`deps_core::interval::VersionRange::Empty`] (#1595), not a real interval, so
+/// [`upper_edge`]/[`lower_edge`] give it no edge — it cannot contribute a
 /// fabricated gap the way an unvalidated degenerate range used to.
 pub(crate) fn explicitly_excludes(version: &str, ranges: &[VersionRange]) -> bool {
     let cmp = |a: &str, b: &str| crate::version::compare_versions_for_range(a, b);

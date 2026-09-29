@@ -10,6 +10,7 @@
 //! hand-rolled comparator under the same constraint (no maintained crate for Maven's scheme).
 
 use std::cmp::Ordering;
+use std::ops::Bound;
 
 /// A single dot-separated prerelease identifier, per SemVer2 precedence rules:
 /// numeric identifiers compare numerically and always sort below alphanumeric ones;
@@ -157,7 +158,7 @@ pub(crate) type VersionRange = deps_core::interval::VersionRange<ParsedVersion>;
 
 /// Parses a NuGet interval-notation `range` (spec §2), once per dependency.
 ///
-/// A bare version (no leading bracket) is a floor — `Minimum { inclusive: true }` — under
+/// A bare version (no leading bracket) is a floor — an inclusive lower bound with no upper — under
 /// `PackageReference`/`PackageVersion` semantics. A bracketed range delegates to
 /// [`deps_core::interval::parse_interval`] under [`deps_core::interval::BracketStyle::Standard`]
 /// (NuGet has no reversed-bracket notation), which returns `None` for malformed syntax —
@@ -175,10 +176,11 @@ pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
     let first = range.chars().next()?;
     if first != '[' && first != '(' {
         // Bare version is a floor (minimum, inclusive) under PackageReference.
-        return Some(VersionRange::Minimum {
-            version: ParsedVersion::parse(range),
-            inclusive: true,
-        });
+        return deps_core::interval::range_from_edges(
+            Bound::Included(ParsedVersion::parse(range)),
+            Bound::Unbounded,
+            compare_parsed,
+        );
     }
 
     deps_core::interval::parse_interval(
@@ -192,22 +194,23 @@ pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
 /// Compares an "up to date" reference version against `range`'s floor, for range shapes
 /// that express a minimum with no upper bound — a bare floor (`1.0.0`) or an explicit
 /// open-ended minimum (`[1.0.0,)`, `(1.0.0,)`, `[1.0.0,]`). Both are the same
-/// `VersionRange::Minimum` shape once parsed, so this classifies on that shape rather than
-/// the range string's leading bracket character (a bare floor and `[1.0.0,)` must be
+/// lower-bound-only `VersionRange::Interval` shape once parsed, so this classifies on that
+/// shape rather than the range string's leading bracket character (a bare floor and `[1.0.0,)` must be
 /// treated identically — see `is_bounded_requirement_up_to_date` in `crate::formatter`).
 ///
 /// Returns `None` for exact pins, maximums, bounded ranges, floating patterns (`1.1.*`,
-/// which `parse_range` cannot represent as `Minimum`), or unparseable input — those already
-/// express a genuine compatibility window rather than a simple pin, so the caller should
+/// which `parse_range` cannot represent as a lower-bound-only interval), or unparseable input —
+/// those already express a genuine compatibility window rather than a simple pin, so the caller should
 /// fall back to `satisfies`.
 pub(crate) fn compare_minimum_floor(range: &str, other: &str) -> Option<Ordering> {
     match parse_range(range)? {
-        VersionRange::Minimum { version, .. } => {
-            Some(compare_parsed(&version, &ParsedVersion::parse(other)))
-        }
-        // `VersionRange` is `#[non_exhaustive]` (defined in `deps_core::interval`) — a
-        // wildcard arm is required here regardless of how many variants exist today.
-        _ => None,
+        VersionRange::Interval(iv) => match (iv.lower(), iv.upper()) {
+            (Bound::Included(v) | Bound::Excluded(v), Bound::Unbounded) => {
+                Some(compare_parsed(v, &ParsedVersion::parse(other)))
+            }
+            _ => None,
+        },
+        VersionRange::Exact(_) | VersionRange::Empty => None,
     }
 }
 
@@ -377,6 +380,16 @@ mod tests {
         assert!(parse_range("[1.0,2.0)").is_some());
         assert!(parse_range("(1.0,2.0]").is_some());
         assert!(parse_range("1.0.0").is_some());
+    }
+
+    #[test]
+    fn test_compare_minimum_floor_only_for_lower_bound_only_shapes() {
+        for range in ["1.0", "[1.0,)", "(1.0,)"] {
+            assert!(compare_minimum_floor(range, "1.0").is_some(), "{range}");
+        }
+        for range in ["[1.0,2.0)", "[1.0]", "(,2.0]", "(3.0,3.0)"] {
+            assert_eq!(compare_minimum_floor(range, "1.0"), None, "{range}");
+        }
     }
 
     #[test]
@@ -609,7 +622,7 @@ mod tests {
 
     /// #821: `$(...)`'s parentheses trip the shared grammar's nested-bracket guard, so this
     /// bracketed MSBuild property reference is now rejected outright rather than parsing to a
-    /// `Bounded` 0.0.0-0.0.0 interval as it used to — see `NuGetFormatter::requirement_is_placeholder`'s
+    /// bounded 0.0.0-0.0.0 interval as it used to — see `NuGetFormatter::requirement_is_placeholder`'s
     /// doc (source of the `Unresolved` classification since #1380) for why that classification
     /// still matters independently of this.
     #[test]
