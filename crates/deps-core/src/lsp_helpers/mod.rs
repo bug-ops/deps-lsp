@@ -64,7 +64,7 @@ pub use diagnostics::{
 // `pub` (#1578): `edit.rs`/`in_use_version.rs` share this in-crate, and it is also reused by
 // callers outside `deps-core` that need this same size gate before compiling a requirement
 // (mirroring `requirement_len_exceeds_cap`'s own `pub` rationale) rather than duplicating the
-// length check at their own `compile_requirement` call site (#1472).
+// length check at their own `compile_bounded_requirement` call site (#1472).
 pub use diagnostics::requirement_is_oversized;
 // `pub(crate)` (not `pub`, matching the constant's own visibility) so `completion.rs` can
 // share this bound with `inlay_hints`/`hover` rather than declaring a duplicate cap.
@@ -75,8 +75,8 @@ pub use diagnostics::requirement_is_oversized;
 pub(crate) use diagnostics::MAX_VERSION_DIAGNOSTIC_CHARS;
 pub use formatter::{
     BareMeaning, DiagnosticMessages, DiagnosticPolicy, EcosystemFormatter, OsvNaming,
-    PackageNaming, PackageRendering, RequirementResolution, RequirementRewriteShape,
-    RequirementStatusGate, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
+    PackageNaming, PackageRendering, RequirementGate, RequirementResolution,
+    RequirementRewriteShape, SourcePolicy, bare_meaning, classify_requirement_rewrite_shape,
     format_version_replacing_by_shape, requirement_is_compound, up_to_date_via_compiled_matcher,
 };
 pub use git_ref::{
@@ -406,7 +406,7 @@ pub enum FallbackEditRejection {
     FallbackUnlisted,
     /// Phase 1, a0 pre-check (issue #1580, CWE-400 defense-in-depth mirroring #1472/#1578):
     /// R0's raw string exceeds [`crate::lsp_helpers::MAX_REQUIREMENT_LEN`] —
-    /// `compile_requirement` is never called for it. A size-based fail-closed guard, distinct
+    /// `compile_bounded_requirement` is never called for it. A size-based fail-closed guard, distinct
     /// from [`Self::OriginalUncompilable`] (a confirmed parse failure on an attempted compile).
     OriginalOversized,
     /// Phase 1, a0: the ORIGINAL declared requirement has no compiled matcher (e.g. GitHub
@@ -440,7 +440,7 @@ pub enum FallbackEditRejection {
     /// `(normalized name, version_range.start)`.
     OccurrenceNotUnique,
     /// Phase 2, a1 pre-check: same guard as [`Self::OriginalOversized`], applied to R1 (the
-    /// re-parsed EDITED requirement) before its own `compile_requirement` attempt.
+    /// re-parsed EDITED requirement) before its own `compile_bounded_requirement` attempt.
     EditedOversized,
     /// Phase 2, a1: the re-parsed, EDITED requirement has no compiled matcher.
     EditedUncompilable,
@@ -467,11 +467,11 @@ pub enum FallbackEditRejection {
 ///
 /// - **Phase 1**, on `R0 = dep.version_requirement()` (the ORIGINAL declared requirement, no
 ///   parse needed): a0-pre (issue #1580, CWE-400 defense-in-depth) R0 must not be
-///   [`requirement_is_oversized`] — `compile_requirement` is never called for an oversized
-///   requirement; a0 `compile_requirement(R0)` must be `Some`; c0
-///   `is_requirement_up_to_date(R0, fallback)` must be `false` (closes a NuGet bare-floor gap,
+///   [`BoundedVersionReq::new`] (i.e. not [`requirement_is_oversized`]) — `compile_bounded_requirement`
+///   is never called for an oversized requirement; a0 `compile_bounded_requirement(R0)` must be
+///   `Some`; c0 `is_bounded_requirement_up_to_date(R0, fallback)` must be `false` (closes a NuGet bare-floor gap,
 ///   spec 076 round-1 critic S2); d0 no `available` entry STRICTLY newer than `fallback` may
-///   satisfy `requirement_already_resolves_to(R0, entry)` (anti-downgrade — writing `fallback`
+///   satisfy `bounded_requirement_already_resolves_to(R0, entry)` (anti-downgrade — writing `fallback`
 ///   must not move resolution backward relative to what R0 already resolves to); fix-cycle #1571:
 ///   when `fallback` itself does not match R0's compiled matcher, R0 must not directly report
 ///   `fallback` as `!=`-excluded ([`RequirementMatcher::explicitly_excludes`]) and it must not
@@ -487,12 +487,12 @@ pub enum FallbackEditRejection {
 ///   would shift under the edit and silently fail closed. Exactly one match is required; zero
 ///   or more than one is [`FallbackEditRejection::OccurrenceNotUnique`].
 /// - **Phase 2**, on `R1` = the located occurrence's re-parsed requirement: a1-pre, the same
-///   [`requirement_is_oversized`] guard as a0-pre, applied to R1 before its own
-///   `compile_requirement` attempt; a1 `compile_requirement(R1)` must be `Some`; b1 R1's
+///   [`BoundedVersionReq::new`] guard as a0-pre, applied to R1 before its own
+///   `compile_bounded_requirement` attempt; a1 `compile_bounded_requirement(R1)` must be `Some`; b1 R1's
 ///   matcher must accept `fallback` itself
 ///   (`Some(true)`) — proving the written edit actually expresses `fallback`, failing closed for
 ///   an unmodellable/unsatisfiable written requirement; d1 no `available` entry STRICTLY newer
-///   than `fallback` may satisfy `requirement_already_resolves_to(R1, entry)` (the edit must not
+///   than `fallback` may satisfy `bounded_requirement_already_resolves_to(R1, entry)` (the edit must not
 ///   auto-follow back into a known newer, still-in-cooldown version).
 ///
 /// Yanked entries in `available` are NOT excluded from the d0/d1 scans — conservative,
@@ -503,7 +503,7 @@ pub enum FallbackEditRejection {
 /// ```
 /// use deps_core::edit::ManifestEdit;
 /// use deps_core::lsp_helpers::{
-///     DiagnosticMessages, DiagnosticPolicy, FallbackEditRejection, FallbackEditVerdict,
+///     BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, FallbackEditRejection, FallbackEditVerdict,
 ///     OsvNaming, PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution,
 ///     SourcePolicy, fallback_edit_excludes_newer,
 /// };
@@ -531,9 +531,9 @@ pub enum FallbackEditRejection {
 ///     }
 /// }
 /// impl RequirementResolution for ExactFormatter {
-///     fn compile_requirement(
+///     fn compile_bounded_requirement(
 ///         &self,
-///         requirement: &VersionReq,
+///         requirement: BoundedVersionReq<'_>,
 ///     ) -> Option<Box<dyn RequirementMatcher>> {
 ///         Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
 ///     }
@@ -621,11 +621,11 @@ pub fn fallback_edit_excludes_newer(
         return FallbackEditVerdict::Rejected(OriginalUncompilable);
     };
     // a0-pre (issue #1580, CWE-400 defense-in-depth mirroring #1472/#1578): fail closed before
-    // `compile_requirement` ever sees an oversized requirement string.
-    if requirement_is_oversized(r0) {
+    // `compile_bounded_requirement` ever sees an oversized requirement string.
+    let Some(r0) = BoundedVersionReq::new(r0) else {
         return FallbackEditVerdict::Rejected(OriginalOversized);
-    }
-    let Some(r0_matcher) = formatter.compile_requirement(r0) else {
+    };
+    let Some(r0_matcher) = formatter.compile_bounded_requirement(r0) else {
         return FallbackEditVerdict::Rejected(OriginalUncompilable);
     };
 
@@ -641,14 +641,14 @@ pub fn fallback_edit_excludes_newer(
         return FallbackEditVerdict::Rejected(FallbackUnlisted);
     };
 
-    if formatter.is_requirement_up_to_date(r0, fallback) {
+    if formatter.is_bounded_requirement_up_to_date(r0, fallback) {
         return FallbackEditVerdict::Rejected(OriginalAlreadyUpToDate);
     }
     // d0 (issues #1564/#1561 fix, matching #1565's shipped floor-comparison exactly): a FLOOR
-    // comparison over R0's raw admitted-set membership (`compile_requirement(..).matches`), not
-    // "does anything newer also match" and NOT `requirement_already_resolves_to` — that stricter
+    // comparison over R0's raw admitted-set membership (`compile_bounded_requirement(..).matches`), not
+    // "does anything newer also match" and NOT `bounded_requirement_already_resolves_to` — that stricter
     // predicate is deliberately always `false` for a floor-shaped requirement (NuGet's bare
-    // `Version="1.0.0"`, see its `requirement_already_resolves_to` doc), which would make this
+    // `Version="1.0.0"`, see its `bounded_requirement_already_resolves_to` doc), which would make this
     // scan find no floor at all and fail closed on every floor-type ecosystem. `available` is
     // newest-first, so the requirement's own floor — the OLDEST entry it still admits — sits at
     // the LARGEST matching index. Accept iff that floor is at or after `fallback`'s own index
@@ -724,10 +724,10 @@ pub fn fallback_edit_excludes_newer(
         return FallbackEditVerdict::Rejected(EditedUncompilable);
     };
     // a1-pre: same guard as a0-pre, applied to R1.
-    if requirement_is_oversized(r1) {
+    let Some(r1) = BoundedVersionReq::new(r1) else {
         return FallbackEditVerdict::Rejected(EditedOversized);
-    }
-    let Some(matcher) = formatter.compile_requirement(r1) else {
+    };
+    let Some(matcher) = formatter.compile_bounded_requirement(r1) else {
         return FallbackEditVerdict::Rejected(EditedUncompilable);
     };
     if matcher.matches(fallback) != Some(true) {
@@ -744,7 +744,7 @@ pub fn fallback_edit_excludes_newer(
     let strictly_newer = &available[..fallback_pos];
     if strictly_newer
         .iter()
-        .any(|v| formatter.requirement_already_resolves_to(r1, v))
+        .any(|v| formatter.bounded_requirement_already_resolves_to(r1, v))
     {
         return FallbackEditVerdict::Rejected(EditedAdmitsNewer);
     }
@@ -3272,7 +3272,7 @@ pub enum RequirementStatus {
 
 /// A `requirement` compiled by one ecosystem, ready to test candidate versions against.
 ///
-/// Produced by [`formatter::RequirementResolution::compile_requirement`]. Kept as a separate object
+/// Produced by [`formatter::RequirementResolution::compile_bounded_requirement`]. Kept as a separate object
 /// (rather than a single "does any version match" function) so the requirement is parsed
 /// once per dependency, and so the scanning loop — including the empty-list guard, the
 /// early-exit on first match, and the "skip an unparseable candidate" rule — lives once in
@@ -3308,7 +3308,7 @@ pub trait RequirementMatcher: Send + Sync {
     /// version format (e.g. a PyPI legacy release identifier, a Maven timestamped snapshot
     /// qualifier) — the caller skips it and keeps scanning the rest of the list. Never
     /// return `None` to mean "the requirement itself is unusable"; that is
-    /// [`formatter::RequirementResolution::compile_requirement`]'s job, via returning `None` from that
+    /// [`formatter::RequirementResolution::compile_bounded_requirement`]'s job, via returning `None` from that
     /// method instead of constructing a matcher at all.
     fn matches(&self, version: &ConcreteVersion) -> Option<bool>;
 
@@ -3441,8 +3441,8 @@ impl RequirementMatcher for SemverReqMatcher {
 /// and Swift Package Manager's `from:`/closed-range/`upToNextMajor` translations both use for
 /// matching.
 ///
-/// The single source of truth for `deps-cargo`'s `CargoFormatter::compile_requirement` and
-/// `deps-swift`'s `SwiftFormatter::compile_requirement` (#1495) — mirroring how #1478 unified
+/// The single source of truth for `deps-cargo`'s `CargoFormatter::compile_bounded_requirement` and
+/// `deps-swift`'s `SwiftFormatter::compile_bounded_requirement` (#1495) — mirroring how #1478 unified
 /// the analogous `node_semver::Range` case into `deps_npm::compile_node_semver_range`.
 ///
 /// Unlike that npm/JSR case, this function has no built-in unresolved-placeholder guard: Cargo
@@ -6268,7 +6268,7 @@ mod tests {
         }
 
         /// SC-014's "semver-backed stub": real `semver::VersionReq` compilation, default
-        /// `is_requirement_up_to_date`/`requirement_already_resolves_to` (Cargo-like).
+        /// `is_bounded_requirement_up_to_date`/`bounded_requirement_already_resolves_to` (Cargo-like).
         struct SemverFormatter;
         impl PackageNaming for SemverFormatter {}
         impl PackageRendering for SemverFormatter {
@@ -6280,9 +6280,9 @@ mod tests {
             }
         }
         impl RequirementResolution for SemverFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 semver::VersionReq::parse(requirement.as_str())
                     .ok()
@@ -6294,7 +6294,7 @@ mod tests {
         impl SourcePolicy for SemverFormatter {}
         impl OsvNaming for SemverFormatter {}
 
-        /// Same as [`SemverFormatter`], but `compile_requirement` fails for the literal text
+        /// Same as [`SemverFormatter`], but `compile_bounded_requirement` fails for the literal text
         /// `"uncompilable"` — isolates the a1 `EditedUncompilable` check from a0, which a
         /// formatter that always fails to compile could not do (phase 1 would reject first).
         struct SelectivelyUncompilableFormatter;
@@ -6308,9 +6308,9 @@ mod tests {
             }
         }
         impl RequirementResolution for SelectivelyUncompilableFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 if requirement.as_str() == "uncompilable" {
                     return None;
@@ -6325,7 +6325,7 @@ mod tests {
         impl SourcePolicy for SelectivelyUncompilableFormatter {}
         impl OsvNaming for SelectivelyUncompilableFormatter {}
 
-        /// A formatter with no `compile_requirement` override at all (trait default `None`) —
+        /// A formatter with no `compile_bounded_requirement` override at all (trait default `None`) —
         /// for the a0 `OriginalUncompilable` check.
         struct NoCompileFormatter;
         impl PackageNaming for NoCompileFormatter {}
@@ -6344,13 +6344,12 @@ mod tests {
         impl OsvNaming for NoCompileFormatter {}
 
         /// Issue #1580 (CWE-400 defense-in-depth mirroring #1472/#1578): otherwise
-        /// semver-backed like [`SemverFormatter`], but asserts `compile_requirement` is never
-        /// called with an oversized requirement — proves the a0-pre/a1-pre gates in
-        /// `fallback_edit_excludes_newer` short-circuit before either `compile_requirement`
-        /// call site, rather than merely happening to also reject via a downstream check.
-        struct PanicsOnOversizedFormatter;
-        impl PackageNaming for PanicsOnOversizedFormatter {}
-        impl PackageRendering for PanicsOnOversizedFormatter {
+        /// semver-backed like [`SemverFormatter`] — a real compiling matcher, so the a0-pre/a1-pre
+        /// gates in `fallback_edit_excludes_newer` are the only thing rejecting an oversized
+        /// requirement (`compile_bounded_requirement` cannot even receive one).
+        struct SemverBackedFormatter;
+        impl PackageNaming for SemverBackedFormatter {}
+        impl PackageRendering for SemverBackedFormatter {
             fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
                 version.to_string()
             }
@@ -6358,24 +6357,20 @@ mod tests {
                 name.as_str().to_string()
             }
         }
-        impl RequirementResolution for PanicsOnOversizedFormatter {
-            fn compile_requirement(
+        impl RequirementResolution for SemverBackedFormatter {
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
-                assert!(
-                    !requirement_is_oversized(requirement),
-                    "compile_requirement must not be called for an oversized requirement (#1580)"
-                );
                 semver::VersionReq::parse(requirement.as_str())
                     .ok()
                     .map(|req| Box::new(SemverMatcher(req)) as Box<dyn RequirementMatcher>)
             }
         }
-        impl DiagnosticMessages for PanicsOnOversizedFormatter {}
-        impl DiagnosticPolicy for PanicsOnOversizedFormatter {}
-        impl SourcePolicy for PanicsOnOversizedFormatter {}
-        impl OsvNaming for PanicsOnOversizedFormatter {}
+        impl DiagnosticMessages for SemverBackedFormatter {}
+        impl DiagnosticPolicy for SemverBackedFormatter {}
+        impl SourcePolicy for SemverBackedFormatter {}
+        impl OsvNaming for SemverBackedFormatter {}
 
         /// A floor matcher: `matches` is membership at-or-above the floor (mirrors NuGet's
         /// bare `Version="X"` shape), but resolution never goes below OR above the floor
@@ -6392,8 +6387,8 @@ mod tests {
             }
         }
 
-        /// SC-014's "NuGet-floor stub" (spec 076 M2): `is_requirement_up_to_date` and
-        /// `requirement_already_resolves_to` overridden with the floor rule — floor at or
+        /// SC-014's "NuGet-floor stub" (spec 076 M2): `is_bounded_requirement_up_to_date` and
+        /// `bounded_requirement_already_resolves_to` overridden with the floor rule — floor at or
         /// above target is up to date; a floor resolves ONLY to itself, never forward.
         struct NugetFloorFormatter;
         impl PackageNaming for NugetFloorFormatter {}
@@ -6406,17 +6401,17 @@ mod tests {
             }
         }
         impl RequirementResolution for NugetFloorFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 semver::Version::parse(requirement.as_str())
                     .ok()
                     .map(|floor| Box::new(NugetFloorMatcher(floor)) as Box<dyn RequirementMatcher>)
             }
-            fn is_requirement_up_to_date(
+            fn is_bounded_requirement_up_to_date(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
                 latest: &ConcreteVersion,
             ) -> bool {
                 semver::Version::parse(requirement.as_str())
@@ -6424,9 +6419,9 @@ mod tests {
                     .zip(semver::Version::parse(latest.as_str()).ok())
                     .is_some_and(|(floor, latest)| floor >= latest)
             }
-            fn requirement_already_resolves_to(
+            fn bounded_requirement_already_resolves_to(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
                 target: &ConcreteVersion,
             ) -> bool {
                 semver::Version::parse(requirement.as_str())
@@ -6481,9 +6476,9 @@ mod tests {
             }
         }
         impl RequirementResolution for ExclusionFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 let (range, excluded) = requirement.as_str().split_once(",!=")?;
                 let range = semver::VersionReq::parse(range).ok()?;
@@ -6494,9 +6489,9 @@ mod tests {
             }
             // Never "already up to date" — isolates the new check from c0, mirroring how
             // `SemverFormatter`'s own default already keeps c0/d0 independent for its tests.
-            fn is_requirement_up_to_date(
+            fn is_bounded_requirement_up_to_date(
                 &self,
-                _requirement: &VersionReq,
+                _requirement: BoundedVersionReq<'_>,
                 _latest: &ConcreteVersion,
             ) -> bool {
                 false
@@ -6589,13 +6584,13 @@ mod tests {
         }
 
         /// Issue #1580: R0 exceeds `MAX_REQUIREMENT_LEN` — the a0-pre gate must reject before
-        /// `compile_requirement` is ever called; `PanicsOnOversizedFormatter` proves it (an
-        /// unguarded call site would panic instead of returning `Rejected`).
+        /// `compile_bounded_requirement` is ever called; `SemverBackedFormatter`
+        /// compiles normally, so only the gate can produce `Rejected`.
         #[test]
         fn original_oversized_a0_pre() {
             let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
             let verdict = fallback_edit_excludes_newer(
-                &PanicsOnOversizedFormatter,
+                &SemverBackedFormatter,
                 &reparsed_to("1.1.0"),
                 "content",
                 &dep(&oversized),
@@ -6781,12 +6776,12 @@ mod tests {
 
         /// Issue #1580: R1 (the re-parsed EDITED requirement) exceeds `MAX_REQUIREMENT_LEN` —
         /// R0 ("1.0") is small and compiles fine, so phase 1 passes and phase 2 is reached; the
-        /// a1-pre gate must then reject before `compile_requirement(R1)` is ever called.
+        /// a1-pre gate must then reject before `compile_bounded_requirement(R1)` is ever called.
         #[test]
         fn edited_oversized_a1_pre() {
             let oversized = "1".repeat(MAX_REQUIREMENT_LEN + 1);
             let verdict = fallback_edit_excludes_newer(
-                &PanicsOnOversizedFormatter,
+                &SemverBackedFormatter,
                 &reparsed_to(&oversized),
                 "content",
                 &dep("1.0"),

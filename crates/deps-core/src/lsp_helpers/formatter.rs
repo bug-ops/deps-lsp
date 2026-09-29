@@ -825,7 +825,7 @@ fn relax_caret_floors(requirement: &str) -> Option<String> {
 /// auto-following range's ceiling) — ignoring the requirement's own minor/patch lower-bound
 /// floor #1622 added to [`RequirementResolution::version_satisfies_requirement`]'s `^` branch.
 ///
-/// [`RequirementResolution::is_requirement_up_to_date`]'s default asks "is `latest` still
+/// [`RequirementResolution::is_bounded_requirement_up_to_date`]'s default asks "is `latest` still
 /// within what this requirement would resolve to", not "does `latest` satisfy every clause of
 /// the requirement" — `latest` is the newest *available* version (already excluding
 /// yanked/prerelease/cooldown-held releases upstream), so it can legitimately sit below a
@@ -873,23 +873,22 @@ fn caret_admits_up_to_date(latest: &str, requirement: &str) -> Option<bool> {
 
 /// Up-to-date verdict backed by the compiled requirement matcher.
 ///
-/// For ecosystems whose [`RequirementResolution::compile_requirement`] matcher models the full
-/// requirement grammar (comparators, `||`, hyphen ranges, wildcards); meant to back an
-/// [`RequirementResolution::is_requirement_up_to_date`] override.
+/// For ecosystems whose [`RequirementResolution::compile_bounded_requirement`] matcher models
+/// the full requirement grammar (comparators, `||`, hyphen ranges, wildcards); meant to back a
+/// [`RequirementResolution::is_bounded_requirement_up_to_date`] override.
 ///
-/// An oversized requirement is `true` (same as the default). A single simple `^` requirement
-/// keeps the default's upper-bound-only semantics (#1622 S2); everything else is asked of the
-/// compiled matcher, also retried with caret floors relaxed to their upper bounds (S2 for
-/// compound requirements) and against `latest`'s numeric core (a prerelease `latest` is judged
-/// by its `X.Y.Z`, since npm matchers exclude prereleases). Falls back to
-/// [`RequirementResolution::version_satisfies_requirement`] when the requirement does not
-/// compile or the matcher cannot judge `latest`.
+/// A single simple `^` requirement keeps the default's upper-bound-only semantics (#1622 S2);
+/// everything else is asked of the compiled matcher, also retried with caret floors relaxed to
+/// their upper bounds (S2 for compound requirements) and against `latest`'s numeric core (a
+/// prerelease `latest` is judged by its `X.Y.Z`, since npm matchers exclude prereleases). Falls
+/// back to [`RequirementResolution::version_satisfies_requirement`] when the requirement does
+/// not compile or the matcher cannot judge `latest`.
 ///
 /// # Examples
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     RequirementMatcher, RequirementResolution, up_to_date_via_compiled_matcher,
+///     BoundedVersionReq, RequirementMatcher, RequirementResolution, up_to_date_via_compiled_matcher,
 /// };
 /// use deps_core::{ConcreteVersion, VersionReq};
 ///
@@ -905,26 +904,28 @@ fn caret_admits_up_to_date(latest: &str, requirement: &str) -> Option<bool> {
 ///
 /// struct Formatter;
 /// impl RequirementResolution for Formatter {
-///     fn compile_requirement(&self, _: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+///     fn compile_bounded_requirement(
+///         &self,
+///         _: BoundedVersionReq<'_>,
+///     ) -> Option<Box<dyn RequirementMatcher>> {
 ///         Some(Box::new(AtLeastOne))
 ///     }
 /// }
 ///
 /// let latest = ConcreteVersion::new("1.4.0");
-/// assert!(up_to_date_via_compiled_matcher(&Formatter, &VersionReq::new(">=1 <2"), &latest));
+/// let requirement = VersionReq::new(">=1 <2");
+/// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+/// assert!(up_to_date_via_compiled_matcher(&Formatter, bounded, &latest));
 /// ```
 pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
     formatter: &F,
-    requirement: &VersionReq,
+    requirement: BoundedVersionReq<'_>,
     latest: &ConcreteVersion,
 ) -> bool {
-    if super::requirement_is_oversized(requirement) {
-        return true;
-    }
     if let Some(admitted) = caret_admits_up_to_date(latest.as_str(), requirement.as_str()) {
         return admitted;
     }
-    let Some(matcher) = formatter.compile_requirement(requirement) else {
+    let Some(matcher) = formatter.compile_bounded_requirement(requirement) else {
         return formatter.version_satisfies_requirement(latest, requirement.as_str());
     };
     let core = ConcreteVersion::new(strip_version_suffix(latest.as_str()));
@@ -932,7 +933,11 @@ pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
         m.matches(latest) == Some(true) || m.matches(&core) == Some(true)
     };
     let relaxed = relax_caret_floors(requirement.as_str())
-        .and_then(|relaxed| formatter.compile_requirement(&VersionReq::new(relaxed)));
+        .map(VersionReq::new)
+        .and_then(|relaxed| {
+            BoundedVersionReq::new(&relaxed)
+                .and_then(|bounded| formatter.compile_bounded_requirement(bounded))
+        });
     if admits(&*matcher) || relaxed.as_deref().is_some_and(admits) {
         true
     } else if matcher.matches(latest).is_none() {
@@ -948,19 +953,19 @@ pub fn up_to_date_via_compiled_matcher<F: RequirementResolution + ?Sized>(
 /// or filesystem access — since these run on the hot hover/diagnostic path. The default
 /// [`classify_requirement_status`](Self::classify_requirement_status) maps
 /// [`requirement_is_unresolved`](Self::requirement_is_unresolved) to its `Unresolved` variant
-/// and otherwise defers to [`is_requirement_up_to_date`](Self::is_requirement_up_to_date). Most
+/// and otherwise defers to [`is_bounded_requirement_up_to_date`](Self::is_bounded_requirement_up_to_date). Most
 /// ecosystems whose requirement syntax can be unresolved (Maven, Gradle, NuGet, Cargo, npm, ...)
 /// need only override [`requirement_is_placeholder`](Self::requirement_is_placeholder) —
 /// `requirement_is_unresolved` defaults to delegating to it. Only `deps-github-actions` and
 /// `deps-gitlab-ci` override `requirement_is_unresolved` directly, since their two predicates
 /// answer genuinely different questions there (see `requirement_is_placeholder`'s doc). Callers
 /// needing the tri-state distinction use
-/// [`RequirementStatusGate::requirement_status`], not the boolean method.
+/// [`RequirementGate::requirement_status`], not the boolean method.
 pub trait RequirementResolution: Send + Sync {
     /// Check if a version satisfies a requirement string.
     ///
     /// General constraint check (e.g. for completion/candidate filtering) — not the
-    /// "is this dependency up to date" hook. That is `is_requirement_up_to_date` below,
+    /// "is this dependency up to date" hook. That is `is_bounded_requirement_up_to_date` below,
     /// which has its own default and its own override points; an ecosystem whose bare
     /// requirement is a floor rather than an auto-following range (see `deps-nuget`)
     /// overrides that method, not this one.
@@ -1046,35 +1051,30 @@ pub trait RequirementResolution: Send + Sync {
     /// auto-following range (NuGet's bare `Version="1.0.0"`) must override this, since "does the
     /// floor accept `latest`" and "is the pin already `latest`" are different questions there.
     ///
-    /// #1627 defense-in-depth: every in-crate caller of this default already gates on
-    /// [`crate::lsp_helpers::requirement_is_oversized`] first ([`RequirementStatusGate::requirement_status`]'s
-    /// own gate, and the fallback-edit verdict in `lsp_helpers::mod`), so this repeats the
-    /// same check here — before either `caret_admits_up_to_date` or
-    /// [`Self::version_satisfies_requirement`] see the requirement text — so the default itself
-    /// stays safe for a caller — in this crate or outside it — that does not. An oversized
-    /// `requirement` never reaches either function this way — it is reported `true` (not
-    /// outdated), the same "unmodellable, suppressed" semantics those existing gates use.
+    /// Takes a [`BoundedVersionReq`]: an oversized requirement is unmodellable, and
+    /// [`RequirementGate::is_requirement_up_to_date`] — the entry point callers use — reports it
+    /// `true` (not outdated) before this hook is ever called, so an override has no oversized
+    /// value it could mishandle.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementResolution};
+    /// use deps_core::lsp_helpers::{BoundedVersionReq, RequirementResolution};
     /// use deps_core::{ConcreteVersion, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl RequirementResolution for DefaultFormatter {}
     ///
-    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
-    /// assert!(DefaultFormatter.is_requirement_up_to_date(&oversized, &ConcreteVersion::new("1.0.0")));
+    /// let requirement = VersionReq::new("^1.2");
+    /// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+    /// assert!(DefaultFormatter.is_bounded_requirement_up_to_date(bounded, &ConcreteVersion::new("1.5.0")));
+    /// assert!(!DefaultFormatter.is_bounded_requirement_up_to_date(bounded, &ConcreteVersion::new("2.0.0")));
     /// ```
-    fn is_requirement_up_to_date(
+    fn is_bounded_requirement_up_to_date(
         &self,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> bool {
-        if super::requirement_is_oversized(requirement) {
-            return true;
-        }
         caret_admits_up_to_date(latest.as_str(), requirement.as_str()).unwrap_or_else(|| {
             self.version_satisfies_requirement(latest, requirement.as_str())
                 || relax_caret_floors(requirement.as_str())
@@ -1147,7 +1147,7 @@ pub trait RequirementResolution: Send + Sync {
     /// requirement syntax can contain an unexpanded placeholder override this single predicate
     /// instead of hand-rolling the same check separately inside
     /// [`format_version_replacing`](PackageRendering::format_version_replacing),
-    /// [`compile_requirement`](Self::compile_requirement), and
+    /// [`compile_bounded_requirement`](Self::compile_bounded_requirement), and
     /// [`version_satisfies_requirement`](Self::version_satisfies_requirement) — and, since
     /// #1391, need not guard [`format_version_replacing`](PackageRendering::format_version_replacing)/
     /// [`format_version_replacing_for`](PackageRendering::format_version_replacing_for) at all:
@@ -1170,18 +1170,18 @@ pub trait RequirementResolution: Send + Sync {
         super::requirement_contains_template_placeholder(requirement.as_str())
     }
 
-    /// Tri-state variant of `is_requirement_up_to_date` that distinguishes "confirmed up to
+    /// Tri-state variant of `is_bounded_requirement_up_to_date` that distinguishes "confirmed up to
     /// date" from "could not be resolved, so we don't know."
     ///
     /// Default: `Unresolved` when `requirement_is_unresolved` says so, otherwise maps the
-    /// boolean result of `is_requirement_up_to_date` to `UpToDate`/`Outdated`. Callers
+    /// boolean result of `is_bounded_requirement_up_to_date` to `UpToDate`/`Outdated`. Callers
     /// needing the distinction — inlay hints, in particular — use
-    /// [`RequirementStatusGate::requirement_status`] so they can tell "verified up to date"
+    /// [`RequirementGate::requirement_status`] so they can tell "verified up to date"
     /// apart from "resolution failed."
     ///
     /// Takes a [`BoundedVersionReq`] rather than `&VersionReq`: an oversized requirement is
     /// unmodellable, not verified up to date or outdated, and
-    /// [`RequirementStatusGate::requirement_status`] — the only production entry point —
+    /// [`RequirementGate::requirement_status`] — the only production entry point —
     /// already rejects one before this hook is ever called, so an override has no oversized
     /// value it could mishandle.
     ///
@@ -1213,7 +1213,7 @@ pub trait RequirementResolution: Send + Sync {
         if self.requirement_is_unresolved(requirement.get()) {
             return RequirementStatus::Unresolved;
         }
-        if self.is_requirement_up_to_date(requirement.get(), latest) {
+        if self.is_bounded_requirement_up_to_date(requirement, latest) {
             RequirementStatus::UpToDate
         } else {
             RequirementStatus::Outdated
@@ -1231,8 +1231,8 @@ pub trait RequirementResolution: Send + Sync {
     /// Default: forwards to [`classify_requirement_status`](Self::classify_requirement_status),
     /// ignoring `dep` — every other ecosystem's requirement text alone is unambiguous, so this
     /// is a no-op for them. Callers that already have `dep` in hand (the diagnostic pipeline's
-    /// outdated rule) call [`RequirementStatusGate::requirement_status_for`] instead of
-    /// [`RequirementStatusGate::requirement_status`] directly, mirroring
+    /// outdated rule) call [`RequirementGate::requirement_status_for`] instead of
+    /// [`RequirementGate::requirement_status`] directly, mirroring
     /// `Registry::select_latest_matching`'s identical additive-default pattern for its own
     /// `selection_context` parameter.
     fn classify_requirement_status_for(
@@ -1278,21 +1278,19 @@ pub trait RequirementResolution: Send + Sync {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::RequirementResolution;
+    /// use deps_core::lsp_helpers::{BoundedVersionReq, RequirementResolution};
     /// use deps_core::VersionReq;
     ///
     /// struct DefaultFormatter;
     /// impl RequirementResolution for DefaultFormatter {}
     ///
-    /// assert!(
-    ///     DefaultFormatter
-    ///         .compile_requirement(&VersionReq::new("^1.2"))
-    ///         .is_none()
-    /// );
+    /// let requirement = VersionReq::new("^1.2");
+    /// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+    /// assert!(DefaultFormatter.compile_bounded_requirement(bounded).is_none());
     /// ```
-    fn compile_requirement(
+    fn compile_bounded_requirement(
         &self,
-        _requirement: &VersionReq,
+        _requirement: BoundedVersionReq<'_>,
     ) -> Option<Box<dyn RequirementMatcher>> {
         None
     }
@@ -1302,57 +1300,48 @@ pub trait RequirementResolution: Send + Sync {
     /// [`crate::edit::plan_vulnerability_fix`] (#1344) consults before deciding a
     /// vulnerability-fix manifest rewrite is unnecessary.
     ///
-    /// Distinct from `compile_requirement(requirement).matches(target)` alone, which only
+    /// Distinct from `compile_bounded_requirement(requirement).matches(target)` alone, which only
     /// answers "is `target` a member of `requirement`'s accepted set" — true both for an
     /// auto-following range (Cargo's `^1`, a Maven bracket range), where membership genuinely
     /// means "no edit needed, re-resolving already gets there", *and* for a floor a resolver
     /// instead pins to its lowest admissible member (NuGet's bare `Version="1.0.0"`, mirroring
-    /// [`Self::is_requirement_up_to_date`]'s own floor carve-out), where it does not: leaving
+    /// [`Self::is_bounded_requirement_up_to_date`]'s own floor carve-out), where it does not: leaving
     /// the manifest unedited keeps resolving to the floor itself, never to `target`.
     ///
-    /// Default: delegates straight to `compile_requirement(requirement).matches(target)`,
+    /// Default: delegates straight to `compile_bounded_requirement(requirement).matches(target)`,
     /// collapsing `None` (uncompilable requirement) and `Some(false)` to `false` — correct for
     /// every ecosystem whose resolution prefers the newest admissible member of a requirement's
     /// accepted set. Override only when some requirement shape in this ecosystem instead
     /// resolves to something other than that newest member.
     ///
-    /// #1627 defense-in-depth: an oversized `requirement` never reaches
-    /// [`Self::compile_requirement`] — it collapses to `false`, the same fail-closed
-    /// "not already resolved, an edit may still be needed" result production call sites
-    /// (`plan_verified_fix`, the fallback-edit verdict) already apply by gating with
-    /// [`crate::lsp_helpers::requirement_is_oversized`] before calling this method.
+    /// Takes a [`BoundedVersionReq`]: [`RequirementGate::requirement_already_resolves_to`] collapses
+    /// an oversized requirement to `false` (fail-closed: an edit may still be needed) before this
+    /// hook is ever called.
     ///
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementResolution};
+    /// use deps_core::lsp_helpers::{BoundedVersionReq, RequirementResolution};
     /// use deps_core::{ConcreteVersion, VersionReq};
     ///
     /// struct DefaultFormatter;
     /// impl RequirementResolution for DefaultFormatter {}
     ///
-    /// // No `compile_requirement` override, so this is always `false` — matches that
+    /// // No `compile_bounded_requirement` override, so this is always `false` — matches that
     /// // method's own default.
-    /// assert!(!DefaultFormatter.requirement_already_resolves_to(
-    ///     &VersionReq::new("^1.2"),
-    ///     &ConcreteVersion::new("1.5.0")
-    /// ));
-    ///
-    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
-    /// assert!(!DefaultFormatter.requirement_already_resolves_to(
-    ///     &oversized,
+    /// let requirement = VersionReq::new("^1.2");
+    /// let bounded = BoundedVersionReq::new(&requirement).unwrap();
+    /// assert!(!DefaultFormatter.bounded_requirement_already_resolves_to(
+    ///     bounded,
     ///     &ConcreteVersion::new("1.5.0")
     /// ));
     /// ```
-    fn requirement_already_resolves_to(
+    fn bounded_requirement_already_resolves_to(
         &self,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         target: &ConcreteVersion,
     ) -> bool {
-        if super::requirement_is_oversized(requirement) {
-            return false;
-        }
-        self.compile_requirement(requirement)
+        self.compile_bounded_requirement(requirement)
             .is_some_and(|matcher| matcher.matches(target) == Some(true))
     }
 
@@ -1363,7 +1352,7 @@ pub trait RequirementResolution: Send + Sync {
     ///
     /// Called by [`crate::lsp_helpers::requirement_is_unsatisfiable`] before compiling `requirement`; returning
     /// `true` suppresses the "no published version satisfies this requirement" diagnostic for
-    /// this dependency, the same as [`Self::compile_requirement`] returning `None` — but,
+    /// this dependency, the same as [`Self::compile_bounded_requirement`] returning `None` — but,
     /// unlike that method, this one sees `available` and can therefore narrow the suppression
     /// instead of disabling it for every requirement of a given shape.
     ///
@@ -1469,26 +1458,89 @@ pub trait RequirementResolution: Send + Sync {
     }
 }
 
-/// The un-overridable entry point for requirement up-to-date status.
+/// The un-overridable entry point for requirement resolution questions.
 ///
 /// Rust cannot mark a trait method non-overridable, so this trait supplies the guarantee
 /// structurally instead: it is implemented, via the blanket impl below, for every
 /// `T: RequirementResolution + ?Sized` — including `dyn EcosystemFormatter` — so any
-/// `impl RequirementStatusGate for X` an ecosystem crate might write is a duplicate-impl
+/// `impl RequirementGate for X` an ecosystem crate might write is a duplicate-impl
 /// error (E0119), the same "sealed by blanket impl" mechanism [`EcosystemFormatter`] itself
-/// already uses. [`Self::requirement_status`]/[`Self::requirement_status_for`] are therefore
-/// the only place [`super::requirement_is_oversized`] is ever checked for these two questions:
-/// they construct a [`BoundedVersionReq`] and, only on success, call through to
-/// [`RequirementResolution::classify_requirement_status`]/
-/// [`RequirementResolution::classify_requirement_status_for`] — the overridable hooks, which
-/// receive the proof newtype and so have no oversized value left to mishandle. An oversized
-/// requirement never reaches an override, regardless of what that override does.
+/// already uses. Its methods are therefore the only place [`super::requirement_is_oversized`]
+/// is ever checked for these questions: they construct a [`BoundedVersionReq`] and, only on
+/// success, call through to the overridable `*_bounded_*`/`classify_*` hooks of
+/// [`RequirementResolution`], which receive the proof newtype and so have no oversized value
+/// left to mishandle. An oversized requirement never reaches an override, regardless of what
+/// that override does.
+///
+/// The oversized result is defined once, here, and is consistent across methods:
+/// [`Self::requirement_status`] is `Unresolved`, `is_requirement_up_to_date` is `true`,
+/// `compile_requirement` is `None`, and `requirement_already_resolves_to` is `false`.
 ///
 /// Call sites only need to bring this trait into scope (`use
-/// deps_core::lsp_helpers::RequirementStatusGate;`) to keep using method syntax — it covers
+/// deps_core::lsp_helpers::RequirementGate;`) to keep using method syntax — it covers
 /// `&dyn EcosystemFormatter` the same way `RequirementResolution` itself does.
-pub trait RequirementStatusGate: RequirementResolution {
-    /// Tri-state variant of `is_requirement_up_to_date` that distinguishes "confirmed up to
+pub trait RequirementGate: RequirementResolution {
+    /// Whether `latest` is already covered by `requirement` under this ecosystem's rules
+    /// ([`RequirementResolution::is_bounded_requirement_up_to_date`]). An oversized requirement
+    /// is unmodellable and reported `true` (not outdated), matching `Unresolved` from
+    /// [`Self::requirement_status`].
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementResolution};
+    /// use deps_core::{ConcreteVersion, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(DefaultFormatter.is_requirement_up_to_date(&oversized, &ConcreteVersion::new("1.0.0")));
+    /// ```
+    fn is_requirement_up_to_date(&self, requirement: &VersionReq, latest: &ConcreteVersion)
+    -> bool;
+
+    /// Compiles `requirement` into a matcher ([`RequirementResolution::compile_bounded_requirement`]).
+    /// An oversized requirement is unmodellable and yields `None`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementResolution};
+    /// use deps_core::VersionReq;
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// assert!(DefaultFormatter.compile_requirement(&VersionReq::new("^1.2")).is_none());
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(DefaultFormatter.compile_requirement(&oversized).is_none());
+    /// ```
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>>;
+
+    /// Whether `requirement`, left unedited, already resolves to a version at or above `target`
+    /// ([`RequirementResolution::bounded_requirement_already_resolves_to`]). An oversized
+    /// requirement collapses to `false`, the fail-closed "an edit may still be needed" result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementResolution};
+    /// use deps_core::{ConcreteVersion, VersionReq};
+    ///
+    /// struct DefaultFormatter;
+    /// impl RequirementResolution for DefaultFormatter {}
+    ///
+    /// let oversized = VersionReq::new(&"1".repeat(MAX_REQUIREMENT_LEN + 1));
+    /// assert!(!DefaultFormatter.requirement_already_resolves_to(&oversized, &ConcreteVersion::new("1.5.0")));
+    /// ```
+    fn requirement_already_resolves_to(
+        &self,
+        requirement: &VersionReq,
+        target: &ConcreteVersion,
+    ) -> bool;
+
+    /// Tri-state variant of [`Self::is_requirement_up_to_date`] that distinguishes "confirmed up to
     /// date" from "could not be resolved, so we don't know" — including an oversized
     /// requirement, which is unmodellable rather than verified up to date or outdated (#1472
     /// defense-in-depth).
@@ -1496,7 +1548,7 @@ pub trait RequirementStatusGate: RequirementResolution {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{RequirementResolution, RequirementStatus, RequirementStatusGate};
+    /// use deps_core::lsp_helpers::{RequirementResolution, RequirementStatus, RequirementGate};
     /// use deps_core::{ConcreteVersion, VersionReq};
     ///
     /// struct DefaultFormatter;
@@ -1524,7 +1576,7 @@ pub trait RequirementStatusGate: RequirementResolution {
     /// # Examples
     ///
     /// ```
-    /// use deps_core::lsp_helpers::{RequirementResolution, RequirementStatus, RequirementStatusGate};
+    /// use deps_core::lsp_helpers::{RequirementResolution, RequirementStatus, RequirementGate};
     /// use deps_core::{ConcreteVersion, Dependency, PackageName, VersionReq};
     ///
     /// struct DefaultFormatter;
@@ -1570,7 +1622,31 @@ pub trait RequirementStatusGate: RequirementResolution {
     ) -> RequirementStatus;
 }
 
-impl<T: RequirementResolution + ?Sized> RequirementStatusGate for T {
+impl<T: RequirementResolution + ?Sized> RequirementGate for T {
+    fn is_requirement_up_to_date(
+        &self,
+        requirement: &VersionReq,
+        latest: &ConcreteVersion,
+    ) -> bool {
+        BoundedVersionReq::new(requirement)
+            .is_none_or(|requirement| self.is_bounded_requirement_up_to_date(requirement, latest))
+    }
+
+    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+        BoundedVersionReq::new(requirement)
+            .and_then(|requirement| self.compile_bounded_requirement(requirement))
+    }
+
+    fn requirement_already_resolves_to(
+        &self,
+        requirement: &VersionReq,
+        target: &ConcreteVersion,
+    ) -> bool {
+        BoundedVersionReq::new(requirement).is_some_and(|requirement| {
+            self.bounded_requirement_already_resolves_to(requirement, target)
+        })
+    }
+
     fn requirement_status(
         &self,
         requirement: &VersionReq,
@@ -2030,7 +2106,7 @@ mod tests {
 
     /// #1648: proves an override cannot bypass the oversized gate even if it tries to —
     /// `AlwaysOutdatedFormatter`'s `classify_requirement_status_for` unconditionally reports
-    /// `Outdated`, yet [`RequirementStatusGate::requirement_status_for`] still reports
+    /// `Outdated`, yet [`RequirementGate::requirement_status_for`] still reports
     /// `Unresolved` for an oversized requirement, because it never reaches the override at
     /// all: the [`BoundedVersionReq::new`] construction fails first. The within-cap positive
     /// control below is load-bearing, not decorative (impl-critic M2): without it, this test
@@ -2092,6 +2168,96 @@ mod tests {
             AlwaysOutdatedFormatter.requirement_status_for(&dep(&oversized), &oversized, &latest),
             RequirementStatus::Unresolved
         );
+    }
+
+    /// #1652: the three hooks cannot be bypassed either — `MisbehavingFormatter` answers every
+    /// hook with the opposite of the gate's oversized result (a matcher, `false`, `true`), yet
+    /// the gated entry points still report `None`/`true`/`false` for an oversized requirement
+    /// because construction of the [`BoundedVersionReq`] fails before any hook runs. The
+    /// within-cap positive controls are load-bearing: they prove a gate that always returned
+    /// the oversized result, or never dispatched to the hooks, would fail here.
+    #[test]
+    fn test_oversized_requirement_bypasses_misbehaving_hook_overrides() {
+        struct AcceptAllMatcher;
+        impl RequirementMatcher for AcceptAllMatcher {
+            fn matches(&self, _version: &ConcreteVersion) -> Option<bool> {
+                Some(true)
+            }
+
+            fn strict_prerelease_exclusion(&self) -> bool {
+                false
+            }
+        }
+
+        struct MisbehavingFormatter;
+        impl PackageNaming for MisbehavingFormatter {}
+        impl PackageRendering for MisbehavingFormatter {
+            fn format_version_for_text_edit(&self, version: &ConcreteVersion) -> String {
+                version.to_string()
+            }
+            fn package_url(&self, name: &PackageName) -> String {
+                name.as_str().to_string()
+            }
+        }
+        impl RequirementResolution for MisbehavingFormatter {
+            fn compile_bounded_requirement(
+                &self,
+                _requirement: BoundedVersionReq<'_>,
+            ) -> Option<Box<dyn RequirementMatcher>> {
+                Some(Box::new(AcceptAllMatcher))
+            }
+
+            fn is_bounded_requirement_up_to_date(
+                &self,
+                _requirement: BoundedVersionReq<'_>,
+                _latest: &ConcreteVersion,
+            ) -> bool {
+                false
+            }
+
+            fn bounded_requirement_already_resolves_to(
+                &self,
+                _requirement: BoundedVersionReq<'_>,
+                _target: &ConcreteVersion,
+            ) -> bool {
+                true
+            }
+        }
+        impl DiagnosticMessages for MisbehavingFormatter {}
+        impl DiagnosticPolicy for MisbehavingFormatter {}
+        impl SourcePolicy for MisbehavingFormatter {}
+        impl OsvNaming for MisbehavingFormatter {}
+
+        let oversized = VersionReq::new("1".repeat(crate::lsp_helpers::MAX_REQUIREMENT_LEN + 1));
+        let at_cap = VersionReq::new("1".repeat(crate::lsp_helpers::MAX_REQUIREMENT_LEN));
+        let within_cap = VersionReq::new("^1.0");
+        let latest = ConcreteVersion::new("1.0.0");
+
+        for requirement in [&within_cap, &at_cap] {
+            assert!(
+                MisbehavingFormatter
+                    .compile_requirement(requirement)
+                    .is_some()
+            );
+            assert!(!MisbehavingFormatter.is_requirement_up_to_date(requirement, &latest));
+            assert!(MisbehavingFormatter.requirement_already_resolves_to(requirement, &latest));
+        }
+
+        assert!(
+            MisbehavingFormatter
+                .compile_requirement(&oversized)
+                .is_none()
+        );
+        assert!(MisbehavingFormatter.is_requirement_up_to_date(&oversized, &latest));
+        assert!(!MisbehavingFormatter.requirement_already_resolves_to(&oversized, &latest));
+
+        let dyn_formatter: &dyn RequirementResolution = &MisbehavingFormatter;
+        assert!(dyn_formatter.compile_requirement(&within_cap).is_some());
+        assert!(!dyn_formatter.is_requirement_up_to_date(&within_cap, &latest));
+        assert!(dyn_formatter.requirement_already_resolves_to(&within_cap, &latest));
+        assert!(dyn_formatter.compile_requirement(&oversized).is_none());
+        assert!(dyn_formatter.is_requirement_up_to_date(&oversized, &latest));
+        assert!(!dyn_formatter.requirement_already_resolves_to(&oversized, &latest));
     }
 
     /// #1636: `~1.5.3`'s own patch floor must be enforced, not just major/minor equality —
@@ -3029,14 +3195,10 @@ mod tests {
     #[test]
     fn test_up_to_date_via_compiled_matcher_falls_back_without_matcher() {
         let latest = ConcreteVersion::new("1.2.3");
+        let requirement = VersionReq::new("1.2.3");
         assert!(up_to_date_via_compiled_matcher(
             &MOCK_FORMATTER,
-            &VersionReq::new("1.2.3"),
-            &latest
-        ));
-        assert!(up_to_date_via_compiled_matcher(
-            &MOCK_FORMATTER,
-            &VersionReq::new("1".repeat(super::super::MAX_REQUIREMENT_LEN + 1)),
+            BoundedVersionReq::new(&requirement).unwrap(),
             &latest
         ));
     }

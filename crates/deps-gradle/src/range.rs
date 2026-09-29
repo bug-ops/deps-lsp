@@ -20,7 +20,7 @@ use deps_maven::interval::{BracketStyle, VersionRange, contains, parse_interval}
 /// (unbalanced/unrecognized delimiters, empty bounds, a nested bracket, an extra
 /// comma-separated component) rather than panicking.
 ///
-/// Used by `GradleFormatter::compile_requirement` to parse the requirement once per
+/// Used by `GradleFormatter::compile_bounded_requirement` to parse the requirement once per
 /// dependency; the resulting `VersionRange` is then tested against each candidate version
 /// via `contains` with no re-parsing.
 pub(crate) fn parse_range(requirement: &str) -> Option<VersionRange> {

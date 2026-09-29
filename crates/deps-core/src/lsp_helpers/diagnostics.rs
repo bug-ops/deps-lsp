@@ -20,8 +20,8 @@ use crate::{
 
 use super::{
     CooldownBlocker, CooldownDisposition, EcosystemFormatter, LatestVerdict, PackageVersions,
-    RequirementMatcher, RequirementStatus, RequirementStatusGate, VersionData,
-    cooldown_disposition, resolve_scan_outcome, version_range_is_synthetic_empty,
+    RequirementGate, RequirementMatcher, RequirementStatus, VersionData, cooldown_disposition,
+    resolve_scan_outcome, version_range_is_synthetic_empty,
 };
 
 /// Stable [`Diagnostic::code`] set on the unsatisfiable-requirement diagnostic.
@@ -483,13 +483,13 @@ impl DiagnosticSeverities {
     }
 }
 
-/// Shared shape for a [`crate::lsp_helpers::RequirementResolution::compile_requirement`] guarded by one predicate.
+/// Shared shape for a [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`] guarded by one predicate.
 ///
 /// This is the pattern several ecosystems' guards independently re-implemented
 /// (`deps-go`'s pseudo-version check, `deps-composer`'s dev-branch/`@dev` check,
 /// `deps-bundler`'s exact-pin check, `deps-maven`/`deps-gradle`'s malformed-range check,
 /// `deps-nuget`'s malformed-requirement check). See
-/// [`crate::lsp_helpers::RequirementResolution::compile_requirement`]'s docs for why `None` is correct in exactly
+/// [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`]'s docs for why `None` is correct in exactly
 /// this case: `is_undecidable(requirement)` true means the fetched `available` list
 /// structurally cannot contain a version that would decide the match either way, so scanning
 /// it would always report `Some(false)` and produce a false "no published version satisfies
@@ -497,12 +497,12 @@ impl DiagnosticSeverities {
 ///
 /// Returns `None` when `is_undecidable(requirement)` is `true`. Otherwise builds `matcher`
 /// from `requirement`'s owned `String` and boxes it as the trait object
-/// [`crate::lsp_helpers::RequirementResolution::compile_requirement`] returns.
+/// [`crate::lsp_helpers::RequirementResolution::compile_bounded_requirement`] returns.
 ///
 /// Ecosystems whose guard is a fallible parse rather than a named predicate over the
 /// requirement string (`deps-cargo`, `deps-npm`, `deps-pypi`, `deps-swift`) don't fit this
-/// shape and implement `compile_requirement` directly via `.ok().map(...)` instead.
-/// `deps-dart` implements `compile_requirement` but has no guard at all — every requirement
+/// shape and implement `compile_bounded_requirement` directly via `.ok().map(...)` instead.
+/// `deps-dart` implements `compile_bounded_requirement` but has no guard at all — every requirement
 /// string is a valid Dart constraint by construction, so it is always `Some`.
 ///
 /// # Examples
@@ -552,10 +552,10 @@ where
 /// compiled and scanned.
 ///
 /// Enforced by [`requirement_is_unsatisfiable`] before it calls
-/// [`RequirementResolution::compile_requirement`](super::RequirementResolution::compile_requirement).
+/// [`RequirementResolution::compile_bounded_requirement`](super::RequirementResolution::compile_bounded_requirement).
 /// No real manifest requirement in any supported ecosystem approaches this length; it exists
 /// solely to bound the cost of an adversarial or corrupted requirement string. All eleven
-/// ecosystems' `compile_requirement` implementations now parse `requirement` exactly once per
+/// ecosystems' `compile_bounded_requirement` implementations now parse `requirement` exactly once per
 /// dependency and reuse the parsed form across every candidate in `matches` —
 /// Maven/Gradle/NuGet's `RequirementMatcher`s were the last holdouts re-parsing per candidate,
 /// fixed alongside this comment — so the scan itself is O(`available.len()`) in the size of
@@ -565,9 +565,9 @@ where
 /// corrupted or adversarial one.
 ///
 /// `pub` (#1483): also reused outside `deps-core` by any ecosystem-specific requirement
-/// source that reaches its own range parser through a path other than `compile_requirement`
+/// source that reaches its own range parser through a path other than `compile_bounded_requirement`
 /// — e.g. `deps-npm`'s pnpm `catalog:` resolver, which calls `node_semver::Range::parse`
-/// directly on a workspace-file-sourced string rather than through `compile_requirement`, and
+/// directly on a workspace-file-sourced string rather than through `compile_bounded_requirement`, and
 /// so needs the same cap applied at its own call site instead of duplicating a second
 /// constant (cross-ecosystem consistency rule, workspace `CLAUDE.md`).
 pub const MAX_REQUIREMENT_LEN: usize = 256;
@@ -577,7 +577,7 @@ pub const MAX_REQUIREMENT_LEN: usize = 256;
 /// This is the shared CWE-400 bound applied before handing a requirement string to any
 /// ecosystem's range/comparator parser (several, e.g. `node_semver::Range`, allocate roughly
 /// 1.6 KB per `||` alternative, making an unbounded string a resource-exhaustion vector) or to
-/// `compile_requirement`/`requirement_matches_only_yanked` (#1472 defense-in-depth: bounds the
+/// `compile_bounded_requirement`/`requirement_matches_only_yanked` (#1472 defense-in-depth: bounds the
 /// one-time parse/scan cost of a pathological requirement string for every ecosystem, on top
 /// of the bundler-specific algorithmic O(n^2) fix).
 ///
@@ -630,15 +630,16 @@ pub fn requirement_is_oversized(requirement: &VersionReq) -> bool {
 /// A [`VersionReq`] proven not [`requirement_is_oversized`].
 ///
 /// The only way to construct one is through [`Self::new`]'s length check, so a
-/// [`RequirementResolution::classify_requirement_status`](super::RequirementResolution::classify_requirement_status)/
-/// [`classify_requirement_status_for`](super::RequirementResolution::classify_requirement_status_for)
-/// override receives a value that has already passed the gate and has nothing oversized it
-/// could forget to reject.
+/// [`super::RequirementResolution`] hook (`classify_requirement_status[_for]`,
+/// `is_bounded_requirement_up_to_date`, `compile_bounded_requirement`,
+/// `bounded_requirement_already_resolves_to`) override receives a value that has already
+/// passed the gate and has nothing oversized it could forget to reject.
 ///
-/// #1648: replaces a manual `requirement_is_oversized` check repeated at every
-/// `classify_requirement_status[_for]` override (and easy to omit at a new one) with a
-/// structural guarantee — [`super::RequirementStatusGate`], the only production entry point,
-/// is the sole place that constructs this type, before any override ever runs.
+/// #1648, #1652: replaces a manual `requirement_is_oversized` check repeated at every hook
+/// override (and easy to omit at a new one) with a structural guarantee —
+/// [`super::RequirementGate`], the entry point production callers use, constructs this type
+/// before any override ever runs; a caller needing a distinct oversized outcome constructs it
+/// itself at its own gate position.
 #[derive(Clone, Copy, Debug)]
 pub struct BoundedVersionReq<'a>(&'a VersionReq);
 
@@ -698,13 +699,13 @@ impl<'a> BoundedVersionReq<'a> {
 /// 1. `!available.is_empty()` — an empty or not-yet-loaded list means "unknown", not
 ///    "unsatisfiable" (FR-004: no diagnostic while loading or offline).
 /// 2. `!requirement.as_str().trim().is_empty()`.
-/// 3. `requirement.as_str().len() <= MAX_REQUIREMENT_LEN` — see that constant's docs; an
+/// 3. `BoundedVersionReq::new(requirement)` is `Some` — see [`MAX_REQUIREMENT_LEN`]; an
 ///    oversized requirement is treated the same as "unmodellable" (suppressed, not warned).
 /// 4. `!formatter.requirement_is_unresolved(requirement)` (FR-005) — an unresolved
 ///    placeholder requirement was never actually checked against anything.
 /// 5. `!formatter.requirement_is_undecidable_given_available(requirement, available)` — this
 ///    ecosystem's registry can hide a published version that would have decided the match.
-/// 6. `formatter.compile_requirement(requirement)` returns `Some(matcher)` — this
+/// 6. `formatter.compile_bounded_requirement(requirement)` returns `Some(matcher)` — this
 ///    ecosystem opted in and the requirement string itself parses.
 /// 7. Scanning `available` with `matcher.matches`: **at least one** candidate returned
 ///    `Some(false)`, and **none** returned `Some(true)`. Candidates returning `None`
@@ -721,7 +722,7 @@ impl<'a> BoundedVersionReq<'a> {
 ///
 /// ```
 /// use deps_core::lsp_helpers::{
-///     requirement_is_unsatisfiable, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
+///     BoundedVersionReq, requirement_is_unsatisfiable, DiagnosticMessages, DiagnosticPolicy, OsvNaming,
 ///     PackageNaming, PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
 /// };
 /// use deps_core::{ConcreteVersion, PackageName, VersionReq};
@@ -748,9 +749,9 @@ impl<'a> BoundedVersionReq<'a> {
 ///     }
 /// }
 /// impl RequirementResolution for ExactFormatter {
-///     fn compile_requirement(
+///     fn compile_bounded_requirement(
 ///         &self,
-///         requirement: &VersionReq,
+///         requirement: BoundedVersionReq<'_>,
 ///     ) -> Option<Box<dyn RequirementMatcher>> {
 ///         Some(Box::new(ExactMatcher(requirement.as_str().to_string())))
 ///     }
@@ -785,7 +786,7 @@ pub fn requirement_is_unsatisfiable(
 ///
 /// Exists so [`apply_unsatisfiable_rule`] can reuse the matcher it already compiled here when
 /// it later calls [`matching_prerelease_would_satisfy`], instead of calling
-/// [`RequirementResolution::compile_requirement`](super::RequirementResolution::compile_requirement)
+/// [`RequirementResolution::compile_bounded_requirement`](super::RequirementResolution::compile_bounded_requirement)
 /// a second time for the same requirement (#1494).
 fn unsatisfiable_matcher(
     formatter: &dyn EcosystemFormatter,
@@ -795,9 +796,7 @@ fn unsatisfiable_matcher(
     if available.is_empty() || requirement.as_str().trim().is_empty() {
         return None;
     }
-    if requirement.as_str().len() > MAX_REQUIREMENT_LEN {
-        return None;
-    }
+    let bounded = BoundedVersionReq::new(requirement)?;
     // #1391: also consults `requirement_is_placeholder` directly, not only
     // `requirement_is_unresolved` — closes a gap for `deps-github-actions`/`deps-gitlab-ci`,
     // whose `requirement_is_unresolved` override answers a narrower question (see that
@@ -811,7 +810,7 @@ fn unsatisfiable_matcher(
     if formatter.requirement_is_undecidable_given_available(requirement, available) {
         return None;
     }
-    let matcher = formatter.compile_requirement(requirement)?;
+    let matcher = formatter.compile_bounded_requirement(bounded)?;
 
     let mut saw_decided_false = false;
     for candidate in available {
@@ -876,7 +875,7 @@ fn requirement_names_prerelease(requirement: &str) -> bool {
 /// `matcher` is `requirement`'s already-compiled [`RequirementMatcher`] — callers reach this
 /// function only after [`unsatisfiable_matcher`] has already compiled `requirement` to decide
 /// unsatisfiability, so this takes that matcher directly instead of recompiling `requirement`
-/// a second time via `compile_requirement` (#1494).
+/// a second time via `compile_bounded_requirement` (#1494).
 ///
 /// Returns `None` when the matcher hasn't opted into strict pre-release exclusion,
 /// `requirement` itself already names a pre-release (see [`requirement_names_prerelease`] — in
@@ -966,13 +965,11 @@ fn requirement_matches_only_yanked(
     if available.is_empty() || yanked.is_empty() || requirement.as_str().trim().is_empty() {
         return None;
     }
-    if requirement.as_str().len() > MAX_REQUIREMENT_LEN {
-        return None;
-    }
+    let bounded = BoundedVersionReq::new(requirement)?;
     if formatter.requirement_is_unresolved(requirement) {
         return None;
     }
-    let matcher = formatter.compile_requirement(requirement)?;
+    let matcher = formatter.compile_bounded_requirement(bounded)?;
 
     let mut saw_match = false;
     let mut saw_undecided = false;
@@ -4798,9 +4795,9 @@ mod tests {
             }
         }
         impl RequirementResolution for AlwaysUnsatisfiable {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                _requirement: &VersionReq,
+                _requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 Some(Box::new(NeverMatches))
             }
@@ -8549,10 +8546,11 @@ mod tests {
             }
         }
         impl RequirementResolution for CountingFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
+                let requirement = requirement.get();
                 self.compile_calls
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 crate::lsp_helpers::compile_semver_requirement(requirement)
@@ -9431,7 +9429,7 @@ mod tests {
     }
 
     /// Table-driven coverage for `requirement_is_unsatisfiable` (plan §4), using a
-    /// formatter whose `compile_requirement` is configured per test via a closure-backed
+    /// formatter whose `compile_bounded_requirement` is configured per test via a closure-backed
     /// matcher, rather than one of the fixed ecosystem formatters.
     mod requirement_is_unsatisfiable_tests {
         use super::*;
@@ -9452,7 +9450,7 @@ mod tests {
             }
         }
 
-        /// A formatter whose `compile_requirement` is `None` (requirement is treated as
+        /// A formatter whose `compile_bounded_requirement` is `None` (requirement is treated as
         /// unmodellable) unless `requirement.as_str() == "modelled"`, in which case it
         /// returns a `ClosureMatcher` wrapping `decide`. `requirement_is_unresolved` fires
         /// on the literal string `"unresolved"`.
@@ -9485,9 +9483,9 @@ mod tests {
                 requirement.as_str() == "unresolved"
             }
 
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 if requirement.as_str() != "modelled" {
                     return None;
@@ -9529,7 +9527,7 @@ mod tests {
             ));
         }
 
-        /// S-1 (security): an oversized requirement is rejected before `compile_requirement`
+        /// S-1 (security): an oversized requirement is rejected before `compile_bounded_requirement`
         /// is even called, bounding the cost of an adversarial/corrupted requirement string
         /// regardless of how expensive that ecosystem's matcher is per candidate.
         #[test]
@@ -9691,10 +9689,11 @@ mod tests {
         }
 
         impl RequirementResolution for NonStrictFormatter {
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
+                let requirement = requirement.get();
                 requirement
                     .as_str()
                     .parse::<semver::VersionReq>()
@@ -9959,7 +9958,7 @@ mod tests {
         }
 
         /// Same shape as `requirement_is_unsatisfiable_tests::TableFormatter`:
-        /// `compile_requirement` only opts in for the literal requirement string `"modelled"`.
+        /// `compile_bounded_requirement` only opts in for the literal requirement string `"modelled"`.
         struct TableFormatter {
             decide: Decide,
         }
@@ -9989,9 +9988,9 @@ mod tests {
                 requirement.as_str() == "unresolved"
             }
 
-            fn compile_requirement(
+            fn compile_bounded_requirement(
                 &self,
-                requirement: &VersionReq,
+                requirement: BoundedVersionReq<'_>,
             ) -> Option<Box<dyn RequirementMatcher>> {
                 if requirement.as_str() != "modelled" {
                     return None;

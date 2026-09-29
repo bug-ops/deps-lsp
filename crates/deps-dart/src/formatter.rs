@@ -5,10 +5,9 @@ use deps_core::ConcreteVersion;
 use deps_core::EcosystemId;
 use deps_core::InvalidPackageName;
 use deps_core::PackageName;
-use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy, bare_meaning,
     format_version_replacing_by_shape,
 };
 use deps_core::normalize_operator_spacing;
@@ -25,7 +24,7 @@ fn is_valid_dart_identifier(name: &str) -> bool {
 }
 
 /// pub.dev constraint matcher, compiled once per dependency by
-/// [`DartFormatter::compile_requirement`]. Holds the requirement already run through
+/// [`DartFormatter::compile_bounded_requirement`]. Holds the requirement already run through
 /// [`normalize_operator_spacing`] so per-candidate matching never re-normalizes or
 /// allocates. `version_matches_normalized_constraint` is a hand-rolled comparator with no
 /// external parser to fail on, so this always decides (`Some`).
@@ -122,9 +121,13 @@ impl RequirementResolution for DartFormatter {
     /// hand-rolled comparator otherwise always decides (`Some`), which would read a
     /// `${VAR}`-shaped constraint as satisfied by no candidate and misreport it
     /// unsatisfiable (`requirement_is_unresolved` already short-circuits that diagnostic
-    /// ahead of this, but keeping `compile_requirement` consistent avoids a second,
+    /// ahead of this, but keeping `compile_bounded_requirement` consistent avoids a second,
     /// independent path — e.g. completion candidate filtering — disagreeing with it).
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
+        let requirement = requirement.get();
         if self.requirement_is_unresolved(requirement) {
             return None;
         }
@@ -150,6 +153,8 @@ impl OsvNaming for DartFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::VersionReq;
+    use deps_core::lsp_helpers::RequirementGate;
 
     #[test]
     fn test_format_version() {

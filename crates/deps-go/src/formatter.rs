@@ -1,14 +1,15 @@
 use deps_core::VersionReq;
 use deps_core::lsp_helpers::{
-    DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming, PackageRendering,
-    RequirementMatcher, RequirementResolution, SourcePolicy, compile_requirement_unless,
+    BoundedVersionReq, DiagnosticMessages, DiagnosticPolicy, OsvNaming, PackageNaming,
+    PackageRendering, RequirementMatcher, RequirementResolution, SourcePolicy,
+    compile_requirement_unless,
 };
 use deps_core::{ConcreteVersion, Dependency, InvalidPackageName, PackageName};
 
 use crate::types::{GoDependency, GoDirective};
 
 /// Exact/pseudo-version comparison shared by `version_satisfies_requirement` and
-/// [`GoFormatter::compile_requirement`]'s matcher — Go module requirements are exact pins
+/// [`GoFormatter::compile_bounded_requirement`]'s matcher — Go module requirements are exact pins
 /// or MVS-selected versions, not ranges, so both call sites need identical semantics:
 ///
 /// 1. Exact match: v1.2.3 == v1.2.3
@@ -31,7 +32,7 @@ fn go_version_matches(version: &str, requirement: &str) -> bool {
 }
 
 /// Exact/pseudo-version matcher, compiled once per dependency by
-/// [`GoFormatter::compile_requirement`]. Always decidable (`Some`) — Go module version
+/// [`GoFormatter::compile_bounded_requirement`]. Always decidable (`Some`) — Go module version
 /// strings need no external parser, just [`go_version_matches`]'s string comparison — so
 /// this never skips a candidate the way ecosystems with a real version parser can.
 struct ExactMatcher(String);
@@ -103,7 +104,7 @@ impl RequirementResolution for GoFormatter {
     /// comparison `version_satisfies_requirement` uses — Go's requirement syntax has no
     /// separate "loose" vs. "precise" distinction, so both share `go_version_matches`. Uses
     /// [`compile_requirement_unless`] (see that function and
-    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`] for the shared "undecidable" contract).
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`] for the shared "undecidable" contract).
     ///
     /// The undecidable predicate is `crate::version::is_pseudo_version` — or an unresolved
     /// external-templating placeholder ([`Self::requirement_is_unresolved`], #1377/#1379
@@ -113,7 +114,10 @@ impl RequirementResolution for GoFormatter {
     /// enumerable), so a pseudo-version pin can never be found in `available` even when the
     /// exact commit it names is real. A `+incompatible`-suffixed *tag* (not a pseudo-version)
     /// is a real entry `/@v/list` does return, so it needs no such guard.
-    fn compile_requirement(&self, requirement: &VersionReq) -> Option<Box<dyn RequirementMatcher>> {
+    fn compile_bounded_requirement(
+        &self,
+        requirement: BoundedVersionReq<'_>,
+    ) -> Option<Box<dyn RequirementMatcher>> {
         compile_requirement_unless(
             requirement.as_str(),
             |req| {
@@ -183,6 +187,7 @@ impl OsvNaming for GoFormatter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position, Range};
 
     fn go_dep(directive: GoDirective, version: &str) -> GoDependency {

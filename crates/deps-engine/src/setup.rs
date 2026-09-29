@@ -908,36 +908,11 @@ mod tests {
         }
     }
 
-    /// #1627 S1: `RequirementResolution::is_requirement_up_to_date`/
-    /// `requirement_already_resolves_to`'s shared defaults gate on `requirement_is_oversized`
-    /// before reaching any ecosystem's matcher — but an ecosystem overriding either method
-    /// (NuGet, GitLab CI, GitHub Actions) bypasses that shared default entirely and must gate
-    /// itself, or otherwise be architecturally safe without one. Iterates every *registered*
-    /// ecosystem (`registry.ecosystem_ids()`, not a hand-written list — works under any
-    /// feature subset and covers a future 15th ecosystem automatically).
-    ///
-    /// `requirement_already_resolves_to` is unconditionally asserted `false` for every
-    /// ecosystem: none of the three overriders above touch this method (verified: grepped for
-    /// an override in `deps-gitlab-ci`/`deps-github-actions`, found none), so every ecosystem
-    /// reaches either the shared, now-gated default or NuGet's now-gated override.
-    ///
-    /// `is_requirement_up_to_date` is asserted `true` (suppressed) for every ecosystem except
-    /// [`deps_core::EcosystemId::GithubActions`] and [`deps_core::EcosystemId::GitlabCi`] —
-    /// both overrides do O(1)/O(length) string comparison only, never an ecosystem matcher
-    /// call, so neither has CWE-400 exposure to gate, but both also legitimately do NOT
-    /// special-case an oversized digit string as "up to date": GitHub Actions' all-digit
-    /// string has more leading components than `latest` and falls through to a real, cheap
-    /// component compare that reports outdated; GitLab CI's (verified empirically here, not
-    /// just by code reading) classifies it as `PinStyle::Tag` (an unprefixed all-digit string
-    /// starts with a digit, matching `is_tag_shaped`, before ever reaching the shorter
-    /// `is_partial_semver_shaped`/branch fallback), whose `status_for_pin` compares it
-    /// literally against `latest` and also reports outdated. Asserting `true` for either
-    /// would test the wrong property — their correctness here doesn't depend on length at
-    /// all, unlike the shared-default/NuGet paths this test's `true` branch actually guards.
+    /// #1652: every *registered* ecosystem's formatter answers an oversized requirement with the
+    /// gate's unmodellable results (no matcher, up to date, not already resolved, `Unresolved`).
     #[test]
     fn test_oversized_requirement_semantics_hold_for_every_ecosystem() {
-        use deps_core::EcosystemId;
-        use deps_core::lsp_helpers::MAX_REQUIREMENT_LEN;
+        use deps_core::lsp_helpers::{MAX_REQUIREMENT_LEN, RequirementGate, RequirementStatus};
         use deps_core::{ConcreteVersion, VersionReq};
 
         let registry = Arc::new(EcosystemRegistry::new());
@@ -953,23 +928,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("{id:?} came from the registry's own ids"));
             let formatter = ecosystem.formatter();
 
-            if matches!(id, EcosystemId::GithubActions | EcosystemId::GitlabCi) {
-                // Exercised (not skipped) so a future change to either override that starts
-                // calling into a real matcher is still caught by re-reading this test's
-                // rationale above — just not asserted against the suppress contract.
-                let _ = formatter.is_requirement_up_to_date(&oversized, &latest);
-            } else {
-                assert!(
-                    formatter.is_requirement_up_to_date(&oversized, &latest),
-                    "{id:?}: is_requirement_up_to_date must treat an oversized requirement as \
-                     suppressed (true, not outdated) instead of reaching this ecosystem's \
-                     matcher"
-                );
-            }
+            assert!(
+                formatter.compile_requirement(&oversized).is_none(),
+                "{id:?}: compile_requirement must not compile an oversized requirement"
+            );
+            assert!(
+                formatter.is_requirement_up_to_date(&oversized, &latest),
+                "{id:?}: is_requirement_up_to_date must treat an oversized requirement as \
+                 suppressed (true, not outdated)"
+            );
             assert!(
                 !formatter.requirement_already_resolves_to(&oversized, &latest),
                 "{id:?}: requirement_already_resolves_to must fail closed (false) for an \
-                 oversized requirement instead of reaching this ecosystem's matcher"
+                 oversized requirement"
+            );
+            assert_eq!(
+                formatter.requirement_status(&oversized, &latest),
+                RequirementStatus::Unresolved,
+                "{id:?}: an oversized requirement must be Unresolved"
             );
         }
     }
@@ -1011,7 +987,7 @@ mod tests {
     }
 
     /// Whether `formatter`'s own comparator (preferring
-    /// [`deps_core::lsp_helpers::RequirementResolution::compile_requirement`], falling back to
+    /// [`deps_core::lsp_helpers::RequirementResolution::compile_bounded_requirement`], falling back to
     /// [`deps_core::lsp_helpers::RequirementResolution::version_satisfies_requirement`] when it
     /// declines to compile) treats a bare `requirement` as an exact pin: it must match
     /// `requirement` itself but reject both a higher patch (`"1.2.9"`) and a higher
@@ -1039,6 +1015,7 @@ mod tests {
         formatter: &dyn deps_core::lsp_helpers::EcosystemFormatter,
         bare: &str,
     ) -> bool {
+        use deps_core::lsp_helpers::RequirementGate;
         use deps_core::{ConcreteVersion, VersionReq};
 
         let requirement = VersionReq::new(bare);
@@ -1190,6 +1167,7 @@ mod tests {
     ))]
     #[test]
     fn test_concrete_pin_version_agrees_with_formatter_for_bare_version() {
+        use deps_core::lsp_helpers::RequirementGate;
         use deps_core::{ConcreteVersion, VersionReq};
 
         let registry = Arc::new(EcosystemRegistry::new());

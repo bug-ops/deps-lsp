@@ -196,7 +196,7 @@ pub(crate) fn parse_range(range: &str) -> Option<VersionRange> {
 /// open-ended minimum (`[1.0.0,)`, `(1.0.0,)`, `[1.0.0,]`). Both are the same
 /// lower-bound-only `VersionRange::Interval` shape once parsed, so this classifies on that
 /// shape rather than the range string's leading bracket character (a bare floor and `[1.0.0,)` must be
-/// treated identically — see `is_requirement_up_to_date` in `crate::formatter`).
+/// treated identically — see `is_bounded_requirement_up_to_date` in `crate::formatter`).
 ///
 /// Returns `None` for exact pins, maximums, bounded ranges, floating patterns (`1.1.*`,
 /// which `parse_range` cannot represent as a lower-bound-only interval), or unparseable input —

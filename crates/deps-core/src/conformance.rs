@@ -763,7 +763,7 @@ pub async fn assert_non_registry_source_yields_no_fetch(
 // ---------------------------------------------------------------------------------------
 // Macro 4b: `unresolved_requirement_conformance!` — issue #1354: an unexpanded
 // placeholder/interpolation in a version requirement must never be rewritten, whether or not
-// `RequirementResolution::compile_requirement`/`requirement_already_resolves_to` happen to
+// `RequirementResolution::compile_bounded_requirement`/`bounded_requirement_already_resolves_to` happen to
 // short-circuit it first.
 // ---------------------------------------------------------------------------------------
 
@@ -791,7 +791,7 @@ pub const UNRESOLVED_REQUIREMENT_CONTROL_DEPENDENCY_NAME: &str = "known-good-con
 ///
 /// The second, independent check is the one that actually matters (#1354/#1391 security
 /// audit): a formatter can pass the first check by coincidence — e.g. because
-/// `RequirementResolution::requirement_already_resolves_to` or `compile_requirement` happens
+/// `RequirementResolution::bounded_requirement_already_resolves_to` or `compile_bounded_requirement` happens
 /// to answer `Some(true)`/decisively for the placeholder — while `replacement_text` would
 /// still destructively rewrite the placeholder if its upstream gate
 /// (`RequirementResolution::requirement_is_placeholder`) were ever wrong. Asserting
@@ -938,7 +938,7 @@ pub async fn assert_unresolved_requirements_never_rewritten(
             // #1391: tightened to `UnresolvedPlaceholder` alone — the assertion above already
             // proved `requirement_is_placeholder(req)` is `true` for this fixture, and
             // `plan_verified_fix`'s central gate (`deps_core::edit::requirement_is_placeholder_for`)
-            // now fires unconditionally on that before either the `requirement_already_resolves_to`
+            // now fires unconditionally on that before either the `bounded_requirement_already_resolves_to`
             // short-circuit or a formatter-level no-op guard could ever be reached — those two
             // are no longer reachable alternate causes for this fixture shape.
             assert!(
@@ -1117,12 +1117,12 @@ pub fn assert_generic_template_placeholders_guarded(
 ///
 /// The unsatisfiable-diagnostic check goes through
 /// [`crate::lsp_helpers::requirement_is_unsatisfiable`] rather than asserting
-/// `compile_requirement(..).is_none()` directly: an ecosystem's `compile_requirement` may
+/// `compile_bounded_requirement(..).is_none()` directly: an ecosystem's `compile_bounded_requirement` may
 /// legitimately compile a placeholder into an always-satisfied matcher (`GradleFormatter`
 /// does, for `$var`) rather than returning `None` — `requirement_is_unsatisfiable` is the
 /// actual diagnostic-facing question this exists to protect, and it short-circuits via
 /// `requirement_is_unresolved`/`requirement_is_placeholder` before ever reaching
-/// `compile_requirement`, so it is `false` either way a formatter chooses to implement the
+/// `compile_bounded_requirement`, so it is `false` either way a formatter chooses to implement the
 /// undecidable case.
 ///
 /// `non_placeholders` is the negative control (#1370 critic M2): requirement strings that

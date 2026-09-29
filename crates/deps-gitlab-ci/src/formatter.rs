@@ -233,14 +233,14 @@ impl RequirementResolution for GitlabCiFormatter {
     /// exact-string equality. A SHA/branch pin returns `true` unconditionally — never a
     /// false "outdated" (the diagnostic itself is separately gated by
     /// [`Self::requirement_is_unresolved`]; this is the boolean fallback for a caller that
-    /// does not consult that first, e.g. the "Update N outdated" code lens).
+    /// does not consult that first).
     ///
     /// Text-only, so ambiguous for a shape shared between grammars — see
     /// [`Self::classify_requirement_status_for`]'s doc for the dependency-aware alternative a
     /// caller holding the dependency should prefer.
-    fn is_requirement_up_to_date(
+    fn is_bounded_requirement_up_to_date(
         &self,
-        requirement: &VersionReq,
+        requirement: BoundedVersionReq<'_>,
         latest: &ConcreteVersion,
     ) -> bool {
         let pin = crate::component::classify_component_pin_style(requirement.as_str());
@@ -265,7 +265,7 @@ impl RequirementResolution for GitlabCiFormatter {
     ///
     /// #1648: this override bypasses [`RequirementResolution::classify_requirement_status`]'s
     /// shared default entirely, but no longer needs its own `requirement_is_oversized` gate —
-    /// [`RequirementStatusGate::requirement_status_for`](deps_core::lsp_helpers::RequirementStatusGate::requirement_status_for),
+    /// [`RequirementGate::requirement_status_for`](deps_core::lsp_helpers::RequirementGate::requirement_status_for),
     /// the only production entry point, already rejects an oversized requirement via
     /// [`BoundedVersionReq`] before this override is ever called.
     fn classify_requirement_status_for(
@@ -436,7 +436,7 @@ impl OsvNaming for GitlabCiFormatter {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deps_core::lsp_helpers::RequirementStatusGate;
+    use deps_core::lsp_helpers::RequirementGate;
     use deps_core::position::{Position, Range};
 
     fn formatter() -> GitlabCiFormatter {
@@ -704,7 +704,7 @@ mod tests {
     /// M-c (#466 review) regression: `requirement_status_for` must side with the
     /// dependency's own `dep.pin` (here `Branch`, as a `project:` ref's simpler grammar
     /// would classify it — see `crate::parser::classify_project_pin`), not the blanket
-    /// component-grammar text reclassification `is_requirement_up_to_date`/
+    /// component-grammar text reclassification `is_bounded_requirement_up_to_date`/
     /// `requirement_is_unresolved` fall back to, which would misjudge `"1.2"` as `Partial`.
     #[test]
     fn test_requirement_status_for_consults_dep_pin_not_text_reclassification() {
@@ -753,7 +753,7 @@ mod tests {
     /// #1631/#1648 regression: `requirement_status_for` must report `Unresolved` for an
     /// oversized requirement before ever consulting `dep.pin` — this override no longer needs
     /// its own gate for that (see [`GitlabCiFormatter::classify_requirement_status_for`]'s doc):
-    /// [`RequirementStatusGate::requirement_status_for`] rejects it structurally via
+    /// [`RequirementGate::requirement_status_for`] rejects it structurally via
     /// [`BoundedVersionReq`] first. A `Tag` pin whose requirement text differs from `latest`
     /// would otherwise reach `status_for_pin`'s `normalize_tag` comparison and report
     /// `Outdated` — the sanity assertion below proves that is what `status_for_pin` (the
@@ -778,6 +778,21 @@ mod tests {
             ),
             RequirementStatus::Unresolved
         );
+    }
+
+    /// #1652: the gated boolean entry point treats an oversized requirement as up to date
+    /// (unmodellable, consistent with `Unresolved` from `requirement_status`), not outdated.
+    #[test]
+    fn test_is_requirement_up_to_date_oversized_requirement_is_up_to_date() {
+        let oversized =
+            VersionReq::new("1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN + 1));
+
+        assert!(formatter().is_requirement_up_to_date(&oversized, &ConcreteVersion::new("2.0.0")));
+
+        // At-cap control: exactly `MAX_REQUIREMENT_LEN` still reaches the hook, which reports
+        // this `Tag` pin outdated against a different `latest`.
+        let at_cap = VersionReq::new("1".repeat(deps_core::lsp_helpers::MAX_REQUIREMENT_LEN));
+        assert!(!formatter().is_requirement_up_to_date(&at_cap, &ConcreteVersion::new("2.0.0")));
     }
 
     /// The cap is exclusive: a requirement of exactly `MAX_REQUIREMENT_LEN` bytes must still

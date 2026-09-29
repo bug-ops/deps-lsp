@@ -1234,7 +1234,7 @@ serde = "1.0.0"
 
         /// End-to-end coverage for issue #206's unsatisfiable-requirement diagnostic,
         /// through the real `DocumentState` -> `Ecosystem::generate_diagnostics` ->
-        /// `generate_diagnostics_from_cache` -> `CargoFormatter::compile_requirement` path
+        /// `generate_diagnostics_from_cache` -> `CargoFormatter::compile_bounded_requirement` path
         /// (not just the pure `requirement_is_unsatisfiable` function).
         #[tokio::test]
         async fn test_handle_diagnostics_unsatisfiable_requirement_yields_one_warning() {
@@ -1390,7 +1390,7 @@ serde = "1.0.0"
         /// End-to-end coverage for issue #247: a dependency pinned to an exact version that
         /// the registry reports as yanked must produce the yanked diagnostic through the real
         /// `DocumentState` -> `Ecosystem::generate_diagnostics` ->
-        /// `generate_diagnostics_from_cache` -> `CargoFormatter::compile_requirement` path —
+        /// `generate_diagnostics_from_cache` -> `CargoFormatter::compile_bounded_requirement` path —
         /// the same live path the LSP server actually calls, not just the pure
         /// `requirement_matches_only_yanked` function.
         #[tokio::test]
